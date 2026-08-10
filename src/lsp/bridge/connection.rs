@@ -768,6 +768,37 @@ mod tests {
         );
     }
 
+    /// The genuine framing error must QUOTE the stray stdout line that broke
+    /// the frame: when a downstream prints an error to STDOUT (observed:
+    /// basedpyright emitting unframed output under load), that text IS the
+    /// crash reason, and the frame that trips over it is the only place the
+    /// evidence is still readable.
+    #[tokio::test]
+    async fn read_message_quotes_the_stray_line_in_the_framing_error() {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'Error: downstream exploded\\r\\n\\r\\n'".to_string(),
+        ];
+        let mut conn = AsyncBridgeConnection::spawn(cmd)
+            .await
+            .expect("spawn should succeed");
+
+        let err = conn
+            .read_message()
+            .await
+            .expect_err("a header block without Content-Length must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing Content-Length header"),
+            "the framing classification must be kept: {msg}"
+        );
+        assert!(
+            msg.contains("Error: downstream exploded"),
+            "the stray stdout line is the crash evidence and must be quoted: {msg}"
+        );
+    }
+
     /// Integration test: Initialize lua-language-server and verify response
     #[tokio::test]
     async fn initialize_lua_language_server() {
