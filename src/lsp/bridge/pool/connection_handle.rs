@@ -81,6 +81,19 @@ pub(crate) enum NotificationSendResult {
 /// (`Closing`/`Failed` → `Closed`, terminal). FIFO writes flow `tx` → writer
 /// task → stdin; the reader task pushes incoming responses through `router` to
 /// oneshot waiters so callers can await without holding any Mutex.
+/// Park times at or above this on the request-slot semaphore are logged
+/// (`kakehashi::bridge::backpressure`, debug): long waits are the saturation
+/// signal, and an order of magnitude above scheduler noise keeps the log
+/// quiet under healthy load.
+const BACKPRESSURE_LOG_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn closed_request_slots_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        "bridge: connection evicted while waiting for a request slot",
+    )
+}
+
 /// The built-in in-flight request cap lives with the config knob it backs
 /// ([`crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS`]); production
 /// code passes a resolved capacity into [`ConnectionHandle::with_state`], so
@@ -241,15 +254,32 @@ impl ConnectionHandle {
     pub(crate) async fn acquire_request_slot(
         &self,
     ) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
-        Arc::clone(&self.request_permits)
+        // Fast path: a free slot needs no clock read.
+        match Arc::clone(&self.request_permits).try_acquire_owned() {
+            Ok(permit) => return Ok(permit),
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(closed_request_slots_error());
+            }
+            Err(tokio::sync::TryAcquireError::NoPermits) => {}
+        }
+        let parked_at = std::time::Instant::now();
+        let permit = Arc::clone(&self.request_permits)
             .acquire_owned()
             .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "bridge: connection evicted while waiting for a request slot",
-                )
-            })
+            .map_err(|_| closed_request_slots_error())?;
+        let waited = parked_at.elapsed();
+        if waited >= BACKPRESSURE_LOG_THRESHOLD {
+            // Saturation must not be an invisible wait: this is the signal
+            // that a downstream is slower than its request supply (raise
+            // `maxConcurrentRequests`? server overloaded?).
+            log::debug!(
+                target: "kakehashi::bridge::backpressure",
+                "[{}] waited {}ms for a request slot",
+                self.connection_key,
+                waited.as_millis()
+            );
+        }
+        Ok(permit)
     }
 
     pub(super) fn record_launch_config(
