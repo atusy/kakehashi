@@ -102,6 +102,15 @@ use crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS;
 /// arrives. Best-effort by nature: the send is a non-blocking queue write,
 /// and a dead writer just drops it — exactly like every other
 /// `$/cancelRequest`.
+///
+/// Deliberately NOT deduplicated against the upstream cancel forwarder: a
+/// client-initiated cancel can drop the request future (guard fires) AND
+/// send its own explicit cancel for the captured downstream id — two
+/// `$/cancelRequest`s for one request. That is bounded (≤2 per request,
+/// ≤2×cap per storm against a 4096-deep queue) and idempotent per the LSP
+/// spec (a server ignores cancels for unknown/finished ids). Exactly-once
+/// bookkeeping needs a recently-cancelled id set that survives router-entry
+/// removal — the same machinery issue #979 needs — and lives there.
 pub(in crate::lsp::bridge) struct CancelOnDropGuard {
     handle: Option<Arc<ConnectionHandle>>,
     request_id: crate::lsp::bridge::protocol::RequestId,
