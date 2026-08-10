@@ -63,7 +63,9 @@ struct FrameParseState {
     line: Vec<u8>,
     content_length: Option<usize>,
     /// First non-`Content-Length` header line, quoted as evidence if the block
-    /// turns out to have no `Content-Length` at all.
+    /// turns out to have no `Content-Length` at all — when a downstream prints
+    /// an error to STDOUT (observed: basedpyright), the frame that trips over it
+    /// is the only place that crash reason is still readable.
     stray_line: Option<String>,
     /// Any byte of this frame consumed, so EOF now means a truncated frame
     /// rather than an idle downstream closing cleanly between messages.
@@ -271,7 +273,10 @@ impl<R: AsyncRead + Unpin> BridgeReader<R> {
                 // would silently read the next frame's header into this body —
                 // the exact desync this module exists to prevent. The cap makes
                 // that impossible by construction rather than by luck.
-                let read = (&mut *stdout.get_mut()).take(body.remaining).read_buf(body.buf).await?;
+                let read = (&mut *stdout.get_mut())
+                    .take(body.remaining)
+                    .read_buf(body.buf)
+                    .await?;
                 if read == 0 {
                     return Err(frame.eof_error());
                 }
@@ -641,7 +646,7 @@ impl AsyncBridgeConnection {
     /// Read and parse a JSON-RPC message from the child process stdout.
     ///
     /// Delegates to internal `BridgeReader`.
-    /// Returns None if the reader has been taken (via split()).
+    /// Returns an error if the reader has been taken (via split()).
     #[cfg(test)]
     pub(crate) async fn read_message(&mut self) -> io::Result<serde_json::Value> {
         match &mut self.reader {
@@ -1323,7 +1328,10 @@ mod tests {
         tokio::spawn(async move {
             tx.write_all(&big[32 * 1024..]).await.unwrap();
         });
-        assert_eq!(reader.read_message_bytes().await.unwrap(), vec![b'y'; 100 * 1024]);
+        assert_eq!(
+            reader.read_message_bytes().await.unwrap(),
+            vec![b'y'; 100 * 1024]
+        );
     }
 
     /// A framing error must leave the reader able to move on: the bytes that

@@ -812,7 +812,13 @@ async fn reader_loop_with_liveness(
                 liveness.start(&server_prefix, router.liveness_epoch());
             }
 
-            // Try to read a message (lowest priority)
+            // Try to read a message (lowest priority).
+            //
+            // A fresh future every iteration, so every branch above drops a
+            // partly-read frame. That is only safe because the parser keeps its
+            // progress in `BridgeReader`, not in this future — see
+            // `BridgeReader::read_message_bytes`. Do not move that state back
+            // into locals.
             result = reader.read_message() => {
                 match result {
                     Ok(message) => {
@@ -3528,6 +3534,52 @@ mod tests {
     ///
     /// ls-bridge-async-connection: Ready to Failed transition on liveness timeout expiry.
     /// When timeout fires while pending > 0, router.fail_all() is called.
+    /// A downstream that stalls PART WAY THROUGH a frame must still be caught.
+    ///
+    /// Since the framing parser became resumable, a half-read frame now
+    /// survives every cancellation instead of being discarded — so the liveness
+    /// timer is the only thing that still notices this server is hung. The
+    /// existing liveness test uses a server that emits nothing at all, which
+    /// never parks a partial frame.
+    #[tokio::test]
+    async fn liveness_timeout_fires_when_downstream_stalls_mid_frame() {
+        use crate::lsp::bridge::protocol::RequestId;
+        use std::time::Duration;
+
+        // A header with no body: the reader parks inside the frame.
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'Content-Length: 100\\r\\n\\r\\n'; sleep 30".to_string(),
+        ])
+        .await
+        .expect("should spawn process");
+
+        let (_writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let rx = router.register(RequestId::new(1)).unwrap();
+
+        let handle = spawn_reader_task_with_liveness(
+            reader,
+            Arc::clone(&router),
+            Some(Duration::from_millis(50)),
+        );
+        handle.notify_liveness_start(1);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("liveness must fire even though a partial frame is parked")
+            .expect("channel should not be closed");
+
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("liveness timeout"),
+            "Error should mention liveness timeout, got: {result}"
+        );
+    }
+
     #[tokio::test]
     async fn liveness_timeout_fires_and_fails_pending_requests() {
         use crate::lsp::bridge::protocol::RequestId;

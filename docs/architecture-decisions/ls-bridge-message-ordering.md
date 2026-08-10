@@ -335,11 +335,18 @@ When the writer task panics, the reader task must also exit to prevent CPU spin 
 ```rust
 // Reader task select! loop
 select! {
-    line = reader.read_line() => { /* handle response */ }
+    result = reader.read_message() => { /* handle response */ }
     _ = token.cancelled() => { break; }  // Writer panicked, exit
     _ = shutdown_rx.recv() => { break; } // Graceful shutdown
 }
 ```
+
+`read_message` must be cancel-safe. Every other branch completing first drops
+the read future, so a parser holding frame progress in future-local state
+loses a consumed header and resyncs onto the next message body — reporting a
+framing error against a well-framed stream. See
+`BridgeReader::read_message_bytes`, which keeps that progress in the reader and
+awaits only cancel-safe primitives.
 
 ## Consequences
 
