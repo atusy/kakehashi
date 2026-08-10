@@ -40,12 +40,14 @@ workDoneProgress = false
   advertise-time and config-layer merge semantics cannot drift apart.
 - **Explicit `false` is the only negation.** TOML has no `null`, so keys
   cannot be removed, only set; an explicit `false` is a spec-honest denial.
-- **`general.positionEncodings` is protected.** It is stripped from the
-  override with a warning: coordinate translation depends on UTF-16, and an
-  override there would silently corrupt every bridged position. Every other
-  field is the user's to override — reducing capability is always LSP-safe,
-  while *adding* capability may invite requests the bridge can only fail
-  (documented as sharp, not guarded).
+- **`general.positionEncodings` is protected.** Enforced as a post-merge
+  invariant: whatever shape the override takes (an object override, a
+  non-object `general` replacing the subtree, a JSON `null`), the baseline
+  value is restored with a warning. Coordinate translation depends on UTF-16,
+  and an override there would silently corrupt every bridged position. Every
+  other field is the user's to override — reducing capability is LSP-safe
+  everywhere except this guarded field, while *adding* capability may invite
+  requests the bridge can only fail (documented as sharp, not guarded).
 - **Initialize-time only.** The override participates in
   `same_launch_config`, so changing it relaunches the server's connection
   like an `initializationOptions` change.
