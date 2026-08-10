@@ -105,12 +105,16 @@ use crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS;
 ///
 /// Deliberately NOT deduplicated against the upstream cancel forwarder: a
 /// client-initiated cancel can drop the request future (guard fires) AND
-/// send its own explicit cancel for the captured downstream id — two
-/// `$/cancelRequest`s for one request. That is bounded (≤2 per request,
-/// ≤2×cap per storm against a 4096-deep queue) and idempotent per the LSP
-/// spec (a server ignores cancels for unknown/finished ids). Exactly-once
-/// bookkeeping needs a recently-cancelled id set that survives router-entry
-/// removal — the same machinery issue #979 needs — and lives there.
+/// send its own explicit cancel for the captured downstream id. The guard
+/// contributes at most ONE cancel per request; the forwarder contributes one
+/// per RECEIVED client cancel (it has never deduplicated repeats — a
+/// pre-existing property, not introduced by the guard), and the formatting
+/// pipeline's probe cancel is a third pre-existing source. All are
+/// idempotent per the LSP spec (a server ignores cancels for
+/// unknown/finished ids) and tiny against the 4096-deep dedicated-writer
+/// queue. Exactly-once bookkeeping needs a recently-cancelled id set that
+/// survives router-entry removal — the same machinery issue #979 needs —
+/// and lives there.
 pub(in crate::lsp::bridge) struct CancelOnDropGuard {
     handle: Option<Arc<ConnectionHandle>>,
     request_id: crate::lsp::bridge::protocol::RequestId,
@@ -484,6 +488,14 @@ impl ConnectionHandle {
     /// `QueueFull` immediately rather than awaiting capacity. On any send error
     /// the router entry is removed (`router.remove()` is idempotent, so this is
     /// safe against concurrent cleanup by the writer task).
+    ///
+    /// Deliberately does NOT check `ConnectionState`: a request that raced
+    /// `begin_shutdown` (state already `Closing` when this enqueues) is
+    /// drained by the writer's 3-phase shutdown ahead of the shutdown/exit
+    /// pair, and its waiter is woken by `fail_all`/channel-close if the
+    /// process exits first — a bounded, pre-existing race. Rejecting it here
+    /// would couple every hot-path send to the state lock for a window that
+    /// graceful shutdown already handles.
     pub(crate) fn send_request<P: serde::Serialize>(
         &self,
         request: JsonRpcRequest<P>,
