@@ -44,7 +44,7 @@ Three critical requirements drive this decision:
 │  │  │ send_request │    │     reader task        │ │    │
 │  │  │   (async)    │    │                        │ │    │
 │  │  └──────┬───────┘    │  select! {             │ │    │
-│  │         │            │    line = read =>      │ │    │
+│  │         │            │    result = read_msg =>│ │    │
 │  │         ▼            │    _ = shutdown =>     │ │    │
 │  │  ┌──────────────┐    │    _ = timeout =>      │ │    │
 │  │  │ AsyncWrite   │    │  }                     │ │    │
@@ -79,6 +79,15 @@ Three critical requirements drive this decision:
   - Shutdown signals
   - Timeout detection
 - Route responses to pending request handlers via shared map
+
+**Cancel-safety of the read branch:** because the read is a `select!` branch,
+any other branch completing drops the read future mid-frame. The framing parser
+must therefore hold its partial-frame progress in the reader
+(`BridgeReader::frame`), not in the read future's locals, and must await only
+cancel-safe primitives. A parser built on `read_line`/`read_exact` silently
+loses a consumed header on every liveness tick and then resyncs onto the
+message body, reporting a framing error against a well-framed stream and
+killing the connection.
 
 **Writer Pattern:**
 - Write requests to server stdin using async mutex-protected writer
@@ -141,7 +150,11 @@ The system uses two distinct timeout mechanisms with different purposes:
 - **Timer Lifecycle**:
   - **Start**: First request sent when pending count transitions 0→1
   - **Keep running**: Additional requests sent (pending count increases)
-  - **Reset**: Any stdout activity (response or notification) while active
+  - **Reset**: Each framed and JSON-decoded downstream message while active
+    (the reset happens before the message is classified, so server-initiated
+    requests count too). Not raw stdout activity: a downstream that dribbles
+    out a partial frame resets nothing and is still caught, which is what makes
+    the timer the backstop for a server that stalls mid-frame.
   - **Stop**: Last response received (pending count returns to 0)
 - **Behavior on Timeout**: Connection transitions to Failed state
 
@@ -255,3 +268,4 @@ Use standard library's `std::process` with one blocking OS thread per server rea
 
 - **2026-01-06**: Merged Amendment 001 - Added pending request cleanup requirements and race prevention pattern to prevent indefinite client hangs on reader task exit
 - **2026-01-06**: Merged Amendment 002 - Added state-based liveness timeout gating and separate initialization timeout mechanism to prevent liveness timeout from firing during slow initialization
+- **2026-08-10**: Amendment — reader framing must be cancel-safe across `select!` wake-ups; partial-frame state moved into `BridgeReader`

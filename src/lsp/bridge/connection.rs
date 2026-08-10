@@ -6,7 +6,7 @@
 use std::io;
 use std::process::Stdio;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 /// Writer handle for sending LSP messages to downstream language server.
@@ -35,129 +35,279 @@ impl BridgeWriter {
     }
 }
 
+/// Longest stray line quoted back in a framing error.
+const STRAY_LINE_MAX_QUOTE_BYTES: usize = 300;
+
+/// tokio's `BufReader` default capacity, and so the point above which reading a
+/// body remainder directly beats staging it through that buffer.
+const BUF_READER_CAPACITY: usize = 8 * 1024;
+
+/// A body remainder large enough to read straight from the source.
+struct LargeBodyRead<'a> {
+    /// Bytes this frame still owes — the cap that keeps the read inside it.
+    remaining: u64,
+    buf: &'a mut Vec<u8>,
+}
+
+/// How far into the current frame the parser has got.
+///
+/// This lives in `BridgeReader` rather than in `read_message_bytes`'s locals so
+/// that a *cancelled* read resumes where it stopped. The reader task awaits
+/// `read_message` as one branch of a `tokio::select!` (see
+/// `actor/reader.rs`), so every other branch that completes first — a liveness
+/// tick, a pending-count wake-up — drops the read future mid-frame. Keeping the
+/// progress here is what makes that drop harmless.
+#[derive(Default)]
+struct FrameParseState {
+    /// Header line accumulated so far, still waiting for its newline.
+    line: Vec<u8>,
+    content_length: Option<usize>,
+    /// First non-`Content-Length` header line, quoted as evidence if the block
+    /// turns out to have no `Content-Length` at all — when a downstream prints
+    /// an error to STDOUT (observed: basedpyright), the frame that trips over it
+    /// is the only place that crash reason is still readable.
+    stray_line: Option<String>,
+    /// Any byte of this frame consumed, so EOF now means a truncated frame
+    /// rather than an idle downstream closing cleanly between messages.
+    started: bool,
+    /// Body bytes accumulated once the header block ended.
+    body: Option<Vec<u8>>,
+}
+
 /// Reader handle for receiving LSP messages from downstream language server.
 ///
 /// Wraps `BufReader<ChildStdout>` to provide LSP message parsing. Used by the
 /// Reader Task (ls-bridge-message-ordering) for non-blocking response routing via ResponseRouter.
-pub(crate) struct BridgeReader {
-    stdout: BufReader<ChildStdout>,
+///
+/// The source is generic only so tests can drive the framing state machine over
+/// an in-memory pipe: cancellation points are then exact instead of racing a
+/// child process's spawn latency. Production always uses the default.
+pub(crate) struct BridgeReader<R = ChildStdout> {
+    stdout: BufReader<R>,
+    frame: FrameParseState,
 }
 
-impl BridgeReader {
-    /// Create a new BridgeReader from a ChildStdout.
-    pub(crate) fn new(stdout: ChildStdout) -> Self {
+impl<R: AsyncRead + Unpin> BridgeReader<R> {
+    /// Create a new BridgeReader from a byte source (a `ChildStdout` in production).
+    pub(crate) fn new(stdout: R) -> Self {
         Self {
             stdout: BufReader::new(stdout),
+            frame: FrameParseState::default(),
         }
     }
 }
 
-impl BridgeReader {
-    /// Read the raw bytes of an LSP message body from stdout.
+impl FrameParseState {
+    /// Take as much of `available` as this frame can use, returning how many
+    /// bytes were consumed. Never consumes bytes belonging to the next frame.
     ///
-    /// Parses headers until empty line, extracts Content-Length, and returns the body bytes.
-    /// Handles multiple headers and different header orders per LSP spec.
-    async fn read_message_bytes(&mut self) -> io::Result<Vec<u8>> {
-        use tokio::io::AsyncReadExt;
+    /// The count is returned even when parsing fails, so the caller can consume
+    /// the offending bytes before propagating: a parser that errors *and* leaves
+    /// its input in the buffer can never advance past a bad line.
+    fn absorb(&mut self, available: &[u8]) -> (usize, io::Result<()>) {
+        self.started = true;
 
-        let mut content_length: Option<usize> = None;
-        let mut saw_header = false;
-        // First non-LSP-header line seen this frame, kept (truncated) so the
-        // genuine framing error below can QUOTE the offending bytes — when a
-        // downstream prints an error to STDOUT (observed: basedpyright), that
-        // text is the crash reason, and the frame that trips over it is the
-        // only place it is still readable.
-        let mut stray_line: Option<String> = None;
-
-        // Read headers until empty line
-        loop {
-            let mut line = String::new();
-            let bytes_read = self.stdout.read_line(&mut line).await?;
-
-            // `read_line` returning 0 is EOF, which would otherwise be
-            // indistinguishable from the end-of-headers empty line and
-            // misreport a dead process as "missing Content-Length header" —
-            // sending crash triage down a protocol-desync path.
-            if bytes_read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    if saw_header {
-                        "downstream closed stdout mid-headers (truncated frame)"
-                    } else {
-                        "downstream closed stdout (EOF)"
-                    },
-                ));
-            }
-
-            // Trim CRLF/LF endings
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-
-            if trimmed.is_empty() {
-                // Only a newline-TERMINATED empty line ends the headers. A
-                // lone '\r' (or bare partial) without its '\n' can only mean
-                // the stream ended mid-separator — `read_line` returns a
-                // newline-less line exclusively at EOF — so fall through to
-                // the next read, which reports the EOF instead of letting a
-                // dying gasp masquerade as a complete (and then
-                // Content-Length-less) header block.
-                if line.ends_with('\n') {
-                    break; // Empty line = end of headers
-                }
-                saw_header = true;
-                continue;
-            }
-            saw_header = true;
-
-            if let Some(value) = trimmed.strip_prefix("Content-Length: ") {
-                content_length = Some(value.trim().parse().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length value")
-                })?);
-            } else if stray_line.is_none() {
-                // Remember the first non-Content-Length line for the framing
-                // error's quote. Legitimate blocks always carry
-                // Content-Length, so this is only ever REPORTED for a failed
-                // block — where any such line (including ones that merely
-                // look header-shaped, like a JSON fragment after a length
-                // mismatch or "Error: …") IS the evidence. Real spare headers
-                // (Content-Type) on healthy frames are still ignored.
-                let mut quoted = trimmed.to_string();
-                const MAX_QUOTE: usize = 300;
-                if quoted.len() > MAX_QUOTE {
-                    let mut end = MAX_QUOTE;
-                    while !quoted.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    quoted.truncate(end);
-                    quoted.push('…');
-                }
-                stray_line = Some(quoted);
-            }
+        // Body phase: take only what this frame still owes.
+        if let Some(body) = self.body.as_mut() {
+            // `body` is opened only once Content-Length is known, so this cannot
+            // fail. Reading the length via the same `if let` would silently fall
+            // through to the header phase and parse body bytes as headers.
+            let length = self
+                .content_length
+                .expect("a body is only opened once Content-Length is known");
+            let take = (length - body.len()).min(available.len());
+            body.extend_from_slice(&available[..take]);
+            return (take, Ok(()));
         }
 
-        let content_length = content_length.ok_or_else(|| match stray_line {
+        // Header phase: a line is only complete once its newline arrives, so a
+        // separator cut short at EOF stays incomplete and is reported as a
+        // truncated frame instead of a header block without Content-Length.
+        match available.iter().position(|&byte| byte == b'\n') {
+            Some(newline) => {
+                self.line.extend_from_slice(&available[..=newline]);
+                let line = std::mem::take(&mut self.line);
+                (newline + 1, self.finish_header_line(&line))
+            }
+            None => {
+                self.line.extend_from_slice(available);
+                (available.len(), Ok(()))
+            }
+        }
+    }
+
+    /// Handle one complete header line (newline included). An empty line ends
+    /// the block and opens the body.
+    fn finish_header_line(&mut self, line: &[u8]) -> io::Result<()> {
+        let mut trimmed = line;
+        while let Some(rest) = trimmed
+            .strip_suffix(b"\n")
+            .or_else(|| trimmed.strip_suffix(b"\r"))
+        {
+            trimmed = rest;
+        }
+
+        if trimmed.is_empty() {
+            let length = self.content_length.ok_or_else(|| self.missing_length())?;
+            self.body = Some(Vec::with_capacity(length));
+            return Ok(());
+        }
+
+        if let Some(value) = trimmed.strip_prefix(b"Content-Length: ") {
+            let value = std::str::from_utf8(value).ok().map(str::trim);
+            let length = value.and_then(|v| v.parse().ok()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length value")
+            })?;
+            self.content_length = Some(length);
+        } else if self.stray_line.is_none() {
+            // Remember the first non-Content-Length line for the framing
+            // error's quote. Legitimate blocks always carry Content-Length, so
+            // this is only ever REPORTED for a failed block — where any such
+            // line (including ones that merely look header-shaped, like a JSON
+            // fragment after a length mismatch or "Error: …") IS the evidence.
+            // Real spare headers (Content-Type) on healthy frames are ignored.
+            let overflowed = trimmed.len() > STRAY_LINE_MAX_QUOTE_BYTES;
+            let head = &trimmed[..trimmed.len().min(STRAY_LINE_MAX_QUOTE_BYTES)];
+            self.stray_line = Some(render_capped_line(head, overflowed));
+        }
+        Ok(())
+    }
+
+    fn missing_length(&self) -> io::Error {
+        match &self.stray_line {
             Some(stray) => io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("missing Content-Length header (stray stdout line: {stray:?})"),
             ),
             None => io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header"),
-        })?;
+        }
+    }
 
-        // Read exact body bytes. Name a mid-body EOF like the header-side
-        // classifications (tokio's generic "early eof" otherwise breaks the
-        // uniform crash-triage reading this reader's errors now have).
-        let mut body = vec![0u8; content_length];
-        self.stdout.read_exact(&mut body).await.map_err(|e| {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "downstream closed stdout mid-body (truncated frame)",
-                )
-            } else {
-                e
+    /// The body buffer and how much it still owes, when the remainder is big
+    /// enough to be worth reading straight from the source instead of staging
+    /// through the `BufReader`.
+    ///
+    /// `buffer_drained` must be the caller's `BufReader` state: bypassing it
+    /// while it still holds bytes would read past them and reorder the stream.
+    fn large_body_remainder(&mut self, buffer_drained: bool) -> Option<LargeBodyRead<'_>> {
+        if !buffer_drained {
+            return None;
+        }
+        let length = self.content_length?;
+        let body = self.body.as_mut()?;
+        let remaining = length - body.len();
+        // Below one BufReader-full, staging is the cheaper path: it batches the
+        // syscall with whatever else is in flight instead of issuing its own.
+        (remaining >= BUF_READER_CAPACITY).then_some(LargeBodyRead {
+            remaining: remaining as u64,
+            buf: body,
+        })
+    }
+
+    /// The finished body, if the frame is complete. Resets for the next frame.
+    fn take_completed_frame(&mut self) -> Option<Vec<u8>> {
+        let length = self.content_length?;
+        if self.body.as_ref()?.len() < length {
+            return None;
+        }
+        let body = self.body.take();
+        *self = Self::default();
+        body
+    }
+
+    /// Classify a downstream EOF by how far into the frame we were. Name a
+    /// mid-frame EOF distinctly: the uniform crash triage reading these errors
+    /// depends on telling a truncated frame from a clean close and from a
+    /// genuine framing desync.
+    fn eof_error(&self) -> io::Error {
+        let reason = if self.body.is_some() {
+            "downstream closed stdout mid-body (truncated frame)"
+        } else if self.started {
+            "downstream closed stdout mid-headers (truncated frame)"
+        } else {
+            "downstream closed stdout (EOF)"
+        };
+        io::Error::new(io::ErrorKind::UnexpectedEof, reason)
+    }
+}
+
+impl<R: AsyncRead + Unpin> BridgeReader<R> {
+    /// Read the raw bytes of an LSP message body from stdout.
+    ///
+    /// Parses headers until empty line, extracts Content-Length, and returns the body bytes.
+    /// Handles multiple headers and different header orders per LSP spec.
+    ///
+    /// Cancel-safe. The only awaits are `fill_buf` and, on the large-body fast
+    /// path, `read_buf`; tokio documents both as consuming nothing when dropped.
+    /// Every byte they do take is recorded in `self.frame` before the next
+    /// await, so cancelling this future loses no input and the next call
+    /// resumes mid-frame.
+    ///
+    /// That matters because the reader task awaits this as a `tokio::select!`
+    /// branch: `read_line`/`read_exact` would discard a partly-read frame on
+    /// every competing wake-up, and the next read would resync onto a message
+    /// body and report a framing error against a perfectly well-framed stream.
+    ///
+    /// A *framing* error consumes the bytes that produced it and clears the
+    /// frame state, so a caller that keeps reading advances past the bad line
+    /// rather than re-parsing it forever. (An I/O error from the source leaves
+    /// the frame untouched — there is nothing to skip, and the source itself is
+    /// what failed.) The reader task treats any error as terminal anyway
+    /// (`actor/reader.rs`), but the parser does not depend on that.
+    async fn read_message_bytes(&mut self) -> io::Result<Vec<u8>> {
+        // Split the borrow so the buffer and the parse state can be held at once.
+        let Self { stdout, frame } = self;
+        loop {
+            if let Some(body) = frame.large_body_remainder(stdout.buffer().is_empty()) {
+                // Staging a multi-megabyte body through the 8 KiB BufReader costs
+                // an extra copy of every byte and ~8x the read() syscalls, because
+                // poll_fill_buf (unlike poll_read) has no large-read bypass. Read
+                // straight into the frame buffer instead.
+                //
+                // Still cancel-safe: read_buf is a single poll_read that appends
+                // nothing when it returns Pending, and body.len() remains the
+                // resume marker.
+                //
+                // `take` bounds the read to this frame. `Vec::with_capacity`
+                // happens to return an exact fit today, but the contract only
+                // promises *at least* the requested capacity, so a pooled or
+                // rounded-up buffer would let read_buf pull the next frame's
+                // header into this body — the exact desync this module exists to
+                // prevent. `a_large_body_with_spare_capacity_still_stops_at_the_frame_end`
+                // seeds that surplus capacity and fails if this cap is removed.
+                let read = (&mut *stdout.get_mut())
+                    .take(body.remaining)
+                    .read_buf(body.buf)
+                    .await?;
+                if read == 0 {
+                    return Err(frame.eof_error());
+                }
+                if let Some(done) = frame.take_completed_frame() {
+                    return Ok(done);
+                }
+                continue;
             }
-        })?;
 
-        Ok(body)
+            let (consumed, outcome) = {
+                let available = stdout.fill_buf().await?;
+                if available.is_empty() {
+                    return Err(frame.eof_error());
+                }
+                frame.absorb(available)
+            };
+            // Consume before propagating: the bytes are already reflected in
+            // `frame`, so leaving them buffered would make a retry re-parse them
+            // into the same error forever, against half-advanced state.
+            stdout.consume(consumed);
+            if let Err(error) = outcome {
+                *frame = FrameParseState::default();
+                return Err(error);
+            }
+
+            if let Some(body) = frame.take_completed_frame() {
+                return Ok(body);
+            }
+        }
     }
 
     /// Read and parse a JSON-RPC message from the downstream language server.
@@ -498,7 +648,7 @@ impl AsyncBridgeConnection {
     /// Read and parse a JSON-RPC message from the child process stdout.
     ///
     /// Delegates to internal `BridgeReader`.
-    /// Returns None if the reader has been taken (via split()).
+    /// Returns an error if the reader has been taken (via split()).
     #[cfg(test)]
     pub(crate) async fn read_message(&mut self) -> io::Result<serde_json::Value> {
         match &mut self.reader {
@@ -588,7 +738,7 @@ async fn drain_stderr_lines<R: tokio::io::AsyncRead + Unpin>(
             if byte == b'\n' {
                 total += 1;
                 if emitted < STDERR_LOG_MAX_LINES {
-                    emit(render_stderr_line(&line, overflowed));
+                    emit(render_capped_line(&line, overflowed));
                     emitted += 1;
                 }
                 line.clear();
@@ -604,18 +754,19 @@ async fn drain_stderr_lines<R: tokio::io::AsyncRead + Unpin>(
     if !line.is_empty() || overflowed {
         total += 1;
         if emitted < STDERR_LOG_MAX_LINES {
-            emit(render_stderr_line(&line, overflowed));
+            emit(render_capped_line(&line, overflowed));
             emitted += 1;
         }
     }
     (emitted, total)
 }
 
-/// Render one captured stderr line for the log: strip a trailing `'\r'`
-/// (CRLF), decode loss-tolerantly, and mark a byte-capped line with `'…'`
-/// (after dropping a trailing UTF-8 sequence the cap cut in half, so the
-/// truncation reads as one marker instead of U+FFFD noise).
-fn render_stderr_line(bytes: &[u8], overflowed: bool) -> String {
+/// Render one captured line of downstream output for a log or error message:
+/// strip a trailing `'\r'` (CRLF), decode loss-tolerantly, and mark a
+/// byte-capped line with `'…'` (after dropping a trailing UTF-8 sequence the
+/// cap cut in half, so the truncation reads as one marker instead of U+FFFD
+/// noise).
+fn render_capped_line(bytes: &[u8], overflowed: bool) -> String {
     let mut bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
     if overflowed {
         bytes = trim_partial_utf8_tail(bytes);
@@ -659,6 +810,7 @@ fn trim_partial_utf8_tail(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::DuplexStream;
 
     #[tokio::test]
     async fn drain_emits_lines_truncated_at_char_boundaries() {
@@ -1018,5 +1170,312 @@ mod tests {
         conn.write_message(&initialized)
             .await
             .expect("should write initialized notification");
+    }
+
+    const PROGRESS: &[u8] = br#"{"jsonrpc":"2.0","method":"$/progress"}"#;
+
+    /// A reader fed by an in-memory pipe.
+    ///
+    /// The cancellation tests below need to cancel at an exact byte offset. A
+    /// spawned producer cannot offer that: its spawn latency (measured median
+    /// 19ms) is the same order as any cancel deadline you could pick, so the
+    /// cancel lands before the header is even written and the test passes
+    /// against a broken parser. In-memory, the cancellation point is exact and
+    /// no clock is involved at all.
+    fn duplex_reader() -> (DuplexStream, BridgeReader<DuplexStream>) {
+        let (tx, rx) = tokio::io::duplex(64 * 1024);
+        (tx, BridgeReader::new(rx))
+    }
+
+    fn header_for(body: &[u8]) -> Vec<u8> {
+        format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes()
+    }
+
+    /// Poll the read exactly once and drop it — what `select!` does to a losing
+    /// branch. The frame is always incomplete here, so a read that *completes*
+    /// means the test set up the wrong cancellation point and would be proving
+    /// nothing; fail loudly instead.
+    async fn cancel_a_read<R: AsyncRead + Unpin>(reader: &mut BridgeReader<R>) {
+        tokio::select! {
+            biased;
+            _ = reader.read_message_bytes() => {
+                panic!("the frame is incomplete, so the read cannot have finished")
+            }
+            _ = std::future::ready(()) => {}
+        }
+    }
+
+    /// The reader task awaits `read_message` as one branch of a `tokio::select!`
+    /// (actor/reader.rs), so any other branch completing first drops the read
+    /// future. Dropping it between the header and its body must not lose the
+    /// header: a parser that kept progress in the future's locals resynced onto
+    /// the body and reported a framing error against a well-framed stream.
+    #[tokio::test]
+    async fn read_resumes_after_cancellation_between_header_and_body() {
+        let (mut tx, mut reader) = duplex_reader();
+        tx.write_all(&header_for(PROGRESS)).await.unwrap();
+        cancel_a_read(&mut reader).await;
+
+        tx.write_all(PROGRESS).await.unwrap();
+        drop(tx);
+        assert_eq!(reader.read_message_bytes().await.unwrap(), PROGRESS);
+    }
+
+    /// Cancelling in the middle of a header LINE must not lose the partial
+    /// line: the next read continues accumulating instead of restarting on
+    /// `gth: 39` and reporting a framing error.
+    #[tokio::test]
+    async fn read_resumes_after_cancellation_mid_header_line() {
+        let (mut tx, mut reader) = duplex_reader();
+        let header = header_for(PROGRESS);
+        let (head, tail) = header.split_at(11); // "Content-Len"
+
+        tx.write_all(head).await.unwrap();
+        cancel_a_read(&mut reader).await;
+
+        tx.write_all(tail).await.unwrap();
+        cancel_a_read(&mut reader).await;
+
+        tx.write_all(PROGRESS).await.unwrap();
+        drop(tx);
+        assert_eq!(reader.read_message_bytes().await.unwrap(), PROGRESS);
+    }
+
+    /// Cancelling PART WAY THROUGH the body: the only case that exercises the
+    /// body phase's `length - body.len()` accounting and `take_completed_frame`'s
+    /// short-body guard.
+    #[tokio::test]
+    async fn read_resumes_after_cancellation_mid_body() {
+        let (mut tx, mut reader) = duplex_reader();
+        let (head, tail) = PROGRESS.split_at(10);
+
+        tx.write_all(&header_for(PROGRESS)).await.unwrap();
+        tx.write_all(head).await.unwrap();
+        cancel_a_read(&mut reader).await;
+
+        tx.write_all(tail).await.unwrap();
+        drop(tx);
+        assert_eq!(reader.read_message_bytes().await.unwrap(), PROGRESS);
+    }
+
+    /// A chunk carrying two whole frames must yield them one at a time: the
+    /// parser must never take bytes belonging to the next frame.
+    #[tokio::test]
+    async fn two_frames_in_one_chunk_are_read_separately() {
+        let (mut tx, mut reader) = duplex_reader();
+        let first = br#"{"id":1}"#;
+        let second = br#"{"id":2}"#;
+
+        let mut chunk = header_for(first);
+        chunk.extend_from_slice(first);
+        chunk.extend_from_slice(&header_for(second));
+        chunk.extend_from_slice(second);
+        tx.write_all(&chunk).await.unwrap();
+        drop(tx);
+
+        assert_eq!(reader.read_message_bytes().await.unwrap(), first);
+        assert_eq!(reader.read_message_bytes().await.unwrap(), second);
+    }
+
+    /// `Content-Length: 0` must complete on the iteration that closes the
+    /// header block. Waiting for one more read would park the empty frame until
+    /// the NEXT message arrived — on an idle link, forever. Framed at the byte
+    /// layer because `read_message`'s JSON parse rejects an empty body, so the
+    /// framing contract is only observable here.
+    #[tokio::test]
+    async fn zero_length_body_completes_without_waiting_for_more_input() {
+        let (mut tx, mut reader) = duplex_reader();
+        tx.write_all(b"Content-Length: 0\r\n\r\n").await.unwrap();
+        // Deliberately no further writes and no EOF.
+        assert_eq!(reader.read_message_bytes().await.unwrap(), b"");
+    }
+
+    /// A body past the BufReader capacity is read straight from the source,
+    /// bypassing that buffer. The bypass must stop exactly at the frame's last
+    /// byte: `Vec::with_capacity` only promises *at least* the requested
+    /// capacity, so an unbounded read into the spare capacity would swallow the
+    /// next frame's header and desync the stream.
+    #[tokio::test]
+    async fn a_large_body_does_not_swallow_the_next_frame() {
+        let big = vec![b'x'; 100 * 1024];
+        let small = br#"{"id":2}"#;
+
+        let (mut tx, mut reader) = duplex_reader();
+        let mut stream = header_for(&big);
+        stream.extend_from_slice(&big);
+        stream.extend_from_slice(&header_for(small));
+        stream.extend_from_slice(small);
+        // The duplex buffer is smaller than this stream, so the writer has to
+        // stay live and be drained by the reads below.
+        tokio::spawn(async move {
+            tx.write_all(&stream).await.unwrap();
+        });
+
+        assert_eq!(reader.read_message_bytes().await.unwrap(), big);
+        assert_eq!(reader.read_message_bytes().await.unwrap(), small);
+    }
+
+    /// The same guarantee when the body buffer has spare capacity beyond the
+    /// frame's length.
+    ///
+    /// `Vec::with_capacity` happens to return an exact fit today, so the test
+    /// above passes even with the read's `take` cap removed. Seeding a body
+    /// with surplus capacity — what a pooled or rounded-up buffer would give —
+    /// makes the cap the only thing standing between the direct read and the
+    /// next frame's header, so this test fails if it is ever dropped.
+    #[tokio::test]
+    async fn a_large_body_with_spare_capacity_still_stops_at_the_frame_end() {
+        let big = vec![b'x'; 100 * 1024];
+        let small = br#"{"id":2}"#;
+
+        let (mut tx, mut reader) = duplex_reader();
+        // Resume as if the header had just been parsed, but hand the body a
+        // buffer four times larger than the frame.
+        reader.frame = FrameParseState {
+            content_length: Some(big.len()),
+            body: Some(Vec::with_capacity(big.len() * 4)),
+            started: true,
+            ..FrameParseState::default()
+        };
+
+        let mut stream = big.clone();
+        stream.extend_from_slice(&header_for(small));
+        stream.extend_from_slice(small);
+        tokio::spawn(async move {
+            tx.write_all(&stream).await.unwrap();
+        });
+
+        assert_eq!(reader.read_message_bytes().await.unwrap(), big);
+        assert_eq!(reader.read_message_bytes().await.unwrap(), small);
+    }
+
+    /// Which read path runs is otherwise invisible from the outside — the two
+    /// produce identical bytes, so a test that only checks the decoded frame
+    /// passes even if the direct path is never entered. Pin the predicate
+    /// itself so the large-body tests are known to exercise it.
+    #[test]
+    fn the_direct_read_path_is_chosen_only_when_it_is_safe_and_worth_it() {
+        let mut frame = FrameParseState {
+            content_length: Some(100 * 1024),
+            body: Some(Vec::new()),
+            started: true,
+            ..FrameParseState::default()
+        };
+
+        assert!(
+            frame.large_body_remainder(false).is_none(),
+            "bypassing a BufReader that still holds bytes would reorder the stream"
+        );
+
+        let remainder = frame
+            .large_body_remainder(true)
+            .expect("a fresh 100 KiB body is worth reading directly");
+        assert_eq!(remainder.remaining, 100 * 1024);
+
+        // Exactly one BufReader-full left: still direct, since reading it
+        // straight in costs the same one source read without the extra copy.
+        frame
+            .body
+            .as_mut()
+            .unwrap()
+            .resize(100 * 1024 - BUF_READER_CAPACITY, 0);
+        assert_eq!(
+            frame.large_body_remainder(true).map(|r| r.remaining),
+            Some(BUF_READER_CAPACITY as u64),
+            "the boundary itself is inclusive"
+        );
+
+        // One byte below it: staging now batches the syscall instead of
+        // issuing its own.
+        frame.body.as_mut().unwrap().push(0);
+        assert!(
+            frame.large_body_remainder(true).is_none(),
+            "a remainder below the BufReader capacity belongs on the staged path"
+        );
+
+        // A small frame never takes the direct path at all.
+        let mut small = FrameParseState {
+            content_length: Some(64),
+            body: Some(Vec::new()),
+            started: true,
+            ..FrameParseState::default()
+        };
+        assert!(small.large_body_remainder(true).is_none());
+    }
+
+    /// The large-body bypass is a second await point, so it needs the same
+    /// cancel-safety as the staged path: bytes already read stay in the frame
+    /// and the read resumes at the right offset.
+    ///
+    /// `the_direct_read_path_is_chosen_only_when_it_is_safe_and_worth_it` is
+    /// what establishes that a 100 KiB body actually goes down that path; this
+    /// test then cancels inside it.
+    #[tokio::test]
+    async fn read_resumes_after_cancellation_inside_a_large_body() {
+        let big = vec![b'y'; 100 * 1024];
+        let (mut tx, mut reader) = duplex_reader();
+
+        tx.write_all(&header_for(&big)).await.unwrap();
+        tx.write_all(&big[..32 * 1024]).await.unwrap();
+        cancel_a_read(&mut reader).await;
+
+        tokio::spawn(async move {
+            tx.write_all(&big[32 * 1024..]).await.unwrap();
+        });
+        assert_eq!(
+            reader.read_message_bytes().await.unwrap(),
+            vec![b'y'; 100 * 1024]
+        );
+    }
+
+    /// A framing error must leave the reader able to move on: the bytes that
+    /// caused it are consumed and the frame state is cleared. Otherwise the
+    /// offending line stays in the buffer and every subsequent read re-parses
+    /// it into the same error — the old parser advanced past it, so losing that
+    /// would be a regression that only shows up in a caller that retries.
+    #[tokio::test]
+    async fn a_framing_error_still_advances_past_the_offending_line() {
+        let (mut tx, mut reader) = duplex_reader();
+        tx.write_all(b"X-Not-A-Length: 1\r\n\r\n").await.unwrap();
+        tx.write_all(&header_for(PROGRESS)).await.unwrap();
+        tx.write_all(PROGRESS).await.unwrap();
+        drop(tx);
+
+        let error = reader
+            .read_message_bytes()
+            .await
+            .expect_err("a header block without Content-Length must fail");
+        assert!(error.to_string().contains("missing Content-Length header"));
+
+        assert_eq!(reader.read_message_bytes().await.unwrap(), PROGRESS);
+    }
+
+    /// Repeated cancellation must not desync the stream: the reader loop
+    /// re-enters `select!` on every iteration, so a busy connection is
+    /// cancelled over and over and the parse state must reset cleanly between
+    /// frames.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_cancellation_never_desyncs_the_stream() {
+        let (mut tx, mut reader) = duplex_reader();
+        let (head, tail) = PROGRESS.split_at(10);
+
+        for _ in 0..5 {
+            tx.write_all(&header_for(PROGRESS)).await.unwrap();
+            cancel_a_read(&mut reader).await;
+            tx.write_all(head).await.unwrap();
+            cancel_a_read(&mut reader).await;
+            tx.write_all(tail).await.unwrap();
+            // A desync parks the read forever with no EOF to end it. The paused
+            // clock auto-advances as soon as nothing else can run, so this bound
+            // costs no wall time and turns that hang into a failure.
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader.read_message_bytes(),
+            )
+            .await
+            .expect("a well-framed stream must not park the reader")
+            .unwrap();
+            assert_eq!(frame, PROGRESS);
+        }
     }
 }
