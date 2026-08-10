@@ -35,12 +35,39 @@ impl BridgeWriter {
     }
 }
 
+/// Longest stray line quoted back in a framing error.
+const STRAY_LINE_MAX_QUOTE_BYTES: usize = 300;
+
+/// How far into the current frame the parser has got.
+///
+/// This lives in `BridgeReader` rather than in `read_message_bytes`'s locals so
+/// that a *cancelled* read resumes where it stopped. The reader task awaits
+/// `read_message` as one branch of a `tokio::select!` (see
+/// `actor/reader.rs`), so every other branch that completes first — a liveness
+/// tick, a pending-count wake-up — drops the read future mid-frame. Keeping the
+/// progress here is what makes that drop harmless.
+#[derive(Default)]
+struct FrameParseState {
+    /// Header line accumulated so far, still waiting for its newline.
+    line: Vec<u8>,
+    content_length: Option<usize>,
+    /// First non-`Content-Length` header line, quoted as evidence if the block
+    /// turns out to have no `Content-Length` at all.
+    stray_line: Option<String>,
+    /// Any byte of this frame consumed, so EOF now means a truncated frame
+    /// rather than an idle downstream closing cleanly between messages.
+    started: bool,
+    /// Body bytes accumulated once the header block ended.
+    body: Option<Vec<u8>>,
+}
+
 /// Reader handle for receiving LSP messages from downstream language server.
 ///
 /// Wraps `BufReader<ChildStdout>` to provide LSP message parsing. Used by the
 /// Reader Task (ls-bridge-message-ordering) for non-blocking response routing via ResponseRouter.
 pub(crate) struct BridgeReader {
     stdout: BufReader<ChildStdout>,
+    frame: FrameParseState,
 }
 
 impl BridgeReader {
@@ -48,7 +75,112 @@ impl BridgeReader {
     pub(crate) fn new(stdout: ChildStdout) -> Self {
         Self {
             stdout: BufReader::new(stdout),
+            frame: FrameParseState::default(),
         }
+    }
+}
+
+impl FrameParseState {
+    /// Take as much of `available` as this frame can use, returning how many
+    /// bytes were consumed. Never consumes bytes belonging to the next frame.
+    fn absorb(&mut self, available: &[u8]) -> io::Result<usize> {
+        self.started = true;
+
+        // Body phase: take only what this frame still owes.
+        if let (Some(body), Some(length)) = (self.body.as_mut(), self.content_length) {
+            let take = (length - body.len()).min(available.len());
+            body.extend_from_slice(&available[..take]);
+            return Ok(take);
+        }
+
+        // Header phase: a line is only complete once its newline arrives, so a
+        // separator cut short at EOF stays incomplete and is reported as a
+        // truncated frame instead of a header block without Content-Length.
+        match available.iter().position(|&byte| byte == b'\n') {
+            Some(newline) => {
+                self.line.extend_from_slice(&available[..=newline]);
+                let line = std::mem::take(&mut self.line);
+                self.finish_header_line(&line)?;
+                Ok(newline + 1)
+            }
+            None => {
+                self.line.extend_from_slice(available);
+                Ok(available.len())
+            }
+        }
+    }
+
+    /// Handle one complete header line (newline included). An empty line ends
+    /// the block and opens the body.
+    fn finish_header_line(&mut self, line: &[u8]) -> io::Result<()> {
+        let mut trimmed = line;
+        while let Some(rest) = trimmed
+            .strip_suffix(b"\n")
+            .or_else(|| trimmed.strip_suffix(b"\r"))
+        {
+            trimmed = rest;
+        }
+
+        if trimmed.is_empty() {
+            let length = self.content_length.ok_or_else(|| self.missing_length())?;
+            self.body = Some(Vec::with_capacity(length));
+            return Ok(());
+        }
+
+        if let Some(value) = trimmed.strip_prefix(b"Content-Length: ") {
+            let value = std::str::from_utf8(value).ok().map(str::trim);
+            let length = value.and_then(|v| v.parse().ok()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length value")
+            })?;
+            self.content_length = Some(length);
+        } else if self.stray_line.is_none() {
+            // Remember the first non-Content-Length line for the framing
+            // error's quote. Legitimate blocks always carry Content-Length, so
+            // this is only ever REPORTED for a failed block — where any such
+            // line (including ones that merely look header-shaped, like a JSON
+            // fragment after a length mismatch or "Error: …") IS the evidence.
+            // Real spare headers (Content-Type) on healthy frames are ignored.
+            let overflowed = trimmed.len() > STRAY_LINE_MAX_QUOTE_BYTES;
+            let head = &trimmed[..trimmed.len().min(STRAY_LINE_MAX_QUOTE_BYTES)];
+            self.stray_line = Some(render_capped_line(head, overflowed));
+        }
+        Ok(())
+    }
+
+    fn missing_length(&self) -> io::Error {
+        match &self.stray_line {
+            Some(stray) => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing Content-Length header (stray stdout line: {stray:?})"),
+            ),
+            None => io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header"),
+        }
+    }
+
+    /// The finished body, if the frame is complete. Resets for the next frame.
+    fn take_completed_frame(&mut self) -> Option<Vec<u8>> {
+        let length = self.content_length?;
+        if self.body.as_ref()?.len() < length {
+            return None;
+        }
+        let body = self.body.take();
+        *self = Self::default();
+        body
+    }
+
+    /// Classify a downstream EOF by how far into the frame we were. Name a
+    /// mid-frame EOF distinctly: the uniform crash triage reading these errors
+    /// depends on telling a truncated frame from a clean close and from a
+    /// genuine framing desync.
+    fn eof_error(&self) -> io::Error {
+        let reason = if self.body.is_some() {
+            "downstream closed stdout mid-body (truncated frame)"
+        } else if self.started {
+            "downstream closed stdout mid-headers (truncated frame)"
+        } else {
+            "downstream closed stdout (EOF)"
+        };
+        io::Error::new(io::ErrorKind::UnexpectedEof, reason)
     }
 }
 
@@ -57,107 +189,33 @@ impl BridgeReader {
     ///
     /// Parses headers until empty line, extracts Content-Length, and returns the body bytes.
     /// Handles multiple headers and different header orders per LSP spec.
+    ///
+    /// Cancel-safe. Only `fill_buf` is awaited — tokio guarantees a dropped
+    /// `fill_buf` consumed nothing — and every byte taken out of the buffer is
+    /// recorded in `self.frame` before the next await. Cancelling this future
+    /// therefore loses no input, and the next call resumes mid-frame.
+    ///
+    /// That matters because the reader task awaits this as a `tokio::select!`
+    /// branch: `read_line`/`read_exact` would discard a partly-read frame on
+    /// every competing wake-up, and the next read would resync onto a message
+    /// body and report a framing error against a perfectly well-framed stream.
     async fn read_message_bytes(&mut self) -> io::Result<Vec<u8>> {
-        use tokio::io::AsyncReadExt;
-
-        let mut content_length: Option<usize> = None;
-        let mut saw_header = false;
-        // First non-LSP-header line seen this frame, kept (truncated) so the
-        // genuine framing error below can QUOTE the offending bytes — when a
-        // downstream prints an error to STDOUT (observed: basedpyright), that
-        // text is the crash reason, and the frame that trips over it is the
-        // only place it is still readable.
-        let mut stray_line: Option<String> = None;
-
-        // Read headers until empty line
+        // Split the borrow so the buffer and the parse state can be held at once.
+        let Self { stdout, frame } = self;
         loop {
-            let mut line = String::new();
-            let bytes_read = self.stdout.read_line(&mut line).await?;
-
-            // `read_line` returning 0 is EOF, which would otherwise be
-            // indistinguishable from the end-of-headers empty line and
-            // misreport a dead process as "missing Content-Length header" —
-            // sending crash triage down a protocol-desync path.
-            if bytes_read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    if saw_header {
-                        "downstream closed stdout mid-headers (truncated frame)"
-                    } else {
-                        "downstream closed stdout (EOF)"
-                    },
-                ));
-            }
-
-            // Trim CRLF/LF endings
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-
-            if trimmed.is_empty() {
-                // Only a newline-TERMINATED empty line ends the headers. A
-                // lone '\r' (or bare partial) without its '\n' can only mean
-                // the stream ended mid-separator — `read_line` returns a
-                // newline-less line exclusively at EOF — so fall through to
-                // the next read, which reports the EOF instead of letting a
-                // dying gasp masquerade as a complete (and then
-                // Content-Length-less) header block.
-                if line.ends_with('\n') {
-                    break; // Empty line = end of headers
+            let consumed = {
+                let available = stdout.fill_buf().await?;
+                if available.is_empty() {
+                    return Err(frame.eof_error());
                 }
-                saw_header = true;
-                continue;
-            }
-            saw_header = true;
+                frame.absorb(available)?
+            };
+            stdout.consume(consumed);
 
-            if let Some(value) = trimmed.strip_prefix("Content-Length: ") {
-                content_length = Some(value.trim().parse().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length value")
-                })?);
-            } else if stray_line.is_none() {
-                // Remember the first non-Content-Length line for the framing
-                // error's quote. Legitimate blocks always carry
-                // Content-Length, so this is only ever REPORTED for a failed
-                // block — where any such line (including ones that merely
-                // look header-shaped, like a JSON fragment after a length
-                // mismatch or "Error: …") IS the evidence. Real spare headers
-                // (Content-Type) on healthy frames are still ignored.
-                let mut quoted = trimmed.to_string();
-                const MAX_QUOTE: usize = 300;
-                if quoted.len() > MAX_QUOTE {
-                    let mut end = MAX_QUOTE;
-                    while !quoted.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    quoted.truncate(end);
-                    quoted.push('…');
-                }
-                stray_line = Some(quoted);
+            if let Some(body) = frame.take_completed_frame() {
+                return Ok(body);
             }
         }
-
-        let content_length = content_length.ok_or_else(|| match stray_line {
-            Some(stray) => io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("missing Content-Length header (stray stdout line: {stray:?})"),
-            ),
-            None => io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header"),
-        })?;
-
-        // Read exact body bytes. Name a mid-body EOF like the header-side
-        // classifications (tokio's generic "early eof" otherwise breaks the
-        // uniform crash-triage reading this reader's errors now have).
-        let mut body = vec![0u8; content_length];
-        self.stdout.read_exact(&mut body).await.map_err(|e| {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "downstream closed stdout mid-body (truncated frame)",
-                )
-            } else {
-                e
-            }
-        })?;
-
-        Ok(body)
     }
 
     /// Read and parse a JSON-RPC message from the downstream language server.
@@ -1021,4 +1079,72 @@ mod tests {
             .expect("should write initialized notification");
     }
 
+    /// Emit `frames` well-formed LSP frames, writing the header and the body as
+    /// separate writes with a gap between them.
+    ///
+    /// That gap is not artificial: vscode-jsonrpc's `WriteableStreamMessageWriter`
+    /// awaits the header write before writing the body, so every message has one.
+    /// Measured against basedpyright 1.39.8 under a pull-diagnostics load, a reader
+    /// landed between the two ~120 times per second.
+    fn framed_producer_with_gap(frames: usize) -> Vec<String> {
+        let body = r#"{"jsonrpc":"2.0","method":"$/progress"}"#;
+        let script = format!(
+            "for i in $(seq {frames}); do \
+               printf 'Content-Length: {len}\\r\\n\\r\\n'; sleep 0.05; printf '%s' '{body}'; \
+             done; sleep 5",
+            len = body.len(),
+        );
+        vec!["sh".to_string(), "-c".to_string(), script]
+    }
+
+    /// The reader loop awaits `read_message` as one branch of a `tokio::select!`
+    /// (actor/reader.rs), so any other branch completing first drops the read
+    /// future. If that happens after the header is consumed but before the body
+    /// arrives, a non-cancel-safe parser loses the header and resyncs onto the
+    /// body — reporting a framing error against a perfectly well-framed stream
+    /// and killing the connection.
+    #[tokio::test]
+    async fn read_message_resumes_after_cancellation_between_header_and_body() {
+        let mut conn = AsyncBridgeConnection::spawn(framed_producer_with_gap(1))
+            .await
+            .expect("spawn should succeed");
+
+        // Cancel while the parser is parked waiting for the body.
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+            _ = conn.read_message() => panic!("body cannot have arrived yet"),
+        }
+
+        let parsed = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read_message())
+            .await
+            .expect("read should not hang")
+            .expect("the stream is well framed, so the message must still parse");
+
+        assert_eq!(parsed["method"], "$/progress");
+    }
+
+    /// Repeated cancellation must not desync the stream either: the reader loop
+    /// re-enters `select!` on every iteration, so a busy connection is cancelled
+    /// over and over.
+    #[tokio::test]
+    async fn repeated_cancellation_never_desyncs_the_stream() {
+        const FRAMES: usize = 5;
+        let mut conn = AsyncBridgeConnection::spawn(framed_producer_with_gap(FRAMES))
+            .await
+            .expect("spawn should succeed");
+
+        let mut read = 0;
+        while read < FRAMES {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                result = conn.read_message() => {
+                    let parsed = result.expect("well-framed stream must keep parsing");
+                    assert_eq!(parsed["method"], "$/progress");
+                    read += 1;
+                }
+            }
+        }
+    }
 }
