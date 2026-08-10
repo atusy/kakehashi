@@ -412,9 +412,11 @@ pub struct BridgeServerConfig {
     /// `window = { showDocument = { support = false } }`) — `false` in place
     /// of an object is an invalid shape a strict server may reject.
     ///
-    /// `general.positionEncodings` is protected: kakehashi's coordinate
-    /// translation depends on it, so an override there is reverted with a
-    /// warning. Forcing `workspace.configuration` on or off is honored but
+    /// Two fields are protected and reverted with a warning:
+    /// `general.positionEncodings` (kakehashi's coordinate translation
+    /// depends on it) and `workspace.workspaceEdit.changeAnnotationSupport`
+    /// (annotated edits would lose their confirmation gate in the bridge).
+    /// Forcing `workspace.configuration` on or off is honored but
     /// warned when it contradicts kakehashi's own gate: enabled without
     /// `settings`, every configuration pull is answered null; disabled with
     /// `settings`, the server may never read them. Adding capabilities the
