@@ -109,12 +109,12 @@ use crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS;
 /// contributes at most ONE cancel per request; the forwarder contributes one
 /// per RECEIVED client cancel (it has never deduplicated repeats — a
 /// pre-existing property, not introduced by the guard), and the formatting
-/// pipeline's probe cancel is a third pre-existing source. All are
-/// idempotent per the LSP spec (a server ignores cancels for
-/// unknown/finished ids) and tiny against the 4096-deep dedicated-writer
-/// queue. Exactly-once bookkeeping needs a recently-cancelled id set that
-/// survives router-entry removal — the same machinery issue #979 needs —
-/// and lives there.
+/// pipeline's probe cancel is a third pre-existing source. So the GUARD's
+/// contribution is bounded at one; total duplicate cancel traffic is not —
+/// a client repeating cancels can keep the forwarder sending until #979's
+/// recently-cancelled set (which must survive router-entry removal) lands.
+/// All duplicates are idempotent per the LSP spec (a server ignores cancels
+/// for unknown/finished ids).
 pub(in crate::lsp::bridge) struct CancelOnDropGuard {
     handle: Option<Arc<ConnectionHandle>>,
     request_id: crate::lsp::bridge::protocol::RequestId,
@@ -491,11 +491,12 @@ impl ConnectionHandle {
     ///
     /// Deliberately does NOT check `ConnectionState`: a request that raced
     /// `begin_shutdown` (state already `Closing` when this enqueues) is
-    /// drained by the writer's 3-phase shutdown ahead of the shutdown/exit
-    /// pair, and its waiter is woken by `fail_all`/channel-close if the
-    /// process exits first — a bounded, pre-existing race. Rejecting it here
-    /// would couple every hot-path send to the state lock for a window that
-    /// graceful shutdown already handles.
+    /// either drained by the writer's shutdown pass or — if it lands after
+    /// the drain's `try_recv` saw empty — abandoned when the writer's
+    /// receiver closes, with its waiter failed during connection teardown
+    /// (`fail_all`/channel-close). A bounded, pre-existing race either way;
+    /// rejecting it here would couple every hot-path send to the state lock
+    /// for a window teardown already handles.
     pub(crate) fn send_request<P: serde::Serialize>(
         &self,
         request: JsonRpcRequest<P>,
