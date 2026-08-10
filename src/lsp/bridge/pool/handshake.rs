@@ -53,7 +53,7 @@ pub(super) async fn perform_lsp_handshake(
         // toggle Kakehashi-level gates; none of them reach this handshake).
         crate::experimental::enabled(),
         capability_override,
-    );
+    )?;
     handle
         .send_request(init_request, init_request_id)
         .map_err(|e| -> io::Error { e.into() })?;
