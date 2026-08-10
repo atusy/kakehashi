@@ -61,6 +61,15 @@ pub(crate) struct DiagnosticPullSnapshot {
     pub(crate) host_generation: u64,
 }
 
+/// Whether two configs would launch the same downstream process.
+///
+/// Compared fields are the spawn/initialize-time inputs (`cmd`, `languages`,
+/// `initializationOptions`, `clientCapabilities`, `workspaceMarkers`,
+/// `onTypeFormattingTriggers`, and the effective boolean prefs) — a change
+/// requires a relaunch. `settings` is ignored (`_`): it reaches a live server
+/// at runtime via `workspace/didChangeConfiguration`. Every field compared
+/// here MUST also be retained by `ConnectionHandle::record_launch_config` —
+/// a compared field the snapshot nulls out is a permanent mismatch.
 fn same_launch_config(
     old: &crate::config::settings::BridgeServerConfig,
     new: &crate::config::settings::BridgeServerConfig,
@@ -9226,6 +9235,40 @@ mod tests {
         assert!(
             pool.diagnostic_pull_baselines
                 .contains_key(&(unrelated, "file:///test.rs".to_string()))
+        );
+    }
+
+    /// The snapshot `record_launch_config` retains must round-trip every field
+    /// `same_launch_config` compares — a compared field the snapshot nulls out
+    /// reads back as a permanent config change, tearing the connection down on
+    /// every acquisition (issue #976's clientCapabilities was shipped that way).
+    #[tokio::test]
+    async fn recorded_client_capabilities_round_trip_through_launch_config() {
+        use serde_json::json;
+
+        let config = crate::config::settings::BridgeServerConfig {
+            client_capabilities: Some(json!({"window": {"workDoneProgress": false}})),
+            ..test_helpers::devnull_config_for_language("python")
+        };
+        let handle = test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("basedpyright"),
+        )
+        .await;
+        handle.record_launch_config(&config);
+
+        assert!(
+            handle.matches_launch_config(&config),
+            "an unchanged clientCapabilities override must not read back as a config change"
+        );
+
+        let changed = crate::config::settings::BridgeServerConfig {
+            client_capabilities: Some(json!({"window": {"workDoneProgress": true}})),
+            ..config.clone()
+        };
+        assert!(
+            !handle.matches_launch_config(&changed),
+            "a changed override must invalidate the connection (initialize-time input)"
         );
     }
 
