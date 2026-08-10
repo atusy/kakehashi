@@ -3265,6 +3265,7 @@ impl LanguageServerPool {
         // - If this function's caller is cancelled, only the JoinHandle await is dropped
         // - The spawned handshake task continues to completion
         let init_options = server_config.initialization_options.clone();
+        let capability_override = server_config.client_capabilities.clone();
         let client_capabilities = self.client_capabilities();
         // Only advertise `workspace.configuration` when this server actually has
         // settings to serve. Advertising it otherwise would flip an
@@ -3293,6 +3294,7 @@ impl LanguageServerPool {
                     init_folders,
                     client_capabilities,
                     advertise_configuration,
+                    capability_override,
                 ),
             )
             .await;
