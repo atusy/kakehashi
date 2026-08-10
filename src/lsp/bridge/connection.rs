@@ -1347,9 +1347,58 @@ mod tests {
         assert_eq!(reader.read_message_bytes().await.unwrap(), small);
     }
 
+    /// Which read path runs is otherwise invisible from the outside — the two
+    /// produce identical bytes, so a test that only checks the decoded frame
+    /// passes even if the direct path is never entered. Pin the predicate
+    /// itself so the large-body tests are known to exercise it.
+    #[test]
+    fn the_direct_read_path_is_chosen_only_when_it_is_safe_and_worth_it() {
+        let mut frame = FrameParseState {
+            content_length: Some(100 * 1024),
+            body: Some(Vec::new()),
+            started: true,
+            ..FrameParseState::default()
+        };
+
+        assert!(
+            frame.large_body_remainder(false).is_none(),
+            "bypassing a BufReader that still holds bytes would reorder the stream"
+        );
+
+        let remainder = frame
+            .large_body_remainder(true)
+            .expect("a fresh 100 KiB body is worth reading directly");
+        assert_eq!(remainder.remaining, 100 * 1024);
+
+        // Fill it to within a BufReader-full of the end: staging now batches the
+        // syscall instead of issuing its own.
+        frame
+            .body
+            .as_mut()
+            .unwrap()
+            .resize(100 * 1024 - BUF_READER_CAPACITY + 1, 0);
+        assert!(
+            frame.large_body_remainder(true).is_none(),
+            "a remainder below the BufReader capacity belongs on the staged path"
+        );
+
+        // A small frame never takes the direct path at all.
+        let mut small = FrameParseState {
+            content_length: Some(64),
+            body: Some(Vec::new()),
+            started: true,
+            ..FrameParseState::default()
+        };
+        assert!(small.large_body_remainder(true).is_none());
+    }
+
     /// The large-body bypass is a second await point, so it needs the same
     /// cancel-safety as the staged path: bytes already read stay in the frame
     /// and the read resumes at the right offset.
+    ///
+    /// `the_direct_read_path_is_chosen_only_when_it_is_safe_and_worth_it` is
+    /// what establishes that a 100 KiB body actually goes down that path; this
+    /// test then cancels inside it.
     #[tokio::test]
     async fn read_resumes_after_cancellation_inside_a_large_body() {
         let big = vec![b'y'; 100 * 1024];

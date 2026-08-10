@@ -3530,30 +3530,29 @@ mod tests {
         drop(writer);
     }
 
-    /// A downstream that stalls PART WAY THROUGH a frame must still be caught.
+    /// End-to-end: the real select loop must survive being cancelled mid-frame
+    /// and still route the response.
     ///
-    /// Since the framing parser became resumable, a half-read frame survives
-    /// every cancellation instead of being discarded, so the liveness timer is
-    /// the only thing left that notices this server is hung.
+    /// The unit tests in `connection.rs` pin the parser's resumption at exact
+    /// byte offsets; this one pins that the actor actually benefits. The
+    /// downstream sends a response header, pauses, then the body. Throughout
+    /// the pause the test fires `notify_liveness_start`, whose `select!` branch
+    /// wins against the read and drops the read future — the precise event that
+    /// used to discard the consumed header and resync onto the body.
     ///
-    /// The downstream answers request 1 in full and only then emits a bare
-    /// header and stalls. Waiting for that first response before arming the
-    /// timer is what keeps the test honest: it proves the reader is alive and
-    /// has consumed everything up to the dangling header, so this cannot pass
-    /// through the "server emitted nothing at all" path that
-    /// `liveness_timeout_fires_and_fails_pending_requests` already covers.
+    /// Against origin/main's parser this fails: the reader reports
+    /// `missing Content-Length header (stray stdout line: ...)` and `fail_all`s
+    /// the request instead of delivering it.
     #[tokio::test]
-    async fn liveness_timeout_fires_when_downstream_stalls_mid_frame() {
+    async fn a_response_split_across_cancellations_is_still_routed() {
         use crate::lsp::bridge::protocol::RequestId;
         use std::time::Duration;
 
-        let first = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
         let script = format!(
-            "printf 'Content-Length: {}\\r\\n\\r\\n{}'; \
-             printf 'Content-Length: 100\\r\\n\\r\\n'; \
-             sleep 30",
-            first.len(),
-            first,
+            "printf 'Content-Length: {}\\r\\n\\r\\n'; sleep 0.5; printf '%s' '{}'; sleep 5",
+            body.len(),
+            body,
         );
         let mut conn =
             AsyncBridgeConnection::spawn(vec!["sh".to_string(), "-c".to_string(), script])
@@ -3562,35 +3561,27 @@ mod tests {
 
         let (_writer, reader) = conn.split();
         let router = Arc::new(ResponseRouter::new());
-        let rx1 = router.register(RequestId::new(1)).unwrap();
-        let rx2 = router.register(RequestId::new(2)).unwrap();
+        let rx = router.register(RequestId::new(1)).unwrap();
 
-        let handle = spawn_reader_task_with_liveness(
-            reader,
-            Arc::clone(&router),
-            Some(Duration::from_millis(200)),
-        );
+        // No liveness timeout: this test is about cancellation, and a firing
+        // timer would fail the request for an unrelated reason.
+        let handle = spawn_reader_task_with_liveness(reader, Arc::clone(&router), None);
 
-        // Request 1 comes back only if the reader really is reading, which
-        // leaves it parked on the dangling header that follows.
-        tokio::time::timeout(Duration::from_secs(5), rx1)
+        // Cancel the read repeatedly across the whole gap between header and
+        // body, so the drops land after the header has been consumed.
+        for _ in 0..100 {
+            handle.notify_liveness_start(1);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(5), rx)
             .await
-            .expect("the first frame must be delivered")
+            .expect("a well-framed response must still arrive")
             .expect("channel should not be closed");
 
-        handle.notify_liveness_start(1);
-
-        let result = tokio::time::timeout(Duration::from_secs(5), rx2)
-            .await
-            .expect("liveness must fire even though a partial frame is parked")
-            .expect("channel should not be closed");
-
-        assert!(
-            result["error"]["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("liveness timeout"),
-            "Error should mention liveness timeout, got: {result}"
+        assert_eq!(
+            result["result"]["ok"], true,
+            "the response must survive being cancelled mid-frame, got: {result}"
         );
     }
 
