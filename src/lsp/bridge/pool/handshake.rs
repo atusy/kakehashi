@@ -156,10 +156,13 @@ mod tests {
         .await
         .expect("handshake must succeed with a capability override");
 
+        // Poll on the assertion target itself: breaking on an earlier
+        // substring (e.g. the method name) can observe a torn, partially
+        // flushed frame and fail on bytes that haven't landed yet.
         let mut messages = String::new();
         for _ in 0..200 {
             messages = std::fs::read_to_string(&output).unwrap_or_default();
-            if messages.contains("\"method\":\"initialize\"") {
+            if messages.contains("\"workDoneProgress\":false") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
