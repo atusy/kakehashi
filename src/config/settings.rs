@@ -487,11 +487,18 @@ impl BridgeServerConfig {
     }
 
     /// Effective in-flight request cap, resolving the inherit (`None`) case
-    /// to [`DEFAULT_MAX_CONCURRENT_REQUESTS`].
+    /// to [`DEFAULT_MAX_CONCURRENT_REQUESTS`] and clamping to the semaphore
+    /// ceiling — so two oversized configured values compare EQUAL here and a
+    /// reload between them doesn't respawn the process for nothing.
     pub(crate) fn effective_max_concurrent_requests(&self) -> usize {
+        // tokio's `Semaphore::MAX_PERMITS` (`usize::MAX >> 3`), spelled
+        // locally so the config layer doesn't import tokio; pinned equal by
+        // `max_permits_matches_tokio_semaphore`.
+        const MAX_PERMITS: usize = usize::MAX >> 3;
         self.max_concurrent_requests
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS)
+            .min(MAX_PERMITS)
     }
 
     /// Effective `enabled` state, resolving the inherit (`None`) case to the
@@ -2007,6 +2014,28 @@ mod tests {
         assert_eq!(
             servers["pyright"].max_concurrent_requests, None,
             "absent maxConcurrentRequests parses as None (inherit -> default)"
+        );
+    }
+
+    /// The local `MAX_PERMITS` mirror inside
+    /// `effective_max_concurrent_requests` must track tokio's constant, or
+    /// the clamp there and the one in `ConnectionHandle::with_state` drift.
+    #[test]
+    fn max_permits_matches_tokio_semaphore() {
+        assert_eq!(usize::MAX >> 3, tokio::sync::Semaphore::MAX_PERMITS);
+    }
+
+    /// Two oversized caps clamp to the same effective value: a reload
+    /// switching between them must not read as a launch-config change.
+    #[test]
+    fn oversized_caps_compare_equal_after_clamping() {
+        let server = |cap: usize| BridgeServerConfig {
+            max_concurrent_requests: std::num::NonZeroUsize::new(cap),
+            ..Default::default()
+        };
+        assert_eq!(
+            server(usize::MAX).effective_max_concurrent_requests(),
+            server(usize::MAX - 1).effective_max_concurrent_requests(),
         );
     }
 
