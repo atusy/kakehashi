@@ -2016,9 +2016,12 @@ mod tests {
                 "ruff": { "cmd": ["ruff", "server"], "maxConcurrentRequests": 0 }
             }
         }"#;
+        let error = serde_json::from_str::<RawWorkspaceSettings>(config_json)
+            .expect_err("zero must be rejected, not silently accepted");
+        let message = error.to_string();
         assert!(
-            serde_json::from_str::<RawWorkspaceSettings>(config_json).is_err(),
-            "zero must be rejected, not silently accepted"
+            message.contains("nonzero"),
+            "the user-facing error must say WHY the value is invalid: {message}"
         );
     }
 

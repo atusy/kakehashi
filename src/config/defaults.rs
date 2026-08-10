@@ -539,6 +539,25 @@ mod tests {
         );
     }
 
+    /// Template ↔ runtime sync for the request-slot cap (#974): the `_`
+    /// wildcard the template emits must carry exactly the value
+    /// `effective_max_concurrent_requests()` falls back to, or the generated
+    /// config would document a different default than the one that runs.
+    #[test]
+    fn default_settings_documents_max_concurrent_requests_default() {
+        let settings = default_settings();
+        let servers = settings
+            .language_servers
+            .as_ref()
+            .expect("should have languageServers");
+        let wildcard = servers.get(WILDCARD_KEY).expect("should have '_' entry");
+        assert_eq!(
+            wildcard.max_concurrent_requests,
+            std::num::NonZeroUsize::new(crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS),
+            "the template documents the built-in in-flight request cap"
+        );
+    }
+
     #[test]
     fn default_capture_mappings_contains_variable_mapping() {
         let mappings = default_capture_mappings();
