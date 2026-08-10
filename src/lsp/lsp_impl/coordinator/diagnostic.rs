@@ -191,127 +191,178 @@ impl DiagnosticSnapshotPreparer {
         // aggregation configs below. A layer gated off still yields a
         // snapshot (with that layer absent) so that publishing an empty list
         // clears anything a previously-enabled configuration left behind.
-        let settings = self.settings_manager.load_settings();
+        // One ArcSwap load supplies BOTH the settings and their generation,
+        // so the lineage's generation always names exactly the snapshot this
+        // surface was resolved from (see `SettingsSnapshot::generation`).
+        let settings_pair = self.settings_manager.load_settings_pair();
+        let settings_generation = settings_pair.generation;
+        let settings = std::sync::Arc::clone(&settings_pair.settings);
         let layer_cfg = crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
             &settings,
             &language_name,
             "textDocument/publishDiagnostics",
         );
 
+        // Whether this snapshot's pull surface is (possibly) narrower than the
+        // editor's own re-pull surface (see
+        // `DiagnosticSnapshot::narrower_than_editor_pull`). Everything here is
+        // resolved under the `textDocument/publishDiagnostics` method key,
+        // while the editor's pull resolves under `textDocument/diagnostic` —
+        // two independent per-method config keys. The forwarded-refresh
+        // absorption may only trust this snapshot's coverage when the two
+        // resolutions agree, so ANY divergence sets the flag (a divergence
+        // where the editor's surface is the narrower one over-nudges — the
+        // safe direction). The `pullFallback` drop below is the one narrowing
+        // that exists even with identical resolutions (the editor's pull never
+        // honors it).
+        let editor_layer_cfg =
+            crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+                &settings,
+                &language_name,
+                "textDocument/diagnostic",
+            );
+        let mut narrower_than_editor_pull = layer_cfg.priorities != editor_layer_cfg.priorities
+            || layer_cfg.strategy != editor_layer_cfg.strategy;
+
         // Virt layer: `None` = the document can never have virt diagnostics
         // (no injection query), distinct from `Some(vec![])` = gated off or
         // currently no regions (publish-empty-to-clear).
-        let virt_contexts: Option<Vec<DocumentRequestContext>> =
-            if !layer_cfg.allows(crate::config::settings::LayerSource::Virt) {
-                log::debug!(
-                    target: LOG_TARGET,
-                    "virt layer disabled for {} via layers.aggregation priorities",
-                    language_name
-                );
-                Some(Vec::new())
-            } else {
-                self.language
-                    .injection_query(&language_name)
-                    .map(|injection_query| {
-                        // Prefer the populate pass's regions riding the current
-                        // parse snapshot (never discover twice, ADR §3); fall
-                        // back to the inline resolution when absent/stale.
-                        let all_regions = match self
-                            .documents
-                            .current_resolved_regions(uri, self.cache.semantic_token_generation())
-                        {
-                            Some(regions) => regions,
-                            None => std::sync::Arc::new(InjectionResolver::resolve_all(
-                                &self.language,
-                                self.bridge.node_tracker(),
-                                uri,
-                                snapshot.tree(),
-                                snapshot.text(),
-                                injection_query.as_ref(),
-                                snapshot.incarnation(),
-                            )),
-                        };
+        let virt_contexts: Option<Vec<DocumentRequestContext>> = if !layer_cfg
+            .allows(crate::config::settings::LayerSource::Virt)
+        {
+            log::debug!(
+                target: LOG_TARGET,
+                "virt layer disabled for {} via layers.aggregation priorities",
+                language_name
+            );
+            Some(Vec::new())
+        } else {
+            self.language
+                .injection_query(&language_name)
+                .map(|injection_query| {
+                    // Prefer the populate pass's regions riding the current
+                    // parse snapshot (never discover twice, ADR §3); fall
+                    // back to the inline resolution when absent/stale.
+                    let all_regions = match self
+                        .documents
+                        .current_resolved_regions(uri, self.cache.semantic_token_generation())
+                    {
+                        Some(regions) => regions,
+                        None => std::sync::Arc::new(InjectionResolver::resolve_all(
+                            &self.language,
+                            self.bridge.node_tracker(),
+                            uri,
+                            snapshot.tree(),
+                            snapshot.text(),
+                            injection_query.as_ref(),
+                            snapshot.incarnation(),
+                        )),
+                    };
 
-                        let mut contexts = Vec::new();
-                        // Configs + aggregation are keyed by injection language, so
-                        // resolve them once per distinct language (a document can
-                        // hold many regions of one language). `None` caches a skipped
-                        // language: no configured server, OR the pull would dispatch
-                        // to none. The key is cloned only on the resolving miss, not
-                        // on every region.
-                        type ResolvedLang =
-                            Option<(Vec<ResolvedServerConfig>, ResolvedAggregationConfig)>;
-                        let mut resolved_by_lang: std::collections::HashMap<String, ResolvedLang> =
-                            std::collections::HashMap::new();
-                        for resolved in all_regions.iter() {
-                            // `get` on the common (cache-hit) path is a single lookup;
-                            // only the resolving miss touches the map again, cloning
-                            // the language key just for that insert.
-                            let entry = match resolved_by_lang.get(&resolved.injection_language) {
-                                Some(entry) => entry,
-                                None => {
-                                    let lang = &resolved.injection_language;
-                                    let computed: ResolvedLang = {
-                                        let configs = self.bridge.get_all_configs_for_language(
+                    let mut contexts = Vec::new();
+                    // Configs + aggregation are keyed by injection language, so
+                    // resolve them once per distinct language (a document can
+                    // hold many regions of one language). `None` caches a skipped
+                    // language: no configured server, OR the pull would dispatch
+                    // to none. The key is cloned only on the resolving miss, not
+                    // on every region.
+                    type ResolvedLang =
+                        Option<(Vec<ResolvedServerConfig>, ResolvedAggregationConfig)>;
+                    let mut resolved_by_lang: std::collections::HashMap<String, ResolvedLang> =
+                        std::collections::HashMap::new();
+                    for resolved in all_regions.iter() {
+                        // `get` on the common (cache-hit) path is a single lookup;
+                        // only the resolving miss touches the map again, cloning
+                        // the language key just for that insert.
+                        let entry = match resolved_by_lang.get(&resolved.injection_language) {
+                            Some(entry) => entry,
+                            None => {
+                                let lang = &resolved.injection_language;
+                                let computed: ResolvedLang = {
+                                    let configs = self.bridge.get_all_configs_for_language(
+                                        &settings,
+                                        &language_name,
+                                        lang,
+                                    );
+                                    if configs.is_empty() {
+                                        None
+                                    } else {
+                                        let agg = resolve_aggregation_config_from_settings(
                                             &settings,
                                             &language_name,
                                             lang,
+                                            "textDocument/publishDiagnostics",
                                         );
-                                        if configs.is_empty() {
+                                        // Per-method divergence: the editor's fan-out
+                                        // for this language resolves under the
+                                        // `textDocument/diagnostic` key; if the two
+                                        // selections differ in any fan-out field, this
+                                        // snapshot cannot vouch for the editor's
+                                        // surface (e.g. a publish-only `priorities =
+                                        // []` empties only the prefetch).
+                                        let editor_agg = resolve_aggregation_config_from_settings(
+                                            &settings,
+                                            &language_name,
+                                            lang,
+                                            "textDocument/diagnostic",
+                                        );
+                                        if agg.priorities != editor_agg.priorities
+                                            || agg.strategy != editor_agg.strategy
+                                            || agg.max_fan_out != editor_agg.max_fan_out
+                                        {
+                                            narrower_than_editor_pull = true;
+                                        }
+                                        // Only keep a language the pull will actually
+                                        // dispatch (#425): drop it when `pullFallback =
+                                        // false` OR its effective server selection is
+                                        // empty (`priorities = []`, `maxFanOut = 0`, or
+                                        // names only unconfigured servers). This keeps
+                                        // the invariant "PullLayer present ⟺ a pull
+                                        // dispatched to ≥1 server", so an absent/Clear
+                                        // pull layer never falsely suppresses a
+                                        // server's spontaneous push. The push path is
+                                        // untouched — only kakehashi's pulling stops.
+                                        //
+                                        // A `pullFallback` drop narrows this snapshot
+                                        // below the editor's re-pull surface even with
+                                        // identical per-method resolutions — record it.
+                                        if !agg.pull_fallback {
+                                            narrower_than_editor_pull = true;
+                                            None
+                                        } else if !dispatches_to_any_server(
+                                            &agg.priorities,
+                                            &configs,
+                                            agg.max_fan_out,
+                                        ) {
                                             None
                                         } else {
-                                            let agg = resolve_aggregation_config_from_settings(
-                                                &settings,
-                                                &language_name,
-                                                lang,
-                                                "textDocument/publishDiagnostics",
-                                            );
-                                            // Only keep a language the pull will actually
-                                            // dispatch (#425): drop it when `pullFallback =
-                                            // false` OR its effective server selection is
-                                            // empty (`priorities = []`, `maxFanOut = 0`, or
-                                            // names only unconfigured servers). This keeps
-                                            // the invariant "PullLayer present ⟺ a pull
-                                            // dispatched to ≥1 server", so an absent/Clear
-                                            // pull layer never falsely suppresses a
-                                            // server's spontaneous push. The push path is
-                                            // untouched — only kakehashi's pulling stops.
-                                            if !agg.pull_fallback
-                                                || !dispatches_to_any_server(
-                                                    &agg.priorities,
-                                                    &configs,
-                                                    agg.max_fan_out,
-                                                )
-                                            {
-                                                None
-                                            } else {
-                                                Some((configs, agg))
-                                            }
+                                            Some((configs, agg))
                                         }
-                                    };
-                                    resolved_by_lang
-                                        .entry(resolved.injection_language.clone())
-                                        .or_insert(computed)
-                                }
-                            };
-                            let Some((configs, agg)) = entry else {
-                                continue;
-                            };
+                                    }
+                                };
+                                resolved_by_lang
+                                    .entry(resolved.injection_language.clone())
+                                    .or_insert(computed)
+                            }
+                        };
+                        let Some((configs, agg)) = entry else {
+                            continue;
+                        };
 
-                            contexts.push(DocumentRequestContext {
-                                uri: uri.clone(),
-                                resolved: resolved.clone(),
-                                configs: configs.clone(),
-                                upstream_request_id: None,
-                                priorities: agg.priorities.clone(),
-                                strategy: agg.strategy,
-                                max_fan_out: agg.max_fan_out,
-                                client_progress_token: None,
-                            });
-                        }
-                        contexts
-                    })
-            };
+                        contexts.push(DocumentRequestContext {
+                            uri: uri.clone(),
+                            resolved: resolved.clone(),
+                            configs: configs.clone(),
+                            upstream_request_id: None,
+                            priorities: agg.priorities.clone(),
+                            strategy: agg.strategy,
+                            max_fan_out: agg.max_fan_out,
+                            client_progress_token: None,
+                        });
+                    }
+                    contexts
+                })
+        };
 
         // Host layer (host-document-bridge): participates when listed in the
         // layer priorities AND opted in via bridge._self.enabled with a
@@ -346,6 +397,17 @@ impl DiagnosticSnapshotPreparer {
             let agg = lang_settings.resolve_host_aggregation("textDocument/publishDiagnostics");
             host_pull_enabled = agg.pull_fallback
                 && dispatches_to_any_server(&agg.priorities, &configs, agg.max_fan_out);
+            // Same two rules as the virt gate above: a per-method resolution
+            // divergence or a `pullFallback` drop narrows this snapshot below
+            // the editor's re-pull surface.
+            let editor_agg = lang_settings.resolve_host_aggregation("textDocument/diagnostic");
+            if agg.priorities != editor_agg.priorities
+                || agg.strategy != editor_agg.strategy
+                || agg.max_fan_out != editor_agg.max_fan_out
+                || !agg.pull_fallback
+            {
+                narrower_than_editor_pull = true;
+            }
             Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: language_name.clone(),
@@ -362,8 +424,17 @@ impl DiagnosticSnapshotPreparer {
         // configured host layer) keeps the old skip-publishing behavior. A
         // configured-but-pull-gated host still produces a snapshot so its stale
         // `PullLayer` is cleared on this event and its re-sync still runs.
+        // Exception: when the narrower flag is set, the editor's re-pull may
+        // still cover surface this snapshot cannot see (e.g. the publish-keyed
+        // layer gate hid the host layer the diagnostic key keeps), so an
+        // empty-but-flagged snapshot is returned to carry the flag to the
+        // forwarded-refresh prefetch instead of vanishing into the skip.
+        // Accepted cost under a diverging config: every open unbridgeable
+        // document of this language now yields an empty snapshot per host
+        // event / prefetch cycle — a no-op Clear plus an Unchanged republish
+        // after the first, cleaned up on close.
         let virt_contexts = match (virt_contexts, host.is_some()) {
-            (None, false) => return None,
+            (None, false) if !narrower_than_editor_pull => return None,
             (virt, _) => virt.unwrap_or_default(),
         };
 
@@ -371,9 +442,11 @@ impl DiagnosticSnapshotPreparer {
             lineage: DiagnosticSnapshotLineage {
                 incarnation: snapshot.incarnation(),
                 content_version,
+                settings_generation,
             },
             virt_contexts,
             host_pull_enabled,
+            narrower_than_editor_pull,
             host,
             layer_cfg,
         })

@@ -7,7 +7,7 @@ use std::io;
 use std::process::Stdio;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 /// Writer handle for sending LSP messages to downstream language server.
 ///
@@ -61,34 +61,101 @@ impl BridgeReader {
         use tokio::io::AsyncReadExt;
 
         let mut content_length: Option<usize> = None;
+        let mut saw_header = false;
+        // First non-LSP-header line seen this frame, kept (truncated) so the
+        // genuine framing error below can QUOTE the offending bytes — when a
+        // downstream prints an error to STDOUT (observed: basedpyright), that
+        // text is the crash reason, and the frame that trips over it is the
+        // only place it is still readable.
+        let mut stray_line: Option<String> = None;
 
         // Read headers until empty line
         loop {
             let mut line = String::new();
-            self.stdout.read_line(&mut line).await?;
+            let bytes_read = self.stdout.read_line(&mut line).await?;
+
+            // `read_line` returning 0 is EOF, which would otherwise be
+            // indistinguishable from the end-of-headers empty line and
+            // misreport a dead process as "missing Content-Length header" —
+            // sending crash triage down a protocol-desync path.
+            if bytes_read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    if saw_header {
+                        "downstream closed stdout mid-headers (truncated frame)"
+                    } else {
+                        "downstream closed stdout (EOF)"
+                    },
+                ));
+            }
 
             // Trim CRLF/LF endings
             let trimmed = line.trim_end_matches(['\r', '\n']);
 
             if trimmed.is_empty() {
-                break; // Empty line = end of headers
+                // Only a newline-TERMINATED empty line ends the headers. A
+                // lone '\r' (or bare partial) without its '\n' can only mean
+                // the stream ended mid-separator — `read_line` returns a
+                // newline-less line exclusively at EOF — so fall through to
+                // the next read, which reports the EOF instead of letting a
+                // dying gasp masquerade as a complete (and then
+                // Content-Length-less) header block.
+                if line.ends_with('\n') {
+                    break; // Empty line = end of headers
+                }
+                saw_header = true;
+                continue;
             }
+            saw_header = true;
 
             if let Some(value) = trimmed.strip_prefix("Content-Length: ") {
                 content_length = Some(value.trim().parse().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length value")
                 })?);
+            } else if stray_line.is_none() {
+                // Remember the first non-Content-Length line for the framing
+                // error's quote. Legitimate blocks always carry
+                // Content-Length, so this is only ever REPORTED for a failed
+                // block — where any such line (including ones that merely
+                // look header-shaped, like a JSON fragment after a length
+                // mismatch or "Error: …") IS the evidence. Real spare headers
+                // (Content-Type) on healthy frames are still ignored.
+                let mut quoted = trimmed.to_string();
+                const MAX_QUOTE: usize = 300;
+                if quoted.len() > MAX_QUOTE {
+                    let mut end = MAX_QUOTE;
+                    while !quoted.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    quoted.truncate(end);
+                    quoted.push('…');
+                }
+                stray_line = Some(quoted);
             }
-            // Other headers (Content-Type, etc.) are silently ignored per LSP spec
         }
 
-        let content_length = content_length.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
+        let content_length = content_length.ok_or_else(|| match stray_line {
+            Some(stray) => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing Content-Length header (stray stdout line: {stray:?})"),
+            ),
+            None => io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header"),
         })?;
 
-        // Read exact body bytes
+        // Read exact body bytes. Name a mid-body EOF like the header-side
+        // classifications (tokio's generic "early eof" otherwise breaks the
+        // uniform crash-triage reading this reader's errors now have).
         let mut body = vec![0u8; content_length];
-        self.stdout.read_exact(&mut body).await?;
+        self.stdout.read_exact(&mut body).await.map_err(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "downstream closed stdout mid-body (truncated frame)",
+                )
+            } else {
+                e
+            }
+        })?;
 
         Ok(body)
     }
@@ -111,6 +178,7 @@ pub(crate) struct AsyncBridgeConnection {
     child: Option<Child>,         // Option to support taking for split()
     writer: Option<BridgeWriter>, // Option to support taking for split()
     reader: Option<BridgeReader>, // Option to support taking for Reader Task
+    stderr: Option<ChildStderr>,  // Option to support taking for the drain task
 }
 
 /// Writer half of a split connection.
@@ -354,7 +422,11 @@ impl AsyncBridgeConnection {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Piped (not null) so a crashing downstream's dying words are
+            // observable: the pool spawns [`drain_downstream_stderr`] on it.
+            // The drain never stops reading (it only stops LOGGING past its
+            // cap), so a chatty child cannot block on a full stderr pipe.
+            .stderr(Stdio::piped())
             .spawn()?;
 
         let stdin = child
@@ -367,11 +439,20 @@ impl AsyncBridgeConnection {
             .take()
             .ok_or_else(|| io::Error::other("bridge: failed to capture stdout"))?;
 
+        let stderr = child.stderr.take();
+
         Ok(Self {
             child: Some(child),
             writer: Some(BridgeWriter { stdin }),
             reader: Some(BridgeReader::new(stdout)),
+            stderr,
         })
+    }
+
+    /// Take the child's stderr for the drain task (None after the first take,
+    /// or if capture failed at spawn).
+    pub(crate) fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.stderr.take()
     }
 
     /// Split into a `SplitConnectionWriter` (holds the child process) and a
@@ -448,9 +529,234 @@ impl Drop for AsyncBridgeConnection {
     }
 }
 
+/// Cap on stderr lines LOGGED per connection; the drain keeps reading past it
+/// (a full pipe would otherwise block the child) but stops the log noise.
+const STDERR_LOG_MAX_LINES: usize = 500;
+/// Cap on a single logged stderr line's bytes (truncated at a char boundary).
+const STDERR_LOG_MAX_LINE_BYTES: usize = 2000;
+
+/// Forward a downstream process's stderr into kakehashi's log, bounded (see
+/// the constants above). This is the crash-triage channel: a downstream that
+/// dies (e.g. a node heap OOM) writes its reason here, which `Stdio::null()`
+/// used to discard while the reader could only report the resulting EOF.
+pub(crate) async fn drain_downstream_stderr(stderr: ChildStderr, server_name: String) {
+    let (logged, total) = drain_stderr_lines(stderr, |line| {
+        log::warn!(target: "kakehashi::bridge::stderr", "[{server_name}] {line}");
+    })
+    .await;
+    if total > logged {
+        log::warn!(
+            target: "kakehashi::bridge::stderr",
+            "[{server_name}] (suppressed {} further stderr lines)",
+            total - logged
+        );
+    }
+}
+
+/// The testable core of [`drain_downstream_stderr`]: read fixed-size byte
+/// chunks until EOF, emit at most [`STDERR_LOG_MAX_LINES`] lines (each capped
+/// at [`STDERR_LOG_MAX_LINE_BYTES`] buffered bytes, decoded loss-tolerantly),
+/// keep DRAINING past both caps, and return `(emitted, total)` line counts.
+///
+/// Deliberately NOT `BufReader::lines()`: that buffers a complete line before
+/// any cap applies (a newline-free stream allocates without bound) and errors
+/// out on invalid UTF-8 — and a drain that stops reading lets the child's
+/// stderr pipe fill up and block it. Stderr is arbitrary bytes, not UTF-8.
+async fn drain_stderr_lines<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    mut emit: impl FnMut(String),
+) -> (usize, usize) {
+    use tokio::io::AsyncReadExt;
+
+    let mut chunk = [0u8; 4096];
+    // Bytes of the current line, capped: anything past the per-line cap is
+    // discarded as it streams by, never buffered.
+    let mut line: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    let mut total = 0usize;
+    let mut emitted = 0usize;
+
+    loop {
+        let n = match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            // A read error on the pipe means the child is gone; the drain's
+            // job is over.
+            Err(_) => break,
+        };
+        for &byte in &chunk[..n] {
+            if byte == b'\n' {
+                total += 1;
+                if emitted < STDERR_LOG_MAX_LINES {
+                    emit(render_stderr_line(&line, overflowed));
+                    emitted += 1;
+                }
+                line.clear();
+                overflowed = false;
+            } else if line.len() < STDERR_LOG_MAX_LINE_BYTES {
+                line.push(byte);
+            } else {
+                overflowed = true;
+            }
+        }
+    }
+    // Trailing bytes without a final newline still form a (partial) line.
+    if !line.is_empty() || overflowed {
+        total += 1;
+        if emitted < STDERR_LOG_MAX_LINES {
+            emit(render_stderr_line(&line, overflowed));
+            emitted += 1;
+        }
+    }
+    (emitted, total)
+}
+
+/// Render one captured stderr line for the log: strip a trailing `'\r'`
+/// (CRLF), decode loss-tolerantly, and mark a byte-capped line with `'…'`
+/// (after dropping a trailing UTF-8 sequence the cap cut in half, so the
+/// truncation reads as one marker instead of U+FFFD noise).
+fn render_stderr_line(bytes: &[u8], overflowed: bool) -> String {
+    let mut bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    if overflowed {
+        bytes = trim_partial_utf8_tail(bytes);
+    }
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if overflowed {
+        text.push('…');
+    }
+    text
+}
+
+/// Drop an incomplete trailing multibyte UTF-8 sequence (a leading byte whose
+/// continuation bytes are missing). Interior invalid bytes are left for the
+/// lossy decode — only a tail the byte cap visibly cut off is trimmed.
+fn trim_partial_utf8_tail(bytes: &[u8]) -> &[u8] {
+    let len = bytes.len();
+    for i in (len.saturating_sub(3)..len).rev() {
+        let byte = bytes[i];
+        if byte < 0x80 {
+            break; // ASCII tail: nothing to trim
+        }
+        if byte >= 0xC0 {
+            // Leading byte of a multibyte char at `i`.
+            let width = if byte >= 0xF0 {
+                4
+            } else if byte >= 0xE0 {
+                3
+            } else {
+                2
+            };
+            if i + width > len {
+                return &bytes[..i];
+            }
+            break; // Complete sequence: keep it
+        }
+        // Continuation byte: keep scanning backwards for its leading byte.
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn drain_emits_lines_truncated_at_char_boundaries() {
+        let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+        let long = format!("{}あ", "x".repeat(STDERR_LOG_MAX_LINE_BYTES - 1));
+        let payload = format!("first\n{long}\nlast\n");
+        tokio::io::AsyncWriteExt::write_all(&mut tx, payload.as_bytes())
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut seen = Vec::new();
+        let (emitted, total) = drain_stderr_lines(rx, |line| seen.push(line)).await;
+        assert_eq!((emitted, total), (3, 3));
+        assert_eq!(seen[0], "first");
+        assert!(seen[1].ends_with('…'), "over-long line is truncated");
+        assert!(
+            seen[1].len() <= STDERR_LOG_MAX_LINE_BYTES + '…'.len_utf8(),
+            "truncation respects the byte cap"
+        );
+        assert_eq!(seen[2], "last");
+    }
+
+    /// Invalid UTF-8 on stderr must not stop the drain: the drain is what
+    /// keeps the child's stderr pipe from filling up and blocking it, so it
+    /// must survive arbitrary bytes (a node crash dump, binary garbage) and
+    /// keep consuming to EOF. Bytes are decoded loss-tolerantly for the log.
+    #[tokio::test]
+    async fn drain_survives_invalid_utf8_and_keeps_draining() {
+        let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+        tokio::io::AsyncWriteExt::write_all(&mut tx, b"good\r\n\xFF\xFEgarbage\nafter\n")
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut seen = Vec::new();
+        let (emitted, total) = drain_stderr_lines(rx, |line| seen.push(line)).await;
+        assert_eq!((emitted, total), (3, 3), "all three lines are consumed");
+        assert_eq!(seen[0], "good", "CRLF line endings are stripped");
+        assert!(
+            seen[1].contains("garbage"),
+            "the invalid-UTF-8 line is decoded loss-tolerantly: {:?}",
+            seen[1]
+        );
+        assert_eq!(seen[2], "after", "draining continues past invalid UTF-8");
+    }
+
+    /// A newline-free stderr stream must not buffer beyond the per-line cap:
+    /// the drain reads fixed-size chunks and discards bytes past
+    /// [`STDERR_LOG_MAX_LINE_BYTES`] as they stream by, so a downstream that
+    /// spews an endless unterminated line costs bounded memory.
+    #[tokio::test]
+    async fn drain_caps_a_newline_free_line_without_buffering_it() {
+        let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            let chunk = [b'x'; 4096];
+            for _ in 0..64 {
+                tokio::io::AsyncWriteExt::write_all(&mut tx, &chunk)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut seen = Vec::new();
+        let (emitted, total) = drain_stderr_lines(rx, |line| seen.push(line)).await;
+        writer.await.unwrap();
+        assert_eq!((emitted, total), (1, 1), "one (unterminated) line");
+        assert!(
+            seen[0].ends_with('…'),
+            "the capped line is marked truncated"
+        );
+        assert!(
+            seen[0].len() <= STDERR_LOG_MAX_LINE_BYTES + '…'.len_utf8(),
+            "buffered bytes stay within the per-line cap: {}",
+            seen[0].len()
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_keeps_reading_past_the_log_cap() {
+        let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            for i in 0..(STDERR_LOG_MAX_LINES + 50) {
+                tokio::io::AsyncWriteExt::write_all(&mut tx, format!("line{i}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let (emitted, total) = drain_stderr_lines(rx, |_| {}).await;
+        writer.await.unwrap();
+        assert_eq!(emitted, STDERR_LOG_MAX_LINES);
+        assert_eq!(
+            total,
+            STDERR_LOG_MAX_LINES + 50,
+            "draining continues past the cap"
+        );
+    }
 
     #[tokio::test]
     async fn spawn_creates_child_process_with_stdio() {
@@ -491,6 +797,162 @@ mod tests {
         assert_eq!(parsed["jsonrpc"], "2.0");
         assert_eq!(parsed["id"], 1);
         assert!(parsed["result"].is_object());
+    }
+
+    /// A downstream that exits cleanly closes stdout; the reader must report
+    /// that as EOF, not as a framing error. The old message ("missing
+    /// Content-Length header") sent crash triage down the wrong path: it read
+    /// as protocol desync when the process had simply died (observed with a
+    /// basedpyright crash under load — and every clean shutdown logged the
+    /// same misleading warning).
+    #[tokio::test]
+    async fn read_message_reports_eof_when_downstream_closes_stdout() {
+        // `true` writes nothing and exits: a clean close before any message.
+        let cmd = vec!["true".to_string()];
+        let mut conn = AsyncBridgeConnection::spawn(cmd)
+            .await
+            .expect("spawn should succeed");
+
+        let err = conn
+            .read_message()
+            .await
+            .expect_err("EOF must surface as an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("closed stdout"),
+            "EOF must not masquerade as a framing error: {err}"
+        );
+    }
+
+    /// EOF in the middle of a header block is a truncated frame (the process
+    /// died mid-write) — still EOF, but named as truncation.
+    #[tokio::test]
+    async fn read_message_reports_truncated_frame_on_eof_mid_headers() {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'Content-Length: 10\\r\\n'".to_string(),
+        ];
+        let mut conn = AsyncBridgeConnection::spawn(cmd)
+            .await
+            .expect("spawn should succeed");
+
+        let err = conn
+            .read_message()
+            .await
+            .expect_err("a truncated header block must surface as an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("mid-headers"),
+            "mid-frame EOF should be named as truncation: {err}"
+        );
+    }
+
+    /// A dying gasp of a lone `\r` (a separator cut before its `\n`) must not
+    /// read as a complete empty line: that resurrects the phantom
+    /// "missing Content-Length header" on a 1-byte window of a crashing
+    /// process. Only a newline-terminated empty line ends the header block.
+    #[tokio::test]
+    async fn read_message_reports_eof_on_a_truncated_separator() {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'Content-Length: 10\\r\\n\\r'".to_string(),
+        ];
+        let mut conn = AsyncBridgeConnection::spawn(cmd)
+            .await
+            .expect("spawn should succeed");
+
+        let err = conn
+            .read_message()
+            .await
+            .expect_err("a truncated separator must surface as an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("mid-headers"),
+            "a separator cut before its newline is a truncated frame, \
+             not a framing error: {err}"
+        );
+    }
+
+    /// A process dying mid-body keeps the UnexpectedEof kind but previously
+    /// surfaced tokio's generic "early eof" — name it like the header-side
+    /// classifications so crash triage reads uniformly.
+    #[tokio::test]
+    async fn read_message_names_the_closed_stdout_on_a_truncated_body() {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'Content-Length: 100\\r\\n\\r\\nshort'".to_string(),
+        ];
+        let mut conn = AsyncBridgeConnection::spawn(cmd)
+            .await
+            .expect("spawn should succeed");
+
+        let err = conn
+            .read_message()
+            .await
+            .expect_err("a truncated body must surface as an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("mid-body"),
+            "mid-body EOF should carry the classification naming: {err}"
+        );
+    }
+
+    /// A COMPLETE header block (terminated by its empty line) that lacks
+    /// Content-Length is the one genuine framing error — the message is kept
+    /// for exactly this case.
+    #[tokio::test]
+    async fn read_message_keeps_framing_error_for_headers_without_content_length() {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'X-Whatever: 1\\r\\n\\r\\n'".to_string(),
+        ];
+        let mut conn = AsyncBridgeConnection::spawn(cmd)
+            .await
+            .expect("spawn should succeed");
+
+        let err = conn
+            .read_message()
+            .await
+            .expect_err("a header block without Content-Length must fail");
+        assert!(
+            err.to_string().contains("missing Content-Length header"),
+            "genuine framing errors keep the framing message: {err}"
+        );
+    }
+
+    /// The genuine framing error must QUOTE the stray stdout line that broke
+    /// the frame: when a downstream prints an error to STDOUT (observed:
+    /// basedpyright emitting unframed output under load), that text IS the
+    /// crash reason, and the frame that trips over it is the only place the
+    /// evidence is still readable.
+    #[tokio::test]
+    async fn read_message_quotes_the_stray_line_in_the_framing_error() {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'Error: downstream exploded\\r\\n\\r\\n'".to_string(),
+        ];
+        let mut conn = AsyncBridgeConnection::spawn(cmd)
+            .await
+            .expect("spawn should succeed");
+
+        let err = conn
+            .read_message()
+            .await
+            .expect_err("a header block without Content-Length must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing Content-Length header"),
+            "the framing classification must be kept: {msg}"
+        );
+        assert!(
+            msg.contains("Error: downstream exploded"),
+            "the stray stdout line is the crash evidence and must be quoted: {msg}"
+        );
     }
 
     /// Integration test: Initialize lua-language-server and verify response

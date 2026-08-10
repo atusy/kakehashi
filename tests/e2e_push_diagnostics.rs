@@ -966,20 +966,93 @@ fn open_host_with_text(client: &mut LspClient, text: &str) {
 }
 
 #[test]
-fn e2e_downstream_refresh_forwarded_to_refresh_capable_client() {
-    // #521: a downstream server's own `workspace/diagnostic/refresh` request is
-    // forwarded upstream to the editor. With a refresh-capable client the bridge
-    // relays it (the `diagnostics-refresh` mock fires one on didOpen).
+fn e2e_downstream_refresh_with_unchanged_prefetch_is_absorbed() {
+    // The refresh↔pull loop breaker: a downstream `workspace/diagnostic/refresh`
+    // whose prefetch commits a pull layer IDENTICAL to the one a covering
+    // editor pull already received is absorbed instead of forwarded (the
+    // editor's re-pull would answer `unchanged`). Forwarding it
+    // unconditionally closed a feedback loop on quiescent multi-region files:
+    // nudge → editor re-pull → downstream analysis → another downstream
+    // refresh → nudge, ~1 Hz forever with zero edits. (The
+    // forward-when-something-changed guarantee (#521) stays pinned by
+    // e2e_downstream_refresh_prefetches_before_forwarding and the ack-order/
+    // failure/stale tests, whose prefetches all end in a change or a coverage
+    // gap; the never-pulled arm is pinned by
+    // e2e_downstream_refresh_forwarded_when_editor_never_pulled.)
     let (mut client, _config_dir) =
-        init_client_with_mode_caps("diagnostics-refresh", refresh_capable_caps());
+        init_client_with_mode_caps("diagnostics-refresh-settled-pulled", refresh_capable_caps());
     open_host(&mut client);
 
+    // The didOpen host-event pull commits the settled set first.
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"] == json!("mock-diagnostic-refresh-settled")
+                    })
+                })
+            },
+        )
+        .expect("precondition: the didOpen pull layer is committed and published");
+
+    // A covering editor pull delivers that set into the pull namespace and
+    // clears the un-nudged commit's pull-view lag — only then is absorption
+    // legitimate. The mock fires its refresh 300 ms after answering THIS
+    // pull, so the lag-clearing order is under the test's control.
+    let pulled = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    assert!(
+        pulled["result"]["items"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics.iter().any(|diagnostic| {
+                diagnostic["message"] == json!("mock-diagnostic-refresh-settled")
+            })),
+        "precondition: the covering pull delivers the settled set: {pulled}"
+    );
+
+    // The negative window must exceed the forwarded-refresh max-wait (1 s
+    // default: features.workspace_diagnostic_refresh.max_wait_ms) plus margin,
+    // so a wrongly-sent trailing refresh would still land inside it.
     assert!(
         client
-            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
-            .is_some(),
-        "a downstream's workspace/diagnostic/refresh must reach a refresh-capable editor (#521)"
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(1500))
+            .is_none(),
+        "a refresh whose covering prefetch changed nothing (and whose set the \
+         editor already pulled) must be absorbed, not forwarded (refresh↔pull loop)"
     );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_forwarded_when_editor_never_pulled() {
+    // Pull-view lag debt: the didOpen host-event pull commits the settled set
+    // into the cache WITHOUT any editor nudge (pull-origin commits never
+    // refresh, by design), and this editor has never pulled — so its pull
+    // namespace cannot hold that set. The refresh's prefetch then compares
+    // equal against kakehashi's OWN record, but that record is exactly the
+    // data the editor is missing: absorbing here would let the editor rot
+    // until the next edit. The debt recorded by the un-nudged commit must
+    // keep the forward alive; it is cleared only by a covering editor pull
+    // (see e2e_downstream_refresh_with_unchanged_prefetch_is_absorbed for
+    // the post-pull absorption arm).
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh-settled", refresh_capable_caps());
+    open_host(&mut client);
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect(
+            "an un-nudged pull-layer commit the editor never pulled must keep \
+             the forwarded refresh alive (pull-view lag debt)",
+        );
+    client.send_response(refresh_id, json!(null));
 
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
@@ -1062,8 +1135,14 @@ fn e2e_downstream_refresh_skips_pull_fallback_disabled_contexts() {
     );
     open_host(&mut client);
 
+    // Discrimination math for the window: the mock sleeps 1000 ms before
+    // answering any pull, so a wrongly-dispatched pull delays the refresh to
+    // ≥ 1000 ms + mock startup (~350 ms baseline observed); the skip path
+    // delivers at startup cost alone (~340-500 ms, jittering to ~900 ms under
+    // ambient load). 900 ms keeps a clean margin on both sides where the old
+    // 600 ms window flaked against the startup jitter.
     let (refresh_id, _) = client
-        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(600))
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(900))
         .expect("pullFallback=false must not delay the editor refresh with a downstream pull");
     client.send_response(refresh_id, json!(null));
     assert!(
@@ -1197,11 +1276,57 @@ fn e2e_downstream_refresh_preserves_unchanged_prefetch_results() {
     );
     open_host(&mut client);
 
-    let (refresh_id, _) = client
-        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(5))
-        .expect("the unchanged prefetch must complete before forwarding");
-    client.send_response(refresh_id, json!(null));
+    // The completion signal is the committed pull layer's publish, NOT an
+    // editor refresh: the didOpen pull and the refresh prefetch race for the
+    // first commit, and on the arm where the didOpen pull wins the prefetch's
+    // `unchanged` report is absorbed without a forward (the loop breaker) —
+    // waiting on the refresh here would flake on exactly that arm.
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(5),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"] == json!("mock-diagnostic-refresh-unchanged")
+                    })
+                })
+            },
+        )
+        .expect("the unchanged prefetch must preserve and publish the prior diagnostics");
+    // On the arm where the prefetch committed first, its change DID forward a
+    // refresh — answer it if present so shutdown is clean on both arms.
+    if let Some((refresh_id, _)) =
+        client.wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(100))
+    {
+        client.send_response(refresh_id, json!(null));
+    }
 
+    // First pull: by now the downstream baseline (resultId
+    // "refresh-prefetch-stable") is established by whichever earlier pull's
+    // FULL answer stored it, so this fan-out carries previousResultId and the
+    // mock answers `kind: unchanged`, emitting the marker. (The didOpen pull
+    // and the prefetch can BOTH land without a baseline on a racy arm — full
+    // answers only — which is why the barrier hangs off the client's own pull
+    // rather than the earlier publish.) Async + notification wait because the
+    // synchronous response helper discards notifications that arrive while it
+    // waits; this pull's response is deliberately dropped with them.
+    let _pull_id = client.send_request_async(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    client
+        .wait_for_notification_where(&["window/logMessage"], Duration::from_secs(5), |params| {
+            // Substring: the bridge prefixes the originating server's name.
+            params["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("mock-unchanged-report-answered"))
+        })
+        .expect("the pull must exercise the unchanged-report baseline reuse");
+
+    // Second pull, synchronous: its downstream fan-out resolves the unchanged
+    // report against the stored baseline again — the retention assert below
+    // therefore checks the baseline-reuse path, not an initial full answer.
     let pulled = client.send_request(
         "textDocument/diagnostic",
         json!({ "textDocument": { "uri": MD_URI } }),
@@ -1423,9 +1548,12 @@ fn e2e_downstream_refresh_gated_off_for_refresh_incapable_client() {
     // #521: the same downstream refresh must NOT be forwarded when the client did
     // not advertise `workspace.diagnostics.refreshSupport` — forwarding it would
     // leak a tower-lsp pending-request entry on a client that silently ignores it.
-    // Empty capabilities (`init_client_with_mode`) → refresh unsupported. Paired
-    // with the positive test above (same mock mode), so a "no refresh" result here
-    // is the gate working, not the mock failing to emit.
+    // Empty capabilities (`init_client_with_mode`) → refresh unsupported. Positive
+    // evidence that a refresh-capable, never-pulling client WOULD receive the
+    // forward (so "no refresh" here is the gate working, not the mock failing to
+    // emit or the absorption firing) is pinned by
+    // e2e_downstream_refresh_forwarded_when_editor_never_pulled and
+    // e2e_downstream_refresh_prefetches_before_forwarding.
     let (mut client, _config_dir) = init_client_with_mode("diagnostics-refresh");
     open_host(&mut client);
 

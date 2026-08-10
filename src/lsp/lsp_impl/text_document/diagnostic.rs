@@ -131,11 +131,15 @@ impl Kakehashi {
         // no-op against the new lifetime rather than poisoning it with a stale-high
         // version (#745).
         let coverage_stamp = self.diagnostics.coverage_stamp(&uri);
+        // Captured alongside: the pull-view lag serial this pull may clear.
+        // A lag recorded after this point (mid-pull commit, or a reopened
+        // lifetime after a close raced this pull) must survive our clear.
+        let pull_view_lag_stamp = self.diagnostics.pull_view_lag_stamp(&uri);
 
         // Get the language for this document
         let Some(language_name) = self.document_language(&uri) else {
             log::debug!(target: "kakehashi::diagnostic", "No language detected");
-            self.mark_pull_covered(&uri, coverage_stamp);
+            self.mark_pull_covered(&uri, coverage_stamp, pull_view_lag_stamp, true);
             return Ok(empty_diagnostic_report());
         };
 
@@ -156,7 +160,7 @@ impl Kakehashi {
                 "no diagnostic layer enabled for {} (layers.aggregation priorities / bridge._self)",
                 language_name
             );
-            self.mark_pull_covered(&uri, coverage_stamp);
+            self.mark_pull_covered(&uri, coverage_stamp, pull_view_lag_stamp, true);
             return Ok(empty_diagnostic_report());
         }
 
@@ -172,6 +176,16 @@ impl Kakehashi {
         } else {
             None
         };
+
+        // Tee the request-failure count through an internal sink: the caller's
+        // sink (CLI diagnose) receives the total after the fan-out settles,
+        // and this handler additionally learns whether ITS OWN fan-out was
+        // clean — a failed/partial pull hands the editor an incomplete set,
+        // which must not clear the pull-view lag (the absorption would then
+        // trust a view the editor does not actually hold).
+        let external_error_sink = request_error_sink;
+        let internal_errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_error_sink: RequestErrorSink = Some(std::sync::Arc::clone(&internal_errors));
 
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
         let upstream_request_id = crate::lsp::current_upstream_id();
@@ -290,13 +304,23 @@ impl Kakehashi {
 
             // Cancellation is handled by the outer select dropping this
             // future (which drops the JoinSet, aborting region tasks).
-            crate::lsp::aggregation::region::collect_region_results_with_cancel(
-                outer_join_set,
-                None,
-                |acc, items: Vec<Diagnostic>| acc.extend(items),
-            )
-            .await
-            .unwrap_or_default()
+            // Drained inline (rather than via collect_region_results_with_cancel)
+            // so a PANICKED region task counts as a request failure: it dropped
+            // its whole region from the answer, and a partial answer must not
+            // read as clean to the pull-view lag check below.
+            let mut collected: Vec<Diagnostic> = Vec::new();
+            let mut panicked_regions = 0usize;
+            while let Some(result) = outer_join_set.join_next().await {
+                match result {
+                    Ok(items) => collected.extend(items),
+                    Err(join_err) => {
+                        log::warn!("region task panicked: {join_err}");
+                        panicked_regions += 1;
+                    }
+                }
+            }
+            count_request_errors(&request_error_sink, panicked_regions);
+            collected
         };
 
         // Host layer (host-document-bridge): the host language's own servers
@@ -350,6 +374,16 @@ impl Kakehashi {
         )
         .await;
 
+        // Settle the failure tee: hand the caller's sink (CLI diagnose) the
+        // total, and derive whether this pull's own fan-out was clean.
+        let request_failures = internal_errors.load(std::sync::atomic::Ordering::Relaxed);
+        if request_failures > 0
+            && let Some(external) = &external_error_sink
+        {
+            external.fetch_add(request_failures, std::sync::atomic::Ordering::Relaxed);
+        }
+        let pull_clean = request_failures == 0;
+
         // Degraded-answer guard (the pull-side sibling of `republish`'s
         // geometry-unknown deferral): the bounded parse wait above can lapse
         // under load, leaving `snapshot` `None` for an open document while the
@@ -363,8 +397,15 @@ impl Kakehashi {
         // client back to a full view, instead of the gap being masked until
         // the next edit. The predicate mirrors `republish`'s `needs_geometry`
         // (non-empty region slots only).
-        let degraded_virt =
-            virt_enabled && snapshot.is_none() && self.diagnostics.has_region_slots(&uri);
+        // Missing-virt evidence for a tree-less answer: cached Region push
+        // slots (mirrors `republish`'s `needs_geometry`) OR a non-empty
+        // cached PullLayer — a pull-only injected server's diagnostics live
+        // only there, and this answer's virt layer silently skipped them
+        // just the same.
+        let degraded_virt = virt_enabled
+            && snapshot.is_none()
+            && (self.diagnostics.has_region_slots(&uri)
+                || self.diagnostics.has_nonempty_pull_layer(&uri));
 
         // The editor is about to receive the current merged set: advance `served` to
         // the version captured at entry, so the refresh gate stops treating those
@@ -400,7 +441,10 @@ impl Kakehashi {
                     .request_pull_diagnostic_refresh(true);
             }
         } else {
-            self.mark_pull_covered(&uri, coverage_stamp);
+            // A failed/partial fan-out (`!pull_clean`) still advances the
+            // coverage version but clears neither the pull-view lag nor the
+            // degraded-pull debt — see `mark_pull_covered`.
+            self.mark_pull_covered(&uri, coverage_stamp, pull_view_lag_stamp, pull_clean);
         }
 
         let items = combine_layer_diagnostics(&layer_cfg, virt_items, host_items);
@@ -419,19 +463,39 @@ impl Kakehashi {
     }
 
     /// A pull answered with a covering (non-degraded) report: advance the
-    /// coverage `served` marker and clear any earlier degraded-pull debt —
-    /// every covering exit must do both, or a stale debt would later fire an
-    /// unnecessary recovery refresh. Not coverage-gated: both recovery paths
-    /// pass `forced`, so the debt is the only thing standing between a stale
-    /// entry and a refresh.
+    /// coverage `served` marker and — when the fan-out was CLEAN — clear any
+    /// earlier degraded-pull debt and the pull-view lag up to the observed
+    /// serial. A failed/partial fan-out is itself a non-covering view
+    /// (CodeRabbit, PR #972): clearing the debt there would remove the
+    /// post-parse recovery trigger, and clearing the lag would let the next
+    /// unchanged prefetch absorb the healing refresh. `mark_served` stays
+    /// unconditional (pre-existing #497 semantics: the editor did receive AN
+    /// answer for this coverage version).
     ///
-    /// Both halves are scoped to the coverage lifetime this pull observed. A
+    /// All halves are scoped to the lifetimes/serials this pull observed. A
     /// pull that started before a close+reopen may neither mark the reopened
     /// lifetime served nor clear a debt recorded within it (#745).
-    fn mark_pull_covered(&self, uri: &Url, coverage_stamp: Option<DiagnosticCoverageStamp>) {
+    fn mark_pull_covered(
+        &self,
+        uri: &Url,
+        coverage_stamp: Option<DiagnosticCoverageStamp>,
+        pull_view_lag_stamp: Option<u64>,
+        pull_clean: bool,
+    ) {
         self.diagnostics.mark_served(uri, coverage_stamp);
+        if !pull_clean {
+            return;
+        }
         self.diagnostics
             .forget_degraded_pull_from(uri, coverage_stamp);
+        // The editor now holds the merged state recorded up to this pull's
+        // entry, so the un-nudged pull-layer moves it observed are delivered —
+        // the forwarded-refresh absorption may trust the recorded set again.
+        // Serial-scoped like the stamped halves above: a lag recorded after
+        // this pull began (including by a reopened lifetime, #745's defect
+        // class) survives (see `pull_view_lag`).
+        self.diagnostics
+            .clear_pull_view_lag_up_to(uri, pull_view_lag_stamp);
     }
 
     /// pushFallback fold (Path B, #425): append push-driven servers' cached

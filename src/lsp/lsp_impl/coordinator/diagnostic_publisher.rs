@@ -76,6 +76,38 @@ impl RepublishOutcome {
     }
 }
 
+/// What a forwarded-refresh prefetch learned, folded across every open
+/// document: whether it moved any host's published set, and whether some
+/// document escaped its coverage — so the editor nudge can be dropped exactly
+/// when the prefetch indicates the editor's re-pull would answer `unchanged`
+/// (for a downstream that signals changes via refresh: a state move after the
+/// prefetch re-arrives as a new refresh generation and re-runs the cycle).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ForwardedPrefetchSummary {
+    /// Some host's merged set changed (`Changed`/`Deferred` republish): the
+    /// editor's pulled view is stale, nudge it.
+    set_changed: bool,
+    /// Some document's downstream state could not be determined — a
+    /// `pullFallback`-gated layer the editor would still pull, a failed pull
+    /// that kept the previous layer, or a commit discarded by an edit race.
+    /// Ambiguity resolves toward nudging: a spurious refresh costs one
+    /// round-trip, a suppressed one hides diagnostics until the next edit.
+    coverage_incomplete: bool,
+}
+
+impl ForwardedPrefetchSummary {
+    fn absorb(&mut self, other: Self) {
+        self.set_changed |= other.set_changed;
+        self.coverage_incomplete |= other.coverage_incomplete;
+    }
+
+    /// The forwarded refresh still needs its editor send: something changed,
+    /// or this prefetch cannot vouch that nothing did.
+    fn needs_editor_nudge(&self) -> bool {
+        self.set_changed || self.coverage_incomplete
+    }
+}
+
 /// Programmed quiet-window default used by paused-time tests. Runtime scheduling
 /// reads the top-level feature policy on each set-changing admission.
 #[cfg(test)]
@@ -176,9 +208,11 @@ impl DiagnosticPublisher {
         (snapshot, settle_window, max_wait)
     }
 
-    /// Forward the first downstream `workspace/diagnostic/refresh` immediately,
-    /// then coalesce later burst activity into at most one trailing refresh
-    /// after quiet or the max-wait deadline (#789).
+    /// Run the first downstream `workspace/diagnostic/refresh`'s cycle
+    /// immediately (prefetch, then a conditional editor forward — see
+    /// [`Self::complete_forwarded_refresh_cycle`]), then coalesce later burst
+    /// activity into at most one trailing cycle after quiet or the max-wait
+    /// deadline (#789).
     pub(crate) fn request_forwarded_diagnostic_refresh(&self) {
         if self.shutdown.is_cancelled() {
             return;
@@ -276,11 +310,61 @@ impl DiagnosticPublisher {
     }
 
     /// Complete one scheduled downstream-refresh cycle: refresh every proactive
-    /// pullFallback cache entry first, then (when supported) notify the editor.
+    /// pullFallback cache entry first, then notify the editor — but only when
+    /// the prefetch either changed something or could not stand in for the
+    /// editor's re-pull ([`ForwardedPrefetchSummary::needs_editor_nudge`]).
+    ///
+    /// The unconditional forced send this replaces closed a feedback loop on
+    /// quiescent multi-region documents: the nudged editor re-pull fans out to
+    /// every region, the downstream servers analyze and send their own
+    /// `workspace/diagnostic/refresh`, which arrived here and was forwarded
+    /// forced again — ~1 Hz forever with zero edits. An unchanged covering
+    /// prefetch indicates the editor's re-pull would answer `unchanged` (any
+    /// later downstream state move re-arrives as a new refresh generation), so
+    /// the nudge is dropped and the EDITOR leg of the loop starves. The
+    /// generation is still marked covered: the downstream activity was fully
+    /// handled (prefetched and found current), and any NEW downstream refresh
+    /// mints a new generation.
+    ///
+    /// Scope of the starvation: the prefetch leg persists — every generation
+    /// still runs the full fan-out — and a configuration whose prefetch can
+    /// never vouch (`coverage_incomplete` every cycle: a pullFallback-gated or
+    /// per-method-diverging layer, a persistently failing downstream pull, a
+    /// tree-less document that never parses) keeps the pre-absorption forward
+    /// on every downstream refresh. A consecutive-absorbed backoff is
+    /// follow-up material.
     async fn complete_forwarded_refresh_cycle(&self, generation: u64) -> bool {
-        if !self.prefetch_open_pull_fallback_diagnostics().await || self.shutdown.is_cancelled() {
+        // Cycle-level settings fence: the per-commit lineage check can pass
+        // just before a `didChangeConfiguration` stores a wider surface, so
+        // re-check across the WHOLE prefetch — any reload during it means
+        // this cycle cannot vouch for the editor's (new-config) re-pull. A
+        // reload after this fence postdates the refresh being handled; the
+        // config-apply path owns signaling its own changes.
+        let settings_generation = self.settings_manager.settings_generation();
+        let Some(summary) = self.prefetch_open_pull_fallback_diagnostics().await else {
+            return false;
+        };
+        if self.shutdown.is_cancelled() {
             return false;
         }
+        let mut summary = summary;
+        summary.coverage_incomplete |=
+            self.settings_manager.settings_generation() != settings_generation;
+        // Read the pull-view lag at DECISION time, after the prefetch
+        // joined. This read is race-free against the nudge-less writers
+        // because their marks are revision-stamped with the mutation and
+        // settled by whichever republish validates a covering revision (see
+        // `settle_pending_pull_view_lag`): the per-host republish lock
+        // serializes that settle against this cycle's own prefetch commit, so
+        // any change the prefetch's Unchanged-compare could have observed had
+        // its lag confirmed here first; a mutation landing after that compare
+        // is settled by a later republish — its change postdates the cycle
+        // and its lag is this same sweep's input next generation.
+        summary.set_changed |= self
+            .documents
+            .open_uris()
+            .iter()
+            .any(|uri| self.aggregator.has_pull_view_lag(uri));
         self.aggregator
             .mark_forwarded_refresh_prefetched(generation);
 
@@ -290,24 +374,68 @@ impl DiagnosticPublisher {
             .aggregator
             .forwarded_refresh_needs_editor_send(generation)
         {
-            if !self.request_pull_diagnostic_refresh_inner(true, false) {
+            if summary.needs_editor_nudge()
+                && !self.request_pull_diagnostic_refresh_inner(true, false)
+            {
                 return false;
             }
+            self.aggregator.mark_forwarded_refresh_covered(generation);
+        } else if summary.needs_editor_nudge()
+            && self.aggregator.forwarded_refresh_epoch_covered(generation)
+        {
+            // The epoch cover only proves ANOTHER refresh was sent after this
+            // activity — its induced re-pull can have answered before this
+            // cycle's prefetch committed, leaving the editor on the
+            // pre-commit set with no later signal owed. With a changed or
+            // lagged summary, coalesce a compensating forced nudge into the
+            // refresh single-flight (at worst one redundant re-pull answered
+            // `unchanged`); an absorbed summary keeps trusting the cover.
+            let _ = self.request_pull_diagnostic_refresh_inner(true, false);
             self.aggregator.mark_forwarded_refresh_covered(generation);
         }
         true
     }
 
-    async fn prefetch_open_pull_fallback_diagnostics(&self) -> bool {
+    /// Prefetch every open document's pullFallback cache entry. `None` means
+    /// the shutdown token aborted the prefetch; `Some` carries whether any
+    /// host's published set changed and whether some document escaped coverage
+    /// (see [`ForwardedPrefetchSummary`]).
+    async fn prefetch_open_pull_fallback_diagnostics(&self) -> Option<ForwardedPrefetchSummary> {
         let mut tasks = tokio::task::JoinSet::new();
+        let mut summary = ForwardedPrefetchSummary::default();
         for uri in self.documents.open_uris() {
             let Some(snapshot) = self.snapshot_preparer.prepare_diagnostic_snapshot(&uri) else {
+                // No snapshot conflates two very different states. A document
+                // that is gone or has no detectable language is covered: the
+                // editor's re-pull finds the same nothing. But an OPEN
+                // document whose parse snapshot is transiently absent
+                // (didChange cleared the tree, parse pending or given up,
+                // settings-reload invalidate) IS answerable by the editor's
+                // re-pull (bounded tree wait + tree-less host layer), so this
+                // prefetch cannot vouch for it — safe direction: nudge.
+                if self
+                    .documents
+                    .get(&uri)
+                    .is_some_and(|doc| doc.snapshot().is_none())
+                {
+                    summary.coverage_incomplete = true;
+                }
                 continue;
             };
             let lineage = snapshot.lineage;
+            let narrower_than_editor_pull = snapshot.narrower_than_editor_pull;
             let pool = self.bridge.pool_arc();
             let publisher = self.clone();
+            // The outstanding pull-view lag is deliberately NOT read here:
+            // the caller sweeps it at decision time, after the join, so a
+            // lag recorded while this prefetch is in flight is still seen.
             tasks.spawn(async move {
+                let mut summary = ForwardedPrefetchSummary {
+                    // A pullFallback-gated layer is pulled by the editor but
+                    // not by this prefetch — coverage is incomplete either way.
+                    coverage_incomplete: narrower_than_editor_pull,
+                    ..Default::default()
+                };
                 let errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let error_sink = Some(std::sync::Arc::clone(&errors));
                 let outcome = collect_push_diagnostics_with_error_sink(
@@ -320,11 +448,16 @@ impl DiagnosticPublisher {
                 .await;
                 if errors.load(std::sync::atomic::Ordering::Relaxed) != 0 {
                     log::warn!(target: LOG_TARGET, "Keeping the previous pull layer after refresh prefetch failed for {uri}");
-                    return;
+                    // The kept layer may lag the downstream's state.
+                    summary.coverage_incomplete = true;
+                    return summary;
                 }
-                publisher
-                    .commit_refresh_prefetch(&uri, lineage, outcome)
-                    .await;
+                summary.absorb(
+                    publisher
+                        .commit_refresh_prefetch(&uri, lineage, outcome)
+                        .await,
+                );
+                summary
             });
         }
 
@@ -334,19 +467,28 @@ impl DiagnosticPublisher {
                 _ = self.shutdown.cancelled() => {
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
-                    return false;
+                    return None;
                 }
                 result = tasks.join_next() => {
-                    if let Some(Err(error)) = result {
-                        log::warn!(target: LOG_TARGET, "Diagnostic refresh prefetch task failed: {error}");
+                    match result {
+                        Some(Ok(task_summary)) => summary.absorb(task_summary),
+                        Some(Err(error)) => {
+                            log::warn!(target: LOG_TARGET, "Diagnostic refresh prefetch task failed: {error}");
+                            // The doc's coverage state is unknown — safe direction.
+                            summary.coverage_incomplete = true;
+                        }
+                        // Unreachable: `join_next` returns `None` only on an
+                        // empty set, and the loop guard checks `!is_empty()`.
+                        None => {}
                     }
                 }
             }
         }
-        true
+        Some(summary)
     }
 
-    /// Commit a refresh prefetch only while its document inputs are current.
+    /// Commit a refresh prefetch only while its document inputs are current,
+    /// reporting what the commit means for the forwarded-refresh editor nudge.
     ///
     /// The lineage check and synchronous cache mutation share the document's
     /// edit lock with didChange/didClose/didOpen. This closes the check→commit
@@ -356,37 +498,76 @@ impl DiagnosticPublisher {
         uri: &Url,
         lineage: DiagnosticSnapshotLineage,
         outcome: PullLayerOutcome,
-    ) {
+    ) -> ForwardedPrefetchSummary {
         let edit_lock = self.documents.edit_lock(uri);
         let edit_guard = edit_lock.lock().await;
         let Some(document) = self.documents.get(uri) else {
             drop(edit_guard);
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
             log::debug!(target: LOG_TARGET, "Discarding refresh prefetch for closed {uri}");
-            return;
+            // Closed: nothing for the editor to re-pull.
+            return ForwardedPrefetchSummary::default();
         };
         let current = {
             document.incarnation() == lineage.incarnation
                 && document.content_version() == lineage.content_version
         };
         drop(document);
+        // A `didChangeConfiguration` landing mid-prefetch can widen the
+        // editor's pull surface (new server/layer/priorities) without
+        // touching the document fields — an old-surface result must not
+        // vouch for the editor's re-pull, and (unlike the lineage discard
+        // below) nothing else is guaranteed to re-pull after a pure config
+        // change, so committing the possibly-narrower result is skipped too.
+        if lineage.settings_generation != self.settings_manager.settings_generation() {
+            log::debug!(
+                target: LOG_TARGET,
+                "Discarding refresh prefetch resolved under stale settings for {uri}"
+            );
+            drop(edit_guard);
+            return ForwardedPrefetchSummary {
+                coverage_incomplete: true,
+                ..Default::default()
+            };
+        }
         if !current {
             log::debug!(target: LOG_TARGET, "Discarding stale refresh prefetch for {uri}");
-            return;
+            // An edit raced the prefetch: this result says nothing about the
+            // downstream's state for the CURRENT content — safe direction.
+            return ForwardedPrefetchSummary {
+                coverage_incomplete: true,
+                ..Default::default()
+            };
         }
 
         match outcome {
-            PullLayerOutcome::Skip => return,
+            // Unreachable from the only caller (the prefetch always passes a
+            // `Some` snapshot, and `Skip` means "no snapshot"). Kept exhaustive
+            // deliberately: Skip ⇔ nothing to pull ⇔ the editor sees the same
+            // nothing — if a future caller reaches it, "covered" is its
+            // meaning, NOT a shortcut for "don't bother nudging".
+            PullLayerOutcome::Skip => return ForwardedPrefetchSummary::default(),
             PullLayerOutcome::Clear => {
-                self.aggregator
-                    .evict_source(uri, &DiagnosticSource::PullLayer);
+                self.aggregator.evict_pull_layer_nudgeless(uri);
             }
             PullLayerOutcome::Publish(diagnostics) => {
-                self.aggregator.set_pull_layer(uri, diagnostics);
+                self.aggregator.set_pull_layer_nudgeless(uri, diagnostics);
             }
         }
+        // The revision-stamped mutations above make this commit's change
+        // convert into a lag at whichever republish validates it: the
+        // in-cycle nudge below is only a request — if the editor does not
+        // actually re-pull, the NEXT cycle's unchanged prefetch must still
+        // forward instead of absorbing forever (the lag is cleared by the
+        // covering pull).
         drop(edit_guard);
-        self.republish(uri).await;
+        // `Deferred` counts as changed: the cache moved, only the geometry
+        // re-anchor is pending — the editor's view is stale either way.
+        let set_changed = self.republish(uri).await.nudges_pull_clients();
+        ForwardedPrefetchSummary {
+            set_changed,
+            ..Default::default()
+        }
     }
 
     fn diagnostic_refresh_supported(&self) -> bool {
@@ -718,7 +899,12 @@ impl DiagnosticPublisher {
     /// (push-propagation-diagnostic-forwarding) handles generally; until then it
     /// self-heals on the next completed pull.
     pub(crate) async fn publish_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
-        self.aggregator.set_pull_layer(host, diagnostics);
+        // The nudge-less mutation stamps its pending pull-view-lag mark
+        // atomically with the cache revision it produced; whichever republish
+        // validates a covering revision settles it — Changed converts it into
+        // the lag, Unchanged drops it (see `set_pull_layer_nudgeless`). A
+        // racing didClose's forget removes the mark on either side.
+        self.aggregator.set_pull_layer_nudgeless(host, diagnostics);
         self.republish(host).await;
     }
 
@@ -740,8 +926,9 @@ impl DiagnosticPublisher {
     /// here would therefore duplicate that cycle's nudge; an incapable editor still
     /// receives the clearing `publishDiagnostics` notification from `republish`.
     pub(crate) async fn clear_pull_layer(&self, host: &Url) {
-        self.aggregator
-            .evict_source(host, &DiagnosticSource::PullLayer);
+        // Same revision-stamped mutation as `publish_pull_layer`: a cleared
+        // set the editor still displays is the worse variant of the lag.
+        self.aggregator.evict_pull_layer_nudgeless(host);
         self.republish(host).await;
     }
 
@@ -947,8 +1134,24 @@ impl DiagnosticPublisher {
                 self.schedule_stale_wire_retry(host);
                 return RepublishOutcome::Deferred;
             }
-            Some(true) => RepublishOutcome::Changed,
-            Some(false) => RepublishOutcome::Unchanged,
+            Some(true) => {
+                // A validated record settles any pending nudge-less mutation
+                // the compared revision covers — whichever republish consumes
+                // the revision (the writer's own, the stale-wire retry, a
+                // concurrent push republish) performs the settle, so no
+                // writer preemption window can lose it. Changed converts the
+                // mark into the confirmed pull-view lag…
+                self.aggregator
+                    .settle_pending_pull_view_lag(host, cache_revision, true);
+                RepublishOutcome::Changed
+            }
+            Some(false) => {
+                // …and Unchanged drops it: the covered mutation demonstrably
+                // left the merged set alone, so no nudge is owed for it.
+                self.aggregator
+                    .settle_pending_pull_view_lag(host, cache_revision, false);
+                RepublishOutcome::Unchanged
+            }
         };
         if changed == RepublishOutcome::Unchanged && !self.aggregator.wire_gate_is_dirty(host) {
             log::debug!(
@@ -1231,7 +1434,14 @@ impl DiagnosticPublisher {
     /// guard — consumes its debt on firing and the induced re-pull sees ready
     /// geometry and answers covering, so it begets at most one round; the indirect
     /// push→refresh→re-pull→downstream-re-push→here path is bounded by
-    /// `published_set_changed`, converging once the re-pushed set stabilizes.)
+    /// `published_set_changed`, converging once the re-pushed set stabilizes;
+    /// and the forwarded-refresh path — where the induced re-pull's downstream
+    /// fan-out makes servers like tsgo emit ANOTHER refresh, un-bounded by any
+    /// set comparison — has its editor leg starved by
+    /// `complete_forwarded_refresh_cycle` dropping the nudge when its covering
+    /// prefetch changed nothing after a covering editor pull; the prefetch leg
+    /// persists at debounce cadence, and a config whose prefetch can never
+    /// vouch keeps the forward — see that method's scope note.)
     ///
     /// **Spawned, not awaited:** `workspace/diagnostic/refresh` is a request whose
     /// future resolves only when the editor answers, so awaiting it inline would
@@ -1441,8 +1651,19 @@ mod tests {
         }
     }
 
+    /// Loop-breaker: a downstream `workspace/diagnostic/refresh` whose prefetch
+    /// covered every open document and changed nothing must NOT nudge the
+    /// editor. The editor's re-pull would answer `unchanged`, and the nudge is
+    /// what closes the refresh↔pull feedback loop: pull → downstream analysis →
+    /// downstream refresh → forced nudge → pull → … at ~1 Hz on a quiescent
+    /// file. With no open documents the prefetch vacuously covers everything,
+    /// so no send may happen.
+    // Paused time: with zero open documents the whole cycle is timer-free
+    // local work, so auto-advance fires only once every task (including the
+    // absorbed cycle) has run to completion — the `== 0` assert below is
+    // therefore ordering-deterministic, not a wall-clock race.
     #[tokio::test(start_paused = true)]
-    async fn forwarded_refresh_sends_the_leading_edge_immediately() {
+    async fn forwarded_refresh_with_covering_unchanged_prefetch_sends_nothing() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         server
@@ -1457,20 +1678,744 @@ mod tests {
                 ..Default::default()
             });
         let publisher = DiagnosticPublisher::new(server);
-        let before = tokio::time::Instant::now();
 
         publisher.request_forwarded_diagnostic_refresh();
-        tokio::time::advance(std::time::Duration::ZERO).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+        let metrics = server.diagnostics.metrics_snapshot();
+        assert_eq!(metrics.refreshes_requested, 1);
+        assert_eq!(
+            metrics.refreshes_sent, 0,
+            "an unchanged covering prefetch must not nudge the editor (refresh↔pull loop)"
+        );
+    }
+
+    /// The #789 leading-edge timing pin, relocated from the deleted
+    /// unconditional-send test: when the leading cycle DOES send (here via the
+    /// pullFallback coverage gap), it must fire without waiting for the
+    /// debounce/settle timer. The whole chain (prefetch with a gated host →
+    /// Clear → republish → forced send) is timer-free local work, so under
+    /// paused time it completes within bounded yields at an unmoved clock.
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_refresh_leading_cycle_sends_before_the_settle_window() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        let mut settings = rust_settings(true);
+        let lang = settings
+            .languages
+            .get_mut("rust")
+            .expect("rust_settings defines the rust language");
+        let bridge = lang
+            .bridge
+            .as_mut()
+            .expect("rust_settings configures the _self bridge");
+        bridge
+            .get_mut(HOST_BRIDGE_KEY)
+            .expect("rust_settings configures the _self bridge")
+            .aggregation = Some(HashMap::from([(
+            "textDocument/publishDiagnostics".to_string(),
+            crate::config::settings::AggregationConfig {
+                pull_fallback: Some(false),
+                ..Default::default()
+            },
+        )]));
+        server.settings_manager.apply_settings(settings);
+
+        let uri = Url::parse("file:///test/leading_edge_host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+
+        let publisher = DiagnosticPublisher::new(server);
+        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        // Clear the seed's own pull-view lag so the timing below measures the
+        // narrower_than_editor_pull send path, like the other divergence pins.
+        server.diagnostics.clear_pull_view_lag(&uri);
+        let before = tokio::time::Instant::now();
+        publisher.request_forwarded_diagnostic_refresh();
+
+        let mut yields = 0;
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0 {
+            yields += 1;
+            assert!(
+                yields < 10_000,
+                "the leading send must complete without any timer advance"
+            );
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             tokio::time::Instant::now(),
             before,
-            "the leading send must happen without advancing to the debounce timer"
+            "the leading forced send must not wait for the settle window"
         );
+    }
+
+    /// A nudge-less writer that has mutated the cache (pending mark stamped)
+    /// but not yet reached its republish is a real, unconfirmed change the
+    /// sweep must treat conservatively as lag: absorbing past it and letting
+    /// the later republish confirm the lag nudge-lessly leaves a pull-first
+    /// editor stale until another refresh. codex fresh-session #4 finding —
+    /// the parked writer is simulated by mutating WITHOUT republishing.
+    #[tokio::test]
+    async fn pending_lag_mark_blocks_absorption_at_the_sweep() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(false));
+
+        // An open doc keeps the sweep's URI set non-empty; with host bridging
+        // off and no injection query the prefetch skips it without flags.
+        let uri = Url::parse("file:///test/pending_mark_sweep.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+
+        // The parked writer: mutation + pending mark stamped, republish not
+        // yet run (no settle, no confirmed lag).
+        server
+            .diagnostics
+            .set_pull_layer_nudgeless(&uri, vec![diag("in-flight")]);
+
+        let publisher = DiagnosticPublisher::new(server);
+        publisher.request_forwarded_diagnostic_refresh();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(
             server.diagnostics.metrics_snapshot().refreshes_sent,
             1,
-            "the first refresh after idle must not wait for the debounce window"
+            "an unsettled pending mark is an unconfirmed change the sweep must \
+             not absorb past"
+        );
+    }
+
+    /// Behavior-level pin for the mid-flight reload guards (the per-commit
+    /// lineage check and the cycle-level fence): a settings reload landing
+    /// while the prefetch is in flight must force the send, whichever guard
+    /// catches it — deleting BOTH turns this red. The doc's edit lock is the
+    /// deterministic seam: the commit blocks on it, the reload lands, then
+    /// the commit resumes and must classify itself stale.
+    #[tokio::test]
+    async fn settings_reload_during_the_prefetch_forces_the_send() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let uri = Url::parse("file:///test/reload_mid_prefetch.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+        let publisher = DiagnosticPublisher::new(server);
+        // Establish a recorded set and clear the seed's lag so nothing but
+        // the reload guards can force the send below.
+        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        server.diagnostics.clear_pull_view_lag(&uri);
+
+        // Park the commit on the edit lock, land the reload, release.
+        let edit_lock = server.documents.edit_lock(&uri);
+        let guard = edit_lock.lock().await;
+        let snapshot = server
+            .diagnostics
+            .begin_forwarded_refresh_debounce()
+            .expect("idle scheduler admits the cycle");
+        let cycle = {
+            let publisher = publisher.clone();
+            let generation = snapshot.generation;
+            tokio::spawn(
+                async move { publisher.complete_forwarded_refresh_cycle(generation).await },
+            )
+        };
+        // Let the cycle run up to the parked commit, then reload.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        server.settings_manager.apply_settings(rust_settings(true));
+        drop(guard);
+
+        assert!(cycle.await.expect("cycle task"), "the cycle must complete");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            1,
+            "a reload landing mid-prefetch means the cycle cannot vouch for the \
+             editor's (new-config) re-pull — the send must survive"
+        );
+        server.diagnostics.cancel_forwarded_refresh_debounce();
+    }
+
+    /// A prefetch whose surface was resolved under settings that changed
+    /// mid-flight cannot vouch for the editor's re-pull (the new config can
+    /// have widened the surface), and nothing re-pulls after a pure config
+    /// change — the commit must be discarded as incomplete coverage. codex
+    /// fresh-session finding.
+    #[tokio::test]
+    async fn stale_settings_prefetch_counts_as_incomplete_coverage() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let uri = Url::parse("file:///test/stale_settings_prefetch.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let (incarnation, content_version) = {
+            let doc = server.documents.get(&uri).expect("doc just inserted");
+            (doc.incarnation(), doc.content_version())
+        };
+        let lineage =
+            crate::lsp::lsp_impl::text_document::publish_diagnostic::DiagnosticSnapshotLineage {
+                incarnation,
+                content_version,
+                settings_generation: server.settings_manager.settings_generation(),
+            };
+        // The mid-flight config change: any apply bumps the generation.
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let publisher = DiagnosticPublisher::new(server);
+        let summary = publisher
+            .commit_refresh_prefetch(
+                &uri,
+                lineage,
+                PullLayerOutcome::Publish(vec![diag("old-surface")]),
+            )
+            .await;
+
+        assert!(
+            summary.coverage_incomplete,
+            "a prefetch resolved under stale settings cannot vouch for the editor's re-pull"
+        );
+        assert!(
+            !summary.set_changed,
+            "the old-surface result must not be committed as a change"
+        );
+        assert!(
+            server.diagnostics.snapshot(&uri).is_empty(),
+            "the old-surface result must not reach the cache"
+        );
+    }
+
+    /// A tree-less editor pull cannot see the virt layer at all — its answer
+    /// is missing everything a cached non-empty PullLayer holds — so it must
+    /// be treated as DEGRADED (like the cached-Region case) rather than as a
+    /// clean covering pull that clears the pull-view lag. codex fresh-session
+    /// finding: with a pull-only injected server (PullLayer, no Region push
+    /// slots), a pull landing in the parse gap answered empty, read as clean,
+    /// cleared the lag, and the next downstream refresh was absorbed while
+    /// the editor displayed the empty answer.
+    #[tokio::test]
+    async fn tree_less_pull_over_a_nonempty_pull_layer_does_not_clear_the_lag() {
+        use std::str::FromStr;
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        // Host bridging OFF: with a `_self` server configured, its failing
+        // fan-out would already count as a request error and keep the lag for
+        // the wrong reason — the hole under test is the VIRT layer being
+        // invisible to a tree-less pull while the cached PullLayer holds it.
+        server.settings_manager.apply_settings(rust_settings(false));
+
+        // Open WITHOUT parsing: the tree stays absent, like the didChange /
+        // invalidate_parse window.
+        let uri = Url::parse("file:///test/treeless_pull_layer.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        // A committed non-empty pull layer records the lag (first commit is
+        // Changed; nothing has nudged the editor).
+        let publisher = DiagnosticPublisher::new(server);
+        publisher.publish_pull_layer(&uri, vec![diag("virt")]).await;
+        assert!(
+            server.diagnostics.has_pull_view_lag(&uri),
+            "precondition: the un-nudged commit recorded the lag"
+        );
+
+        // The editor pull answers without the virt layer (no tree): it must
+        // be degraded, not a covering clean pull.
+        let lsp_uri = tower_lsp_server::ls_types::Uri::from_str(uri.as_str()).unwrap();
+        let _ = server
+            .diagnostic_impl(tower_lsp_server::ls_types::DocumentDiagnosticParams {
+                text_document: tower_lsp_server::ls_types::TextDocumentIdentifier { uri: lsp_uri },
+                identifier: None,
+                previous_result_id: None,
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await;
+
+        assert!(
+            server.diagnostics.has_pull_view_lag(&uri),
+            "a tree-less answer misses the cached PullLayer content — it must \
+             not clear the pull-view lag"
+        );
+    }
+
+    /// The epoch-cover compensation: an intervening refresh (sent after this
+    /// cycle's activity, epoch bumped) suppresses the normal send path, but
+    /// its induced re-pull can have answered before this cycle's prefetch
+    /// committed — a changed/lagged summary must coalesce a compensating
+    /// forced nudge instead of trusting the cover. Removing the compensation
+    /// branch turns the send below into silence (this test's RED).
+    #[tokio::test]
+    async fn forwarded_refresh_epoch_cover_is_compensated_when_the_prefetch_cannot_vouch() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        let mut settings = rust_settings(true);
+        let lang = settings
+            .languages
+            .get_mut("rust")
+            .expect("rust_settings defines the rust language");
+        let bridge = lang
+            .bridge
+            .as_mut()
+            .expect("rust_settings configures the _self bridge");
+        bridge
+            .get_mut(HOST_BRIDGE_KEY)
+            .expect("rust_settings configures the _self bridge")
+            .aggregation = Some(HashMap::from([(
+            "textDocument/publishDiagnostics".to_string(),
+            crate::config::settings::AggregationConfig {
+                pull_fallback: Some(false),
+                ..Default::default()
+            },
+        )]));
+        server.settings_manager.apply_settings(settings);
+
+        let uri = Url::parse("file:///test/epoch_covered_host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+        let publisher = DiagnosticPublisher::new(server);
+        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        server.diagnostics.clear_pull_view_lag(&uri);
+
+        // Register the downstream activity, then simulate the intervening
+        // refresh: a wire send AFTER the activity bumps the epoch, which is
+        // exactly the state the epoch cover suppresses.
+        let snapshot = server
+            .diagnostics
+            .begin_forwarded_refresh_debounce()
+            .expect("idle scheduler admits the cycle");
+        server.diagnostics.record_refresh_sent();
+        assert_eq!(server.diagnostics.metrics_snapshot().refreshes_sent, 1);
+
+        assert!(
+            publisher
+                .complete_forwarded_refresh_cycle(snapshot.generation)
+                .await,
+            "the cycle itself must complete"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent < 2
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            2,
+            "a changed/lagged summary under the epoch cover must coalesce the \
+             compensating forced nudge"
+        );
+        server.diagnostics.cancel_forwarded_refresh_debounce();
+    }
+
+    /// The absorption arm of the epoch cover: an unchanged covering prefetch
+    /// keeps trusting the intervening refresh — no compensating send.
+    #[tokio::test]
+    async fn forwarded_refresh_epoch_cover_is_trusted_when_the_prefetch_vouches() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let publisher = DiagnosticPublisher::new(server);
+
+        // No open documents: the prefetch vacuously covers and changes nothing.
+        let snapshot = server
+            .diagnostics
+            .begin_forwarded_refresh_debounce()
+            .expect("idle scheduler admits the cycle");
+        server.diagnostics.record_refresh_sent();
+
+        assert!(
+            publisher
+                .complete_forwarded_refresh_cycle(snapshot.generation)
+                .await
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            1,
+            "an absorbed summary must keep trusting the epoch cover"
+        );
+        server.diagnostics.cancel_forwarded_refresh_debounce();
+    }
+
+    /// An OPEN document whose parse snapshot is transiently absent (didChange
+    /// cleared the tree; parse pending or given up) must count as a coverage
+    /// gap: the editor's re-pull answers it (bounded tree wait + tree-less
+    /// host layer), so the prefetch cannot vouch for it. Review finding
+    /// (contract regression, HIGH): the skip previously counted such a
+    /// document as vacuously covered, absorbing the refresh — with
+    /// `pullFallback = false` or a settings-reload `invalidate_parse` window
+    /// there is no later signal, and the editor rots until the next edit.
+    #[tokio::test]
+    async fn forwarded_refresh_still_sends_when_an_open_document_has_no_snapshot() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        // Insert WITHOUT parsing: the document is open but has no tree, so
+        // `prepare_diagnostic_snapshot` returns `None` transiently.
+        let uri = Url::parse("file:///test/tree_pending_host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        let publisher = DiagnosticPublisher::new(server);
+        publisher.request_forwarded_diagnostic_refresh();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            1,
+            "an open document without a parse snapshot is NOT covered by the \
+             prefetch — the forced send must survive"
+        );
+    }
+
+    /// The publish wire SEAL (`layers.aggregation."textDocument/publishDiagnostics"
+    /// .priorities = []`, #685) is a documented pull-first setup whose delivery
+    /// signal IS the forwarded refresh. The seal narrows only the
+    /// publishDiagnostics-keyed prefetch surface — the editor's re-pull
+    /// resolves under `textDocument/diagnostic` and is unsealed — so the
+    /// prefetch cannot vouch and the forced send must survive. Review finding
+    /// (adversarial sweep, HIGH): absorbing here made the sealed config
+    /// permanently stale.
+    #[tokio::test]
+    async fn forwarded_refresh_still_sends_under_the_publish_seal() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_seal());
+
+        let uri = Url::parse("file:///test/sealed_host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+
+        let publisher = DiagnosticPublisher::new(server);
+        // Seed a recorded (empty) published set first: without it the cycle's
+        // very first republish compares against nothing and reports Changed,
+        // which would make this test pass without exercising the divergence
+        // flag at all (a first commit always nudges). The seed itself records
+        // a pull-view lag (it IS an un-nudged first commit) — clear it, as a
+        // covering editor pull would, so the send below can only come from
+        // the narrower_than_editor_pull flag.
+        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        server.diagnostics.clear_pull_view_lag(&uri);
+        publisher.request_forwarded_diagnostic_refresh();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            1,
+            "the seal narrows only the prefetch surface, not the editor's re-pull — \
+             the forwarded refresh is the sealed setup's delivery signal and must survive"
+        );
+    }
+
+    /// Per-method aggregation divergence: an empty server selection keyed ONLY
+    /// under `textDocument/publishDiagnostics` empties the prefetch's fan-out
+    /// while the editor's `textDocument/diagnostic` fan-out keeps its default —
+    /// the prefetch surface is narrower, so the forced send must survive.
+    #[tokio::test]
+    async fn forwarded_refresh_still_sends_when_publish_selection_diverges() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        let mut settings = rust_settings(true);
+        let lang = settings
+            .languages
+            .get_mut("rust")
+            .expect("rust_settings defines the rust language");
+        let bridge = lang
+            .bridge
+            .as_mut()
+            .expect("rust_settings configures the _self bridge");
+        bridge
+            .get_mut(HOST_BRIDGE_KEY)
+            .expect("rust_settings configures the _self bridge")
+            .aggregation = Some(HashMap::from([(
+            "textDocument/publishDiagnostics".to_string(),
+            crate::config::settings::AggregationConfig {
+                priorities: Some(Vec::new()),
+                ..Default::default()
+            },
+        )]));
+        server.settings_manager.apply_settings(settings);
+
+        let uri = Url::parse("file:///test/diverged_host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+
+        let publisher = DiagnosticPublisher::new(server);
+        // Seed a recorded set so the cycle's republish can genuinely report
+        // Unchanged, and clear the seed's own pull-view lag (see the seal
+        // test above for why both steps are load-bearing).
+        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        server.diagnostics.clear_pull_view_lag(&uri);
+        publisher.request_forwarded_diagnostic_refresh();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            1,
+            "a publishDiagnostics-only empty selection narrows the prefetch below \
+             the editor's diagnostic-keyed fan-out — the forced send must survive"
+        );
+    }
+
+    /// Safe direction: when `pullFallback = false` gates a pull-eligible layer
+    /// out of the prefetch, the prefetch canNOT stand in for the editor's
+    /// re-pull (the editor's live fan-out still pulls that layer), so the
+    /// forwarded refresh must keep its forced editor send.
+    #[tokio::test]
+    async fn forwarded_refresh_still_sends_when_pull_fallback_gates_a_layer() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        let mut settings = rust_settings(true);
+        let lang = settings
+            .languages
+            .get_mut("rust")
+            .expect("rust_settings defines the rust language");
+        let bridge = lang
+            .bridge
+            .as_mut()
+            .expect("rust_settings configures the _self bridge");
+        bridge
+            .get_mut(HOST_BRIDGE_KEY)
+            .expect("rust_settings configures the _self bridge")
+            .aggregation = Some(HashMap::from([(
+            "textDocument/publishDiagnostics".to_string(),
+            crate::config::settings::AggregationConfig {
+                pull_fallback: Some(false),
+                ..Default::default()
+            },
+        )]));
+        server.settings_manager.apply_settings(settings);
+
+        let uri = Url::parse("file:///test/narrower_than_editor_pull_host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+
+        let publisher = DiagnosticPublisher::new(server);
+        // Seed a recorded set so the send below can only come from the
+        // narrower_than_editor_pull flag — not from a first-commit Changed,
+        // and (after clearing the seed's own lag) not from pull-view lag.
+        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        server.diagnostics.clear_pull_view_lag(&uri);
+        publisher.request_forwarded_diagnostic_refresh();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            1,
+            "a pullFallback-gated layer means the prefetch did not cover the editor's \
+             re-pull surface — the forced send must survive"
         );
     }
 

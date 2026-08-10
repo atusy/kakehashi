@@ -40,6 +40,12 @@ use crate::lsp::client::check_semantic_tokens_refresh_support;
 pub(crate) struct SettingsSnapshot {
     pub(crate) raw_settings: Arc<RawWorkspaceSettings>,
     pub(crate) settings: Arc<WorkspaceSettings>,
+    /// Monotonic application count, embedded IN the snapshot so settings and
+    /// generation are read atomically from one `ArcSwap` load — a separate
+    /// counter would leave a store→increment gap in which a consumer could
+    /// pair the NEW settings' visibility question with the OLD generation
+    /// (see the diagnostic refresh prefetch's stale-settings guard).
+    pub(crate) generation: u64,
 }
 
 pub(crate) struct SettingsManager {
@@ -58,6 +64,10 @@ pub(crate) struct SettingsManager {
     /// the handshake — only the folder list does.
     folderless_root_path: OnceLock<Option<PathBuf>>,
     settings_snapshot: ArcSwap<SettingsSnapshot>,
+    /// Allocator for [`SettingsSnapshot::generation`] values. Only ever read
+    /// through the snapshot (see [`Self::settings_generation`]); the atomic
+    /// exists to mint the next value across concurrent applies.
+    settings_generation: std::sync::atomic::AtomicU64,
     /// Client capabilities from initialize() - immutable after initialization.
     /// Uses OnceLock to enforce "set once, read many" semantics per LSP protocol.
     client_capabilities: OnceLock<ClientCapabilities>,
@@ -117,7 +127,9 @@ impl SettingsManager {
             settings_snapshot: ArcSwap::new(Arc::new(SettingsSnapshot {
                 raw_settings: Arc::new(raw_settings),
                 settings: Arc::new(settings),
+                generation: 0,
             })),
+            settings_generation: std::sync::atomic::AtomicU64::new(0),
             client_capabilities: OnceLock::new(),
             root_markers_deprecation_warned: AtomicBool::new(false),
             auto_install_deprecation_warned: AtomicBool::new(false),
@@ -249,10 +261,24 @@ impl SettingsManager {
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
+        let generation = self
+            .settings_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         self.settings_snapshot.store(Arc::new(SettingsSnapshot {
             raw_settings: Arc::new(raw_settings),
             settings: Arc::new(settings),
+            generation,
         }));
+    }
+
+    /// The generation of the currently visible settings snapshot. Reading it
+    /// and the settings from the SAME `load_settings_pair` snapshot is what
+    /// gives consumers an atomic (settings, generation) view; two separate
+    /// loads can still straddle a store, which a guard must treat as a
+    /// mismatch in the safe (over-nudge) direction.
+    pub(crate) fn settings_generation(&self) -> u64 {
+        self.settings_snapshot.load().generation
     }
 
     /// Returns true only if client declared workspace.semanticTokens.refreshSupport.

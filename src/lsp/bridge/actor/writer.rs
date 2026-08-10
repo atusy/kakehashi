@@ -17,9 +17,21 @@ use super::ResponseRouter;
 
 /// Queue capacity for outbound messages per ls-bridge-message-ordering.
 ///
-/// This bounds memory usage and provides backpressure. With 256 slots and
-/// typical message sizes, this uses approximately 32KB per connection.
-pub(crate) const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+/// Sized for the region fan-out, not for typing traffic: a multi-region host
+/// document dispatches one pull per region per server in one burst (observed:
+/// 308 python regions on one markdown file), and the editor-pull and
+/// refresh-prefetch cycles can overlap, so a server can legitimately receive
+/// ~2× regions requests plus the didOpen/didChange notification burst at
+/// once. The old 256 overflowed there every cycle: `try_send` failures
+/// surfaced as "request queue full" (partial pull answers — user-visible
+/// diagnostic flicker — and a prefetch marked `coverage_incomplete`, whose
+/// forced refresh re-ran the fan-out, sustaining the overload), and dropped
+/// didOpen notifications wedged virtual documents. 4096 covers the observed
+/// burst with ~6× headroom; the queue still bounds a hung child (worst case
+/// is bounded by regions × in-flight cycles, far below the cap in steady
+/// state). A per-connection concurrency cap that would make the depth
+/// burst-independent is follow-up material.
+pub(crate) const OUTBOUND_QUEUE_CAPACITY: usize = 4096;
 
 /// Handle to a running Writer Task, managing its lifetime via RAII.
 ///

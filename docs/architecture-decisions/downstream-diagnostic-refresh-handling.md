@@ -85,11 +85,19 @@ A downstream refresh is **workspace-wide** (it names no URI), so this trigger
 re-pulls every open document with a `pullFallback`-eligible downstream, unlike
 the per-URI host-event triggers.
 
-### 3. Forward iff the editor is refresh-capable
+### 3. Forward when the editor is refresh-capable AND the prefetch cannot vouch
 
 kakehashi forwards `workspace/diagnostic/refresh` to the editor only when the
 editor advertises `workspace.diagnostics.refreshSupport`
-(`check_diagnostic_refresh_support`). The gate's solid justification is
+(`check_diagnostic_refresh_support`) — refresh capability is necessary but not
+sufficient: the completed prefetch (rule 2) must additionally have changed some
+host's published set, or been unable to cover the editor's re-pull surface
+(a `pullFallback`-gated or per-method-diverging layer, a failed pull, a
+snapshot-less open document, an edit-raced commit, or an outstanding
+pull-view lag). An unchanged, fully covering prefetch after a covering editor
+pull absorbs the forward — that absorption is what starves the refresh↔pull
+feedback loop (nudge → editor re-pull → downstream analysis → downstream
+refresh → nudge, ~1 Hz on a quiescent multi-region file). The gate's solid justification is
 leak-avoidance: a non-refresh-capable editor would silently ignore the request and
 leak a tower-lsp pending-request entry (the same hazard
 push-propagation-diagnostic-forwarding's republish guards against). Its *intended*
@@ -101,8 +109,8 @@ on it. This gate is orthogonal to rule 2's *pull*.
 Forwarding is scheduled once per upstream workspace connection, not once per
 downstream server. The first downstream refresh after idle starts a leading
 cycle immediately. Each cycle first completes the workspace-wide Path A prefetch
-and only then forwards the editor refresh, so a client pull cannot race ahead of
-kakehashi's proactive cache. Further downstream refreshes join one trailing
+and only then decides the editor forward (see rule 3's absorption above), so a
+client pull cannot race ahead of kakehashi's proactive cache. Further downstream refreshes join one trailing
 debounce cycle. Its workspace-wide timing policy is configured independently of
 languages and downstream servers:
 
@@ -139,7 +147,7 @@ keeps the default `true`. kakehashi never guesses the editor's behavior.
 
 | editor refresh-capable | `pullFallback` | forward to editor | kakehashi pull + publish | editor stays fresh via |
 | --- | --- | --- | --- | --- |
-| yes | true  | yes | yes | the push (guaranteed); plus its re-pull if it pull-tracks — downstream pulled twice |
+| yes | true  | yes, unless the covering prefetch changed nothing after a covering editor pull | yes | the push (guaranteed); plus its re-pull if it pull-tracks — downstream pulled twice on a change |
 | yes | false | yes | no  | its re-pull **iff it actually pull-tracks**; otherwise stale |
 | no  | true  | no  | yes | the push (guaranteed) |
 | no  | false | no  | no  | **nothing** — stale (config-incoherent; default `true` avoids it) |
@@ -185,8 +193,10 @@ keeps the default `true`. kakehashi never guesses the editor's behavior.
 ### Negative (accepted cost)
 
 - **Double pull in matrix row 1** (refresh-capable editor, `pullFallback = true`):
-  if the editor actually pull-tracks, the forwarded refresh causes a Path B re-pull
-  alongside kakehashi's Path A pull, so the downstream is pulled twice. This is the
+  if the editor actually pull-tracks, a forwarded refresh causes a Path B re-pull
+  alongside kakehashi's Path A pull, so the downstream is pulled twice. (The
+  absorption in rule 3 removes the Path B half on the quiescent-unchanged
+  cycles; a genuinely changed cycle still pays both.) This is the
   accepted cost of keeping the pull client-independent — Considered Option 3 (skip
   the pull when the editor can pull) would remove it but couple Path A to a client
   capability. A user who
@@ -226,8 +236,14 @@ workspace-wide scheduler snapshots every open URI with the same
 `DiagnosticSnapshotPreparer` as didOpen/didSave/didChange, runs
 `collect_push_diagnostics`, and updates the shared pull layer before continuing.
 For rule 3, each completed prefetch cycle checks
-`workspace.diagnostics.refreshSupport` and sends through the existing detached
-single-flight path. A client without refresh support still runs rule 2 but skips
-only the editor-facing request.
+`workspace.diagnostics.refreshSupport` and the cycle's
+`ForwardedPrefetchSummary` (`set_changed || coverage_incomplete`), then sends
+through the existing detached single-flight path. A client without refresh
+support still runs rule 2 but skips only the editor-facing request.
 
-There is no current implementation gap for this decision.
+There is no current implementation gap for this decision. Known residual: any
+configuration whose prefetch can never vouch (a `pullFallback`-gated layer,
+per-method config divergence such as the publish wire seal) keeps the
+pre-absorption forward on every downstream refresh, so the feedback loop those
+configs allowed before is unchanged there; a consecutive-absorbed backoff is
+follow-up material.

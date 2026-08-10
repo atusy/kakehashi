@@ -387,8 +387,9 @@ pub(crate) struct DiagnosticAggregator {
     /// refreshes (#789). Unlike [`Self::refresh_flight`], which only coalesces
     /// while the editor's acknowledgement is outstanding, this also collapses
     /// bursts when the editor answers each request immediately. The first
-    /// activity after idle sends without waiting; later activity produces a
-    /// trailing send only when no refresh from any origin has covered it.
+    /// activity after idle starts its cycle without waiting (the cycle's
+    /// prefetch may then absorb the send); later activity produces a
+    /// trailing cycle only when no refresh from any origin has covered it.
     forwarded_refresh_debounce: Mutex<ForwardedRefreshDebounce>,
     /// Per-host coverage versions for the refresh **coverage gate** (#497, commit 2).
     /// `current` bumps on every set-changing republish (the editor's pulled view is
@@ -440,6 +441,50 @@ pub(crate) struct DiagnosticAggregator {
     /// backstop would find nothing and the editor would keep a region-less
     /// answer (#745).
     degraded_pulls: Mutex<HashMap<Url, Option<u64>>>,
+    /// Hosts whose recorded merged set moved through an **editor-origin,
+    /// nudge-less** mutation (`publish_pull_layer`/`clear_pull_layer`, and
+    /// the refresh prefetch's own commit) since the last **covering** editor
+    /// pull — confirmed at the Changed republish that recorded the move (see
+    /// [`Self::set_pull_layer_nudgeless`] /
+    /// [`Self::settle_pending_pull_view_lag`]). Those writers never emit `workspace/diagnostic/refresh` (by
+    /// design — they are normally paired with the editor's own event-driven
+    /// pull), but that pairing is a race: the editor's pull can answer with
+    /// the downstream's PRE-analysis state while the slower synthetic pull
+    /// commits the post-analysis set. The forwarded-refresh absorption
+    /// compares against kakehashi's record, so without this debt it would
+    /// read exactly that raced commit as "the editor already has it" and
+    /// starve the one signal that heals the lag. A covering pull clears the
+    /// debt ([`Self::clear_pull_view_lag_up_to`] via the pull handler);
+    /// `didClose` forgets it ([`Self::forget_published`]). The debt is
+    /// deliberately NOT cleared when a nudge is sent — only the editor
+    /// actually re-pulling proves the lag closed.
+    ///
+    /// The value is a monotonic recording serial (from
+    /// [`Self::next_pull_view_lag_serial`]). A covering pull captures the
+    /// host's serial at ENTRY and clears only up to it: a lag recorded while
+    /// the pull was in flight — including one recorded by a reopened
+    /// lifetime after a close raced the pull (#745's defect class) — carries
+    /// a newer serial and survives the stale clear.
+    pull_view_lag: Mutex<HashMap<Url, u64>>,
+    /// Nudge-less mutations performed but not yet settled by a recorded
+    /// republish, keyed to the CACHE REVISION current when the mutation
+    /// landed (stamped inside the same `cache_revisions` critical section —
+    /// see [`Self::set_pull_layer_nudgeless`]). The republish that validates
+    /// a revision `r` settles every mark with revision ≤ r: a Changed record
+    /// converts it into the confirmed lag, an Unchanged record drops it (the
+    /// mutation demonstrably left the merged set alone). Revision-keying is
+    /// what stops an unrelated earlier Changed from consuming a mark whose
+    /// mutation it never saw. Marks are invisible to pull STAMPS until
+    /// confirmed (a pull must never clear an unconfirmed change), but the
+    /// absorption sweep counts them conservatively as lag
+    /// ([`Self::has_pull_view_lag`]): a writer parked between its mutation
+    /// and its republish is a real, unconfirmed change the cycle must not
+    /// absorb past.
+    pull_view_lag_pending: Mutex<HashMap<Url, u64>>,
+    /// Allocator for [`Self::pull_view_lag`] serials. Process-wide (not
+    /// per-host) so a close/reopen can never re-mint an already-captured
+    /// value.
+    next_pull_view_lag_serial: AtomicU64,
     /// Per-host coalescing state for the editor-facing `publishDiagnostics`
     /// wire sends (the quiet window): see [`WireGate`] and
     /// [`Self::wire_gate_admit`]. Mutated under the host's republish lock
@@ -755,9 +800,9 @@ impl DiagnosticAggregator {
 
     /// Check whether activity occurred during the debounce wait. A newer
     /// generation restarts the settle window. Once the wait settles, request a
-    /// trailing refresh only when no refresh send has covered the latest
-    /// downstream activity; the leading send or another refresh origin may
-    /// already have done so.
+    /// trailing cycle only when no cycle has covered the latest downstream
+    /// activity; the leading cycle (whose nudge may have been absorbed) or
+    /// another refresh origin may already have done so.
     pub(crate) fn finish_forwarded_refresh_wait(
         &self,
         observed: u64,
@@ -830,9 +875,14 @@ impl DiagnosticAggregator {
             .task_scheduled = false;
     }
 
-    /// Record that a forced refresh has been admitted for the latest downstream
-    /// activity. Admission is enough: the refresh single-flight guarantees that
-    /// an in-flight request will eventually emit its forced pending successor.
+    /// Record that the latest downstream activity is fully handled: a forced
+    /// refresh was admitted, the client lacks refresh support, or the cycle's
+    /// covering-unchanged prefetch absorbed the nudge. For the admitted case,
+    /// admission is enough: the refresh single-flight guarantees that an
+    /// in-flight request will eventually emit its forced pending successor.
+    /// For the absorbed case the prefetch itself is the handling — any NEW
+    /// downstream activity mints a new generation, which this mark (being
+    /// generation-guarded) can never cover.
     pub(crate) fn mark_forwarded_refresh_covered(&self, generation: u64) {
         let mut debounce = self
             .forwarded_refresh_debounce
@@ -856,9 +906,10 @@ impl DiagnosticAggregator {
         }
     }
 
-    /// Whether a completed prefetch for `generation` should still nudge the
-    /// editor. Newer activity must first receive its own prefetch, while another
-    /// refresh sent after this activity already supplies the nudge.
+    /// Whether a completed prefetch for `generation` still owes the editor
+    /// handling (the actual nudge is additionally gated by the prefetch
+    /// summary). Newer activity must first receive its own prefetch, while
+    /// another refresh sent after this activity already supplies the nudge.
     pub(crate) fn forwarded_refresh_needs_editor_send(&self, generation: u64) -> bool {
         let debounce = self
             .forwarded_refresh_debounce
@@ -867,6 +918,27 @@ impl DiagnosticAggregator {
         debounce.generation == generation
             && debounce.covered_generation != Some(generation)
             && debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity
+    }
+
+    /// Whether `generation` was suppressed ONLY by the epoch cover — an
+    /// intervening refresh from another origin was sent after this activity,
+    /// so [`Self::forwarded_refresh_needs_editor_send`] treats the cycle as
+    /// already nudged. That cover is a heuristic about ORDER: the intervening
+    /// refresh's induced re-pull can have answered BEFORE this cycle's
+    /// prefetch committed, in which case the editor holds the pre-commit set
+    /// and no later signal is guaranteed. A cycle whose prefetch produced a
+    /// changed/lagged summary uses this to coalesce a compensating forced
+    /// nudge into the refresh single-flight instead of trusting the cover.
+    /// Distinct from a GENERATION mismatch, where newer downstream activity
+    /// owns a fresh cycle (and prefetch) of its own — no compensation there.
+    pub(crate) fn forwarded_refresh_epoch_covered(&self, generation: u64) -> bool {
+        let debounce = self
+            .forwarded_refresh_debounce
+            .lock()
+            .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
+        debounce.generation == generation
+            && debounce.covered_generation != Some(generation)
+            && debounce.refresh_epoch != debounce.refresh_epoch_at_last_activity
     }
 
     pub(crate) fn new() -> Self {
@@ -996,6 +1068,10 @@ impl DiagnosticAggregator {
     ///
     /// The pull-layer is a cross-connection aggregate, not a single connection's
     /// push, so its slot is tagged `None` and is never touched by crash eviction.
+    /// Test-only since the production writers moved to
+    /// [`Self::set_pull_layer_nudgeless`] (which additionally stamps the
+    /// pending pull-view-lag mark in the same critical section).
+    #[cfg(test)]
     pub(crate) fn set_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
         self.record(
             host,
@@ -1036,6 +1112,21 @@ impl DiagnosticAggregator {
     pub(crate) fn has_region_slots(&self, host: &Url) -> bool {
         let cache = self.lock();
         cache.get(host).is_some_and(has_live_region_slots)
+    }
+
+    /// Whether `host`'s cached `PullLayer` blob holds any diagnostics. The
+    /// degraded-pull guard consults this alongside [`Self::has_region_slots`]:
+    /// a tree-less pull answers without the virt layer entirely, so cached
+    /// pull-layer content (a pull-only server's home — it never has push
+    /// slots) is exactly what such an answer is missing. An empty blob has
+    /// nothing to miss.
+    pub(crate) fn has_nonempty_pull_layer(&self, host: &Url) -> bool {
+        let cache = self.lock();
+        cache.get(host).is_some_and(|slots| {
+            slots
+                .get(&DiagnosticSource::PullLayer)
+                .is_some_and(|servers| servers.values().any(|slot| !slot.diagnostics.is_empty()))
+        })
     }
 
     /// Drop everything for a host (host `didClose`). Returns whether it existed.
@@ -1140,6 +1231,219 @@ impl DiagnosticAggregator {
         self.last_wire_published
             .lock()
             .recover_poison("DiagnosticAggregator::last_wire_published")
+            .remove(host);
+        // Pending and confirmed lag are cleared under BOTH locks, in the
+        // fixed pending → confirmed order shared with
+        // `settle_pending_pull_view_lag`, so a settle cannot interleave
+        // between the two removals and resurrect a closed host's lag.
+        let mut pending = self
+            .pull_view_lag_pending
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag_pending");
+        pending.remove(host);
+        self.pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag")
+            .remove(host);
+        drop(pending);
+    }
+
+    /// Replace the pull-layer blob AND stamp the pending pull-view-lag mark
+    /// in one `cache_revisions` critical section — the nudge-less variant of
+    /// [`Self::set_pull_layer`] (see the [`Self::pull_view_lag_pending`]
+    /// field doc). Stamping atomically with the mutation ties the mark to
+    /// the exact revision carrying this data, so a republish can only settle
+    /// it once its validated snapshot INCLUDES the mutation.
+    pub(crate) fn set_pull_layer_nudgeless(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
+        let mut revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
+        let mut cache = self.lock();
+        let source_slots = if let Some(source_slots) = cache.get_mut(host) {
+            source_slots
+        } else {
+            cache.entry(host.clone()).or_default()
+        };
+        let changed = source_slots
+            .get(&DiagnosticSource::PullLayer)
+            .and_then(|servers| servers.get(PULL_LAYER_SERVER))
+            .is_none_or(|slot| slot.diagnostics != diagnostics);
+        source_slots
+            .entry(DiagnosticSource::PullLayer)
+            .or_default()
+            .insert(
+                PULL_LAYER_SERVER.to_string(),
+                SlotEntry {
+                    diagnostics,
+                    connection_id: None,
+                },
+            );
+        if changed {
+            revisions.insert(host.clone(), self.allocate_cache_revision());
+            // Stamp only a REAL change (Qodo, PR #972): a no-op mutation owes
+            // the editor nothing, and its stale mark would otherwise be
+            // converted into a spurious lag by whatever unrelated Changed
+            // republish settles next.
+            let revision = revisions.get(host).copied().unwrap_or(0);
+            self.pull_view_lag_pending
+                .lock()
+                .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
+                .insert(host.clone(), revision);
+        }
+    }
+
+    /// Evict the pull-layer blob AND stamp the pending mark, like
+    /// [`Self::set_pull_layer_nudgeless`] — the nudge-less variant of
+    /// `evict_source(host, PullLayer)`.
+    pub(crate) fn evict_pull_layer_nudgeless(&self, host: &Url) {
+        let mut revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
+        let mut cache = self.lock();
+        let removed = if let Some(slots) = cache.get_mut(host) {
+            let removed = slots.remove(&DiagnosticSource::PullLayer).is_some();
+            if slots.is_empty() {
+                cache.remove(host);
+            }
+            removed
+        } else {
+            false
+        };
+        if removed {
+            revisions.insert(host.clone(), self.allocate_cache_revision());
+            // Same real-change gate as `set_pull_layer_nudgeless`.
+            let revision = revisions.get(host).copied().unwrap_or(0);
+            self.pull_view_lag_pending
+                .lock()
+                .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
+                .insert(host.clone(), revision);
+        }
+    }
+
+    /// Settle any pending mark covered by the revision a republish just
+    /// validated (see the [`Self::pull_view_lag_pending`] field doc): a
+    /// Changed record converts it into the confirmed lag, an Unchanged
+    /// record drops it. Called by `republish` right after
+    /// `published_set_changed_current_revision` returns `Some(_)`, under the
+    /// per-host republish lock — that lock orders every same-host republish,
+    /// which is what makes the forwarded-refresh decision sweep a
+    /// linearization point. Both maps are locked in the fixed
+    /// pending → confirmed order (shared with [`Self::forget_published`]) so
+    /// a didClose cleanup can never interleave between the settle's two
+    /// halves and resurrect a closed host's lag.
+    pub(crate) fn settle_pending_pull_view_lag(
+        &self,
+        host: &Url,
+        cache_revision: u64,
+        changed: bool,
+    ) {
+        let mut pending = self
+            .pull_view_lag_pending
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag_pending");
+        let covered = pending
+            .get(host)
+            .is_some_and(|&revision| revision <= cache_revision);
+        if !covered {
+            return;
+        }
+        pending.remove(host);
+        if changed {
+            let serial = self
+                .next_pull_view_lag_serial
+                .fetch_add(1, Ordering::Relaxed);
+            self.pull_view_lag
+                .lock()
+                .recover_poison("DiagnosticAggregator::pull_view_lag")
+                .insert(host.clone(), serial);
+        }
+    }
+
+    /// Whether `host` carries an outstanding pull-view lag — the recorded set
+    /// moved without a nudge and no covering pull has been answered since —
+    /// or an UNSETTLED pending mark. The pending half is deliberate
+    /// conservatism for the absorption sweep: a writer that has mutated the
+    /// cache but not yet reached its republish is a real, unconfirmed change
+    /// (the republish that later confirms it emits no nudge of its own), so
+    /// the sweep must not absorb past it. A mark whose republish turns out
+    /// Unchanged costs one spurious nudge — the safe direction. Pull stamps
+    /// stay confirmed-only ([`Self::pull_view_lag_stamp`]): a pull must never
+    /// clear what is not yet confirmed.
+    pub(crate) fn has_pull_view_lag(&self, host: &Url) -> bool {
+        // Both maps are read under BOTH locks in the fixed pending → confirmed
+        // order shared with `settle_pending_pull_view_lag` and
+        // `forget_published`: two sequential single-lock reads could straddle
+        // a settle (pending removed, confirmed inserted) and see NEITHER —
+        // absorbing past a real lag mid-transition.
+        let pending = self
+            .pull_view_lag_pending
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag_pending");
+        if pending.contains_key(host) {
+            return true;
+        }
+        self.pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag")
+            .contains_key(host)
+    }
+
+    /// The serial a covering pull must capture at ENTRY to be allowed to
+    /// clear the lag it observed (`None` = no lag outstanding right now).
+    pub(crate) fn pull_view_lag_stamp(&self, host: &Url) -> Option<u64> {
+        self.pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag")
+            .get(host)
+            .copied()
+    }
+
+    /// A covering editor pull that observed `stamp` at entry was answered for
+    /// `host`: the editor now holds everything recorded up to that point, so
+    /// clear the lag — but only when no NEWER lag was recorded meanwhile (a
+    /// mid-pull commit, or a close/reopen lifetime the stale pull must not
+    /// settle, #745). `stamp == None` means no lag was outstanding at entry,
+    /// so there is nothing this pull can vouch for — never clear. (A pull
+    /// that answered concurrently with the very commit whose serial it
+    /// captured can still clear while carrying the pre-commit set — a narrow
+    /// race whose consequence is the pre-debt behavior, i.e. one absorbed
+    /// refresh.)
+    pub(crate) fn clear_pull_view_lag_up_to(&self, host: &Url, stamp: Option<u64>) {
+        let Some(stamp) = stamp else {
+            return;
+        };
+        let mut lags = self
+            .pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag");
+        if lags.get(host).is_some_and(|&serial| serial <= stamp) {
+            lags.remove(host);
+        }
+    }
+
+    /// Test-only: hold the CONFIRMED-lag lock open, so a test can prove
+    /// [`Self::has_pull_view_lag`] answers a pending-only host without ever
+    /// touching it (the pending → confirmed nesting: pending is read first
+    /// and short-circuits). The pre-fix implementation locked confirmed
+    /// FIRST and deadlocks against this guard.
+    #[cfg(test)]
+    pub(crate) fn lock_confirmed_pull_view_lag_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<Url, u64>> {
+        self.pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag")
+    }
+
+    /// Test-only unconditional clear, standing in for a covering pull in unit
+    /// fixtures that seed the cache directly.
+    #[cfg(test)]
+    pub(crate) fn clear_pull_view_lag(&self, host: &Url) {
+        self.pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag")
             .remove(host);
     }
 
@@ -1951,6 +2255,115 @@ impl DiagnosticAggregator {
 
 #[cfg(test)]
 mod tests {
+    /// Qodo review finding (PR #972): a NO-OP nudgeless mutation (identical
+    /// blob, or evicting an absent layer — no revision bump) must not stamp a
+    /// pending mark, or an unrelated later Changed republish converts it into
+    /// a spurious confirmed lag that keeps forcing nudges until a covering
+    /// pull.
+    #[test]
+    fn a_no_op_nudgeless_mutation_mints_no_lag_from_an_unrelated_change() {
+        use super::*;
+        let agg = DiagnosticAggregator::new();
+        let host = Url::parse("file:///no_op_nudgeless.md").unwrap();
+
+        // No-op evict: no PullLayer exists.
+        agg.evict_pull_layer_nudgeless(&host);
+        let (_, revision) = agg.snapshot_with_revision(&host);
+        // An unrelated Changed republish settling at the current revision…
+        agg.settle_pending_pull_view_lag(&host, revision, true);
+        assert!(
+            !agg.has_pull_view_lag(&host),
+            "an absent-layer evict changed nothing — no lag may be minted"
+        );
+
+        // No-op set: identical blob twice. Settle the REAL first change away
+        // (as its own republish would), then repeat it verbatim.
+        agg.set_pull_layer_nudgeless(&host, Vec::new());
+        let (_, revision) = agg.snapshot_with_revision(&host);
+        agg.settle_pending_pull_view_lag(&host, revision, true);
+        agg.clear_pull_view_lag(&host);
+        agg.set_pull_layer_nudgeless(&host, Vec::new());
+        let (_, revision) = agg.snapshot_with_revision(&host);
+        agg.settle_pending_pull_view_lag(&host, revision, true);
+        assert!(
+            !agg.has_pull_view_lag(&host),
+            "an identical re-commit changed nothing — no lag may be minted"
+        );
+    }
+
+    /// Lock-order pin for `has_pull_view_lag`: a pending-only host must be
+    /// answerable from the pending lock alone (pending → confirmed nesting,
+    /// pending read first with a short-circuit). The pre-fix implementation
+    /// acquired the confirmed lock FIRST, so with that lock held here it
+    /// would block forever — this test turns red (timeout) if the read order
+    /// regresses, which is exactly the order whose two unlocked halves let a
+    /// settle hide mid-transition.
+    #[test]
+    fn pending_only_lag_is_answerable_without_the_confirmed_lock() {
+        use super::*;
+        use std::sync::Arc as StdArc;
+        let agg = StdArc::new(DiagnosticAggregator::new());
+        let host = Url::parse("file:///lag_lock_order.md").unwrap();
+        agg.set_pull_layer_nudgeless(&host, Vec::new());
+
+        let _confirmed_guard = agg.lock_confirmed_pull_view_lag_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = {
+            let agg = StdArc::clone(&agg);
+            let host = host.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(agg.has_pull_view_lag(&host));
+            })
+        };
+        let answered = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("pending-only lag must be answerable while the confirmed lock is held");
+        assert!(answered, "the pending mark must read as lag");
+        drop(_confirmed_guard);
+        reader.join().expect("reader thread");
+    }
+
+    #[test]
+    fn pull_view_lag_is_visible_across_the_settle_transition_states() {
+        use super::*;
+        let agg = DiagnosticAggregator::new();
+        let host = Url::parse("file:///lag_states.md").unwrap();
+
+        // Pending-only (writer parked before its republish).
+        agg.set_pull_layer_nudgeless(&host, Vec::new());
+        assert!(
+            agg.has_pull_view_lag(&host),
+            "pending mark must read as lag"
+        );
+        assert!(
+            agg.pull_view_lag_stamp(&host).is_none(),
+            "a pull must not be able to clear an unconfirmed mark"
+        );
+
+        // Confirmed (a Changed republish settled it).
+        let (_, revision) = agg.snapshot_with_revision(&host);
+        agg.settle_pending_pull_view_lag(&host, revision, true);
+        assert!(
+            agg.has_pull_view_lag(&host),
+            "confirmed lag must read as lag"
+        );
+        let stamp = agg.pull_view_lag_stamp(&host);
+        assert!(
+            stamp.is_some(),
+            "a confirmed lag is clearable by a covering pull"
+        );
+
+        // Cleared by the covering pull.
+        agg.clear_pull_view_lag_up_to(&host, stamp);
+        assert!(!agg.has_pull_view_lag(&host));
+
+        // Unchanged settles drop the mark without minting a lag.
+        agg.set_pull_layer_nudgeless(&host, Vec::new());
+        let (_, revision) = agg.snapshot_with_revision(&host);
+        agg.settle_pending_pull_view_lag(&host, revision, false);
+        assert!(!agg.has_pull_view_lag(&host));
+    }
+
     use super::*;
     use tower_lsp_server::ls_types::{Position, Range};
 

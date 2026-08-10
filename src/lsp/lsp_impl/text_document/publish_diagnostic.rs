@@ -23,6 +23,15 @@ use super::{RequestErrorSink, count_request_errors};
 pub(crate) struct DiagnosticSnapshotLineage {
     pub(crate) incarnation: u64,
     pub(crate) content_version: u64,
+    /// The settings generation the pull surface was resolved under (captured
+    /// BEFORE loading the settings — see
+    /// `SettingsManager::settings_generation`). The refresh prefetch
+    /// re-checks it at commit: a `workspace/didChangeConfiguration` landing
+    /// mid-prefetch can widen the editor's pull surface (new
+    /// server/layer/priorities) without touching the document fields, and an
+    /// old-surface prefetch must then count as incomplete coverage rather
+    /// than vouch for the editor's re-pull.
+    pub(crate) settings_generation: u64,
 }
 
 /// Everything a push-diagnostics task needs, captured at schedule time
@@ -48,6 +57,13 @@ pub(crate) struct DiagnosticSnapshot {
     /// selection is empty; the context still drives the re-sync. Always `false`
     /// when `host` is `None`.
     pub(crate) host_pull_enabled: bool,
+    /// Whether `pullFallback = false` excluded a pull-eligible layer from this
+    /// snapshot. The editor's own `textDocument/diagnostic` fan-out does not
+    /// honor `pullFallback` (it is a proactive-cache policy), so when this is
+    /// set, a pull built from this snapshot covers LESS than the editor's
+    /// re-pull would — the forwarded-refresh prefetch must then keep its
+    /// forced editor nudge instead of standing in for it.
+    pub(crate) narrower_than_editor_pull: bool,
     /// Cross-layer combine config for `textDocument/publishDiagnostics`.
     pub(crate) layer_cfg: ResolvedLayerConfig,
 }
@@ -129,6 +145,7 @@ pub(crate) async fn collect_push_diagnostics_with_error_sink(
         mut virt_contexts,
         host,
         host_pull_enabled,
+        narrower_than_editor_pull: _,
         layer_cfg,
     } = snapshot;
 
@@ -298,8 +315,10 @@ mod tests {
             lineage: DiagnosticSnapshotLineage {
                 incarnation: 0,
                 content_version: 0,
+                settings_generation: 0,
             },
             virt_contexts: vec![virt_ctx_for_server("test")],
+            narrower_than_editor_pull: false,
             host: None,
             host_pull_enabled: false,
             layer_cfg: ResolvedLayerConfig::with_defaults("textDocument/publishDiagnostics"),

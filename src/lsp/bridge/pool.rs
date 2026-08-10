@@ -2511,6 +2511,16 @@ impl LanguageServerPool {
         // Spawn new connection (while holding lock to prevent concurrent spawns)
         let mut conn = AsyncBridgeConnection::spawn(server_config.cmd().to_vec()).await?;
 
+        // Crash-triage channel: forward the child's stderr into the log,
+        // bounded (see `drain_downstream_stderr`). Detached — it exits on the
+        // child's EOF, which the writer's Drop kill guarantees eventually.
+        if let Some(stderr) = conn.take_stderr() {
+            tokio::spawn(super::connection::drain_downstream_stderr(
+                stderr,
+                server_name.to_string(),
+            ));
+        }
+
         // Split connection immediately
         let (writer, reader) = conn.split();
         let router = Arc::new(ResponseRouter::new());
