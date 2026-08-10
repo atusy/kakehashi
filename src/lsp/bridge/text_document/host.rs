@@ -485,6 +485,13 @@ impl LanguageServerPool {
     ) -> io::Result<T> {
         // Route per-connection state by this handle's pool key (#382).
         let connection_key = handle.key();
+
+        // In-flight cap (#974): park BEFORE the `connections` and
+        // `host_documents` locks below, mirroring
+        // `execute_bridge_request_observed` — a task waiting on a saturated
+        // connection must hold nothing other connections' requests need.
+        let _request_slot = handle.acquire_request_slot().await?;
+
         if let Some(ref id) = upstream_request_id {
             self.register_upstream_request(id.clone(), connection_key);
         }
