@@ -62,6 +62,12 @@ impl BridgeReader {
 
         let mut content_length: Option<usize> = None;
         let mut saw_header = false;
+        // First non-LSP-header line seen this frame, kept (truncated) so the
+        // genuine framing error below can QUOTE the offending bytes — when a
+        // downstream prints an error to STDOUT (observed: basedpyright), that
+        // text is the crash reason, and the frame that trips over it is the
+        // only place it is still readable.
+        let mut stray_line: Option<String> = None;
 
         // Read headers until empty line
         loop {
@@ -106,12 +112,34 @@ impl BridgeReader {
                 content_length = Some(value.trim().parse().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length value")
                 })?);
+            } else if stray_line.is_none() {
+                // Remember the first non-Content-Length line for the framing
+                // error's quote. Legitimate blocks always carry
+                // Content-Length, so this is only ever REPORTED for a failed
+                // block — where any such line (including ones that merely
+                // look header-shaped, like a JSON fragment after a length
+                // mismatch or "Error: …") IS the evidence. Real spare headers
+                // (Content-Type) on healthy frames are still ignored.
+                let mut quoted = trimmed.to_string();
+                const MAX_QUOTE: usize = 300;
+                if quoted.len() > MAX_QUOTE {
+                    let mut end = MAX_QUOTE;
+                    while !quoted.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    quoted.truncate(end);
+                    quoted.push('…');
+                }
+                stray_line = Some(quoted);
             }
-            // Other headers (Content-Type, etc.) are silently ignored per LSP spec
         }
 
-        let content_length = content_length.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
+        let content_length = content_length.ok_or_else(|| match stray_line {
+            Some(stray) => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing Content-Length header (stray stdout line: {stray:?})"),
+            ),
+            None => io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header"),
         })?;
 
         // Read exact body bytes. Name a mid-body EOF like the header-side
