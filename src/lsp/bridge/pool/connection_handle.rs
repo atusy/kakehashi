@@ -242,7 +242,11 @@ impl ConnectionHandle {
             incapable_fallback_logged: AtomicBool::new(false),
             settings,
             launch_config: OnceLock::new(),
-            request_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests)),
+            // Clamped: tokio's Semaphore panics above MAX_PERMITS, and the
+            // config's NonZero type only floors the value (#974).
+            request_permits: Arc::new(tokio::sync::Semaphore::new(
+                max_concurrent_requests.min(tokio::sync::Semaphore::MAX_PERMITS),
+            )),
         }
     }
 
