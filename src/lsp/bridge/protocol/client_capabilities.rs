@@ -532,6 +532,63 @@ pub(super) fn apply_capability_override(
     }
 }
 
+/// Config-shape problems in a `clientCapabilities` override worth telling the
+/// USER about, detectable from the override alone (no baseline needed).
+///
+/// Mirrors the conditions [`apply_capability_override`] enforces at merge
+/// time. Enforcement keeps its `log::warn!` backstops, but `log::warn!` is
+/// invisible at the default log level, so the pool surfaces these through
+/// `warn_to_editor` at spawn — where the server name is in scope — as the
+/// user-facing channel. `advertise_configuration` is the settings-presence
+/// gate the override may contradict (downstream-settings-propagation).
+pub(crate) fn capability_override_user_warnings(
+    override_json: &serde_json::Value,
+    advertise_configuration: bool,
+) -> Vec<String> {
+    if !override_json.is_object() {
+        return vec!["clientCapabilities must be a table; ignoring the override".to_string()];
+    }
+    let mut warnings = Vec::new();
+    match override_json.get("general") {
+        Some(general) if !general.is_object() => warnings.push(
+            "clientCapabilities.general must be a table; general.positionEncodings stays utf-16"
+                .to_string(),
+        ),
+        Some(general) if general.get("positionEncodings").is_some() => warnings.push(
+            "clientCapabilities cannot change general.positionEncodings \
+             (kakehashi's coordinate translation requires utf-16); keeping utf-16"
+                .to_string(),
+        ),
+        _ => {}
+    }
+    if override_json
+        .pointer("/workspace/workspaceEdit/changeAnnotationSupport")
+        .is_some()
+    {
+        warnings.push(
+            "clientCapabilities cannot advertise workspace.workspaceEdit.changeAnnotationSupport \
+             (annotated edits would lose needsConfirmation in the bridge); removing it"
+                .to_string(),
+        );
+    }
+    if let Some(forced) = override_json
+        .pointer("/workspace/configuration")
+        .and_then(serde_json::Value::as_bool)
+        && forced != advertise_configuration
+    {
+        warnings.push(if forced {
+            "clientCapabilities forces workspace.configuration=true but this server has no \
+             settings to serve: every configuration pull will be answered null"
+                .to_string()
+        } else {
+            "clientCapabilities forces workspace.configuration=false while this server has \
+             settings: a pull-model server may never read them"
+                .to_string()
+        });
+    }
+    warnings
+}
+
 /// Post-merge invariant #2: `workspace.workspaceEdit.changeAnnotationSupport`
 /// must never be advertised. The upstream mirror deliberately withholds it —
 /// ls-types' untagged `OneOf` drops `annotationId` when deserializing
@@ -1397,6 +1454,52 @@ mod tests {
         assert_eq!(
             capabilities.pointer("/workspace/workspaceEdit/changeAnnotationSupport"),
             None,
+        );
+    }
+
+    /// The spawn-time user warnings must mirror what enforcement does: one
+    /// message per problem, none for a benign override.
+    #[test]
+    fn override_user_warnings_cover_each_enforced_condition() {
+        use serde_json::json;
+
+        assert_eq!(
+            capability_override_user_warnings(&json!("nope"), false).len(),
+            1,
+            "a non-object override warns exactly once (it is ignored wholesale)"
+        );
+        assert!(
+            capability_override_user_warnings(
+                &json!({"window": {"workDoneProgress": false}}),
+                false
+            )
+            .is_empty(),
+            "a benign override must not warn"
+        );
+
+        let noisy = json!({
+            "general": {"positionEncodings": ["utf-8"]},
+            "workspace": {
+                "workspaceEdit": {"changeAnnotationSupport": {"groupsOnLabel": true}},
+                "configuration": true
+            }
+        });
+        let warnings = capability_override_user_warnings(&noisy, false);
+        assert_eq!(
+            warnings.len(),
+            3,
+            "positionEncodings + changeAnnotationSupport + configuration conflict: {warnings:?}"
+        );
+
+        assert_eq!(
+            capability_override_user_warnings(&json!({"general": "utf-8"}), false).len(),
+            1,
+            "a non-object general warns about the protected encoding"
+        );
+        assert!(
+            capability_override_user_warnings(&json!({"workspace": {"configuration": true}}), true)
+                .is_empty(),
+            "configuration matching the gate is not a conflict"
         );
     }
 

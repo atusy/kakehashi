@@ -3281,28 +3281,26 @@ impl LanguageServerPool {
         // `initializationOptions`-configured server to pull and get every
         // section answered `null` (downstream-settings-propagation).
         let advertise_configuration = server_config.settings.is_some();
-        // The clientCapabilities override merges AFTER that gate, so a user
-        // forcing `workspace.configuration` overrules it. Honored — the
-        // override is user-explicit — but the failure mode is silent: a
-        // server flipped to pull without `settings` is answered null for
-        // every section; forced off, the settings the bridge holds are
-        // stranded. Name the conflict at each connection spawn, where the
-        // server name is in scope.
-        if let Some(forced) = capability_override
-            .as_ref()
-            .and_then(|c| c.pointer("/workspace/configuration"))
-            .and_then(serde_json::Value::as_bool)
-            && forced != advertise_configuration
-        {
-            let consequence = if forced {
-                "a server pulling without settings is answered null for every section"
-            } else {
-                "the server may never read the settings the bridge holds"
-            };
-            log::warn!(
-                target: "kakehashi::bridge",
-                "[{server_name}] clientCapabilities forces workspace.configuration={forced} but the bridge would advertise {advertise_configuration}: {consequence}"
-            );
+        // Surface override problems to the USER at spawn, where the server
+        // name is in scope: shape errors, protected-field attempts, and a
+        // `workspace.configuration` forced against the settings-presence
+        // gate (the override merges after that gate, so it overrules it —
+        // honored because user-explicit, but the failure modes are silent).
+        // `apply_capability_override` keeps `log::warn!` backstops at merge
+        // time; this is the editor-visible channel. Known gap: settings
+        // added later via didChangeConfiguration retain the connection, so
+        // a conflict created at runtime is not re-warned until the next
+        // relaunch — tolerable because the settings still reach the server
+        // through the didChangeConfiguration push; only pull-model servers
+        // are affected in the interim.
+        if let Some(override_json) = capability_override.as_ref() {
+            for warning in crate::lsp::bridge::protocol::capability_override_user_warnings(
+                override_json,
+                advertise_configuration,
+            ) {
+                log::warn!(target: "kakehashi::bridge", "[{server_name}] {warning}");
+                self.warn_to_editor(format!("{server_name}: {warning}"));
+            }
         }
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
