@@ -9469,7 +9469,6 @@ mod tests {
         let lua =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
         ra.record_launch_config(&crate::config::settings::BridgeServerConfig {
-            client_capabilities: None,
             settings: Some(json!({ "not-retained": true })),
             ..Default::default()
         });
@@ -9488,12 +9487,10 @@ mod tests {
         let pushed = pool
             .propagate_settings(move |name| match name {
                 "rust-analyzer" => Some(crate::config::settings::BridgeServerConfig {
-                    client_capabilities: None,
                     settings: Some(ra_value_for_resolve.clone()),
                     ..Default::default()
                 }),
                 "lua" => Some(crate::config::settings::BridgeServerConfig {
-                    client_capabilities: None,
                     settings: Some(lua_value_for_resolve.clone()),
                     ..Default::default()
                 }),
@@ -9522,12 +9519,10 @@ mod tests {
         let pushed_again = pool
             .propagate_settings(move |name| match name {
                 "rust-analyzer" => Some(crate::config::settings::BridgeServerConfig {
-                    client_capabilities: None,
                     settings: Some(ra_again.clone()),
                     ..Default::default()
                 }),
                 "lua" => Some(crate::config::settings::BridgeServerConfig {
-                    client_capabilities: None,
                     settings: Some(lua_again.clone()),
                     ..Default::default()
                 }),
@@ -9560,7 +9555,6 @@ mod tests {
         let pushed = pool
             .propagate_settings(move |_| {
                 Some(crate::config::settings::BridgeServerConfig {
-                    client_capabilities: None,
                     settings: Some(value_for_resolve.clone()),
                     ..Default::default()
                 })
@@ -9583,7 +9577,6 @@ mod tests {
         let pushed = pool
             .propagate_settings(|_| {
                 Some(crate::config::settings::BridgeServerConfig {
-                    client_capabilities: None,
                     settings: Some(serde_json::json!({ "x": 1 })),
                     ..Default::default()
                 })
