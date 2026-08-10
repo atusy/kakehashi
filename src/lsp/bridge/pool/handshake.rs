@@ -48,7 +48,7 @@ pub(super) async fn perform_lsp_handshake(
         client_capabilities.as_ref(),
         advertise_configuration,
         capability_override,
-    );
+    )?;
     handle
         .send_request(init_request, init_request_id)
         .map_err(|e| -> io::Error { e.into() })?;
