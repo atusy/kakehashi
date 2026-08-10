@@ -1098,6 +1098,59 @@ mod tests {
             .expect("slot frees once the permit drops");
     }
 
+    /// A connection leaving service (crash → `Failed`, teardown → `Closing`)
+    /// must WAKE tasks parked on its request slots with an error (#974): the
+    /// permits of a dead connection never free, so without this a parked
+    /// request would hang for its caller's full patience instead of failing
+    /// fast into the coverage machinery (the safe direction).
+    #[tokio::test]
+    async fn terminal_state_wakes_parked_request_slot_waiters() {
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("spawn sink");
+        let (writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+        let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let handle = Arc::new(ConnectionHandle::with_state(
+            writer,
+            router,
+            reader_handle,
+            ConnectionState::Ready,
+            tx,
+            rx,
+            default_dynamic_caps(),
+            ConnectionKey::for_server("dying"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            Arc::new(arc_swap::ArcSwapOption::empty()),
+            1,
+        ));
+
+        let _occupant = handle
+            .acquire_request_slot()
+            .await
+            .expect("first slot acquires");
+        let parked = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.acquire_request_slot().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!parked.is_finished(), "the waiter parks at capacity 1");
+
+        handle.set_state(ConnectionState::Failed);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), parked)
+            .await
+            .expect("a terminal state must wake the parked waiter promptly")
+            .expect("waiter task must not panic");
+        let error = result.expect_err("a dead connection's slot must error, not acquire");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+    }
+
     /// The settings cell stored on the handle is the *same* `Arc` the reader's
     /// `ServerRequestDeps` clones, so a path-c `store_settings` is observable by a
     /// path-b pull (downstream-settings-propagation).
