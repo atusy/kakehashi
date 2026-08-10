@@ -47,14 +47,20 @@ workDoneProgress = false
   inner boolean (`window.showDocument.support = false`) — `false` in place
   of an object is an invalid shape a strictly-typed server may reject at
   `initialize`.
-- **`general.positionEncodings` is protected.** Enforced as a post-merge
-  invariant: whatever shape the override takes (an object override, a
-  non-object `general` replacing the subtree, a JSON `null`), the baseline
-  value is restored with a warning. Coordinate translation depends on UTF-16,
-  and an override there would silently corrupt every bridged position. Every
-  other field is the user's to override — reducing capability is LSP-safe
-  everywhere except this guarded field, while *adding* capability may invite
-  requests the bridge can only fail (documented as sharp, not guarded).
+- **Two fields are protected as post-merge invariants** — enforced on the
+  merged result, so no override shape (a non-object subtree, a JSON `null`)
+  can bypass them. `general.positionEncodings`: coordinate translation
+  depends on UTF-16, and an override there would silently corrupt every
+  bridged position; the baseline value is restored with a warning.
+  `workspace.workspaceEdit.changeAnnotationSupport`: the upstream mirror
+  deliberately withholds it because the typed edit parse drops
+  `annotationId`, so re-advertising it would let a downstream's
+  `needsConfirmation` edit apply without confirmation; it is removed with a
+  warning. Every other field is the user's to override — reducing capability
+  is LSP-safe outside the guarded fields, while *adding* capability may
+  invite requests the bridge can only fail (documented as sharp, not
+  guarded). The guard criterion is unchanged: only fields whose corruption
+  would be silent.
 - **Initialize-time only.** The override participates in
   `same_launch_config`, so changing it relaunches the server's connection
   like an `initializationOptions` change.
@@ -74,7 +80,7 @@ server's value) — see configuration-merging-strategy.
   `workspace.applyEdit` the editor lacks); the bridge then fails those
   requests as it always has for unsupported traffic. This is accepted — the
   guard list is limited to fields whose corruption would be silent
-  (`positionEncodings`).
+  (`positionEncodings`, `changeAnnotationSupport`).
 - One enabling lie is warned rather than failed: forcing
   `workspace.configuration` against the settings-presence gate
   (downstream-settings-propagation). Enabled without `settings`, the server
