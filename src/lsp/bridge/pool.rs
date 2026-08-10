@@ -2658,6 +2658,25 @@ impl LanguageServerPool {
         // `initializationOptions`-configured server to pull and get every
         // section answered `null` (downstream-settings-propagation).
         let advertise_configuration = server_config.settings.is_some();
+        // The clientCapabilities override merges AFTER that gate, so a user
+        // forcing `workspace.configuration` overrules it. Honored — the
+        // override is user-explicit — but the failure mode is silent: a
+        // server flipped to pull without `settings` is answered null for
+        // every section; forced off, the settings the bridge holds are
+        // stranded. Name the conflict once at spawn, where the server name
+        // is in scope.
+        if let Some(forced) = capability_override
+            .as_ref()
+            .and_then(|c| c.pointer("/workspace/configuration"))
+            .and_then(serde_json::Value::as_bool)
+            && forced != advertise_configuration
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "[{server_name}] clientCapabilities forces workspace.configuration={forced} but the bridge would advertise {advertise_configuration}: \
+                 a server pulling without settings is answered null; one told not to pull may never read the settings the bridge holds"
+            );
+        }
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
         let command_origins = Arc::clone(&self.command_origins);
