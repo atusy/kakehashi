@@ -556,6 +556,63 @@ mod tests {
         }
     }
 
+    /// The #974 user requirement, pinned directly: a connection saturated to
+    /// its in-flight cap must not delay requests to a DIFFERENT connection.
+    /// Permits are per-connection and a parked task holds no shared lock, so
+    /// an idle connection is fed immediately.
+    #[tokio::test]
+    async fn saturated_connection_does_not_delay_an_idle_connection() {
+        let cap = crate::lsp::bridge::pool::DEFAULT_MAX_CONCURRENT_REQUESTS;
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = test_host_uri("cross-connection");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let busy = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("busy-server"),
+        )
+        .await;
+        let idle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("idle-server"),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&busy)).await;
+        pool.insert_connection(Arc::clone(&idle)).await;
+
+        // Saturate the busy connection past its cap (sink server: nothing
+        // ever completes, so all permits stay taken and one task is parked).
+        let mut busy_requests = Vec::new();
+        for i in 0..(cap + 1) {
+            let (request, _probe) = start_observed_request(
+                Arc::clone(&pool),
+                Arc::clone(&busy),
+                host_uri.clone(),
+                UpstreamId::Number(2_000 + i as i64),
+            );
+            busy_requests.push(request);
+        }
+
+        // A request to the idle connection must reach its downstream
+        // promptly (downstream id published) despite the saturation.
+        let (idle_request, idle_probe) = start_observed_request(
+            Arc::clone(&pool),
+            Arc::clone(&idle),
+            host_uri.clone(),
+            UpstreamId::Number(3_000),
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_for_downstream_id(&idle_probe),
+        )
+        .await
+        .expect("an idle connection must be fed while another is saturated");
+
+        idle_request.abort();
+        for request in &busy_requests {
+            request.abort();
+        }
+    }
+
     #[tokio::test]
     async fn host_close_waits_for_request_enqueue_guard() {
         let pool = Arc::new(LanguageServerPool::new());
