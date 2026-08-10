@@ -51,6 +51,7 @@ pub(super) async fn perform_lsp_handshake(
         // env read (the per-instance AtomicBool exists only so unit tests can
         // toggle Kakehashi-level gates; none of them reach this handshake).
         crate::experimental::enabled(),
+        None,
     );
     handle
         .send_request(init_request, init_request_id)
