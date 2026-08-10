@@ -461,6 +461,64 @@ mod tests {
         }
     }
 
+    /// `completionItem/resolve` must take the same per-connection request
+    /// slot as every other request (#974): eager resolve batches exist
+    /// (code actions resolve up to 8 at once per phase-one response), so the
+    /// inline-send paths are burst sources too — with the only slot held,
+    /// the resolve must PARK (never registers with the router) until the
+    /// slot frees.
+    #[tokio::test]
+    async fn completion_resolve_parks_on_the_request_slot_cap() {
+        use crate::lsp::bridge::pool::test_helpers::*;
+        use crate::lsp::bridge::pool::{ConnectionKey, ConnectionState, LanguageServerPool};
+        use std::sync::Arc;
+
+        let pool = Arc::new(LanguageServerPool::new());
+        let handle = create_capped_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("test-server"),
+            1,
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        let occupant = handle
+            .acquire_request_slot()
+            .await
+            .expect("the only slot acquires");
+
+        let resolve = {
+            let pool = Arc::clone(&pool);
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move {
+                pool.send_completion_resolve_on_handle(
+                    &handle,
+                    CompletionItem::new_simple("x".into(), "d".into()),
+                    None,
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            handle.router().pending_count(),
+            0,
+            "with the only slot held, the resolve must not have been \
+             registered/sent yet"
+        );
+
+        drop(occupant);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while handle.router().pending_count() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the parked resolve proceeds once the slot frees");
+        resolve.abort();
+    }
+
     // ==========================================================================
     // resolve_guard_region_end tests
     // ==========================================================================
