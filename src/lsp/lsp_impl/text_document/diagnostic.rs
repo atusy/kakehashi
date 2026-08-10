@@ -9,7 +9,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
@@ -41,12 +40,6 @@ use crate::lsp::lsp_impl::text_document::{
 // ============================================================================
 // Shared diagnostic utilities (used by both pull and push diagnostics)
 // ============================================================================
-
-/// Per-request timeout for diagnostic fan-out (pull-first-diagnostic-forwarding).
-///
-/// Used by both pull diagnostics (textDocument/diagnostic) and
-/// synthetic push diagnostics (didSave/didOpen/didChange triggered).
-const DIAGNOSTIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Collect diagnostics for a single injection region using strategy-aware dispatch.
 ///
@@ -712,14 +705,16 @@ pub(crate) async fn collect_host_diagnostics(
     }
 }
 
-/// Send a diagnostic request for a single fan-out task with timeout.
+/// Send a diagnostic request for a single fan-out task.
 ///
-/// Shared by both concatenated and preferred dispatch strategies.
+/// Shared by both concatenated and preferred dispatch strategies. The answer
+/// deadline (`DIAGNOSTIC_RESPONSE_TIMEOUT`) is applied inside the pool,
+/// measured from send — an outer timeout here would count request-slot queue
+/// wait (#974) and connection init against it, turning a saturated-but-healthy
+/// downstream's burst tail into spurious failures.
 async fn send_diagnostic_fan_out_request(t: FanOutTask) -> std::io::Result<Vec<Diagnostic>> {
-    let rid = t.region_id.clone();
-    tokio::time::timeout(
-        DIAGNOSTIC_REQUEST_TIMEOUT,
-        t.pool.send_diagnostic_request(
+    t.pool
+        .send_diagnostic_request(
             &t.server_name,
             &t.server_config,
             &t.uri,
@@ -728,26 +723,20 @@ async fn send_diagnostic_fan_out_request(t: FanOutTask) -> std::io::Result<Vec<D
             t.offset,
             &t.virtual_content,
             t.upstream_id,
-        ),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        Err(std::io::Error::other(format!(
-            "diagnostic request timed out for region {rid}"
-        )))
-    })
+        )
+        .await
 }
 
-/// Send a host diagnostic request for a single fan-out task with timeout, with
-/// **no** error counting. The caller counts per strategy: concatenated counts
+/// Send a host diagnostic request for a single fan-out task, with **no**
+/// error counting. The caller counts per strategy: concatenated counts
 /// every failure in-task (a missing merge contribution); preferred counts only
-/// the no-winner case via [`count_no_winner_errors`] (#487).
+/// the no-winner case via [`count_no_winner_errors`] (#487). The answer
+/// deadline is applied inside the pool, measured from send (#974).
 async fn send_host_diagnostic_fan_out_request(
     t: HostFanOutTask,
 ) -> std::io::Result<Vec<Diagnostic>> {
-    tokio::time::timeout(
-        DIAGNOSTIC_REQUEST_TIMEOUT,
-        t.pool.send_host_diagnostic_request(
+    t.pool
+        .send_host_diagnostic_request(
             &t.server_name,
             &t.server_config,
             &crate::lsp::bridge::HostDocument {
@@ -757,15 +746,8 @@ async fn send_host_diagnostic_fan_out_request(
             },
             serde_json::json!({ "textDocument": { "uri": t.uri.as_str() } }),
             t.upstream_id,
-        ),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        Err(std::io::Error::other(format!(
-            "host diagnostic request timed out for {}",
-            t.server_name
-        )))
-    })
+        )
+        .await
 }
 
 /// Send one fan-out diagnostic request, counting a request-time failure into

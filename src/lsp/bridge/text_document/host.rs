@@ -321,6 +321,7 @@ impl LanguageServerPool {
                 upstream_request_id,
                 |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
                 move |response| parse_host_raw_response(response, method),
+                None,
             )
             // Outer `?`: transport/protocol failure from `execute_host_request`.
             // Inner `Result` from the parser: a downstream JSON-RPC error
@@ -367,6 +368,7 @@ impl LanguageServerPool {
             // mode maps onto its error exit code. Only the no-capability
             // early return above yields `Ok(None)`.
             move |response| parse_host_formatting_response(response, method).map(Some),
+            None,
         )
         .await?
     }
@@ -449,6 +451,7 @@ impl LanguageServerPool {
                     }
                     super::diagnostic::parse_downstream_diagnostic_report(response)
                 },
+                Some(super::diagnostic::DIAGNOSTIC_RESPONSE_TIMEOUT),
             )
             .await?;
         let document_is_open = self
@@ -478,6 +481,7 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
         build_request: impl FnOnce(RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value) -> T,
+        response_timeout: Option<std::time::Duration>,
     ) -> io::Result<T> {
         // Route per-connection state by this handle's pool key (#382).
         let connection_key = handle.key();
@@ -555,7 +559,36 @@ impl LanguageServerPool {
             }
         }
 
-        let response = handle.wait_for_response(request_id, response_rx).await;
+        // `response_timeout` starts after send, mirroring
+        // `execute_bridge_request_observed` (#974): queue wait must not
+        // consume the answer deadline.
+        let response = match response_timeout {
+            Some(deadline) => {
+                match tokio::time::timeout(
+                    deadline,
+                    handle.wait_for_response(request_id, response_rx),
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        // Router entry still pending; router_guard stays ARMED
+                        // and removes it on this early return.
+                        if let Some(ref id) = upstream_request_id {
+                            self.unregister_upstream_request(id, connection_key);
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "bridge: no response for {} within {:?} (measured from send)",
+                                doc.uri, deadline
+                            ),
+                        ));
+                    }
+                }
+            }
+            None => handle.wait_for_response(request_id, response_rx).await,
+        };
         router_guard.disarm();
 
         if let Some(ref id) = upstream_request_id {

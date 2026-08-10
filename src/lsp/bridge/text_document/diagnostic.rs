@@ -30,6 +30,15 @@ use super::super::protocol::{
     response_has_jsonrpc_error, virtual_uri_to_lsp_uri,
 };
 
+/// How long a diagnostic pull may wait for the downstream's ANSWER, measured
+/// from send — after the request slot was granted and the request enqueued
+/// (#974). Queue wait deliberately doesn't count: under a many-region burst
+/// the tail used to time out on a healthy-but-saturated downstream (observed:
+/// ruff with 308 regions), and each such failure marked the refresh cycle
+/// incomplete, forcing a nudge that re-ran the burst.
+pub(in crate::lsp::bridge) const DIAGNOSTIC_RESPONSE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 impl LanguageServerPool {
     /// Send a diagnostic request and wait for the response.
     ///
@@ -91,7 +100,7 @@ impl LanguageServerPool {
             .map(|entry| entry.result_id.clone());
 
         let report = self
-            .execute_bridge_request_with_handle(
+            .execute_bridge_request_observed(
                 handle,
                 host_uri,
                 injection_language,
@@ -119,6 +128,8 @@ impl LanguageServerPool {
                     // failure; `null` clears the baseline and `unchanged` reuses it.
                     parse_downstream_diagnostic_report(response)
                 },
+                None,
+                Some(DIAGNOSTIC_RESPONSE_TIMEOUT),
             )
             .await?;
 

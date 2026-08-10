@@ -105,6 +105,7 @@ impl LanguageServerPool {
             build_request,
             transform_response,
             None,
+            None,
         )
         .await
     }
@@ -129,6 +130,7 @@ impl LanguageServerPool {
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
         downstream_id_probe: Option<&std::sync::OnceLock<RequestId>>,
+        response_timeout: Option<std::time::Duration>,
     ) -> io::Result<T> {
         // Route all per-connection state by this handle's pool key
         // `(server_name, root)` rather than a separately-threaded server name,
@@ -250,7 +252,41 @@ impl LanguageServerPool {
         // Wait for response via oneshot channel (no Mutex held) with timeout.
         // After this returns (success, channel-closed, or timeout),
         // the router entry has been consumed or cleaned up internally.
-        let response = handle.wait_for_response(request_id, response_rx).await;
+        //
+        // `response_timeout` starts HERE — after the request slot was granted
+        // and the request enqueued (#974). Measuring it from fan-out entry
+        // (as callers used to) made a burst's queue wait count against the
+        // deadline, so the tail of a burst timed out on a perfectly healthy
+        // downstream.
+        let response = match response_timeout {
+            Some(deadline) => {
+                match tokio::time::timeout(
+                    deadline,
+                    handle.wait_for_response(request_id, response_rx),
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        // wait_for_response's own cleanup branch never ran, so
+                        // the router entry is still pending; router_guard stays
+                        // ARMED and removes it on this early return.
+                        if let Some(ref id) = upstream_request_id {
+                            self.unregister_upstream_request(id, connection_key);
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "bridge: no response for {} within {:?} (measured from send)",
+                                virtual_uri.to_uri_string(),
+                                deadline
+                            ),
+                        ));
+                    }
+                }
+            }
+            None => handle.wait_for_response(request_id, response_rx).await,
+        };
         router_guard.disarm();
 
         // Unregister from the upstream request registry regardless of result
@@ -394,6 +430,7 @@ mod tests {
                 },
                 |_, _| (),
                 Some(&request_probe),
+                None,
             )
             .await
         });
@@ -554,6 +591,127 @@ mod tests {
                 request.abort();
             }
         }
+    }
+
+    /// The `response_timeout` clock starts from SEND, not from fan-out entry
+    /// (#974): a request parked on the request-slot semaphore for longer than
+    /// its whole deadline must still be sent once a slot frees, and only then
+    /// time out. Under the old caller-side wrap, a burst's queue wait counted
+    /// against the deadline and the tail died before ever reaching a
+    /// healthy-but-saturated downstream.
+    #[tokio::test]
+    async fn response_deadline_excludes_request_slot_queue_wait() {
+        use crate::lsp::bridge::actor::{ResponseRouter, spawn_reader_task};
+        use crate::lsp::bridge::connection::AsyncBridgeConnection;
+        use crate::lsp::bridge::pool::DynamicCapabilityRegistry;
+        use tokio::sync::mpsc;
+
+        const DEADLINE: std::time::Duration = std::time::Duration::from_millis(150);
+        // Longer than DEADLINE: the parked request outlives its whole answer
+        // budget while waiting for a slot.
+        const PARKED: std::time::Duration = std::time::Duration::from_millis(400);
+
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = test_host_uri("deadline-from-send");
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        // Capacity-1 sink connection: one request occupies the only slot
+        // forever (the sink never answers).
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("spawn sink");
+        let (writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+        let (tx, rx) = mpsc::channel(crate::lsp::bridge::actor::OUTBOUND_QUEUE_CAPACITY);
+        let handle = Arc::new(ConnectionHandle::with_state(
+            writer,
+            router,
+            reader_handle,
+            ConnectionState::Ready,
+            tx,
+            rx,
+            Arc::new(DynamicCapabilityRegistry::new()),
+            ConnectionKey::for_server("test-server"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            Arc::new(arc_swap::ArcSwapOption::empty()),
+            1,
+        ));
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        let (occupant, occupant_probe) = start_observed_request(
+            Arc::clone(&pool),
+            Arc::clone(&handle),
+            host_uri.clone(),
+            UpstreamId::Number(4_000),
+        );
+        wait_for_downstream_id(&occupant_probe).await;
+
+        // The deadlined request parks on the slot.
+        let probe = Arc::new(std::sync::OnceLock::new());
+        let request_probe = Arc::clone(&probe);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let handle = Arc::clone(&handle);
+            let host_uri = host_uri.clone();
+            tokio::spawn(async move {
+                pool.execute_bridge_request_observed(
+                    handle,
+                    &host_uri,
+                    "lua",
+                    TEST_ULID_LUA_0,
+                    &RegionOffset::new(0, 0),
+                    "print('hello')",
+                    Some(UpstreamId::Number(4_001)),
+                    |_, request_id| {
+                        JsonRpcRequest::new(
+                            request_id.as_i64(),
+                            "test/request",
+                            serde_json::Value::Null,
+                        )
+                    },
+                    |_, _| (),
+                    Some(&request_probe),
+                    Some(DEADLINE),
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(PARKED).await;
+        assert!(
+            !request.is_finished(),
+            "a parked request must not consume its answer deadline"
+        );
+        assert!(
+            probe.get().is_none(),
+            "the parked request must not have reached the downstream yet"
+        );
+
+        // Free the slot; the parked request must now be SENT, then time out
+        // on the (still silent) sink after its own full deadline.
+        let released_at = std::time::Instant::now();
+        occupant.abort();
+        let error = request
+            .await
+            .expect("request task must not panic")
+            .expect_err("the sink never answers, so the deadline must fire");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "error: {error}");
+        assert!(
+            probe.get().is_some(),
+            "the request must reach the downstream once a slot frees"
+        );
+        assert!(
+            released_at.elapsed() >= DEADLINE,
+            "the deadline must be measured from send, not from entry: \
+             elapsed {:?} < deadline {:?}",
+            released_at.elapsed(),
+            DEADLINE
+        );
     }
 
     /// The #974 user requirement, pinned directly: a connection saturated to
