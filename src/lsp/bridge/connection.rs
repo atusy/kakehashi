@@ -609,6 +609,61 @@ mod tests {
         assert_eq!(seen[2], "last");
     }
 
+    /// Invalid UTF-8 on stderr must not stop the drain: the drain is what
+    /// keeps the child's stderr pipe from filling up and blocking it, so it
+    /// must survive arbitrary bytes (a node crash dump, binary garbage) and
+    /// keep consuming to EOF. Bytes are decoded loss-tolerantly for the log.
+    #[tokio::test]
+    async fn drain_survives_invalid_utf8_and_keeps_draining() {
+        let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+        tokio::io::AsyncWriteExt::write_all(&mut tx, b"good\r\n\xFF\xFEgarbage\nafter\n")
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut seen = Vec::new();
+        let (emitted, total) = drain_stderr_lines(rx, |line| seen.push(line)).await;
+        assert_eq!((emitted, total), (3, 3), "all three lines are consumed");
+        assert_eq!(seen[0], "good", "CRLF line endings are stripped");
+        assert!(
+            seen[1].contains("garbage"),
+            "the invalid-UTF-8 line is decoded loss-tolerantly: {:?}",
+            seen[1]
+        );
+        assert_eq!(seen[2], "after", "draining continues past invalid UTF-8");
+    }
+
+    /// A newline-free stderr stream must not buffer beyond the per-line cap:
+    /// the drain reads fixed-size chunks and discards bytes past
+    /// [`STDERR_LOG_MAX_LINE_BYTES`] as they stream by, so a downstream that
+    /// spews an endless unterminated line costs bounded memory.
+    #[tokio::test]
+    async fn drain_caps_a_newline_free_line_without_buffering_it() {
+        let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            let chunk = [b'x'; 4096];
+            for _ in 0..64 {
+                tokio::io::AsyncWriteExt::write_all(&mut tx, &chunk)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut seen = Vec::new();
+        let (emitted, total) = drain_stderr_lines(rx, |line| seen.push(line)).await;
+        writer.await.unwrap();
+        assert_eq!((emitted, total), (1, 1), "one (unterminated) line");
+        assert!(
+            seen[0].ends_with('…'),
+            "the capped line is marked truncated"
+        );
+        assert!(
+            seen[0].len() <= STDERR_LOG_MAX_LINE_BYTES + '…'.len_utf8(),
+            "buffered bytes stay within the per-line cap: {}",
+            seen[0].len()
+        );
+    }
+
     #[tokio::test]
     async fn drain_keeps_reading_past_the_log_cap() {
         let (mut tx, rx) = tokio::io::duplex(64 * 1024);
