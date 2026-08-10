@@ -588,7 +588,7 @@ async fn drain_stderr_lines<R: tokio::io::AsyncRead + Unpin>(
             if byte == b'\n' {
                 total += 1;
                 if emitted < STDERR_LOG_MAX_LINES {
-                    emit(render_stderr_line(&line, overflowed));
+                    emit(render_capped_line(&line, overflowed));
                     emitted += 1;
                 }
                 line.clear();
@@ -604,18 +604,19 @@ async fn drain_stderr_lines<R: tokio::io::AsyncRead + Unpin>(
     if !line.is_empty() || overflowed {
         total += 1;
         if emitted < STDERR_LOG_MAX_LINES {
-            emit(render_stderr_line(&line, overflowed));
+            emit(render_capped_line(&line, overflowed));
             emitted += 1;
         }
     }
     (emitted, total)
 }
 
-/// Render one captured stderr line for the log: strip a trailing `'\r'`
-/// (CRLF), decode loss-tolerantly, and mark a byte-capped line with `'…'`
-/// (after dropping a trailing UTF-8 sequence the cap cut in half, so the
-/// truncation reads as one marker instead of U+FFFD noise).
-fn render_stderr_line(bytes: &[u8], overflowed: bool) -> String {
+/// Render one captured line of downstream output for a log or error message:
+/// strip a trailing `'\r'` (CRLF), decode loss-tolerantly, and mark a
+/// byte-capped line with `'…'` (after dropping a trailing UTF-8 sequence the
+/// cap cut in half, so the truncation reads as one marker instead of U+FFFD
+/// noise).
+fn render_capped_line(bytes: &[u8], overflowed: bool) -> String {
     let mut bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
     if overflowed {
         bytes = trim_partial_utf8_tail(bytes);
@@ -1019,4 +1020,5 @@ mod tests {
             .await
             .expect("should write initialized notification");
     }
+
 }
