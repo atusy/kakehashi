@@ -460,20 +460,21 @@ pub struct BridgeServerConfig {
     /// starts only when the request is actually sent — so a burst over many
     /// injection regions queues instead of timing out.
     ///
-    /// `None` = inherit (built-in default `8`, sized for the common
-    /// single-threaded event-loop server). Raise it for servers that answer
-    /// requests in parallel. Zero is rejected; the cap applies from the next
-    /// (re)spawn of the server.
+    /// `None` = inherit (built-in default `256` — a generous backstop).
+    /// Lower it per server when a downstream struggles under concurrent
+    /// load. Zero is rejected; the cap applies from the next (re)spawn of
+    /// the server.
     pub max_concurrent_requests: Option<std::num::NonZeroUsize>,
 }
 
 /// Built-in default for [`BridgeServerConfig::max_concurrent_requests`]
-/// (#974). Most downstreams (ruff, basedpyright, lua_ls) are effectively
-/// single-threaded event loops: a healthy ruff answered a 308-region burst in
-/// under 5 s (60+/s), so 8 concurrent requests with immediate refill lose no
-/// throughput — while an uncapped burst saturates the downstream and makes
-/// the response deadline meaningless (the tail times out while queued).
-pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
+/// (#974). Deliberately generous (maintainer decision): the default is a
+/// backstop against pathological pile-ups, not throughput tuning — most
+/// documents never approach it, and a server that struggles under load is
+/// tuned DOWN per server rather than throttling everyone by default. The
+/// answer deadline being measured from send (not queue entry) is what
+/// actually defuses burst timeouts.
+pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 256;
 
 impl BridgeServerConfig {
     /// Effective `prefer_shared_instance` preference, resolving the inherit
