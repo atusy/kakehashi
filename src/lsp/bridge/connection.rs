@@ -237,10 +237,11 @@ impl<R: AsyncRead + Unpin> BridgeReader<R> {
     /// Parses headers until empty line, extracts Content-Length, and returns the body bytes.
     /// Handles multiple headers and different header orders per LSP spec.
     ///
-    /// Cancel-safe. Only `fill_buf` is awaited — tokio guarantees a dropped
-    /// `fill_buf` consumed nothing — and every byte taken out of the buffer is
-    /// recorded in `self.frame` before the next await. Cancelling this future
-    /// therefore loses no input, and the next call resumes mid-frame.
+    /// Cancel-safe. The only awaits are `fill_buf` and, on the large-body fast
+    /// path, `read_buf`; tokio documents both as consuming nothing when dropped.
+    /// Every byte they do take is recorded in `self.frame` before the next
+    /// await, so cancelling this future loses no input and the next call
+    /// resumes mid-frame.
     ///
     /// That matters because the reader task awaits this as a `tokio::select!`
     /// branch: `read_line`/`read_exact` would discard a partly-read frame on
@@ -265,14 +266,13 @@ impl<R: AsyncRead + Unpin> BridgeReader<R> {
                 // nothing when it returns Pending, and body.len() remains the
                 // resume marker.
                 //
-                // `take` bounds the read to this frame. It is deliberately
-                // forward-looking: today `Vec::with_capacity` returns an exact
-                // fit, so read_buf could not overshoot anyway (removing the cap
-                // keeps every test green). But the contract only promises *at
-                // least* the requested capacity, so a pooled or rounded-up buffer
-                // would silently read the next frame's header into this body —
-                // the exact desync this module exists to prevent. The cap makes
-                // that impossible by construction rather than by luck.
+                // `take` bounds the read to this frame. `Vec::with_capacity`
+                // happens to return an exact fit today, but the contract only
+                // promises *at least* the requested capacity, so a pooled or
+                // rounded-up buffer would let read_buf pull the next frame's
+                // header into this body — the exact desync this module exists to
+                // prevent. `a_large_body_with_spare_capacity_still_stops_at_the_frame_end`
+                // seeds that surplus capacity and fails if this cap is removed.
                 let read = (&mut *stdout.get_mut())
                     .take(body.remaining)
                     .read_buf(body.buf)
