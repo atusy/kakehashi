@@ -422,7 +422,7 @@ pub struct BridgeServerConfig {
     /// `settings`, the server may never read them. Adding capabilities the
     /// editor or kakehashi cannot actually handle may invite downstream
     /// requests that fail; reducing capabilities is safe apart from the
-    /// protected field. Consumed only at `initialize` time — a change
+    /// protected fields. Consumed only at `initialize` time — a change
     /// relaunches this server's connections on the next config reload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_capabilities: Option<Value>,
