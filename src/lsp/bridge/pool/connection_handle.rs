@@ -351,7 +351,14 @@ impl ConnectionHandle {
     ) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
         // Fast path: a free slot needs no clock read.
         match Arc::clone(&self.request_permits).try_acquire_owned() {
-            Ok(permit) => return Ok(permit),
+            Ok(permit) => {
+                // See the router check below — the derived terminal state
+                // must reject the fast path too.
+                if !self.router.is_accepting() {
+                    return Err(closed_request_slots_error());
+                }
+                return Ok(permit);
+            }
             Err(tokio::sync::TryAcquireError::Closed) => {
                 return Err(closed_request_slots_error());
             }
@@ -362,6 +369,13 @@ impl ConnectionHandle {
             .acquire_owned()
             .await
             .map_err(|_| closed_request_slots_error())?;
+        // A reader-death terminal state is DERIVED (`state()` reads
+        // `!router.is_accepting()`; no `set_state` runs, so no semaphore
+        // close): a permit granted on such a connection is a permit to fail
+        // at register — reject here with the uniform error instead.
+        if !self.router.is_accepting() {
+            return Err(closed_request_slots_error());
+        }
         let waited = parked_at.elapsed();
         if waited >= BACKPRESSURE_LOG_THRESHOLD {
             // Saturation must not be an invisible wait: this is the signal
