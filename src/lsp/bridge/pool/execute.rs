@@ -468,6 +468,86 @@ mod tests {
             .await;
     }
 
+    /// The per-connection in-flight cap (#974): with `cap + 1` concurrent
+    /// requests against one connection, only `cap` may reach the downstream
+    /// (observable via the downstream-id probe — publishing the id means the
+    /// request got past the permit gate). The extra request parks until a
+    /// permit frees (here: an in-flight request is aborted), then proceeds.
+    /// The backing process is a sink that never answers, so in-flight
+    /// requests stay in flight for the whole test.
+    #[tokio::test]
+    async fn requests_beyond_the_in_flight_cap_park_until_a_permit_frees() {
+        let cap = crate::lsp::bridge::pool::DEFAULT_MAX_CONCURRENT_REQUESTS;
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = test_host_uri("in-flight-cap");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("test-server"),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        let mut requests = Vec::new();
+        let mut probes = Vec::new();
+        for i in 0..(cap + 1) {
+            let (request, probe) = start_observed_request(
+                Arc::clone(&pool),
+                Arc::clone(&handle),
+                host_uri.clone(),
+                UpstreamId::Number(1_000 + i as i64),
+            );
+            requests.push(request);
+            probes.push(probe);
+        }
+
+        let published = |probes: &[Arc<std::sync::OnceLock<RequestId>>]| {
+            probes.iter().filter(|p| p.get().is_some()).count()
+        };
+
+        // Exactly `cap` requests get a permit and publish their downstream id.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while published(&probes) < cap {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the first `cap` requests should reach the downstream");
+
+        // The extra request must PARK: give it real time to (wrongly) proceed.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            published(&probes),
+            cap,
+            "request cap+1 must wait for a permit, not reach the downstream"
+        );
+
+        // Freeing one permit (aborting an in-flight request) unparks it.
+        let mut aborted_index = None;
+        for (i, probe) in probes.iter().enumerate() {
+            if probe.get().is_some() {
+                requests[i].abort();
+                aborted_index = Some(i);
+                break;
+            }
+        }
+        let aborted_index = aborted_index.expect("some request was in flight");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while published(&probes) < cap + 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the parked request should proceed once a permit frees");
+
+        for (i, request) in requests.iter().enumerate() {
+            if i != aborted_index {
+                request.abort();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn host_close_waits_for_request_enqueue_guard() {
         let pool = Arc::new(LanguageServerPool::new());

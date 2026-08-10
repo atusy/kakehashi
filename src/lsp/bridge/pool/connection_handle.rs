@@ -81,6 +81,15 @@ pub(crate) enum NotificationSendResult {
 /// (`Closing`/`Failed` → `Closed`, terminal). FIFO writes flow `tx` → writer
 /// task → stdin; the reader task pushes incoming responses through `router` to
 /// oneshot waiters so callers can await without holding any Mutex.
+/// Default cap on concurrent in-flight requests per connection (#974).
+///
+/// Most downstreams (ruff, basedpyright, lua_ls) are effectively
+/// single-threaded event loops: a healthy ruff answered a 308-region burst in
+/// under 5 s (60+/s), so 8 concurrent requests with immediate refill lose no
+/// throughput — while an uncapped burst saturates the downstream and makes
+/// the response deadline meaningless (the tail times out while queued).
+pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
+
 pub(crate) struct ConnectionHandle {
     /// Connection state - uses std::sync::RwLock for fast, synchronous state checks
     state: std::sync::RwLock<ConnectionState>,

@@ -31,7 +31,9 @@ pub(crate) use connection_action::BridgeError;
 use connection_action::{ConnectionAction, decide_connection_action};
 use handshake::perform_lsp_handshake;
 
-pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
+pub(crate) use connection_handle::{
+    ConnectionHandle, DEFAULT_MAX_CONCURRENT_REQUESTS, NotificationSendResult,
+};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
 use document_tracker::DocumentTracker;
