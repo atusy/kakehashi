@@ -7736,6 +7736,38 @@ mod tests {
         assert!(same_launch_config(&inherited, &explicit));
     }
 
+    /// The one production line that makes `maxConcurrentRequests` real is
+    /// the spawn site passing `effective_max_concurrent_requests()` into the
+    /// semaphore — pin it end-to-end: a connection spawned from a cap-1
+    /// config must park the second acquisition (#974). Every other cap test
+    /// constructs its handle directly, so without this a regression to a
+    /// hardcoded default would stay green.
+    #[tokio::test]
+    async fn spawned_connection_is_capped_by_the_configured_max_concurrent_requests() {
+        if !is_lua_ls_available() {
+            return;
+        }
+        let pool = LanguageServerPool::new();
+        let mut config = lua_ls_config();
+        config.max_concurrent_requests = std::num::NonZeroUsize::new(1);
+
+        let handle = pool
+            .get_or_create_connection("capped", &config, None)
+            .await
+            .expect("spawn should succeed");
+
+        let _held = handle
+            .acquire_request_slot()
+            .await
+            .expect("the configured slot acquires");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), handle.acquire_request_slot())
+                .await
+                .is_err(),
+            "maxConcurrentRequests = 1 must park the second acquisition"
+        );
+    }
+
     /// The request-slot semaphore is sized at spawn, so a changed
     /// `maxConcurrentRequests` must read as a different launch config (and
     /// respawn the process on reload); an explicit value equal to the
