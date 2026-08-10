@@ -1530,6 +1530,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
 
@@ -1562,6 +1563,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled: None,
             settings: None,
+            max_concurrent_requests: None,
         };
         let mut servers = HashMap::new();
         servers.insert("ruff".to_string(), server("python"));
@@ -1613,6 +1615,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
         servers.insert(
@@ -1627,6 +1630,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
         let settings = Arc::new(WorkspaceSettings {
@@ -1685,6 +1689,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
         let settings = Arc::new(WorkspaceSettings {
@@ -1733,6 +1738,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled: None,
             settings: None,
+            max_concurrent_requests: None,
         };
         let mut servers = HashMap::new();
         servers.insert("ruff".to_string(), server("ruff"));
@@ -1898,6 +1904,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
 
@@ -1940,6 +1947,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
         servers.insert(
@@ -1953,6 +1961,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
 
@@ -2013,6 +2022,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: Some(false),
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
         servers.insert(
@@ -2026,6 +2036,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
 
@@ -2083,6 +2094,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: Some(false),
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
         servers.insert(
@@ -2096,6 +2108,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: Some(true),
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
 
@@ -2133,6 +2146,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
         servers.insert(
@@ -2146,6 +2160,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
 
@@ -2521,6 +2536,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
 
@@ -2559,6 +2575,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
 
@@ -2678,6 +2695,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
 
@@ -2904,6 +2922,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
 

@@ -56,6 +56,7 @@ pub(in crate::lsp::bridge) fn lua_ls_config() -> BridgeServerConfig {
         prefer_shared_instance: None,
         enabled: None,
         settings: None,
+        max_concurrent_requests: None,
     }
 }
 
@@ -80,6 +81,7 @@ pub(in crate::lsp::bridge) fn devnull_config_for_language(language: &str) -> Bri
         prefer_shared_instance: None,
         enabled: None,
         settings: None,
+        max_concurrent_requests: None,
     }
 }
 
@@ -208,6 +210,7 @@ pub(in crate::lsp::bridge) async fn create_handle_with_state_and_pid_keyed(
         key,
         crate::lsp::bridge::WorkspaceFolderSet::new(None),
         std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+        crate::lsp::bridge::pool::DEFAULT_MAX_CONCURRENT_REQUESTS,
     ));
     (handle, pid)
 }

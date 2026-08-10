@@ -861,6 +861,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled: None,
             settings: None,
+            max_concurrent_requests: None,
         };
 
         // Only the built-in `_` defaults entry (empty cmd): not runnable.
@@ -897,6 +898,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled,
             settings: None,
+            max_concurrent_requests: None,
         };
 
         // Directly disabled: not a willSave consumer even with a real cmd.

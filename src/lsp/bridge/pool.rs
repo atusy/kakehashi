@@ -77,6 +77,7 @@ fn same_launch_config(
         on_type_formatting_triggers: old_on_type_formatting_triggers,
         prefer_shared_instance: _,
         enabled: _,
+        max_concurrent_requests: _,
     } = old;
     let BridgeServerConfig {
         cmd: new_cmd,
@@ -87,6 +88,7 @@ fn same_launch_config(
         on_type_formatting_triggers: new_on_type_formatting_triggers,
         prefer_shared_instance: _,
         enabled: _,
+        max_concurrent_requests: _,
     } = new;
     old_cmd == new_cmd
         && old_languages == new_languages
@@ -95,6 +97,9 @@ fn same_launch_config(
         && old_on_type_formatting_triggers == new_on_type_formatting_triggers
         && old.prefers_shared_instance() == new.prefers_shared_instance()
         && old.is_enabled() == new.is_enabled()
+        // The request-slot semaphore is created at spawn time, so a changed
+        // cap needs a fresh process to take effect (#974).
+        && old.effective_max_concurrent_requests() == new.effective_max_concurrent_requests()
 }
 
 fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHandle>) {
@@ -2622,6 +2627,7 @@ impl LanguageServerPool {
             connection_key.clone(),
             workspace_folders,
             settings_cell,
+            server_config.effective_max_concurrent_requests(),
         ));
         handle.record_launch_config(server_config);
 
@@ -4295,6 +4301,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled: None,
             settings: None,
+            max_concurrent_requests: None,
         };
 
         let result = pool
@@ -5676,6 +5683,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            crate::lsp::bridge::pool::DEFAULT_MAX_CONCURRENT_REQUESTS,
         ));
 
         // Add connection to pool
@@ -7726,6 +7734,27 @@ mod tests {
             ..Default::default()
         };
         assert!(same_launch_config(&inherited, &explicit));
+    }
+
+    /// The request-slot semaphore is sized at spawn, so a changed
+    /// `maxConcurrentRequests` must read as a different launch config (and
+    /// respawn the process on reload); an explicit value equal to the
+    /// built-in default must NOT (#974).
+    #[test]
+    fn launch_config_compares_request_cap_by_effective_value() {
+        let inherited = crate::config::settings::BridgeServerConfig::default();
+        let explicit_default = crate::config::settings::BridgeServerConfig {
+            max_concurrent_requests: std::num::NonZeroUsize::new(
+                crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS,
+            ),
+            ..Default::default()
+        };
+        let raised = crate::config::settings::BridgeServerConfig {
+            max_concurrent_requests: std::num::NonZeroUsize::new(32),
+            ..Default::default()
+        };
+        assert!(same_launch_config(&inherited, &explicit_default));
+        assert!(!same_launch_config(&inherited, &raised));
     }
 
     #[tokio::test]

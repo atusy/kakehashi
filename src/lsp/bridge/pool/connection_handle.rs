@@ -81,14 +81,12 @@ pub(crate) enum NotificationSendResult {
 /// (`Closing`/`Failed` → `Closed`, terminal). FIFO writes flow `tx` → writer
 /// task → stdin; the reader task pushes incoming responses through `router` to
 /// oneshot waiters so callers can await without holding any Mutex.
-/// Default cap on concurrent in-flight requests per connection (#974).
-///
-/// Most downstreams (ruff, basedpyright, lua_ls) are effectively
-/// single-threaded event loops: a healthy ruff answered a 308-region burst in
-/// under 5 s (60+/s), so 8 concurrent requests with immediate refill lose no
-/// throughput — while an uncapped burst saturates the downstream and makes
-/// the response deadline meaningless (the tail times out while queued).
-pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
+/// The built-in in-flight request cap lives with the config knob it backs
+/// ([`crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS`]); production
+/// code passes a resolved capacity into [`ConnectionHandle::with_state`], so
+/// the alias below is only for tests.
+#[cfg(test)]
+pub(crate) use crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS;
 
 pub(crate) struct ConnectionHandle {
     /// Connection state - uses std::sync::RwLock for fast, synchronous state checks
@@ -187,6 +185,7 @@ impl ConnectionHandle {
             ConnectionKey::for_server("test"),
             WorkspaceFolderSet::new(None),
             Arc::new(arc_swap::ArcSwapOption::empty()),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         )
     }
 
@@ -205,6 +204,7 @@ impl ConnectionHandle {
         connection_key: ConnectionKey,
         workspace_folders: WorkspaceFolderSet,
         settings: Arc<arc_swap::ArcSwapOption<serde_json::Value>>,
+        max_concurrent_requests: usize,
     ) -> Self {
         use crate::lsp::bridge::actor::spawn_writer_task;
 
@@ -229,7 +229,7 @@ impl ConnectionHandle {
             incapable_fallback_logged: AtomicBool::new(false),
             settings,
             launch_config: OnceLock::new(),
-            request_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+            request_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests)),
         }
     }
 
@@ -265,6 +265,7 @@ impl ConnectionHandle {
             on_type_formatting_triggers: config.on_type_formatting_triggers.clone(),
             prefer_shared_instance: config.prefer_shared_instance,
             enabled: config.enabled,
+            max_concurrent_requests: config.max_concurrent_requests,
         };
         let _ = self.launch_config.set(snapshot);
     }
@@ -1047,6 +1048,56 @@ mod tests {
         Arc::new(DynamicCapabilityRegistry::new())
     }
 
+    /// The configured `maxConcurrentRequests` sizes the request-slot
+    /// semaphore (#974): with capacity 1, a second acquisition pends until
+    /// the first permit drops.
+    #[tokio::test]
+    async fn with_state_honors_the_configured_request_cap() {
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("spawn sink");
+        let (writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+        let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let handle = ConnectionHandle::with_state(
+            writer,
+            router,
+            reader_handle,
+            ConnectionState::Ready,
+            tx,
+            rx,
+            default_dynamic_caps(),
+            ConnectionKey::for_server("capped"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            Arc::new(arc_swap::ArcSwapOption::empty()),
+            1,
+        );
+
+        let first = handle
+            .acquire_request_slot()
+            .await
+            .expect("first slot acquires");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                handle.acquire_request_slot()
+            )
+            .await
+            .is_err(),
+            "second acquisition must pend at capacity 1"
+        );
+        drop(first);
+        let _reacquired = handle
+            .acquire_request_slot()
+            .await
+            .expect("slot frees once the permit drops");
+    }
+
     /// The settings cell stored on the handle is the *same* `Arc` the reader's
     /// `ServerRequestDeps` clones, so a path-c `store_settings` is observable by a
     /// path-b pull (downstream-settings-propagation).
@@ -1080,6 +1131,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             Arc::clone(&cell),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         );
 
         assert!(handle.current_settings().is_none(), "starts empty");
@@ -1234,6 +1286,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         ));
 
         // Verify initial state is Ready
@@ -1310,6 +1363,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         ));
 
         // Register a request to start the liveness timer
@@ -1370,6 +1424,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         ));
 
         // Register a request - this should NOT start the liveness timer
@@ -1437,6 +1492,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         ));
 
         // Register first request - this starts the liveness timer
@@ -1532,6 +1588,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         );
 
         // Register a request with upstream ID
@@ -1576,6 +1633,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         );
 
         // Register without upstream ID
@@ -1619,6 +1677,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         );
 
         // Should return immediately
@@ -1654,6 +1713,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         ));
 
         // Spawn a task that will transition to Ready after a delay
@@ -1697,6 +1757,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         ));
 
         let waiter = tokio::spawn({
@@ -1747,6 +1808,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         ));
 
         // Spawn a task that will transition to Failed
@@ -1795,6 +1857,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         );
 
         // Wait with short timeout - should timeout
@@ -1832,6 +1895,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            DEFAULT_MAX_CONCURRENT_REQUESTS,
         ));
 
         // Spawn a task that will transition to Closing

@@ -1,5 +1,6 @@
 ---
 source: src/config/settings.rs
+assertion_line: 1909
 expression: settings.language_servers
 ---
 {
@@ -15,7 +16,8 @@ expression: settings.language_servers
     "workspaceMarkers": null,
     "onTypeFormattingTriggers": null,
     "preferSharedInstance": null,
-    "enabled": null
+    "enabled": null,
+    "maxConcurrentRequests": null
   },
   "rust-analyzer": {
     "cmd": [
@@ -28,6 +30,7 @@ expression: settings.language_servers
     "workspaceMarkers": null,
     "onTypeFormattingTriggers": null,
     "preferSharedInstance": null,
-    "enabled": null
+    "enabled": null,
+    "maxConcurrentRequests": null
   }
 }

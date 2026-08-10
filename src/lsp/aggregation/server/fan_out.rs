@@ -145,6 +145,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             }),
         }
     }

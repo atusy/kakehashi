@@ -1,6 +1,6 @@
 ---
 source: src/config/merge.rs
-assertion_line: 871
+assertion_line: 878
 expression: result
 ---
 {
@@ -86,7 +86,8 @@ expression: result
       "workspaceMarkers": null,
       "onTypeFormattingTriggers": null,
       "preferSharedInstance": null,
-      "enabled": null
+      "enabled": null,
+      "maxConcurrentRequests": null
     },
     "pyright": {
       "cmd": [
@@ -100,7 +101,8 @@ expression: result
       "workspaceMarkers": null,
       "onTypeFormattingTriggers": null,
       "preferSharedInstance": null,
-      "enabled": null
+      "enabled": null,
+      "maxConcurrentRequests": null
     },
     "rust-analyzer": {
       "cmd": [
@@ -118,7 +120,8 @@ expression: result
       "workspaceMarkers": null,
       "onTypeFormattingTriggers": null,
       "preferSharedInstance": null,
-      "enabled": null
+      "enabled": null,
+      "maxConcurrentRequests": null
     }
   }
 }

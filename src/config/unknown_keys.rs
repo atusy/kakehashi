@@ -45,6 +45,7 @@ pub(crate) const KNOWN_BRIDGE_SERVER_SETTING_KEYS: &[&str] = &[
     "enabled",
     "initializationOptions",
     "languages",
+    "maxConcurrentRequests",
     "onTypeFormattingTriggers",
     "preferSharedInstance",
     "rootMarkers",

@@ -131,6 +131,11 @@ pub(crate) fn merge_bridge_server_configs(
         // concrete server's explicit `enabled` overrides the wildcard, so
         // `_.enabled: false` can be opted back into per server.
         enabled: overlay.enabled.or(base.enabled),
+        // Overlay-wins-when-present, mirroring `enabled`: a concrete server's
+        // explicit `maxConcurrentRequests` overrides the wildcard (#974).
+        max_concurrent_requests: overlay
+            .max_concurrent_requests
+            .or(base.max_concurrent_requests),
     }
 }
 
@@ -725,6 +730,7 @@ mod tests {
                         prefer_shared_instance: None,
                         enabled: None,
                         settings: None,
+                        max_concurrent_requests: None,
                     },
                 ),
                 (
@@ -738,6 +744,7 @@ mod tests {
                         prefer_shared_instance: None,
                         enabled: None,
                         settings: None,
+                        max_concurrent_requests: None,
                     },
                 ),
             ])),
@@ -808,6 +815,7 @@ mod tests {
                         prefer_shared_instance: None,
                         enabled: None,
                         settings: None,
+                        max_concurrent_requests: None,
                     },
                 ),
                 (
@@ -825,6 +833,7 @@ mod tests {
                         prefer_shared_instance: None,
                         enabled: None,
                         settings: None,
+                        max_concurrent_requests: None,
                     },
                 ),
             ])),
@@ -890,6 +899,7 @@ mod tests {
                     prefer_shared_instance: None,
                     enabled: None,
                     settings: None,
+                    max_concurrent_requests: None,
                 },
             )])),
             ..Default::default()
@@ -1281,6 +1291,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1299,6 +1310,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1318,6 +1330,7 @@ mod tests {
                     prefer_shared_instance: None,
                     enabled: None,
                     settings: None,
+                    max_concurrent_requests: None,
                 },
             ),
             (
@@ -1331,6 +1344,7 @@ mod tests {
                     prefer_shared_instance: None,
                     enabled: None,
                     settings: None,
+                    max_concurrent_requests: None,
                 },
             ),
         ]);
@@ -1362,6 +1376,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled: None,
             settings: None,
+            max_concurrent_requests: None,
         };
 
         // Unset overlay inherits from base (wildcard default applies)
@@ -1374,6 +1389,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled: None,
             settings: None,
+            max_concurrent_requests: None,
         };
         let merged = merge_bridge_server_configs(&base, &inheriting);
         assert_eq!(
@@ -1419,6 +1435,7 @@ mod tests {
             prefer_shared_instance: prefer,
             settings: None,
             enabled: None,
+            max_concurrent_requests: None,
         };
 
         // Unset overlay inherits the base (wildcard) value.
@@ -1444,6 +1461,35 @@ mod tests {
         );
     }
 
+    /// `maxConcurrentRequests` merges overlay-wins-when-present, exactly like
+    /// `enabled`: a wildcard `_` cap applies to every server, and a concrete
+    /// server's explicit value overrides it (#974).
+    #[test]
+    fn test_merge_bridge_server_configs_max_concurrent_requests() {
+        use settings::BridgeServerConfig;
+
+        let server = |cap: Option<usize>| BridgeServerConfig {
+            max_concurrent_requests: cap.and_then(std::num::NonZeroUsize::new),
+            ..Default::default()
+        };
+
+        let base = server(Some(4));
+        assert_eq!(
+            merge_bridge_server_configs(&base, &server(None))
+                .max_concurrent_requests
+                .map(|n| n.get()),
+            Some(4),
+            "unset overlay inherits the wildcard cap"
+        );
+        assert_eq!(
+            merge_bridge_server_configs(&base, &server(Some(32)))
+                .max_concurrent_requests
+                .map(|n| n.get()),
+            Some(32),
+            "explicit overlay overrides the wildcard cap"
+        );
+    }
+
     /// `enabled` merges overlay-wins-when-present, exactly like
     /// `prefer_shared_instance`, so a `languageServers._.enabled: false` can
     /// disable every server by default while a concrete server opts back in
@@ -1461,6 +1507,7 @@ mod tests {
             prefer_shared_instance: None,
             settings: None,
             enabled,
+            max_concurrent_requests: None,
         };
 
         // Unset overlay inherits the base (wildcard) value.
@@ -1510,6 +1557,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled: None,
             settings: None,
+            max_concurrent_requests: None,
         };
         let overlay = BridgeServerConfig {
             cmd: Some(vec!["rust-analyzer".to_string()]),
@@ -1524,6 +1572,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled: None,
             settings: None,
+            max_concurrent_requests: None,
         };
 
         let resolved = merge_bridge_server_configs(&base, &overlay);
@@ -1614,6 +1663,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled: None,
             settings: None,
+            max_concurrent_requests: None,
         };
 
         let base = server(Some(vec!["}"]));
@@ -1767,6 +1817,7 @@ mod tests {
                     prefer_shared_instance: None,
                     enabled: None,
                     settings: None,
+                    max_concurrent_requests: None,
                 },
             ),
             // rust-analyzer: only specifies cmd and languages
@@ -1781,6 +1832,7 @@ mod tests {
                     prefer_shared_instance: None,
                     enabled: None,
                     settings: None,
+                    max_concurrent_requests: None,
                 },
             ),
         ]);
@@ -1822,6 +1874,7 @@ mod tests {
                     prefer_shared_instance: None,
                     enabled: None,
                     settings: None,
+                    max_concurrent_requests: None,
                 },
             ),
             // rust-analyzer: specifies only cmd, inherits languages from wildcard
@@ -1836,6 +1889,7 @@ mod tests {
                     prefer_shared_instance: None,
                     enabled: None,
                     settings: None,
+                    max_concurrent_requests: None,
                 },
             ),
         ]);
@@ -2180,6 +2234,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled,
             settings: None,
+            max_concurrent_requests: None,
         };
 
         let full_resolution = |servers: &HashMap<String, settings::BridgeServerConfig>,

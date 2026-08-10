@@ -98,6 +98,12 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
             // disables every server by default; a concrete server can then
             // opt back in individually with its own `enabled: true`.
             enabled: Some(true),
+            // Spell out the built-in in-flight request cap (#974) so the
+            // template documents the knob; parallel-capable servers can
+            // raise it per server.
+            max_concurrent_requests: std::num::NonZeroUsize::new(
+                crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS,
+            ),
         },
     )])
 }

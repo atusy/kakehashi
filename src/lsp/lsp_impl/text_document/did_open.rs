@@ -563,6 +563,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
         server.settings_manager.apply_settings(WorkspaceSettings {
@@ -657,6 +658,7 @@ print("hello")
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         );
         let mut languages = HashMap::new();

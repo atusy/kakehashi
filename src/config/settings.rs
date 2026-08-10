@@ -454,13 +454,40 @@ pub struct BridgeServerConfig {
     /// the wildcard, so `_.enabled: false` can disable every server by
     /// default while individual servers opt back in with `enabled: true`.
     pub enabled: Option<bool>,
+    /// Cap on concurrent in-flight requests kakehashi keeps open to this
+    /// server (per spawned connection). Requests beyond the cap wait for a
+    /// slot instead of piling onto the server, and the response deadline
+    /// starts only when the request is actually sent — so a burst over many
+    /// injection regions queues instead of timing out.
+    ///
+    /// `None` = inherit (built-in default `8`, sized for the common
+    /// single-threaded event-loop server). Raise it for servers that answer
+    /// requests in parallel. Zero is rejected; the cap applies from the next
+    /// (re)spawn of the server.
+    pub max_concurrent_requests: Option<std::num::NonZeroUsize>,
 }
+
+/// Built-in default for [`BridgeServerConfig::max_concurrent_requests`]
+/// (#974). Most downstreams (ruff, basedpyright, lua_ls) are effectively
+/// single-threaded event loops: a healthy ruff answered a 308-region burst in
+/// under 5 s (60+/s), so 8 concurrent requests with immediate refill lose no
+/// throughput — while an uncapped burst saturates the downstream and makes
+/// the response deadline meaningless (the tail times out while queued).
+pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
 
 impl BridgeServerConfig {
     /// Effective `prefer_shared_instance` preference, resolving the inherit
     /// (`None`) case to the built-in default `false` (per-root instances).
     pub(crate) fn prefers_shared_instance(&self) -> bool {
         self.prefer_shared_instance.unwrap_or(false)
+    }
+
+    /// Effective in-flight request cap, resolving the inherit (`None`) case
+    /// to [`DEFAULT_MAX_CONCURRENT_REQUESTS`].
+    pub(crate) fn effective_max_concurrent_requests(&self) -> usize {
+        self.max_concurrent_requests
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS)
     }
 
     /// Effective `enabled` state, resolving the inherit (`None`) case to the
@@ -1894,6 +1921,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled,
             settings: None,
+            max_concurrent_requests: None,
         };
 
         // Own cmd and enabled, no wildcard needed.
@@ -1946,6 +1974,50 @@ mod tests {
         assert_eq!(
             servers["pyright"].prefer_shared_instance, None,
             "absent preferSharedInstance parses as None (inherit -> per-root)"
+        );
+    }
+
+    #[test]
+    fn should_parse_max_concurrent_requests() {
+        let config_json = r#"{
+            "languageServers": {
+                "ruff": {
+                    "cmd": ["ruff", "server"],
+                    "languages": ["python"],
+                    "maxConcurrentRequests": 4
+                },
+                "pyright": {
+                    "cmd": ["pyright-langserver", "--stdio"],
+                    "languages": ["python"]
+                }
+            }
+        }"#;
+
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
+        let servers = settings.language_servers.expect("languageServers parses");
+        assert_eq!(
+            servers["ruff"].max_concurrent_requests.map(|n| n.get()),
+            Some(4),
+            "explicit maxConcurrentRequests is preserved"
+        );
+        assert_eq!(
+            servers["pyright"].max_concurrent_requests, None,
+            "absent maxConcurrentRequests parses as None (inherit -> default)"
+        );
+    }
+
+    /// `maxConcurrentRequests = 0` would mean "never send any request" — a
+    /// config foot-gun, rejected at parse time by the NonZero type.
+    #[test]
+    fn zero_max_concurrent_requests_is_a_parse_error() {
+        let config_json = r#"{
+            "languageServers": {
+                "ruff": { "cmd": ["ruff", "server"], "maxConcurrentRequests": 0 }
+            }
+        }"#;
+        assert!(
+            serde_json::from_str::<RawWorkspaceSettings>(config_json).is_err(),
+            "zero must be rejected, not silently accepted"
         );
     }
 
@@ -2019,6 +2091,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled: None,
             settings: None,
+            max_concurrent_requests: None,
         };
         let servers = HashMap::from([
             ("a".to_string(), server(Some(vec!["}", ";"]))),
@@ -2058,6 +2131,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled,
             settings: None,
+            max_concurrent_requests: None,
         };
 
         // A disabled server's own trigger never spawns anything, so it must
@@ -2142,6 +2216,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         )]);
         assert_eq!(
@@ -2165,6 +2240,7 @@ mod tests {
                 prefer_shared_instance: None,
                 enabled: None,
                 settings: None,
+                max_concurrent_requests: None,
             },
         )]);
         assert_eq!(
@@ -2343,6 +2419,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled: None,
             settings: None,
+            max_concurrent_requests: None,
         };
 
         let json = serde_json::to_value(&config).unwrap();
