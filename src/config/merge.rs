@@ -1663,7 +1663,6 @@ mod tests {
         use settings::BridgeServerConfig;
 
         let with_settings = BridgeServerConfig {
-            client_capabilities: None,
             settings: Some(json!({ "Lua": { "diagnostics": { "globals": ["vim"] } } })),
             ..Default::default()
         };
