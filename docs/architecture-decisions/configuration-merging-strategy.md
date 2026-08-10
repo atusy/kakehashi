@@ -232,7 +232,7 @@ silently shadow every user-supplied top-level opt-out.
 
 **Bridge servers HashMap** (`languageServers`):
 - **Deep merge at server level**: Keys (server names) from later sources override same keys from earlier sources
-- **Deep merge within each server**: Individual fields (`cmd`, `languages`, `initializationOptions`, `settings`, `onTypeFormattingTriggers`) are merged (JSON-object fields `initializationOptions` and `settings` deep-merge; list options like `onTypeFormattingTriggers` are overlay-wins-when-present, not unioned). `settings` carries downstream workspace configuration propagated post-initialize — see downstream-settings-propagation.
+- **Deep merge within each server**: Individual fields (`cmd`, `languages`, `initializationOptions`, `settings`, `clientCapabilities`, `onTypeFormattingTriggers`) are merged (JSON-object fields `initializationOptions`, `settings`, and `clientCapabilities` deep-merge; list options like `onTypeFormattingTriggers` are overlay-wins-when-present, not unioned). `settings` carries downstream workspace configuration propagated post-initialize — see downstream-settings-propagation. `clientCapabilities` overrides the capabilities the bridge advertises to the server — see ls-bridge-client-capabilities-override.
 - Example:
   ```toml
   # user config
