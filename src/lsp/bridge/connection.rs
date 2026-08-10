@@ -1313,6 +1313,40 @@ mod tests {
         assert_eq!(reader.read_message_bytes().await.unwrap(), small);
     }
 
+    /// The same guarantee when the body buffer has spare capacity beyond the
+    /// frame's length.
+    ///
+    /// `Vec::with_capacity` happens to return an exact fit today, so the test
+    /// above passes even with the read's `take` cap removed. Seeding a body
+    /// with surplus capacity — what a pooled or rounded-up buffer would give —
+    /// makes the cap the only thing standing between the direct read and the
+    /// next frame's header, so this test fails if it is ever dropped.
+    #[tokio::test]
+    async fn a_large_body_with_spare_capacity_still_stops_at_the_frame_end() {
+        let big = vec![b'x'; 100 * 1024];
+        let small = br#"{"id":2}"#;
+
+        let (mut tx, mut reader) = duplex_reader();
+        // Resume as if the header had just been parsed, but hand the body a
+        // buffer four times larger than the frame.
+        reader.frame = FrameParseState {
+            content_length: Some(big.len()),
+            body: Some(Vec::with_capacity(big.len() * 4)),
+            started: true,
+            ..FrameParseState::default()
+        };
+
+        let mut stream = big.clone();
+        stream.extend_from_slice(&header_for(small));
+        stream.extend_from_slice(small);
+        tokio::spawn(async move {
+            tx.write_all(&stream).await.unwrap();
+        });
+
+        assert_eq!(reader.read_message_bytes().await.unwrap(), big);
+        assert_eq!(reader.read_message_bytes().await.unwrap(), small);
+    }
+
     /// The large-body bypass is a second await point, so it needs the same
     /// cancel-safety as the staged path: bytes already read stay in the frame
     /// and the read resumes at the right offset.

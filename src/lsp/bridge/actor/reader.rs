@@ -3530,43 +3530,57 @@ mod tests {
         drop(writer);
     }
 
-    /// Test that liveness timeout fires and fails pending requests.
-    ///
-    /// ls-bridge-async-connection: Ready to Failed transition on liveness timeout expiry.
-    /// When timeout fires while pending > 0, router.fail_all() is called.
     /// A downstream that stalls PART WAY THROUGH a frame must still be caught.
     ///
-    /// Since the framing parser became resumable, a half-read frame now
-    /// survives every cancellation instead of being discarded — so the liveness
-    /// timer is the only thing that still notices this server is hung. The
-    /// existing liveness test uses a server that emits nothing at all, which
-    /// never parks a partial frame.
+    /// Since the framing parser became resumable, a half-read frame survives
+    /// every cancellation instead of being discarded, so the liveness timer is
+    /// the only thing left that notices this server is hung.
+    ///
+    /// The downstream answers request 1 in full and only then emits a bare
+    /// header and stalls. Waiting for that first response before arming the
+    /// timer is what keeps the test honest: it proves the reader is alive and
+    /// has consumed everything up to the dangling header, so this cannot pass
+    /// through the "server emitted nothing at all" path that
+    /// `liveness_timeout_fires_and_fails_pending_requests` already covers.
     #[tokio::test]
     async fn liveness_timeout_fires_when_downstream_stalls_mid_frame() {
         use crate::lsp::bridge::protocol::RequestId;
         use std::time::Duration;
 
-        // A header with no body: the reader parks inside the frame.
-        let mut conn = AsyncBridgeConnection::spawn(vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "printf 'Content-Length: 100\\r\\n\\r\\n'; sleep 30".to_string(),
-        ])
-        .await
-        .expect("should spawn process");
+        let first = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let script = format!(
+            "printf 'Content-Length: {}\\r\\n\\r\\n{}'; \
+             printf 'Content-Length: 100\\r\\n\\r\\n'; \
+             sleep 30",
+            first.len(),
+            first,
+        );
+        let mut conn =
+            AsyncBridgeConnection::spawn(vec!["sh".to_string(), "-c".to_string(), script])
+                .await
+                .expect("should spawn process");
 
         let (_writer, reader) = conn.split();
         let router = Arc::new(ResponseRouter::new());
-        let rx = router.register(RequestId::new(1)).unwrap();
+        let rx1 = router.register(RequestId::new(1)).unwrap();
+        let rx2 = router.register(RequestId::new(2)).unwrap();
 
         let handle = spawn_reader_task_with_liveness(
             reader,
             Arc::clone(&router),
-            Some(Duration::from_millis(50)),
+            Some(Duration::from_millis(200)),
         );
+
+        // Request 1 comes back only if the reader really is reading, which
+        // leaves it parked on the dangling header that follows.
+        tokio::time::timeout(Duration::from_secs(5), rx1)
+            .await
+            .expect("the first frame must be delivered")
+            .expect("channel should not be closed");
+
         handle.notify_liveness_start(1);
 
-        let result = tokio::time::timeout(Duration::from_secs(5), rx)
+        let result = tokio::time::timeout(Duration::from_secs(5), rx2)
             .await
             .expect("liveness must fire even though a partial frame is parked")
             .expect("channel should not be closed");
@@ -3580,6 +3594,10 @@ mod tests {
         );
     }
 
+    /// Test that liveness timeout fires and fails pending requests.
+    ///
+    /// ls-bridge-async-connection: Ready to Failed transition on liveness timeout expiry.
+    /// When timeout fires while pending > 0, router.fail_all() is called.
     #[tokio::test]
     async fn liveness_timeout_fires_and_fails_pending_requests() {
         use crate::lsp::bridge::protocol::RequestId;
