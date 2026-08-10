@@ -1,6 +1,6 @@
 # LS Bridge Work Done Progress
 
-**Related Decisions**: [language-server-bridge](language-server-bridge.md), [ls-bridge-message-ordering](ls-bridge-message-ordering.md), [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)
+**Related Decisions**: [language-server-bridge](language-server-bridge.md), [ls-bridge-message-ordering](ls-bridge-message-ordering.md), [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md), [ls-bridge-client-capabilities-override](ls-bridge-client-capabilities-override.md)
 
 ## Context
 
@@ -34,6 +34,9 @@ so client–kakehashi–downstream stays consistent and collision-free:
   `window.workDoneProgress` to downstreams **only when the real editor
   advertises it** (the capability merge gates it), so a downstream only sends
   `create` when the editor can accept it — making the optimistic ack sound.
+  A user can additionally mask the capability per server with the
+  `clientCapabilities` config override (ls-bridge-client-capabilities-override),
+  eliminating a chatty downstream's progress stream at the source.
 - **`$/progress`** (downstream → bridge notification): the first `begin`
   decides the token's fate (lazy announcement). A `begin` carrying anything
   renderable — a non-empty title or message, a percentage, or
