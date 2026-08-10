@@ -575,6 +575,12 @@ impl LanguageServerPool {
             }
         }
 
+        // On the wire from here: abandonment (deadline, 30s cap, future drop)
+        // must cancel downstream before the permit frees — mirrors
+        // `execute_bridge_request_observed` (#974).
+        let mut cancel_on_drop =
+            super::super::pool::CancelOnDropGuard::new(Arc::clone(&handle), request_id);
+
         // `response_timeout` starts after send, mirroring
         // `execute_bridge_request_observed` (#974): queue wait must not
         // consume the answer deadline.
@@ -588,10 +594,8 @@ impl LanguageServerPool {
                 {
                     Ok(response) => response,
                     Err(_) => {
-                        // Tell the downstream to stop computing the abandoned
-                        // request before this return releases the permit —
-                        // mirrors `execute_bridge_request_observed` (#974).
-                        let _ = self.send_cancel_notification(&handle, connection_key, request_id);
+                        // cancel_on_drop stays armed and queues the
+                        // $/cancelRequest before the permit frees.
                         // Router entry still pending; router_guard stays ARMED
                         // and removes it on this early return.
                         if let Some(ref id) = upstream_request_id {
@@ -615,7 +619,10 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, connection_key);
         }
 
-        Ok(transform_response(response?))
+        // A real response arrived — nothing left to cancel.
+        let response = response?;
+        cancel_on_drop.disarm();
+        Ok(transform_response(response))
     }
 }
 

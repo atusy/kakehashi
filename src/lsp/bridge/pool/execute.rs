@@ -257,6 +257,15 @@ impl LanguageServerPool {
         }
         drop(host_lifecycle);
 
+        // From here the request is ON THE WIRE: any exit that isn't a real
+        // response (deadline expiry, the internal 30s cap, a JoinSet abort or
+        // supersession dropping this future) must tell the downstream to
+        // stop, or the released permit would admit new work on top of the
+        // abandoned computation. Declared after `_request_slot`, so the drop
+        // order queues the cancel BEFORE the permit frees.
+        let mut cancel_on_drop =
+            super::connection_handle::CancelOnDropGuard::new(Arc::clone(&handle), request_id);
+
         // Wait for response via oneshot channel (no Mutex held) with timeout.
         // After this returns (success, channel-closed, or timeout),
         // the router entry has been consumed or cleaned up internally.
@@ -276,15 +285,10 @@ impl LanguageServerPool {
                 {
                     Ok(response) => response,
                     Err(_) => {
-                        // The downstream is still computing the abandoned
-                        // request, and this return releases the permit — tell
-                        // it to stop, or each expiry would admit a NEW request
-                        // on top of the still-running one and the cap would
-                        // bound our waiters, not the server's in-flight work.
-                        // Sent BEFORE the unregister so the cancel mappings
-                        // are still consistent at send time; best-effort, like
-                        // every $/cancelRequest.
-                        let _ = self.send_cancel_notification(&handle, connection_key, request_id);
+                        // cancel_on_drop stays armed: the downstream is still
+                        // computing the abandoned request, and this return
+                        // releases the permit — the guard's drop queues the
+                        // $/cancelRequest before the permit frees.
                         // wait_for_response's own cleanup branch never ran, so
                         // the router entry is still pending; router_guard stays
                         // ARMED and removes it on this early return.
@@ -318,7 +322,12 @@ impl LanguageServerPool {
             offset,
         };
 
-        Ok(transform_response(response?, &context))
+        // A real response arrived — nothing left to cancel. Error responses
+        // ARE responses; only the `response?` Err paths (timeout/closed
+        // channel) leave the guard armed.
+        let response = response?;
+        cancel_on_drop.disarm();
+        Ok(transform_response(response, &context))
     }
 
     /// Like [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle)

@@ -92,6 +92,63 @@ fn closed_request_slots_error() -> io::Error {
 #[cfg(test)]
 use crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS;
 
+/// Queues `$/cancelRequest` for a SENT downstream request when dropped while
+/// armed. Every drop path — a JoinSet abort on a preferred-strategy loss,
+/// diagnostic supersession, a caller timeout dropping the future, and the
+/// response-deadline / internal-30s expiry error returns — releases the
+/// request slot, and without the cancel the downstream would keep computing
+/// work nobody will read: the cap would bound kakehashi's waiters, not the
+/// server's real in-flight depth (#974). Disarm once a response actually
+/// arrives. Best-effort by nature: the send is a non-blocking queue write,
+/// and a dead writer just drops it — exactly like every other
+/// `$/cancelRequest`.
+pub(in crate::lsp::bridge) struct CancelOnDropGuard {
+    handle: Option<Arc<ConnectionHandle>>,
+    request_id: crate::lsp::bridge::protocol::RequestId,
+}
+
+impl CancelOnDropGuard {
+    pub(in crate::lsp::bridge) fn new(
+        handle: Arc<ConnectionHandle>,
+        request_id: crate::lsp::bridge::protocol::RequestId,
+    ) -> Self {
+        Self {
+            handle: Some(handle),
+            request_id,
+        }
+    }
+
+    /// A response arrived (or the caller cancelled explicitly): the
+    /// downstream is done with this request, nothing to cancel.
+    pub(in crate::lsp::bridge) fn disarm(&mut self) {
+        self.handle = None;
+    }
+}
+
+impl Drop for CancelOnDropGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            use tower_lsp_server::ls_types::{CancelParams, NumberOrString};
+            let notification = crate::lsp::bridge::protocol::JsonRpcNotification::new(
+                "$/cancelRequest",
+                CancelParams {
+                    // Safe: downstream ids come from an i64 counter starting
+                    // at 2, well within i32 range (ls-types constrains
+                    // Number to i32).
+                    id: NumberOrString::Number(self.request_id.as_i64() as i32),
+                },
+            );
+            let _ = handle.send_notification(notification);
+            log::debug!(
+                target: "kakehashi::bridge::cancel",
+                "[{}] cancelled abandoned downstream request {} on drop",
+                handle.key(),
+                self.request_id.as_i64()
+            );
+        }
+    }
+}
+
 /// Per-connection state + I/O actors (ls-bridge-message-ordering single-writer loop).
 ///
 /// Lifecycle: `Initializing` → `Ready` (after initialize/initialized) or

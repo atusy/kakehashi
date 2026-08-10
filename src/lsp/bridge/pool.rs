@@ -31,6 +31,7 @@ pub(crate) use connection_action::BridgeError;
 use connection_action::{ConnectionAction, decide_connection_action};
 use handshake::perform_lsp_handshake;
 
+pub(in crate::lsp::bridge) use connection_handle::CancelOnDropGuard;
 pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
@@ -3042,7 +3043,7 @@ impl LanguageServerPool {
     /// via the single-writer loop (ls-bridge-message-ordering). The pending
     /// entry stays in place: the server may still respond with a result or
     /// `REQUEST_CANCELLED` (-32800).
-    pub(in crate::lsp::bridge) fn send_cancel_notification(
+    fn send_cancel_notification(
         &self,
         handle: &ConnectionHandle,
         connection_key: &ConnectionKey,
