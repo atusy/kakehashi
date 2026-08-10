@@ -7,7 +7,7 @@ use std::io;
 use std::process::Stdio;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 /// Writer handle for sending LSP messages to downstream language server.
 ///
@@ -150,6 +150,7 @@ pub(crate) struct AsyncBridgeConnection {
     child: Option<Child>,         // Option to support taking for split()
     writer: Option<BridgeWriter>, // Option to support taking for split()
     reader: Option<BridgeReader>, // Option to support taking for Reader Task
+    stderr: Option<ChildStderr>,  // Option to support taking for the drain task
 }
 
 /// Writer half of a split connection.
@@ -393,7 +394,11 @@ impl AsyncBridgeConnection {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Piped (not null) so a crashing downstream's dying words are
+            // observable: the pool spawns [`drain_downstream_stderr`] on it.
+            // The drain never stops reading (it only stops LOGGING past its
+            // cap), so a chatty child cannot block on a full stderr pipe.
+            .stderr(Stdio::piped())
             .spawn()?;
 
         let stdin = child
@@ -406,11 +411,20 @@ impl AsyncBridgeConnection {
             .take()
             .ok_or_else(|| io::Error::other("bridge: failed to capture stdout"))?;
 
+        let stderr = child.stderr.take();
+
         Ok(Self {
             child: Some(child),
             writer: Some(BridgeWriter { stdin }),
             reader: Some(BridgeReader::new(stdout)),
+            stderr,
         })
+    }
+
+    /// Take the child's stderr for the drain task (None after the first take,
+    /// or if capture failed at spawn).
+    pub(crate) fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.stderr.take()
     }
 
     /// Split into a `SplitConnectionWriter` (holds the child process) and a
@@ -487,9 +501,106 @@ impl Drop for AsyncBridgeConnection {
     }
 }
 
+/// Cap on stderr lines LOGGED per connection; the drain keeps reading past it
+/// (a full pipe would otherwise block the child) but stops the log noise.
+const STDERR_LOG_MAX_LINES: usize = 500;
+/// Cap on a single logged stderr line's bytes (truncated at a char boundary).
+const STDERR_LOG_MAX_LINE_BYTES: usize = 2000;
+
+/// Forward a downstream process's stderr into kakehashi's log, bounded (see
+/// the constants above). This is the crash-triage channel: a downstream that
+/// dies (e.g. a node heap OOM) writes its reason here, which `Stdio::null()`
+/// used to discard while the reader could only report the resulting EOF.
+pub(crate) async fn drain_downstream_stderr(stderr: ChildStderr, server_name: String) {
+    let (logged, total) = drain_stderr_lines(stderr, |line| {
+        log::warn!(target: "kakehashi::bridge::stderr", "[{server_name}] {line}");
+    })
+    .await;
+    if total > logged {
+        log::warn!(
+            target: "kakehashi::bridge::stderr",
+            "[{server_name}] (suppressed {} further stderr lines)",
+            total - logged
+        );
+    }
+}
+
+/// The testable core of [`drain_downstream_stderr`]: read lines until EOF,
+/// emit at most [`STDERR_LOG_MAX_LINES`] of them (truncated to
+/// [`STDERR_LOG_MAX_LINE_BYTES`] at a char boundary), keep DRAINING past the
+/// cap, and return `(emitted, total)` line counts.
+async fn drain_stderr_lines<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    mut emit: impl FnMut(String),
+) -> (usize, usize) {
+    let mut lines = BufReader::new(reader).lines();
+    let mut total = 0usize;
+    let mut emitted = 0usize;
+    while let Ok(Some(mut line)) = lines.next_line().await {
+        total += 1;
+        if emitted >= STDERR_LOG_MAX_LINES {
+            continue;
+        }
+        if line.len() > STDERR_LOG_MAX_LINE_BYTES {
+            let mut end = STDERR_LOG_MAX_LINE_BYTES;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line.truncate(end);
+            line.push('…');
+        }
+        emit(line);
+        emitted += 1;
+    }
+    (emitted, total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn drain_emits_lines_truncated_at_char_boundaries() {
+        let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+        let long = format!("{}あ", "x".repeat(STDERR_LOG_MAX_LINE_BYTES - 1));
+        let payload = format!("first\n{long}\nlast\n");
+        tokio::io::AsyncWriteExt::write_all(&mut tx, payload.as_bytes())
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut seen = Vec::new();
+        let (emitted, total) = drain_stderr_lines(rx, |line| seen.push(line)).await;
+        assert_eq!((emitted, total), (3, 3));
+        assert_eq!(seen[0], "first");
+        assert!(seen[1].ends_with('…'), "over-long line is truncated");
+        assert!(
+            seen[1].len() <= STDERR_LOG_MAX_LINE_BYTES + '…'.len_utf8(),
+            "truncation respects the byte cap"
+        );
+        assert_eq!(seen[2], "last");
+    }
+
+    #[tokio::test]
+    async fn drain_keeps_reading_past_the_log_cap() {
+        let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            for i in 0..(STDERR_LOG_MAX_LINES + 50) {
+                tokio::io::AsyncWriteExt::write_all(&mut tx, format!("line{i}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let (emitted, total) = drain_stderr_lines(rx, |_| {}).await;
+        writer.await.unwrap();
+        assert_eq!(emitted, STDERR_LOG_MAX_LINES);
+        assert_eq!(
+            total,
+            STDERR_LOG_MAX_LINES + 50,
+            "draining continues past the cap"
+        );
+    }
 
     #[tokio::test]
     async fn spawn_creates_child_process_with_stdio() {
