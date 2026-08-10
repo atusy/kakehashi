@@ -141,7 +141,7 @@ use dashmap::DashMap;
 use tokio::sync::Mutex;
 use url::Url;
 
-use tower_lsp_server::ls_types::{CancelParams, NumberOrString};
+use tower_lsp_server::ls_types::NumberOrString;
 
 use crate::error::LockResultExt;
 
@@ -3049,15 +3049,10 @@ impl LanguageServerPool {
         connection_key: &ConnectionKey,
         downstream_id: RequestId,
     ) -> io::Result<()> {
-        // Per LSP spec: $/cancelRequest is a notification with { id: request_id }
-        let notification = JsonRpcNotification::new(
-            "$/cancelRequest",
-            CancelParams {
-                // Safe: IDs are generated from an atomic counter starting at 0,
-                // well within i32 range. ls-types constrains Number to i32.
-                id: NumberOrString::Number(downstream_id.as_i64() as i32),
-            },
-        );
+        // Per LSP spec: $/cancelRequest is a notification with { id: request_id },
+        // carrying the full i64 id (ls_types::CancelParams would truncate to
+        // i32 and cancel nothing).
+        let notification = super::protocol::cancel_request_notification(downstream_id);
 
         match handle.send_notification(notification) {
             NotificationSendResult::Queued => {

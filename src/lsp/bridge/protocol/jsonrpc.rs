@@ -90,9 +90,33 @@ impl<P> JsonRpcNotification<P> {
     }
 }
 
+/// Build a `$/cancelRequest` notification for a downstream request id,
+/// carrying the id as the SAME i64 JSON number the request went out with.
+/// Deliberately not `ls_types::CancelParams`: that type constrains numeric
+/// ids to i32, and a truncated id would cancel nothing (JSON-RPC matches the
+/// id by value), letting the abandoned request keep computing downstream.
+pub(crate) fn cancel_request_notification(
+    downstream_id: super::RequestId,
+) -> JsonRpcNotification<serde_json::Value> {
+    JsonRpcNotification::new(
+        "$/cancelRequest",
+        serde_json::json!({ "id": downstream_id.as_i64() }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cancel id must survive beyond i32: `ls_types::CancelParams` would
+    /// truncate 2^31 to a negative number, cancelling nothing.
+    #[test]
+    fn cancel_notification_keeps_the_full_i64_id() {
+        let id = super::super::RequestId::new(i64::from(i32::MAX) + 1);
+        let serialized = serde_json::to_value(cancel_request_notification(id)).expect("serializes");
+        assert_eq!(serialized["method"], "$/cancelRequest");
+        assert_eq!(serialized["params"]["id"], i64::from(i32::MAX) + 1);
+    }
 
     #[test]
     fn request_serializes_correctly() {

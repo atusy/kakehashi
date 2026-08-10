@@ -30,7 +30,8 @@ mod workspace_edit;
 // Re-export all public items for external use
 pub(crate) use command_routing::{decode_command, encode_command};
 pub(crate) use jsonrpc::{
-    JsonRpcNotification, JsonRpcRequest, jsonrpc_error_summary, response_has_jsonrpc_error,
+    JsonRpcNotification, JsonRpcRequest, cancel_request_notification, jsonrpc_error_summary,
+    response_has_jsonrpc_error,
 };
 pub(crate) use lifecycle::*;
 pub(crate) use request::*;

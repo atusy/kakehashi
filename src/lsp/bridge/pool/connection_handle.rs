@@ -141,16 +141,8 @@ impl CancelOnDropGuard {
 impl Drop for CancelOnDropGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            use tower_lsp_server::ls_types::{CancelParams, NumberOrString};
-            let notification = crate::lsp::bridge::protocol::JsonRpcNotification::new(
-                "$/cancelRequest",
-                CancelParams {
-                    // Safe: downstream ids come from an i64 counter starting
-                    // at 2, well within i32 range (ls-types constrains
-                    // Number to i32).
-                    id: NumberOrString::Number(self.request_id.as_i64() as i32),
-                },
-            );
+            let notification =
+                crate::lsp::bridge::protocol::cancel_request_notification(self.request_id);
             // Failure outcomes (QueueFull / ChannelClosed) are already
             // logged at warn by `send_notification` itself — log only the
             // SUCCESS context here, so mass abandonment during teardown
