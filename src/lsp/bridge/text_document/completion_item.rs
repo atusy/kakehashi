@@ -310,15 +310,39 @@ impl LanguageServerPool {
         let request = build_completion_resolve_request(outgoing, request_id);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        if let Err(e) = handle.send_request(request, request_id) {
-            warn!(
-                target: "kakehashi::bridge",
-                "completionItem/resolve: failed to send request on {connection_key:?}: {e}"
-            );
-            if let Some(ref id) = upstream_id {
-                self.unregister_upstream_request(id, connection_key);
+        // Verify `handle` is still the pool's LIVE connection under the
+        // `connections` lock before sending (the guard the executeCommand and
+        // codeAction/resolve paths already use): the handle was fetched
+        // earlier — and the request may have PARKED on the slot since (#974)
+        // — so a reload could have replaced it, and enqueueing on the
+        // retiring process would wait out the full timeout for nothing.
+        {
+            let connections = self.connections().await;
+            if !connections
+                .get(connection_key)
+                .is_some_and(|current| Arc::ptr_eq(current, handle))
+            {
+                drop(connections);
+                warn!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve: connection {connection_key} was replaced before send"
+                );
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return None;
             }
-            return None;
+            if let Err(e) = handle.send_request(request, request_id) {
+                drop(connections);
+                warn!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve: failed to send request on {connection_key:?}: {e}"
+                );
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return None;
+            }
         }
 
         // On the wire: abandonment must cancel downstream before the slot

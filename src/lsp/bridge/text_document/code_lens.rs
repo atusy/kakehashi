@@ -285,17 +285,39 @@ impl LanguageServerPool {
 
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        if let Err(e) = handle.send_request(request, request_id) {
-            warn!(
-                target: "kakehashi::bridge",
-                "codeLens/resolve: failed to send request for {}: {}",
-                server_name, e
-            );
-            if let Some(ref id) = upstream_id {
-                self.unregister_upstream_request(id, connection_key);
+        // Live-handle check under the `connections` lock before sending —
+        // same rationale as completionItem/resolve: the slot park (#974)
+        // widens the window in which a reload can replace the handle.
+        {
+            let connections = self.connections().await;
+            if !connections
+                .get(connection_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                drop(connections);
+                warn!(
+                    target: "kakehashi::bridge",
+                    "codeLens/resolve: connection {connection_key} was replaced before send"
+                );
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                re_envelope_lens(&mut lens, &envelope);
+                return lens;
             }
-            re_envelope_lens(&mut lens, &envelope);
-            return lens;
+            if let Err(e) = handle.send_request(request, request_id) {
+                drop(connections);
+                warn!(
+                    target: "kakehashi::bridge",
+                    "codeLens/resolve: failed to send request for {}: {}",
+                    server_name, e
+                );
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                re_envelope_lens(&mut lens, &envelope);
+                return lens;
+            }
         }
 
         // On the wire: abandonment must cancel downstream before the slot
