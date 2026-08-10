@@ -135,6 +135,14 @@ impl LanguageServerPool {
         // so per-root pooling (#382) stays consistent.
         let connection_key = handle.key();
 
+        // In-flight cap (#974): park here — BEFORE the host lifecycle lock
+        // and the `connections` lock below — until this connection has a free
+        // request slot. A task waiting on a saturated connection holds
+        // nothing, so requests to other (idle) connections proceed
+        // unhindered. The permit is RAII: response, error, and future drop
+        // (cancel, JoinSet abort) all release it.
+        let _request_slot = handle.acquire_request_slot().await?;
+
         // Convert host_uri to lsp_types::Uri for bridge protocol functions
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;

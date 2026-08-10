@@ -153,6 +153,14 @@ pub(crate) struct ConnectionHandle {
     /// `settings` is ignored when comparing this snapshot on reload because it
     /// can be propagated at runtime; every other field is spawn-time state.
     launch_config: OnceLock<crate::config::settings::BridgeServerConfig>,
+    /// Cap on concurrent in-flight requests to this connection (#974).
+    ///
+    /// Acquired (owned, RAII) at the entry of the shared request-execution
+    /// paths, BEFORE the per-host lifecycle lock and the pool `connections`
+    /// lock — a task parked here must never hold anything another
+    /// connection's requests need. Notifications, `$/cancelRequest`, and the
+    /// initialize/shutdown lifecycle are deliberately exempt.
+    request_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl ConnectionHandle {
@@ -221,7 +229,27 @@ impl ConnectionHandle {
             incapable_fallback_logged: AtomicBool::new(false),
             settings,
             launch_config: OnceLock::new(),
+            request_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
         }
+    }
+
+    /// Acquire an in-flight request slot on this connection (#974). The
+    /// returned permit is held for the whole request lifetime — response,
+    /// error, or future drop all release it. Errors when the semaphore was
+    /// closed (connection evicted): failing fast beats parking on a dead
+    /// connection's permits.
+    pub(crate) async fn acquire_request_slot(
+        &self,
+    ) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.request_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "bridge: connection evicted while waiting for a request slot",
+                )
+            })
     }
 
     pub(super) fn record_launch_config(
