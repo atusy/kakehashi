@@ -1171,10 +1171,13 @@ mod tests {
             "second acquisition must pend at capacity 1"
         );
         drop(first);
-        let _reacquired = handle
-            .acquire_request_slot()
-            .await
-            .expect("slot frees once the permit drops");
+        let _reacquired = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle.acquire_request_slot(),
+        )
+        .await
+        .expect("re-acquisition must not hang: a regression here would wedge CI, not fail it")
+        .expect("slot frees once the permit drops");
     }
 
     /// A connection leaving service (crash → `Failed`, teardown → `Closing`)

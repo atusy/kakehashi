@@ -529,15 +529,23 @@ mod tests {
     /// permit frees (here: an in-flight request is aborted), then proceeds.
     /// The backing process is a sink that never answers, so in-flight
     /// requests stay in flight for the whole test.
+    ///
+    /// A SMALL explicit cap, deliberately: the parking mechanics are
+    /// identical at any capacity, while `DEFAULT_MAX_CONCURRENT_REQUESTS + 1`
+    /// tasks would couple this test's wall time (and its poll windows) to a
+    /// tuning constant that is free to grow. The default's own wiring is
+    /// pinned by `spawned_connection_is_capped_by_the_configured_max_concurrent_requests`
+    /// and the config tests.
     #[tokio::test]
     async fn requests_beyond_the_in_flight_cap_park_until_a_permit_frees() {
-        let cap = crate::lsp::bridge::pool::DEFAULT_MAX_CONCURRENT_REQUESTS;
+        let cap = 4;
         let pool = Arc::new(LanguageServerPool::new());
         let host_uri = test_host_uri("in-flight-cap");
         pool.open_host_incarnation(&host_uri, 1).await;
-        let handle = create_handle_with_key(
+        let handle = create_capped_handle_with_key(
             ConnectionState::Ready,
             ConnectionKey::for_server("test-server"),
+            cap,
         )
         .await;
         pool.insert_connection(Arc::clone(&handle)).await;
@@ -610,11 +618,6 @@ mod tests {
     /// healthy-but-saturated downstream.
     #[tokio::test]
     async fn response_deadline_excludes_request_slot_queue_wait() {
-        use crate::lsp::bridge::actor::{ResponseRouter, spawn_reader_task};
-        use crate::lsp::bridge::connection::AsyncBridgeConnection;
-        use crate::lsp::bridge::pool::DynamicCapabilityRegistry;
-        use tokio::sync::mpsc;
-
         const DEADLINE: std::time::Duration = std::time::Duration::from_millis(150);
         // Longer than DEADLINE: the parked request outlives its whole answer
         // budget while waiting for a slot.
@@ -626,30 +629,12 @@ mod tests {
 
         // Capacity-1 sink connection: one request occupies the only slot
         // forever (the sink never answers).
-        let mut conn = AsyncBridgeConnection::spawn(vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "cat > /dev/null".to_string(),
-        ])
-        .await
-        .expect("spawn sink");
-        let (writer, reader) = conn.split();
-        let router = Arc::new(ResponseRouter::new());
-        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
-        let (tx, rx) = mpsc::channel(crate::lsp::bridge::actor::OUTBOUND_QUEUE_CAPACITY);
-        let handle = Arc::new(ConnectionHandle::with_state(
-            writer,
-            router,
-            reader_handle,
+        let handle = create_capped_handle_with_key(
             ConnectionState::Ready,
-            tx,
-            rx,
-            Arc::new(DynamicCapabilityRegistry::new()),
             ConnectionKey::for_server("test-server"),
-            crate::lsp::bridge::WorkspaceFolderSet::new(None),
-            Arc::new(arc_swap::ArcSwapOption::empty()),
             1,
-        ));
+        )
+        .await;
         pool.insert_connection(Arc::clone(&handle)).await;
 
         let (occupant, occupant_probe) = start_observed_request(
@@ -822,15 +807,22 @@ mod tests {
     /// its in-flight cap must not delay requests to a DIFFERENT connection.
     /// Permits are per-connection and a parked task holds no shared lock, so
     /// an idle connection is fed immediately.
+    ///
+    /// Saturation is ASSERTED before the idle request is spawned — without
+    /// that precondition the test would pass vacuously whenever the busy
+    /// requests errored out early (or, on a multi-thread runtime, hadn't
+    /// been polled yet), and a global-semaphore bug could hide behind the
+    /// scheduling order.
     #[tokio::test]
     async fn saturated_connection_does_not_delay_an_idle_connection() {
-        let cap = crate::lsp::bridge::pool::DEFAULT_MAX_CONCURRENT_REQUESTS;
+        let cap = 2;
         let pool = Arc::new(LanguageServerPool::new());
         let host_uri = test_host_uri("cross-connection");
         pool.open_host_incarnation(&host_uri, 1).await;
-        let busy = create_handle_with_key(
+        let busy = create_capped_handle_with_key(
             ConnectionState::Ready,
             ConnectionKey::for_server("busy-server"),
+            cap,
         )
         .await;
         let idle = create_handle_with_key(
@@ -844,15 +836,32 @@ mod tests {
         // Saturate the busy connection past its cap (sink server: nothing
         // ever completes, so all permits stay taken and one task is parked).
         let mut busy_requests = Vec::new();
+        let mut busy_probes = Vec::new();
         for i in 0..(cap + 1) {
-            let (request, _probe) = start_observed_request(
+            let (request, probe) = start_observed_request(
                 Arc::clone(&pool),
                 Arc::clone(&busy),
                 host_uri.clone(),
                 UpstreamId::Number(2_000 + i as i64),
             );
             busy_requests.push(request);
+            busy_probes.push(probe);
         }
+        let published = |probes: &[Arc<std::sync::OnceLock<RequestId>>]| {
+            probes.iter().filter(|p| p.get().is_some()).count()
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while published(&busy_probes) < cap {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the busy connection must reach its cap before the idle probe runs");
+        assert_eq!(
+            published(&busy_probes),
+            cap,
+            "exactly `cap` busy requests in flight; the extra one is parked"
+        );
 
         // A request to the idle connection must reach its downstream
         // promptly (downstream id published) despite the saturation.
@@ -862,12 +871,7 @@ mod tests {
             host_uri.clone(),
             UpstreamId::Number(3_000),
         );
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            wait_for_downstream_id(&idle_probe),
-        )
-        .await
-        .expect("an idle connection must be fed while another is saturated");
+        wait_for_downstream_id(&idle_probe).await;
 
         idle_request.abort();
         for request in &busy_requests {
