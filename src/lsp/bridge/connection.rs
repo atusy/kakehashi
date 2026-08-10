@@ -722,6 +722,7 @@ fn trim_partial_utf8_tail(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::DuplexStream;
 
     #[tokio::test]
     async fn drain_emits_lines_truncated_at_char_boundaries() {
@@ -1083,72 +1084,150 @@ mod tests {
             .expect("should write initialized notification");
     }
 
-    /// Emit `frames` well-formed LSP frames, writing the header and the body as
-    /// separate writes with a gap between them.
+    const PROGRESS: &[u8] = br#"{"jsonrpc":"2.0","method":"$/progress"}"#;
+
+    /// A reader fed by an in-memory pipe.
     ///
-    /// That gap is not artificial: vscode-jsonrpc's `WriteableStreamMessageWriter`
-    /// awaits the header write before writing the body, so every message has one.
-    /// Measured against basedpyright 1.39.8 under a pull-diagnostics load, a reader
-    /// landed between the two ~120 times per second.
-    fn framed_producer_with_gap(frames: usize) -> Vec<String> {
-        let body = r#"{"jsonrpc":"2.0","method":"$/progress"}"#;
-        let script = format!(
-            "for i in $(seq {frames}); do \
-               printf 'Content-Length: {len}\\r\\n\\r\\n'; sleep 0.05; printf '%s' '{body}'; \
-             done; sleep 5",
-            len = body.len(),
-        );
-        vec!["sh".to_string(), "-c".to_string(), script]
+    /// The cancellation tests below need to cancel at an exact byte offset. A
+    /// spawned producer cannot offer that: its spawn latency (measured median
+    /// 19ms) is the same order as any cancel deadline you could pick, so the
+    /// cancel lands before the header is even written and the test passes
+    /// against a broken parser. In-memory, the cancellation point is exact and
+    /// no clock is involved at all.
+    fn duplex_reader() -> (DuplexStream, BridgeReader<DuplexStream>) {
+        let (tx, rx) = tokio::io::duplex(64 * 1024);
+        (tx, BridgeReader::new(rx))
     }
 
-    /// The reader loop awaits `read_message` as one branch of a `tokio::select!`
-    /// (actor/reader.rs), so any other branch completing first drops the read
-    /// future. If that happens after the header is consumed but before the body
-    /// arrives, a non-cancel-safe parser loses the header and resyncs onto the
-    /// body — reporting a framing error against a perfectly well-framed stream
-    /// and killing the connection.
-    #[tokio::test]
-    async fn read_message_resumes_after_cancellation_between_header_and_body() {
-        let mut conn = AsyncBridgeConnection::spawn(framed_producer_with_gap(1))
-            .await
-            .expect("spawn should succeed");
+    fn header_for(body: &[u8]) -> Vec<u8> {
+        format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes()
+    }
 
-        // Cancel while the parser is parked waiting for the body.
+    /// Poll the read exactly once and drop it — what `select!` does to a losing
+    /// branch. The frame is always incomplete here, so a read that *completes*
+    /// means the test set up the wrong cancellation point and would be proving
+    /// nothing; fail loudly instead.
+    async fn cancel_a_read<R: AsyncRead + Unpin>(reader: &mut BridgeReader<R>) {
         tokio::select! {
             biased;
-            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
-            _ = conn.read_message() => panic!("body cannot have arrived yet"),
+            _ = reader.read_message_bytes() => {
+                panic!("the frame is incomplete, so the read cannot have finished")
+            }
+            _ = std::future::ready(()) => {}
         }
-
-        let parsed = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read_message())
-            .await
-            .expect("read should not hang")
-            .expect("the stream is well framed, so the message must still parse");
-
-        assert_eq!(parsed["method"], "$/progress");
     }
 
-    /// Repeated cancellation must not desync the stream either: the reader loop
-    /// re-enters `select!` on every iteration, so a busy connection is cancelled
-    /// over and over.
+    /// The reader task awaits `read_message` as one branch of a `tokio::select!`
+    /// (actor/reader.rs), so any other branch completing first drops the read
+    /// future. Dropping it between the header and its body must not lose the
+    /// header: a parser that kept progress in the future's locals resynced onto
+    /// the body and reported a framing error against a well-framed stream.
     #[tokio::test]
-    async fn repeated_cancellation_never_desyncs_the_stream() {
-        const FRAMES: usize = 5;
-        let mut conn = AsyncBridgeConnection::spawn(framed_producer_with_gap(FRAMES))
-            .await
-            .expect("spawn should succeed");
+    async fn read_resumes_after_cancellation_between_header_and_body() {
+        let (mut tx, mut reader) = duplex_reader();
+        tx.write_all(&header_for(PROGRESS)).await.unwrap();
+        cancel_a_read(&mut reader).await;
 
-        let mut read = 0;
-        while read < FRAMES {
-            tokio::select! {
-                biased;
-                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
-                result = conn.read_message() => {
-                    let parsed = result.expect("well-framed stream must keep parsing");
-                    assert_eq!(parsed["method"], "$/progress");
-                    read += 1;
-                }
-            }
+        tx.write_all(PROGRESS).await.unwrap();
+        drop(tx);
+        assert_eq!(reader.read_message_bytes().await.unwrap(), PROGRESS);
+    }
+
+    /// Cancelling in the middle of a header LINE must not lose the partial
+    /// line: the next read continues accumulating instead of restarting on
+    /// `gth: 39` and reporting a framing error.
+    #[tokio::test]
+    async fn read_resumes_after_cancellation_mid_header_line() {
+        let (mut tx, mut reader) = duplex_reader();
+        let header = header_for(PROGRESS);
+        let (head, tail) = header.split_at(11); // "Content-Len"
+
+        tx.write_all(head).await.unwrap();
+        cancel_a_read(&mut reader).await;
+
+        tx.write_all(tail).await.unwrap();
+        cancel_a_read(&mut reader).await;
+
+        tx.write_all(PROGRESS).await.unwrap();
+        drop(tx);
+        assert_eq!(reader.read_message_bytes().await.unwrap(), PROGRESS);
+    }
+
+    /// Cancelling PART WAY THROUGH the body: the only case that exercises the
+    /// body phase's `length - body.len()` accounting and `take_completed_frame`'s
+    /// short-body guard.
+    #[tokio::test]
+    async fn read_resumes_after_cancellation_mid_body() {
+        let (mut tx, mut reader) = duplex_reader();
+        let (head, tail) = PROGRESS.split_at(10);
+
+        tx.write_all(&header_for(PROGRESS)).await.unwrap();
+        tx.write_all(head).await.unwrap();
+        cancel_a_read(&mut reader).await;
+
+        tx.write_all(tail).await.unwrap();
+        drop(tx);
+        assert_eq!(reader.read_message_bytes().await.unwrap(), PROGRESS);
+    }
+
+    /// A chunk carrying two whole frames must yield them one at a time: the
+    /// parser must never take bytes belonging to the next frame.
+    #[tokio::test]
+    async fn two_frames_in_one_chunk_are_read_separately() {
+        let (mut tx, mut reader) = duplex_reader();
+        let first = br#"{"id":1}"#;
+        let second = br#"{"id":2}"#;
+
+        let mut chunk = header_for(first);
+        chunk.extend_from_slice(first);
+        chunk.extend_from_slice(&header_for(second));
+        chunk.extend_from_slice(second);
+        tx.write_all(&chunk).await.unwrap();
+        drop(tx);
+
+        assert_eq!(reader.read_message_bytes().await.unwrap(), first);
+        assert_eq!(reader.read_message_bytes().await.unwrap(), second);
+    }
+
+    /// `Content-Length: 0` must complete on the iteration that closes the
+    /// header block. Waiting for one more read would park the empty frame until
+    /// the NEXT message arrived — on an idle link, forever. Framed at the byte
+    /// layer because `read_message`'s JSON parse rejects an empty body, so the
+    /// framing contract is only observable here.
+    #[tokio::test]
+    async fn zero_length_body_completes_without_waiting_for_more_input() {
+        let (mut tx, mut reader) = duplex_reader();
+        tx.write_all(b"Content-Length: 0\r\n\r\n").await.unwrap();
+        // Deliberately no further writes and no EOF.
+        assert_eq!(reader.read_message_bytes().await.unwrap(), b"");
+    }
+
+    /// Repeated cancellation must not desync the stream: the reader loop
+    /// re-enters `select!` on every iteration, so a busy connection is
+    /// cancelled over and over and the parse state must reset cleanly between
+    /// frames.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_cancellation_never_desyncs_the_stream() {
+        let (mut tx, mut reader) = duplex_reader();
+        let (head, tail) = PROGRESS.split_at(10);
+
+        for _ in 0..5 {
+            tx.write_all(&header_for(PROGRESS)).await.unwrap();
+            cancel_a_read(&mut reader).await;
+            tx.write_all(head).await.unwrap();
+            cancel_a_read(&mut reader).await;
+            tx.write_all(tail).await.unwrap();
+            // A desync parks the read forever with no EOF to end it. The paused
+            // clock auto-advances as soon as nothing else can run, so this bound
+            // costs no wall time and turns that hang into a failure.
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader.read_message_bytes(),
+            )
+            .await
+            .expect("a well-framed stream must not park the reader")
+            .unwrap();
+            assert_eq!(frame, PROGRESS);
         }
     }
 }
