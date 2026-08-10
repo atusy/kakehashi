@@ -553,34 +553,107 @@ pub(crate) async fn drain_downstream_stderr(stderr: ChildStderr, server_name: St
     }
 }
 
-/// The testable core of [`drain_downstream_stderr`]: read lines until EOF,
-/// emit at most [`STDERR_LOG_MAX_LINES`] of them (truncated to
-/// [`STDERR_LOG_MAX_LINE_BYTES`] at a char boundary), keep DRAINING past the
-/// cap, and return `(emitted, total)` line counts.
+/// The testable core of [`drain_downstream_stderr`]: read fixed-size byte
+/// chunks until EOF, emit at most [`STDERR_LOG_MAX_LINES`] lines (each capped
+/// at [`STDERR_LOG_MAX_LINE_BYTES`] buffered bytes, decoded loss-tolerantly),
+/// keep DRAINING past both caps, and return `(emitted, total)` line counts.
+///
+/// Deliberately NOT `BufReader::lines()`: that buffers a complete line before
+/// any cap applies (a newline-free stream allocates without bound) and errors
+/// out on invalid UTF-8 — and a drain that stops reading lets the child's
+/// stderr pipe fill up and block it. Stderr is arbitrary bytes, not UTF-8.
 async fn drain_stderr_lines<R: tokio::io::AsyncRead + Unpin>(
-    reader: R,
+    mut reader: R,
     mut emit: impl FnMut(String),
 ) -> (usize, usize) {
-    let mut lines = BufReader::new(reader).lines();
+    use tokio::io::AsyncReadExt;
+
+    let mut chunk = [0u8; 4096];
+    // Bytes of the current line, capped: anything past the per-line cap is
+    // discarded as it streams by, never buffered.
+    let mut line: Vec<u8> = Vec::new();
+    let mut overflowed = false;
     let mut total = 0usize;
     let mut emitted = 0usize;
-    while let Ok(Some(mut line)) = lines.next_line().await {
-        total += 1;
-        if emitted >= STDERR_LOG_MAX_LINES {
-            continue;
-        }
-        if line.len() > STDERR_LOG_MAX_LINE_BYTES {
-            let mut end = STDERR_LOG_MAX_LINE_BYTES;
-            while !line.is_char_boundary(end) {
-                end -= 1;
+
+    loop {
+        let n = match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            // A read error on the pipe means the child is gone; the drain's
+            // job is over.
+            Err(_) => break,
+        };
+        for &byte in &chunk[..n] {
+            if byte == b'\n' {
+                total += 1;
+                if emitted < STDERR_LOG_MAX_LINES {
+                    emit(render_stderr_line(&line, overflowed));
+                    emitted += 1;
+                }
+                line.clear();
+                overflowed = false;
+            } else if line.len() < STDERR_LOG_MAX_LINE_BYTES {
+                line.push(byte);
+            } else {
+                overflowed = true;
             }
-            line.truncate(end);
-            line.push('…');
         }
-        emit(line);
-        emitted += 1;
+    }
+    // Trailing bytes without a final newline still form a (partial) line.
+    if !line.is_empty() || overflowed {
+        total += 1;
+        if emitted < STDERR_LOG_MAX_LINES {
+            emit(render_stderr_line(&line, overflowed));
+            emitted += 1;
+        }
     }
     (emitted, total)
+}
+
+/// Render one captured stderr line for the log: strip a trailing `'\r'`
+/// (CRLF), decode loss-tolerantly, and mark a byte-capped line with `'…'`
+/// (after dropping a trailing UTF-8 sequence the cap cut in half, so the
+/// truncation reads as one marker instead of U+FFFD noise).
+fn render_stderr_line(bytes: &[u8], overflowed: bool) -> String {
+    let mut bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    if overflowed {
+        bytes = trim_partial_utf8_tail(bytes);
+    }
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if overflowed {
+        text.push('…');
+    }
+    text
+}
+
+/// Drop an incomplete trailing multibyte UTF-8 sequence (a leading byte whose
+/// continuation bytes are missing). Interior invalid bytes are left for the
+/// lossy decode — only a tail the byte cap visibly cut off is trimmed.
+fn trim_partial_utf8_tail(bytes: &[u8]) -> &[u8] {
+    let len = bytes.len();
+    for i in (len.saturating_sub(3)..len).rev() {
+        let byte = bytes[i];
+        if byte < 0x80 {
+            break; // ASCII tail: nothing to trim
+        }
+        if byte >= 0xC0 {
+            // Leading byte of a multibyte char at `i`.
+            let width = if byte >= 0xF0 {
+                4
+            } else if byte >= 0xE0 {
+                3
+            } else {
+                2
+            };
+            if i + width > len {
+                return &bytes[..i];
+            }
+            break; // Complete sequence: keep it
+        }
+        // Continuation byte: keep scanning backwards for its leading byte.
+    }
+    bytes
 }
 
 #[cfg(test)]
