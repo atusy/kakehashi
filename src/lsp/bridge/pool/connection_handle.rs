@@ -1087,6 +1087,42 @@ mod tests {
         Arc::new(DynamicCapabilityRegistry::new())
     }
 
+    /// A pathologically large configured cap must not panic at spawn:
+    /// tokio's `Semaphore::new` asserts `permits <= MAX_PERMITS`
+    /// (`usize::MAX >> 3`), and `maxConcurrentRequests` is only floor-checked
+    /// by its NonZero type — the ceiling is clamped here (#974).
+    #[tokio::test]
+    async fn with_state_clamps_an_oversized_request_cap() {
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("spawn sink");
+        let (writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+        let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let handle = ConnectionHandle::with_state(
+            writer,
+            router,
+            reader_handle,
+            ConnectionState::Ready,
+            tx,
+            rx,
+            default_dynamic_caps(),
+            ConnectionKey::for_server("oversized"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            Arc::new(arc_swap::ArcSwapOption::empty()),
+            usize::MAX,
+        );
+        let _permit = handle
+            .acquire_request_slot()
+            .await
+            .expect("a clamped cap still grants slots");
+    }
+
     /// The configured `maxConcurrentRequests` sizes the request-slot
     /// semaphore (#974): with capacity 1, a second acquisition pends until
     /// the first permit drops.
