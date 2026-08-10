@@ -31,8 +31,6 @@ pub(crate) use connection_action::BridgeError;
 use connection_action::{ConnectionAction, decide_connection_action};
 use handshake::perform_lsp_handshake;
 
-#[cfg(test)]
-pub(crate) use connection_handle::DEFAULT_MAX_CONCURRENT_REQUESTS;
 pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
@@ -5683,7 +5681,7 @@ mod tests {
             ConnectionKey::for_server("test"),
             crate::lsp::bridge::WorkspaceFolderSet::new(None),
             std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
-            crate::lsp::bridge::pool::DEFAULT_MAX_CONCURRENT_REQUESTS,
+            crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS,
         ));
 
         // Add connection to pool

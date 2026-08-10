@@ -94,12 +94,11 @@ fn closed_request_slots_error() -> io::Error {
     )
 }
 
-/// The built-in in-flight request cap lives with the config knob it backs
-/// ([`crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS`]); production
-/// code passes a resolved capacity into [`ConnectionHandle::with_state`], so
-/// the alias below is only for tests.
+// The built-in in-flight request cap lives with the config knob it backs;
+// production code passes a resolved capacity into `with_state`, so the
+// import is only for this module's test-only constructor and tests.
 #[cfg(test)]
-pub(crate) use crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS;
+use crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS;
 
 pub(crate) struct ConnectionHandle {
     /// Connection state - uses std::sync::RwLock for fast, synchronous state checks
@@ -255,7 +254,7 @@ impl ConnectionHandle {
     /// error, or future drop all release it. Errors when the semaphore was
     /// closed (connection evicted): failing fast beats parking on a dead
     /// connection's permits.
-    pub(crate) async fn acquire_request_slot(
+    pub(in crate::lsp::bridge) async fn acquire_request_slot(
         &self,
     ) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
         // Fast path: a free slot needs no clock read.

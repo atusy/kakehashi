@@ -211,7 +211,7 @@ pub(in crate::lsp::bridge) async fn create_handle_with_state_and_pid_keyed(
     create_handle_impl(
         state,
         key,
-        crate::lsp::bridge::pool::DEFAULT_MAX_CONCURRENT_REQUESTS,
+        crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS,
     )
     .await
 }
