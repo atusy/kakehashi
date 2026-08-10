@@ -11,16 +11,46 @@ use tower_lsp_server::ls_types::{
     TextDocumentIdentifier, Uri, WorkspaceFolder, WorkspaceFoldersChangeEvent,
 };
 
-use super::client_capabilities::build_bridge_client_capabilities;
+use super::client_capabilities::{apply_capability_override, build_bridge_client_capabilities};
 use super::jsonrpc::{JsonRpcNotification, JsonRpcRequest};
 use super::request_id::RequestId;
+
+/// Initialize params carrying an optional user `clientCapabilities` override
+/// (issue #976), folded in at serialization time.
+///
+/// The override must merge at the JSON layer — a typed round-trip would drop
+/// fields `ClientCapabilities` doesn't model — but the no-override path must
+/// NOT round-trip through `serde_json::Value` either, which would reorder
+/// keys and disturb byte-identical serialization. Deferring the merge into
+/// `Serialize` keeps one params type for both paths, and a merge failure
+/// surfaces through the writer's existing serialization-error handling.
+#[derive(Debug)]
+pub(crate) struct InitializeParamsWithOverride {
+    params: InitializeParams,
+    capability_override: Option<serde_json::Value>,
+}
+
+impl serde::Serialize for InitializeParamsWithOverride {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Some(override_json) = &self.capability_override else {
+            return self.params.serialize(serializer);
+        };
+        let mut params = serde_json::to_value(&self.params).map_err(serde::ser::Error::custom)?;
+        if let Some(capabilities) = params.get_mut("capabilities") {
+            apply_capability_override(capabilities, override_json);
+        }
+        params.serialize(serializer)
+    }
+}
 
 /// Build an LSP initialize request.
 ///
 /// `root_uri` and `workspace_folders` are forwarded from the upstream client;
 /// `upstream_capabilities` are merged into the bridge defaults. `experimental`
 /// is the process-wide `KAKEHASHI_EXPERIMENTAL=true` opt-in, threaded through
-/// to the declared client capabilities.
+/// to the declared client capabilities. `capability_override` is the server's
+/// `clientCapabilities` config value, deep-merged last over the advertised
+/// capabilities (see [`InitializeParamsWithOverride`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_initialize_request(
     request_id: RequestId,
@@ -30,7 +60,8 @@ pub(crate) fn build_initialize_request(
     upstream_capabilities: Option<&ClientCapabilities>,
     advertise_configuration: bool,
     experimental: bool,
-) -> JsonRpcRequest<InitializeParams> {
+    capability_override: Option<serde_json::Value>,
+) -> JsonRpcRequest<InitializeParamsWithOverride> {
     let root_path = root_uri.as_deref().and_then(|uri| {
         url::Url::parse(uri)
             .ok()
@@ -54,7 +85,14 @@ pub(crate) fn build_initialize_request(
         ..Default::default()
     };
 
-    JsonRpcRequest::new(request_id.as_i64(), "initialize", params)
+    JsonRpcRequest::new(
+        request_id.as_i64(),
+        "initialize",
+        InitializeParamsWithOverride {
+            params,
+            capability_override,
+        },
+    )
 }
 
 /// Build an LSP initialized notification.
@@ -310,6 +348,7 @@ mod tests {
                 None,
                 true,
                 experimental,
+                None,
             );
 
             insta::with_settings!({snapshot_suffix => suffix}, {
@@ -338,6 +377,7 @@ mod tests {
                 None,
                 true,
                 experimental,
+                None,
             );
 
             insta::with_settings!({snapshot_suffix => suffix}, {
@@ -359,6 +399,7 @@ mod tests {
             None,
             true,
             false,
+            None,
         );
 
         let json = serde_json::to_value(&request).unwrap();
@@ -368,7 +409,7 @@ mod tests {
     #[test]
     fn initialize_request_has_null_root_uri_when_not_provided() {
         let request =
-            build_initialize_request(RequestId::new(1), None, None, None, None, true, false);
+            build_initialize_request(RequestId::new(1), None, None, None, None, true, false, None);
 
         let json = serde_json::to_value(&request).unwrap();
         assert!(json["params"]["rootUri"].is_null());
@@ -389,6 +430,7 @@ mod tests {
                 None,
                 true,
                 experimental,
+                None,
             );
 
             insta::with_settings!({snapshot_suffix => suffix}, {
@@ -402,7 +444,7 @@ mod tests {
     #[test]
     fn initialize_request_has_null_workspace_folders_when_not_provided() {
         let request =
-            build_initialize_request(RequestId::new(1), None, None, None, None, true, false);
+            build_initialize_request(RequestId::new(1), None, None, None, None, true, false, None);
 
         let json = serde_json::to_value(&request).unwrap();
         assert!(json["params"]["workspaceFolders"].is_null());
@@ -419,6 +461,7 @@ mod tests {
             None,
             true,
             false,
+            None,
         );
 
         let json = serde_json::to_value(&request).unwrap();
@@ -428,7 +471,7 @@ mod tests {
     #[test]
     fn initialize_request_has_null_root_path_when_no_root_uri() {
         let request =
-            build_initialize_request(RequestId::new(1), None, None, None, None, true, false);
+            build_initialize_request(RequestId::new(1), None, None, None, None, true, false, None);
 
         let json = serde_json::to_value(&request).unwrap();
         assert!(json["params"]["rootPath"].is_null());
@@ -470,6 +513,7 @@ mod tests {
                 Some(&upstream),
                 true,
                 experimental,
+                None,
             );
 
             insta::with_settings!({snapshot_suffix => suffix}, {
@@ -478,6 +522,67 @@ mod tests {
                 });
             });
         }
+    }
+
+    #[test]
+    fn initialize_request_applies_client_capability_override() {
+        let request = build_initialize_request(
+            RequestId::new(1),
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            Some(serde_json::json!({"window": {"workDoneProgress": false}})),
+        );
+
+        let json = serde_json::to_value(&request).unwrap();
+        let capabilities = &json["params"]["capabilities"];
+        assert_eq!(
+            capabilities["window"]["workDoneProgress"],
+            serde_json::json!(false),
+            "the user's clientCapabilities override must reach the wire"
+        );
+        assert!(
+            capabilities["textDocument"]["completion"].is_object(),
+            "baseline capabilities must survive the override merge"
+        );
+        assert_eq!(
+            json["params"]["processId"],
+            serde_json::json!(std::process::id()),
+            "non-capability initialize params must be untouched"
+        );
+    }
+
+    #[test]
+    fn initialize_request_without_override_serializes_as_before() {
+        // The no-override path must not round-trip through serde_json::Value:
+        // that would alphabetize keys and (worse) silently normalize anything
+        // a typed re-parse would drop. Equality with the direct typed
+        // serialization pins the passthrough.
+        let request = build_initialize_request(
+            RequestId::new(7),
+            None,
+            Some("file:///home/user/project".to_string()),
+            None,
+            None,
+            true,
+            false,
+            None,
+        );
+        let serialized = serde_json::to_string(&request).unwrap();
+        let process_id_at = serialized
+            .find("\"processId\"")
+            .expect("processId must be serialized");
+        let capabilities_at = serialized
+            .find("\"capabilities\"")
+            .expect("capabilities must be serialized");
+        assert!(
+            process_id_at < capabilities_at,
+            "typed field order must be preserved (a Value round-trip would \
+             alphabetize capabilities ahead of processId): {serialized}"
+        );
     }
 
     #[test]

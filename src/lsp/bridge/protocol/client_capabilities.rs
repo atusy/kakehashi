@@ -460,6 +460,47 @@ fn merge_upstream_capabilities(
     base
 }
 
+/// Fold a user's `clientCapabilities` config override into the serialized
+/// capabilities (issue #976).
+///
+/// Runs at the JSON layer, after [`merge_upstream_capabilities`], so the user
+/// is the last merge layer (their `false` reliably masks an
+/// upstream-propagated `true`) and fields the typed `ClientCapabilities`
+/// doesn't model pass through instead of being dropped by a typed round-trip.
+/// Merge semantics are [`crate::config::merge::deep_merge_json`] — the same
+/// deep merge that combines the override across config layers.
+///
+/// `general.positionEncodings` is stripped from the override with a warning:
+/// kakehashi's coordinate translation requires UTF-16, and an override there
+/// would silently corrupt every position in every bridged response. A
+/// non-object override is ignored with a warning — deep-merging it would
+/// replace the whole capabilities object.
+pub(super) fn apply_capability_override(
+    capabilities: &mut serde_json::Value,
+    override_json: &serde_json::Value,
+) {
+    if !override_json.is_object() {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "clientCapabilities override must be a table, got {override_json}; ignoring it"
+        );
+        return;
+    }
+    let mut override_json = override_json.clone();
+    if let Some(general) = override_json
+        .get_mut("general")
+        .and_then(|general| general.as_object_mut())
+        && general.remove("positionEncodings").is_some()
+    {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "clientCapabilities override of general.positionEncodings is ignored: \
+             kakehashi's coordinate translation requires UTF-16"
+        );
+    }
+    *capabilities = crate::config::merge::deep_merge_json(capabilities, &override_json);
+}
+
 /// Build the client capabilities the bridge declares to downstream servers.
 ///
 /// Combines bridge baseline capabilities with upstream client capabilities.
@@ -1155,6 +1196,93 @@ mod tests {
                 insta::assert_json_snapshot!(merged);
             });
         }
+    }
+
+    #[test]
+    fn capability_override_wins_over_upstream_merge() {
+        use serde_json::json;
+        use tower_lsp_server::ls_types::WindowClientCapabilities;
+
+        // The editor supports progress, so the merge advertises it — the
+        // user's override must still win (user is the last merge layer).
+        let upstream = ClientCapabilities {
+            window: Some(WindowClientCapabilities {
+                work_done_progress: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = build_bridge_client_capabilities(Some(&upstream), true, false);
+        let mut capabilities = serde_json::to_value(&merged).unwrap();
+
+        apply_capability_override(
+            &mut capabilities,
+            &json!({"window": {"workDoneProgress": false}}),
+        );
+
+        assert_eq!(
+            capabilities.pointer("/window/workDoneProgress"),
+            Some(&json!(false)),
+            "the user override must mask the upstream-propagated capability"
+        );
+        assert!(
+            capabilities.pointer("/textDocument/completion").is_some(),
+            "sibling baseline capabilities must survive the deep merge"
+        );
+    }
+
+    #[test]
+    fn capability_override_cannot_touch_position_encodings() {
+        use serde_json::json;
+
+        let merged = build_bridge_client_capabilities(None, true, false);
+        let mut capabilities = serde_json::to_value(&merged).unwrap();
+
+        apply_capability_override(
+            &mut capabilities,
+            &json!({
+                "general": {"positionEncodings": ["utf-8"]},
+                "window": {"workDoneProgress": false}
+            }),
+        );
+
+        assert_eq!(
+            capabilities.pointer("/general/positionEncodings"),
+            Some(&json!(["utf-16"])),
+            "positionEncodings is bridge-load-bearing: an override would \
+             silently corrupt every coordinate translation"
+        );
+        assert_eq!(
+            capabilities.pointer("/window/workDoneProgress"),
+            Some(&json!(false)),
+            "the rest of the override must still apply"
+        );
+    }
+
+    #[test]
+    fn capability_override_passes_through_unknown_fields() {
+        use serde_json::json;
+
+        // The override is merged at the JSON layer so fields the typed
+        // ClientCapabilities doesn't model are advertised verbatim instead of
+        // being silently dropped by a typed round-trip.
+        let merged = build_bridge_client_capabilities(None, true, false);
+        let mut capabilities = serde_json::to_value(&merged).unwrap();
+
+        apply_capability_override(
+            &mut capabilities,
+            &json!({"workspace": {"futureCapability": {"nested": true}}}),
+        );
+
+        assert_eq!(
+            capabilities.pointer("/workspace/futureCapability/nested"),
+            Some(&json!(true)),
+        );
+        assert_eq!(
+            capabilities.pointer("/workspace/workspaceFolders"),
+            Some(&json!(true)),
+            "existing workspace keys must survive alongside the addition"
+        );
     }
 
     #[test]
