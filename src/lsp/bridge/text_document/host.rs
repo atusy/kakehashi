@@ -386,8 +386,9 @@ impl LanguageServerPool {
     /// dedicated method keeps that strictness out of the
     /// shared raw path that other host methods rely on.
     ///
-    /// Waits through server initialization (the caller's request timeout bounds
-    /// the wait) — returning empty while a server initializes would silently
+    /// Waits through server initialization (bounded by `INIT_TIMEOUT_SECS`;
+    /// the answer itself by `DIAGNOSTIC_RESPONSE_TIMEOUT`, measured from send,
+    /// #974) — returning empty while a server initializes would silently
     /// lose the host layer on the first pull, like the virt diagnostic path.
     ///
     /// The method is fixed to `textDocument/diagnostic`: this path is dedicated
@@ -468,12 +469,20 @@ impl LanguageServerPool {
         Ok(self.resolve_diagnostic_pull_report(&cache_key, snapshot, report, document_is_open))
     }
 
-    /// Drive a host bridge request end-to-end: register for cancel
-    /// forwarding, sync the host document, send, await, transform.
+    /// Drive a host bridge request end-to-end: take a request slot (may PARK,
+    /// #974), register for cancel forwarding, sync the host document, send,
+    /// await, transform.
     ///
-    /// The skeleton mirrors `execute_bridge_request_with_handle` minus the
+    /// The skeleton mirrors `execute_bridge_request_observed` minus the
     /// virtual URI and the coordinate translation — host responses are the
-    /// downstream server's verbatim answer.
+    /// downstream server's verbatim answer. `response_timeout` bounds only
+    /// the answer wait, measured from send; `None` leaves the internal 30s.
+    ///
+    /// Known residual (pre-existing, widened by parking): the host document
+    /// is synced from the caller's TEXT SNAPSHOT after the park, so a sync
+    /// racing a newer eager re-sync can rewind the downstream's copy until
+    /// the next content change heals it — the request-path twin of #422;
+    /// fixing it needs a live-text reader plumbed through this API.
     async fn execute_host_request<T, P: serde::Serialize>(
         &self,
         handle: Arc<ConnectionHandle>,

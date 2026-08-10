@@ -75,8 +75,8 @@ pub fn config_init_settings() -> RawWorkspaceSettings {
 
 /// Returns the default languageServers map: a defaults-only `_` wildcard
 /// entry documenting the built-in `workspaceMarkers`, `preferSharedInstance`,
-/// and `enabled` defaults that every concrete server inherits
-/// (wildcard-config-inheritance). Not spawnable itself — lookups skip the
+/// `enabled`, and `maxConcurrentRequests` defaults that every concrete server
+/// inherits (wildcard-config-inheritance). Not spawnable itself — lookups skip the
 /// wildcard key and any server that isn't [`BridgeServerConfig::is_spawnable`]
 /// (empty resolved cmd, or resolved `enabled: false`).
 fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
@@ -99,8 +99,8 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
             // opt back in individually with its own `enabled: true`.
             enabled: Some(true),
             // Spell out the built-in in-flight request cap (#974) so the
-            // template documents the knob; parallel-capable servers can
-            // raise it per server.
+            // template documents the knob; lower it per server for a
+            // downstream that struggles under concurrent load.
             max_concurrent_requests: std::num::NonZeroUsize::new(
                 crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS,
             ),

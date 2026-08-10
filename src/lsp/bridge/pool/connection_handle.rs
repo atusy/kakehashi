@@ -73,14 +73,6 @@ pub(crate) enum NotificationSendResult {
     SerializationFailed,
 }
 
-/// Per-connection state + I/O actors (ls-bridge-message-ordering single-writer loop).
-///
-/// Lifecycle: `Initializing` → `Ready` (after initialize/initialized) or
-/// `Failed` (timeout/error). Shutdown then drives `begin_shutdown`
-/// (`Initializing`/`Ready` → `Closing`) and `complete_shutdown`
-/// (`Closing`/`Failed` → `Closed`, terminal). FIFO writes flow `tx` → writer
-/// task → stdin; the reader task pushes incoming responses through `router` to
-/// oneshot waiters so callers can await without holding any Mutex.
 /// Park times at or above this on the request-slot semaphore are logged
 /// (`kakehashi::bridge::backpressure`, debug): long waits are the saturation
 /// signal, and an order of magnitude above scheduler noise keeps the log
@@ -100,6 +92,14 @@ fn closed_request_slots_error() -> io::Error {
 #[cfg(test)]
 use crate::config::settings::DEFAULT_MAX_CONCURRENT_REQUESTS;
 
+/// Per-connection state + I/O actors (ls-bridge-message-ordering single-writer loop).
+///
+/// Lifecycle: `Initializing` → `Ready` (after initialize/initialized) or
+/// `Failed` (timeout/error). Shutdown then drives `begin_shutdown`
+/// (`Initializing`/`Ready` → `Closing`) and `complete_shutdown`
+/// (`Closing`/`Failed` → `Closed`, terminal). FIFO writes flow `tx` → writer
+/// task → stdin; the reader task pushes incoming responses through `router` to
+/// oneshot waiters so callers can await without holding any Mutex.
 pub(crate) struct ConnectionHandle {
     /// Connection state - uses std::sync::RwLock for fast, synchronous state checks
     state: std::sync::RwLock<ConnectionState>,
@@ -166,10 +166,17 @@ pub(crate) struct ConnectionHandle {
     /// Cap on concurrent in-flight requests to this connection (#974).
     ///
     /// Acquired (owned, RAII) at the entry of the shared request-execution
-    /// paths, BEFORE the per-host lifecycle lock and the pool `connections`
-    /// lock — a task parked here must never hold anything another
-    /// connection's requests need. Notifications, `$/cancelRequest`, and the
-    /// initialize/shutdown lifecycle are deliberately exempt.
+    /// paths (`execute_bridge_request_observed`, `execute_host_request`),
+    /// BEFORE the per-host lifecycle lock and the pool `connections` lock —
+    /// a task parked here must never hold anything another connection's
+    /// requests need. Exempt by design: notifications, `$/cancelRequest`
+    /// (it relieves saturation), and the initialize/shutdown lifecycle.
+    /// Also currently ungated because they build their requests inline
+    /// rather than through the shared paths: `workspace/executeCommand`,
+    /// `completionItem/resolve`, `codeAction/resolve`, and
+    /// `textDocument/codeLens` — all single user-gesture requests, not
+    /// fan-out sources; gating them is a follow-up, so the cap is a burst
+    /// bound, not a hard per-connection ceiling.
     request_permits: Arc<tokio::sync::Semaphore>,
 }
 
@@ -254,6 +261,17 @@ impl ConnectionHandle {
     /// error, or future drop all release it. Errors when the semaphore was
     /// closed (connection evicted): failing fast beats parking on a dead
     /// connection's permits.
+    ///
+    /// The park itself carries no timeout, by design: every permit holder is
+    /// bounded (diagnostics by the 5s answer deadline, everything else by
+    /// `wait_for_response`'s 30s `REQUEST_TIMEOUT`), so the wait is bounded
+    /// by `ceil(queued / cap) ×` that; a connection leaving service closes
+    /// the semaphore via `set_state` and wakes waiters with `NotConnected`;
+    /// and a caller dropping its future releases everything via RAII. A
+    /// `$/cancelRequest` arriving while its request is still parked finds no
+    /// registration to cancel — the caller's own cancel subscription (where
+    /// one exists) drops the parked future instead; without one the request
+    /// runs to completion, the pre-existing best-effort cancel semantics.
     pub(in crate::lsp::bridge) async fn acquire_request_slot(
         &self,
     ) -> io::Result<tokio::sync::OwnedSemaphorePermit> {

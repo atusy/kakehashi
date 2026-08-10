@@ -91,6 +91,14 @@ Initialization (60s) > Liveness (30-120s) > Per-request (5s)
 Global Shutdown overrides all (highest priority)
 ```
 
+> **#974 amendment**: the per-request deadline (5s, diagnostics) bounds only
+> the ANSWER, measured from send. Request-slot queue wait (the per-connection
+> `maxConcurrentRequests` cap) and connection init precede it and are bounded
+> by the holders' own deadlines and by Initialization respectively — so a
+> single request's wall clock is no longer nested inside the 5s figure. On
+> expiry the abandoned downstream request is `$/cancelRequest`ed.
+
+
 **Global Shutdown Design:**
 - Single ceiling for entire shutdown (not per-server)
 - Graceful attempts → SIGTERM → SIGKILL escalation

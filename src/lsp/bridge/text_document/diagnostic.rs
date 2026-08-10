@@ -32,10 +32,14 @@ use super::super::protocol::{
 
 /// How long a diagnostic pull may wait for the downstream's ANSWER, measured
 /// from send — after the request slot was granted and the request enqueued
-/// (#974). Queue wait deliberately doesn't count: under a many-region burst
-/// the tail used to time out on a healthy-but-saturated downstream (observed:
-/// ruff with 308 regions), and each such failure marked the refresh cycle
-/// incomplete, forcing a nudge that re-ran the burst.
+/// (#974). Slot queue wait and connection init deliberately don't count:
+/// under a many-region burst the tail used to time out on a
+/// healthy-but-saturated downstream (observed: ruff with 308 regions), and
+/// each such failure marked the refresh cycle incomplete, forcing a nudge
+/// that re-ran the burst. The writer-queue residence after enqueue DOES
+/// count, but it is a non-blocking `try_send` into a 4096-deep channel
+/// drained by a dedicated task — milliseconds, not the seconds-scale queue
+/// this exists to exclude.
 pub(in crate::lsp::bridge) const DIAGNOSTIC_RESPONSE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 
@@ -43,10 +47,11 @@ impl LanguageServerPool {
     /// Send a diagnostic request and wait for the response.
     ///
     /// Unlike other request types that fail fast when a server is initializing,
-    /// diagnostic requests wait for the server to become Ready so users see
-    /// diagnostics appear rather than empty results. After the wait and capability
-    /// check, delegates to
-    /// [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle).
+    /// diagnostic requests wait for the server to become Ready (bounded by
+    /// `INIT_TIMEOUT_SECS`) so users see diagnostics appear rather than empty
+    /// results. After the wait and capability check, delegates to
+    /// [`execute_bridge_request_observed`](Self::execute_bridge_request_observed)
+    /// with [`DIAGNOSTIC_RESPONSE_TIMEOUT`] as the answer deadline.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_diagnostic_request(
         &self,
@@ -82,8 +87,8 @@ impl LanguageServerPool {
         }
 
         // Server is Ready and supports diagnostics — proceed with standard lifecycle.
-        // Use execute_bridge_request_with_handle to reuse the pre-fetched handle,
-        // avoiding a redundant HashMap lookup.
+        // Use execute_bridge_request_observed to reuse the pre-fetched handle,
+        // avoiding a redundant HashMap lookup, and to pass the answer deadline.
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);

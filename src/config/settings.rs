@@ -456,9 +456,11 @@ pub struct BridgeServerConfig {
     pub enabled: Option<bool>,
     /// Cap on concurrent in-flight requests kakehashi keeps open to this
     /// server (per spawned connection). Requests beyond the cap wait for a
-    /// slot instead of piling onto the server, and the response deadline
-    /// starts only when the request is actually sent — so a burst over many
-    /// injection regions queues instead of timing out.
+    /// slot instead of piling onto the server, and the diagnostic answer
+    /// deadline starts only when the request is actually sent — so a burst
+    /// over many injection regions queues instead of timing out. Caller-side
+    /// budgets (e.g. the formatting pipeline's step budget) still include
+    /// queueing time.
     ///
     /// `None` = inherit (built-in default `256` — a generous backstop).
     /// Lower it per server when a downstream struggles under concurrent
@@ -471,9 +473,10 @@ pub struct BridgeServerConfig {
 /// (#974). Deliberately generous (maintainer decision): the default is a
 /// backstop against pathological pile-ups, not throughput tuning — most
 /// documents never approach it, and a server that struggles under load is
-/// tuned DOWN per server rather than throttling everyone by default. The
-/// answer deadline being measured from send (not queue entry) is what
-/// actually defuses burst timeouts.
+/// tuned DOWN per server rather than throttling everyone by default. For
+/// requests that actually park, the answer deadline measured from send (not
+/// queue entry) is what defuses burst timeouts; requests admitted within the
+/// cap race the downstream's real service rate, as before.
 pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 256;
 
 impl BridgeServerConfig {

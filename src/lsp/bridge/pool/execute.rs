@@ -80,7 +80,8 @@ impl LanguageServerPool {
     /// (callers obtain it via `get_or_create_connection`, usually because they
     /// need capability checks first). `build_request` shapes the JSON-RPC body
     /// once the virtual URI and request ID are known; `transform_response`
-    /// projects the raw response onto the typed result.
+    /// projects the raw response onto the typed result. May PARK at entry
+    /// until the connection has a free request slot (#974).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_bridge_request_with_handle<T, P: serde::Serialize>(
         &self,
@@ -117,6 +118,13 @@ impl LanguageServerPool {
     /// still cancel the in-flight downstream request precisely by that id —
     /// the upstream-id cancel mapping is removed by the router cleanup guard
     /// the moment the future is dropped, so it cannot be looked up afterward.
+    ///
+    /// `response_timeout`, when `Some`, bounds only the wait for the ANSWER:
+    /// the clock starts after the request slot is granted and the request is
+    /// enqueued (#974), so slot queue wait and connection state never consume
+    /// the deadline; on expiry the downstream request is cancelled and the
+    /// permit released. `None` leaves only `wait_for_response`'s internal 30s
+    /// cap — a `Some` above that is shadowed by it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_bridge_request_observed<T, P: serde::Serialize>(
         &self,
