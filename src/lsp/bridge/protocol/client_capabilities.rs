@@ -442,10 +442,14 @@ pub(super) fn apply_capability_override(
         }
         // A non-object `general` from the override replaced the subtree; a
         // scalar there is spec-invalid anyway, so rebuild the object around
-        // the load-bearing field.
+        // the load-bearing field. (Any baseline `general` siblings are lost
+        // here — today positionEncodings is the only one.)
         Some(other) => {
             *other = serde_json::json!({ "positionEncodings": baseline });
         }
+        // Unreachable today — deep_merge_json never removes keys, so a
+        // baseline `general` survives every merge — kept so the invariant
+        // holds even if the merge semantics change.
         None => {
             if let Some(capabilities) = capabilities.as_object_mut() {
                 capabilities.insert(
