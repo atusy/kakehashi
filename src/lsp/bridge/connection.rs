@@ -6,7 +6,7 @@
 use std::io;
 use std::process::Stdio;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 /// Writer handle for sending LSP messages to downstream language server.
@@ -65,14 +65,18 @@ struct FrameParseState {
 ///
 /// Wraps `BufReader<ChildStdout>` to provide LSP message parsing. Used by the
 /// Reader Task (ls-bridge-message-ordering) for non-blocking response routing via ResponseRouter.
-pub(crate) struct BridgeReader {
-    stdout: BufReader<ChildStdout>,
+///
+/// The source is generic only so tests can drive the framing state machine over
+/// an in-memory pipe: cancellation points are then exact instead of racing a
+/// child process's spawn latency. Production always uses the default.
+pub(crate) struct BridgeReader<R = ChildStdout> {
+    stdout: BufReader<R>,
     frame: FrameParseState,
 }
 
-impl BridgeReader {
-    /// Create a new BridgeReader from a ChildStdout.
-    pub(crate) fn new(stdout: ChildStdout) -> Self {
+impl<R: AsyncRead + Unpin> BridgeReader<R> {
+    /// Create a new BridgeReader from a byte source (a `ChildStdout` in production).
+    pub(crate) fn new(stdout: R) -> Self {
         Self {
             stdout: BufReader::new(stdout),
             frame: FrameParseState::default(),
@@ -184,7 +188,7 @@ impl FrameParseState {
     }
 }
 
-impl BridgeReader {
+impl<R: AsyncRead + Unpin> BridgeReader<R> {
     /// Read the raw bytes of an LSP message body from stdout.
     ///
     /// Parses headers until empty line, extracts Content-Length, and returns the body bytes.
