@@ -761,6 +761,70 @@ pub(crate) fn normalize_host_goto_result(result: serde_json::Value) -> Option<Ve
 mod tests {
     use super::*;
 
+    /// Host-layer requests take the same per-connection request slot as
+    /// injection-region requests (#974): with the only slot held, a host
+    /// diagnostic pull must PARK (observable: it never registers with the
+    /// router) until the slot frees.
+    #[tokio::test]
+    async fn host_request_parks_on_the_request_slot_cap() {
+        use crate::lsp::bridge::pool::test_helpers::*;
+        use crate::lsp::bridge::pool::{ConnectionKey, ConnectionState};
+        use std::sync::Arc;
+
+        let pool = Arc::new(crate::lsp::bridge::pool::LanguageServerPool::new());
+        let handle = create_capped_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("test-server"),
+            1,
+        )
+        .await;
+        advertise_pull_diagnostics(&handle);
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        let occupant = handle
+            .acquire_request_slot()
+            .await
+            .expect("the only slot acquires");
+
+        let host_uri = test_host_uri("host-slot");
+        let request = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            tokio::spawn(async move {
+                pool.send_host_diagnostic_request(
+                    "test-server",
+                    &devnull_config(),
+                    &crate::lsp::bridge::HostDocument {
+                        uri: &host_uri,
+                        language_id: "markdown",
+                        text: "# doc",
+                    },
+                    serde_json::json!({ "textDocument": { "uri": host_uri.as_str() } }),
+                    None,
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            handle.router().pending_count(),
+            0,
+            "with the only slot held, the host request must not have been \
+             registered/sent yet"
+        );
+
+        drop(occupant);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while handle.router().pending_count() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the parked host request proceeds once the slot frees");
+        request.abort();
+    }
+
     #[test]
     fn raw_response_strips_envelope_and_passes_result_verbatim() {
         let response = serde_json::json!({

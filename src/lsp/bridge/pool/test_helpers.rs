@@ -139,6 +139,32 @@ pub(in crate::lsp::bridge) async fn create_handle_with_key(
     create_handle_with_state_and_pid_keyed(state, key).await.0
 }
 
+/// Advertise pull-diagnostic support on a test handle (the setter is
+/// `pub(super)` to the pool, so tests outside it go through this helper).
+pub(in crate::lsp::bridge) fn advertise_pull_diagnostics(handle: &ConnectionHandle) {
+    use tower_lsp_server::ls_types::{
+        DiagnosticOptions, DiagnosticServerCapabilities, ServerCapabilities,
+    };
+    handle.set_server_capabilities(ServerCapabilities {
+        diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+            DiagnosticOptions::default(),
+        )),
+        ..Default::default()
+    });
+}
+
+/// Like [`create_handle_with_key`], but with an explicit request-slot
+/// capacity (#974) for tests that pin parking behavior with tiny caps.
+pub(in crate::lsp::bridge) async fn create_capped_handle_with_key(
+    state: ConnectionState,
+    key: ConnectionKey,
+    max_concurrent_requests: usize,
+) -> Arc<ConnectionHandle> {
+    create_handle_impl(state, key, max_concurrent_requests)
+        .await
+        .0
+}
+
 /// Like [`create_handle_with_key`], but also advertises `commands` as the
 /// connection's static `executeCommandProvider.commands`, and optionally records
 /// `spawned_from` as the config the connection was launched with.
@@ -182,6 +208,19 @@ pub(in crate::lsp::bridge) async fn create_handle_with_state_and_pid_keyed(
     state: ConnectionState,
     key: ConnectionKey,
 ) -> (Arc<ConnectionHandle>, u32) {
+    create_handle_impl(
+        state,
+        key,
+        crate::lsp::bridge::pool::DEFAULT_MAX_CONCURRENT_REQUESTS,
+    )
+    .await
+}
+
+async fn create_handle_impl(
+    state: ConnectionState,
+    key: ConnectionKey,
+    max_concurrent_requests: usize,
+) -> (Arc<ConnectionHandle>, u32) {
     // Create a mock server process (sink — discards all input, no output)
     let mut conn = AsyncBridgeConnection::spawn(vec![
         "sh".to_string(),
@@ -210,7 +249,7 @@ pub(in crate::lsp::bridge) async fn create_handle_with_state_and_pid_keyed(
         key,
         crate::lsp::bridge::WorkspaceFolderSet::new(None),
         std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
-        crate::lsp::bridge::pool::DEFAULT_MAX_CONCURRENT_REQUESTS,
+        max_concurrent_requests,
     ));
     (handle, pid)
 }
