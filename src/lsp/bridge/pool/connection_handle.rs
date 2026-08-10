@@ -263,6 +263,7 @@ impl ConnectionHandle {
             cmd: config.cmd.clone(),
             languages: config.languages.clone(),
             initialization_options: config.initialization_options.clone(),
+            client_capabilities: None,
             settings: None,
             workspace_markers: config.workspace_markers.clone(),
             on_type_formatting_triggers: config.on_type_formatting_triggers.clone(),
