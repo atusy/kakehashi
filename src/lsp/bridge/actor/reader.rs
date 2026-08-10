@@ -704,8 +704,10 @@ async fn reader_loop(
 ///
 /// The liveness timer (when configured) detects a hung server: firing triggers a
 /// Ready→Failed transition via `router.fail_all()` and signals `liveness_failed_tx`.
-/// Its start/reset/stop lifecycle is driven by the `liveness_*` channels and stdout
-/// activity (see `LivenessTimerState`).
+/// Its start/reset/stop lifecycle is driven by the `liveness_*` channels and by
+/// each framed and JSON-decoded downstream message — not by raw stdout activity,
+/// so a server dribbling out a partial frame is still caught (see
+/// `LivenessTimerState`).
 async fn reader_loop_with_liveness(
     mut reader: BridgeReader,
     router: Arc<ResponseRouter>,
@@ -3537,47 +3539,73 @@ mod tests {
     /// and still route the response.
     ///
     /// The unit tests in `connection.rs` pin the parser's resumption at exact
-    /// byte offsets; this one pins that the actor actually benefits. The
-    /// downstream sends a response header, pauses, then the body. Throughout
-    /// the pause the test fires `notify_liveness_start`, whose `select!` branch
-    /// wins against the read and drops the read future — the precise event that
-    /// used to discard the consumed header and resync onto the body.
+    /// byte offsets; this one pins that the actor actually benefits.
     ///
-    /// Against origin/main's parser this fails: the reader reports
-    /// `missing Content-Length header (stray stdout line: ...)` and `fail_all`s
-    /// the request instead of delivering it.
+    /// The downstream emits a complete response for request 2, then the header
+    /// for request 1, and then blocks reading stdin. Two things follow, and
+    /// both are needed for the test to mean anything:
+    ///
+    /// - receiving response 2 proves the reader is running and has reached the
+    ///   dangling header that was written right behind it, and
+    /// - the body cannot arrive until the test releases the shell, so every
+    ///   cancellation fired in between necessarily lands mid-frame.
+    ///
+    /// The cancellations come from `notify_liveness_start`, whose `select!`
+    /// branch beats the read under `biased` and drops the read future — the
+    /// precise event that used to discard the consumed header and resync onto
+    /// the body. Against origin/main's parser this fails: request 1 comes back
+    /// `bridge: reader error` instead of the response.
     #[tokio::test]
     async fn a_response_split_across_cancellations_is_still_routed() {
         use crate::lsp::bridge::protocol::RequestId;
         use std::time::Duration;
 
-        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        let sync = r#"{"jsonrpc":"2.0","id":2,"result":null}"#;
+        let target = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
         let script = format!(
-            "printf 'Content-Length: {}\\r\\n\\r\\n'; sleep 0.5; printf '%s' '{}'; sleep 5",
-            body.len(),
-            body,
+            "printf 'Content-Length: {}\\r\\n\\r\\n%s' '{}'; \
+             printf 'Content-Length: {}\\r\\n\\r\\n'; \
+             read _release; \
+             printf '%s' '{}'; \
+             sleep 5",
+            sync.len(),
+            sync,
+            target.len(),
+            target,
         );
         let mut conn =
             AsyncBridgeConnection::spawn(vec!["sh".to_string(), "-c".to_string(), script])
                 .await
                 .expect("should spawn process");
 
-        let (_writer, reader) = conn.split();
+        let (mut writer, reader) = conn.split();
         let router = Arc::new(ResponseRouter::new());
-        let rx = router.register(RequestId::new(1)).unwrap();
+        let target_rx = router.register(RequestId::new(1)).unwrap();
+        let sync_rx = router.register(RequestId::new(2)).unwrap();
 
         // No liveness timeout: this test is about cancellation, and a firing
         // timer would fail the request for an unrelated reason.
         let handle = spawn_reader_task_with_liveness(reader, Arc::clone(&router), None);
 
-        // Cancel the read repeatedly across the whole gap between header and
-        // body, so the drops land after the header has been consumed.
-        for _ in 0..100 {
+        tokio::time::timeout(Duration::from_secs(5), sync_rx)
+            .await
+            .expect("the synchronizing response must arrive")
+            .expect("channel should not be closed");
+
+        // The reader is now at (or about to consume) the dangling header, and
+        // the body is held behind the shell's blocking read.
+        for _ in 0..50 {
             handle.notify_liveness_start(1);
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
 
-        let result = tokio::time::timeout(Duration::from_secs(5), rx)
+        // Release the shell: any line will do, and write_message ends with one.
+        writer
+            .write_message(&json!({"jsonrpc": "2.0", "method": "release"}))
+            .await
+            .expect("should write to child stdin");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), target_rx)
             .await
             .expect("a well-framed response must still arrive")
             .expect("channel should not be closed");
