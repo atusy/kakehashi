@@ -181,6 +181,7 @@ The bridge requires knowing which server to use for each language. Language serv
 | `languageServers.*.cmd` | Yes | Command array: first element is program, rest are arguments |
 | `languageServers.*.languages` | No (inherits from `_`) | Languages this server handles. The element `"*"` matches every language, for servers not tied to one (any-language-server-wildcard). An omitted list is *not* "any": it inherits from the `_` entry, and an empty one says the server handles nothing (wildcard-config-inheritance) |
 | `languageServers.*.initializationOptions` | No | Passed to server's `initialize` request |
+| `languageServers.*.clientCapabilities` | No | Deep-merged last over the client capabilities the bridge advertises to this server; explicit `false` masks a capability (ls-bridge-client-capabilities-override) |
 | `languageServers.*.onTypeFormattingTriggers` | No | Trigger characters for bridged `textDocument/onTypeFormatting`; the sorted union is advertised at initialize, and requests are forwarded only when the downstream also declares the typed character (#354) |
 | `languageServers.*.enabled` | No | Whether this server is eligible to spawn/use at all. Default `true`; inheritable via the `_` wildcard, so `_.enabled: false` disables every server by default while individual servers opt back in with `enabled: true` |
 

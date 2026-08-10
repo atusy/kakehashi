@@ -41,6 +41,7 @@ pub(crate) const KNOWN_AGGREGATION_SETTING_KEYS: &[&str] = &[
 pub(crate) const KNOWN_BRIDGE_LANGUAGE_SETTING_KEYS: &[&str] = &["aggregation", "enabled"];
 
 pub(crate) const KNOWN_BRIDGE_SERVER_SETTING_KEYS: &[&str] = &[
+    "clientCapabilities",
     "cmd",
     "enabled",
     "initializationOptions",

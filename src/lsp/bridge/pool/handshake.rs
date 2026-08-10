@@ -37,6 +37,7 @@ pub(super) async fn perform_lsp_handshake(
     workspace_folders: Option<Vec<WorkspaceFolder>>,
     client_capabilities: Option<ClientCapabilities>,
     advertise_configuration: bool,
+    capability_override: Option<serde_json::Value>,
 ) -> io::Result<ServerCapabilities> {
     // 1. Build and send initialize request via the single-writer loop
     let init_request = build_initialize_request(
@@ -51,7 +52,8 @@ pub(super) async fn perform_lsp_handshake(
         // env read (the per-instance AtomicBool exists only so unit tests can
         // toggle Kakehashi-level gates; none of them reach this handshake).
         crate::experimental::enabled(),
-    );
+        capability_override,
+    )?;
     handle
         .send_request(init_request, init_request_id)
         .map_err(|e| -> io::Error { e.into() })?;
@@ -111,6 +113,67 @@ mod tests {
     use crate::lsp::bridge::connection::AsyncBridgeConnection;
 
     #[tokio::test]
+    async fn initialize_advertises_capability_override_downstream() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("messages");
+        let mut connection = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > \"$1\"".to_string(),
+            "sh".to_string(),
+            output.display().to_string(),
+        ])
+        .await
+        .unwrap();
+        let (writer, reader) = connection.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+        let handle = ConnectionHandle::new(writer, Arc::clone(&router), reader_handle);
+        // The writer only writes Tracked messages whose id is registered
+        // (claim_for_write); register like the real spawn path does, but feed
+        // the handshake a pre-fired response channel since the fake server
+        // (`cat`) never answers.
+        let _router_rx = router
+            .register(RequestId::new(1))
+            .expect("fresh router must accept the registration");
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        response_tx
+            .send(serde_json::json!({"result": {"capabilities": {}}}))
+            .unwrap();
+
+        perform_lsp_handshake(
+            &handle,
+            RequestId::new(1),
+            response_rx,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some(serde_json::json!({"window": {"workDoneProgress": false}})),
+        )
+        .await
+        .expect("handshake must succeed with a capability override");
+
+        // Poll on the assertion target itself: breaking on an earlier
+        // substring (e.g. the method name) can observe a torn, partially
+        // flushed frame and fail on bytes that haven't landed yet.
+        let mut messages = String::new();
+        for _ in 0..200 {
+            messages = std::fs::read_to_string(&output).unwrap_or_default();
+            if messages.contains("\"workDoneProgress\":false") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            messages.contains("\"workDoneProgress\":false"),
+            "the server config's clientCapabilities override must reach the \
+             initialize request on the wire: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn recovered_capabilities_complete_the_handshake() {
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("messages");
@@ -148,6 +211,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await
         .expect("recoverable capability errors must not stop the handshake");

@@ -61,6 +61,15 @@ pub(crate) struct DiagnosticPullSnapshot {
     pub(crate) host_generation: u64,
 }
 
+/// Whether two configs would launch the same downstream process.
+///
+/// Compared fields are the spawn/initialize-time inputs (`cmd`, `languages`,
+/// `initializationOptions`, `clientCapabilities`, `workspaceMarkers`,
+/// `onTypeFormattingTriggers`, and the effective boolean prefs) — a change
+/// requires a relaunch. `settings` is ignored (`_`): it reaches a live server
+/// at runtime via `workspace/didChangeConfiguration`. Every field compared
+/// here MUST also be retained by `ConnectionHandle::record_launch_config` —
+/// a compared field the snapshot nulls out is a permanent mismatch.
 fn same_launch_config(
     old: &crate::config::settings::BridgeServerConfig,
     new: &crate::config::settings::BridgeServerConfig,
@@ -71,6 +80,7 @@ fn same_launch_config(
         languages: old_languages,
         initialization_options: old_initialization_options,
         settings: _,
+        client_capabilities: old_client_capabilities,
         workspace_markers: old_workspace_markers,
         on_type_formatting_triggers: old_on_type_formatting_triggers,
         prefer_shared_instance: _,
@@ -81,6 +91,7 @@ fn same_launch_config(
         languages: new_languages,
         initialization_options: new_initialization_options,
         settings: _,
+        client_capabilities: new_client_capabilities,
         workspace_markers: new_workspace_markers,
         on_type_formatting_triggers: new_on_type_formatting_triggers,
         prefer_shared_instance: _,
@@ -89,6 +100,7 @@ fn same_launch_config(
     old_cmd == new_cmd
         && old_languages == new_languages
         && old_initialization_options == new_initialization_options
+        && old_client_capabilities == new_client_capabilities
         && old_workspace_markers == new_workspace_markers
         && old_on_type_formatting_triggers == new_on_type_formatting_triggers
         && old.prefers_shared_instance() == new.prefers_shared_instance()
@@ -2639,12 +2651,34 @@ impl LanguageServerPool {
         // - If this function's caller is cancelled, only the JoinHandle await is dropped
         // - The spawned handshake task continues to completion
         let init_options = server_config.initialization_options.clone();
+        let capability_override = server_config.client_capabilities.clone();
         let client_capabilities = self.client_capabilities();
         // Only advertise `workspace.configuration` when this server actually has
         // settings to serve. Advertising it otherwise would flip an
         // `initializationOptions`-configured server to pull and get every
         // section answered `null` (downstream-settings-propagation).
         let advertise_configuration = server_config.settings.is_some();
+        // Surface override problems to the USER at spawn, where the server
+        // name is in scope: shape errors, protected-field attempts, and a
+        // `workspace.configuration` forced against the settings-presence
+        // gate (the override merges after that gate, so it overrules it —
+        // honored because user-explicit, but the failure modes are silent).
+        // `apply_capability_override` keeps `log::warn!` backstops at merge
+        // time; this is the editor-visible channel. Known gap: settings
+        // added later via didChangeConfiguration retain the connection, so
+        // a conflict created at runtime is not re-warned until the next
+        // relaunch — tolerable because the settings still reach the server
+        // through the didChangeConfiguration push; only pull-model servers
+        // are affected in the interim.
+        if let Some(override_json) = capability_override.as_ref() {
+            for warning in crate::lsp::bridge::protocol::capability_override_user_warnings(
+                override_json,
+                advertise_configuration,
+            ) {
+                log::warn!(target: "kakehashi::bridge", "[{server_name}] {warning}");
+                self.warn_to_editor(format!("{server_name}: {warning}"));
+            }
+        }
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
         let command_origins = Arc::clone(&self.command_origins);
@@ -2667,6 +2701,7 @@ impl LanguageServerPool {
                     init_folders,
                     client_capabilities,
                     advertise_configuration,
+                    capability_override,
                 ),
             )
             .await;
@@ -4292,6 +4327,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
 
@@ -7712,6 +7748,40 @@ mod tests {
         assert!(
             pool.diagnostic_pull_baselines
                 .contains_key(&(unrelated, "file:///test.rs".to_string()))
+        );
+    }
+
+    /// The snapshot `record_launch_config` retains must round-trip every field
+    /// `same_launch_config` compares — a compared field the snapshot nulls out
+    /// reads back as a permanent config change, tearing the connection down on
+    /// every acquisition (issue #976's clientCapabilities was shipped that way).
+    #[tokio::test]
+    async fn recorded_client_capabilities_round_trip_through_launch_config() {
+        use serde_json::json;
+
+        let config = crate::config::settings::BridgeServerConfig {
+            client_capabilities: Some(json!({"window": {"workDoneProgress": false}})),
+            ..test_helpers::devnull_config_for_language("python")
+        };
+        let handle = test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("basedpyright"),
+        )
+        .await;
+        handle.record_launch_config(&config);
+
+        assert!(
+            handle.matches_launch_config(&config),
+            "an unchanged clientCapabilities override must not read back as a config change"
+        );
+
+        let changed = crate::config::settings::BridgeServerConfig {
+            client_capabilities: Some(json!({"window": {"workDoneProgress": true}})),
+            ..config.clone()
+        };
+        assert!(
+            !handle.matches_launch_config(&changed),
+            "a changed override must invalidate the connection (initialize-time input)"
         );
     }
 

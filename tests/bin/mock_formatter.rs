@@ -170,6 +170,9 @@ fn main() {
 
         match method {
             "initialize" => {
+                // Env-gated (MOCK_LSP_CANCEL_DIR): lets e2e tests assert the
+                // exact client capabilities kakehashi advertised downstream.
+                record_mock_event(&mode, "initialize", &message);
                 let capabilities = match mode.as_str() {
                     "range-upper" => json!({
                         "documentRangeFormattingProvider": true,

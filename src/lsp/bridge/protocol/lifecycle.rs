@@ -11,7 +11,7 @@ use tower_lsp_server::ls_types::{
     TextDocumentIdentifier, Uri, WorkspaceFolder, WorkspaceFoldersChangeEvent,
 };
 
-use super::client_capabilities::build_bridge_client_capabilities;
+use super::client_capabilities::{apply_capability_override, build_bridge_client_capabilities};
 use super::jsonrpc::{JsonRpcNotification, JsonRpcRequest};
 use super::request_id::RequestId;
 
@@ -20,7 +20,16 @@ use super::request_id::RequestId;
 /// `root_uri` and `workspace_folders` are forwarded from the upstream client;
 /// `upstream_capabilities` are merged into the bridge defaults. `experimental`
 /// is the process-wide `KAKEHASHI_EXPERIMENTAL=true` opt-in, threaded through
-/// to the declared client capabilities.
+/// to the declared client capabilities. `capability_override` is the server's
+/// `clientCapabilities` config value, deep-merged last over the advertised
+/// capabilities at the JSON layer — a typed round-trip would drop capability
+/// fields `ClientCapabilities` doesn't model, and the wire always serializes
+/// from a `serde_json::Value` anyway (`send_request` converts the whole
+/// request, and `preserve_order` keeps field order stable through it).
+///
+/// Errors only if `InitializeParams` fails `to_value` — unreachable with
+/// today's types (no non-string map keys), kept as an honest path rather
+/// than a panic.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_initialize_request(
     request_id: RequestId,
@@ -30,7 +39,8 @@ pub(crate) fn build_initialize_request(
     upstream_capabilities: Option<&ClientCapabilities>,
     advertise_configuration: bool,
     experimental: bool,
-) -> JsonRpcRequest<InitializeParams> {
+    capability_override: Option<serde_json::Value>,
+) -> std::io::Result<JsonRpcRequest<serde_json::Value>> {
     let root_path = root_uri.as_deref().and_then(|uri| {
         url::Url::parse(uri)
             .ok()
@@ -53,8 +63,25 @@ pub(crate) fn build_initialize_request(
         initialization_options,
         ..Default::default()
     };
+    let mut params = serde_json::to_value(params).map_err(std::io::Error::other)?;
+    if let Some(override_json) = capability_override {
+        match params.get_mut("capabilities") {
+            Some(capabilities) => apply_capability_override(capabilities, &override_json),
+            // InitializeParams.capabilities is a required field today; guard
+            // against a future ls_types making it skippable, where silently
+            // dropping the user's override would be the failure mode.
+            None => log::warn!(
+                target: "kakehashi::bridge",
+                "initialize params lost their capabilities field; clientCapabilities override not applied"
+            ),
+        }
+    }
 
-    JsonRpcRequest::new(request_id.as_i64(), "initialize", params)
+    Ok(JsonRpcRequest::new(
+        request_id.as_i64(),
+        "initialize",
+        params,
+    ))
 }
 
 /// Build an LSP initialized notification.
@@ -298,7 +325,9 @@ mod tests {
                 None,
                 true,
                 experimental,
-            );
+                None,
+            )
+            .expect("initialize request must build");
 
             insta::with_settings!({snapshot_suffix => suffix}, {
                 insta::assert_json_snapshot!(request, {
@@ -326,7 +355,9 @@ mod tests {
                 None,
                 true,
                 experimental,
-            );
+                None,
+            )
+            .expect("initialize request must build");
 
             insta::with_settings!({snapshot_suffix => suffix}, {
                 insta::assert_json_snapshot!(request, {
@@ -347,7 +378,9 @@ mod tests {
             None,
             true,
             false,
-        );
+            None,
+        )
+        .expect("initialize request must build");
 
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["params"]["rootUri"], root_uri);
@@ -356,7 +389,8 @@ mod tests {
     #[test]
     fn initialize_request_has_null_root_uri_when_not_provided() {
         let request =
-            build_initialize_request(RequestId::new(1), None, None, None, None, true, false);
+            build_initialize_request(RequestId::new(1), None, None, None, None, true, false, None)
+                .expect("initialize request must build");
 
         let json = serde_json::to_value(&request).unwrap();
         assert!(json["params"]["rootUri"].is_null());
@@ -377,7 +411,9 @@ mod tests {
                 None,
                 true,
                 experimental,
-            );
+                None,
+            )
+            .expect("initialize request must build");
 
             insta::with_settings!({snapshot_suffix => suffix}, {
                 insta::assert_json_snapshot!(request, {
@@ -390,7 +426,8 @@ mod tests {
     #[test]
     fn initialize_request_has_null_workspace_folders_when_not_provided() {
         let request =
-            build_initialize_request(RequestId::new(1), None, None, None, None, true, false);
+            build_initialize_request(RequestId::new(1), None, None, None, None, true, false, None)
+                .expect("initialize request must build");
 
         let json = serde_json::to_value(&request).unwrap();
         assert!(json["params"]["workspaceFolders"].is_null());
@@ -407,7 +444,9 @@ mod tests {
             None,
             true,
             false,
-        );
+            None,
+        )
+        .expect("initialize request must build");
 
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["params"]["rootPath"], "/home/user/project");
@@ -416,7 +455,8 @@ mod tests {
     #[test]
     fn initialize_request_has_null_root_path_when_no_root_uri() {
         let request =
-            build_initialize_request(RequestId::new(1), None, None, None, None, true, false);
+            build_initialize_request(RequestId::new(1), None, None, None, None, true, false, None)
+                .expect("initialize request must build");
 
         let json = serde_json::to_value(&request).unwrap();
         assert!(json["params"]["rootPath"].is_null());
@@ -458,7 +498,9 @@ mod tests {
                 Some(&upstream),
                 true,
                 experimental,
-            );
+                None,
+            )
+            .expect("initialize request must build");
 
             insta::with_settings!({snapshot_suffix => suffix}, {
                 insta::assert_json_snapshot!(request, {
@@ -466,6 +508,38 @@ mod tests {
                 });
             });
         }
+    }
+
+    #[test]
+    fn initialize_request_applies_client_capability_override() {
+        let request = build_initialize_request(
+            RequestId::new(1),
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            Some(serde_json::json!({"window": {"workDoneProgress": false}})),
+        )
+        .expect("initialize request must build");
+
+        let json = serde_json::to_value(&request).unwrap();
+        let capabilities = &json["params"]["capabilities"];
+        assert_eq!(
+            capabilities["window"]["workDoneProgress"],
+            serde_json::json!(false),
+            "the user's clientCapabilities override must reach the wire"
+        );
+        assert!(
+            capabilities["textDocument"]["completion"].is_object(),
+            "baseline capabilities must survive the override merge"
+        );
+        assert_eq!(
+            json["params"]["processId"],
+            serde_json::json!(std::process::id()),
+            "non-capability initialize params must be untouched"
+        );
     }
 
     #[test]
