@@ -16,7 +16,9 @@ This decision coordinates timeout mechanisms across the bridge architecture. It 
 
 **Phase 1 Timeouts** (implemented now): Initialization (Tier 0), Liveness (Tier 2), Global Shutdown (Tier 3)
 
-**Phase 3 Timeout** (future): Per-Request (Tier 1) — only needed for multi-server aggregation
+**Diagnostic answer deadline** (implemented, #974): 5s per diagnostic pull, measured from send — see the amendment under Relationships below. Distinct from the still-future aggregation deadline:
+
+**Phase 3 Timeout** (future): Per-Request (Tier 1) for multi-server aggregation — a wall-clock bound on the whole fan-out, which the #974 deadline deliberately is NOT
 
 ## Context
 
@@ -25,7 +27,7 @@ The async bridge architecture defines timeout systems across three decisions:
 1. **Initialization Timeout** (ls-bridge-async-connection): Bounds server initialization time during startup
 2. **Liveness Timeout** (ls-bridge-async-connection): Detects hung servers (unresponsive to pending requests)
 3. **Global Shutdown Timeout** (ls-bridge-graceful-shutdown): Bounds total shutdown time
-4. **Per-Request Timeout** (ls-bridge-server-pool-coordination): Bounds user-facing latency for multi-server aggregation *[Phase 3 only]*
+4. **Per-Request Timeout** (ls-bridge-server-pool-coordination): Bounds user-facing latency for multi-server aggregation *[Phase 3 only; the implemented #974 diagnostic deadline is a different instrument — it bounds one request's ANSWER from send, not the aggregation]*
 
 ### The Problem
 
@@ -51,9 +53,15 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 - **Liveness timeout**: Only during `Ready` state with pending requests; disabled on shutdown
 - **Global shutdown**: Overrides all other timeouts (highest priority)
 
+### Implemented (#974): Diagnostic Answer Deadline
+
+| Timeout | Duration | Trigger | Action |
+|---------|----------|---------|--------|
+| Diagnostic answer deadline | 5s (`DIAGNOSTIC_RESPONSE_TIMEOUT`) | Every diagnostic pull (virt + host), any fan-out width, measured from send | `$/cancelRequest` the downstream request, count a request failure (→ `coverage_incomplete`) |
+
 ### Phase 3 Addition: Per-Request Timeout (Tier 1)
 
-> **Note**: Only needed for multi-server aggregation. In Phase 1, liveness timeout provides sufficient protection.
+> **Note**: Only needed for multi-server aggregation. In Phase 1, liveness timeout provides sufficient protection; since #974, diagnostics additionally carry the answer deadline above.
 
 | Tier | Timeout | Duration | Trigger | Action |
 |------|---------|----------|---------|--------|
@@ -83,7 +91,8 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 | **Initialization** | 30-60s | Heavy servers (rust-analyzer) need time to index |
 | **Liveness** | 30-120s | Detect hung servers without false positives |
 | **Global Shutdown** | 5-15s | Balance clean exit vs user wait time |
-| **Per-Request** *(Phase 3)* | 2-5s | User-facing latency bound for aggregation |
+| **Diagnostic answer deadline** *(#974)* | 5s | Bound the wait for one diagnostic ANSWER, from send |
+| **Per-Request** *(Phase 3, future)* | 2-5s | User-facing latency bound for aggregation |
 
 **Relationships:**
 ```
@@ -158,6 +167,8 @@ Let implementation details determine which timeout wins.
 
 **Phase 1**: Three timeout tiers — Initialization (30-60s), Liveness (30-120s), Global Shutdown (5-15s)
 
-**Phase 3**: Adds Per-Request timeout (2-5s) for multi-server aggregation
+**#974 (implemented)**: Diagnostic answer deadline (5s from send, cancel on expiry); request-slot queue wait and init are outside it
+
+**Phase 3 (future)**: Adds Per-Request timeout (2-5s) for multi-server aggregation
 
 **Key Rule**: Global shutdown overrides all other timeouts
