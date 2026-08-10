@@ -470,13 +470,14 @@ fn merge_upstream_capabilities(
 /// Merge semantics are [`crate::config::merge::deep_merge_json`] — the same
 /// deep merge that combines the override across config layers.
 ///
-/// `general.positionEncodings` is protected: kakehashi's coordinate
-/// translation requires UTF-16, and an override there would silently corrupt
-/// every position in every bridged response. Enforced as a post-merge
-/// invariant — the baseline value is restored (with a warning) whatever shape
-/// the override took, so a non-object `general` replacing the subtree cannot
-/// bypass it the way an input filter could. A non-object override at the root
-/// is ignored with a warning — deep-merging it would replace the whole
+/// Two fields are protected as post-merge invariants (enforced on the merged
+/// result, so no override shape can bypass them the way an input filter
+/// could): `general.positionEncodings` — kakehashi's coordinate translation
+/// requires UTF-16, and an override there would silently corrupt every
+/// position in every bridged response — and
+/// `workspace.workspaceEdit.changeAnnotationSupport` — see
+/// [`strip_change_annotation_support`]. A non-object override at the root is
+/// ignored with a warning — deep-merging it would replace the whole
 /// capabilities object.
 pub(super) fn apply_capability_override(
     capabilities: &mut serde_json::Value,
@@ -492,6 +493,8 @@ pub(super) fn apply_capability_override(
     let baseline_encodings = capabilities.pointer("/general/positionEncodings").cloned();
     let merged = crate::config::merge::deep_merge_json(capabilities, override_json);
     *capabilities = merged;
+
+    strip_change_annotation_support(capabilities);
 
     let Some(baseline) = baseline_encodings else {
         return;
@@ -526,6 +529,29 @@ pub(super) fn apply_capability_override(
                 );
             }
         }
+    }
+}
+
+/// Post-merge invariant #2: `workspace.workspaceEdit.changeAnnotationSupport`
+/// must never be advertised. The upstream mirror deliberately withholds it —
+/// ls-types' untagged `OneOf` drops `annotationId` when deserializing
+/// downstream edits, so inviting annotated edits would silently strip
+/// `needsConfirmation` and let a downstream's guarded edit apply without the
+/// confirmation it demanded (the same silent-corruption class as
+/// `positionEncodings`). A user override cannot be allowed to re-open it.
+fn strip_change_annotation_support(capabilities: &mut serde_json::Value) {
+    let Some(workspace_edit) = capabilities
+        .pointer_mut("/workspace/workspaceEdit")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    if workspace_edit.remove("changeAnnotationSupport").is_some() {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "clientCapabilities override cannot advertise workspace.workspaceEdit.changeAnnotationSupport: \
+             annotated edits would lose needsConfirmation in the bridge; removing it"
+        );
     }
 }
 
@@ -1315,6 +1341,63 @@ mod tests {
                 "the rest of the override must still apply"
             );
         }
+    }
+
+    /// `changeAnnotationSupport` is deliberately withheld from the upstream
+    /// mirror (ls-types drops `annotationId`, so `needsConfirmation` would be
+    /// silently lost); an override must not be able to re-open that hole —
+    /// neither on a mirrored `workspaceEdit` nor by creating one from scratch.
+    #[test]
+    fn change_annotation_support_cannot_be_reopened_by_override() {
+        use serde_json::json;
+        use tower_lsp_server::ls_types::{
+            ChangeAnnotationWorkspaceEditClientCapabilities, WorkspaceClientCapabilities,
+            WorkspaceEditClientCapabilities,
+        };
+
+        let annotation_override = json!({
+            "workspace": {"workspaceEdit": {"changeAnnotationSupport": {"groupsOnLabel": true}}}
+        });
+
+        // Upstream mirrors workspaceEdit (annotations withheld by the merge).
+        let upstream = ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                workspace_edit: Some(WorkspaceEditClientCapabilities {
+                    document_changes: Some(true),
+                    change_annotation_support: Some(
+                        ChangeAnnotationWorkspaceEditClientCapabilities {
+                            groups_on_label: Some(true),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = build_bridge_client_capabilities(Some(&upstream), true, false);
+        let mut capabilities = serde_json::to_value(&merged).unwrap();
+        apply_capability_override(&mut capabilities, &annotation_override);
+        assert_eq!(
+            capabilities.pointer("/workspace/workspaceEdit/changeAnnotationSupport"),
+            None,
+            "the override must not re-advertise annotation support the mirror withheld"
+        );
+        assert_eq!(
+            capabilities.pointer("/workspace/workspaceEdit/documentChanges"),
+            Some(&json!(true)),
+            "sibling workspaceEdit fields must survive the strip"
+        );
+
+        // No upstream workspaceEdit: the override creating one from scratch is
+        // stripped of the annotation key all the same.
+        let merged = build_bridge_client_capabilities(None, true, false);
+        let mut capabilities = serde_json::to_value(&merged).unwrap();
+        apply_capability_override(&mut capabilities, &annotation_override);
+        assert_eq!(
+            capabilities.pointer("/workspace/workspaceEdit/changeAnnotationSupport"),
+            None,
+        );
     }
 
     /// A non-object override at the root would replace the entire capabilities
