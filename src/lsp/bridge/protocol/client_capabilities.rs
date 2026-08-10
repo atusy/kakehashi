@@ -484,9 +484,21 @@ pub(super) fn apply_capability_override(
     override_json: &serde_json::Value,
 ) {
     if !override_json.is_object() {
+        // Name the type, not the value: the payload is user-supplied and
+        // unbounded, and the pool's editor-facing warning already identifies
+        // the offending server without dumping it.
+        let type_name = match override_json {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "a boolean",
+            serde_json::Value::Number(_) => "a number",
+            serde_json::Value::String(_) => "a string",
+            serde_json::Value::Array(_) => "an array",
+            // Unreachable behind the is_object guard; a string beats a panic.
+            serde_json::Value::Object(_) => "a table",
+        };
         log::warn!(
             target: "kakehashi::bridge",
-            "clientCapabilities override must be a table, got {override_json}; ignoring it"
+            "clientCapabilities override must be a table, got {type_name}; ignoring it"
         );
         return;
     }
