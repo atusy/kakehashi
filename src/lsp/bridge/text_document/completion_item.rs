@@ -271,6 +271,21 @@ impl LanguageServerPool {
         // envelope's host URI by the caller.
         let connection_key = handle.key();
 
+        // In-flight cap (#974): resolves are burst sources too (eager
+        // code-action resolves batch per response), so they take the same
+        // per-connection slot as every other request. Fail-soft on a closed
+        // (evicted) connection.
+        let _request_slot = match handle.acquire_request_slot().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve: no request slot on {connection_key:?}: {e}"
+                );
+                return None;
+            }
+        };
+
         // Register in the upstream request registry FIRST for cancel lookup.
         if let Some(ref id) = upstream_id {
             self.register_upstream_request(id.clone(), connection_key);
@@ -306,6 +321,10 @@ impl LanguageServerPool {
             return None;
         }
 
+        // On the wire: abandonment must cancel downstream before the slot
+        // frees (#974).
+        let mut cancel_on_drop =
+            super::super::pool::CancelOnDropGuard::new(Arc::clone(handle), request_id);
         let response = handle.wait_for_response(request_id, response_rx).await;
         router_guard.disarm();
 
@@ -315,7 +334,10 @@ impl LanguageServerPool {
         }
 
         match response {
-            Ok(response) => parse_completion_resolve_response(response),
+            Ok(response) => {
+                cancel_on_drop.disarm();
+                parse_completion_resolve_response(response)
+            }
             Err(e) => {
                 warn!(
                     target: "kakehashi::bridge",

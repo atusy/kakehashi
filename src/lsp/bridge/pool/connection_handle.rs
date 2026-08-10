@@ -223,17 +223,16 @@ pub(crate) struct ConnectionHandle {
     /// Cap on concurrent in-flight requests to this connection (#974).
     ///
     /// Acquired (owned, RAII) at the entry of the shared request-execution
-    /// paths (`execute_bridge_request_observed`, `execute_host_request`),
-    /// BEFORE the per-host lifecycle lock and the pool `connections` lock —
-    /// a task parked here must never hold anything another connection's
-    /// requests need. Exempt by design: notifications, `$/cancelRequest`
-    /// (it relieves saturation), and the initialize/shutdown lifecycle.
-    /// Also currently ungated because they build their requests inline
-    /// rather than through the shared paths: `workspace/executeCommand`,
-    /// `completionItem/resolve`, `codeAction/resolve`, and
-    /// `textDocument/codeLens` — all single user-gesture requests, not
-    /// fan-out sources; gating them is a follow-up, so the cap is a burst
-    /// bound, not a hard per-connection ceiling.
+    /// paths (`execute_bridge_request_observed`, `execute_host_request`) and
+    /// of the inline-send request paths (`workspace/executeCommand`,
+    /// `completionItem/resolve`, `codeAction/resolve`,
+    /// `textDocument/codeLens` — the eager code-action resolve pass batches
+    /// these, so they are burst sources too). Always taken BEFORE the
+    /// per-host lifecycle lock and the pool `connections` lock — a task
+    /// parked here must never hold anything another connection's requests
+    /// need. Exempt by design: notifications, `$/cancelRequest` (it relieves
+    /// saturation), and the initialize/shutdown lifecycle (which runs after
+    /// `set_state(Closing)` already closed this semaphore).
     request_permits: Arc<tokio::sync::Semaphore>,
 }
 

@@ -991,6 +991,21 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
     ) -> Option<CodeAction> {
         let connection_key = handle.key();
+
+        // In-flight cap (#974): the eager resolve pass batches these per
+        // phase-one response across regions — a genuine burst source, so it
+        // takes the same per-connection slot as every request.
+        let _request_slot = match handle.acquire_request_slot().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "codeAction/resolve: no request slot on {connection_key:?}: {e}"
+                );
+                return None;
+            }
+        };
+
         if let Some(ref id) = upstream_id {
             self.register_upstream_request(id.clone(), connection_key);
         }
@@ -1051,6 +1066,10 @@ impl LanguageServerPool {
             }
         }
 
+        // On the wire: abandonment must cancel downstream before the slot
+        // frees (#974).
+        let mut cancel_on_drop =
+            super::super::pool::CancelOnDropGuard::new(Arc::clone(handle), request_id);
         let response = handle.wait_for_response(request_id, response_rx).await;
         router_guard.disarm();
         if let Some(ref id) = upstream_id {
@@ -1061,7 +1080,10 @@ impl LanguageServerPool {
         // action on the eager fan-out (unbounded by a hostile lazy-action
         // list); the callers own the bounded warn (aggregate / per-selection).
         let response = match response {
-            Ok(r) => r,
+            Ok(r) => {
+                cancel_on_drop.disarm();
+                r
+            }
             Err(e) => {
                 log::debug!(
                     target: "kakehashi::bridge",

@@ -240,6 +240,19 @@ impl LanguageServerPool {
         // Route per-connection cancel state by this handle's pool key (#382).
         let connection_key = handle.key();
 
+        // In-flight cap (#974): same per-connection slot as every request.
+        let _request_slot = match handle.acquire_request_slot().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "codeLens/resolve: no request slot for {server_name}: {e}"
+                );
+                re_envelope_lens(&mut lens, &envelope);
+                return lens;
+            }
+        };
+
         // Register in the upstream request registry FIRST for cancel lookup.
         if let Some(ref id) = upstream_id {
             self.register_upstream_request(id.clone(), connection_key);
@@ -285,6 +298,10 @@ impl LanguageServerPool {
             return lens;
         }
 
+        // On the wire: abandonment must cancel downstream before the slot
+        // frees (#974).
+        let mut cancel_on_drop =
+            super::super::pool::CancelOnDropGuard::new(Arc::clone(&handle), request_id);
         let response = handle.wait_for_response(request_id, response_rx).await;
         router_guard.disarm();
 
@@ -293,7 +310,10 @@ impl LanguageServerPool {
         }
 
         let response = match response {
-            Ok(r) => r,
+            Ok(r) => {
+                cancel_on_drop.disarm();
+                r
+            }
             Err(e) => {
                 warn!(
                     target: "kakehashi::bridge",

@@ -32,7 +32,9 @@ use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::ConnectionKey;
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::decode_command;
-use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionState, LanguageServerPool, UpstreamId};
+use crate::lsp::bridge::pool::{
+    CancelOnDropGuard, ConnectionHandle, ConnectionState, LanguageServerPool, UpstreamId,
+};
 use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
 use tower_lsp_server::ls_types::ExecuteCommandParams;
 
@@ -558,6 +560,20 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
     ) -> Option<Value> {
         let connection_key = handle.key();
+
+        // In-flight cap (#974): same per-connection slot as every request.
+        let _request_slot = match handle.acquire_request_slot().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "executeCommand: no request slot on {connection_key:?} for {:?}: {e}",
+                    params.command
+                );
+                return None;
+            }
+        };
+
         if let Some(ref id) = upstream_id {
             self.register_upstream_request(id.clone(), connection_key);
         }
@@ -619,6 +635,9 @@ impl LanguageServerPool {
             }
         }
 
+        // On the wire: abandonment must cancel downstream before the slot
+        // frees (#974).
+        let mut cancel_on_drop = CancelOnDropGuard::new(Arc::clone(handle), request_id);
         let response = handle.wait_for_response(request_id, response_rx).await;
         router_guard.disarm();
         if let Some(ref id) = upstream_id {
@@ -629,7 +648,10 @@ impl LanguageServerPool {
         // other branches so execute-time issues are debuggable (sibling sweep of
         // the codeAction/resolve logging fix).
         let response = match response {
-            Ok(r) => r,
+            Ok(r) => {
+                cancel_on_drop.disarm();
+                r
+            }
             Err(e) => {
                 warn!(
                     target: "kakehashi::bridge",
