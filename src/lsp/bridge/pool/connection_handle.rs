@@ -502,6 +502,15 @@ impl ConnectionHandle {
         // Notify watchers of state change. send_replace() is non-blocking and
         // always succeeds (it replaces the current value regardless of receivers).
         self.state_watch.send_replace(new_state);
+        // A connection leaving service never frees its permits again — wake
+        // parked request-slot waiters with an error instead of letting them
+        // hang (#974). Idempotent; in-flight permit holders are unaffected.
+        match new_state {
+            ConnectionState::Failed | ConnectionState::Closing | ConnectionState::Closed => {
+                self.request_permits.close();
+            }
+            ConnectionState::Initializing | ConnectionState::Ready => {}
+        }
     }
 
     /// Complete initialization only while this handle still belongs to its
