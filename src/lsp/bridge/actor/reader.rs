@@ -378,7 +378,8 @@ fn new_liveness_timer(timeout: Duration) -> LivenessTimer {
 
 /// Reader-task liveness timer: `timer: Option<…>` (Some = armed) plus the
 /// configured `timeout`. Methods cover the `start` (pending 0→1) / `reset`
-/// (stdout activity) / `stop` (pending→0) lifecycle.
+/// (each framed and JSON-decoded downstream message) / `stop` (pending→0)
+/// lifecycle.
 struct LivenessTimerState {
     /// Active timer future, None when inactive.
     timer: Option<LivenessTimer>,
@@ -3413,7 +3414,9 @@ mod tests {
 
     /// Test that liveness timer resets on message activity.
     ///
-    /// ls-bridge-async-connection: Timer resets on any stdout activity (response or notification).
+    /// ls-bridge-async-connection: the timer resets on each framed and
+    /// JSON-decoded downstream message — not on raw stdout activity, since a
+    /// partial frame must not keep a stalled server alive.
     /// This verifies that receiving a message resets the timer to full duration.
     ///
     /// Uses paused time for deterministic testing - avoids CI flakiness from

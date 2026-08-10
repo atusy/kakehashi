@@ -150,10 +150,11 @@ The system uses two distinct timeout mechanisms with different purposes:
 - **Timer Lifecycle**:
   - **Start**: First request sent when pending count transitions 0→1
   - **Keep running**: Additional requests sent (pending count increases)
-  - **Reset**: Each successfully parsed LSP message (response or notification)
-    while active. Not raw stdout activity: a downstream that dribbles out a
-    partial frame resets nothing and is still caught, which is what makes the
-    timer the backstop for a server that stalls mid-frame.
+  - **Reset**: Each framed and JSON-decoded downstream message while active
+    (the reset happens before the message is classified, so server-initiated
+    requests count too). Not raw stdout activity: a downstream that dribbles
+    out a partial frame resets nothing and is still caught, which is what makes
+    the timer the backstop for a server that stalls mid-frame.
   - **Stop**: Last response received (pending count returns to 0)
 - **Behavior on Timeout**: Connection transitions to Failed state
 

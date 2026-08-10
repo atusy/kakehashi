@@ -248,10 +248,12 @@ impl<R: AsyncRead + Unpin> BridgeReader<R> {
     /// every competing wake-up, and the next read would resync onto a message
     /// body and report a framing error against a perfectly well-framed stream.
     ///
-    /// An `Err` consumes the bytes that produced it and clears the frame state,
-    /// so a caller that keeps reading advances past the bad line rather than
-    /// re-parsing it forever. The reader task treats any error as terminal
-    /// anyway (`actor/reader.rs`), but the parser does not depend on that.
+    /// A *framing* error consumes the bytes that produced it and clears the
+    /// frame state, so a caller that keeps reading advances past the bad line
+    /// rather than re-parsing it forever. (An I/O error from the source leaves
+    /// the frame untouched — there is nothing to skip, and the source itself is
+    /// what failed.) The reader task treats any error as terminal anyway
+    /// (`actor/reader.rs`), but the parser does not depend on that.
     async fn read_message_bytes(&mut self) -> io::Result<Vec<u8>> {
         // Split the borrow so the buffer and the parse state can be held at once.
         let Self { stdout, frame } = self;
@@ -1370,13 +1372,22 @@ mod tests {
             .expect("a fresh 100 KiB body is worth reading directly");
         assert_eq!(remainder.remaining, 100 * 1024);
 
-        // Fill it to within a BufReader-full of the end: staging now batches the
-        // syscall instead of issuing its own.
+        // Exactly one BufReader-full left: still direct, since reading it
+        // straight in costs the same one source read without the extra copy.
         frame
             .body
             .as_mut()
             .unwrap()
-            .resize(100 * 1024 - BUF_READER_CAPACITY + 1, 0);
+            .resize(100 * 1024 - BUF_READER_CAPACITY, 0);
+        assert_eq!(
+            frame.large_body_remainder(true).map(|r| r.remaining),
+            Some(BUF_READER_CAPACITY as u64),
+            "the boundary itself is inclusive"
+        );
+
+        // One byte below it: staging now batches the syscall instead of
+        // issuing its own.
+        frame.body.as_mut().unwrap().push(0);
         assert!(
             frame.large_body_remainder(true).is_none(),
             "a remainder below the BufReader capacity belongs on the staged path"
