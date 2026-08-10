@@ -87,14 +87,24 @@ impl<R: AsyncRead + Unpin> BridgeReader<R> {
 impl FrameParseState {
     /// Take as much of `available` as this frame can use, returning how many
     /// bytes were consumed. Never consumes bytes belonging to the next frame.
-    fn absorb(&mut self, available: &[u8]) -> io::Result<usize> {
+    ///
+    /// The count is returned even when parsing fails, so the caller can consume
+    /// the offending bytes before propagating: a parser that errors *and* leaves
+    /// its input in the buffer can never advance past a bad line.
+    fn absorb(&mut self, available: &[u8]) -> (usize, io::Result<()>) {
         self.started = true;
 
         // Body phase: take only what this frame still owes.
-        if let (Some(body), Some(length)) = (self.body.as_mut(), self.content_length) {
+        if let Some(body) = self.body.as_mut() {
+            // `body` is opened only once Content-Length is known, so this cannot
+            // fail. Reading the length via the same `if let` would silently fall
+            // through to the header phase and parse body bytes as headers.
+            let length = self
+                .content_length
+                .expect("a body is only opened once Content-Length is known");
             let take = (length - body.len()).min(available.len());
             body.extend_from_slice(&available[..take]);
-            return Ok(take);
+            return (take, Ok(()));
         }
 
         // Header phase: a line is only complete once its newline arrives, so a
@@ -104,12 +114,11 @@ impl FrameParseState {
             Some(newline) => {
                 self.line.extend_from_slice(&available[..=newline]);
                 let line = std::mem::take(&mut self.line);
-                self.finish_header_line(&line)?;
-                Ok(newline + 1)
+                (newline + 1, self.finish_header_line(&line))
             }
             None => {
                 self.line.extend_from_slice(available);
-                Ok(available.len())
+                (available.len(), Ok(()))
             }
         }
     }
@@ -203,18 +212,30 @@ impl<R: AsyncRead + Unpin> BridgeReader<R> {
     /// branch: `read_line`/`read_exact` would discard a partly-read frame on
     /// every competing wake-up, and the next read would resync onto a message
     /// body and report a framing error against a perfectly well-framed stream.
+    ///
+    /// An `Err` consumes the bytes that produced it and clears the frame state,
+    /// so a caller that keeps reading advances past the bad line rather than
+    /// re-parsing it forever. The reader task treats any error as terminal
+    /// anyway (`actor/reader.rs`), but the parser does not depend on that.
     async fn read_message_bytes(&mut self) -> io::Result<Vec<u8>> {
         // Split the borrow so the buffer and the parse state can be held at once.
         let Self { stdout, frame } = self;
         loop {
-            let consumed = {
+            let (consumed, outcome) = {
                 let available = stdout.fill_buf().await?;
                 if available.is_empty() {
                     return Err(frame.eof_error());
                 }
-                frame.absorb(available)?
+                frame.absorb(available)
             };
+            // Consume before propagating: the bytes are already reflected in
+            // `frame`, so leaving them buffered would make a retry re-parse them
+            // into the same error forever, against half-advanced state.
             stdout.consume(consumed);
+            if let Err(error) = outcome {
+                *frame = FrameParseState::default();
+                return Err(error);
+            }
 
             if let Some(body) = frame.take_completed_frame() {
                 return Ok(body);
@@ -1200,6 +1221,28 @@ mod tests {
         tx.write_all(b"Content-Length: 0\r\n\r\n").await.unwrap();
         // Deliberately no further writes and no EOF.
         assert_eq!(reader.read_message_bytes().await.unwrap(), b"");
+    }
+
+    /// A framing error must leave the reader able to move on: the bytes that
+    /// caused it are consumed and the frame state is cleared. Otherwise the
+    /// offending line stays in the buffer and every subsequent read re-parses
+    /// it into the same error — the old parser advanced past it, so losing that
+    /// would be a regression that only shows up in a caller that retries.
+    #[tokio::test]
+    async fn a_framing_error_still_advances_past_the_offending_line() {
+        let (mut tx, mut reader) = duplex_reader();
+        tx.write_all(b"X-Not-A-Length: 1\r\n\r\n").await.unwrap();
+        tx.write_all(&header_for(PROGRESS)).await.unwrap();
+        tx.write_all(PROGRESS).await.unwrap();
+        drop(tx);
+
+        let error = reader
+            .read_message_bytes()
+            .await
+            .expect_err("a header block without Content-Length must fail");
+        assert!(error.to_string().contains("missing Content-Length header"));
+
+        assert_eq!(reader.read_message_bytes().await.unwrap(), PROGRESS);
     }
 
     /// Repeated cancellation must not desync the stream: the reader loop
