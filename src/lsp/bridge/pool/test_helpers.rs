@@ -55,6 +55,7 @@ pub(in crate::lsp::bridge) fn lua_ls_config() -> BridgeServerConfig {
         on_type_formatting_triggers: None,
         prefer_shared_instance: None,
         enabled: None,
+        client_capabilities: None,
         settings: None,
     }
 }
@@ -79,6 +80,7 @@ pub(in crate::lsp::bridge) fn devnull_config_for_language(language: &str) -> Bri
         on_type_formatting_triggers: None,
         prefer_shared_instance: None,
         enabled: None,
+        client_capabilities: None,
         settings: None,
     }
 }

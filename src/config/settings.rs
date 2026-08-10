@@ -400,6 +400,23 @@ pub struct BridgeServerConfig {
     /// kakehashi (passthrough), exactly like `initialization_options`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<Value>,
+    /// Override the client capabilities kakehashi advertises to this server.
+    ///
+    /// Deep-merged over the capabilities kakehashi would otherwise send in
+    /// `initialize` (after the editor's own capabilities are folded in), so
+    /// values written here always win. Keys cannot be removed — TOML has no
+    /// null — so disable a capability with an explicit `false`, e.g.
+    /// `clientCapabilities = { window = { workDoneProgress = false } }` to
+    /// stop a progress-chatty server from streaming `$/progress`.
+    ///
+    /// `general.positionEncodings` is protected: kakehashi's coordinate
+    /// translation depends on it, so an override there is ignored with a
+    /// warning. Adding capabilities the editor or kakehashi cannot actually
+    /// handle may invite downstream requests that fail; reducing capabilities
+    /// is always safe. Consumed only at `initialize` time — a change needs a
+    /// server restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_capabilities: Option<Value>,
     /// Marker files/directories that locate the workspace root for this
     /// server, mirroring Neovim's `vim.fs.root` `(string|string[])[]` shape:
     /// entries are tried in list order (earlier = higher priority) and each
@@ -1712,6 +1729,29 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_bridge_server_config_client_capabilities() {
+        // `clientCapabilities` is an opaque JSON override deep-merged over the
+        // capabilities the bridge advertises to this server (issue #976).
+        let config_json = r#"{
+            "cmd": ["basedpyright-langserver", "--stdio"],
+            "languages": ["python"],
+            "clientCapabilities": {
+                "window": { "workDoneProgress": false }
+            }
+        }"#;
+
+        let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
+
+        assert_eq!(
+            config
+                .client_capabilities
+                .as_ref()
+                .and_then(|c| c.pointer("/window/workDoneProgress")),
+            Some(&serde_json::Value::Bool(false)),
+        );
+    }
+
+    #[test]
     fn should_parse_bridge_server_config_minimal() {
         // Test that only required fields need to be present
         let config_json = r#"{
@@ -1893,6 +1933,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             enabled,
+            client_capabilities: None,
             settings: None,
         };
 
@@ -2018,6 +2059,7 @@ mod tests {
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
         let servers = HashMap::from([
@@ -2057,6 +2099,7 @@ mod tests {
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
             enabled,
+            client_capabilities: None,
             settings: None,
         };
 
@@ -2141,6 +2184,7 @@ mod tests {
                 on_type_formatting_triggers: Some(vec![";".to_string()]),
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         )]);
@@ -2164,6 +2208,7 @@ mod tests {
                 on_type_formatting_triggers: Some(vec![String::new()]),
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         )]);
@@ -2342,6 +2387,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
 

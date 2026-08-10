@@ -273,6 +273,7 @@ mod tests {
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 }),
             }],

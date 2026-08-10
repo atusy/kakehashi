@@ -1529,6 +1529,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -1561,6 +1562,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
         let mut servers = HashMap::new();
@@ -1612,6 +1614,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -1626,6 +1629,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -1684,6 +1688,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -1732,6 +1737,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
         let mut servers = HashMap::new();
@@ -1897,6 +1903,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -1939,6 +1946,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -1952,6 +1960,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2012,6 +2021,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: Some(false),
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2025,6 +2035,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2082,6 +2093,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: Some(false),
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2095,6 +2107,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: Some(true),
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2132,6 +2145,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2145,6 +2159,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2520,6 +2535,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2558,6 +2574,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2677,6 +2694,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2903,6 +2921,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );

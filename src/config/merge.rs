@@ -112,6 +112,13 @@ pub(crate) fn merge_bridge_server_configs(
             (Some(b), Some(o)) => Some(deep_merge_json(b, o)),
             _ => overlay.settings.clone().or(base.settings.clone()),
         },
+        client_capabilities: match (&base.client_capabilities, &overlay.client_capabilities) {
+            (Some(b), Some(o)) => Some(deep_merge_json(b, o)),
+            _ => overlay
+                .client_capabilities
+                .clone()
+                .or(base.client_capabilities.clone()),
+        },
         workspace_markers: overlay
             .workspace_markers
             .clone()
@@ -724,6 +731,7 @@ mod tests {
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
                         enabled: None,
+                        client_capabilities: None,
                         settings: None,
                     },
                 ),
@@ -737,6 +745,7 @@ mod tests {
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
                         enabled: None,
+                        client_capabilities: None,
                         settings: None,
                     },
                 ),
@@ -807,6 +816,7 @@ mod tests {
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
                         enabled: None,
+                        client_capabilities: None,
                         settings: None,
                     },
                 ),
@@ -824,6 +834,7 @@ mod tests {
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
                         enabled: None,
+                        client_capabilities: None,
                         settings: None,
                     },
                 ),
@@ -889,6 +900,7 @@ mod tests {
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             )])),
@@ -1280,6 +1292,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         )]);
@@ -1298,6 +1311,7 @@ mod tests {
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         )]);
@@ -1317,6 +1331,7 @@ mod tests {
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             ),
@@ -1330,6 +1345,7 @@ mod tests {
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             ),
@@ -1342,6 +1358,57 @@ mod tests {
         assert_eq!(
             init_opts.get("linkedProjects"),
             Some(&json!(["./Cargo.toml"]))
+        );
+    }
+
+    /// `clientCapabilities` deep-merges like `initializationOptions`/`settings`:
+    /// a wildcard's override and a concrete server's override combine key-wise
+    /// (specific wins on conflict), so `_.clientCapabilities` can set a fleet-wide
+    /// mask that individual servers refine rather than replace (issue #976).
+    #[test]
+    fn test_merge_bridge_server_configs_client_capabilities_deep_merge() {
+        use serde_json::json;
+        use settings::BridgeServerConfig;
+
+        let base = BridgeServerConfig {
+            client_capabilities: Some(json!({
+                "window": {"workDoneProgress": false}
+            })),
+            ..Default::default()
+        };
+        let overlay = BridgeServerConfig {
+            client_capabilities: Some(json!({
+                "window": {"showDocument": {"support": false}},
+                "textDocument": {"completion": {"completionItem": {"snippetSupport": false}}}
+            })),
+            ..Default::default()
+        };
+
+        let merged = merge_bridge_server_configs(&base, &overlay);
+        let caps = merged.client_capabilities.unwrap();
+        assert_eq!(
+            caps.pointer("/window/workDoneProgress"),
+            Some(&json!(false)),
+            "wildcard-level key must survive the merge"
+        );
+        assert_eq!(
+            caps.pointer("/window/showDocument/support"),
+            Some(&json!(false)),
+            "sibling keys under a shared object must combine, not replace"
+        );
+        assert_eq!(
+            caps.pointer("/textDocument/completion/completionItem/snippetSupport"),
+            Some(&json!(false)),
+        );
+
+        // One side only → that side is used verbatim.
+        let merged = merge_bridge_server_configs(&base, &BridgeServerConfig::default());
+        assert_eq!(
+            merged
+                .client_capabilities
+                .unwrap()
+                .pointer("/window/workDoneProgress"),
+            Some(&json!(false)),
         );
     }
 
@@ -1361,6 +1428,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
 
@@ -1373,6 +1441,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
         let merged = merge_bridge_server_configs(&base, &inheriting);
@@ -1417,6 +1486,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: prefer,
+            client_capabilities: None,
             settings: None,
             enabled: None,
         };
@@ -1459,6 +1529,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            client_capabilities: None,
             settings: None,
             enabled,
         };
@@ -1509,6 +1580,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
         let overlay = BridgeServerConfig {
@@ -1523,6 +1595,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
 
@@ -1543,6 +1616,7 @@ mod tests {
         // `initialization_options`: nested objects deep-merge, scalars take the
         // overlay (downstream-settings-propagation).
         let base = BridgeServerConfig {
+            client_capabilities: None,
             settings: Some(json!({
                 "rust-analyzer": {
                     "cargo": { "features": "all", "noDefaultFeatures": false },
@@ -1552,6 +1626,7 @@ mod tests {
             ..Default::default()
         };
         let overlay = BridgeServerConfig {
+            client_capabilities: None,
             settings: Some(json!({
                 "rust-analyzer": {
                     "cargo": { "features": ["foo"] }
@@ -1580,6 +1655,7 @@ mod tests {
         use settings::BridgeServerConfig;
 
         let with_settings = BridgeServerConfig {
+            client_capabilities: None,
             settings: Some(json!({ "Lua": { "diagnostics": { "globals": ["vim"] } } })),
             ..Default::default()
         };
@@ -1613,6 +1689,7 @@ mod tests {
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
 
@@ -1766,6 +1843,7 @@ mod tests {
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             ),
@@ -1780,6 +1858,7 @@ mod tests {
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             ),
@@ -1821,6 +1900,7 @@ mod tests {
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             ),
@@ -1835,6 +1915,7 @@ mod tests {
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
                     enabled: None,
+                    client_capabilities: None,
                     settings: None,
                 },
             ),
@@ -2179,6 +2260,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             enabled,
+            client_capabilities: None,
             settings: None,
         };
 
