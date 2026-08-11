@@ -169,7 +169,10 @@ a routine LSP outcome (hover misses, empty definitions) — so an empty
 envelope can never masquerade as a null result. The guarantee is scoped to
 valid JSON-RPC responses: a downstream answer carrying both keys, neither
 key, or a malformed error object fails the outer request with
-`data.reason: "malformedResponse"` instead of being relayed.
+`data.reason: "malformedResponse"` instead of being relayed — provided the
+envelope still carries the matching bridge-minted id. An invalid message
+that cannot be correlated to its pending entry is dropped and logged, and
+the outer request stays pending until cancellation or connection loss.
 
 The JSON-RPC framing fields (`jsonrpc`, `id`) are stripped: the downstream
 `id` is a bridge-internal request id, unrelated to the caller's, and echoing
@@ -354,10 +357,11 @@ Three lifecycle rules keep the set coherent:
 `restart` = the `stop` sequence above (with its per-status shortcuts; a no-op
 if the slot is already stopped) + clear the stopped entry + respawn the
 **same** `ConnectionKey` under the configuration current at that moment —
-"that moment" being replacement insertion: the respawn revalidates the
-configuration generation before inserting, and a reload that superseded its
-snapshot while no handle existed forces a re-read, so a process spawned
-from a configuration the reload never observed can never be inserted. The
+"that moment" being replacement insertion: generation revalidation happens
+inside the insertion critical section, **serialized with settings
+publication** — a reload that superseded the snapshot forces a re-read, and
+because publication and insertion are mutually ordered, no window remains
+where a newer generation publishes between validation and insertion. The
 outer request resolves when the replacement reaches `Ready` (result `null`)
 or fails (error `restartFailed`), bounded by the existing initialization
 timeout (ls-bridge-timeout-hierarchy). `restartFailed` covers every failure
@@ -571,9 +575,15 @@ namespace.
   cleared and no handle exists yet — the registry is the key's only owner
   then, so without it the slot would vanish from enumeration and calls
   would answer `unknownClient` instead of `clientRestarting`. A
-  registry-only key enumerates as `starting`.
+  registry-only key enumerates by its registered operation — `stopping`
+  for an in-flight `stop` (a reload can purge the `Closing` handle,
+  leaving the registry as sole owner), `starting` for a restart's respawn
+  phase. When a key has several owners, precedence is live handle >
+  stopped set > control registry, deduplicated to one row.
 - The stopped set lives beside the pool's per-connection maps, keyed by
-  `ConnectionKey`; the acquire path checks it before any spawn decision.
+  `ConnectionKey`; the acquire path checks it — together with the
+  control-operation registry — inside the same critical section, before
+  any spawn decision.
 - `restart` clears the slot's entry in `consecutive_panic_counts` before
   respawning; `stop` drives `force_kill_with_escalation` from a new
   per-connection timeout rather than the pool-wide teardown path.
@@ -627,6 +637,6 @@ namespace.
 | **Response envelope** | `ForwardResult`: exactly one of `result` (always emitted, may be `null`) or `error`; framing fields stripped |
 | **Errors** | `RequestFailed` (`-32803`) + `data.reason` discriminator; fail fast, never queue |
 | **Cancellation** | Outer `$/cancelRequest` forwarded to the inner downstream request; outer fails `RequestCancelled`; no bridge-imposed timeout, no Tier-2 liveness accounting |
-| **`stop`** | Graceful handshake bounded by a new per-connection timeout, then forced escalation; stopped set pins the slot until explicit `restart`; single-flight per key |
+| **`stop`** | Graceful handshake when `running` (init-abort when `starting`, handshake bypass when `failed`), bounded by a new per-connection timeout, then forced escalation; stopped set pins the slot until explicit `restart`; single-flight per key |
 | **`restart`** | Same key, current process-level config, no re-key; derived re-open (ARM/CLAIM); resolves at `Ready` or returns `restartFailed`; clears the panic count |
 | **Discovery** | Announced as `capabilities.experimental.kakehashi.bridgeClient: true` |
