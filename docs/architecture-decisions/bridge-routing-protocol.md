@@ -835,17 +835,20 @@ Decision-cache lifecycle:
     open) discards the flight's answer and the waiting open tasks fall
     open to kakehashi-decided routing — one wasted round trip, never a
     wrong serve — with one carve-out: an epoch bump caused solely by
-    the `Ready` arrival of a provider **this flight selected and
-    awaited** re-anchors the flight to the new epoch under its original
-    deadline instead of discarding it (the arrival is the event the
-    initialization wait exists for; without the carve-out the wait
-    could never use the provider it awaited). The carve-out is
+    the `Ready` arrival of **any eligible handle covered by this
+    flight's per-name wait subscription** — not just the one handle
+    the wait initially targeted — re-anchors the flight to the new
+    epoch under its original deadline instead of discarding it (the
+    arrival is the event the initialization wait exists for; without
+    the carve-out, the very wake that re-enumerates a later-ordered
+    handle would bump the epoch and make its own answer inadmissible).
+    The carve-out is
     enforceable because every flush advances the epoch **exactly once
     and records its cause** — for a Ready transition, the exact handle
     — so a flight re-anchors only when each advance since its anchor is
-    a recorded Ready transition of a handle it awaited; any other
-    cause, another provider's arrival or a workspace-folder change,
-    discards as usual. The bookkeeping is a **bounded cause ring**, not
+    a recorded Ready transition of a handle its subscription covers;
+    any other cause, another provider's arrival or a workspace-folder
+    change, discards as usual. The bookkeeping is a **bounded cause ring**, not
     a log and not a per-flush walk: the epoch-bumping critical section
     appends one (epoch, cause, handle) record in O(1) — never touching
     the live flights, whose count scales with open documents — and a

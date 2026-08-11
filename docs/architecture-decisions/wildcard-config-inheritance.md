@@ -254,4 +254,4 @@ The existing `resolve_capture()` in `legend.rs` already implements lazy fallback
 
 - [configuration-merging-strategy](configuration-merging-strategy.md): Cross-layer configuration merging strategy
 - [any-language-server-wildcard](any-language-server-wildcard.md): Why widening past an inherited `languages` list needs an in-list marker
-- [bridge-routing-protocol](bridge-routing-protocol.md): The wire projection sends wildcard-resolved effective values; the routing method key is exempt from the `"_"` method-wildcard merge
+- [bridge-routing-protocol](bridge-routing-protocol.md): The wire projection sends wildcard-resolved effective values; the routing method key is exempt from the `"_"` method-wildcard merge (target state — today's resolution applies the generic merge to every method string)
