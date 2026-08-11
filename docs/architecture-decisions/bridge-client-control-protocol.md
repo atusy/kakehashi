@@ -237,8 +237,8 @@ control-protocol failures; bridged LSP requests keep their existing
 | `clientNotReady` | slot is `starting`, `stopping`, or `failed`; `data.status` carries which |
 | `clientStopped` | slot explicitly stopped; `restart` revives it |
 | `clientRestarting` | slot is mid-`restart`; retry after it returns |
-| `restartFailed` | the `restart` respawn failed — at spawn (missing or unspawnable command), during initialization, or at completion, when the ownership check found the replacement displaced (e.g. by a reload); the message names the cause |
-| `stopFailed` | a `stop` was finalized abnormally (panic, cancellation) before the slot verifiably reached `Closed` |
+| `restartFailed` | the `restart` failed — in its stop phase before respawn, at spawn (missing or unspawnable command), during initialization, or at completion, when the ownership check found the replacement displaced (e.g. by a reload); the message names the cause |
+| `stopFailed` | a `stop` failed to reach a verified `Closed` — abnormal finalization (panic, cancellation) or termination unconfirmed at the per-slot deadline |
 | `forwardFailed` | the inner message could not be handed to the connection (bounded writer full, send error); nothing was forwarded |
 | `connectionLost` | the connection died after the inner request was forwarded |
 | `malformedResponse` | the downstream answered with an invalid JSON-RPC response |
@@ -463,7 +463,11 @@ commit points and primitive calls the task holds no pool locks and
 touches no shared state other than the processes it owns, whose kill
 handles are registered **atomically at acquisition** — at spawn for a
 new process, at reclaim for a pre-existing writer or process — so no
-abort window exists between owning a process and having it on record. A commit point's
+abort window exists between owning a process and having it on record. A
+handle in flight through a channel (the writer's stdin handoff) travels
+as a **pre-registered RAII wrapper**: an aborted receiver drops the
+wrapper and the process returns to the registry instead of vanishing
+into a channel buffer. A commit point's
 critical section contains **no suspension point** — it runs synchronously
 under the pool lock — which is what makes a Tokio hard-cancel atomic with
 respect to it. Cancellation is observed on entry to each commit point; a
@@ -485,13 +489,21 @@ dropped from the pool snapshot. Process termination has **exactly one
 owner at a time**: outside teardown the finalizer terminates the
 record's processes itself, bounded by the per-slot shutdown timeout
 (SIGTERM → SIGKILL). A child whose **termination is unconfirmed** at the
-deadline never settles as closed: the slot stays non-`Closed`, `stop`
-settles `stopFailed`, and `restart` settles `restartFailed` and restores
-the fenced retry tombstone — a replacement must not spawn while the old
-process may still hold locks or sockets. Only a **confirmed-exited**
-child whose `wait` is still pending may transfer to the pool-owned
-background zombie reaper (reap-only, never live processes; its pending
-reaps join teardown's cleanup). During teardown the termination
+deadline — confirmation means exactly that `Child::wait` returned, the
+one primitive that both observes and reaps; SIGKILL delivery proves
+nothing — never settles as closed: `stop` settles `stopFailed`,
+`restart` settles `restartFailed`, and the key converts to a pool-owned
+**termination-pending record** that retains the kill handle, enumerates
+as `stopping`, blocks acquires and further control calls
+(`clientNotReady`), survives reload purges, joins teardown, and converts
+to the fenced retry tombstone only when `wait` returns. A replacement
+must never spawn while the old process may still hold locks or sockets,
+and a later `restart` must never clear a tombstone that does not exist
+yet; a background task drives the pending `wait`s. This
+never-`Closed`-while-unconfirmed rule is a **steady-state** invariant —
+global teardown's final deadline instead logs and abandons the child to
+the OS, since the kakehashi process itself is ending
+(ls-bridge-graceful-shutdown). During teardown the termination
 obligation transfers with the
 live process registry to the escalation phase, and finalization settles
 **records and pool state only** — no two paths ever kill or reap one

@@ -78,6 +78,14 @@ Failed → Closed (skip LSP handshake)
 └─ Wait for process exit, then SIGKILL if needed
 ```
 
+**Unconfirmed termination at the global deadline**: the connection still
+transitions to `Closed` for bookkeeping, and the child is logged and
+abandoned to the OS — global teardown is ending the kakehashi process
+itself, so no continuing owner exists to keep waiting. This is the one
+exception to bridge-client-control-protocol's steady-state rule that an
+unconfirmed termination never reaches `Closed` (a per-slot `stop` has a
+continuing pool to protect; final teardown does not).
+
 ### Operation Disposal Policy: Reject New, Drain Accepted, Fail Pending at Closure or Deadline
 
 **Decision**: Reject new operations immediately, drain the already-accepted
