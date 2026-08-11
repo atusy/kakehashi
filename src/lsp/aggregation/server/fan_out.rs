@@ -32,15 +32,28 @@ pub(crate) struct FanOutTask {
     pub(crate) region_id: String,
     pub(crate) offset: RegionOffset,
     pub(crate) virtual_content: String,
-    /// The region's end-of-content in host coordinates, derived ONCE per
-    /// request (deriving it is O(virtual_content)); every fan-out arm and the
-    /// dispatch bound reuse this value.
-    pub(crate) region_end: tower_lsp_server::ls_types::Position,
+    /// Lazily derived end-of-content position, shared across every arm of one
+    /// request (see [`FanOutTask::region_end`]).
+    region_end_cell: std::sync::Arc<std::sync::OnceLock<tower_lsp_server::ls_types::Position>>,
     pub(crate) upstream_id: Option<UpstreamId>,
     /// Bridge-minted `workDoneToken` to hand this downstream so its `$/progress`
     /// routes to the request's aggregator (ls-bridge-client-progress); `None`
     /// when the request carries no client `workDoneToken`.
     pub(crate) client_progress_token: Option<tower_lsp_server::ls_types::NumberOrString>,
+}
+
+impl FanOutTask {
+    /// The region's end-of-content in host coordinates
+    /// (`region_host_end(virtual_content, offset)`), derived at most ONCE per
+    /// request no matter how many arms read it — deriving it is
+    /// O(virtual_content), and only position-shaped senders need it, so
+    /// non-position fan-outs (diagnostics, symbols, formatting, …) never pay
+    /// for it.
+    pub(crate) fn region_end(&self) -> tower_lsp_server::ls_types::Position {
+        *self.region_end_cell.get_or_init(|| {
+            crate::lsp::bridge::region_host_end(&self.virtual_content, &self.offset)
+        })
+    }
 }
 
 /// Result tagged with the originating server name.
@@ -104,15 +117,10 @@ where
     Fut: Future<Output = io::Result<T>> + Send + 'static,
 {
     let mut join_set = JoinSet::new();
-    // Derived once for the whole fan-out (O(virtual_content) — a per-arm
-    // recompute would rescan the region once per server).
-    let region_end = crate::lsp::bridge::region_host_end(
-        &ctx.resolved.virtual_content,
-        &RegionOffset::with_per_line_offsets(
-            ctx.resolved.region.line_range.start,
-            ctx.resolved.line_column_offsets.clone(),
-        ),
-    );
+    // One shared cell per request: the first position-shaped arm derives the
+    // end-of-content once; non-position fan-outs never touch it.
+    let region_end_cell =
+        std::sync::Arc::new(std::sync::OnceLock::<tower_lsp_server::ls_types::Position>::new());
     for config in selected {
         let server_name = config.server_name.clone();
         let task = FanOutTask {
@@ -127,7 +135,7 @@ where
                 ctx.resolved.line_column_offsets.clone(),
             ),
             virtual_content: ctx.resolved.virtual_content.clone(),
-            region_end,
+            region_end_cell: std::sync::Arc::clone(&region_end_cell),
             upstream_id: ctx.upstream_request_id.clone(),
             client_progress_token: client_progress_tokens
                 .and_then(|m| m.get(&server_name).cloned()),

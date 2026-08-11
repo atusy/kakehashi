@@ -73,7 +73,7 @@ impl Kakehashi {
                             &t.server_config,
                             &t.uri,
                             position,
-                            t.region_end,
+                            t.region_end(),
                             &ch,
                             options,
                             &t.injection_language,
