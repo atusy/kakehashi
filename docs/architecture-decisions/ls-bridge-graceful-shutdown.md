@@ -243,6 +243,12 @@ enum ShutdownMode {
 // an in-progress ServerRemains teardown cannot terminate around it.
 
 async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
+    // Join-or-start the SHARED teardown run and apply this caller's
+    // mode to the shared state at entry (monotonic upgrade; ProcessExit
+    // dominates). Everything below reads mode only through that state.
+    let teardown = pool.teardown_run().join_or_start();
+    teardown.upgrade(mode);
+
     // Both deadlines are absolute and anchored at FUNCTION ENTRY, so
     // sealing/snapshot work spends the same ceiling it lives under.
     // The gap between them is the escalation reserve
@@ -329,32 +335,34 @@ async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
     // abortable set, so the expired producer cutoff costs it nothing
     // and revocable idempotent claims mean an interrupted finalizer
     // never strands a record.
-    join!(
+    let (kill_unresolved, _) = join!(
         force_kill_remaining_until(deadline, connections, &control_procs),
         abort_survivors_and_finalize(&mut control_tasks, graceful_deadline),
     );
 
     // Both arms have joined: no control task is alive, so no RAII
     // wrapper can hand a process back later. Only NOW close the live
-    // registry and take its final contents — capturing the unresolved
-    // set from the force arm's last scan would miss a late hand-back.
-    let unresolved = control_procs.close_and_take();
+    // registry and take its final contents, and UNION them with the
+    // force arm's unresolved ordinary connections — either set alone
+    // drops survivors (control processes live only in the registry;
+    // snapshot connections only in the force arm's return).
+    let unresolved = kill_unresolved.union(control_procs.close_and_take());
 
-    // Mode-dependent disposition of children still unconfirmed
-    // (§ Unconfirmed termination). Disposition is lock-bounded local
-    // work — like cleanup, it runs right after the ceiling rather than
-    // inside it — and it COMMITS UNDER THE SAME LOCK the shared-mode
-    // upgrade takes, so it observes the FINAL effective mode: an
-    // upgrade racing the commit either lands first and is honored, or
-    // lands after and finds ordinary termination-pending records whose
-    // Drop owner disposes them at process end anyway. Records retained
-    // under ServerRemains are likewise Drop-disposed at actual process
-    // end; no teardown re-entry is promised or required.
-    match effective_mode() { // shared, monotonically upgraded — not the caller's copy
-        ShutdownMode::ProcessExit  => log_and_abandon(unresolved),
+    // Disposition of children still unconfirmed (§ Unconfirmed
+    // termination) is ONE locked operation: it takes the mode-upgrade
+    // lock, reads the final effective mode, commits the branch, and
+    // publishes completion before releasing — no gap exists between
+    // reading the mode and acting on it. It is lock-bounded local work,
+    // running right after the ceiling rather than inside it. An exit
+    // upgrade arriving AFTER the commit must itself claim and log the
+    // already-reinserted records before returning: the signal path ends
+    // in process::exit, which runs no destructors, so the Drop owner
+    // covers only ordinary process end.
+    teardown.dispose_locked(unresolved, |final_mode, records| match final_mode {
+        ShutdownMode::ProcessExit  => log_and_abandon(records),
         ShutdownMode::ServerRemains =>
-            pool.reinsert_termination_pending(unresolved), // atomic; waits restarted
-    }
+            pool.reinsert_termination_pending(records), // atomic; waits restarted
+    });
 
     // Only now — every control task terminated, finalized, and the live
     // process registry closed or handed back — may pool/router cleanup
@@ -399,8 +407,11 @@ Shutdown signal arrives
 
 ```rust
 async fn shutdown_router(mode: ShutdownMode) {
-    // 0. One absolute ceiling, anchored before any teardown work begins;
-    //    the escalation reserve is the gap to graceful_deadline
+    // 0. Join-or-start the shared teardown run and apply this caller's
+    //    mode (monotonic upgrade); one absolute ceiling anchored before
+    //    any teardown work begins, escalation reserve as the gap
+    let teardown = connection_pool.teardown_run().join_or_start();
+    teardown.upgrade(mode);
     let deadline = Instant::now() + GLOBAL_TIMEOUT;
     let graceful_deadline = deadline - GLOBAL_TIMEOUT.mul_f32(0.2);
 
@@ -455,15 +466,15 @@ async fn shutdown_router(mode: ShutdownMode) {
     // Cancellation signalled at adoption; producer cutoff at
     // graceful_deadline; finalization for every non-normal outcome —
     // see the sketch above
-    join!(
+    let (kill_unresolved, _) = join!(
         force_kill_remaining_until(deadline, all_connections, &control_procs),
         abort_survivors_and_finalize(&mut control_tasks, graceful_deadline),
     );
-    // Close-and-take AFTER both arms join (late RAII hand-backs land in
-    // the final contents); dispose against the shared effective mode,
-    // linearized with the upgrade lock — see the sketch above
-    let unresolved = control_procs.close_and_take();
-    dispose_unresolved(effective_mode(), unresolved);
+    // Close-and-take AFTER both arms join, unioned with the force arm's
+    // unresolved connections; disposition is the single locked
+    // choose-and-commit operation — see the sketch above
+    let unresolved = kill_unresolved.union(control_procs.close_and_take());
+    teardown.dispose_locked(unresolved, dispose_by_mode);
 
     // 5. Clean up router resources — runs after every control task has
     //    terminated (the join above), so no ADOPTED CONTROL TASK can
@@ -491,9 +502,9 @@ async fn shutdown_router(mode: ShutdownMode) {
 - Prevents cache corruption from abrupt termination
 
 **Bounded Shutdown Latency:**
-- Global timeout bounds the termination *attempt* — escalation and
-  ownership handling, not confirmed termination (local cleanup falls
-  outside the ceiling and needs no server cooperation)
+- Global timeout bounds the termination *attempt* — escalation only, not
+  confirmed termination; ownership disposition and local cleanup run
+  immediately after, outside the ceiling, and need no server cooperation
 - Fail-fast disposal of pending and new operations prevents hang; on the
   graceful path the accepted write queue drains — the *amount* of work is
   queue-bounded, but each write can block on a full pipe if the
