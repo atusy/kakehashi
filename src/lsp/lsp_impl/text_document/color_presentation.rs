@@ -51,6 +51,7 @@ impl Kakehashi {
                         &t.server_config,
                         &t.uri,
                         range,
+                        t.region_end(),
                         color,
                         &t.injection_language,
                         &t.region_id,

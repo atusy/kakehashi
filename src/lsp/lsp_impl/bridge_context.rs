@@ -739,11 +739,12 @@ impl Kakehashi {
     /// Returns `None` for any early-exit condition (invalid URI, no document,
     /// no language, no injection at position).
     /// Returns the preamble plus the NORMALIZED position: per LSP 3.18 a
-    /// `character` past the line's end (or a line past the document's end)
-    /// defaults back to the nearest real location rather than failing, so the
-    /// byte lookup, the bounds precheck, and the downstream dispatch must all
-    /// see the same defended position — position-based callers thread it into
-    /// their request context in place of the client's raw position.
+    /// `character` past the line's end defaults back to the line length
+    /// rather than failing, so the byte lookup, the bounds precheck, and the
+    /// downstream dispatch must all see the same defended position —
+    /// position-based callers thread it into their request context in place
+    /// of the client's raw position. A `line` past the document's end has no
+    /// such spec default and is REJECTED (no virtual context).
     fn resolve_bridge_preamble(
         &self,
         lsp_uri: &Uri,
