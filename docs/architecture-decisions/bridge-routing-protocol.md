@@ -54,7 +54,8 @@ only subtract servers or redirect roots (see Trust Model).
 
 ### The Request
 
-One request is issued per **(host document, language)** decision — not per
+One **decision** — one logical fan-out, carrying one JSON-RPC request per
+selected provider — is issued per **(host document, language)**, not per
 injection region. All injection regions of one language in one host document
 route to the same connections, so the decision is genuinely per language;
 querying per region would multiply one decision by the region count (the
@@ -451,7 +452,14 @@ candidates at all likewise queries nothing.
   every `preferred` dispatch provides. Each answer is validated and
   normalized (Answer Semantics) **before** the predicate runs, so an
   answer whose only content validation dropped cannot win the walk and
-  block lower providers. For routing the predicate is: the `routing` map
+  block lower providers. Normalization is **per entry**: suppression
+  and affirmation entries need no filesystem work and normalize
+  immediately, while a folder-bearing entry whose validation cannot
+  complete within the decision's remaining budget (or acquire pool
+  capacity) is dropped with a warning — the answer's other, already
+  normalized entries stand, and the predicate runs on whatever
+  normalization produced by the deadline. Whole-answer discard is
+  reserved for an answer that never arrived or never deserialized. For routing the predicate is: the `routing` map
   holds at least one operative entry, per the operative rule above.
   `null`, `{ routing: {} }`, an entry with no fields, an error response,
   a timeout, and a malformed answer all mean "no opinion" and fall
@@ -703,13 +711,18 @@ Decision-cache lifecycle:
   candidate set are built from that generation, so a reload landing
   before dispatch invalidates the flight rather than blessing a stale
   projection with a fresh generation; only the flush-epoch anchor is
-  captured at **first dispatch**, so provider-set churn before dispatch
-  — a provider reaching `Ready` just before it — folds into the
-  dispatch-time selection instead of invalidating a flight that never
-  dispatched. The epoch read and the provider-handle enumeration happen
-  in **one pool critical section**, so a provider cannot commit `Ready`
-  between them and land selected-under-E+1 while the flight anchors to
-  E. The driver re-verifies its exact pending (incarnation, flight) and
+  captured at **provider enumeration** — one pool critical section
+  shared by the epoch read and the handle walk, run by every flight
+  including one that selects nobody — so provider-set churn before
+  enumeration folds into the selection instead of invalidating a
+  flight that never dispatched, and a provider cannot commit `Ready`
+  between the read and the walk and land selected-under-E+1 while the
+  flight anchors to E. An **empty selection** validates the same
+  anchor at its fallback commit: a provider reaching `Ready` in the
+  gap bumps the epoch, the commit misses, and the flight
+  re-enumerates under its remaining deadline — the arrival that
+  should turn an empty decision into a queried one does exactly that
+  instead of being sealed out. The driver re-verifies its exact pending (incarnation, flight) and
   generation **before dispatching** — a close or reload landing before
   its first scheduling cancels it without any provider I/O, and
   `didClose`/teardown signal that cancellation directly.
@@ -799,8 +812,12 @@ inside Tier-1's trigger once Phase 3 lands, and a 2-5s per-request bound
 would preempt a longer routing deadline): the routing deadline is the sole
 bound on these requests.
 
-Filesystem validation (the canonicalization above) runs off the async
-executor on a **globally bounded validation pool** (a semaphore with a
+Filesystem validation — the canonicalization above, **and** the
+ordinary marker resolution an override entry needs to construct its
+trust anchor and its configuration-resolved stopped key (marker walks
+make synchronous metadata calls that a network or automounted path can
+stall) — runs off the async executor on a **globally bounded validation
+pool** (a semaphore with a
 bounded queue), charged against the caller's remaining budget; at the
 deadline the decision falls open and the orphaned blocking call's result
 is discarded — the *decision's* latency stays bounded even where an OS
@@ -835,7 +852,13 @@ requests were still pending), an incarnation abort, global teardown, and
 expiry alike cancel every still-pending routing request
 (`$/cancelRequest`) and retire its router entry atomically with the
 decision's settlement — a hung losing provider can never pin an entry
-indefinitely, and a late answer always finds its entry gone.
+indefinitely, and a late answer always finds its entry gone. The
+driver and the per-server open tasks are additionally covered by a
+**pool-owned completion guard** of the same class the control protocol
+requires for its detached operations: an abnormal exit — panic or
+abort — CAS-settles the exact flight to the fallback and retires its
+retained (handle, id) registrations, so no crash can leave a flight,
+a router entry, or a pending binding stuck until shutdown.
 
 **Where the await lives.** The decision is *not* awaited on the `didOpen`
 handler. The handler's candidate enumeration stays synchronous and the
