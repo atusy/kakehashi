@@ -100,8 +100,13 @@ buffer already grew. The body ceiling's default is implementation-defined and
 deliberately generous — well above the largest legitimate payloads observed
 (multi-megabyte diagnostics bursts are real) — so it trips on runaway or
 adversarial peers, not on big workspaces; a configuration knob can follow if a
-legitimate deployment ever meets it. A peer whose honest traffic exceeds the
-ceiling fails repeatedly through respawn — accepted: such a peer is
+legitimate deployment ever meets it. The header-line and header-block
+ceilings are likewise implementation-defined, in the small-kilobytes class —
+LSP headers are few and tiny, so any legitimate margin is enormous. A peer
+whose honest traffic exceeds a ceiling fails repeatedly through
+acquire-driven respawn — or, for a connection nothing re-acquires (a
+`forceStart`-only policy server with `languages = []`), stays unavailable
+until a reload or an explicit restart — accepted: such a peer is
 indistinguishable from a runaway one at the framing layer.
 
 **Writer Pattern:**
@@ -290,3 +295,4 @@ Use standard library's `std::process` with one blocking OS thread per server rea
 - **2026-01-06**: Merged Amendment 001 - Added pending request cleanup requirements and race prevention pattern to prevent indefinite client hangs on reader task exit
 - **2026-01-06**: Merged Amendment 002 - Added state-based liveness timeout gating and separate initialization timeout mechanism to prevent liveness timeout from firing during slow initialization
 - **2026-08-10**: Amendment — reader framing must be cancel-safe across `select!` wake-ups; partial-frame state moved into `BridgeReader`
+- **2026-08-12**: Amendment (with bridge-routing-protocol) — framing size ceilings: incrementally enforced header-line, header-block, and `Content-Length` bounds, each a fatal framing error; see § Framing size ceilings

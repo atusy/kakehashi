@@ -507,10 +507,12 @@ structures with different lifetimes carry the outcome:
   server, and later opens retry the retained key through the ordinary
   respawn path rather than falling through to a different resolution;
   *not-applicable* settles when a server is genuinely rejected
-  **before** any acquire runs — a capability prefilter, or a
-  configuration removal/disablement that ends its candidacy — and is
-  consumed like a suppression (waiters proceed without the server;
-  distinct provenance in the logs). It is **not** the
+  **before** any acquire runs — a configuration removal or disablement
+  that ends its candidacy for the document — and is consumed like a
+  suppression (waiters proceed without the server; distinct provenance
+  in the logs); method-level capability prefilters are deliberately
+  *not* a cause — they are per-request facts (lacking hover does not
+  mean lacking completion) and never settle the binding. It is **not** the
   generation-mismatch outcome: a mismatch whose server is still a
   current candidate falls to ordinary resolution, whose acquire commit
   settles *routed(key)*/*retained(key)* as usual, and a decision that
@@ -554,8 +556,11 @@ Decision-cache lifecycle:
   languages' entries, and its binding, at once. A configuration reload
   flushes the whole cache: superseded-generation entries are unreadable
   under the new generation and would otherwise sit resident until their
-  document closes. Cache and binding are each bounded by open documents
-  × layers × languages.
+  document closes. Cache and binding are each bounded in top-level keys
+  by open documents × layers × languages; a binding entry additionally
+  carries per-candidate-server settlements and, for shared overrides,
+  the capped folder list, so the byte bound multiplies by the
+  candidate-server count and the folder cap.
 - **Flushed wholesale whenever the set of `Ready` advertising providers
   changes** — a provider reaching `Ready`, being replaced by restart or
   respawn, being stopped, failing, or having its advertisement cleared by
@@ -607,7 +612,13 @@ Decision-cache lifecycle:
     awaited** re-anchors the flight to the new epoch under its original
     deadline instead of discarding it (the arrival is the event the
     initialization wait exists for; without the carve-out the wait
-    could never use the provider it awaited);
+    could never use the provider it awaited). The carve-out is
+    enforceable because every flush advances the epoch **exactly once
+    and records its cause** — for a Ready transition, the exact handle
+    — so a flight re-anchors only when each advance since its anchor is
+    a recorded Ready transition of a handle it awaited; any other
+    cause, another provider's arrival or a workspace-folder change,
+    discards as usual;
   - an **incarnation** move (`didClose`, or close/re-open) **aborts**
     the waiting tasks outright — no `didOpen` is sent at all, and the
     incarnation is re-checked at the open's enqueue commit point, so an
@@ -678,9 +689,11 @@ ownership makes the pool bound real: the semaphore permit travels
 **into** the blocking task and is released only when the OS call
 returns — a timed-out *waiter* abandoning the call must not free
 capacity for the next caller to hang another worker — so permanently
-hung calls can exhaust the pool for unrelated providers; that is the
-recorded failure mode (everything then fails open), and teardown never
-blocks on the pool.
+hung calls can exhaust the pool for unrelated providers. That is the
+recorded failure mode, and its effects are the contract's, not a
+blanket fail-open: *new decisions* fail open, while bound-key reuse
+that cannot validate stays dark and sweep barriers fail soft until
+capacity returns. Teardown never blocks on the pool.
 
 Because they carry no tier accounting, outstanding provider requests are
 cleaned up on **every terminal outcome of the decision**, not only
@@ -1059,8 +1072,9 @@ a slot a routing provider left in play.
   ADR): generous implementation-defined defaults that trip on runaway
   peers, not big workspaces.
 - ls-bridge-timeout-hierarchy gains the routing decision deadline
-  (registered beside the per-slot control shutdown timeout) and the
-  Tier-2 exclusion note; that edit lands with this ADR.
+  (registered beside the per-slot control shutdown timeout), the
+  binding-reuse validation budget, and the Tier-2 exclusion note; that
+  edit lands with this ADR.
 
 ## Summary
 

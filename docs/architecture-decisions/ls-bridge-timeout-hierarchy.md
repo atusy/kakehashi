@@ -157,7 +157,7 @@ Global Shutdown overrides all (highest priority)
 
 ### Negative
 
-- **Multiple concepts**: Three timeout *tiers* in Phase 1 (four in Phase 3), plus the tier-exempt deadlines registered here (per-slot control shutdown, routing decision, writer-idle)
+- **Multiple concepts**: Three timeout *tiers* in Phase 1 (four in Phase 3), plus the tier-exempt deadlines registered here (per-slot control shutdown, routing decision, binding-reuse validation, writer-idle)
 - **Tuning required**: Implementation-defined values need careful selection
 
 ### Neutral
@@ -190,7 +190,7 @@ Let implementation details determine which timeout wins.
 - **[ls-bridge-message-ordering](ls-bridge-message-ordering.md)**: Connection state machine (state-based timeout gating)
 - **[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)**: Per-request timeout *(Phase 3)*
 - **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Global shutdown timeout
-- **[bridge-routing-protocol](bridge-routing-protocol.md)**: Routing decision deadline; Tier-1/Tier-2 exemptions for routing queries
+- **[bridge-routing-protocol](bridge-routing-protocol.md)**: Routing decision deadline and binding-reuse validation budget; Tier-1/Tier-2 exemptions for routing queries
 
 ## Summary
 
