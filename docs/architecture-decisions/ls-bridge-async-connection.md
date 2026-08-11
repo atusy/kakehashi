@@ -89,7 +89,11 @@ loses a consumed header on every liveness tick and then resyncs onto the
 message body, reporting a framing error against a well-framed stream and
 killing the connection.
 
-**Framing size ceilings** (amended with bridge-routing-protocol): the reader
+**Framing size ceilings** (amended with bridge-routing-protocol; **target
+state** — today's `BridgeReader` enforces none of these bounds and
+allocates the declared `Content-Length` unchecked, which is exactly the
+exposure this amendment closes; the ceilings land with that protocol's
+implementation): the reader
 enforces three incrementally checked bounds — a maximum header-line length, a
 maximum total header-block size, and a maximum declared `Content-Length` —
 each violation being a framing error with the same fatal disposition as every
