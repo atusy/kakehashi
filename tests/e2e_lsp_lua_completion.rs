@@ -152,3 +152,83 @@ More text.
     // Clean shutdown
     shutdown_client(&mut client);
 }
+
+/// Regression: the insert-mode caret at the very end of an injection region.
+///
+/// An UNCLOSED fence at EOF ends its content node mid-line (no trailing
+/// newline), so the completion caret after the last typed character sits
+/// exactly at the region's end byte. Strict half-open node containment alone
+/// routes that request away from the injection and the downstream server
+/// never sees it (the "fish_lsp doesn't complete at the tail of `!git co`"
+/// bug); the caret-end fallback must resolve it to the Lua region.
+#[test]
+fn test_lua_completion_at_caret_end_of_unclosed_fence() {
+    if skip_if_lua_ls_unavailable() {
+        return;
+    }
+
+    let (mut client, _config_dir) = create_lua_configured_client();
+
+    // No newline after "print(" — the document ends mid-line inside the
+    // unclosed block, so the region's end byte is EOF with a non-zero column.
+    let markdown_content = "# Test Document\n\n```lua\nprint(";
+    let markdown_uri = "file:///test_caret_end.md";
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": markdown_uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": markdown_content
+            }
+        }),
+    );
+
+    // Caret after "print(" on line 3: character 6 == the region's end byte.
+    let completion_response = poll_for_completions(
+        &mut client,
+        markdown_uri,
+        3,   // line
+        6,   // character — exactly at the end of the region's content
+        10,  // max_attempts
+        500, // delay_ms between attempts
+    );
+
+    let completion_response = completion_response.expect(
+        "completion at the caret end of an unclosed fence must reach lua-ls \
+         via the caret-end fallback; null means the request was routed away \
+         from the injection",
+    );
+
+    assert!(
+        completion_response.get("error").is_none(),
+        "Completion should not return error: {:?}",
+        completion_response.get("error")
+    );
+
+    let result = completion_response
+        .get("result")
+        .expect("Completion should have result field");
+    let items = if let Some(items_array) = result.get("items") {
+        items_array.as_array().expect("items should be an array")
+    } else if result.is_array() {
+        result.as_array().expect("result should be an array")
+    } else {
+        panic!("Unexpected completion response format: {:?}", result);
+    };
+    assert!(
+        !items.is_empty(),
+        "Should receive completion items from lua-ls at the region's caret end, got: {:?}",
+        items
+    );
+
+    println!(
+        "✓ Received {} completion items at the caret end of an unclosed fence",
+        items.len()
+    );
+
+    // Clean shutdown
+    shutdown_client(&mut client);
+}
