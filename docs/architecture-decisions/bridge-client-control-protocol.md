@@ -315,7 +315,15 @@ response receipt: `Initializing → Closing` always means direct
 termination, and only a slot that already committed `Initializing → Ready`
 — initialize response processed *and* `initialized` enqueued — takes the
 normal `shutdown` → `exit` sequence, so `shutdown` can never jump the
-queue ahead of `initialized`. This deliberately diverges
+queue ahead of `initialized`. Two invariants make that arbitration sound:
+every handshake terminal transition — `Ready`, and `Failed` from error,
+timeout, or task failure alike — commits **conditionally from
+`Initializing`**, so once `Closing` wins nothing overwrites it (today the
+timeout and task-failure paths write `Failed` unconditionally and the
+error path is check-then-write); and the `initialized` enqueue commits
+**atomically with the `Ready` transition**, while the direct-abort path
+does not drain the queue — a losing handshake can neither enqueue
+`initialized` after `Closing` won nor have the abort flush it downstream. This deliberately diverges
 from ls-bridge-graceful-shutdown's `Initializing → Closing` rule, which
 sends `exit` in that window and is itself non-conformant on this point;
 correcting that decision is a follow-up. `stop` on a `failed` slot skips the LSP
