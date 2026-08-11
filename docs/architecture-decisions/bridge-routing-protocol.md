@@ -46,7 +46,8 @@ the transport: absence or failure of providers reproduces today's
 *initial* routing decision, at worst one decision deadline later — with
 one recorded difference in what happens afterwards: the decision settles
 into the document's route binding either way, so even a fallback route is
-frozen for the document's open lifetime, where today a restart's re-open
+frozen for the **binding's lifetime** (the host's close; an injection
+tuple's last-region disappearance), where today a restart's re-open
 re-resolves live markers (respawn-reopen-derives-its-targets records the
 same freeze from its side). A *successful* answer, by design, can
 only subtract servers or redirect roots (see Trust Model).
@@ -608,9 +609,9 @@ structures with different lifetimes carry the outcome:
   second same-name connection, because those sites read the *binding*.
   Bindings are also **grandfathered against trust-universe shrinkage**:
   an override admitted under an earlier workspace-folder set keeps
-  driving re-opens for that document's lifetime (the trust guarantee is
+  driving re-opens for the binding's lifetime (the trust guarantee is
   scoped to admission time; revoking an open document's route is
-  close/re-open, or `stop`). Only a server with no binding record at all
+  close/re-open — or the tuple's language leaving — or `stop`). Only a server with no binding record at all
   (one that became a candidate after the open, say via reload) falls
   through to kakehashi's ordinary resolution. The binding governs
   **every** site that derives a connection from the host URI — the
@@ -621,9 +622,10 @@ structures with different lifetimes carry the outcome:
   (ls-bridge-server-pool-coordination is amended accordingly). The
   envelope must carry enough identity to *hit the right binding*: the
   layer/language pair, the open incarnation, and the tuple's **binding
-  generation** — drawn from one per-host monotonic 64-bit counter that
-  is never reset and never reused (no per-tuple state survives
-  eviction, so no tombstones; monotonicity rules out collision and a
+  generation** — drawn from one **session-global** monotonic 64-bit
+  counter that is never reset and never reused (no per-host or
+  per-tuple allocator state exists at all, so nothing survives or
+  resets across `didClose`; monotonicity rules out collision and a
   64-bit space cannot wrap in practice), stamped anew each time a
   tuple's binding is created, because an injection language can leave
   and re-enter the document without the host incarnation moving —
@@ -650,7 +652,11 @@ Decision-cache lifecycle:
   a missing parser) preserve bindings, and the parse-state
   discriminator that distinction requires, which the re-open decision
   records as not existing today, is an implementation prerequisite of
-  this eviction rule. A configuration reload
+  this eviction rule. The eviction commits as a **non-inserting
+  compare-and-set** against the exact incarnation/content version the
+  parse result speaks for and the tuple's current binding generation —
+  a lagging parse of older text can never evict a language the newest
+  text retains or has reintroduced. A configuration reload
   flushes the whole cache: superseded-generation entries are unreadable
   under the new generation and would otherwise sit resident until their
   document closes. Cache and binding are each bounded in top-level keys
@@ -735,10 +741,16 @@ Decision-cache lifecycle:
   - an **incarnation** move (`didClose`, or close/re-open) **aborts**
     the waiting tasks outright — no `didOpen` is sent at all, and the
     open's enqueue commit re-checks the incarnation **and, for a
-    virtual open, the tuple's current binding generation** (the
-    incarnation alone does not move when an injection language leaves
-    and re-enters), so an old task can never emit a ghost open for a
-    closed document or a removed region. A
+    virtual open, the tuple's current binding generation and the exact
+    current region/virtual-document identity** (the incarnation alone
+    does not move when an injection language leaves and re-enters, and
+    the tuple generation alone does not move when one region of a
+    language is removed while another remains). The enqueue
+    registration and the tuple's eviction/close share **one lifecycle
+    critical section** — an old task cannot validate, lose the lock to
+    a cleanup that evicts and closes everything, and then register a
+    ghost open. So a stale task can never open a closed document or a
+    removed region. A
     re-opened document never receives the previous open's answer:
     the anchors are part of the flight's identity, so a caller arriving
     after a flush or re-open never joins the stale flight — it starts a
