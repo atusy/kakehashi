@@ -38,7 +38,9 @@ Failed → Closed          (skip shutdown handshake, cleanup only)
 **Operation Gating in Closing State:**
 - New operations: Reject with `REQUEST_FAILED` ("bridge: connection closing")
 - Order queue: Continue draining (send queued operations)
-- Pending responses: Wait for responses up to global timeout
+- Pending responses: Wait up to the applicable shutdown deadline (per-slot
+  `stop` or global teardown), failing at connection closure if it comes
+  first
 
 ### LSP Shutdown Handshake Sequence
 
@@ -50,9 +52,9 @@ Follow LSP specification's two-phase shutdown:
 │ ────────────────────────────────────────────────────    │
 │ 1. Transition to Closing state                          │
 │ 2. Send LSP shutdown request to server                  │
-│ 3. Wait for shutdown response (until global timeout)    │
+│ 3. Wait for shutdown response (until the deadline)      │
 │ 4. Send LSP exit notification                           │
-│ 5. Wait for process exit (until global timeout)         │
+│ 5. Wait for process exit (until the deadline)           │
 │ 6. Transition to Closed state                           │
 └─────────────────────────────────────────────────────────┘
                            │
@@ -76,11 +78,11 @@ Failed → Closed (skip LSP handshake)
 └─ Wait for process exit, then SIGKILL if needed
 ```
 
-### Operation Disposal Policy: Reject New, Drain Accepted, Fail Pending at Timeout
+### Operation Disposal Policy: Reject New, Drain Accepted, Fail Pending at Closure or Deadline
 
 **Decision**: Reject new operations immediately, drain the already-accepted
-order queue ahead of the shutdown handshake, and fail pending responses when
-the timeout expires.
+order queue ahead of the shutdown handshake, and fail pending responses at
+connection closure or the applicable deadline, whichever comes first.
 
 **Rationale:**
 - **Predictable latency**: Bounded shutdown time, no waiting for slow servers
@@ -99,6 +101,11 @@ the timeout expires.
 | **New operations** | Reject with `REQUEST_FAILED` ("bridge: connection closing") when attempting to enqueue |
 
 **Why not abort mid-write**: Operations in the order queue may be partially written to stdin. Aborting mid-write corrupts the protocol stream.
+
+**Forced-termination exception**: the drain and complete-write rows describe
+the graceful path. A forced termination (writer-idle timeout, deadline
+expiry) kills the process regardless of queue state — the remaining queue is
+abandoned, and its tracked requests fail exactly like pending responses.
 
 ### Writer Loop Shutdown Synchronization
 
@@ -174,7 +181,7 @@ async fn graceful_shutdown(&self) {
 }
 ```
 
-**Guarantees:**
+**Guarantees (graceful path — a forced termination voids the last two):**
 - ✅ Writer loop stops dequeuing **before** shutdown writes to stdin
 - ✅ No concurrent writes to stdin (sequential: writer → shutdown)
 - ✅ Bounded wait (2s timeout prevents indefinite hang)
@@ -182,7 +189,7 @@ async fn graceful_shutdown(&self) {
 
 **Why 2-second timeout**: Writer loop writes typically <100ms. 2s allows for slow disk I/O without indefinite hang.
 
-**Note**: This 2s timeout is per-connection and runs inside `graceful_shutdown()`, which itself runs under the global shutdown timeout. The 2s counts against the global budget.
+**Note**: This 2s timeout is per-connection and runs inside `graceful_shutdown()`, which itself runs under the applicable shutdown deadline (per-slot `stop` or global teardown). The 2s counts against that budget.
 
 ### Shutdown Timeout Policy
 
@@ -205,26 +212,30 @@ All connections shut down in parallel under a single global ceiling. This is int
 **Timeout Application:**
 ```rust
 async fn shutdown_all_connections(pool: &ConnectionPool) {
-    let global_timeout = Duration::from_secs(IMPL_DEFINED);
-    let deadline = Instant::now() + global_timeout;   // ONE absolute ceiling
-    // Reserve part of the ceiling for forced escalation
-    // (ls-bridge-timeout-hierarchy: ~20% for SIGTERM/SIGKILL)
-    let graceful_budget = global_timeout.mul_f32(0.8);
+    // Both deadlines are absolute and anchored at FUNCTION ENTRY, so
+    // sealing/snapshot work spends the same ceiling it lives under.
+    // The gap between them is the escalation reserve
+    // (ls-bridge-timeout-hierarchy: ~20% for SIGTERM/SIGKILL).
+    let deadline = Instant::now() + GLOBAL_TIMEOUT;
+    let graceful_deadline = deadline - GLOBAL_TIMEOUT.mul_f32(0.2);
 
-    // Seal control admission FIRST, before any snapshot: no new per-slot
+    // Gate ordinary admission: the pool-wide shutting_down flag stops
+    // acquires from spawning new connections from here on.
+    pool.mark_shutting_down();
+
+    // Seal control admission before any snapshot: no new per-slot
     // stop/restart (bridge-client-control-protocol) may begin, ownership
     // of in-flight control operations transfers to this teardown, and
-    // the seal blocks replacement insertion — an adopted restart aborts
-    // at its next commit point. Control operations register every
-    // process they spawn in the teardown-owned `control_procs` registry
-    // AT SPAWN TIME, so a restart crossing its spawn point can never
-    // lose its kill handle.
+    // the seal blocks replacement insertion. Control operations register
+    // every process they spawn in the teardown-owned `control_procs`
+    // registry AT SPAWN TIME, so a restart crossing its spawn point can
+    // never lose its kill handle.
     let (control_ops, control_procs) = seal_and_take_control_operations();
 
-    // Snapshot AFTER the seal: nothing can be inserted past it.
+    // Snapshot AFTER both gates: nothing can be inserted past them.
     let connections = pool.all_connections();
 
-    let graceful = tokio::time::timeout(graceful_budget, async {
+    let graceful = tokio::time::timeout_at(graceful_deadline, async {
         // Shutdown all connections in parallel (best-effort).
         // Each task uses the state-aware dispatch below (§ Multi-Connection
         // Shutdown): Failed → cleanup_only, Initializing →
@@ -236,9 +247,15 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
     }).await;
 
     if graceful.is_err() {
-        // Abort adopted control tasks and JOIN them before killing, so
-        // none can mutate registries or tombstones after cleanup.
-        abort_and_join_control_tasks().await;
+        // Cancel adopted control tasks COOPERATIVELY: each observes the
+        // seal at its next commit point and stops there — mutations are
+        // atomic between commit points, so no tombstone, ARM state, or
+        // registry is left half-written. The join is bounded by the
+        // remaining budget; a straggler past it is left to force-kill,
+        // which is safe for the same commit-point reason.
+        let _ = tokio::time::timeout_at(
+            deadline, cancel_and_join_control_tasks_at_commit_points()
+        ).await;
     }
 
     // Escalation runs against the SAME absolute deadline, covering the
@@ -246,7 +263,7 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
     // connections already Closed). When the remaining budget is shorter
     // than the normal SIGTERM grace, the grace is shortened or skipped —
     // the ceiling wins over politeness.
-    force_kill_remaining_until(deadline, connections, control_procs);
+    force_kill_remaining_until(deadline, connections, control_procs).await;
 }
 ```
 
@@ -283,7 +300,13 @@ Shutdown signal arrives
 
 ```rust
 async fn shutdown_router() {
-    // 1. Stop accepting new requests
+    // 0. One absolute ceiling, anchored before any teardown work begins;
+    //    the escalation reserve is the gap to graceful_deadline
+    let deadline = Instant::now() + GLOBAL_TIMEOUT;
+    let graceful_deadline = deadline - GLOBAL_TIMEOUT.mul_f32(0.2);
+
+    // 1. Stop accepting new requests (also gates ordinary acquires via
+    //    the pool-wide shutting_down flag)
     mark_router_shutting_down();
 
     // 2. Fail all pending routing decisions
@@ -297,14 +320,12 @@ async fn shutdown_router() {
     //    registered in the teardown-owned control_procs registry at
     //    spawn time
     let (control_ops, control_procs) = seal_and_take_control_operations();
-    let deadline = Instant::now() + GLOBAL_TIMEOUT;
 
-    // 4. Shutdown all connections in parallel (snapshot AFTER the seal)
+    // 4. Shutdown all connections in parallel (snapshot AFTER both gates)
     let all_connections = connection_pool.all_connections();
 
-    // Reserve part of the single ceiling for forced escalation
-    // (ls-bridge-timeout-hierarchy: ~20% for SIGTERM/SIGKILL)
-    let graceful = tokio::time::timeout(GLOBAL_TIMEOUT.mul_f32(0.8), async {
+    // Graceful phase bounded by the absolute graceful deadline
+    let graceful = tokio::time::timeout_at(graceful_deadline, async {
         let tasks = all_connections.iter()
             .map(|conn| async move {
                 // Atomic compare-transition: each arm commits its
@@ -321,16 +342,18 @@ async fn shutdown_router() {
     }).await;
 
     if graceful.is_err() {
-        // Abort adopted control tasks and JOIN them before killing, so
-        // none can mutate registries or tombstones after cleanup below
-        abort_and_join_control_tasks().await;
+        // Cooperative cancellation at commit points (see the sketch
+        // above); the join is bounded by the remaining budget
+        let _ = tokio::time::timeout_at(
+            deadline, cancel_and_join_control_tasks_at_commit_points()
+        ).await;
     }
 
     // Escalation against the same absolute deadline; covers stragglers
     // and every registered control process alike (no-op for connections
     // already Closed). A remaining budget shorter than the normal
     // SIGTERM grace shortens or skips the grace — the ceiling wins.
-    force_kill_remaining_until(deadline, all_connections, control_procs);
+    force_kill_remaining_until(deadline, all_connections, control_procs).await;
 
     // 5. Clean up router resources
     cleanup_router_state();
@@ -377,7 +400,8 @@ async fn shutdown_router() {
 
 **No Response Draining:**
 - Accepted writes drain to the server, but their responses are not
-  awaited — pending operations fail when the timeout expires
+  awaited — pending operations fail at connection closure or the
+  deadline, whichever comes first
 - May surprise users expecting "finish pending work"
 - Trade-off: Predictable shutdown time vs completion
 

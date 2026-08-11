@@ -309,9 +309,10 @@ otherwise wait forever, and a wedged server is precisely this method's
 motivating case. On expiry the forced escalation applies (SIGTERM → SIGKILL
 on Unix; immediate kill on Windows). Operations follow that decision's disposal policy, with the timeout being
 this per-connection one: the already-accepted order queue drains ahead of
-`shutdown`, pending responses fail at connection closure or the timeout —
-whichever comes first — and newly arriving operations are rejected
-immediately. The result `null` is returned when
+`shutdown` (graceful path only — a forced termination abandons the
+remainder, which then fails like pending work), pending responses fail at
+connection closure or the timeout — whichever comes first — and newly
+arriving operations are rejected immediately. The result `null` is returned when
 the slot reaches `Closed`, whichever path got it there. `stop` on a
 `starting` slot is legal and aborts initialization with **no LSP message
 at all**: the spec forbids the client every additional request *and*
@@ -425,11 +426,14 @@ operation itself runs to completion detached, and the single-flight guard
 releases only when it finishes — a dropped handler can never leave a slot
 half-stopped or release the guard midway. Pool-wide shutdown does not wait
 behind them either: global teardown takes ownership of in-flight control
-operations, joins them, and force-kills at its own deadline whatever the
-per-slot timeout has not finished (ls-bridge-timeout-hierarchy § Per-Slot
-Control Shutdown), so a wedged per-slot `stop` can neither stall teardown
-nor outlive it; the outer control request then fails per the disposal
-policy.
+operations, cancels them **cooperatively at their next commit point** —
+the same commit points that make them non-abortable mid-mutation, so
+neither cancellation nor the deadline force-kill can leave a slot
+half-mutated — joins them within its remaining budget, and force-kills at
+its own deadline whatever the per-slot timeout has not finished
+(ls-bridge-timeout-hierarchy § Per-Slot Control Shutdown). A wedged
+per-slot `stop` can therefore neither stall teardown nor outlive it; the
+outer control request then fails per the disposal policy.
 
 - **Process-level configuration applies.** `command`, `args`,
   `initializationOptions`, settings — whatever the config says *now* is what

@@ -68,7 +68,7 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 | Normal operation (Phase 1) | Liveness | Reset on activity; `Ready` → `Failed` on timeout |
 | Normal operation (Phase 3) | Liveness, Per-request | Per-request bounds aggregation; Liveness detects hung servers |
 | Shutdown (any state) | Global only | All other timeouts (Init/Liveness/Per-request) STOP; global enforces termination |
-| Late response during shutdown | Global | ACCEPT until global timeout expires |
+| Late response during shutdown | Global | ACCEPT until the connection closes or the deadline expires |
 
 **Key Interactions:**
 - Liveness timeout **STOPS** when entering `Closing` state
@@ -106,10 +106,10 @@ Global Shutdown overrides all (highest priority)
   control operations, and its deadline caps and force-kills whatever the
   per-slot timeout has not finished
 
-**Writer-Idle Timeout** (within Global Shutdown):
+**Writer-Idle Timeout** (within the applicable shutdown deadline):
 - **Duration**: 2s fixed
 - **Purpose**: Wait for writer loop to finish current operation before taking exclusive stdin access
-- **Scope**: Counts against global shutdown budget (not additional time)
+- **Scope**: Counts against the applicable shutdown budget — per-slot `stop` or global teardown — not additional time
 - **See**: ls-bridge-graceful-shutdown § Writer Loop Shutdown Synchronization
 
 ## Consequences
