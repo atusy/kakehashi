@@ -541,8 +541,10 @@ languageServers:
   state: an editor's `untitled:` scratch document landed on a second server
   process that never saw the documents on the shared one (observed as a
   completion corpus missing every open buffer's words). Marker-less documents
-  are also exempt from the incapable-shared divert, since they add no root the
-  capability would be needed for. Non-opted-in servers keep the client-root
+  are also exempt from the incapable-shared divert, since they bring no marker
+  root the capability would be needed for (their client-workspace announcement
+  is capability-gated away there — the possibly out-of-workspace `didOpen` is
+  the accepted residual recorded above). Non-opted-in servers keep the client-root
   fallback for marker-less documents. Known consequence: a shared connection
   spawned by a marker-less FIRST acquisition seeds its folder set and
   initialize handshake with the full client snapshot of that moment, and

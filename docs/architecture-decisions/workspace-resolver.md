@@ -181,7 +181,10 @@ async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
     only — no dynamic `client/registerCapability` tracking) cannot take on a new
     root, so a marker-rooted document it does not already serve is **diverted to
     its own per-root process** (not dropped); marker-less documents are exempt —
-    they bring no root the capability would be needed for. This divert happens at **two** sites, because the shared
+    they bring no MARKER root the capability would be needed for, and their
+    client-workspace announcement is capability-gated away on such a
+    connection (the possibly out-of-workspace `didOpen` is an accepted,
+    documented residual). This divert happens at **two** sites, because the shared
     connection's capability is only known once it is `Ready`:
     - **Early** in `resolve_acquire` — when the shared handle is *already*
       `Ready` and incapable.

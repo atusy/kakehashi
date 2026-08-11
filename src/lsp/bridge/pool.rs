@@ -3931,9 +3931,11 @@ mod tests {
 
     /// An incapable shared connection diverts marker-rooted documents whose
     /// root it does not serve (previous tests) — but a marker-less document
-    /// adds no root, so the capability the server lacks
-    /// (`didChangeWorkspaceFolders`) is never needed for it: it stays on the
-    /// shared connection instead of forking the fallback process.
+    /// brings no marker root, so the capability the server lacks
+    /// (`didChangeWorkspaceFolders`) never blocks it: it stays on the shared
+    /// connection instead of forking the fallback process, accepting that its
+    /// client-workspace announcement is capability-gated away here (the
+    /// possibly out-of-workspace didOpen is the documented residual).
     #[tokio::test]
     async fn resolve_acquire_keeps_marker_less_docs_on_incapable_shared() {
         let pool = LanguageServerPool::new();
@@ -3956,9 +3958,11 @@ mod tests {
 
     /// The post-Ready divert in `get_or_create_connection_wait_ready` exempts
     /// marker-less documents the same way: the divert exists so an incapable
-    /// shared connection is never asked to absorb a root it cannot announce,
-    /// and a rootless document asks for no such thing — wait_ready must hand
-    /// back the shared connection itself, not fork the fallback.
+    /// shared connection is never asked to absorb a marker root it cannot
+    /// announce, and a marker-less document asks for no such thing (its
+    /// client-workspace announcement is capability-gated away here — the
+    /// documented residual) — wait_ready must hand back the shared connection
+    /// itself, not fork the fallback.
     #[tokio::test]
     async fn wait_ready_keeps_marker_less_docs_on_incapable_shared() {
         let pool = Arc::new(LanguageServerPool::new());
