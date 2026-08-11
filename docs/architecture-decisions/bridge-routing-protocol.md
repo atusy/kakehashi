@@ -234,9 +234,12 @@ A provider **cannot**:
   component-wise, never string-prefix (`/proj/app` does not admit
   `/proj/app-secrets`). An override can therefore re-root a server within
   the universe kakehashi's own resolution already spans, never walk above
-  it. A host document with a non-`file:` URI has no path of its own, so
-  only the workspace-folder branch applies; a session that announced no
-  workspace folders and resolves no root rejects every element. The
+  it. A host document with a non-`file:` URI has no path to walk, so the
+  marker branch never contributes — but the client-fallback root is
+  still kakehashi's own resolution for such a document (the existing
+  marker-less fallback already serves non-`file:` documents), so the
+  universe there is the client workspace folders plus that fallback
+  root; a session with neither rejects every element. The
   element count per entry is capped (implementation-defined, documented
   default in the tens). An entry violating any of these rules is dropped
   whole with a warning.
@@ -565,9 +568,11 @@ Decision-cache lifecycle:
   per-candidate-server payloads (a normalized answer's routing map, a
   binding's settlements) and capped folder lists, so the byte bound
   multiplies by the candidate-server count and the folder cap. The
-  framing ceilings bound the *answer-originated* strings; server names
-  are bounded by the configuration-read ceiling, while host-URI bytes
-  are proportional to upstream URI lengths, which no protocol ceiling
+  framing ceilings bound the *answer-originated* strings; server-name
+  bytes are proportional to their configuration sources (a
+  file-originated name is bounded by its file's read ceiling; names
+  from session overrides by that ingress), and host-URI bytes are
+  proportional to upstream URI lengths, which no protocol ceiling
   bounds — the same proportionality every per-URI structure in the
   server already carries, not a new exposure.
 - **Flushed wholesale whenever the set of `Ready` advertising providers
