@@ -6,7 +6,7 @@
 - [aggregation-priorities-wildcard](aggregation-priorities-wildcard.md) — the ordered-allowlist `priorities` semantics reused for provider selection
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — the `preferred` strategy whose fan-out/fan-in machinery this protocol dispatches
 - [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) — registers the routing decision deadline and the Tier-1/Tier-2 exemptions
-- [respawn-reopen-derives-its-targets](respawn-reopen-derives-its-targets.md) — the derived re-open, which consults only cached routing decisions
+- [respawn-reopen-derives-its-targets](respawn-reopen-derives-its-targets.md) — the derived re-open, which consults only the active route binding
 - [wildcard-config-inheritance](wildcard-config-inheritance.md) — the inheritance resolution applied before the config projection goes on the wire
 - [host-document-bridge](host-document-bridge.md) — the `_self` layer whose `enabled` gate and aggregation entry govern host-document routing decisions
 - [language-server-bridge](language-server-bridge.md) — the security model this protocol's trust model extends
@@ -333,9 +333,11 @@ would tax exactly the fleets that have no providers at all. Slots that are
 (bridge-client-control-protocol's states) are skipped, never parked on. A
 provider *name* can own several live connections at once (per-root
 pooling, plus a `forceStart` spawn); the routing query rides exactly
-**one** of them, picked deterministically — the shared or client-fallback
-handle when it is `Ready`, otherwise the `Ready` handle whose key
-rendering sorts first — an arbitrary but stable choice, recorded as such.
+**one** of them, picked by a total order over the name's handles —
+shared, then client-fallback, then the remainder by ascending key
+rendering — taking the first `Ready` handle, and, when the
+initialization wait applies, awaiting the first `Initializing` handle in
+that same order. An arbitrary but stable choice, recorded as such.
 
 Provider order is configured through the existing per-method aggregation
 map — `languages.<host>.bridge.<lang>.aggregation`, abbreviated
@@ -419,9 +421,9 @@ Two structural rules keep the protocol from consuming itself:
 - **No recursion.** Establishing a connection to a provider, and the
   routing query itself, never trigger a routing query. Provider
   connections are routed by kakehashi's own rules — the bootstrap base
-  case. The derived re-open sweep after a restart consults only **cached**
-  decisions (below), so a respawn never issues queries or spawns as a
-  routing side effect — preserving respawn-reopen-derives-its-targets'
+  case. The derived re-open sweep after a restart consults only the
+  **route binding** (below), so a respawn never issues queries or spawns
+  as a routing side effect — preserving respawn-reopen-derives-its-targets'
   read-only, never-spawns stage discipline and its fixed budget.
 - **Document-independent traffic.** The routing request rides the
   provider's connection like any managed request but needs no open
@@ -444,19 +446,34 @@ structures with different lifetimes carry the outcome:
   inherits the in-flight decision's remaining deadline, never a fresh
   one. The cache is policy, and policy is invalidatable — flushed and
   evicted by the rules below.
-- The **active route binding** records the outcome actually applied when
-  the open tasks ran: per (host document, layer, language), which servers
-  were suppressed and which `ConnectionKey` each open landed on, stamped
-  with the document's open incarnation. The binding is *identity*, not
-  policy: the lazy request-path open and the derived re-open sweep
+- The **active route binding** records the decision's applied outcome:
+  per (host document, layer, language), which servers were suppressed,
+  which `ConnectionKey` each open landed on, and — for a shared-instance
+  override — the canonical override folders themselves, all stamped with
+  the document's open incarnation. The binding record is installed
+  **synchronously at the query point, in a pending state**, and settles
+  when the decision applies: a lazy request-path open that finds a
+  *pending* binding awaits the in-flight decision (inheriting its
+  remaining deadline) instead of default-opening — without that, a
+  hover-class request racing the decision window could open the document
+  on a server the arriving answer suppresses. The settled binding is
+  *identity*, not policy: the lazy open and the derived re-open sweep
   consult it — a suppressed server stays suppressed, a bound key stays
-  the key — and it is evicted only by the host document's `didClose`,
-  never by a flush. This is what makes invalidation non-retroactive
-  without opening side doors: a flushed *cache* cannot lift a
-  suppression or re-root an open document onto a second same-name
-  connection, because those sites read the *binding*. A server with no
-  binding record (one that became a candidate only after the open, say
-  via reload) falls through to kakehashi's ordinary resolution.
+  the key, and a shared replacement's re-open re-adds and announces the
+  binding's folders before the `didOpen` (a `#shared` key carries no
+  folders and a restart loses the old set, so the binding is the only
+  place the override survives). It is evicted only by the host
+  document's `didClose`, never by a flush — this is what makes
+  invalidation non-retroactive without opening side doors: a flushed
+  *cache* cannot lift a suppression or re-root an open document onto a
+  second same-name connection, because those sites read the *binding*.
+  Bindings are also **grandfathered against trust-universe shrinkage**:
+  an override admitted under an earlier workspace-folder set keeps
+  driving re-opens for that document's lifetime (the trust guarantee is
+  scoped to admission time; revoking an open document's route is
+  close/re-open, or `stop`). Only a server with no binding record at all
+  (one that became a candidate after the open, say via reload) falls
+  through to kakehashi's ordinary resolution.
 
 Decision-cache lifecycle:
 
@@ -471,8 +488,9 @@ Decision-cache lifecycle:
   respawn, being stopped, failing, or having its advertisement cleared by
   `-32601` — **and whenever the effective client workspace-folder set
   changes** (`workspace/didChangeWorkspaceFolders`, or config paths that
-  adjust it): the folder set is part of the trust universe, so decisions
-  validated against the old set must not be reused. The flush is
+  adjust it): the folder set is part of the trust universe, so *future*
+  decisions must not reuse answers validated against the old set
+  (existing bindings are grandfathered — above). The flush is
   deliberately coarse: the cache is small, per-entry provenance tracking
   is not worth its bookkeeping, and the rule uniformly covers the cases a
   finer rule mishandles (a `null`-chained answer whose *losing*
@@ -492,17 +510,29 @@ Decision-cache lifecycle:
   when it starts — the epoch is a monotonic counter bumped by every
   flush; the incarnation is the per-open token the document store
   already mints — and its answer is **applied and inserted only while
-  all three still hold**. Otherwise the flight's result is discarded
-  whole: waiting open tasks fall open to kakehashi-decided routing (one
-  wasted round trip, never a wrong serve), and because the anchors are
-  part of the flight's identity, a caller arriving after a flush or
-  re-open never joins the stale flight — it starts a fresh one.
-  `didClose` retires in-flight flights the same way, which closes the
-  close/reopen ABA: a re-opened document can never receive the previous
-  open's answer. Generation anchoring alone — the discipline the
-  bridge's `cached_configs` snapshot cache records for this race —
-  covers neither a flush (which changes no generation) nor a re-open
-  (which changes neither).
+  the anchors hold**, with a mismatch handled by kind:
+  - a **generation or epoch** move (the document is still the same
+    open) discards the flight's answer and the waiting open tasks fall
+    open to kakehashi-decided routing — one wasted round trip, never a
+    wrong serve — with one carve-out: an epoch bump caused solely by
+    the `Ready` arrival of a provider **this flight selected and
+    awaited** re-anchors the flight to the new epoch under its original
+    deadline instead of discarding it (the arrival is the event the
+    initialization wait exists for; without the carve-out the wait
+    could never use the provider it awaited);
+  - an **incarnation** move (`didClose`, or close/re-open) **aborts**
+    the waiting tasks outright — no `didOpen` is sent at all, and the
+    incarnation is re-checked at the open's enqueue commit point, so an
+    old task can never emit a ghost open for a closed document. A
+    re-opened document never receives the previous open's answer:
+    the anchors are part of the flight's identity, so a caller arriving
+    after a flush or re-open never joins the stale flight — it starts a
+    fresh one.
+
+  Generation anchoring alone — the discipline the bridge's
+  `cached_configs` snapshot cache records for this race — covers
+  neither a flush (which changes no generation) nor a re-open (which
+  changes neither).
 - **Generation revalidation at apply time**: the acquire path
   additionally re-reads the current config generation inside its
   critical section and compares it to the answer's; on mismatch the
@@ -835,10 +865,10 @@ a slot a routing provider left in play.
 - Candidate enumeration (`get_host_configs_for_language` in the
   coordinator, and the virt candidate enumeration) stays synchronous.
   Suppression and root overrides apply at the routing gate: one shared
-  per-decision future awaited inside the per-server open tasks, and
-  consulted cache-only by the lazy per-request open
-  (`ensure_document_opened`, a pool function called from the
-  request-execute path) and the re-open sweep — one gate, not scattered
+  per-decision future awaited inside the per-server open tasks; the lazy
+  per-request open (`ensure_document_opened`, a pool function called
+  from the request-execute path) and the re-open sweep consult the route
+  binding, awaiting it while pending — one gate, not scattered
   per-call-site checks, and never an await under the ingress ticket.
 - The routing query is awaited inside the open task, before that task's
   acquire, holding no pool lock; the acquire critical section
@@ -896,4 +926,4 @@ a slot a routing provider left in play.
 | **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy); expiry cancels pending requests, retires entries, falls open; exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
 | **Caching** | decision cache per (host URI, layer, languageId, config generation), single-flight, evicted on `didClose`, flushed on reload / `Ready`-provider-set / workspace-folder-set change, (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until `didClose`; never retroactive |
 | **Cold start** | `forceStart` (post-config-publication get-or-create, marker-less fallback root shape, warm-up scope limited to shared/marker-less/policy servers) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
-| **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; re-open reads the cache only |
+| **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; re-open reads the binding only |

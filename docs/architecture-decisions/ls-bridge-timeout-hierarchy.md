@@ -20,12 +20,14 @@ This decision coordinates timeout mechanisms across the bridge architecture. It 
 
 ## Context
 
-The async bridge architecture defines timeout systems across three decisions:
+The async bridge architecture defines timeout systems across several decisions:
 
 1. **Initialization Timeout** (ls-bridge-async-connection): Bounds server initialization time during startup
 2. **Liveness Timeout** (ls-bridge-async-connection): Detects hung servers (unresponsive to pending requests)
 3. **Global Shutdown Timeout** (ls-bridge-graceful-shutdown): Bounds the shutdown termination attempt (escalation); ownership disposition and local cleanup run as actor transitions outside the ceiling
 4. **Per-Request Timeout** (ls-bridge-server-pool-coordination): Bounds user-facing latency for multi-server aggregation *[Phase 3 only]*
+5. **Per-Slot Control Shutdown Timeout** (bridge-client-control-protocol): Bounds a single-slot `stop`/`restart` (see the dedicated section below)
+6. **Routing Decision Deadline** (bridge-routing-protocol): Bounds one routing decision — provider fan-out plus initialization waits (see the dedicated section below)
 
 ### The Problem
 
@@ -147,7 +149,7 @@ Global Shutdown overrides all (highest priority)
 
 ### Negative
 
-- **Multiple concepts**: Three timeout systems in Phase 1 (four in Phase 3)
+- **Multiple concepts**: Three timeout *tiers* in Phase 1 (four in Phase 3), plus the tier-exempt deadlines registered here (per-slot control shutdown, routing decision, writer-idle)
 - **Tuning required**: Implementation-defined values need careful selection
 
 ### Neutral
