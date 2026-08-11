@@ -238,6 +238,7 @@ control-protocol failures; bridged LSP requests keep their existing
 | `clientStopped` | slot explicitly stopped; `restart` revives it |
 | `clientRestarting` | slot is mid-`restart`; retry after it returns |
 | `restartFailed` | the `restart` respawn failed — at spawn (missing or unspawnable command), during initialization, or at completion, when the ownership check found the replacement displaced (e.g. by a reload); the message names the cause |
+| `stopFailed` | a `stop` was finalized abnormally (panic, cancellation) before the slot verifiably reached `Closed` |
 | `forwardFailed` | the inner message could not be handed to the connection (bounded writer full, send error); nothing was forwarded |
 | `connectionLost` | the connection died after the inner request was forwarded |
 | `malformedResponse` | the downstream answered with an invalid JSON-RPC response |
@@ -479,10 +480,12 @@ owns at any moment** — the pre-existing process whose writer a `stop`
 reclaimed as much as a newly spawned replacement — so an interrupted
 stop phase cannot leak a half-shut-down server that a reload has already
 dropped from the pool snapshot. Process termination has **exactly one
-owner at a time**: outside teardown the finalizer terminates and reaps
-the record's processes itself, bounded by the per-slot shutdown timeout
-(SIGTERM → SIGKILL; a SIGKILLed child's reap is kernel-guaranteed, not
-server-cooperative); during teardown that obligation transfers with the
+owner at a time**: outside teardown the finalizer terminates the
+record's processes itself, bounded by the per-slot shutdown timeout
+(SIGTERM → SIGKILL; a child whose reap is still unconfirmed at the
+deadline — uninterruptible sleep, pending `wait` — transfers to a
+background zombie reaper rather than blocking settlement); during
+teardown that obligation transfers with the
 live process registry to the escalation phase, and finalization settles
 **records and pool state only** — no two paths ever kill or reap one
 child. Settlement itself is idempotent by construction (it inspects the
@@ -490,10 +493,18 @@ state it finds), so record claims are revocable: a claim abandoned by an
 interrupted finalizer reverts and settlement re-runs; exactly-once is an
 optimization, not a correctness requirement. Settlement also includes
 the **outer result channel**: a finalized operation settles its pending
-`stop`/`restart` response exactly once — `stop` answers `null` when the
-slot verifiably reached `Closed` with its tombstone installed and a
-`RequestFailed` otherwise; `restart` answers `restartFailed` — so a
-panicking detached task can never leave the caller pending. The record's
+`stop`/`restart` response exactly once, answering what the last recorded
+commit implies. `stop` answers `null` when the slot verifiably reached
+`Closed` — with its tombstone installed, or with the tombstone
+legitimately omitted because a reload deleted the server (closure is
+what `stop` promises; the tombstone is bookkeeping) — and otherwise
+`RequestFailed` with `data.reason: "stopFailed"`. `restart`'s success
+commit — the verified-Ready registry release — **atomically transfers
+the replacement's process ownership to the pool and records the `null`
+result**, so a failure after that commit settles `null` and the
+finalizer touches no process; anything short of it settles
+`restartFailed`. A panicking detached task can therefore never leave the
+caller pending, kill a committed replacement, or misreport a success. The record's
 owner runs during **normal service**, not only at teardown: a pool-owned
 control-task reaper observes each detached operation's terminal outcome
 as it happens and finalizes abnormal exits immediately — without it, a

@@ -248,8 +248,10 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
     // last control task terminates. It covers EVERY process a control
     // operation owns — a pre-existing server whose writer a stop
     // reclaimed as much as a fresh replacement. The seal also quiesces
-    // the normal-service reaper and adopts its in-progress finalizers
-    // into this set (single claim per record — no double finalization).
+    // the normal-service reaper and takes over its in-progress
+    // finalizations as teardown-run settlement work OUTSIDE this
+    // abortable set; claims are revocable and settlement idempotent, so
+    // an interrupted finalizer never strands a record.
     let (mut control_tasks, control_procs) = seal_and_take_control_operations();
 
     // Snapshot AFTER both gates: nothing can be inserted past them.
