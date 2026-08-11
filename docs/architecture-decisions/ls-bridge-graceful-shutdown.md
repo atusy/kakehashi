@@ -79,12 +79,18 @@ Failed → Closed (skip LSP handshake)
 ```
 
 **Unconfirmed termination at the global deadline**: the connection still
-transitions to `Closed` for bookkeeping, and the child is logged and
-abandoned to the OS — global teardown is ending the kakehashi process
-itself, so no continuing owner exists to keep waiting. This is the one
+transitions to `Closed` for bookkeeping. What happens to the child
+depends on whether the kakehashi process is actually exiting:
+log-and-abandon applies **only on the process-exit path** (the `exit`
+notification, or teardown that ends the process). When `shutdown_all`
+runs while the server stays alive — the LSP `shutdown` request is
+answered and the process then waits for `exit`, possibly indefinitely —
+ownership of every unconfirmed child is **retained**: its
+termination-pending record and background `wait` persist past the
+teardown, so a client that delays or omits `exit` cannot leave a live
+child unowned or unreaped. This bookkeeping-only `Closed` is the one
 exception to bridge-client-control-protocol's steady-state rule that an
-unconfirmed termination never reaches `Closed` (a per-slot `stop` has a
-continuing pool to protect; final teardown does not).
+unconfirmed termination never reaches `Closed`.
 
 ### Operation Disposal Policy: Reject New, Drain Accepted, Fail Pending at Closure or Deadline
 
@@ -256,10 +262,14 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
     // last control task terminates. It covers EVERY process a control
     // operation owns — a pre-existing server whose writer a stop
     // reclaimed as much as a fresh replacement. The seal also quiesces
-    // the normal-service reaper and takes over its in-progress
+    // the normal-service reaper, takes over its in-progress
     // finalizations as teardown-run settlement work OUTSIDE this
-    // abortable set; claims are revocable and settlement idempotent, so
-    // an interrupted finalizer never strands a record.
+    // abortable set (claims revocable, settlement idempotent), and
+    // TRANSFERS existing termination-pending records — kill handles and
+    // pending Child::wait futures from earlier stopFailed slots — into
+    // control_procs, so a child from a failed stop is inside the
+    // escalation set even though it is in neither the connection
+    // snapshot nor the task set.
     let (mut control_tasks, control_procs) = seal_and_take_control_operations();
 
     // Snapshot AFTER both gates: nothing can be inserted past them.
@@ -449,8 +459,12 @@ async fn shutdown_router() {
 - Users see "bridge: connection closing" error, not silent hang
 
 **Resource Cleanup:**
-- SIGTERM → SIGKILL sequence ensures process termination
-- No zombie processes or leaked file descriptors
+- SIGTERM → SIGKILL sequence terminates processes in the ordinary case;
+  a child unconfirmed at the deadline is retained via its
+  termination-pending record (or logged and abandoned on the
+  process-exit path — see § Unconfirmed termination)
+- No zombie processes or leaked file descriptors while kakehashi lives
+  (pending `wait`s are driven to completion)
 - Lock files and caches properly released
 
 **Multi-Server Resilience:**

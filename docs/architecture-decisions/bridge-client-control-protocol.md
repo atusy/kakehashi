@@ -489,9 +489,11 @@ dropped from the pool snapshot. Process termination has **exactly one
 owner at a time**: outside teardown the finalizer terminates the
 record's processes itself, bounded by the per-slot shutdown timeout
 (SIGTERM → SIGKILL). A child whose **termination is unconfirmed** at the
-deadline — confirmation means exactly that `Child::wait` returned, the
-one primitive that both observes and reaps; SIGKILL delivery proves
-nothing — never settles as closed: `stop` settles `stopFailed`,
+deadline — confirmation means exactly that `Child::wait` returned
+`Ok(ExitStatus)`, the one primitive that both observes and reaps; an
+`Err` confirms nothing and the record retries the `wait`, staying fenced
+however often it fails — never promoted silently; SIGKILL delivery
+likewise proves nothing — never settles as closed: `stop` settles `stopFailed`,
 `restart` settles `restartFailed`, and the key converts to a pool-owned
 **termination-pending record** that retains the kill handle, enumerates
 as `stopping`, blocks acquires and further control calls
@@ -715,9 +717,11 @@ namespace.
 - Methods register via `LspService::build().custom_method(...)` following the
   `kakehashi/node*` pattern; handlers live under
   `src/lsp/lsp_impl/kakehashi/bridge/client/`.
-- Id resolution: render each live pool key, stopped-set key, and
-  control-operation-registry key with `ConnectionKey`'s `Display` and
-  compare for exact equality with the supplied id; no parsing. The registry
+- Id resolution: render each live pool key, termination-pending-record
+  key, stopped-set key, and control-operation-registry key with
+  `ConnectionKey`'s `Display` and compare for exact equality with the
+  supplied id; no parsing. Owner precedence for enumeration is live >
+  termination-pending (`stopping`) > stopped > control registry. The registry
   matters during the restart window, when the stopped entry is already
   cleared and no handle exists yet — the registry is the key's only owner
   then, so without it the slot would vanish from enumeration and calls
@@ -733,8 +737,8 @@ namespace.
   `Client.status` of its own).
 - The stopped set lives beside the pool's per-connection maps, keyed by
   `ConnectionKey`; the acquire path checks it — together with the
-  control-operation registry — inside the same critical section, before
-  any spawn decision.
+  control-operation registry and the termination-pending records —
+  inside the same critical section, before any spawn decision.
 - `restart` clears the slot's entry in `consecutive_panic_counts` before
   respawning; `stop` drives `force_kill_with_escalation` from a new
   per-connection timeout rather than the pool-wide teardown path.

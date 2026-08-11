@@ -173,7 +173,9 @@ enum ConnectionState {
     Ready,         // Initialization completed successfully
     Failed,        // Initialization failed or writer loop panicked
     Closing,       // Shutdown initiated, draining operations (ls-bridge-graceful-shutdown)
-    Closed,        // Connection fully terminated
+    Closed,        // Connection terminated (bookkeeping-only at the global
+                   // deadline: an unconfirmed child may be retained or
+                   // abandoned — ls-bridge-graceful-shutdown)
 }
 ```
 
