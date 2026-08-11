@@ -129,8 +129,9 @@ async fn graceful_shutdown(&self) {
     // Phase 2: Wait for writer to become idle...
 }
 
-// Writer loop
-async fn writer_loop(&self) {
+// Writer loop — owns its state by value (incl. stdin), matching the
+// actual writer task; ownership is what makes the handoff transfer real
+async fn writer_loop(mut self) {
     // recv() on a closed queue yields the remaining accepted items in
     // FIFO order, then None — so the loop drains everything accepted
     // before the seal and only then exits (§ Operation Disposal Policy).
@@ -244,7 +245,11 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
     // both phases poll the same set. `control_procs` is a LIVE registry
     // with kill-on-register from this point on — a child spawned after
     // any scan is killed at registration — and it closes only when the
-    // last control task terminates.
+    // last control task terminates. It covers EVERY process a control
+    // operation owns — a pre-existing server whose writer a stop
+    // reclaimed as much as a fresh replacement. The seal also quiesces
+    // the normal-service reaper and adopts its in-progress finalizers
+    // into this set (single claim per record — no double finalization).
     let (mut control_tasks, control_procs) = seal_and_take_control_operations();
 
     // Snapshot AFTER both gates: nothing can be inserted past them.

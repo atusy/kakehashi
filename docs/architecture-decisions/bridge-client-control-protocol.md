@@ -380,8 +380,13 @@ Three lifecycle rules keep the set coherent:
 
 ### `restart`: Same Key, Current Config, Derived Re-Open
 
-`restart` = the `stop` sequence above (with its per-status shortcuts; a no-op
-if the slot is already stopped) + clear the stopped entry + respawn the
+`restart` = the `stop` *sequence* above (with its per-status shortcuts; a
+no-op if the slot is already stopped) — but **without installing a
+stopped entry**: the tombstone is `stop`'s artifact, and during a restart
+the control-registry ownership stands in for it, so no interval exists in
+which the slot reads `stopped` or errors `clientStopped` mid-restart. A
+pre-existing entry from an earlier `stop` is cleared atomically with
+acquiring that ownership. Then respawn the
 **same** `ConnectionKey` under the configuration current at that moment —
 "that moment" being replacement insertion: generation revalidation happens
 inside the insertion critical section, **serialized with settings
@@ -469,12 +474,21 @@ non-normal terminal outcome — hard abort, cooperative cancellation short
 of completion, or panic — applying the ownership-at-completion rule on
 the operation's behalf and settling the ARM state, tombstone,
 replacement, and registry entries to whatever the last recorded commit
-implies. The record's owner runs during **normal service**, not only at
+implies. The durable record also tracks **every process the operation
+owns at any moment** — the pre-existing process whose writer a `stop`
+reclaimed as much as a newly spawned replacement — and the finalizer
+force-terminates and reaps any such process before releasing the
+single-flight state, so an interrupted stop phase cannot leak a
+half-shut-down server that a reload has already dropped from the pool
+snapshot. The record's owner runs during **normal service**, not only at
 teardown: a pool-owned control-task reaper observes each detached
 operation's terminal outcome as it happens and finalizes abnormal exits
 immediately — without it, a panicking detached `restart` would leave the
 single-flight guard, ARM state, and tombstone stuck until shutdown.
-Teardown adopts whatever the reaper still holds.
+Teardown's seal atomically **quiesces the reaper** — no new finalization
+may start past the seal — and adopts in-progress finalizers into the set
+it joins before cleanup; each durable record is claimed exactly once, so
+finalization never runs twice for one operation.
 
 - **Process-level configuration applies.** `command`, `args`,
   `initializationOptions`, settings — whatever the config says *now* is what
