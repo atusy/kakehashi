@@ -275,11 +275,12 @@ impl LanguageServerPool {
     /// Like [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle)
     /// but for position-based requests (hover, completion, definition, …): aborts
     /// before contacting the downstream server when `host_position` falls outside
-    /// the injection region — *above* its start line, on the start line but
-    /// *before* its start column (e.g. the cursor is on the markdown fence
-    /// backticks or inside a blockquote `> ` prefix), or *past* the region's
-    /// end-of-content (a caret inside a trailing child the query excluded, or
-    /// stale region data after an edit shrank the region). See
+    /// the *snapshotted* injection region — *above* its start line, on the
+    /// start line but *before* its start column (e.g. the cursor is on the
+    /// markdown fence backticks or inside a blockquote `> ` prefix), or *past*
+    /// the region's end-of-content (a caret inside a trailing child the query
+    /// excluded). The bound is snapshot-scoped — see the comment at the guard
+    /// below for the in-flight-edit window it does not cover — and checked by
     /// [`host_position_within_region_bounds`].
     ///
     /// Translating an out-of-region position would silently mistranslate it
