@@ -587,7 +587,9 @@ structures with different lifetimes carry the outcome:
   be the one to initiate provider I/O (in particular, the query-free
   sweep guarantee cannot be broken by the sweep merely awaiting a
   pending binding). Every server's
-  entry then reaches a **terminal settlement**, so waiters never hang:
+  entry then reaches a **terminal settlement or terminal deletion**
+  (deletion is logged with per-server provenance like any settlement),
+  so waiters never hang:
   *suppressed* settles when the answer applies — no acquire runs, but
   the settlement still commits inside a **route-admission critical
   section** under the same pool lock the acquires use, where the
@@ -603,7 +605,14 @@ structures with different lifetimes carry the outcome:
   attempted because its owner died; the settlement record carries
   which — waiters proceed without the
   server, and later opens retry the retained key through the ordinary
-  respawn path rather than falling through to a different resolution;
+  respawn path rather than falling through to a different resolution.
+  A successful retry **transitions the entry to *routed*** with the key
+  the acquire actually landed on — a capability downgrade records the
+  downgraded per-root key, so enumeration and folder announcements
+  follow the real connection, never a stale `#shared` name — committed
+  through the same route-admission critical section at the same
+  incarnation; a failed retry re-records *retained* with fresh
+  provenance;
   *not-applicable* settles when a server is genuinely rejected
   **before** any acquire runs — a configuration removal or disablement
   that ends its candidacy for the document — and is consumed like a
@@ -970,7 +979,9 @@ the shared future as passive subscribers, each applying the answer
 `didOpen`. The
 injection-layer decision is awaited the same way by the virtual-document
 open tasks, off the parse loop; the lazy request-path open and the
-re-open sweep consult the binding only, as above. The deadline's cost is
+re-open sweep consult the binding per exact server entry — falling
+through to ordinary (for the sweep, read-only marker) resolution where
+an entry is absent — and never query, as above. The deadline's cost is
 therefore **deferred feature availability** — downstream opens, and the
 features they enable, land up to one deadline later than today — not a
 stalled writer ticket or parse cycle.

@@ -124,7 +124,9 @@ Both parameters are optional and compose as AND:
   per exact (host, layer, language, server) tuple
   (bridge-routing-protocol), so an overridden or suppressed route
   filters by where the document actually opened; ordinary resolution
-  applies only to a tuple with no binding at all, and a *pending* tuple
+  applies per exact entry — only where that (host, layer, language,
+  server) entry has no record (other servers' settlements on the same
+  tuple do not block it) — and a *pending* entry
   (its decision still in flight) matches nothing yet — the document is
   not open there — rather than falling through. A *retained* tuple (the
   route decided but its acquire failed, or never ran because its owner
@@ -606,9 +608,9 @@ and their waits (ls-bridge-graceful-shutdown § Unconfirmed termination).
   key, bypassing the ordinary acquire path that announces new shared
   roots, so for a shared replacement the sweep must add-and-announce, before
   each document's first `didOpen`, that document's folders — for any bound
-  tuple, the folders its binding retains (the override folders, or the
+  entry, the folders its binding retains (the override folders, or the
   ordinarily resolved root recorded at open — bridge-routing-protocol);
-  live resolution only for a tuple with no binding — otherwise non-seed
+  live resolution only for a server entry with no record — otherwise non-seed
   documents reopen on a server that was never told about their folder. In a
   workspace-less session (initialize carried neither `rootUri` nor
   `workspaceFolders`), the replacement spawns rootless with an empty folder

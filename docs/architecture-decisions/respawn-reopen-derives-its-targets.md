@@ -111,8 +111,9 @@ with the work that belongs to the connection.
    bridge-routing-protocol amends this stage: when the document holds an
    active route binding for the server, the binding answers instead of the
    marker walk — a suppressed server is "not applicable", a bound key must
-   match this connection's — and a document with no binding falls through to
-   the marker rule above. Bindings are keyed per (host, layer, language),
+   match this connection's — and an entry-less server (this exact (host,
+   layer, language, server) entry has no record, whatever the tuple's
+   other servers settled) falls through to the marker rule above. Bindings are keyed per (host, layer, language),
    so stages 2-3 evaluate each layer/language binding **independently**:
    the injection units are the resolved injections stage 2 already
    produces, and the host layer is its own unit — screened by
