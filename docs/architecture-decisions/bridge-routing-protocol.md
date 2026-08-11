@@ -496,9 +496,13 @@ structures with different lifetimes carry the outcome:
   evicted by the rules below.
 - The **active route binding** records the decision's applied outcome:
   per (host document, layer, language), which servers were suppressed,
-  which `ConnectionKey` each open landed on, and — for a shared-instance
-  override — the canonical override folders themselves, all stamped with
-  the document's open incarnation. The pending binding record is
+  which `ConnectionKey` each open landed on, and — for **every** shared
+  routed/retained entry, override-driven or not — the effective
+  canonical folder(s) announced at open (the override folders, or the
+  ordinarily resolved root), all stamped with the document's open
+  incarnation. Retaining the folder for non-override shared routes too
+  is what gives a restarted shared replacement a folder source for every
+  bound document; live resolution serves only tuples with no binding. The pending binding record is
   installed **synchronously in the `didOpen` handler (respectively the
   virtual-document creation path), before the open tasks are spawned
   and before the writer ticket is released** — installing it inside the
@@ -514,7 +518,11 @@ structures with different lifetimes carry the outcome:
   sweep guarantee cannot be broken by the sweep merely awaiting a
   pending binding). Every server's
   entry then reaches a **terminal settlement**, so waiters never hang:
-  *suppressed* settles when the answer applies (no acquire runs);
+  *suppressed* settles when the answer applies — no acquire runs, but
+  the settlement still commits inside a **route-admission critical
+  section** under the same pool lock the acquires use, where the
+  both-key stopped check runs atomically with the commit (uniform with
+  routed entries, whose admission section is the acquire's own);
   *routed(key)* settles at that server's acquire commit, recording the
   key actually landed on (a capability-fallback downgrade records the
   downgraded per-root key); *retained(key)* settles when an acquire

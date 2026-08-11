@@ -592,10 +592,10 @@ and their waits (ls-bridge-graceful-shutdown § Unconfirmed termination).
   obligation falls on the re-open sweep: it acquires the replacement by
   key, bypassing the ordinary acquire path that announces new shared
   roots, so for a shared replacement the sweep must add-and-announce, before
-  each document's first `didOpen`, that document's folders — the retained
-  override folders for an override-bound tuple, the ordinarily resolved
-  root for an unbound one (bridge-routing-protocol), never both —
-  otherwise non-seed
+  each document's first `didOpen`, that document's folders — for any bound
+  tuple, the folders its binding retains (the override folders, or the
+  ordinarily resolved root recorded at open — bridge-routing-protocol);
+  live resolution only for a tuple with no binding — otherwise non-seed
   documents reopen on a server that was never told about their folder. In a
   workspace-less session (initialize carried neither `rootUri` nor
   `workspaceFolders`), the replacement spawns rootless with an empty folder

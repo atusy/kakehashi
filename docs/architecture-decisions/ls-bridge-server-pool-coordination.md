@@ -51,8 +51,9 @@ The `ConnectionKey` is stored on each connection handle, so the request,
 no `textDocument`, so the originating host URI is stashed in their routing
 envelopes (`KakehashiEnvelope` / `CodeActionEnvelope` / `CodeLensEnvelope`)
 and used to re-resolve the same `(server, root)` connection that produced the
-item. A legacy envelope without that field falls back to the client-root
-connection (the pre-#382 behavior). Amended with bridge-routing-protocol:
+item. (A legacy envelope without that field historically fell back to the
+client-root connection — pre-#382 behavior, superseded by the fail-soft
+rule below.) Amended with bridge-routing-protocol:
 this re-resolution — like every site that derives a connection from the host
 URI — consults the active route binding first, matched by the envelope's
 layer/language and open-incarnation stamp; a missing, legacy, evicted, or
