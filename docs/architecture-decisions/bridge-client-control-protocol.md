@@ -303,8 +303,11 @@ motivating case. On expiry the forced escalation applies (SIGTERM → SIGKILL
 on Unix; immediate kill on Windows). In-flight and newly arriving operations
 fail per that decision's disposal policy. The result `null` is returned when
 the slot reaches `Closed`, whichever path got it there. `stop` on a
-`starting` slot is legal (`Initializing → Closing` is an existing transition)
-and likewise returns at `Closed`. `stop` on a `failed` slot skips the LSP
+`starting` slot is legal but takes the initialization-abort path
+ls-bridge-graceful-shutdown defines for `Initializing → Closing`: abort the
+handshake, **skip `shutdown`** (a request sent before `initialize`
+completes violates LSP ordering), send `exit`, and escalate — likewise
+returning at `Closed`. `stop` on a `failed` slot skips the LSP
 handshake — the `Failed → Closed` bypass ls-bridge-graceful-shutdown already
 defines — cleans up the process, and records the stopped entry: pinning a
 repeatedly failing slot before the next acquire respawns it is a
@@ -324,6 +327,11 @@ Three lifecycle rules keep the set coherent:
   check happens inside the same `connections` critical section where the
   acquire path decides, removes, and spawns — an acquire cannot observe
   "not stopped", lose the race to a committing `stop`, and spawn anyway.
+  The same in-section check covers the control-operation registry: an
+  acquire finding the key mid-`stop`/`restart` does not spawn, exactly as
+  for a stopped key. Without that fence, a reload purging the `Closing`
+  handle mid-operation would let an ordinary acquire see a map miss and
+  spawn beside the control operation's own replacement or tombstone.
 - **Control calls are single-flight per key.** `stop` and `restart` both
   span a handshake and mutate the same entry, so the bridge serializes them:
   a control call arriving while another is in flight on the same key fails
