@@ -113,32 +113,25 @@ async fn graceful_shutdown(&self) {
     // 1. Transition to Closing state (new operations rejected)
     self.state.set(Closing);
 
-    // 2. Signal writer loop to stop once the accepted queue has drained
-    //    (§ Operation Disposal Policy: accepted writes are sent, in order)
-    let _ = self.writer_stop_tx.send(());
+    // 2. Atomically close queue admission: the close() is the seal —
+    //    after it, no enqueue can succeed, even from a caller holding a
+    //    stale Ready view of the handle. Everything accepted before the
+    //    close is still in the queue and will be drained.
+    self.order_queue.close();
 
     // Phase 2: Wait for writer to become idle...
 }
 
 // Writer loop
 async fn writer_loop(&self) {
-    loop {
-        select! {
-            operation = self.order_queue.recv() => {
-                // Write operation...
-
-                // After write, check if stop signaled
-                if self.writer_stop_rx.try_recv().is_ok() {
-                    break; // Exit loop
-                }
-            }
-            _ = &mut self.writer_stop_rx => {
-                break; // Exit immediately if idle
-            }
-        }
+    // recv() on a closed queue yields the remaining accepted items in
+    // FIFO order, then None — so the loop drains everything accepted
+    // before the seal and only then exits (§ Operation Disposal Policy).
+    while let Some(operation) = self.order_queue.recv().await {
+        // Write operation... (never aborted mid-write)
     }
 
-    // Signal: writer is idle
+    // Signal: writer is idle (queue fully drained)
     let _ = self.writer_idle_tx.send(());
 }
 ```
@@ -205,13 +198,19 @@ All connections shut down in parallel under a single global ceiling. This is int
 ```rust
 async fn shutdown_all_connections(connections: Vec<Connection>) {
     let global_timeout = Duration::from_secs(IMPL_DEFINED);
+    // Reserve part of the single ceiling for forced escalation
+    // (ls-bridge-timeout-hierarchy: ~20% for SIGTERM/SIGKILL)
+    let graceful_budget = global_timeout.mul_f32(0.8);
 
     // Seal control admission first: no new per-slot stop/restart
-    // (bridge-client-control-protocol) may begin, and ownership of
-    // in-flight control operations transfers to this teardown.
-    let control_ops = seal_and_take_control_operations();
+    // (bridge-client-control-protocol) may begin, ownership of in-flight
+    // control operations transfers to this teardown, and the seal also
+    // blocks replacement insertion — an adopted restart aborts at its
+    // next commit point, and any process it already spawned is returned
+    // here as a kill handle rather than becoming a live replacement.
+    let (control_ops, control_procs) = seal_and_take_control_operations();
 
-    tokio::time::timeout(global_timeout, async {
+    let _ = tokio::time::timeout(graceful_budget, async {
         // Shutdown all connections in parallel (best-effort).
         // Each task uses the state-aware dispatch below (§ Multi-Connection
         // Shutdown): Failed → cleanup_only, Initializing →
@@ -222,11 +221,12 @@ async fn shutdown_all_connections(connections: Vec<Connection>) {
         // Join adopted control operations alongside — a registry-only
         // restart must not escape the snapshot of live connections.
         futures::future::join_all(tasks.chain(control_ops)).await;
-    }).await.unwrap_or_else(|_| {
-        // Global timeout expired - force kill remaining, including
-        // processes owned by adopted control operations
-        force_kill_all(connections);
-    });
+    }).await;
+
+    // Escalation runs inside the reserved remainder of the SAME ceiling,
+    // covering the snapshot and the adopted control processes alike
+    // (a no-op for connections that already reached Closed).
+    force_kill_remaining(connections, control_procs);
 }
 ```
 
@@ -270,14 +270,19 @@ async fn shutdown_router() {
     fail_pending_routes();
 
     // 3. Seal control admission and adopt in-flight stop/restart
-    //    operations (bridge-client-control-protocol) so a registry-only
-    //    restart cannot escape the connection snapshot below
-    let control_ops = seal_and_take_control_operations();
+    //    operations (bridge-client-control-protocol): the seal blocks
+    //    replacement insertion, so a registry-only restart can neither
+    //    escape the connection snapshot below nor leave a live
+    //    replacement behind; its spawned process comes back as a kill
+    //    handle
+    let (control_ops, control_procs) = seal_and_take_control_operations();
 
     // 4. Shutdown all connections in parallel
     let all_connections = connection_pool.all_connections();
 
-    tokio::time::timeout(GLOBAL_TIMEOUT, async {
+    // Reserve part of the single ceiling for forced escalation
+    // (ls-bridge-timeout-hierarchy: ~20% for SIGTERM/SIGKILL)
+    let _ = tokio::time::timeout(GLOBAL_TIMEOUT.mul_f32(0.8), async {
         let tasks = all_connections.iter()
             .map(|conn| async move {
                 // Atomic compare-transition: each arm commits its
@@ -291,11 +296,12 @@ async fn shutdown_router() {
 
         // Adopted control operations are joined alongside
         futures::future::join_all(tasks.chain(control_ops)).await;
-    }).await.unwrap_or_else(|_| {
-        // Global timeout - force kill stragglers, including processes
-        // owned by adopted control operations
-        force_kill_all(all_connections);
-    });
+    }).await;
+
+    // Escalation inside the reserved remainder of the same ceiling;
+    // covers stragglers and adopted control processes alike (no-op for
+    // connections already Closed)
+    force_kill_remaining(all_connections, control_procs);
 
     // 5. Clean up router resources
     cleanup_router_state();
