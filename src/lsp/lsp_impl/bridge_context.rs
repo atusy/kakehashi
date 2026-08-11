@@ -2907,6 +2907,87 @@ mod tests {
         }
     }
 
+    /// Range endpoints are bounds, not carets: the whole-document idiom
+    /// `(0,0)..(u32::MAX, u32::MAX)` (codeActionsOnSave and friends) must
+    /// clamp to the document end, never reject — rejection would silently
+    /// disable the virt layer for exactly those flows.
+    #[test]
+    fn range_endpoints_clamp_rather_than_reject() {
+        let mapper = PositionMapper::new("ab\ncd\n");
+        let range = normalize_range_endpoints(
+            &mapper,
+            Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: u32::MAX,
+                    character: u32::MAX,
+                },
+            },
+        )
+        .expect("a whole-document range is valid");
+        assert_eq!(
+            range.end,
+            Position {
+                line: 2,
+                character: 0
+            },
+            "an end past EOF clamps to the document end"
+        );
+        // An over-long character clamps within its own line.
+        let range = normalize_range_endpoints(
+            &mapper,
+            Range {
+                start: Position {
+                    line: 0,
+                    character: 99,
+                },
+                end: Position {
+                    line: 1,
+                    character: 99,
+                },
+            },
+        )
+        .expect("in-document lines are valid");
+        assert_eq!(
+            (range.start.character, range.end.character),
+            (2, 2),
+            "over-long characters clamp to their lines' ends"
+        );
+    }
+
+    /// The caret defense stays strict: a line past the document's end has no
+    /// LSP default and must reject, while the character clamp applies.
+    #[test]
+    fn caret_position_rejects_line_past_eof() {
+        let mapper = PositionMapper::new("ab\n");
+        assert!(
+            normalize_client_position(
+                &mapper,
+                Position {
+                    line: 5,
+                    character: 0
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(
+            normalize_client_position(
+                &mapper,
+                Position {
+                    line: 0,
+                    character: 99
+                }
+            ),
+            Some(Position {
+                line: 0,
+                character: 2
+            })
+        );
+    }
+
     #[test]
     fn caret_shaped_methods_resolve_with_caret_end_fallback() {
         use crate::language::injection::RegionBoundary;
