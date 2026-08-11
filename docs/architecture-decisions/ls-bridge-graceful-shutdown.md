@@ -214,7 +214,7 @@ it):**
 
 ### Shutdown Timeout Policy
 
-**Global timeout**: Implementation-defined duration (typically 5-15 seconds) bounding connection and process termination across all connections. Local cleanup (registries, router state) needs no server cooperation and falls outside the ceiling.
+**Global timeout**: Implementation-defined duration (typically 5-15 seconds) bounding the termination *attempt* — escalation and ownership disposition — across all connections. Local cleanup (registries, router state) needs no server cooperation and falls outside the ceiling.
 
 **Best-Effort Parallel Shutdown:**
 All connections shut down in parallel under a single global ceiling. This is intentionally best-effort:
@@ -232,7 +232,12 @@ All connections shut down in parallel under a single global ceiling. This is int
 
 **Timeout Application:**
 ```rust
-async fn shutdown_all_connections(pool: &ConnectionPool) {
+enum ShutdownMode {
+    ProcessExit,   // exit notification / signal path: kakehashi is ending
+    ServerRemains, // LSP shutdown request: server stays alive awaiting exit
+}
+
+async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
     // Both deadlines are absolute and anchored at FUNCTION ENTRY, so
     // sealing/snapshot work spends the same ceiling it lives under.
     // The gap between them is the escalation reserve
@@ -319,18 +324,24 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
     // abortable set, so the expired producer cutoff costs it nothing
     // and revocable idempotent claims mean an interrupted finalizer
     // never strands a record.
-    join!(
+    let (unresolved, _) = join!(
         force_kill_remaining_until(deadline, connections, &control_procs),
         abort_survivors_and_finalize(&mut control_tasks, graceful_deadline),
     );
+
+    // Mode-dependent disposition of children still unconfirmed at the
+    // deadline (§ Unconfirmed termination). The exit-notification path
+    // later re-enters with ProcessExit to dispose records retained
+    // here; a Drop owner covers abnormal process end.
+    match mode {
+        ShutdownMode::ProcessExit  => log_and_abandon(unresolved),
+        ShutdownMode::ServerRemains =>
+            pool.reinsert_termination_pending(unresolved), // atomic; waits restarted
+    }
+
     // Only now — every control task terminated, finalized, and the live
-    // process registry closed — may pool/router cleanup run; nothing can
-    // mutate registries or tombstones after it. Disposition of children
-    // still unconfirmed here is mode-dependent (§ Unconfirmed
-    // termination): on the shutdown-request path, where the server stays
-    // alive awaiting exit, their records return to the pool ATOMICALLY
-    // with their waits restarted; only the process-exit path logs and
-    // abandons.
+    // process registry closed or handed back — may pool/router cleanup
+    // run; nothing can mutate registries or tombstones after it.
 }
 ```
 
@@ -421,12 +432,14 @@ async fn shutdown_router() {
     // hard-aborted (safe: shared-state effects live only at commit
     // points — see the sketch above and bridge-client-control-protocol)
     // Cancellation signalled at adoption; producer cutoff at
-    // graceful_deadline; finalization for every non-normal outcome —
-    // see the sketch above
-    join!(
+    // graceful_deadline; finalization for every non-normal outcome; the
+    // caller passes the same ShutdownMode and the unresolved set takes
+    // the same mode branch — see the sketch above
+    let (unresolved, _) = join!(
         force_kill_remaining_until(deadline, all_connections, &control_procs),
         abort_survivors_and_finalize(&mut control_tasks, graceful_deadline),
     );
+    dispose_unresolved(mode, unresolved);
 
     // 5. Clean up router resources — runs after every control task has
     //    terminated (the join above), so nothing can mutate registries

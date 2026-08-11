@@ -91,7 +91,9 @@ Configuration loading therefore rejects `languageServers` names containing
 
 **`status`** mirrors the connection state machine
 (ls-bridge-graceful-shutdown): `starting` = `Initializing`, `running` =
-`Ready`, `stopping` = `Closing`, `failed` = `Failed`, and `stopped` =
+`Ready`, `stopping` = `Closing` **or** a termination-pending record whose
+process termination is not yet confirmed (its handle may already be
+`Closed` or gone), `failed` = `Failed`, and `stopped` =
 explicitly stopped via `stop` (see below). Stopped slots **are included** in
 the enumeration — they are absent from the live pool, so the enumeration is
 the only way to recover their id for a later `restart`. `Failed` connections
@@ -491,9 +493,11 @@ record's processes itself, bounded by the per-slot shutdown timeout
 (SIGTERM → SIGKILL). A child whose **termination is unconfirmed** at the
 deadline — confirmation means exactly that `Child::wait` returned
 `Ok(ExitStatus)`, the one primitive that both observes and reaps; an
-`Err` confirms nothing and the record retries the `wait`, staying fenced
-however often it fails — never promoted silently; SIGKILL delivery
-likewise proves nothing — never settles as closed: `stop` settles `stopFailed`,
+`Err` confirms nothing and the record retries the `wait` with logged,
+bounded backoff, staying fenced however long it fails — the long-term
+posture is operator-visible fencing (the slot enumerates `stopping`),
+never a silent promotion or a hot loop; SIGKILL delivery likewise proves
+nothing — never settles as closed: `stop` settles `stopFailed`,
 `restart` settles `restartFailed`, and the key converts to a pool-owned
 **termination-pending record** that retains the kill handle, enumerates
 as `stopping`, blocks acquires and further control calls

@@ -24,7 +24,7 @@ The async bridge architecture defines timeout systems across three decisions:
 
 1. **Initialization Timeout** (ls-bridge-async-connection): Bounds server initialization time during startup
 2. **Liveness Timeout** (ls-bridge-async-connection): Detects hung servers (unresponsive to pending requests)
-3. **Global Shutdown Timeout** (ls-bridge-graceful-shutdown): Bounds connection/process termination during shutdown (local cleanup falls outside)
+3. **Global Shutdown Timeout** (ls-bridge-graceful-shutdown): Bounds the shutdown termination attempt — escalation and ownership disposition (local cleanup falls outside)
 4. **Per-Request Timeout** (ls-bridge-server-pool-coordination): Bounds user-facing latency for multi-server aggregation *[Phase 3 only]*
 
 ### The Problem
@@ -92,7 +92,7 @@ Global Shutdown overrides all (highest priority)
 ```
 
 **Global Shutdown Design:**
-- Single ceiling for connection/process termination during pool teardown (not per-server; local cleanup falls outside)
+- Single ceiling for the termination attempt during pool teardown (not per-server; local cleanup falls outside)
 - Graceful attempts → SIGTERM → SIGKILL escalation
 - Reserve ~20% of timeout for SIGTERM/SIGKILL (e.g., 10s total → 8s graceful + 2s forced)
 
