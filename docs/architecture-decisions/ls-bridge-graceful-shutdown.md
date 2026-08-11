@@ -285,12 +285,19 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
     // budget is shorter than the normal SIGTERM grace, the grace is
     // shortened or skipped.
     // abort_survivors_and_finalize FINALIZES before returning: per
-    // bridge-client-control-protocol it runs the finalizer for EVERY
+    // bridge-client-control-protocol it runs settlement for EVERY
     // non-normal terminal outcome (hard abort, cancellation short of
     // completion, panic — even one already reaped by the graceful
     // drain, via the durable operation record), settling ARM,
-    // tombstone, replacement, and registry state to what the last
-    // recorded commit implies.
+    // tombstone, replacement, registry state, and the outer result
+    // channel to what the last recorded commit implies. During teardown
+    // settlement touches RECORDS AND POOL STATE ONLY — process
+    // termination belongs exclusively to the escalation arm via the
+    // live registry (single owner; no double kill/reap) — and it is
+    // synchronous lock-bounded work run by teardown itself, outside the
+    // abortable set, so the expired producer cutoff costs it nothing
+    // and revocable idempotent claims mean an interrupted finalizer
+    // never strands a record.
     join!(
         force_kill_remaining_until(deadline, connections, &control_procs),
         abort_survivors_and_finalize(&mut control_tasks, graceful_deadline),
@@ -352,8 +359,12 @@ async fn shutdown_router() {
     //    escape the connection snapshot below nor leave a live
     //    replacement behind; every process a control operation spawns is
     //    registered in the teardown-owned live control_procs registry at
-    //    spawn time (kill-on-register once teardown begins); the
-    //    JoinSet outlives the timed future, as in the sketch above
+    //    spawn time (kill-on-register once teardown begins). The
+    //    registry covers EVERY process a control operation owns —
+    //    reclaimed pre-existing servers included — and the seal also
+    //    quiesces the normal-service reaper, taking over in-progress
+    //    finalizations as teardown-run settlement work; the JoinSet
+    //    outlives the timed future, as in the sketch above
     let (mut control_tasks, control_procs) = seal_and_take_control_operations();
 
     // 4. Shutdown all connections in parallel (snapshot AFTER both gates)

@@ -476,19 +476,32 @@ the operation's behalf and settling the ARM state, tombstone,
 replacement, and registry entries to whatever the last recorded commit
 implies. The durable record also tracks **every process the operation
 owns at any moment** — the pre-existing process whose writer a `stop`
-reclaimed as much as a newly spawned replacement — and the finalizer
-force-terminates and reaps any such process before releasing the
-single-flight state, so an interrupted stop phase cannot leak a
-half-shut-down server that a reload has already dropped from the pool
-snapshot. The record's owner runs during **normal service**, not only at
-teardown: a pool-owned control-task reaper observes each detached
-operation's terminal outcome as it happens and finalizes abnormal exits
-immediately — without it, a panicking detached `restart` would leave the
-single-flight guard, ARM state, and tombstone stuck until shutdown.
-Teardown's seal atomically **quiesces the reaper** — no new finalization
-may start past the seal — and adopts in-progress finalizers into the set
-it joins before cleanup; each durable record is claimed exactly once, so
-finalization never runs twice for one operation.
+reclaimed as much as a newly spawned replacement — so an interrupted
+stop phase cannot leak a half-shut-down server that a reload has already
+dropped from the pool snapshot. Process termination has **exactly one
+owner at a time**: outside teardown the finalizer terminates and reaps
+the record's processes itself, bounded by the per-slot shutdown timeout
+(SIGTERM → SIGKILL; a SIGKILLed child's reap is kernel-guaranteed, not
+server-cooperative); during teardown that obligation transfers with the
+live process registry to the escalation phase, and finalization settles
+**records and pool state only** — no two paths ever kill or reap one
+child. Settlement itself is idempotent by construction (it inspects the
+state it finds), so record claims are revocable: a claim abandoned by an
+interrupted finalizer reverts and settlement re-runs; exactly-once is an
+optimization, not a correctness requirement. Settlement also includes
+the **outer result channel**: a finalized operation settles its pending
+`stop`/`restart` response exactly once — `stop` answers `null` when the
+slot verifiably reached `Closed` with its tombstone installed and a
+`RequestFailed` otherwise; `restart` answers `restartFailed` — so a
+panicking detached task can never leave the caller pending. The record's
+owner runs during **normal service**, not only at teardown: a pool-owned
+control-task reaper observes each detached operation's terminal outcome
+as it happens and finalizes abnormal exits immediately — without it, a
+panicking detached `restart` would leave the single-flight guard, ARM
+state, and tombstone stuck until shutdown. Teardown's seal atomically
+**quiesces the reaper** — no new finalization may start past the seal —
+and takes over in-progress finalizations; those run as teardown's own
+lock-bounded settlement work, never inside the abortable task set.
 
 - **Process-level configuration applies.** `command`, `args`,
   `initializationOptions`, settings — whatever the config says *now* is what
