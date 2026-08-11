@@ -1057,8 +1057,15 @@ a slot a routing provider left in play.
   routing-specific step precedes dispatch: the expanded entries are
   pruned to the selected provider set (`expand_priorities` does not do
   this, and the `maxFanOut` truncation step is deliberately skipped).
-  Cleanup on every terminal outcome of the decision — early winner,
-  incarnation abort, teardown, expiry — uses
+  Routing requests are **bridge-minted**: there is no upstream request
+  id to reuse (the pool's id-reuse rule applies to forwarded client
+  traffic only), so each selected handle allocates an id through its
+  own existing allocator and registers the pending entry with no
+  upstream mapping and with routing's non-liveness classification; the
+  driver retains the (handle, id) pair for cancellation, and a
+  registration failure counts as that provider's failure (a `null` in
+  the walk). Cleanup on every terminal outcome of the decision — early
+  winner, incarnation abort, teardown, expiry — uses
   `forward_cancel_downstream` per still-pending provider request;
   retirement must be atomic with the decision's settlement so late
   answers drop.
