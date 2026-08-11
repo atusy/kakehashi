@@ -97,11 +97,15 @@ with the work that belongs to the connection.
    same-host-language documents is barely thinned, and the later stages carry
    the load. It must still run before the parse wait and the injection
    resolution, not merely before the open.
-2. Do its resolved injections actually bridge to this server? Also pure
-   configuration, but it needs the injections, so it is paid only by hosts that
-   survived (1).
-3. Does it route to *this* connection? A marker resolution, paid only by hosts
-   that survived (2). Read-only: it never spawns, so asking about a document
+2. Which of its route units bridge to this server? This stage produces
+   **units**, not a host-level verdict (bridge-routing-protocol): each
+   resolved injection language whose `bridge` filter admits the server is an
+   injection unit, and the host layer is a unit of its own when `_self` is
+   enabled with a host-language match — a host-only `_self` route survives
+   with no matching injection at all. Pure configuration, but the injection
+   half needs the injections, so it is paid only by hosts that survived (1).
+3. Does the unit route to *this* connection? A marker resolution, paid per
+   unit surviving (2). Read-only: it never spawns, so asking about a document
    belonging to another root cannot bring that root's server up.
    bridge-routing-protocol amends this stage: when the document holds an
    active route binding for the server, the binding answers instead of the

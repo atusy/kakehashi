@@ -241,12 +241,14 @@ A provider **cannot**:
   component-wise, never string-prefix (`/proj/app` does not admit
   `/proj/app-secrets`). An override can therefore re-root a server within
   the universe kakehashi's own resolution already spans, never walk above
-  it. A host document with a non-`file:` URI has no path to walk, so the
-  marker branch never contributes — but the client-fallback root is
-  still kakehashi's own resolution for such a document (the existing
-  marker-less fallback already serves non-`file:` documents), so the
-  universe there is the client workspace folders plus that fallback
-  root; a session with neither rejects every element. The
+  it. Only `file:`-scheme, existing-directory anchors contribute to the
+  universe — a non-`file:` client-fallback root cannot be canonicalized
+  or compared component-wise and contributes **no** anchor. A host
+  document with a non-`file:` URI has no path to walk, so the marker
+  branch never contributes either; its universe is the client workspace
+  folders plus the fallback root *when that root is a `file:`
+  directory*, and a session where no anchor qualifies rejects every
+  element. The
   element count per entry is capped (implementation-defined, documented
   default in the tens). An entry violating any of these rules is dropped
   whole with a warning.
@@ -373,9 +375,13 @@ lets a dedicated policy server opt out of ever being a document candidate
 An `Initializing` server is awaited (within the decision deadline, below)
 **only** when its advertisement is already known — observed earlier in the
 session and remembered per server name — or it is named explicitly
-(non-`"*"`) in the routing `priorities`: advertisement is observable only
-after the handshake, and awaiting every initializing server to find out
-would tax exactly the fleets that have no providers at all. Slots that are
+(non-`"*"`) in the routing `priorities`, or it carries
+`forceStart = true` (an explicitly configured eager spawn is as strong a
+signal of intent as a named priority — without this, a first `didOpen`
+racing startup would freeze fallback routing past the very provider
+`forceStart` exists to have ready): advertisement is observable only
+after the handshake, and awaiting every *other* initializing server to
+find out would tax exactly the fleets that have no providers at all. Slots that are
 `stopping`, `stopped`, `failed`, or mid-`restart`
 (bridge-client-control-protocol's states) are skipped, never parked on. A
 provider *name* can own several live connections at once (per-root
@@ -620,7 +626,14 @@ structures with different lifetimes carry the outcome:
 Decision-cache lifecycle:
 
 - **Evicted on the host document's `didClose`** — all its layers' and
-  languages' entries, and its binding, at once. A configuration reload
+  languages' entries, and its binding, at once — **and per injection
+  language when its last region disappears**: a parse supersession that
+  removes an injection language from the document evicts that (host,
+  injection, language) tuple's cache entry and binding and retires its
+  pending flight through the same cleanup path a `didClose` uses, so a
+  flight whose subscribers vanished with their regions still reaches a
+  terminal state, and a document that churns through language ids does
+  not accumulate tuples for its whole open lifetime. A configuration reload
   flushes the whole cache: superseded-generation entries are unreadable
   under the new generation and would otherwise sit resident until their
   document closes. Cache and binding are each bounded in top-level keys
@@ -825,9 +838,17 @@ configured. Two pieces close most of the gap:
   the same marker-less fallback shape a document-less acquire produces
   (`root_markers::workspace_from_marker`: the client-supplied `rootUri`
   and the client's workspace-folder snapshot; rootless in a
-  workspace-less session), and it observes the stopped set and control
-  registry exactly as a lazy acquire does, colliding rather than
-  double-spawning when one races it. That fallback shape is also the
+  workspace-less session) — **except** for a `preferSharedInstance`
+  server, where it resolves the `#shared` key directly, seeded with the
+  client's primary root exactly as the control protocol's shared
+  re-seed is (the document-less acquire's ordinary answer would be the
+  client-fallback key, which marker-rooted documents bypass — the
+  warm-up would warm a process nothing uses); the capability verdict
+  lands at the handshake as for any shared spawn, and an incapable
+  server simply serves nothing new, per the existing fallback. It
+  observes the stopped set and control registry exactly as a lazy
+  acquire does, colliding rather than double-spawning when one races
+  it. That fallback shape is also the
   honest scope of the warm-up: documents under marker roots resolve
   *marker* keys and will not reuse the warmed connection, so `forceStart`
   warms a usable connection only for shared-instance servers, marker-less
