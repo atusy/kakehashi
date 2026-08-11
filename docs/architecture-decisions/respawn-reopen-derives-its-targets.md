@@ -217,7 +217,10 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
   the barrier is a no-op for it. Re-rooting is not only a configuration change:
   marker resolution walks the live filesystem uncached, so creating a marker
   (`git init` in a subdirectory, a submodule checkout, scaffolding a nested
-  project) re-roots a host with settings untouched.
+  project) re-roots a host with settings untouched. Both apply only to
+  documents *without* an active route binding: a bound document
+  (bridge-routing-protocol) keeps its bound key for its open lifetime and
+  is not re-rooted by live marker changes.
 - The re-open considers every open document rather than a pre-narrowed set. The
   configuration question is answered first and from a memo, so the cost is a
   map lookup per open document, but it does scale with the workspace rather
@@ -226,9 +229,10 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
   stage-1 screen re-couples them, and the symptom is every command on a
   respawned connection failing soft on a large workspace.
 - Marker resolution now runs during the re-open for hosts that bridge to the
-  respawned server. The pre-existing eager path already resolves markers per
-  open, so this is not a new kind of work, but it is work the captured-list
-  design skipped.
+  respawned server — those without a route binding; bound hosts answer from
+  the binding instead. The pre-existing eager path already resolves markers
+  per open, so this is not a new kind of work, but it is work the
+  captured-list design skipped.
 
 ### Known limits of `done`
 

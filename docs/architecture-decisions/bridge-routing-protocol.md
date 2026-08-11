@@ -153,11 +153,15 @@ The result layers a "kakehashi decides" default at every granularity:
   treated as `null`; a well-typed entry whose `workspaceFolders` fails
   validation (below) is dropped whole (kakehashi decides for that server);
   an entry naming an unknown server is ignored. The answer is also
-  bounded *before* normalization: an implementation-defined ceiling on
-  the response's total size and on the number of `routing` entries
-  examined — an answer beyond either is discarded whole as malformed
-  (`null` + warn), so a provider cannot make kakehashi allocate for or
-  walk unboundedly many entries it would only discard. An answer is also
+  bounded *before* normalization: an implementation-defined cap on the
+  number of `routing` entries examined — beyond it the answer is
+  discarded whole as malformed (`null` + warn), so a provider cannot
+  make kakehashi walk unboundedly many entries it would only discard.
+  The *allocation* bound cannot live at this layer — the frame is fully
+  read before method dispatch — so a framing-level ceiling on
+  downstream message size, with defined oversized-frame behavior, is
+  recorded as a transport hardening this bound depends on
+  (Implementation Notes). An answer is also
   re-screened when applied: an entry whose server is no longer a current
   candidate (deleted, disabled, or no longer language-matching after a
   reload) is dropped with a warning.
@@ -487,8 +491,13 @@ structures with different lifetimes carry the outcome:
   running after the handler returns sees no record at all. The flight —
   the single-flight future and its deadline clock — is created
   **atomically with the pending record**, so an observer of a pending
-  entry always has a future to await and a remaining budget to inherit;
-  the first task to poll it dispatches the fan-out. Every server's
+  entry always has a future to await and a remaining budget to inherit.
+  The flight is driven by a **dedicated driver task** spawned with it;
+  every other party — the open tasks, the lazy open, the re-open sweep —
+  is a passive subscriber, so an observer polling the future can never
+  be the one to initiate provider I/O (in particular, the query-free
+  sweep guarantee cannot be broken by the sweep merely awaiting a
+  pending binding). Every server's
   entry then reaches a **terminal settlement**, so waiters never hang:
   *suppressed* settles when the answer applies (no acquire runs);
   *routed(key)* settles at that server's acquire commit, recording the
@@ -497,8 +506,11 @@ structures with different lifetimes carry the outcome:
   fails *after* the route was decided — waiters proceed without the
   server, and later opens retry the retained key through the ordinary
   respawn path rather than falling through to a different resolution;
-  and a decision that ends with no answer does **not** settle entries
-  keyless: each open task proceeds by kakehashi's own resolution, and
+  *not-applicable* settles when a server is rejected **before** any
+  acquire runs — a capability prefilter, configuration removal or
+  disablement, a generation-mismatch fallback dropping it — so no
+  entry can stay pending forever; and a decision that ends with no
+  answer does **not** settle entries keyless: each open task proceeds by kakehashi's own resolution, and
   that ordinary acquire's commit settles *routed(key)* or
   *retained(key)* exactly as above — every settled entry carries a key
   or a suppression, so a lazy waiter can never resolve a different key
@@ -567,12 +579,15 @@ Decision-cache lifecycle:
   anchored on (config generation, flush epoch, document open
   incarnation) — the epoch is a monotonic counter bumped by every
   flush; the incarnation is the per-open token the document store
-  already mints. The incarnation anchor is fixed when the pending
-  record is created; the generation and epoch anchors are captured at
-  **first dispatch** (the first poll that fans out), so provider-set
-  churn between record creation and dispatch — a provider reaching
-  `Ready` just before the first poll — folds into the dispatch-time
-  selection instead of invalidating a flight that never dispatched.
+  already mints. The incarnation and **config generation** anchors are
+  fixed when the pending record is created — the projection and
+  candidate set are built from that generation, so a reload landing
+  before dispatch invalidates the flight rather than blessing a stale
+  projection with a fresh generation; only the flush-epoch anchor is
+  captured at **first dispatch**, so provider-set churn before dispatch
+  — a provider reaching `Ready` just before it — folds into the
+  dispatch-time selection instead of invalidating a flight that never
+  dispatched.
   The answer is **applied and inserted only while the anchors hold**,
   with a mismatch handled by kind:
   - a **generation or epoch** move (the document is still the same
@@ -634,11 +649,18 @@ would preempt a longer routing deadline): the routing deadline is the sole
 bound on these requests.
 
 Filesystem validation (the canonicalization above) runs off the async
-executor, charged against the decision's remaining budget; at the
+executor on a **globally bounded validation pool** (a semaphore with a
+bounded queue), charged against the caller's remaining budget; at the
 deadline the decision falls open and the orphaned blocking call's result
 is discarded — the *decision's* latency stays bounded even where an OS
 filesystem call (a network mount, an automount) cannot be cancelled and
-outlives it detached.
+outlives it detached, and a hanging mount can pin at most the pool,
+never an unbounded worker pile: a caller that cannot acquire pool
+capacity within its budget fails open without launching another orphan.
+Binding-*reuse* revalidation carries its own bound — the sweep's
+remaining budget on sweep paths, and a dedicated, implementation-defined
+validation budget on lazy-open and retained-key retry paths — with
+"exceeded" reading as not applicable for that attempt, warned.
 
 Because they carry no tier accounting, outstanding provider requests are
 cleaned up on **every terminal outcome of the decision**, not only
@@ -654,11 +676,12 @@ handler. The handler's candidate enumeration stays synchronous and the
 per-URI ingress writer ticket stays await-free — the posture the open
 path deliberately keeps (a slow await under the ticket wedges later
 same-URI readers and writers; the codebase records exactly this hazard
-for auto-install). Instead, the eager per-server open tasks — already
-fire-and-forget off the ticket — share the decision: the first task to
-consult the routing gate starts the single-flight query, its siblings
-await the same future, and each task applies the answer (suppression,
-root override, then its acquire) before sending its `didOpen`. The
+for auto-install). Instead, the handler installs the pending record and
+spawns the flight's dedicated driver (both synchronous), and the eager
+per-server open tasks — already fire-and-forget off the ticket — await
+the shared future as passive subscribers, each applying the answer
+(suppression, root override, then its acquire) before sending its
+`didOpen`. The
 injection-layer decision is awaited the same way by the virtual-document
 open tasks, off the parse loop; the lazy request-path open and the
 re-open sweep consult the binding only, as above. The deadline's cost is
@@ -998,6 +1021,12 @@ a slot a routing provider left in play.
   and `-32601` advertisement clearing. Each is already a pool-lock commit
   point; the flush (a map clear plus an epoch bump) is synchronous, safe
   to run inside them.
+- The frame reader currently allocates the declared `Content-Length`
+  before parsing anything, so the answer-size bound needs a
+  **framing-level ceiling on downstream message size** with defined
+  oversized-frame behavior — a transport hardening recorded here as an
+  implementation prerequisite of this protocol's allocation bound, not
+  a routing-handler check (which would run too late).
 - ls-bridge-timeout-hierarchy gains the routing decision deadline
   (registered beside the per-slot control shutdown timeout) and the
   Tier-2 exclusion note; that edit lands with this ADR.
