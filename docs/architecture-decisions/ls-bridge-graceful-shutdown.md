@@ -327,8 +327,11 @@ What the previous machinery bought, the actor gives structurally:
   (`ProcessExit` dominates) but can never extend the ceiling — an active
   run retains the **earliest** deadline it has been offered. The actor
   owns the single completion watch, hands every caller a receiver, and
-  publishes the run's **success-or-failure** only after cleanup; callers
-  surface or log a failed teardown rather than mistaking it for success. A
+  publishes the run's **success-or-failure** only after cleanup — with
+  the single final-deadline exception below, where completion publishes
+  as failed while an unjoined producer's record stays authoritative;
+  callers surface or log a failed teardown rather than mistaking it for
+  success. A
   `Teardown(ProcessExit)` arriving **after** a completed `ServerRemains`
   run is a new transition, not a lost upgrade: it adopts the retained
   termination-pending records **and spawn-cleanup records**, disposes
@@ -375,7 +378,8 @@ retains it — slot still writable — until the sub-task's termination
 surfaces through the `JoinSet`; a handle landing in that window is
 killed-and-reaped by the final settlement, so no child can slip in
 behind an escalation scan, and teardown publishes completion only after
-its adopted `Spawning` entries have settled this way. Claim closure is
+its adopted `Spawning` entries have settled this way (or, at the final
+deadline, publishes as failed per the disposition below). Claim closure is
 **deadline-bounded like everything else**: a spawn sub-task that has not
 terminated by the applicable deadline (per-slot for `stop`/`restart`,
 the absolute deadline for teardown) fails the operation
@@ -417,7 +421,11 @@ enum ShutdownMode {
 enum LifecycleMsg {
     Stop { key: ConnectionKey, reply: Reply },
     Restart { key: ConnectionKey, reply: Reply },
-    CommitSpawn { key: ConnectionKey, reply: Reply },   // acquire's spawn path
+    CommitSpawn { key: ConnectionKey, reply: Reply },
+    // ^ the reply is the ACCEPTANCE acknowledgment (intent committed),
+    //   not the terminal spawn result — the acquire caller observes the
+    //   handle through the ordinary pool path afterwards, so a control
+    //   transition claiming the intent leaves no pending reply to error
     Reload { generation: ConfigGeneration, reply: Reply },
     Teardown { mode: ShutdownMode, deadline: Instant, reply: Reply<WatchRx> },
     // ^ deadline captured by the caller at initiation; actor owns the one watch
