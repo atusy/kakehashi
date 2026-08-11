@@ -194,9 +194,11 @@ override's first element, checked after the truncation below. If either is
 stopped, the answer's entry for that server is discarded (the
 configuration-resolved stop wins; a provider cannot steer a document
 around a user's pin by naming a different root). Both checks run
-**inside the one acquire critical section** that admits the route —
-never as a separate look-then-acquire, which a concurrently committing
-`stop` could slip between — and the binding retains **both** keys, so
+**inside the route-admission critical section** — realized by the
+acquire's own critical section for routed entries, and by the same pool
+lock for acquire-less suppressions — never as a separate
+look-then-admit, which a concurrently committing `stop` could slip
+between — and the binding retains **both** keys, so
 every later binding-driven acquire (the lazy open, the re-open sweep)
 re-checks both in its own critical section: a key stopped after
 admission makes the bound route not applicable, exactly as ordinary
@@ -498,9 +500,15 @@ structures with different lifetimes carry the outcome:
   per (host document, layer, language), which servers were suppressed,
   which `ConnectionKey` each open landed on, and — for **every** shared
   routed/retained entry, override-driven or not — the effective
-  canonical folder(s) announced at open (the override folders, or the
-  ordinarily resolved root), all stamped with the document's open
-  incarnation. Retaining the folder for non-override shared routes too
+  canonical folder(s) **selected for the route and persisted before the
+  acquire runs** (the override folders, or the ordinarily resolved
+  root; `retained` entries have folders even though their acquire
+  failed and nothing was announced), all stamped with the document's
+  open incarnation. An ordinarily resolved root entering a binding is
+  canonicalized on the same validation pool and budget as an override
+  folder — binding reuse demands equality with an admission-time
+  canonical URI, so the retained value must be canonical from the
+  start. Retaining the folder for non-override shared routes too
   is what gives a restarted shared replacement a folder source for every
   bound document; live resolution serves only tuples with no binding. The pending binding record is
   installed **synchronously in the `didOpen` handler (respectively the
@@ -521,8 +529,11 @@ structures with different lifetimes carry the outcome:
   *suppressed* settles when the answer applies — no acquire runs, but
   the settlement still commits inside a **route-admission critical
   section** under the same pool lock the acquires use, where the
-  both-key stopped check runs atomically with the commit (uniform with
-  routed entries, whose admission section is the acquire's own);
+  both-key stopped check, the config-generation revalidation, and the
+  current-candidacy re-screen all run atomically with the commit
+  (uniform with routed entries, whose admission section is the
+  acquire's own — a stale suppression is never applied across a reload
+  either);
   *routed(key)* settles at that server's acquire commit, recording the
   key actually landed on (a capability-fallback downgrade records the
   downgraded per-root key); *retained(key)* settles when an acquire

@@ -573,11 +573,13 @@ and their waits (ls-bridge-graceful-shutdown § Unconfirmed termination).
   caller's own risk.
 - **A shared instance re-seeds; nothing is remembered** — with one
   recorded exception: a document's active route binding
-  (bridge-routing-protocol) retains its override folders, and — provided
-  the replacement still supports workspace folders — the re-open sweep
-  re-adds and announces them before that document's `didOpen`; a
-  replacement the capability fallback downgraded gets neither, and the
-  bound route reads not applicable per that decision. A `#shared` key
+  (bridge-routing-protocol) retains the effective canonical folders of
+  every bound shared route (override folders or the ordinarily resolved
+  root recorded at open), and — provided the replacement still supports
+  workspace folders — the re-open sweep re-adds and announces them
+  before that document's `didOpen`; a replacement the capability
+  fallback downgraded gets neither, and the bound route reads not
+  applicable per that decision. A `#shared` key
   carries no root, and the old handle's accumulated folder set dies with
   it. Because no triggering document exists to resolve a marker root — the
   existing acquire path cannot revive a dead shared key without one — the
