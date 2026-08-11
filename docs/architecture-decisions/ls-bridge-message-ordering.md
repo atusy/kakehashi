@@ -223,9 +223,14 @@ enum ConnectionState {
 | `Initializing` | shutdown signal | `Closing` |
 | `Ready` | shutdown signal | `Closing` |
 | `Ready` | crash / panic | `Failed` |
-| `Failed` | (automatic) | `Closed` |
+| `Failed` | cleanup / shutdown (not automatic) | `Closed` |
 | `Closing` | (graceful or timeout) | `Closed` |
 | `Closing` | panic | `Closed` |
+
+`Failed` handles stay pool-resident — addressable and enumerable — until a
+later acquire replaces them or cleanup/shutdown closes them;
+bridge-client-control-protocol relies on that residency for its `failed`
+status and `restart` target resolution.
 
 **Key Transition: Failed → Closed (Direct)**
 

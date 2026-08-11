@@ -96,6 +96,16 @@ Global Shutdown overrides all (highest priority)
 - Graceful attempts → SIGTERM → SIGKILL escalation
 - Reserve ~20% of timeout for SIGTERM/SIGKILL (e.g., 10s total → 8s graceful + 2s forced)
 
+**Per-Slot Control Shutdown** (bridge-client-control-protocol):
+- A single-slot `stop`/`restart` runs under its own per-connection shutdown
+  timeout with the same graceful → SIGTERM → SIGKILL shape
+- This is not the rejected per-server teardown timeout: it bounds one
+  user-initiated control operation while the rest of the pool keeps
+  serving; pool teardown keeps the single global ceiling above
+- Precedence on overlap: global shutdown takes ownership of in-flight
+  control operations, and its deadline caps and force-kills whatever the
+  per-slot timeout has not finished
+
 **Writer-Idle Timeout** (within Global Shutdown):
 - **Duration**: 2s fixed
 - **Purpose**: Wait for writer loop to finish current operation before taking exclusive stdin access

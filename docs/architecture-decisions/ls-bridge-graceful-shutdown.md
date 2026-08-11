@@ -76,22 +76,26 @@ Failed → Closed (skip LSP handshake)
 └─ Wait for process exit, then SIGKILL if needed
 ```
 
-### Operation Disposal Policy: Fail Immediately
+### Operation Disposal Policy: Reject New, Drain Accepted, Fail Pending at Timeout
 
-**Decision**: Fail all in-flight operations immediately when shutdown begins.
+**Decision**: Reject new operations immediately, drain the already-accepted
+order queue ahead of the shutdown handshake, and fail pending responses when
+the timeout expires.
 
 **Rationale:**
 - **Predictable latency**: Bounded shutdown time, no waiting for slow servers
 - **Clear error semantics**: Operations receive explicit failure, not timeout
-- **Simplicity**: No complex draining logic or partial completion tracking
+- **Stream integrity**: The accepted queue drains in FIFO order — the
+  writer's existing behavior — so `shutdown` cannot overtake messages the
+  bridge already committed to send
 
 **Operation Handling:**
 
 | Operation Location | Shutdown Action |
 |-------------------|-----------------|
-| **Order queue - Not yet dequeued** | Never sent (writer loop stops dequeuing) |
-| **Order queue - Currently writing** | Complete write, then writer loop exits |
-| **Pending responses** | Fail with `REQUEST_FAILED` ("bridge: connection closing") when global timeout expires |
+| **Order queue - Not yet dequeued** | Drained: sent before `shutdown`, preserving FIFO order |
+| **Order queue - Currently writing** | Complete write (never abort mid-stream) |
+| **Pending responses** | Fail with `REQUEST_FAILED` ("bridge: connection closing") when the timeout expires |
 | **New operations** | Reject with `REQUEST_FAILED` ("bridge: connection closing") when attempting to enqueue |
 
 **Why not abort mid-write**: Operations in the order queue may be partially written to stdin. Aborting mid-write corrupts the protocol stream.
@@ -262,11 +266,13 @@ async fn shutdown_router() {
     tokio::time::timeout(GLOBAL_TIMEOUT, async {
         let tasks = all_connections.iter()
             .map(|conn| async move {
-                match conn.state() {
-                    Failed => conn.cleanup_only(),       // Skip LSP handshake
-                    Initializing => conn.terminate_without_lsp(), // No LSP message (see Initialization Shutdown)
-                    _ => conn.graceful_shutdown(),       // Full LSP sequence
-                }
+                // Atomic compare-transition: each arm commits its
+                // *→Closing transition conditionally (Failed → cleanup
+                // only, Initializing → terminate without LSP, Ready →
+                // full handshake), so a handshake that commits Ready
+                // between observe and act is shut down gracefully,
+                // never terminated without the handshake.
+                conn.shutdown_by_state()
             });
 
         futures::future::join_all(tasks).await;
@@ -416,3 +422,4 @@ Skip synchronization, just send shutdown request whenever ready.
 
 - **2026-01-06**: Merged Amendment 001 - Added three-phase writer loop shutdown synchronization to prevent stdin corruption during concurrent shutdown writes
 - **2026-08-11**: Corrected Initialization Shutdown - the abort path sends no LSP message at all (the earlier revision sent `exit` before the initialize response, which LSP ordering forbids); adopted alongside bridge-client-control-protocol, whose per-slot `stop` shares the path
+- **2026-08-11**: Reconciled the Operation Disposal Policy with the Closing-state gating and the writer's actual behavior - the accepted order queue drains ahead of `shutdown` (the earlier table said queued operations are never sent, contradicting § Operation Gating and the FIFO writer)

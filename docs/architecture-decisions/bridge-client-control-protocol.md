@@ -273,7 +273,7 @@ type OpenDocument = {
 - `documents` returns the bridge-managed open documents of the connection —
   virtual documents included, distinguished by `hostUri`. Documents opened
   via pass-through are invisible here (outside the managed domain, by the
-  boundary above). `documentSelector?: DocumentSelector` filters against the
+  boundary above). `documentSelector?: DocumentSelector | null` filters against the
   downstream-facing `uri`/`languageId`, accepting the text-document filter
   forms (`language`/`scheme`/`pattern`); `pattern` may be a plain glob or
   a `RelativePattern`, which is self-contained — it carries its own
@@ -307,8 +307,10 @@ pool-wide `GlobalShutdownTimeout` bounds it, via the teardown-only
 `force_kill_all` — so a single-slot `stop` against a wedged server would
 otherwise wait forever, and a wedged server is precisely this method's
 motivating case. On expiry the forced escalation applies (SIGTERM → SIGKILL
-on Unix; immediate kill on Windows). In-flight and newly arriving operations
-fail per that decision's disposal policy. The result `null` is returned when
+on Unix; immediate kill on Windows). Operations follow that decision's disposal policy, with the timeout being
+this per-connection one: the already-accepted order queue drains ahead of
+`shutdown`, pending responses fail when the timeout expires, and newly
+arriving operations are rejected immediately. The result `null` is returned when
 the slot reaches `Closed`, whichever path got it there. `stop` on a
 `starting` slot is legal and aborts initialization with **no LSP message
 at all**: the spec forbids the client every additional request *and*
@@ -420,7 +422,13 @@ Neither `stop` nor `restart` is abortable mid-mutation: a `$/cancelRequest`
 for the outer request may fail it with `RequestCancelled`, but the
 operation itself runs to completion detached, and the single-flight guard
 releases only when it finishes — a dropped handler can never leave a slot
-half-stopped or release the guard midway.
+half-stopped or release the guard midway. Pool-wide shutdown does not wait
+behind them either: global teardown takes ownership of in-flight control
+operations, joins them, and force-kills at its own deadline whatever the
+per-slot timeout has not finished (ls-bridge-timeout-hierarchy § Per-Slot
+Control Shutdown), so a wedged per-slot `stop` can neither stall teardown
+nor outlive it; the outer control request then fails per the disposal
+policy.
 
 - **Process-level configuration applies.** `command`, `args`,
   `initializationOptions`, settings — whatever the config says *now* is what
@@ -615,7 +623,10 @@ namespace.
   for an in-flight `stop` (a reload can purge the `Closing` handle,
   leaving the registry as sole owner), `starting` for a restart's respawn
   phase. When a key has several owners, precedence is live handle >
-  stopped set > control registry, deduplicated to one row.
+  stopped set > control registry, deduplicated to one row — except that a
+  `Closed` handle awaiting removal is ignored, so during that window the
+  registry's operation supplies the status (`Closed` deliberately has no
+  `Client.status` of its own).
 - The stopped set lives beside the pool's per-connection maps, keyed by
   `ConnectionKey`; the acquire path checks it — together with the
   control-operation registry — inside the same critical section, before
