@@ -778,9 +778,13 @@ impl Kakehashi {
         // Get injection query to detect injection regions
         let injection_query = self.language.injection_query(&language_name)?;
 
-        // Resolve injection region at position
+        // Resolve injection region at position. Strict conversion: a
+        // client-supplied column past the line's end must mean "no such
+        // location" (virt layer silent), not spill into a later line's bytes
+        // and containment-match a region the caret is not visually in —
+        // same policy as kakehashi/node position resolution.
         let mapper = PositionMapper::new(snapshot.text());
-        let byte_offset = mapper.position_to_byte(position)?;
+        let byte_offset = mapper.position_to_byte_strict(position)?;
 
         let Some(resolved) = crate::language::InjectionResolver::resolve_at_byte_offset(
             &self.language,
