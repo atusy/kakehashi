@@ -99,8 +99,9 @@ child's handshake begins; once claimed into settling it reads
 process termination is not yet confirmed (its handle may already be
 `Closed` or gone), **or** a settling `Spawning` entry or configured
 cleanup record being wound down (each answers control calls with
-`clientNotReady`, `data.status: "stopping"` — except an entry owned by
-an active `restart`, which answers `clientRestarting` per single-flight), `failed` = `Failed`, and `stopped` =
+`clientNotReady`, `data.status: "stopping"` — except that **restart ownership overrides the generic non-ready
+mapping in every phase**: a slot an active `restart` owns answers
+`clientRestarting` whether it currently reads `stopping` or `starting`), `failed` = `Failed`, and `stopped` =
 pinned until an explicit `restart` — by a user's `stop`, or by the
 fenced retry tombstone a failed `restart` leaves (the enumeration does
 not distinguish who pinned it; both revive the same way — see below). Stopped slots **are included** in
@@ -739,7 +740,7 @@ namespace.
   visibility rule), stopped-set key, and in-flight-operation key with
   `ConnectionKey`'s
   `Display` and compare for exact equality with the supplied id; no
-  parsing. The last three all live in the lifecycle actor's state, read
+  parsing. All but the live pool key live in the lifecycle actor's state, read
   through a snapshot it publishes atomically per transition. Owner
   precedence for enumeration is live handle > termination-pending record
   (`stopping`) > settling/cleanup record (`stopping`) > stopped set >
