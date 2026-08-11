@@ -242,7 +242,7 @@ enum ShutdownMode {
 // every caller joins completion before proceeding — an exit path racing
 // an in-progress ServerRemains teardown cannot terminate around it.
 
-async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
+async fn shutdown_all_connections(pool: Arc<ConnectionPool>, mode: ShutdownMode) {
     // Capture the prospective ceiling BEFORE any coordination, so the
     // starter's deadlines are anchored ahead of lock traffic; the gap
     // is the escalation reserve (ls-bridge-timeout-hierarchy: ~20%).
@@ -254,12 +254,18 @@ async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
     // join_or_start — never inline in a caller's request future — so a
     // cancelled or panicking caller cannot drop adopted tasks or
     // process leases mid-teardown. The pool-owned task runs the body
-    // under a PANIC GUARD (supervisor): on an owner panic the guard
-    // aborts and joins the adopted tasks, recovers process leases,
-    // performs mode-aware disposition and cleanup itself, and only then
-    // publishes completion AS FAILED — joiners are released with
-    // ownership settled, never around it. Every caller, starter
-    // included, is a joiner:
+    // under a PANIC GUARD (supervisor). Everything the run adopts —
+    // control tasks, the process registry, snapshots, unresolved
+    // leases — lives in SUPERVISOR-OWNED storage on the TeardownRun,
+    // not in locals of the panic-catching future, so unwinding cannot
+    // drop it. On an owner panic the guard re-borrows that storage,
+    // aborts and joins the adopted tasks, recovers process leases, runs
+    // the same idempotent durable-record finalizer as any abnormal
+    // outcome (bridge-client-control-protocol: ARM, tombstone,
+    // replacement, and outer-result settlement), performs mode-aware
+    // disposition and cleanup, and only then publishes completion AS
+    // FAILED — joiners are released with ownership settled, never
+    // around it. Every caller, starter included, is a joiner:
     let Joined { late_exit_claim, completion } =
         pool.teardown_run().join_or_start(mode, now);
 
@@ -314,7 +320,10 @@ async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
     // control_procs, so a child from a failed stop is inside the
     // escalation set even though it is in neither the connection
     // snapshot nor the task set.
-    let (mut control_tasks, control_procs) = seal_and_take_control_operations();
+    // Adopted state is placed in the supervisor-owned TeardownState —
+    // the body only borrows it, so an unwind cannot drop it.
+    let TeardownState { control_tasks, control_procs } =
+        teardown.adopt(seal_and_take_control_operations());
 
     // Snapshot AFTER both gates: nothing can be inserted past them.
     let connections = pool.all_connections();
@@ -366,8 +375,17 @@ async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
     // abortable set, so the expired producer cutoff costs it nothing
     // and revocable idempotent claims mean an interrupted finalizer
     // never strands a record.
+    // ONE canonical lease-owner map is built before escalation:
+    // snapshot entries whose lease the registry owns are excluded from
+    // the force arm, so no process ever has two escalation owners
+    // (duplicate SIGTERM/SIGKILL/wait is prevented up front, not merely
+    // deduplicated afterwards).
     let (kill_unresolved, _) = join!(
-        force_kill_remaining_until(deadline, connections, &control_procs),
+        force_kill_remaining_until(
+            deadline,
+            connections.excluding_leases_of(&control_procs),
+            &control_procs,
+        ),
         abort_survivors_and_finalize(&mut control_tasks, graceful_deadline),
     );
 
@@ -462,7 +480,7 @@ async fn shutdown_router(mode: ShutdownMode) {
     //    published, so a joiner cannot resume around it. Keeping one
     //    canonical body is deliberate: two parallel sketches of this
     //    sequence drifted repeatedly.
-    shutdown_all_connections(&connection_pool, mode).await;
+    shutdown_all_connections(connection_pool.clone(), mode).await;
     // No trailing cleanup here: run_pool_and_router_cleanup() inside the
     // owner body is the single cleanup site, executed exactly once
     // before completion publication.
