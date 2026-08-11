@@ -1440,7 +1440,7 @@ mod tests {
             outcome
                 .events
                 .iter()
-                .map(|e| format!("{:?}: {}", e.kind, &e.message))
+                .map(|e| format!("{:?}: {}", e.kind, e.message))
                 .collect::<Vec<_>>()
         );
         assert!(
