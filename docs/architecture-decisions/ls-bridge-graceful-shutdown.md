@@ -388,17 +388,24 @@ async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
     // Both escalation paths claim each process ATOMICALLY from ONE
     // LIVE lease-owner map shared with the still-open registry — not a
     // pre-filtered snapshot, which would race a control task reclaiming
-    // a snapshot lease after the filter. A late registration REVOKES
-    // the ordinary claim, so no process ever has two escalation owners
-    // (duplicate SIGTERM/SIGKILL/wait is structurally impossible).
-    state.kill_unresolved = join!(
+    // a snapshot lease after the filter. The map is the CENTRAL lease
+    // owner and SERIALIZES every signal/wait: a claimant operates only
+    // while holding the lease's operation lock, and revocation is
+    // REVOKE-AND-ACKNOWLEDGE — it cancels and joins the in-progress
+    // operation and receives the RAII lease back before the new owner
+    // may act, so a mid-flight SIGTERM or pending Child::wait is never
+    // preempted by a mere map edit. No process ever has two escalation
+    // owners. The force result is recorded IN PLACE (a transactional
+    // phase-guard store — no join! temporary is ever the sole owner
+    // across a panic point).
+    state.record_kill_unresolved(join!(
         force_kill_remaining_until(
             deadline,
             teardown.lease_owners().claim_ordinary(&state.connections),
             &state.control_procs,
         ),
         abort_survivors_and_finalize(&mut state.control_tasks, graceful_deadline),
-    ).0;
+    ).0);
 
     // Both arms have joined: no control task is alive, so no RAII
     // wrapper can hand a process back later. Only NOW close the live
@@ -409,8 +416,11 @@ async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
     // by ConnectionKey: a control-owned process reachable through both
     // a Closing handle and the registry carries one lease and appears
     // once.
-    state.unresolved = state.kill_unresolved
-        .union_by_lease(state.control_procs.close_and_take());
+    state.fold_registry_into_unresolved();
+    // ^ close_and_take plus the lease-keyed union happen IN PLACE inside
+    //   supervisor state (take-with-rollback-on-unwind): neither the
+    //   taken registry contents nor the union input is ever the sole
+    //   owner across a panic point.
 
     // Disposition of children still unconfirmed (§ Unconfirmed
     // termination) is ONE locked operation: it takes the mode-upgrade
@@ -420,7 +430,10 @@ async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
     // the ceiling rather than inside it. An exit upgrade arriving AFTER
     // the commit receives the already-reinserted records back from
     // join_or_start as its late-exit claim (the Joined arm above).
-    teardown.dispose_locked(state.take_unresolved(), |final_mode, records| match final_mode {
+    // dispose_locked_adopting ADOPTS the survivor set under its own
+    // lock BEFORE any panic-prone work; an unwind inside the closure
+    // rolls the set back into supervisor state instead of dropping it.
+    teardown.dispose_locked_adopting(state, |final_mode, records| match final_mode {
         ShutdownMode::ProcessExit  => log_and_abandon(records),
         ShutdownMode::ServerRemains =>
             pool.reinsert_termination_pending(records), // atomic; waits restarted
