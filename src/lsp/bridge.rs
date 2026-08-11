@@ -128,6 +128,10 @@ mod tests {
                 &server_config,
                 &host_uri,
                 host_position,
+                Position {
+                    line: 5,
+                    character: 3,
+                },
                 "lua",
                 "region-0",
                 RegionOffset::new(3, 0),
@@ -163,6 +167,10 @@ mod tests {
                 &server_config,
                 &host_uri,
                 host_position,
+                Position {
+                    line: 3,
+                    character: 3,
+                },
                 "lua",
                 "region-0",
                 RegionOffset::new(3, 0),

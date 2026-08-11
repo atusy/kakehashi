@@ -15,8 +15,7 @@ use url::Url;
 use super::{ConnectionHandle, ConnectionHandleSender, LanguageServerPool, UpstreamId};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
-    host_position_within_region_bounds, region_host_end,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region_bounds,
 };
 
 /// Context provided to response transformers during bridge request execution.
@@ -33,14 +32,6 @@ pub(crate) struct BridgeResponseContext<'a> {
     pub host_uri_lsp: &'a Uri,
     /// The injection region offset for coordinate translation back to host space.
     pub offset: &'a RegionOffset,
-    /// The region's end-of-content in host coordinates
-    /// (`region_host_end(virtual_content, offset)`), when the dispatch path
-    /// already derived it — the position path computes it for the trailing
-    /// bound, and the formatting paths compute it for edit containment.
-    /// Deriving it is O(virtual_content), so transformers that need it reuse
-    /// this instead of recomputing per request. `None` on paths that never
-    /// derived it.
-    pub region_end: Option<Position>,
 }
 
 struct RequestHostLifecycle<'a> {
@@ -114,7 +105,6 @@ impl LanguageServerPool {
             build_request,
             transform_response,
             None,
-            None,
         )
         .await
     }
@@ -139,7 +129,6 @@ impl LanguageServerPool {
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
         downstream_id_probe: Option<&std::sync::OnceLock<RequestId>>,
-        region_end: Option<Position>,
     ) -> io::Result<T> {
         // Route all per-connection state by this handle's pool key
         // `(server_name, root)` rather than a separately-threaded server name,
@@ -266,7 +255,6 @@ impl LanguageServerPool {
             virtual_uri_string: virtual_uri.to_uri_string(),
             host_uri_lsp: &host_uri_lsp,
             offset,
-            region_end,
         };
 
         Ok(transform_response(response?, &context))
@@ -306,20 +294,23 @@ impl LanguageServerPool {
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
         host_position: Position,
+        region_end: Position,
         method: &'static str,
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
     ) -> io::Result<T> {
-        // The bound is SNAPSHOT-scoped, not wire-scoped: `virtual_content`
-        // and `offset` come from the preamble's document snapshot, while the
-        // open path (`ensure_document_opened`) deliberately substitutes the
-        // latest published content at enqueue time so later didChanges
-        // serialize behind a current didOpen. An edit landing between the
-        // snapshot and the enqueue can therefore still put this (validated)
-        // position past the content actually opened — the same in-flight
-        // staleness every LSP position request has, which downstream servers
-        // clamp. Closing it needs generation-bound opens (issue #996).
-        let region_end = region_host_end(virtual_content, offset);
+        // `region_end` is `region_host_end(virtual_content, offset)`, derived
+        // once per request by the fan-out (deriving it is O(virtual_content))
+        // and shared by every arm. The bound is SNAPSHOT-scoped, not
+        // wire-scoped: `virtual_content` and `offset` come from the
+        // preamble's document snapshot, while the open path
+        // (`ensure_document_opened`) deliberately substitutes the latest
+        // published content at enqueue time so later didChanges serialize
+        // behind a current didOpen. An edit landing between the snapshot and
+        // the enqueue can therefore still put this (validated) position past
+        // the content actually opened — the same in-flight staleness every
+        // LSP position request has, which downstream servers clamp. Closing
+        // it needs generation-bound opens (issue #996).
         if !host_position_within_region_bounds(host_position, offset, region_end) {
             if host_position.line < offset.line() {
                 // Line above the region → almost certainly stale region data
@@ -365,7 +356,6 @@ impl LanguageServerPool {
                 virtual_uri_string: virtual_uri.to_uri_string(),
                 host_uri_lsp: &host_uri_lsp,
                 offset,
-                region_end: Some(region_end),
             };
             return Ok(transform_response(
                 serde_json::json!({ "result": null }),
@@ -384,7 +374,6 @@ impl LanguageServerPool {
             build_request,
             transform_response,
             None,
-            Some(region_end),
         )
         .await
     }
@@ -396,6 +385,7 @@ mod tests {
     use crate::lsp::bridge::pool::ConnectionKey;
     use crate::lsp::bridge::pool::ConnectionState;
     use crate::lsp::bridge::pool::test_helpers::*;
+    use crate::lsp::bridge::protocol::region_host_end;
     use std::sync::Arc;
 
     fn start_observed_request(
@@ -427,7 +417,6 @@ mod tests {
                 },
                 |_, _| (),
                 Some(&request_probe),
-                None,
             )
             .await
         });
@@ -567,6 +556,7 @@ mod tests {
                     line: 0,
                     character: 0,
                 },
+                region_host_end("print('hello')", &RegionOffset::new(0, 0)),
                 "lua",
                 TEST_ULID_LUA_0,
                 RegionOffset::new(0, 0),
@@ -625,6 +615,7 @@ mod tests {
                     line: 2,
                     character: 0,
                 },
+                region_host_end("print('hello')", &RegionOffset::new(10, 0)),
                 "lua",
                 TEST_ULID_LUA_0,
                 RegionOffset::new(10, 0),
@@ -679,6 +670,7 @@ mod tests {
                     line: 10,
                     character: 1,
                 },
+                region_host_end("print('hello')", &RegionOffset::new(10, 4)),
                 "lua",
                 TEST_ULID_LUA_0,
                 RegionOffset::new(10, 4),
@@ -784,7 +776,6 @@ mod tests {
             virtual_uri_string: "file:///project/virtual.lua".to_string(),
             host_uri_lsp: &host_uri,
             offset: &offset,
-            region_end: None,
         };
         assert_eq!(ctx.virtual_uri_string, "file:///project/virtual.lua");
         assert_eq!(ctx.host_uri_lsp, &host_uri);

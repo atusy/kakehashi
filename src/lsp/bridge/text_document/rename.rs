@@ -21,8 +21,8 @@ use tower_lsp_server::ls_types::RenameParams;
 
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
-    build_text_document_position_params, region_host_end, response_has_jsonrpc_error,
-    strip_bridge_local_versions, transform_workspace_edit_to_host, workspace_edit_has_effect,
+    build_text_document_position_params, response_has_jsonrpc_error, strip_bridge_local_versions,
+    transform_workspace_edit_to_host, workspace_edit_has_effect,
     workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 
@@ -39,6 +39,7 @@ impl LanguageServerPool {
         server_config: &BridgeServerConfig,
         host_uri: &Url,
         host_position: Position,
+        region_end: Position,
         injection_language: &str,
         region_id: &str,
         offset: RegionOffset,
@@ -62,6 +63,7 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             host_position,
+            region_end,
             "textDocument/rename",
             |virtual_uri, request_id| {
                 build_rename_request(
@@ -74,11 +76,6 @@ impl LanguageServerPool {
                 )
             },
             |response, ctx| {
-                // The position dispatch derived region_end for the trailing
-                // bound; recompute only on the (unreachable here) None path.
-                let region_end = ctx
-                    .region_end
-                    .unwrap_or_else(|| region_host_end(virtual_content, ctx.offset));
                 transform_workspace_edit_response_to_host_bounded(
                     response,
                     &ctx.virtual_uri_string,

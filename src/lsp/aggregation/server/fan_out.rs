@@ -32,6 +32,10 @@ pub(crate) struct FanOutTask {
     pub(crate) region_id: String,
     pub(crate) offset: RegionOffset,
     pub(crate) virtual_content: String,
+    /// The region's end-of-content in host coordinates, derived ONCE per
+    /// request (deriving it is O(virtual_content)); every fan-out arm and the
+    /// dispatch bound reuse this value.
+    pub(crate) region_end: tower_lsp_server::ls_types::Position,
     pub(crate) upstream_id: Option<UpstreamId>,
     /// Bridge-minted `workDoneToken` to hand this downstream so its `$/progress`
     /// routes to the request's aggregator (ls-bridge-client-progress); `None`
@@ -100,6 +104,15 @@ where
     Fut: Future<Output = io::Result<T>> + Send + 'static,
 {
     let mut join_set = JoinSet::new();
+    // Derived once for the whole fan-out (O(virtual_content) — a per-arm
+    // recompute would rescan the region once per server).
+    let region_end = crate::lsp::bridge::region_host_end(
+        &ctx.resolved.virtual_content,
+        &RegionOffset::with_per_line_offsets(
+            ctx.resolved.region.line_range.start,
+            ctx.resolved.line_column_offsets.clone(),
+        ),
+    );
     for config in selected {
         let server_name = config.server_name.clone();
         let task = FanOutTask {
@@ -114,6 +127,7 @@ where
                 ctx.resolved.line_column_offsets.clone(),
             ),
             virtual_content: ctx.resolved.virtual_content.clone(),
+            region_end,
             upstream_id: ctx.upstream_request_id.clone(),
             client_progress_token: client_progress_tokens
                 .and_then(|m| m.get(&server_name).cloned()),

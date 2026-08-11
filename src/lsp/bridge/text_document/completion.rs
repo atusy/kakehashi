@@ -21,7 +21,7 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
-    region_host_end, response_has_jsonrpc_error, text_edit_safe_in_region,
+    response_has_jsonrpc_error, text_edit_safe_in_region,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -42,6 +42,7 @@ impl LanguageServerPool {
         server_config: &BridgeServerConfig,
         host_uri: &Url,
         host_position: Position,
+        region_end: Position,
         injection_language: &str,
         region_id: &str,
         offset: RegionOffset,
@@ -63,16 +64,12 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             host_position,
+            region_end,
             "textDocument/completion",
             |virtual_uri, request_id| {
                 build_completion_request(virtual_uri, host_position, &offset, request_id)
             },
             |response, ctx| {
-                // The position dispatch derived region_end for the trailing
-                // bound; recompute only on the (unreachable here) None path.
-                let region_end = ctx
-                    .region_end
-                    .unwrap_or_else(|| region_host_end(virtual_content, ctx.offset));
                 transform_completion_response_to_host(
                     response,
                     ctx.offset,

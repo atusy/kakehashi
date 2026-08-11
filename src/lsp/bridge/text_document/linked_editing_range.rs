@@ -35,6 +35,7 @@ impl LanguageServerPool {
         server_config: &BridgeServerConfig,
         host_uri: &Url,
         host_position: Position,
+        region_end: Position,
         injection_language: &str,
         region_id: &str,
         offset: RegionOffset,
@@ -56,6 +57,7 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             host_position,
+            region_end,
             "textDocument/linkedEditingRange",
             |virtual_uri, request_id| {
                 build_linked_editing_range_request(virtual_uri, host_position, &offset, request_id)

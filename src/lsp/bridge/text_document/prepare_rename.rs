@@ -18,7 +18,7 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
-    host_position_within_region_bounds, region_host_end, response_has_jsonrpc_error,
+    host_position_within_region_bounds, response_has_jsonrpc_error,
 };
 
 impl LanguageServerPool {
@@ -34,6 +34,7 @@ impl LanguageServerPool {
         server_config: &BridgeServerConfig,
         host_uri: &Url,
         host_position: Position,
+        region_end: Position,
         injection_language: &str,
         region_id: &str,
         offset: RegionOffset,
@@ -51,7 +52,6 @@ impl LanguageServerPool {
                 // enforces: a caret outside the region's content is not
                 // renameable-at-position, and a phantom DefaultBehavior would
                 // win preferred aggregation over real lower-priority results.
-                let region_end = region_host_end(virtual_content, &offset);
                 if !host_position_within_region_bounds(host_position, &offset, region_end) {
                     return Ok(None);
                 }
@@ -70,6 +70,7 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             host_position,
+            region_end,
             "textDocument/prepareRename",
             |virtual_uri, request_id| {
                 build_prepare_rename_request(virtual_uri, host_position, &offset, request_id)
