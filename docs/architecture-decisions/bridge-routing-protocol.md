@@ -312,8 +312,11 @@ equivalent stopped key. Canonicalization is admission-time work, and
 binding-driven *reuse* does not trust it forever: **every** binding-driven
 acquire or open — a retained-key retry, a restart's folder re-add, and
 the fast paths that find an already-live per-root handle or an
-already-announced folder — **re-canonicalizes** the retained URI and
-requires the result to **equal** the admission-time canonical URI
+already-announced folder — **re-canonicalizes** the retained
+**override-originated** URI (an ordinarily resolved root reuses
+verbatim — it is kakehashi's own value, per the binding's identity
+contract) and requires the result to **equal** the admission-time
+canonical URI
 (containment is not enough: a directory swapped for a symlink to a
 *sibling* inside the same trust root still canonicalizes elsewhere, and
 equality catches it where containment would not). A mismatch reads not
@@ -500,17 +503,22 @@ structures with different lifetimes carry the outcome:
   per (host document, layer, language), which servers were suppressed,
   which `ConnectionKey` each open landed on, and — for **every** shared
   routed/retained entry, override-driven or not — the effective
-  canonical folder(s) **selected for the route and persisted before the
-  acquire runs** (the override folders, or the ordinarily resolved
-  root; `retained` entries have folders even though their acquire
+  folder(s) **selected for the route and persisted before the acquire
+  runs** (`retained` entries have folders even though their acquire
   failed and nothing was announced), all stamped with the document's
-  open incarnation. An ordinarily resolved root entering a binding is
-  canonicalized on the same validation pool and budget as an override
-  folder — binding reuse demands equality with an admission-time
-  canonical URI, so the retained value must be canonical from the
-  start. Retaining the folder for non-override shared routes too
-  is what gives a restarted shared replacement a folder source for every
-  bound document; live resolution serves only tuples with no binding. The pending binding record is
+  open incarnation. The retained value's identity contract differs by
+  origin: an **override** folder is provider-supplied and retains its
+  admission-time canonical URI under the Trust Model's full
+  validation; an **ordinarily resolved** root is kakehashi's own value
+  and is retained **exactly as resolution produced it** — no
+  canonicalization, no directory requirement, no decision-budget
+  charge, and reuse compares it verbatim (a canonical filesystem
+  identity beside it is an optional hardening, not a requirement) —
+  so a fallback decision needs no filesystem work at all and non-`file:`
+  client roots remain representable. Retaining the folder for
+  non-override shared routes too is what gives a restarted shared
+  replacement a folder source for every bound document; live resolution
+  serves only tuples with no binding. The pending binding record is
   installed **synchronously in the `didOpen` handler (respectively the
   virtual-document creation path), before the open tasks are spawned
   and before the writer ticket is released** — installing it inside the
