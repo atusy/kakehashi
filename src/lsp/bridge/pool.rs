@@ -716,8 +716,19 @@ impl LanguageServerPool {
         for (key, handle) in connections.iter() {
             let follows_client_workspace = key.is_client_fallback();
             if !follows_client_workspace {
-                // Marker-owned and shared connections derive their folders
-                // from marker-root acquisition, not this client snapshot.
+                // Marker-owned connections derive their folders from the
+                // marker-root walk, not this client snapshot. A shared
+                // connection's folder set is acquisition-driven after spawn
+                // (roots join via `announce_shared_root`) — and when a
+                // marker-less acquisition spawned it, its INITIAL folders were
+                // seeded from the client snapshot of that moment. This loop
+                // deliberately does not keep that seed current: the set has
+                // one writer after spawn (acquisitions), and forwarding client
+                // changes would need per-folder provenance to avoid removing a
+                // folder a marker acquisition also claims. The accepted cost
+                // is that a client-seeded shared connection answers
+                // workspace-folder pulls from its initialize-time snapshot
+                // until marker roots join.
                 continue;
             }
             if handle.state() == ConnectionState::Initializing {
@@ -1364,12 +1375,13 @@ impl LanguageServerPool {
     /// Reconnect to the exact `(server, root)` a routing token names, with no
     /// document to re-resolve the root from (execute-command-routing-token).
     ///
-    /// Acquiring with `document_uri: None` would NOT do: `resolve_acquire`
-    /// answers a marker-less acquisition with the client-root fallback key, so a
-    /// marker-rooted or shared connection would be replaced by a client-rooted
-    /// process and the command would run in the wrong workspace. Passing the
-    /// decoded key straight to the resolved acquisition avoids that re-resolution
-    /// entirely.
+    /// Acquiring with `document_uri: None` would NOT do: for a non-opted-in
+    /// server `resolve_acquire` answers a marker-less acquisition with the
+    /// client-root fallback key — replacing a marker-rooted connection with a
+    /// client-rooted process — and for a `preferSharedInstance` server it
+    /// answers the shared key, which loses the marker root the token names
+    /// either way. Passing the decoded key straight to the resolved
+    /// acquisition avoids that re-resolution entirely.
     ///
     /// Returns `None` (fail soft, warn-logged) for a SHARED key: the marker
     /// roots a dead shared instance was serving died with its folder set, and
@@ -2226,7 +2238,6 @@ impl LanguageServerPool {
                 if handle.state() == ConnectionState::Ready
                     && !handle.supports_workspace_folder_changes() =>
             {
-                handle.log_incapable_fallback_once(server_name);
                 // Divert only a root the incapable connection does not already
                 // serve: its own spawn root stays on the shared key (it is
                 // already rooted and serving it), and a marker-less acquisition
@@ -2237,6 +2248,12 @@ impl LanguageServerPool {
                     .as_ref()
                     .is_some_and(|(_root, folder)| !handle.workspace_folders().contains(folder));
                 if needs_divert {
+                    // Log only when a fallback actually happens (matching the
+                    // wait_ready site): a served-root or marker-less
+                    // acquisition stays on the shared connection, and
+                    // announcing "falling back to per-root instances" for it
+                    // would describe a divert this session may never perform.
+                    handle.log_incapable_fallback_once(server_name);
                     per_root_key
                 } else {
                     shared_key
@@ -3825,6 +3842,52 @@ mod tests {
         assert!(
             Arc::ptr_eq(&result, &handle),
             "wait_ready must return the incapable shared connection for a rootless document"
+        );
+    }
+
+    /// The divert-TAKEN direction of the same post-Ready check, pinned at the
+    /// wait_ready level because only wait_ready can construct it: a
+    /// marker-rooted document optimistically routed to a still-Initializing
+    /// shared connection (resolve_acquire's catch-all arm) must be re-keyed to
+    /// its per-root connection once the shared handle comes up Ready WITHOUT
+    /// the workspaceFolders capability — the #391 protection. Without this
+    /// test, inverting the divert to "never divert" would open documents on an
+    /// incapable shared connection for roots it cannot announce, and no other
+    /// test would notice.
+    #[tokio::test]
+    async fn wait_ready_diverts_rooted_doc_when_shared_comes_up_incapable() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+
+        // The doc's per-root connection already exists and is Ready, so the
+        // divert lands on ReturnExisting rather than needing a spawn.
+        let per_root_key = pool.connection_key("lua", &config, Some(&doc));
+        let per_root = create_handle_with_key(ConnectionState::Ready, per_root_key).await;
+        pool.insert_connection(Arc::clone(&per_root)).await;
+
+        // The shared connection is mid-handshake at acquire time, so
+        // resolve_acquire routes to it optimistically...
+        let shared =
+            create_handle_with_key(ConnectionState::Initializing, ConnectionKey::shared("lua"))
+                .await;
+        pool.insert_connection(Arc::clone(&shared)).await;
+        // ...and it comes up Ready but incapable while wait_ready waits.
+        let shared_clone = Arc::clone(&shared);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            shared_clone
+                .set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+            shared_clone.set_state(ConnectionState::Ready);
+        });
+
+        let result = pool
+            .get_or_create_connection_wait_ready("lua", &config, Some(&doc), Duration::from_secs(2))
+            .await
+            .expect("the per-root connection is Ready; the divert needs no spawn");
+        assert!(
+            Arc::ptr_eq(&result, &per_root),
+            "a root the incapable shared connection does not serve must divert to its per-root connection"
         );
     }
 
