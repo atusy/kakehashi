@@ -577,11 +577,12 @@ fn find_injection_at_position<'a>(
 ///
 /// Node containment is half-open `[start, end)` (node-reference-protocol
 /// § Half-Open Intervals), and that stays the default. But caret-shaped
-/// methods (completion, signatureHelp, linkedEditingRange) fire with the
-/// insert-mode caret sitting *after* the last typed byte — for a region that
-/// ends mid-line (a vim `!cmd`, an embedded string) that caret is exactly the
-/// end byte, and a strict half-open lookup routes the request away from the
-/// injection the user is visibly typing in.
+/// methods (the `region_boundary_for_method` set: completion, signatureHelp,
+/// linkedEditingRange, onTypeFormatting) fire with the insert-mode caret
+/// sitting *after* the last typed byte — for a region that ends mid-line (a
+/// vim `!cmd`, an embedded string) that caret is exactly the end byte, and a
+/// strict half-open lookup routes the request away from the injection the
+/// user is visibly typing in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RegionBoundary {
     /// Strict half-open `[start, end)`: a cursor at the end byte is outside.
