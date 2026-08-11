@@ -600,4 +600,80 @@ mod tests {
             region_end,
         ));
     }
+
+    #[test]
+    fn bounds_compare_lexicographically_across_lines() {
+        // Multi-line region ending at (4, 2). A component-wise comparison
+        // (line <= end.line && character <= end.character) would wrongly
+        // reject any character above 2 on the earlier lines.
+        let offset = RegionOffset::new(2, 4);
+        let region_end = Position {
+            line: 4,
+            character: 2,
+        };
+        assert!(host_position_within_region_bounds(
+            Position {
+                line: 2,
+                character: 15,
+            },
+            &offset,
+            region_end,
+        ));
+        assert!(host_position_within_region_bounds(
+            Position {
+                line: 3,
+                character: 99,
+            },
+            &offset,
+            region_end,
+        ));
+        // Past the end on the end line itself.
+        assert!(!host_position_within_region_bounds(
+            Position {
+                line: 4,
+                character: 3,
+            },
+            &offset,
+            region_end,
+        ));
+    }
+
+    #[test]
+    fn bounds_compose_with_blockquote_prefix_offsets() {
+        // Blockquote: `> ` prefix width 2 on both virtual lines; region ends
+        // mid-line at (11, 8). The leading (per-line prefix) and trailing
+        // bounds must both hold.
+        let offset = RegionOffset::with_per_line_offsets(10, vec![2, 2]);
+        let region_end = Position {
+            line: 11,
+            character: 8,
+        };
+        // Inside the prefix on the end line: below the leading bound.
+        assert!(!host_position_within_region_bounds(
+            Position {
+                line: 11,
+                character: 1,
+            },
+            &offset,
+            region_end,
+        ));
+        // End-of-content: accepted, inclusive.
+        assert!(host_position_within_region_bounds(
+            Position {
+                line: 11,
+                character: 8,
+            },
+            &offset,
+            region_end,
+        ));
+        // One past the end: rejected.
+        assert!(!host_position_within_region_bounds(
+            Position {
+                line: 11,
+                character: 9,
+            },
+            &offset,
+            region_end,
+        ));
+    }
 }

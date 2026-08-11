@@ -186,7 +186,8 @@ fn test_lua_completion_at_caret_end_of_unclosed_fence() {
         }),
     );
 
-    // Caret after "print(" on line 3: character 6 == the region's end byte.
+    // Caret after "print(" on line 3: character 6 maps to the region's end
+    // byte (the document's last byte).
     let completion_response = poll_for_completions(
         &mut client,
         markdown_uri,
@@ -196,16 +197,15 @@ fn test_lua_completion_at_caret_end_of_unclosed_fence() {
         500, // delay_ms between attempts
     );
 
+    // The sibling test above passes under these same poll parameters, so
+    // lua-ls warm-up is not a plausible cause of a persistent null here — a
+    // null isolates the routing regression. (Error responses are retried
+    // away inside poll_for_lsp_result, so no separate error check is
+    // meaningful on the returned value.)
     let completion_response = completion_response.expect(
         "completion at the caret end of an unclosed fence must reach lua-ls \
          via the caret-end fallback; null means the request was routed away \
          from the injection",
-    );
-
-    assert!(
-        completion_response.get("error").is_none(),
-        "Completion should not return error: {:?}",
-        completion_response.get("error")
     );
 
     let result = completion_response

@@ -2641,6 +2641,63 @@ mod tests {
         assert_eq!(region.language, "python");
     }
 
+    /// NESTED regions sharing an end byte: the fallback scans in the same
+    /// sorted order as containment (start ascending), so the OUTERMOST region
+    /// wins — the tie-break the fallback comment and the ADR pin.
+    #[test]
+    fn caret_end_fallback_prefers_outermost_at_shared_end() {
+        let mut parser = create_rust_parser();
+        let text = "fn f(){}";
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+        // `parameters` "()" spans [4,6); its `)` child spans [5,6) — same end.
+        let outer = root.descendant_for_byte_range(4, 6).expect("parameters");
+        let inner = root.descendant_for_byte_range(5, 6).expect(") token");
+        assert_eq!(
+            outer.end_byte(),
+            inner.end_byte(),
+            "fixture must share the end"
+        );
+        assert!(
+            outer.start_byte() < inner.start_byte(),
+            "outer must start first"
+        );
+
+        // collect_all_injections sorts by (start, end, …) ascending — outer first.
+        let injections = vec![
+            InjectionRegionInfo {
+                language: "lua".to_string(),
+                content_node: outer,
+                pattern_index: 0,
+                include_children: false,
+                offset: None,
+                combined: false,
+                identity_slot: 0,
+            },
+            InjectionRegionInfo {
+                language: "python".to_string(),
+                content_node: inner,
+                pattern_index: 0,
+                include_children: false,
+                offset: None,
+                combined: false,
+                identity_slot: 0,
+            },
+        ];
+
+        let (_, region) = find_injection_at_position(
+            &injections,
+            6,
+            text.len(),
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("shared trailing edge resolves");
+        assert_eq!(
+            region.language, "lua",
+            "the outermost of the regions sharing the end byte must win"
+        );
+    }
+
     #[test]
     fn test_collect_all_injections_respects_lua_match_predicate() {
         // Regression test: #lua-match? is a general predicate (not built-in to tree-sitter).
