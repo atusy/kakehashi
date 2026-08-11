@@ -309,6 +309,15 @@ impl LanguageServerPool {
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
     ) -> io::Result<T> {
+        // The bound is SNAPSHOT-scoped, not wire-scoped: `virtual_content`
+        // and `offset` come from the preamble's document snapshot, while the
+        // open path (`ensure_document_opened`) deliberately substitutes the
+        // latest published content at enqueue time so later didChanges
+        // serialize behind a current didOpen. An edit landing between the
+        // snapshot and the enqueue can therefore still put this (validated)
+        // position past the content actually opened — the same in-flight
+        // staleness every LSP position request has, which downstream servers
+        // clamp. Closing it needs generation-bound opens (issue #996).
         let region_end = region_host_end(virtual_content, offset);
         if !host_position_within_region_bounds(host_position, offset, region_end) {
             if host_position.line < offset.line() {
