@@ -295,8 +295,9 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
     // graceful_deadline — wedged before, between, or after commit
     // points — is hard-aborted at the cutoff (not the final deadline),
     // closing the process registry; the escalation reserve always kills
-    // a CLOSED set and a child registered near expiry cannot outrun
-    // confirmed termination. Hard-abort is safe by commit-point
+    // a CLOSED set and a child registered near expiry cannot escape
+    // the escalation set (the kill attempt is what is guaranteed;
+    // confirmation remains the reaped wait). Hard-abort is safe by commit-point
     // atomicity (bridge-client-control-protocol). Escalation covers the
     // snapshot and every registered control process alike (no-op for
     // connections already Closed; a control-owned key contributing both
@@ -324,7 +325,12 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
     );
     // Only now — every control task terminated, finalized, and the live
     // process registry closed — may pool/router cleanup run; nothing can
-    // mutate registries or tombstones after it.
+    // mutate registries or tombstones after it. Disposition of children
+    // still unconfirmed here is mode-dependent (§ Unconfirmed
+    // termination): on the shutdown-request path, where the server stays
+    // alive awaiting exit, their records return to the pool ATOMICALLY
+    // with their waits restarted; only the process-exit path logs and
+    // abandons.
 }
 ```
 
@@ -382,9 +388,11 @@ async fn shutdown_router() {
     //    spawn time (kill-on-register once teardown begins). The
     //    registry covers EVERY process a control operation owns —
     //    reclaimed pre-existing servers included — and the seal also
-    //    quiesces the normal-service reaper, taking over in-progress
-    //    finalizations as teardown-run settlement work; the JoinSet
-    //    outlives the timed future, as in the sketch above
+    //    quiesces the normal-service reaper, takes over in-progress
+    //    finalizations as teardown-run settlement work, and transfers
+    //    existing termination-pending records; unresolved survivors
+    //    hand back per the sketch above. The JoinSet outlives the timed
+    //    future, as in the sketch above
     let (mut control_tasks, control_procs) = seal_and_take_control_operations();
 
     // 4. Shutdown all connections in parallel (snapshot AFTER both gates)
@@ -444,8 +452,9 @@ async fn shutdown_router() {
 - Prevents cache corruption from abrupt termination
 
 **Bounded Shutdown Latency:**
-- Global timeout bounds connection/process termination (local cleanup
-  falls outside the ceiling and needs no server cooperation)
+- Global timeout bounds the termination *attempt* — escalation and
+  ownership handling, not confirmed termination (local cleanup falls
+  outside the ceiling and needs no server cooperation)
 - Fail-fast disposal of pending and new operations prevents hang; on the
   graceful path the accepted write queue drains — the *amount* of work is
   queue-bounded, but each write can block on a full pipe if the
@@ -578,7 +587,8 @@ Skip synchronization, just send shutdown request whenever ready.
 
 **Process Management**: SIGTERM → SIGKILL pattern
 - SIGTERM allows graceful cleanup
-- SIGKILL guarantees termination (last resort)
+- SIGKILL is the last resort; delivery does not prove exit — confirmation
+  is the reaped `wait`
 
 ## Amendment History
 

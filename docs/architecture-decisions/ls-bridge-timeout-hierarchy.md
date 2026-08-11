@@ -67,7 +67,7 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 |----------|----------------|----------|
 | Normal operation (Phase 1) | Liveness | Reset on activity; `Ready` → `Failed` on timeout |
 | Normal operation (Phase 3) | Liveness, Per-request | Per-request bounds aggregation; Liveness detects hung servers |
-| Shutdown (any state) | Global only | All other timeouts (Init/Liveness/Per-request) STOP; global enforces termination |
+| Shutdown (any state) | Global only | All other timeouts (Init/Liveness/Per-request) STOP; global bounds the termination attempt |
 | Late response during shutdown | Global | ACCEPT until the connection closes or the deadline expires |
 
 **Key Interactions:**

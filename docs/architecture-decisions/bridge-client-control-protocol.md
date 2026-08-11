@@ -498,14 +498,17 @@ likewise proves nothing — never settles as closed: `stop` settles `stopFailed`
 **termination-pending record** that retains the kill handle, enumerates
 as `stopping`, blocks acquires and further control calls
 (`clientNotReady`), survives reload purges, joins teardown, and converts
-to the fenced retry tombstone only when `wait` returns. A replacement
+to the fenced retry tombstone only when `wait` returns `Ok` (an `Err`
+retains and retries the fenced record). A replacement
 must never spawn while the old process may still hold locks or sockets,
 and a later `restart` must never clear a tombstone that does not exist
 yet; a background task drives the pending `wait`s. This
-never-`Closed`-while-unconfirmed rule is a **steady-state** invariant —
-global teardown's final deadline instead logs and abandons the child to
-the OS, since the kakehashi process itself is ending
-(ls-bridge-graceful-shutdown). During teardown the termination
+never-`Closed`-while-unconfirmed rule is a **steady-state** invariant;
+global teardown's final deadline disposes by mode instead: on the
+process-exit path it logs and abandons the child to the OS, while a
+shutdown-request teardown that leaves the server alive awaiting `exit`
+atomically returns unresolved records to the pool with their waits
+restarted (ls-bridge-graceful-shutdown § Unconfirmed termination). During teardown the termination
 obligation transfers with the
 live process registry to the escalation phase, and finalization settles
 **records and pool state only** — no two paths ever kill or reap one
@@ -731,9 +734,11 @@ namespace.
   stop phase** (a reload can purge the `Closing` handle, leaving the
   registry as sole owner in either case), `starting` once a restart's
   respawn has begun. When a key has several owners, precedence is live handle >
-  stopped set > control registry, deduplicated to one row — except that a
-  `Closed` handle awaiting removal is ignored, so during that window the
-  registry's operation supplies the status (`Closed` deliberately has no
+  termination-pending record (`stopping`) > stopped set > control
+  registry, deduplicated to one row — a `Closed` handle awaiting removal
+  is ignored and falls through that same order, so a termination-pending
+  record answers `stopping` first and only then does the registry's
+  operation supply the status (`Closed` deliberately has no
   `Client.status` of its own).
 - The stopped set lives beside the pool's per-connection maps, keyed by
   `ConnectionKey`; the acquire path checks it — together with the
