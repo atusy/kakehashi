@@ -200,11 +200,12 @@ override's first element, checked after the truncation below. If either is
 stopped, the answer's entry for that server is discarded (the
 configuration-resolved stop wins; a provider cannot steer a document
 around a user's pin by naming a different root). Both checks run
-**inside the route-admission critical section** — realized by the
-acquire's own critical section for routed entries, and by the same pool
-lock for acquire-less suppressions — never as a separate
+**inside the acquire's own critical section**, never as a separate
 look-then-admit, which a concurrently committing `stop` could slip
-between — and the binding retains **both** keys, so
+between (suppression entries carry no key and skip the stopped check
+entirely — a suppression cannot steer around a stop, and deriving a
+key to check would cost a marker walk; their admission section
+revalidates generation and candidacy only) — and the binding retains **both** keys, so
 every later binding-driven acquire (the lazy open, the re-open sweep)
 re-checks both in its own critical section: a key stopped after
 admission makes the bound route not applicable, exactly as ordinary
@@ -239,7 +240,11 @@ A provider **cannot**:
 - resurrect a stopped slot (precedence above);
 - see `cmd`, `initializationOptions`, or `settings` (projection);
 - point a server at an arbitrary filesystem location. Each
-  `workspaceFolders` element must be a `file:`-scheme URI, and after
+  `workspaceFolders` element **that the mapping below will use** — all
+  of them for a shared instance, the first for a per-root server (the
+  ignored trailing elements are skipped unvalidated: they produce no
+  effect to validate, and validating them would spend filesystem work
+  on discarded data) — must be a `file:`-scheme URI, and after
   canonicalization (symlinks resolved, on both sides) it must lie **at or
   below** one of: a client-announced workspace folder, or the root
   kakehashi's own resolution produces for that (document, server) — the
@@ -604,11 +609,15 @@ structures with different lifetimes carry the outcome:
   *suppressed* settles when the answer applies — no acquire runs, but
   the settlement still commits inside a **route-admission critical
   section** under the same pool lock the acquires use, where the
-  both-key stopped check, the config-generation revalidation, and the
-  current-candidacy re-screen all run atomically with the commit
-  (uniform with routed entries, whose admission section is the
-  acquire's own — a stale suppression is never applied across a reload
-  either);
+  config-generation revalidation and the current-candidacy re-screen
+  run atomically with the commit (a stale suppression is never applied
+  across a reload either). Suppression admission deliberately runs
+  **no stopped-key check**: a suppression cannot resurrect or steer
+  around a `stop` — it only subtracts, and a stopped slot stays dark
+  either way — and deriving the key just to check it would cost a
+  marker walk after normalization, outside the decision's bounded
+  validation work; the both-key rule guards *routes*, whose admission
+  section is the acquire's own;
   *routed(key)* settles at that server's acquire commit, recording the
   key actually landed on (a capability-fallback downgrade records the
   downgraded per-root key); *retained(key)* settles when the decided
@@ -961,7 +970,8 @@ abnormal exit of one **open task** finalizes only that task's own
 still-running or already-decided shared flight. Entry finalization is
 by the stage the dead task reached, and it commits **through the same
 route-admission critical section as the live path** — the locked
-candidacy, generation, and both-key stopped checks included, so an
+candidacy and generation checks always, the both-key stopped check for
+route entries (suppressions skip it, as on the live path), so an
 abnormal exit cannot grandfather a directive a reload or `stop` has
 since rejected: a decided suppression commits as *suppressed*; a
 decided route settles *retained(key)* — later opens retry the key; a

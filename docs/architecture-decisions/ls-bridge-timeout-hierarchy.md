@@ -137,6 +137,10 @@ Global Shutdown overrides all (highest priority)
   routing deadline is the sole bound on these requests
 - Global teardown overrides: decisions waiting on provider handshakes
   resolve to the fallback immediately
+- Exception to the generic late-response rule above: routing requests'
+  entries are retired atomically on every terminal outcome of their
+  decision, so a late routing response is dropped, never accepted or
+  delivered
 - The binding-reuse validation budget composes as a **minimum**: the
   effective bound on a lazy-open/retry validation is min(its configured
   budget, the enclosing request's deadline — including Tier-1 once
