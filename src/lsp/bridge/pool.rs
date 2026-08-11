@@ -2239,12 +2239,13 @@ impl LanguageServerPool {
         }
         // A marker-less document (no marker root, non-file URI, no document
         // hint, or the `[]` kill switch) joins the shared instance too: it has
-        // no root to announce, but announcing is what NEW ROOTS need, not what
-        // admission needs — `announce_shared_root` no-ops on a `None` marker
-        // and the document simply opens on the shared connection. Keeping such
-        // documents on the client-root fallback (as this once did) forked a
-        // second server process whose session-wide state (e.g. a completion
-        // corpus of every open document) never met the shared instance's.
+        // no MARKER root to announce, and admission needs none —
+        // `announce_shared_root` announces the client root on its behalf when
+        // the editor supplied one, and the document opens on the shared
+        // connection either way. Keeping such documents on the client-root
+        // fallback (as this once did) forked a second server process whose
+        // session-wide state (e.g. a completion corpus of every open
+        // document) never met the shared instance's.
 
         let shared_key = ConnectionKey::shared(server_name);
         // Clone the shared handle out under the lock, then probe its capability
@@ -2309,10 +2310,16 @@ impl LanguageServerPool {
     /// Surfacing it as an error makes the acquire fail and retry, re-attempting
     /// the announce once the queue drains.
     ///
-    /// `Ok(())` no-op for per-root keys, marker-less acquisitions,
-    /// capability-less servers, or a root already in the set — including a
-    /// connection's own initialize-time root, so the first root never
-    /// re-announces.
+    /// A marker-less acquisition announces the CLIENT root in place of a
+    /// marker root (when the editor supplied one): such documents previously
+    /// lived on a client-rooted fallback process, and without this a shared
+    /// connection spawned under some marker root would receive didOpens for
+    /// documents outside every folder it was ever told about.
+    ///
+    /// `Ok(())` no-op for per-root keys, rootless sessions (no client root to
+    /// name), capability-less servers, or a root already in the set —
+    /// including a connection's own initialize-time root, so the first root
+    /// never re-announces.
     async fn announce_shared_root(
         &self,
         handle: &Arc<ConnectionHandle>,
@@ -2321,8 +2328,32 @@ impl LanguageServerPool {
         if !handle.key().is_shared() {
             return Ok(());
         }
-        let Some((_root, folder)) = marker else {
-            return Ok(());
+        // A marker-less acquisition still has a workspace to name: the CLIENT
+        // root. A real file with no marker up its tree (or the
+        // `workspaceMarkers = []` kill switch) previously landed on a
+        // client-rooted fallback process, and an editor scratch document
+        // belongs to the same session — so announce the client root on its
+        // behalf, and a shared connection spawned under some marker root does
+        // not receive didOpens for documents outside every folder it was ever
+        // told about. The set's path-normalized dedup makes this a no-op on a
+        // client-seeded connection (its initialize already listed the client
+        // root) and on every acquisition after the first.
+        let client_fallback;
+        let folder = match marker {
+            Some((_root, folder)) => folder,
+            None => {
+                let Some(fallback) = self
+                    .root_uri()
+                    .and_then(|root| Url::parse(&root).ok())
+                    .and_then(super::root_markers::workspace_at_root)
+                else {
+                    // The editor supplied no root at all: nothing to name,
+                    // and none is needed to open a document.
+                    return Ok(());
+                };
+                client_fallback = fallback;
+                &client_fallback.1
+            }
         };
         if !handle.supports_workspace_folder_changes() {
             return Ok(());
@@ -4212,6 +4243,87 @@ mod tests {
         // invalidation, and arming here would double-book the debt.
         pool.arm_reopen_if_key_changed(&registry_key, &registry_key);
         assert!(pool.pending_reopen.claim(&registry_key).is_none());
+    }
+
+    /// A marker-less acquisition announces the CLIENT root on a capable
+    /// shared connection: such documents previously lived on a client-rooted
+    /// fallback process, and without this a shared connection spawned under
+    /// some marker root would receive didOpens for documents outside every
+    /// folder it was ever told about. Dedup keeps it to one announce.
+    #[tokio::test]
+    async fn marker_less_acquisition_announces_the_client_root() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+
+        // Use the tmp marker root as the session's client root.
+        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+        let (client_root, client_folder) = marker.expect("tmp dir has a marker root");
+        pool.set_root_uri(Some(String::from(client_root)));
+
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        handle.set_server_capabilities(capable_workspace_folders_caps());
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        let cmdline = Url::parse("untitled://cmdline").unwrap();
+        let result = pool
+            .get_or_create_connection_wait_ready(
+                "lua",
+                &config,
+                Some(&cmdline),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("the capable shared connection is Ready");
+        assert!(Arc::ptr_eq(&result, &handle));
+        let folders = handle.workspace_folders().snapshot().unwrap_or_default();
+        assert!(
+            folders.iter().any(|folder| folder.uri == client_folder.uri),
+            "the client root must be announced on the marker-less acquisition's behalf"
+        );
+
+        // A second acquisition dedups: still exactly one folder.
+        pool.get_or_create_connection_wait_ready(
+            "lua",
+            &config,
+            Some(&cmdline),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("still Ready");
+        assert_eq!(handle.workspace_folders().snapshot().unwrap().len(), 1);
+    }
+
+    /// A rootless session (the editor supplied no root) has nothing to name:
+    /// the marker-less acquisition still succeeds, announcing nothing.
+    #[tokio::test]
+    async fn marker_less_acquisition_without_client_root_announces_nothing() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        handle.set_server_capabilities(capable_workspace_folders_caps());
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        let cmdline = Url::parse("untitled://cmdline").unwrap();
+        pool.get_or_create_connection_wait_ready(
+            "lua",
+            &config,
+            Some(&cmdline),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("a rootless session must still open the document");
+        assert!(
+            handle
+                .workspace_folders()
+                .snapshot()
+                .unwrap_or_default()
+                .is_empty(),
+            "nothing to announce without a client root"
+        );
     }
 
     /// Pins the user-visible limitation of shared-key routing: a routing token

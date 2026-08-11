@@ -58,11 +58,12 @@ client-root connection (the pre-#382 behavior).
 (`ConnectionKey::shared`, kept distinct from the client-root fallback) instead
 of one per marker root. Marker-less documents (non-file URIs such as an
 editor's `untitled:` scratch documents, files with no marker up the tree, or
-acquisitions with no document hint) join the shared instance too: they have no
-root to announce, and none is needed to open a document — keeping them on the
-client-root fallback would fork a second process whose session-wide state
-(e.g. a completion corpus over every open document) never meets the shared
-instance's. Root-JOINING is honored only when the downstream server advertises
+acquisitions with no document hint) join the shared instance too — the client
+root is announced on their behalf when the editor supplied one, so a shared
+connection spawned under some marker root still learns the workspace such
+documents belong to. Keeping them on the client-root fallback would fork a
+second process whose session-wide state (e.g. a completion corpus over every
+open document) never meets the shared instance's. Root-JOINING is honored only when the downstream server advertises
 `workspace.workspaceFolders.{supported, changeNotifications}`
 (`ConnectionHandle::supports_workspace_folder_changes`); the acquire path
 (`resolve_acquire`) checks the existing shared connection's capability and, if

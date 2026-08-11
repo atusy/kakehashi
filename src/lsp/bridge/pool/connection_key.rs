@@ -13,7 +13,8 @@
 //! marker found, or the `[]` kill switch) — such a document falls back to the
 //! single client-rooted connection, matching the pre-#382 behavior, unless the
 //! server opted into `preferSharedInstance` (#391), in which case it joins the
-//! shared instance (it has no root to announce, and none is needed to open).
+//! shared instance (the client root is announced on its behalf when the
+//! editor supplied one; admission itself needs no root).
 
 use std::fmt;
 

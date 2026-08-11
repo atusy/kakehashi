@@ -171,8 +171,8 @@ async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
     join one `Shared` connection via `workspace/didChangeWorkspaceFolders` (the
     `WorkspaceFolderSet`, defined in `workspace/folder_set.rs`, driven from
     `pool.rs`); marker-less documents (non-file URIs, no marker hit, no hint)
-    join it with no announcement at all — they have no root, and none is needed
-    to open a document. A shared connection that came up **without**
+    join it too, with the CLIENT root announced on their behalf when the
+    editor supplied one (they carry no marker root of their own). A shared connection that came up **without**
     `workspace.workspaceFolders.changeNotifications`
     (`supports_workspace_folder_changes`, static `InitializeResult` capabilities
     only — no dynamic `client/registerCapability` tracking) cannot take on a new
