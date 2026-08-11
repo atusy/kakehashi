@@ -278,6 +278,7 @@ Use standard library's `std::process` with one blocking OS thread per server rea
 - **[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)**: Server Pool Coordination (uses this I/O foundation for N servers)
 - **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Graceful Shutdown (uses shutdown signal from `select!`, adds LSP handshake and process cleanup)
 - **[ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md)**: Timeout Hierarchy (coordinates liveness timeout with other timeout systems)
+- **[bridge-routing-protocol](bridge-routing-protocol.md)**: Motivated the framing size ceilings amendment (its answer-allocation bound depends on them)
 
 ## Notes
 

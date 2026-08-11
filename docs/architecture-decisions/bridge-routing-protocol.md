@@ -5,7 +5,8 @@
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md) — the `ConnectionKey` model, per-root pooling, shared instances, and the workspace-folder capability fallback that a `workspaceFolders` override interacts with
 - [aggregation-priorities-wildcard](aggregation-priorities-wildcard.md) — the ordered-allowlist `priorities` semantics reused for provider selection
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — the `preferred` strategy whose fan-out/fan-in machinery this protocol dispatches
-- [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) — registers the routing decision deadline and the Tier-1/Tier-2 exemptions
+- [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) — registers the routing decision deadline, the binding-reuse validation budget, and the Tier-1/Tier-2 exemptions
+- [ls-bridge-async-connection](ls-bridge-async-connection.md) — the framing size ceilings (amended with this decision) that the answer-allocation bound depends on
 - [respawn-reopen-derives-its-targets](respawn-reopen-derives-its-targets.md) — the derived re-open, which consults only the active route binding
 - [wildcard-config-inheritance](wildcard-config-inheritance.md) — the inheritance resolution applied before the config projection goes on the wire
 - [host-document-bridge](host-document-bridge.md) — the `_self` layer whose `enabled` gate and aggregation entry govern host-document routing decisions
@@ -153,10 +154,13 @@ The result layers a "kakehashi decides" default at every granularity:
   treated as `null`; a well-typed entry whose `workspaceFolders` fails
   validation (below) is dropped whole (kakehashi decides for that server);
   an entry naming an unknown server is ignored. The answer is also
-  bounded *before* normalization: an implementation-defined cap on the
-  number of `routing` entries examined — beyond it the answer is
-  discarded whole as malformed (`null` + warn), so a provider cannot
-  make kakehashi walk unboundedly many entries it would only discard.
+  bounded *before* normalization: the number of `routing` entries
+  examined is capped at the size of the projection the query carried
+  (`languageServers`) — a discoverable-by-construction limit a complete
+  honest answer can never exceed, with unknown names consuming the same
+  budget — and an answer beyond it is discarded whole as malformed
+  (`null` + warn), so a provider cannot make kakehashi walk unboundedly
+  many entries it would only discard.
   The *allocation* bound cannot live at this layer — the frame is fully
   read before method dispatch — so a framing-level ceiling on
   downstream message size, with defined oversized-frame behavior, is
@@ -618,7 +622,9 @@ Decision-cache lifecycle:
     — so a flight re-anchors only when each advance since its anchor is
     a recorded Ready transition of a handle it awaited; any other
     cause, another provider's arrival or a workspace-folder change,
-    discards as usual;
+    discards as usual. Cause records are bounded, not session-long:
+    they are retained back to the oldest live flight's anchor and
+    pruned as flights settle;
   - an **incarnation** move (`didClose`, or close/re-open) **aborts**
     the waiting tasks outright — no `didOpen` is sent at all, and the
     incarnation is re-checked at the open's enqueue commit point, so an
@@ -1088,7 +1094,7 @@ a slot a routing provider left in play.
 | **Trust** | providers are trusted-by-configuration; folder overrides bounded to canonicalized `file:` URIs at-or-below client workspace folders or the config-resolved root, count-capped |
 | **Folders↔Key** | shared instance: union-only join; per-root: first element, rest warned+ignored; at most one connection per server name per document |
 | **Providers** | all spawnable configured servers ∩ advertising ∩ `Ready` (Initializing awaited only when the advertisement is known or the server is named), ordered by routing `priorities` (no `"_"` method-wildcard inheritance); concurrent fan-out, `preferred` fan-in, operative-entry rule |
-| **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy); expiry cancels pending requests, retires entries, falls open; exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
+| **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy, plus a separate binding-reuse validation budget); expiry cancels pending requests, retires entries, falls open; exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
 | **Caching** | decision cache per (host URI, layer, languageId, config generation), single-flight, evicted on `didClose`, flushed on reload / `Ready`-provider-set / workspace-folder-set change, (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until `didClose`; never retroactive |
 | **Cold start** | `forceStart` (post-config-publication get-or-create, marker-less fallback root shape, warm-up scope limited to shared/marker-less/policy servers) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
 | **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; re-open reads the binding only |
