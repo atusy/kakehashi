@@ -113,8 +113,42 @@ pub(crate) fn same_root_uri(a: &str, b: &str) -> bool {
     }
     let file_path = |s: &str| Url::parse(s).ok().and_then(|url| url.to_file_path().ok());
     match (file_path(a), file_path(b)) {
-        (Some(a), Some(b)) => a == b,
+        (Some(a), Some(b)) => same_file_path(&a, &b),
         _ => false,
+    }
+}
+
+/// Filesystem-path identity, platform-aware without touching the filesystem
+/// (`fs::canonicalize` would resolve symlinks and fail on paths that do not
+/// exist yet — both wrong for a root-identity question). On Windows the drive
+/// letter is case-folded (`C:\repo` and `c:\repo` decode from equally valid
+/// URL spellings of one directory); the rest of the path is compared verbatim
+/// — folding it wholesale would merge genuinely distinct directories on
+/// case-sensitive volumes, and the conservative failure direction here is the
+/// false NEGATIVE (a re-announce or an extra per-root process), never the
+/// false positive (two different roots treated as one).
+#[cfg(not(windows))]
+fn same_file_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b
+}
+
+#[cfg(windows)]
+fn same_file_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::path::{Component, Prefix};
+    let mut components_a = a.components();
+    let mut components_b = b.components();
+    match (components_a.next(), components_b.next()) {
+        (Some(Component::Prefix(prefix_a)), Some(Component::Prefix(prefix_b))) => {
+            let prefix_eq = match (prefix_a.kind(), prefix_b.kind()) {
+                (
+                    Prefix::Disk(drive_a) | Prefix::VerbatimDisk(drive_a),
+                    Prefix::Disk(drive_b) | Prefix::VerbatimDisk(drive_b),
+                ) => drive_a.eq_ignore_ascii_case(&drive_b),
+                (kind_a, kind_b) => kind_a == kind_b,
+            };
+            prefix_eq && components_a.eq(components_b)
+        }
+        _ => a == b,
     }
 }
 

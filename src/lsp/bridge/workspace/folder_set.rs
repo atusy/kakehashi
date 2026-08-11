@@ -174,9 +174,17 @@ mod tests {
     /// folders that marker walks later regenerate in canonical form.
     #[test]
     fn add_and_announce_swallows_an_equivalent_spelling_of_a_present_folder() {
-        let set = WorkspaceFolderSet::new(Some(vec![folder("file:///repo/x/")]));
+        // Build both spellings from a real platform path: a drive-less
+        // "file:///repo/x" literal would not decode to a file path on
+        // Windows, silently voiding the equivalence this test pins.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("x");
+        let slashed = url::Url::from_directory_path(&dir).unwrap(); // trailing slash
+        let plain = url::Url::from_file_path(&dir).unwrap(); // no trailing slash
+
+        let set = WorkspaceFolderSet::new(Some(vec![folder(slashed.as_str())]));
         let mut announced = false;
-        let committed = set.add_and_announce(folder("file:///repo/x"), || {
+        let committed = set.add_and_announce(folder(plain.as_str()), || {
             announced = true;
             true
         });
