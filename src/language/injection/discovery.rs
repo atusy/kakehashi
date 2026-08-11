@@ -2498,7 +2498,9 @@ mod tests {
             .is_none(),
             "a column-0 region end is the closing fence — the fallback must not fire"
         );
-        // Sanity: the last content byte still resolves half-open.
+        // Sanity: the last content byte still resolves under the fallback
+        // mode's half-open primary scan — the fallback must not break
+        // ordinary interior containment.
         assert!(
             InjectionResolver::resolve_at_byte_offset(
                 &coordinator,
@@ -2509,11 +2511,54 @@ mod tests {
                 &query,
                 fence_line_start - 1,
                 0,
-                RegionBoundary::HalfOpen,
+                RegionBoundary::CaretEndFallback,
             )
             .is_some(),
             "the newline before the fence is inside the region"
         );
+    }
+
+    /// A region ending with a trailing newline AT EOF (an unclosed block whose
+    /// last typed character was Enter): the caret on the file's empty last
+    /// line is still *inside* the unclosed injection — there is no closing
+    /// fence line for the column-0 rule to protect. The end-of-document
+    /// exception (mirroring the ADR's `b == L && e == L` rule) must let the
+    /// fallback fire.
+    #[test]
+    fn caret_end_fallback_resolves_trailing_newline_region_at_eof() {
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        // Unclosed fence; the document ends right after the newline the user
+        // just typed, so the content node ends at EOF, column 0.
+        let text = "```lua\nprint(\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &md_language,
+            r#"
+                ((fenced_code_block
+                   (info_string (language) @injection.language)
+                   (code_fence_content) @injection.content))
+            "#,
+        )
+        .expect("valid query");
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("caret_end_eof_newline");
+
+        let resolved = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            text.len(),
+            0,
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("the caret on the empty last line of an unclosed block resolves");
+        assert_eq!(resolved.region.language, "lua");
     }
 
     /// At an adjacency `end(A) == start(B)`, half-open containment (B) must
