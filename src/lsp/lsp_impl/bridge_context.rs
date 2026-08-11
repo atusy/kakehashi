@@ -71,22 +71,33 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
     )
 }
 
-/// Methods whose request position is the insert-mode caret, which sits *after*
-/// the last typed character — for an injection region ending mid-line that is
-/// exactly the region's end byte, outside the default half-open containment.
-/// These resolve with [`RegionBoundary::CaretEndFallback`] so typing at the
-/// tail of a `vim` `!cmd` or an embedded string still reaches the injected
-/// language's server. Point-shaped methods (hover, definition, …) keep strict
-/// half-open containment per node-reference-protocol § Half-Open Intervals.
+/// The region-boundary rule a method's position resolves under.
+///
+/// Caret-shaped methods — whose request position is the insert-mode caret,
+/// sitting *after* the last typed character — resolve with
+/// [`RegionBoundary::CaretEndFallback`]: for an injection region ending
+/// mid-line that caret is exactly the region's end byte, outside the default
+/// half-open containment, and strict resolution would route the request away
+/// from the injection the user is typing in (a `vim` `!cmd`, an embedded
+/// string). Point-shaped methods (hover, definition, documentHighlight, …)
+/// keep strict [`RegionBoundary::HalfOpen`] containment per
+/// node-reference-protocol § Half-Open Intervals.
+///
+/// This returns the boundary itself (rather than a boolean the caller
+/// branches on) so the unit test pins the exact value the preamble passes to
+/// resolution — there is no untested branch between the tested function and
+/// the resolve call.
 ///
 /// [`RegionBoundary::CaretEndFallback`]: crate::language::injection::RegionBoundary::CaretEndFallback
-fn method_accepts_region_end_position(method: &str) -> bool {
-    matches!(
-        method,
+/// [`RegionBoundary::HalfOpen`]: crate::language::injection::RegionBoundary::HalfOpen
+fn region_boundary_for_method(method: &str) -> crate::language::injection::RegionBoundary {
+    use crate::language::injection::RegionBoundary;
+    match method {
         "textDocument/completion"
-            | "textDocument/signatureHelp"
-            | "textDocument/linkedEditingRange"
-    )
+        | "textDocument/signatureHelp"
+        | "textDocument/linkedEditingRange" => RegionBoundary::CaretEndFallback,
+        _ => RegionBoundary::HalfOpen,
+    }
 }
 
 /// RAII sweep of the upstream-request registry for one request id: on drop,
@@ -779,11 +790,7 @@ impl Kakehashi {
             injection_query.as_ref(),
             byte_offset,
             snapshot.incarnation(),
-            if method_accepts_region_end_position(method_name) {
-                crate::language::injection::RegionBoundary::CaretEndFallback
-            } else {
-                crate::language::injection::RegionBoundary::HalfOpen
-            },
+            region_boundary_for_method(method_name),
         ) else {
             // Not in an injection region - return None
             return None;
@@ -2786,13 +2793,18 @@ mod tests {
     }
 
     #[test]
-    fn caret_shaped_methods_accept_region_end_position() {
+    fn caret_shaped_methods_resolve_with_caret_end_fallback() {
+        use crate::language::injection::RegionBoundary;
         for method in [
             "textDocument/completion",
             "textDocument/signatureHelp",
             "textDocument/linkedEditingRange",
         ] {
-            assert!(method_accepts_region_end_position(method), "{method}");
+            assert_eq!(
+                region_boundary_for_method(method),
+                RegionBoundary::CaretEndFallback,
+                "{method}"
+            );
         }
         // Point-shaped methods keep strict half-open containment.
         for method in [
@@ -2802,7 +2814,11 @@ mod tests {
             "textDocument/documentHighlight",
             "textDocument/rename",
         ] {
-            assert!(!method_accepts_region_end_position(method), "{method}");
+            assert_eq!(
+                region_boundary_for_method(method),
+                RegionBoundary::HalfOpen,
+                "{method}"
+            );
         }
     }
 
