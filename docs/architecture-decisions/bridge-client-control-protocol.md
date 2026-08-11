@@ -250,7 +250,7 @@ control-protocol failures; bridged LSP requests keep their existing
 | `clientStopped` | slot explicitly stopped; `restart` revives it |
 | `clientRestarting` | slot is mid-`restart`; retry after it returns |
 | `restartFailed` | the `restart` failed — in its stop phase before respawn, at spawn (missing or unspawnable command), during initialization, or at completion, when the ownership check found the replacement displaced (e.g. by a reload); the message names the cause |
-| `stopFailed` | a `stop` failed to reach a verified `Closed` — abnormal finalization (panic, cancellation) or termination unconfirmed at the per-slot deadline |
+| `stopFailed` | a `stop` failed to reach a verified `Closed` — abnormal sub-task outcome (panic, cancellation) or termination unconfirmed at the per-slot deadline |
 | `forwardFailed` | the inner message could not be handed to the connection (bounded writer full, send error); nothing was forwarded |
 | `connectionLost` | the connection died after the inner request was forwarded |
 | `malformedResponse` | the downstream answered with an invalid JSON-RPC response |
@@ -441,7 +441,10 @@ as any tombstone install (a server deleted mid-restart dissolves the id
 into `unknownClient` instead). Recovery is decided by **pool ownership at
 the completion transition**, which also covers a replacement a reload
 removed while still `Initializing`: a still-configured id never silently
-disappears.
+disappears. That is the **ownership-at-completion rule**, stated once: a
+key whose replacement is not pool-resident and `Ready` at the completion
+transition re-installs the fenced tombstone if its server is still
+configured, and dissolves into `unknownClient` if a reload deleted it.
 
 Neither `stop` nor `restart` is abortable mid-mutation: a
 `$/cancelRequest` for the outer request may fail it with
@@ -455,13 +458,15 @@ their sub-tasks (handshakes, kills, waits) within the deadline, and the
 escalation reserve covers every process the actor's state records. A
 wedged per-slot `stop` can therefore neither stall teardown, nor outlive
 it, nor mutate pool state after cleanup; the outer control request then
-fails per the disposal policy (ls-bridge-timeout-hierarchy § Per-Slot
-Control Shutdown).
+settles `stopFailed`/`restartFailed` per the settlement rules below
+(deadline shape: ls-bridge-timeout-hierarchy § Per-Slot Control
+Shutdown).
 
 The abort-safety story is short because the actor makes it so: **all
 lifecycle state effects happen inside the actor's message handling, which
-is serialized and non-suspending per message.** Sub-tasks own only a
-process handle and a reply channel — the writer's stdin handoff travels
+is serialized and non-suspending per message.** Sub-tasks own only what the transition hands them — a process handle,
+the connection's I/O endpoints for a handshake, a reply channel — and no
+lifecycle state; the writer's stdin handoff travels
 inside such a sub-task, so an aborted receiver returns the process to the
 actor as a completion message rather than losing it into a channel
 buffer — and a sub-task that dies (panic, cancellation, crash) is
@@ -478,8 +483,9 @@ answers `null` only after the verified-Ready completion transition and
 leave the caller pending, kill a committed replacement, or misreport
 success. One implementation precondition transfers unchanged from the
 earlier lock-based design: purge paths that today await while holding
-`connections` must move into actor transitions (or lose the await) before
-`restart` may adopt them.
+`connections` must become non-suspending actor transitions — any awaiting
+work moves into a sub-task that reports back — before `restart` may adopt
+them.
 
 Process termination has **exactly one owner: the actor.** Confirmation
 means exactly that `Child::wait` returned `Ok(ExitStatus)` — the one
@@ -521,9 +527,9 @@ and their waits (ls-bridge-graceful-shutdown § Unconfirmed termination).
   if unsettled); other request paths open their own documents and do not
   wait. Restoration is therefore an observable catch-up window: `restart`
   resolves at verified `Ready` (the completion transition above), the re-open
-  sweep runs after it, `documents` may
-  briefly under-report, and a pass-through request racing the sweep is —
-  like all pass-through — the caller's own risk.
+  sweep runs after it, `documents` may briefly under-report, and a
+  pass-through request racing the sweep is — like all pass-through — the
+  caller's own risk.
 - **A shared instance re-seeds; nothing is remembered.** A `#shared` key
   carries no root, and the old handle's accumulated folder set dies with
   it. Because no triggering document exists to resolve a marker root — the
@@ -549,7 +555,8 @@ and their waits (ls-bridge-graceful-shutdown § Unconfirmed termination).
   pool-coordination's existing capability fallback applies: subsequent
   acquires degrade to per-root connections and the restarted shared slot
   simply serves nothing new. One piece of routing metadata **is**
-  retained across the stopped, termination-pending, and control records:
+  retained across the stopped, termination-pending, and
+  in-flight-operation records:
   the shared slot's workspace-folder **capability verdict**, which that
   fallback consults. The live decision reads it from the `Ready` handle,
   and the handle dies with a stop — without the retained verdict,
@@ -645,8 +652,9 @@ namespace.
 - Nearly every mechanism is reuse: `ConnectionKey` routing,
   `forward_cancel_downstream`, the graceful-shutdown state machine, the
   ARM/CLAIM derived re-open. The genuinely new state is the **lifecycle
-  actor** and what it owns (the stopped set, termination-pending records,
-  per-key operation state, the per-connection shutdown timeout), plus the
+  actor**, its pool supervisor, and what the actor owns (the stopped set,
+  termination-pending records, per-key operation state, the
+  per-connection shutdown timeout), plus the
   in-flight pass-through id map, the per-handle `serverInfo`, the
   liveness classification on router pending entries, and the deny list.
 - Held ids survive restarts, so tooling built on the protocol needs no

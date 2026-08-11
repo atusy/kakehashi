@@ -90,7 +90,7 @@ Failed → Closed (skip LSP handshake)
 transitions to `Closed` for bookkeeping. What happens to the child
 depends on whether the kakehashi process is actually exiting:
 log-and-abandon applies **only on the process-exit path** (the `exit`
-notification, or teardown that ends the process). When `shutdown_all`
+notification, or teardown that ends the process). When a `Teardown(ServerRemains)`
 runs while the server stays alive — the LSP `shutdown` request is
 answered and the process then waits for `exit`, possibly indefinitely —
 ownership of every unconfirmed child is **retained**: its
@@ -135,8 +135,8 @@ abandoned, and its tracked requests fail exactly like pending responses.
 
 **Solution**: Three-phase shutdown coordination.
 
-> **Target design.** The sketches in this section (and § Shutdown Timeout
-> Policy / § Multi-Connection Shutdown below) record the protocol adopted
+> **Target design.** The sketches in this section (and § Lifecycle Actor /
+> § Multi-Connection Shutdown below) record the protocol adopted
 > alongside bridge-client-control-protocol. The current implementation
 > differs — a stop oneshot with `try_recv` drain, a separate writer
 > return channel, no per-connection handoff timeout — and converges as
@@ -230,7 +230,7 @@ it):**
 
 ### Shutdown Timeout Policy
 
-**Global timeout**: Implementation-defined duration (typically 5-15 seconds) bounding the termination *attempt* (escalation) across all connections. Ownership disposition and local cleanup (registries, router state) are lock-bounded local work needing no server cooperation; they run immediately after and fall outside the ceiling.
+**Global timeout**: Implementation-defined duration (typically 5-15 seconds) bounding the termination *attempt* (escalation) across all connections. Ownership disposition and local cleanup (actor state, router state) are non-suspending actor transitions needing no server cooperation; they run immediately after and fall outside the ceiling.
 
 **Best-Effort Parallel Shutdown:**
 All connections shut down in parallel under a single global ceiling. This is intentionally best-effort:
@@ -253,9 +253,16 @@ escalation reserve are owned by the actor's teardown state machine.
 
 **Decision**: one pool-owned **lifecycle actor** owns every lifecycle
 transition — per-slot `stop`/`restart` (bridge-client-control-protocol),
-pool teardown, spawn commits, respawn decisions, tombstones, and
-termination-pending records. Callers send messages and await replies;
-nothing else mutates lifecycle state.
+pool teardown, spawn commits, respawn decisions, tombstones,
+termination-pending records, and configuration-reload connection purges
+with their settings publication. Callers send messages and await replies;
+reads (enumeration, id resolution, acquire routing checks) go through a
+snapshot the actor publishes atomically per transition; nothing else
+mutates lifecycle state. The one deliberate boundary: per-connection
+*handshake* terminal commits (`Initializing → Ready/Failed/Closing`)
+remain the conditional compare-transitions ls-bridge-message-ordering
+§ Connection State Tracking defines — the actor's abort path wins or
+loses through that same conditional commit, never around it.
 
 This replaces the lock-based concurrent design an earlier revision of this
 section specified (see Alternative 4): instead of *handling* the races
@@ -264,8 +271,9 @@ machinery, serialization **removes** them by construction.
 
 **The actor loop never blocks.** Long operations — the LSP shutdown
 handshake, SIGTERM/SIGKILL escalation, `Child::wait` — run as spawned
-sub-tasks that own only a process handle and a reply channel and touch no
-shared state; each completion comes back to the actor as a message. A
+sub-tasks that own only what the transition hands them (a process handle,
+the connection's I/O endpoints for a handshake, a reply channel) and no
+lifecycle state; each completion comes back to the actor as a message. A
 multi-step operation (`restart` = stop phase → respawn → verify) is a
 small per-key state machine advanced by those messages, so every state
 mutation is atomic at message granularity and there is no lock to hold,
@@ -277,32 +285,52 @@ What the previous machinery bought, the actor gives structurally:
   messages; the second is answered from the key's current state
   (`clientRestarting`, `clientNotReady`, …). No registry, no guard to
   release, no half-mutated slot for a dropped handler to leave behind.
-- **No lease-owner map** — the actor is the only entity that signals or
-  waits a process. Sub-tasks it spawns are the delegation, tracked in its
-  own `JoinSet`; a "revoked claim" is just the actor not caring about a
-  stale reply message.
+- **No lease-owner map** — the actor is the only entity that spawns,
+  signals, or waits a process: because spawning itself is a non-suspending
+  actor transition, no child can come into existence behind an escalation
+  scan. Sub-tasks the actor spawns are the delegation, tracked in its
+  `JoinSet`; a "revoked claim" is just the actor ignoring a stale
+  completion message.
 - **Spawn commit is an actor transition** — the acquire path may use an
   existing `Ready` connection lock-free, but *creating* one goes through
   the actor, which checks the stopped set, termination-pending records,
-  and teardown sealing in-queue. An acquire can never race a committing
-  `stop` into spawning beside a tombstone.
-- **Teardown is a message** — `Teardown(mode)` seals admission (the actor
-  simply stops accepting spawn/control transitions), snapshots its own
-  state, and drives the parallel per-connection shutdowns as sub-tasks
-  under the absolute deadline (escalation reserve: ~20%,
-  ls-bridge-timeout-hierarchy). A second `Teardown` upgrades the mode
-  monotonically (`ProcessExit` dominates); every caller awaits one shared
-  completion watch, published only after cleanup.
-- **Abnormal outcomes settle in one place** — the actor observes its
-  sub-task `JoinSet`; a panicked or cancelled operation is a completion
-  message like any other, and the actor applies the
-  ownership-at-completion rules (bridge-client-control-protocol) to its
-  own state entry: settle the tombstone/ARM/replacement records, answer
-  the outer request (`stopFailed`/`restartFailed`), keep or convert the
-  termination-pending record. The actor task itself runs under the pool's
-  supervisor: if it panics, the supervisor restarts it and the new
-  incarnation re-derives from pool state and its mailbox — the same
-  derive-don't-remember posture as respawn-reopen-derives-its-targets.
+  in-flight operations, and teardown sealing in-queue. An acquire can
+  never race a committing `stop` into spawning beside a tombstone.
+- **Teardown is a message** — `Teardown(mode)` seals admission and drives
+  the parallel per-connection shutdowns as sub-tasks. Sealing means the
+  actor *answers differently*, not that it stops reading its queue: a
+  post-seal spawn commit fails the acquire, and a post-seal
+  `Stop`/`Restart` answers `clientNotReady` with
+  `data.status: "stopping"`. The budget is one absolute deadline with an
+  escalation reserve (~20%, ls-bridge-timeout-hierarchy): the graceful
+  phase runs to `deadline − reserve`, escalation gets the remainder, and
+  each `DeadlineExpired` token carries the operation generation it was
+  armed for — a token whose generation no longer matches is stale and
+  dropped. A second `Teardown` upgrades the mode monotonically
+  (`ProcessExit` dominates); the actor owns the single completion watch,
+  hands every caller a receiver, and publishes only after cleanup.
+- **Abnormal outcomes settle in one place** — the actor polls its
+  sub-task `JoinSet` alongside the mailbox, so a sub-task that panics
+  (and therefore never sends its completion) still surfaces as a
+  `join_next` result; the actor applies the ownership-at-completion rules
+  (bridge-client-control-protocol) to its own state entry: settle the
+  tombstone/ARM/replacement records, answer the outer request
+  (`stopFailed`/`restartFailed`), keep or convert the termination-pending
+  record.
+
+**The actor's state outlives the actor task.** `LifecycleState` and the
+sub-task `JoinSet` live in pool-owned storage handed to each incarnation,
+never in task locals — a panicking incarnation can drop neither the
+stopped set (which is precisely the record of keys *not* in the pool and
+so cannot be re-derived from it), nor termination-pending kill handles,
+nor in-flight `Child::wait`s. The pool's supervisor restarts the actor;
+the new incarnation resumes from that storage plus its mailbox, and
+re-derives only what pool state can supply (connection states) — the same
+derive-don't-remember posture as respawn-reopen-derives-its-targets. The
+one thing a dying incarnation *can* drop is a reply channel it was about
+to answer; the caller's closed receiver maps to `RequestFailed`
+(`stopFailed`/`restartFailed`), so settlement is at-most-once and no
+caller is ever left pending.
 
 **Sketch** (illustrative, target design):
 
@@ -316,17 +344,24 @@ enum LifecycleMsg {
     Stop { key: ConnectionKey, reply: Reply },
     Restart { key: ConnectionKey, reply: Reply },
     CommitSpawn { key: ConnectionKey, reply: Reply },   // acquire's spawn path
-    Teardown { mode: ShutdownMode, done: WatchTx },
-    SubTaskDone { key: ConnectionKey, outcome: Outcome }, // handshake/kill/wait results
-    DeadlineExpired { token: DeadlineToken },
+    Reload { generation: ConfigGeneration, reply: Reply },
+    Teardown { mode: ShutdownMode, reply: Reply<WatchRx> }, // actor owns the one watch
+    DeadlineExpired { token: DeadlineToken },           // generation-stamped
 }
 
-async fn lifecycle_actor(pool: Arc<ConnectionPool>, mut rx: Receiver<LifecycleMsg>) {
-    let mut state = LifecycleState::default(); // slots, tombstones, pending waits, teardown
-    while let Some(msg) = rx.recv().await {
-        // Every arm is non-suspending state mutation plus sub-task spawns;
-        // long I/O never runs inside the loop.
-        state.step(msg, &pool);
+async fn lifecycle_actor(pool: Arc<ConnectionPool>) {
+    // State and JoinSet are POOL-OWNED, handed to each incarnation —
+    // a panicking incarnation drops neither records nor in-flight waits.
+    let (mut rx, state, tasks) = pool.lifecycle_storage();
+    loop {
+        select! {
+            Some(msg) = rx.recv() => state.step(msg, &pool, tasks),
+            Some(done) = tasks.join_next() => state.settle(done, &pool),
+            // Every arm is non-suspending state mutation plus sub-task
+            // spawns; long I/O never runs inside the loop. A panicked
+            // sub-task never sends a completion message — join_next is
+            // how it still surfaces.
+        }
     }
 }
 ```
@@ -335,7 +370,6 @@ async fn lifecycle_actor(pool: Arc<ConnectionPool>, mut rx: Receiver<LifecycleMs
 serializing them costs nothing observable. The per-connection shutdown
 handshakes themselves still run in parallel as sub-tasks — the actor
 serializes *decisions*, not process I/O.
-
 
 ### Initialization Shutdown: Abort Immediately, No LSP Message
 
@@ -385,7 +419,7 @@ async fn shutdown_router(mode: ShutdownMode) {
     //    are all the actor's teardown state machine; router-specific
     //    resource cleanup runs inside its cleanup step, BEFORE
     //    completion is published, so no caller can resume around it.
-    lifecycle.teardown(mode).await;
+    pool.lifecycle().teardown(mode).await;
 }
 ```
 
@@ -539,9 +573,10 @@ upgrade.
 1. **Mechanism per race, forever**: every closed interleaving exposed the
    next one; ~20 review rounds added machinery without converging,
    because the concurrency the machinery serves is the problem
-2. **Weight mismatch**: the races' blast radius (a transient zombie, a
-   redundant signal to a dead pid, a slot wedged until restart) never
-   justified database-grade ownership transactions
+2. **Weight mismatch**: the residual risk left after serialization (a
+   transient zombie, a redundant signal to a dead pid, a slot wedged
+   until restart) never justified *dedicated* database-grade ownership
+   machinery on top
 3. **Foreign to the codebase**: kakehashi already solves this class with
    actors (parse actor, writer task, response router); a lock-and-lease
    subsystem would be the odd one out
@@ -552,8 +587,9 @@ upgrade.
 handling them; the observable contracts (single-flight answers,
 tombstone/termination-pending semantics, teardown mode upgrade,
 settlement of abnormal outcomes) survive unchanged as consequences of one
-queue. Latency is unaffected because only decisions serialize, not
-process I/O.
+queue. The actor and its supervisor are new code too — but one
+well-worn shape instead of five bespoke mechanisms — and latency is
+unaffected because only decisions serialize, not process I/O.
 
 ## Related Decisions
 

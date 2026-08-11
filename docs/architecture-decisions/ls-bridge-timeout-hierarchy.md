@@ -24,7 +24,7 @@ The async bridge architecture defines timeout systems across three decisions:
 
 1. **Initialization Timeout** (ls-bridge-async-connection): Bounds server initialization time during startup
 2. **Liveness Timeout** (ls-bridge-async-connection): Detects hung servers (unresponsive to pending requests)
-3. **Global Shutdown Timeout** (ls-bridge-graceful-shutdown): Bounds the shutdown termination attempt (escalation); ownership disposition and local cleanup are lock-bounded work outside the ceiling
+3. **Global Shutdown Timeout** (ls-bridge-graceful-shutdown): Bounds the shutdown termination attempt (escalation); ownership disposition and local cleanup run as actor transitions outside the ceiling
 4. **Per-Request Timeout** (ls-bridge-server-pool-coordination): Bounds user-facing latency for multi-server aggregation *[Phase 3 only]*
 
 ### The Problem
@@ -49,7 +49,7 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 **State-Based Gating:**
 - **Initialization timeout**: Only during `Initializing` state; disabled on shutdown
 - **Liveness timeout**: Only during `Ready` state with pending requests; disabled on shutdown
-- **Global shutdown**: Overrides all other timeouts (highest priority)
+- **Global shutdown**: Overrides all other timeouts (highest priority), including an in-flight per-slot control shutdown deadline (subsumed by `Teardown`)
 
 ### Phase 3 Addition: Per-Request Timeout (Tier 1)
 
@@ -67,7 +67,7 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 |----------|----------------|----------|
 | Normal operation (Phase 1) | Liveness | Reset on activity; `Ready` → `Failed` on timeout |
 | Normal operation (Phase 3) | Liveness, Per-request | Per-request bounds aggregation; Liveness detects hung servers |
-| Shutdown (any state) | Global only | All other timeouts (Init/Liveness/Per-request) STOP; global bounds the termination attempt |
+| Shutdown (any state) | Global only | All other timeouts (Init/Liveness/Per-request) STOP; an in-flight per-slot control shutdown is subsumed by the `Teardown` transition, its deadline superseded by the global one; global bounds the termination attempt |
 | Late response during shutdown | Global | ACCEPT until the connection closes or the deadline expires |
 
 **Key Interactions:**
@@ -106,9 +106,12 @@ Global Shutdown overrides all (highest priority)
 - This is not the rejected per-server teardown timeout: it bounds one
   user-initiated control operation while the rest of the pool keeps
   serving; pool teardown keeps the single global ceiling above
-- Precedence on overlap: global shutdown takes ownership of in-flight
-  control operations, and its deadline caps and force-kills whatever the
-  per-slot timeout has not finished
+- Precedence on overlap: `Teardown` is a message on the same
+  lifecycle-actor queue, so it is ordered against every in-flight control
+  transition by construction; from the teardown transition on, the global
+  deadline governs, and the escalation reserve force-kills whatever a
+  per-slot operation has not finished (ls-bridge-graceful-shutdown
+  § Lifecycle Actor)
 
 **Writer-Idle Timeout** (within the applicable shutdown deadline):
 - **Duration**: 2s fixed
