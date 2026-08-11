@@ -1957,7 +1957,7 @@ impl LanguageServerPool {
             // `resolve_acquire`'s pre-Ready probe applies.
             let needs_divert = marker
                 .as_ref()
-                .is_some_and(|(root, folder)| !incapable_shared_serves(&handle, root, folder));
+                .is_some_and(|(root, _folder)| !incapable_shared_serves(&handle, root));
             if needs_divert {
                 handle.log_incapable_fallback_once(server_name);
                 let remaining = timeout.saturating_sub(start.elapsed());
@@ -2201,12 +2201,13 @@ impl LanguageServerPool {
     /// [`resolve_marker_and_key`](Self::resolve_marker_and_key) (per-root/#382).
     /// For an opt-in server it returns the shared-instance key — UNLESS a shared
     /// connection already exists, is `Ready`, and did NOT advertise the
-    /// `workspaceFolders` capability. In that case kakehashi logs once and
-    /// degrades to per-root instances, so a misconfigured opt-in never wedges
-    /// the 2nd+ root on a server that ignores `didChangeWorkspaceFolders`. The
-    /// fallback keeps the shared connection's OWN spawn root on the shared key
-    /// (that connection is correctly rooted there and already serves it) and
-    /// diverts only *other* roots to per-root keys — yielding true per-root
+    /// folder-change capability. In that case kakehashi logs once and degrades
+    /// to per-root instances, so a misconfigured opt-in never wedges the 2nd+
+    /// root on a server that ignores `didChangeWorkspaceFolders`. The fallback
+    /// keeps every root the connection is already serving on the shared key —
+    /// its spawn root always, plus initialize-listed folders when the server
+    /// declared `workspaceFolders.supported` (see `incapable_shared_serves`) —
+    /// and diverts only *other* roots to per-root keys, yielding true per-root
     /// isolation rather than splitting one root across two processes.
     ///
     /// A still-initializing shared connection is treated optimistically as
@@ -2254,8 +2255,11 @@ impl LanguageServerPool {
         };
 
         let key = match shared_handle {
-            // A Ready shared connection that never advertised the capability
-            // can't take on new roots via didChangeWorkspaceFolders.
+            // A Ready shared connection that never advertised the
+            // folder-CHANGE capability can't take on new roots via
+            // didChangeWorkspaceFolders (it may still serve its
+            // initialize-listed folders; the divert proof below accounts
+            // for both).
             Some(handle)
                 if handle.state() == ConnectionState::Ready
                     && !handle.supports_workspace_folder_changes() =>
@@ -2268,7 +2272,7 @@ impl LanguageServerPool {
                 // opt-in exists to avoid.
                 let needs_divert = marker
                     .as_ref()
-                    .is_some_and(|(root, folder)| !incapable_shared_serves(&handle, root, folder));
+                    .is_some_and(|(root, _folder)| !incapable_shared_serves(&handle, root));
                 if needs_divert {
                     // Log only when a fallback actually happens (matching the
                     // wait_ready site): a served-root or marker-less
@@ -2671,10 +2675,13 @@ impl LanguageServerPool {
             settings_cell,
         ));
         handle.record_launch_config(server_config);
-        // The incapable-shared divert proves served-ness against this root,
-        // NOT against the folder set (which is the protocol snapshot and, for
-        // a client-seeded shared spawn, lists folders beyond the rootUri that
-        // an incapable server never promised to serve).
+        // The incapable-shared divert's baseline proof: the spawn root always
+        // counts as served, whatever the server declared about workspace
+        // folders. Initialize-listed folders widen the proof only for servers
+        // that declared workspaceFolders.supported (incapable_shared_serves);
+        // for anyone else the folder set is just the protocol snapshot, and a
+        // client-seeded shared spawn's snapshot lists folders beyond the
+        // rootUri that such a server never promised to serve.
         handle.record_spawn_root(root_uri.clone());
 
         // Insert into pool immediately so concurrent requests see Initializing state
@@ -3372,45 +3379,54 @@ impl LanguageServerPool {
     }
 }
 
-/// Served-root proof for the incapable-shared divert: whether `handle` — a
-/// Ready shared connection that will not act on `didChangeWorkspaceFolders` —
-/// is already serving the marker root `(root, folder)`.
-///
-/// Two tiers, by what the server itself declared:
-/// - `workspaceFolders.supported == true` (initial folders accepted, only the
-///   CHANGE notifications missing): every initialize-listed folder is served,
-///   so folder-set membership is the proof. The set cannot overstate it —
-///   additions after spawn are gated on the change capability this server
-///   lacks, so the set IS the initialize list.
-/// - no folder support at all: only the spawn root is guaranteed (told-at-
-///   initialize folders beyond the rootUri promise nothing), compared by
-///   filesystem path when both sides parse as file URLs so that trailing-slash
-///   or percent-encoding differences between a client-supplied root string and
-///   a marker walk's regenerated URL do not fake a mismatch (a false mismatch
-///   diverts — safe, but forks the very process the opt-in exists to avoid).
-fn incapable_shared_serves(
-    handle: &ConnectionHandle,
-    root: &Url,
-    folder: &tower_lsp_server::ls_types::WorkspaceFolder,
-) -> bool {
-    if handle.supports_initial_workspace_folders() {
-        return handle.workspace_folders().contains(folder);
-    }
-    let Some(spawn_root) = handle.spawn_root() else {
-        return false;
-    };
-    if spawn_root == root.as_str() {
+/// Whether `candidate` (a recorded spawn root or an initialize-listed folder
+/// URI) and `root` (a marker walk's regenerated URL) name the same workspace
+/// root: filesystem-path identity when both parse as file URLs, URI-text
+/// identity otherwise. A client-supplied string and a regenerated URL can
+/// spell the same directory with a trailing slash or different
+/// percent-encoding, and a textual mismatch diverts — safe, but forks the
+/// very process the opt-in exists to avoid.
+fn same_workspace_root(candidate: &str, root: &Url) -> bool {
+    if candidate == root.as_str() {
         return true;
     }
     match (
-        Url::parse(spawn_root)
+        Url::parse(candidate)
             .ok()
             .and_then(|url| url.to_file_path().ok()),
         root.to_file_path().ok(),
     ) {
-        (Some(spawn_path), Some(root_path)) => spawn_path == root_path,
+        (Some(candidate_path), Some(root_path)) => candidate_path == root_path,
         _ => false,
     }
+}
+
+/// Served-root proof for the incapable-shared divert: whether `handle` — a
+/// Ready shared connection that will not act on `didChangeWorkspaceFolders` —
+/// is already serving the marker root `root`.
+///
+/// The SPAWN root always proves service: the server initialized rooted there,
+/// whatever else it declared (this covers the rootUri-without-folders client
+/// shape even when the server claims folder support). Initialize-listed
+/// folders prove it ADDITIONALLY when the server declared
+/// `workspaceFolders.supported` — the set cannot overstate that list, because
+/// post-spawn additions are gated on the change capability this server lacks.
+/// Told-at-initialize folders prove nothing for a server that declared no
+/// folder support at all. All comparisons go through [`same_workspace_root`].
+fn incapable_shared_serves(handle: &ConnectionHandle, root: &Url) -> bool {
+    if handle
+        .spawn_root()
+        .is_some_and(|spawn_root| same_workspace_root(spawn_root, root))
+    {
+        return true;
+    }
+    handle.supports_initial_workspace_folders()
+        && handle
+            .workspace_folders()
+            .snapshot()
+            .unwrap_or_default()
+            .iter()
+            .any(|folder| same_workspace_root(folder.uri.as_str(), root))
 }
 
 #[cfg(test)]
@@ -3774,6 +3790,25 @@ mod tests {
         assert_eq!(handle.workspace_folders().snapshot(), Some(vec![marker]));
     }
 
+    /// Capabilities of a server that accepts initialize-supplied workspace
+    /// folders but ignores later change notifications — the middle tier of
+    /// the incapable-shared served-root proof.
+    fn supported_folders_without_change_notifications()
+    -> tower_lsp_server::ls_types::ServerCapabilities {
+        tower_lsp_server::ls_types::ServerCapabilities {
+            workspace: Some(tower_lsp_server::ls_types::WorkspaceServerCapabilities {
+                workspace_folders: Some(
+                    tower_lsp_server::ls_types::WorkspaceFoldersServerCapabilities {
+                        supported: Some(true),
+                        change_notifications: None,
+                    },
+                ),
+                file_operations: None,
+            }),
+            ..Default::default()
+        }
+    }
+
     fn shared_config() -> crate::config::settings::BridgeServerConfig {
         crate::config::settings::BridgeServerConfig {
             prefer_shared_instance: Some(true),
@@ -4025,18 +4060,7 @@ mod tests {
 
         let handle =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
-        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities {
-            workspace: Some(tower_lsp_server::ls_types::WorkspaceServerCapabilities {
-                workspace_folders: Some(
-                    tower_lsp_server::ls_types::WorkspaceFoldersServerCapabilities {
-                        supported: Some(true),
-                        change_notifications: None,
-                    },
-                ),
-                file_operations: None,
-            }),
-            ..Default::default()
-        });
+        handle.set_server_capabilities(supported_folders_without_change_notifications());
         handle
             .workspace_folders()
             .add_and_announce(folder_b, || true);
@@ -4047,6 +4071,67 @@ mod tests {
             key_b,
             ConnectionKey::shared("lua"),
             "an initialize-listed folder is served by a supported=true server: doc B stays"
+        );
+    }
+
+    /// The supported-folder tier goes through the same path-normalized root
+    /// comparison as the spawn root: an initialize-listed folder spelled with
+    /// a trailing slash still proves the marker walk's slash-less root.
+    #[tokio::test]
+    async fn supported_tier_matches_initial_folders_by_path_not_uri_text() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+
+        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+        let (root, folder) = marker.expect("doc sits under a marker root");
+
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        handle.set_server_capabilities(supported_folders_without_change_notifications());
+        let slashed = tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: format!("{}/", root.as_str().trim_end_matches('/'))
+                .parse()
+                .expect("trailing-slash spelling still parses"),
+            name: folder.name,
+        };
+        handle
+            .workspace_folders()
+            .add_and_announce(slashed, || true);
+        pool.insert_connection(handle).await;
+
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
+        assert_eq!(
+            key,
+            ConnectionKey::shared("lua"),
+            "the same directory spelled with a trailing slash is the same served folder"
+        );
+    }
+
+    /// The spawn root proves service in EVERY tier: a supported=true server
+    /// whose initialize listed no folders at all (the rootUri-only client
+    /// shape) still keeps its spawn root's documents aboard — folder support
+    /// widens the proof, it must not replace it.
+    #[tokio::test]
+    async fn supported_tier_still_honors_the_spawn_root() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+
+        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+        let own_root = marker.expect("doc has a marker root").0;
+
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        handle.set_server_capabilities(supported_folders_without_change_notifications());
+        handle.record_spawn_root(Some(String::from(own_root)));
+        pool.insert_connection(handle).await;
+
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
+        assert_eq!(
+            key,
+            ConnectionKey::shared("lua"),
+            "an empty initialize folder list must not erase the spawn-root proof"
         );
     }
 

@@ -33,20 +33,13 @@ use crate::lsp::bridge::protocol::{
 };
 use crate::lsp::bridge::workspace::WorkspaceFolderSet;
 
-/// Whether `caps` advertises everything the shared-instance opt-in (#391)
-/// needs to drive one connection across roots via
-/// `workspace/didChangeWorkspaceFolders`: `workspace.workspaceFolders` with
-/// `supported == true` AND `changeNotifications` set to a value other than the
-/// explicit `false` (either `true` or a registration id string). Anything
-/// missing or `Left(false)` means the server will not act on folder-change
-/// notifications, so the bridge must keep it on per-root instances.
 /// Whether `caps` advertises `workspace.workspaceFolders.supported == true` —
 /// the server accepts the folders supplied at `initialize`, whether or not it
 /// also acts on later `didChangeWorkspaceFolders` (that stricter question is
 /// [`supports_workspace_folder_changes`]). The incapable-shared divert uses
-/// this to decide what counts as served-root proof: initialize-listed folders
-/// for a server that declared it supports them, the spawn root alone
-/// otherwise.
+/// this to widen its served-root proof: the spawn root always proves service,
+/// and initialize-listed folders prove it additionally for a server that
+/// declared it supports them.
 pub(crate) fn supports_initial_workspace_folders(caps: &ServerCapabilities) -> bool {
     caps.workspace
         .as_ref()
@@ -54,6 +47,13 @@ pub(crate) fn supports_initial_workspace_folders(caps: &ServerCapabilities) -> b
         .is_some_and(|folders| folders.supported == Some(true))
 }
 
+/// Whether `caps` advertises everything the shared-instance opt-in (#391)
+/// needs to drive one connection across roots via
+/// `workspace/didChangeWorkspaceFolders`: `workspace.workspaceFolders` with
+/// `supported == true` AND `changeNotifications` set to a value other than the
+/// explicit `false` (either `true` or a registration id string). Anything
+/// missing or `Left(false)` means the server will not act on folder-change
+/// notifications, so the bridge must keep it on per-root instances.
 pub(crate) fn supports_workspace_folder_changes(caps: &ServerCapabilities) -> bool {
     let Some(folders) = caps
         .workspace

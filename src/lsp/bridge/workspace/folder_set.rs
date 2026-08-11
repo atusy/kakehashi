@@ -71,11 +71,12 @@ impl WorkspaceFolderSet {
             .recover_poison("WorkspaceFolderSet::replace") = Self::deduplicate(folders);
     }
 
-    /// Whether a folder with `folder`'s URI is already in the set. Serves as
-    /// the incapable-shared divert's served-root proof for servers that
-    /// declared `workspaceFolders.supported` (initialize-listed folders are
-    /// accepted); production membership checks during announce live inside
-    /// `add_and_announce`'s atomic section.
+    /// Whether a folder with `folder`'s URI is already in the set. Test-only:
+    /// the incapable-shared divert compares path-normalized roots against
+    /// `snapshot()` (raw URI equality would fake mismatches), and production
+    /// membership checks during announce live inside `add_and_announce`'s
+    /// atomic section.
+    #[cfg(test)]
     pub(crate) fn contains(&self, folder: &WorkspaceFolder) -> bool {
         self.inner
             .lock()
