@@ -140,11 +140,12 @@ Global Shutdown overrides all (highest priority)
 - The binding-reuse validation budget composes as a **minimum**: the
   effective bound on a lazy-open/retry validation is min(its configured
   budget, the enclosing request's deadline — including Tier-1 once
-  Phase 3 lands — and the global shutdown ceiling); an upstream
-  cancellation that leaves a job with no remaining waiter **removes it
-  from the queue while still queued** (no permit is ever spent on work
-  nobody wants), and only a job whose filesystem call is already
-  running keeps its permit until the call returns, its result discarded
+  Phase 3 lands — and the global shutdown ceiling); **any** last-waiter
+  departure — upstream cancellation, a lazy/retry or sweep budget
+  expiring, teardown — removes a still-queued job from the queue (no
+  permit is ever spent on work nobody wants), and only a job whose
+  filesystem call is already running keeps its permit until the call
+  returns, its result discarded
 
 **Writer-Idle Timeout** (within the applicable shutdown deadline):
 - **Duration**: 2s fixed

@@ -473,14 +473,14 @@ candidates at all likewise queries nothing.
   waiting for answers that may never come, JSON object order confers
   nothing, and `"*"` fan-in's earliest-arrival semantics are untouched
   (this order governs validation admission only). The canonical key
-  orders jobs **within one decision**; the shared pool arbitrates
-  **across** decisions — and the binding-reuse validations, which have
-  no provider or position and form their own queue — by fair
-  round-robin over the per-decision queues. The queue bound is
-  **global** — one implementation-defined cap on queued jobs across
-  all decisions and the reuse queue, with the per-decision structure
-  only ordering fairness beneath it — and a refusal at either level
-  reads as that entry's capacity drop. "Arrival" for fan-in
+  orders jobs **within one decision**; the shared pool arbitrates by
+  fair round-robin over the full queue set — every per-decision queue
+  **plus** the binding-reuse queue (whose jobs have no provider or
+  position) as one more member of the rotation. The queue bound is
+  **global**: one implementation-defined cap on queued jobs across the
+  whole set, with the queue structure only ordering fairness beneath
+  it, and the cap is the single refusal point — an enqueue that finds
+  it full is refused, which reads as that entry's capacity drop. "Arrival" for fan-in
   purposes is **completed normalization**, not raw receipt: an answer
   becomes eligible as a whole once every entry has validated or
   dropped — a suppression-only answer normalizes instantly and so
