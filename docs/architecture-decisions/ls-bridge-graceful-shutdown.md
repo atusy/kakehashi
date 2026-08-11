@@ -253,9 +253,13 @@ async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
     // below) always runs in a POOL-OWNED task spawned by the first
     // join_or_start — never inline in a caller's request future — so a
     // cancelled or panicking caller cannot drop adopted tasks or
-    // process leases mid-teardown, and a panicking owner task completes
-    // the run AS FAILED, releasing every joiner instead of wedging
-    // them. Every caller, starter included, is a joiner:
+    // process leases mid-teardown. The pool-owned task runs the body
+    // under a PANIC GUARD (supervisor): on an owner panic the guard
+    // aborts and joins the adopted tasks, recovers process leases,
+    // performs mode-aware disposition and cleanup itself, and only then
+    // publishes completion AS FAILED — joiners are released with
+    // ownership settled, never around it. Every caller, starter
+    // included, is a joiner:
     let Joined { late_exit_claim, completion } =
         pool.teardown_run().join_or_start(mode, now);
 
@@ -266,12 +270,17 @@ async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
     // there); completion is published only after cleanup, so an
     // exiting caller can never terminate around it.
     log_and_abandon(late_exit_claim);
-    completion.await;
+    if let Err(failure) = completion.await {
+        // Failed completion means the panic guard settled ownership and
+        // ran disposition/cleanup on the owner's behalf; surface it so
+        // a failed teardown is distinguishable from success.
+        log::error!("bridge teardown completed as failed: {failure}");
+    }
 }
 
 // The owner body, spawned once per run into a pool-owned task by
-// join_or_start:
-async fn teardown_body(teardown: TeardownRun, pool: &ConnectionPool) {
+// join_or_start (owned Arc — a 'static spawn cannot borrow the pool):
+async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
     let deadline = teardown.deadline;      // = starter's now + GLOBAL_TIMEOUT
     let graceful_deadline = teardown.graceful_deadline;
 
