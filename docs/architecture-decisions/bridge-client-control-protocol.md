@@ -292,8 +292,10 @@ type OpenDocument = {
   initialization; only capabilities are load-bearing). A slot that is not
   `running` fails with `clientStopped`/`clientNotReady` instead, so "no
   usable `serverInfo`" and "no live connection" never blur.
-- `serverCapabilities` returns the downstream's static
-  `InitializeResult.capabilities` verbatim as `static`, plus the
+- `serverCapabilities` returns as `static` the bridge-retained,
+  normalized capabilities — the typed subset the initialize parser kept
+  (malformed fields dropped under its tolerance policy), deliberately
+  *not* a byte-for-byte reproduction of the announcement — plus the
   bridge's record of currently active dynamic registrations
   (`client/registerCapability`, minus later unregistrations) as
   `dynamic`. This is what makes the pass-through escape hatch

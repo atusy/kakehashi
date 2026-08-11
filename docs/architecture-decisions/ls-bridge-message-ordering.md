@@ -229,6 +229,13 @@ enum ConnectionState {
 | `Closing` | (graceful or timeout) | `Closed` |
 | `Closing` | panic | `Closed` |
 
+The timeout and panic rows mark the **handle** `Closed` unconditionally —
+that is connection-object bookkeeping. Slot-level termination
+confirmation is tracked separately: when the process is unconfirmed, a
+termination-pending record keeps the *slot* at `stopping` even though the
+handle reads `Closed` (bridge-client-control-protocol; enumeration
+ignores `Closed` handles and lets the record answer).
+
 `Failed` handles stay pool-resident — addressable and enumerable — until a
 later acquire replaces them or cleanup/shutdown closes them;
 bridge-client-control-protocol relies on that residency for its `failed`
@@ -253,12 +260,16 @@ Operations are gated at two levels: **server lifecycle** and **document lifecycl
   - `Closing` → `REQUEST_FAILED` ("bridge: connection closing") [See ls-bridge-graceful-shutdown]
   - `Closed` → `REQUEST_FAILED` ("bridge: connection closed")
 - **Notifications**: Accepted by writer loop in `Initializing` or `Ready` state only
-  - During `Initializing`, acceptance means QUEUED, not sent: only
-    handshake-owned traffic reaches the wire until `initialized` has been
-    written — LSP forbids the client any other request or notification
-    before the initialize response — and the `Initializing → Ready`
-    transition commits atomically with the `initialized` enqueue, so
-    held traffic can never overtake it (bridge-client-control-protocol)
+  - During `Initializing`, accepted notifications enter a **pre-ready
+    holding queue**, separate from the wire FIFO — a strict single FIFO
+    could not reorder traffic accepted before the initialize response
+    behind the later `initialized`. Only handshake-owned traffic reaches
+    the wire until `initialized` has been written (LSP forbids the
+    client any other request or notification before the initialize
+    response); the holding queue is flushed into the FIFO, in arrival
+    order, only after the `initialized` enqueue — which commits
+    atomically with `Initializing → Ready`
+    (bridge-client-control-protocol)
   - `Closing`/`Closed` → DROP (writer loop stopped, see ls-bridge-graceful-shutdown)
   - Subject to document lifecycle gating below
 

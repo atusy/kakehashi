@@ -484,7 +484,8 @@ Shutdown signal arrives
 ├─ Transition: Initializing → Closing
 ├─ Fail pending initialization request (if sent)
 ├─ Kill process (SIGTERM → SIGKILL) — no shutdown request, no exit notification
-└─ Transition: Closing → Closed
+└─ Transition: Closing → Closed (handle bookkeeping; per-slot slot status
+   stays `stopping` via a termination-pending record until wait returns Ok)
 ```
 
 **Rationale:**
