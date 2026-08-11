@@ -27,7 +27,7 @@ The async bridge architecture defines timeout systems across several decisions:
 3. **Global Shutdown Timeout** (ls-bridge-graceful-shutdown): Bounds the shutdown termination attempt (escalation); ownership disposition and local cleanup run as actor transitions outside the ceiling
 4. **Per-Request Timeout** (ls-bridge-server-pool-coordination): Bounds user-facing latency for multi-server aggregation *[Phase 3 only]*
 5. **Per-Slot Control Shutdown Timeout** (bridge-client-control-protocol): Bounds a single-slot `stop`/`restart` (see the dedicated section below)
-6. **Routing Decision Deadline** (bridge-routing-protocol): Bounds one routing decision — provider fan-out plus initialization waits (see the dedicated section below)
+6. **Routing Decision Deadline** (bridge-routing-protocol): Bounds one routing decision — provider fan-out, initialization waits, and answer normalization (see the dedicated section below)
 7. **Binding-Reuse Validation Budget** (bridge-routing-protocol): Bounds the *caller's wait* on filesystem revalidation along binding-driven reuse paths — capped by the sweep's remaining budget on re-open sweeps, a dedicated implementation-defined budget on lazy-open/retry paths, and the global shutdown ceiling always. It does not bound the underlying OS call or its worker permit, which may outlive every deadline (the permit returns only when the call does)
 
 ### The Problem
@@ -126,7 +126,8 @@ Global Shutdown overrides all (highest priority)
 - On expiry the pending provider requests are cancelled
   (`$/cancelRequest`) and retired, unfinished folder entries drop
   per-entry, and fan-in runs over the normalized results that exist;
-  the whole fallback is synthesized only when nothing operative arrived
+  the whole fallback is synthesized only when no operative normalized
+  result remains
 - Routing requests are excluded from Tier-2 liveness accounting (same
   per-entry classification as pass-through): they carry their own
   deadline, and a slow provider must never drive a `Ready` connection to
@@ -165,7 +166,7 @@ Global Shutdown overrides all (highest priority)
 
 ### Neutral
 
-- **LSP compliant**: Request timeouts trigger explicit error responses, not silent hangs (the routing decision deadline is the exception by design — it falls open to kakehashi-decided routing with a warning, never an upstream error)
+- **LSP compliant**: Request timeouts trigger explicit error responses, not silent hangs (the routing decision deadline is the exception by design — expiry resolves the decision from partial results, or kakehashi-decided routing when no operative normalized result remains, with a warning and never an upstream error)
 
 ## Alternatives Considered
 

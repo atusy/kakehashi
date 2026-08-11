@@ -461,10 +461,16 @@ candidates at all likewise queries nothing.
   normalization produced by the deadline. Folder-entry validations
   launch **concurrently** onto the pool (admission is FIFO per
   decision), so one blocked entry cannot serially starve later entries
-  of the deadline, and no JSON object order becomes an accidental
-  priority. Whole-answer discard is reserved for an answer that never
-  arrived, never deserialized, or failed the structural bounds (the
-  entry cap). For routing the predicate is: the `routing` map
+  of the deadline. Admission order is canonical — entries enqueue in
+  server-name order, not JSON object order — and the non-starvation
+  claim is scoped honestly: concurrency removes *serial* dependency
+  between entries, while pool *capacity* can still gate them (a hung
+  validation retains its permit), in which case entries denied
+  capacity within budget drop per the capacity rule. Within
+  normalization, whole-answer discard is reserved for an answer that
+  never arrived, never deserialized, or failed the structural bounds
+  (the entry cap); application-anchor invalidation (the triple-anchor
+  rules) is its own, later discard path. For routing the predicate is: the `routing` map
   holds at least one operative entry, per the operative rule above.
   `null`, `{ routing: {} }`, an entry with no fields, an error response,
   a timeout, and a malformed answer all mean "no opinion" and fall
@@ -827,7 +833,8 @@ make synchronous metadata calls that a network or automounted path can
 stall) — runs off the async executor on a **globally bounded validation
 pool** (a semaphore with a
 bounded queue), charged against the caller's remaining budget; at the
-deadline the decision falls open and the orphaned blocking call's result
+deadline the affected entry drops (per-entry, as normalization defines)
+and the orphaned blocking call's result
 is discarded — the *decision's* latency stays bounded even where an OS
 filesystem call (a network mount, an automount) cannot be cancelled and
 outlives it detached, and a hanging mount can pin at most the pool,
@@ -867,14 +874,20 @@ requires for its detached operations: an abnormal exit — panic or
 abort — CAS-settles the exact flight to the fallback and retires its
 retained (handle, id) registrations, so no crash can leave a flight,
 a router entry, or a pending binding stuck until shutdown. The guard
-finalizes **per entry** too: an open task that dies *after* the flight
-settled leaves its (incarnation, flight, server) binding entry to the
-guard, which settles it *retained(key)* when a route was decided for
-that server (later opens retry the key) and *not-applicable*
-otherwise — the guard settles records, it never performs opens. And a
-(handle, id) registration is attached to the guard's cleanup ownership
-**atomically with the router insertion**, so a panic between the two
-cannot leak an unretained registration.
+finalizes **per entry** too, by the stage the dead task reached: a
+decided suppression commits as *suppressed* (a record-only admission
+the guard can perform); a decided route settles *retained(key)* —
+later opens retry the key; an entry whose task died before any
+directive or key was persisted settles ***unresolved***, consumed
+exactly like an absent record so ordinary resolution and lazy retry
+still work — never *not-applicable*, which stays reserved for genuine
+candidacy rejection. The guard settles records; it never performs
+opens or acquires. It also **owns cancellation**: a finalized entry's
+transmitted-but-pending request gets its `$/cancelRequest` atomically
+with retirement (skipped only when the request was never written), and
+a (handle, id) registration is attached to the guard's cleanup
+ownership **atomically with the router insertion**, so a panic between
+the two cannot leak an unretained registration.
 
 **Where the await lives.** The decision is *not* awaited on the `didOpen`
 handler. The handler's candidate enumeration stays synchronous and the
@@ -1116,10 +1129,13 @@ a slot a routing provider left in play.
   install a provider, it advertises, it works — zero configuration in the
   common case, `priorities` only to order or allowlist providers.
 - Transport-level fail-open: no provider, a slow provider, a crashed
-  provider, or a malformed answer all reproduce today's *initial* routing
-  decision, at worst one decision deadline later (the resulting fallback
-  binding still freezes the root for the binding's lifetime — the
-  Decision section's recorded difference).
+  provider, or a malformed answer degrade toward today's *initial*
+  routing decision, at worst one decision deadline later — and expiry
+  is partial-result, so another provider's operative normalized answer
+  still wins its position rather than being discarded with the slow
+  one (the resulting binding, fallback or not, still freezes the route
+  for the binding's lifetime — the Decision section's recorded
+  difference).
 - Per-language provider policy falls out of the aggregation machinery for
   free, as does the ordered-allowlist vocabulary users already know.
 - The policy-server pattern needs no self-referential tricks: candidacy
@@ -1158,8 +1174,9 @@ a slot a routing provider left in play.
 - The three-field projection and the answer schema are new compatibility
   surfaces; both may evolve only additively.
 - The bounded initialization wait cannot help providers that initialize
-  slower than the low-seconds decision deadline; their first opens route
-  by defaults after paying the full deadline.
+  slower than the low-seconds decision deadline; their first opens
+  decide without them after paying the full deadline (by another
+  provider's answer when one exists, by defaults otherwise).
 
 ### Neutral
 
@@ -1290,7 +1307,7 @@ a slot a routing provider left in play.
 | **Trust** | providers are trusted-by-configuration; folder overrides bounded to canonicalized `file:` URIs at-or-below client workspace folders or the config-resolved root, count-capped |
 | **Folders↔Key** | shared instance: union-only join; per-root: first element, rest warned+ignored; at most one connection per server name per document |
 | **Providers** | all spawnable configured servers ∩ advertising ∩ `Ready` (Initializing awaited only when the advertisement is known, the server is named, or it carries `forceStart`), ordered by routing `priorities` (no `"_"` method-wildcard inheritance); concurrent fan-out, `preferred` fan-in, operative-entry rule |
-| **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy, plus a separate binding-reuse validation budget); expiry cancels pending requests, retires entries, falls open; exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
+| **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy, plus a separate binding-reuse validation budget); expiry is partial-result (cancel unanswered, drop unfinished entries, fan-in over what normalized; whole fallback only when no operative normalized result remains); exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
 | **Caching** | decision cache per (host URI, layer, languageId, config generation), single-flight, evicted on `didClose` and on an injection tuple's authoritative last-region disappearance, flushed on reload / `Ready`-provider-set / workspace-folder-set change, (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until `didClose` (injection tuples: also last-region disappearance); never retroactive |
 | **Cold start** | `forceStart` (post-config-publication get-or-create; `#shared` + primary-root seed for `preferSharedInstance` servers, the marker-less fallback shape otherwise; warm-up scope limited to shared/marker-less/policy servers; wait-eligible for the initialization wait) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
 | **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; re-open reads the binding only |
