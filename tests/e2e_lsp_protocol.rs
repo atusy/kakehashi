@@ -66,7 +66,7 @@ fn test_initialize_exposes_kakehashi_version() {
     assert_eq!(
         result["serverInfo"]["version"],
         json!(env!("CARGO_PKG_VERSION")),
-        "clients use serverInfo.version to distinguish old flat-only servers"
+        "initialize should expose the package version"
     );
 }
 
