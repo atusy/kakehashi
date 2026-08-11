@@ -394,7 +394,13 @@ and a later `restart` retries. Re-installation obeys the same
 config-revalidation rule as any tombstone install: it happens only when
 the server name still exists in current configuration; if a reload
 deleted the server mid-restart, no entry is installed and the id resolves
-`unknownClient`. Without that retryable tombstone, a
+`unknownClient`. Recovery is decided by **pool ownership at completion**,
+which also covers a replacement a reload removed while still
+`Initializing` — the interrupted handshake commits no `Failed` handle, so
+a control operation finding its key unowned at completion installs the
+fenced tombstone when the server is still configured, and only a deleted
+server dissolves the id into `unknownClient`; a still-configured id never
+silently disappears. Without that retryable tombstone, a
 pre-handle failure would leave no live, stopped, or control-registry owner
 for the key, the slot would vanish from enumeration, and retry would
 answer `unknownClient`.
