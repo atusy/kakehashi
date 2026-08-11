@@ -433,9 +433,11 @@ enum LifecycleMsg {
     //   GENERATION-BOUND RECEIVER, subscribed inside the accepting
     //   transition itself, so no later notification can precede the
     //   subscription. That receiver ALWAYS terminates: a handle landing
-    //   resolves it, and an intent
-    //   that settles without one — spawn failure, or a claim by
-    //   stop/restart/teardown — publishes the key's terminal state in
+    //   resolves it; a pre-handle SPAWN FAILURE resolves it with the
+    //   original spawn error while the failed intent dissolves (no
+    //   retained state — the ordinary acquire path also surfaces spawn
+    //   errors and simply retries later); a claim by
+    //   stop/restart/teardown publishes the key's terminal state in
     //   the snapshot, resolving the wait to that state's ordinary
     //   acquire error; reload DELETION removes the row instead, and the
     //   removal itself notifies waiters of that (key, generation) with

@@ -91,14 +91,16 @@ Configuration loading therefore rejects `languageServers` names containing
 `@` or `#`.
 
 **`status`** mirrors the connection state machine
-(ls-bridge-graceful-shutdown): `starting` = `Initializing` **or** a
-pre-handle `Spawning` intent entry (an ordinary acquire's spawn commit
-before the child's handshake begins), `running` =
+(ls-bridge-graceful-shutdown): `starting` = `Initializing` **or** an **active, unclaimed** pre-handle
+`Spawning` intent entry (an ordinary acquire's spawn commit before the
+child's handshake begins; once claimed into settling it reads
+`stopping`), `running` =
 `Ready`, `stopping` = `Closing`, **or** a termination-pending record whose
 process termination is not yet confirmed (its handle may already be
 `Closed` or gone), **or** a settling `Spawning` entry or configured
-cleanup record being wound down (each also answers control calls with
-`clientNotReady`, `data.status: "stopping"`), `failed` = `Failed`, and `stopped` =
+cleanup record being wound down (each answers control calls with
+`clientNotReady`, `data.status: "stopping"` — except an entry owned by
+an active `restart`, which answers `clientRestarting` per single-flight), `failed` = `Failed`, and `stopped` =
 pinned until an explicit `restart` — by a user's `stop`, or by the
 fenced retry tombstone a failed `restart` leaves (the enumeration does
 not distinguish who pinned it; both revive the same way — see below). Stopped slots **are included** in
@@ -733,7 +735,9 @@ namespace.
   `kakehashi/node*` pattern; handlers live under
   `src/lsp/lsp_impl/kakehashi/bridge/client/`.
 - Id resolution: render each live pool key, termination-pending-record
-  key, stopped-set key, and in-flight-operation key with `ConnectionKey`'s
+  key, settling/cleanup-record key (subject to the reload-deletion
+  visibility rule), stopped-set key, and in-flight-operation key with
+  `ConnectionKey`'s
   `Display` and compare for exact equality with the supplied id; no
   parsing. The last three all live in the lifecycle actor's state, read
   through a snapshot it publishes atomically per transition. Owner
