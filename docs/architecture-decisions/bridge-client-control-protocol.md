@@ -306,11 +306,15 @@ motivating case. On expiry the forced escalation applies (SIGTERM → SIGKILL
 on Unix; immediate kill on Windows). In-flight and newly arriving operations
 fail per that decision's disposal policy. The result `null` is returned when
 the slot reaches `Closed`, whichever path got it there. `stop` on a
-`starting` slot is legal but takes the initialization-abort path
-ls-bridge-graceful-shutdown defines for `Initializing → Closing`: abort the
-handshake, **skip `shutdown`** (a request sent before `initialize`
-completes violates LSP ordering), send `exit`, and escalate — likewise
-returning at `Closed`. `stop` on a `failed` slot skips the LSP
+`starting` slot is legal and aborts initialization with **no LSP message
+at all**: the spec forbids the client every additional request *and*
+notification — `exit` included — until the initialize response arrives, so
+the process is terminated directly (the forced escalation, minus the
+handshake). If the initialize response wins the race, the normal
+`shutdown` → `exit` sequence applies instead. This deliberately diverges
+from ls-bridge-graceful-shutdown's `Initializing → Closing` rule, which
+sends `exit` in that window and is itself non-conformant on this point;
+correcting that decision is a follow-up. `stop` on a `failed` slot skips the LSP
 handshake — the `Failed → Closed` bypass ls-bridge-graceful-shutdown already
 defines — cleans up the process, and records the stopped entry: pinning a
 repeatedly failing slot before the next acquire respawns it is a
