@@ -127,7 +127,8 @@ Both parameters are optional and compose as AND:
   applies only to a tuple with no binding at all, and a *pending* tuple
   (its decision still in flight) matches nothing yet — the document is
   not open there — rather than falling through. A *retained* tuple (the
-  route decided but its acquire failed — bridge-routing-protocol)
+  route decided but its acquire failed, or never ran because its owner
+  died — bridge-routing-protocol)
   **matches its retained key when a slot for that key is enumerable**,
   whatever that slot's status (a `Failed` handle, or a `running` shared
   handle whose folder announcement failed; a pre-handle spawn failure

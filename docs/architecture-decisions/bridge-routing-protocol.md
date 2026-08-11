@@ -7,7 +7,7 @@
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — the `preferred` strategy whose fan-out/fan-in machinery this protocol dispatches
 - [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) — registers the routing decision deadline, the binding-reuse validation budget, and the Tier-1/Tier-2 exemptions
 - [ls-bridge-async-connection](ls-bridge-async-connection.md) — the framing size ceilings (amended with this decision) that the answer-allocation bound depends on
-- [respawn-reopen-derives-its-targets](respawn-reopen-derives-its-targets.md) — the derived re-open, which consults only the active route binding
+- [respawn-reopen-derives-its-targets](respawn-reopen-derives-its-targets.md) — the derived re-open, which issues no routing query and never spawns: bindings answer where they exist, marker resolution where they do not
 - [wildcard-config-inheritance](wildcard-config-inheritance.md) — the inheritance resolution applied before the config projection goes on the wire
 - [host-document-bridge](host-document-bridge.md) — the `_self` layer whose `enabled` gate and aggregation entry govern host-document routing decisions
 - [language-server-bridge](language-server-bridge.md) — the security model this protocol's trust model extends
@@ -48,7 +48,8 @@ the transport: absence or failure of providers reproduces today's
 one recorded difference in what happens afterwards: the decision settles
 into the document's route binding either way, so even a fallback route is
 frozen for the **binding's lifetime** (the host's close; an injection
-tuple's last-region disappearance), where today a restart's re-open
+tuple's last-region disappearance — with the one abnormal-finalization
+exception the Caching section records), where today a restart's re-open
 re-resolves live markers (respawn-reopen-derives-its-targets records the
 same freeze from its side). A *successful* answer, by design, can
 only subtract servers or redirect roots (see Trust Model).
@@ -523,10 +524,12 @@ Two structural rules keep the protocol from consuming itself:
 - **No recursion.** Establishing a connection to a provider, and the
   routing query itself, never trigger a routing query. Provider
   connections are routed by kakehashi's own rules — the bootstrap base
-  case. The derived re-open sweep after a restart consults only the
-  **route binding** (below), so a respawn never issues queries or spawns
-  as a routing side effect — preserving respawn-reopen-derives-its-targets'
-  read-only, never-spawns stage discipline and its fixed budget.
+  case. The derived re-open sweep after a restart **issues no routing
+  query and never spawns as a routing side effect** — it reads the
+  route binding where one exists and falls through to read-only marker
+  resolution where none does (below) — preserving
+  respawn-reopen-derives-its-targets' read-only, never-spawns stage
+  discipline and its fixed budget.
 - **Document-independent traffic.** The routing request rides the
   provider's connection like any managed request but needs no open
   document. A provider that answers `enabled: false` for itself therefore
@@ -612,7 +615,8 @@ structures with different lifetimes carry the outcome:
   affirmation-only win, which vetoes every lower-priority provider
   while changing nothing and would otherwise leave no trace — and a
   **settlement record** per server as its entry settles (the landed or
-  downgraded key, a retained failure, a suppression taking hold). This
+  downgraded key; a retention, with its failed-versus-owner-died
+  provenance; a suppression taking hold). This
   is what makes a valid-but-wrong policy diagnosable from the logs
   (warnings cover the rejected, invalid, and timed-out outcomes; a
   *successful* misroute would otherwise be silent). Method-level capability prefilters are deliberately
@@ -931,15 +935,17 @@ the flight has terminally established that no **route-affecting**
 directive (no suppression, no override — an affirmation-only win
 included) applies to the entry, or on the retryable generation/stopped
 mismatches. This is the one **recorded narrowing of the freezing
-guarantee**, stated at its honest width: a normal no-answer decision
-settles a key and freezes it, but an abnormally dead open task never
-ran its acquire and the guard must not acquire on its behalf, so the
-entry ends absent — and absence promises no single frozen route:
-subsequent retriers run ordinary resolution, whose outcome can vary
-with live filesystem state, and the read-only sweep consuming the
-absence establishes nothing; the tuple is simply unbound until some
-later open's admission settles a record, exactly as if routing had
-never spoken for it. The guard settles records; it never
+guarantee**, and its scope is exactly the deletion rule above: an
+entry whose dead task left a surviving route-affecting directive still
+settles (*suppressed*, or *retained(key)*); only an entry with no such
+directive — or a retryable mismatch — ends absent, and absence
+promises no single frozen route for **that server's entry** (the
+tuple's other entries keep their settlements): subsequent retriers run
+ordinary resolution, whose outcome can vary with live filesystem
+state, and the read-only sweep consuming the absence establishes
+nothing; the entry stays unbound until some later open's admission
+settles a record, exactly as if routing had never spoken for that
+server. The guard settles records; it never
 performs opens or acquires. Cancellation ownership is **exclusively
 the driver/flight side's**: open tasks are passive subscribers and
 their guard touches no provider request; the flight's cleanup honors
@@ -1197,7 +1203,7 @@ a slot a routing provider left in play.
   still wins its position rather than being discarded with the slow
   one (the resulting binding, fallback or not, still freezes the route
   for the binding's lifetime — the Decision section's recorded
-  difference).
+  difference, with the abnormal-finalization exception it names).
 - Per-language provider policy falls out of the aggregation machinery for
   free, as does the ordered-allowlist vocabulary users already know.
 - The policy-server pattern needs no self-referential tricks: candidacy
@@ -1226,8 +1232,9 @@ a slot a routing provider left in play.
   stale for its whole open lifetime as project state moves under it; the
   provider has no way to say so (deferred invalidation notification),
   and an open document keeps its route binding until close/re-open (an
-  injection tuple: until its language leaves the document) even when a
-  newer provider would decide differently.
+  injection tuple: until its language leaves the document; the
+  abnormal-finalization exception aside) even when a newer provider
+  would decide differently.
 - Under the default `priorities = ["*"]`, a server upgrade that adds the
   advertisement silently promotes an installed server to routing
   authority, and ordering between multiple `"*"`-group providers is
@@ -1372,4 +1379,4 @@ a slot a routing provider left in play.
 | **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy, plus a separate binding-reuse validation budget); expiry is partial-result (cancel unanswered, drop unfinished entries, fan-in over what normalized; whole fallback only when no operative normalized result remains); exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
 | **Caching** | decision cache per (host URI, layer, languageId, config generation), single-flight, evicted on `didClose` and on an injection tuple's authoritative last-region disappearance, flushed on reload / `Ready`-provider-set / workspace-folder-set change, (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until `didClose` (injection tuples: also last-region disappearance); never retroactive |
 | **Cold start** | `forceStart` (post-config-publication get-or-create; `#shared` + primary-root seed for `preferSharedInstance` servers, the marker-less fallback shape otherwise; warm-up scope limited to shared/marker-less/policy servers; wait-eligible for the initialization wait) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
-| **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; re-open reads the binding only |
+| **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; the sweep reads bindings where they exist, marker resolution where they do not, and never spawns |
