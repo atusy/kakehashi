@@ -40,6 +40,20 @@ use crate::lsp::bridge::workspace::WorkspaceFolderSet;
 /// explicit `false` (either `true` or a registration id string). Anything
 /// missing or `Left(false)` means the server will not act on folder-change
 /// notifications, so the bridge must keep it on per-root instances.
+/// Whether `caps` advertises `workspace.workspaceFolders.supported == true` —
+/// the server accepts the folders supplied at `initialize`, whether or not it
+/// also acts on later `didChangeWorkspaceFolders` (that stricter question is
+/// [`supports_workspace_folder_changes`]). The incapable-shared divert uses
+/// this to decide what counts as served-root proof: initialize-listed folders
+/// for a server that declared it supports them, the spawn root alone
+/// otherwise.
+pub(crate) fn supports_initial_workspace_folders(caps: &ServerCapabilities) -> bool {
+    caps.workspace
+        .as_ref()
+        .and_then(|ws| ws.workspace_folders.as_ref())
+        .is_some_and(|folders| folders.supported == Some(true))
+}
+
 pub(crate) fn supports_workspace_folder_changes(caps: &ServerCapabilities) -> bool {
     let Some(folders) = caps
         .workspace
@@ -545,6 +559,14 @@ impl ConnectionHandle {
     pub(crate) fn supports_workspace_folder_changes(&self) -> bool {
         self.server_capabilities()
             .is_some_and(supports_workspace_folder_changes)
+    }
+
+    /// Whether the server declared `workspace.workspaceFolders.supported`,
+    /// accepting the folders supplied at `initialize` even if it ignores later
+    /// change notifications. See [`supports_initial_workspace_folders`].
+    pub(crate) fn supports_initial_workspace_folders(&self) -> bool {
+        self.server_capabilities()
+            .is_some_and(supports_initial_workspace_folders)
     }
 
     /// Log, at most once per connection, that a `preferSharedInstance` server

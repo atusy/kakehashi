@@ -484,19 +484,13 @@ impl LanguageServerPool {
                 // `null` even though it would be Ready moments later. Fails soft on
                 // timeout/spawn error like every other branch.
                 //
-                // A key-CHANGING reconnect (preferSharedInstance flipped on
-                // since registration) is about to spawn under a key that never
-                // had a predecessor, so nothing armed its re-open debt — arm it
-                // BEFORE acquiring so the spawn's handshake claims the debt and
-                // runs the derive-from-current-open-documents repair ahead of
-                // this command; the barrier below then genuinely waits on it.
-                // Idempotent, and harmless when the resolved key's connection
-                // is already live: an armed-but-unclaimed key is invisible to
-                // the wait, and the next respawn under that key claims it.
+                // A key-CHANGING reconnect spawns under a key that never had
+                // a predecessor to arm its re-open debt; arm it BEFORE
+                // acquiring so the spawn's handshake claims the debt and the
+                // barrier below genuinely waits on the repair (see
+                // `arm_reopen_if_key_changed` for the full rationale).
                 let (_marker, resolved_key) = self.resolve_acquire(origin, &config, None).await;
-                if resolved_key != key {
-                    self.arm_pending_reopen(&resolved_key);
-                }
+                self.arm_reopen_if_key_changed(&key, &resolved_key);
                 match self
                     .get_or_create_connection_wait_ready(
                         origin,

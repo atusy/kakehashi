@@ -538,14 +538,18 @@ languageServers:
   are also exempt from the incapable-shared divert, since they add no root the
   capability would be needed for. Non-opted-in servers keep the client-root
   fallback for marker-less documents. Known consequence: a shared connection
-  spawned by a marker-less FIRST acquisition seeds its folder set (and
-  initialize handshake) with only the PRIMARY client folder — the folder set
-  doubles as served-root proof for the incapable divert, and "told at
-  initialize" only guarantees the rootUri — and `apply_workspace_folder_change`
-  deliberately does not keep that seed current (the folder set has one writer
-  after spawn — acquisitions; forwarding client changes would need per-folder
-  provenance). Such a connection answers workspace-folder pulls from that
-  spawn-time seed until marker roots join.
+  spawned by a marker-less FIRST acquisition seeds its folder set and
+  initialize handshake with the full client snapshot of that moment, and
+  `apply_workspace_folder_change` deliberately does not keep that seed current
+  (the folder set has one writer after spawn — acquisitions; forwarding client
+  changes would need per-folder provenance). Served-root proof for the
+  incapable divert is a separate, tiered fact (`incapable_shared_serves`):
+  initialize-listed folders count for a server that declared
+  `workspaceFolders.supported` (only change notifications missing), while a
+  server with no folder support at all is only ever proven for its recorded
+  spawn root (compared by filesystem path, so trailing-slash or
+  percent-encoding differences between a client root string and a marker
+  walk's URL cannot fake a mismatch).
 - **2026-07-01**: Renamed the `languageServers.*.rootMarkers` config key to
   `workspaceMarkers` (aligning with the LSP spec's `workspaceFolders`); the old
   `rootMarkers` is accepted as a deprecated serde alias for backward
