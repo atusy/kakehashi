@@ -97,7 +97,9 @@ before the child's handshake begins), `running` =
 `Ready`, `stopping` = `Closing` **or** a termination-pending record whose
 process termination is not yet confirmed (its handle may already be
 `Closed` or gone), `failed` = `Failed`, and `stopped` =
-explicitly stopped via `stop` (see below). Stopped slots **are included** in
+pinned until an explicit `restart` — by a user's `stop`, or by the
+fenced retry tombstone a failed `restart` leaves (the enumeration does
+not distinguish who pinned it; both revive the same way — see below). Stopped slots **are included** in
 the enumeration — they are absent from the live pool, so the enumeration is
 the only way to recover their id for a later `restart`. `Failed` connections
 stay pool-resident until a later acquire replaces them, so `failed` is
@@ -375,21 +377,20 @@ defines — cleans up the process, and records the stopped entry: pinning a
 repeatedly failing slot before the next acquire respawns it is a
 first-class use of this method, not an edge case. `stop` on a pre-handle
 `Spawning` entry **settles the intent**: the entry is marked settling
-and retained until the spawn sub-task terminates, any handle its escrow
-receives in the meantime is killed and reaped, and then the tombstone
-installs and `stop` answers (`null`, or `stopFailed` into a
-termination-pending record if the reap is unconfirmed). The outcomes split
-three ways by what exists at the deadline: a **verified reap** installs
-the config-revalidated tombstone and answers `null`; a **known child
-with an unconfirmed reap** answers `stopFailed` and converts to the
-ordinary termination-pending record (the known-handle path below); an
-**unterminated producer** answers `stopFailed` and leaves the fenced
-open-escrow cleanup record — no tombstone yet, the eventual child killed
-and reaped on arrival (ls-bridge-graceful-shutdown § Lifecycle Actor).
-`restart` respawns only after a verified pre-deadline settlement; short
-of one it answers `restartFailed` with the corresponding record. `restart` on a
-`Spawning` slot is that same settlement followed by its ordinary respawn
-sequence.
+and retained, any handle its escrow receives is killed and reaped, and
+the outcome branches **on producer termination first**, which makes the
+partition exhaustive and exclusive. Producer terminated: either no
+child was ever created or its reap verified — the config-revalidated
+tombstone installs and `stop` answers `null` — or a known child's reap
+is unconfirmed, which answers `stopFailed` and converts to the ordinary
+termination-pending record (the known-handle path below). Producer
+still running at the deadline: `stop` answers `stopFailed` and leaves
+the fenced open-escrow cleanup record — no tombstone yet, the eventual
+child killed and reaped on arrival (ls-bridge-graceful-shutdown
+§ Lifecycle Actor). `restart` on a `Spawning` slot is that same
+settlement followed by its ordinary respawn sequence, respawning only
+after a verified settlement and answering `restartFailed` with the
+corresponding record short of one.
 
 What is new is the **stopped set**: the pool records the `ConnectionKey` as
 explicitly stopped, and the normal routing path consults it — a `didOpen` (or
