@@ -259,7 +259,10 @@ async fn shutdown_all_connections(pool: Arc<ConnectionPool>, mode: ShutdownMode)
     // leases — lives in SUPERVISOR-OWNED storage on the TeardownRun,
     // not in locals of the panic-catching future, so unwinding cannot
     // drop it. On an owner panic the guard re-borrows that storage,
-    // aborts and joins the adopted tasks, recovers process leases, runs
+    // aborts and joins the adopted tasks, recovers process leases,
+    // CONTINUES the deadline-bounded escalation for any recovered
+    // process still running (an owner can panic before or during the
+    // graceful phase), runs
     // the same idempotent durable-record finalizer as any abnormal
     // outcome (bridge-client-control-protocol: ARM, tombstone,
     // replacement, and outer-result settlement), performs mode-aware
@@ -267,7 +270,10 @@ async fn shutdown_all_connections(pool: Arc<ConnectionPool>, mode: ShutdownMode)
     // FAILED — joiners are released with ownership settled, never
     // around it. Every caller, starter included, is a joiner:
     let Joined { late_exit_claim, completion } =
-        pool.teardown_run().join_or_start(mode, now);
+        pool.teardown_run().join_or_start(pool.clone(), mode, now);
+        // ^ the Arc handed over here becomes the spawned owner task's
+        //   pool handle — ownership transfer to the 'static spawn is
+        //   explicit, not borrowed
 
     // If this caller's upgrade raced past an already-committed
     // ServerRemains disposition, the same linearized call hands back
@@ -320,13 +326,17 @@ async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
     // control_procs, so a child from a failed stop is inside the
     // escalation set even though it is in neither the connection
     // snapshot nor the task set.
-    // Adopted state is placed in the supervisor-owned TeardownState —
-    // the body only borrows it, so an unwind cannot drop it.
-    let TeardownState { control_tasks, control_procs } =
-        teardown.adopt(seal_and_take_control_operations());
+    // ALL ownership lives in the ONE supervisor-owned TeardownState —
+    // the body only borrows its fields, and every ownership-moving
+    // phase result below is stored back into it (with a phase marker)
+    // BEFORE the next panic point, so an unwind at any await can never
+    // be the sole owner of adopted tasks, leases, snapshots, or the
+    // post-close unresolved set.
+    let state = teardown.state();
+    state.adopt(seal_and_take_control_operations());
 
     // Snapshot AFTER both gates: nothing can be inserted past them.
-    let connections = pool.all_connections();
+    state.connections = pool.all_connections();
 
     let graceful = tokio::time::timeout_at(graceful_deadline, async {
         // Shutdown all connections in parallel (best-effort).
@@ -336,13 +346,13 @@ async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
         // full handshake), so a handshake that commits Ready between
         // observe and act is shut down gracefully, never terminated
         // without the handshake.
-        let tasks = connections.iter()
+        let tasks = state.connections.iter()
             .map(|conn| conn.shutdown_by_state());
 
-        // Poll the teardown-owned JoinSet alongside; the set itself
+        // Poll the supervisor-owned JoinSet alongside; the set itself
         // outlives this future, so nothing detaches on timeout
         join!(futures::future::join_all(tasks),
-              drain_join_set(&mut control_tasks));
+              drain_join_set(&mut state.control_tasks));
     }).await;
 
     // Survivor handling runs CONCURRENTLY with escalation. PRODUCER
@@ -375,19 +385,20 @@ async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
     // abortable set, so the expired producer cutoff costs it nothing
     // and revocable idempotent claims mean an interrupted finalizer
     // never strands a record.
-    // ONE canonical lease-owner map is built before escalation:
-    // snapshot entries whose lease the registry owns are excluded from
-    // the force arm, so no process ever has two escalation owners
-    // (duplicate SIGTERM/SIGKILL/wait is prevented up front, not merely
-    // deduplicated afterwards).
-    let (kill_unresolved, _) = join!(
+    // Both escalation paths claim each process ATOMICALLY from ONE
+    // LIVE lease-owner map shared with the still-open registry — not a
+    // pre-filtered snapshot, which would race a control task reclaiming
+    // a snapshot lease after the filter. A late registration REVOKES
+    // the ordinary claim, so no process ever has two escalation owners
+    // (duplicate SIGTERM/SIGKILL/wait is structurally impossible).
+    state.kill_unresolved = join!(
         force_kill_remaining_until(
             deadline,
-            connections.excluding_leases_of(&control_procs),
-            &control_procs,
+            teardown.lease_owners().claim_ordinary(&state.connections),
+            &state.control_procs,
         ),
-        abort_survivors_and_finalize(&mut control_tasks, graceful_deadline),
-    );
+        abort_survivors_and_finalize(&mut state.control_tasks, graceful_deadline),
+    ).0;
 
     // Both arms have joined: no control task is alive, so no RAII
     // wrapper can hand a process back later. Only NOW close the live
@@ -398,7 +409,8 @@ async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
     // by ConnectionKey: a control-owned process reachable through both
     // a Closing handle and the registry carries one lease and appears
     // once.
-    let unresolved = kill_unresolved.union_by_lease(control_procs.close_and_take());
+    state.unresolved = state.kill_unresolved
+        .union_by_lease(state.control_procs.close_and_take());
 
     // Disposition of children still unconfirmed (§ Unconfirmed
     // termination) is ONE locked operation: it takes the mode-upgrade
@@ -408,7 +420,7 @@ async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
     // the ceiling rather than inside it. An exit upgrade arriving AFTER
     // the commit receives the already-reinserted records back from
     // join_or_start as its late-exit claim (the Joined arm above).
-    teardown.dispose_locked(unresolved, |final_mode, records| match final_mode {
+    teardown.dispose_locked(state.take_unresolved(), |final_mode, records| match final_mode {
         ShutdownMode::ProcessExit  => log_and_abandon(records),
         ShutdownMode::ServerRemains =>
             pool.reinsert_termination_pending(records), // atomic; waits restarted
