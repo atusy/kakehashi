@@ -429,9 +429,11 @@ enum LifecycleMsg {
     Restart { key: ConnectionKey, reply: Reply },
     CommitSpawn { key: ConnectionKey, reply: Reply },
     // ^ the reply is the ACCEPTANCE acknowledgment (intent committed),
-    //   not the terminal spawn result. The acquire caller then waits on
-    //   the key's pool entry (the ordinary acquire notify path), which
-    //   ALWAYS terminates: a handle landing resolves it, and an intent
+    //   not the terminal spawn result — and it carries a
+    //   GENERATION-BOUND RECEIVER, subscribed inside the accepting
+    //   transition itself, so no later notification can precede the
+    //   subscription. That receiver ALWAYS terminates: a handle landing
+    //   resolves it, and an intent
     //   that settles without one — spawn failure, or a claim by
     //   stop/restart/teardown — publishes the key's terminal state in
     //   the snapshot, resolving the wait to that state's ordinary

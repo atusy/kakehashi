@@ -94,9 +94,11 @@ Configuration loading therefore rejects `languageServers` names containing
 (ls-bridge-graceful-shutdown): `starting` = `Initializing` **or** a
 pre-handle `Spawning` intent entry (an ordinary acquire's spawn commit
 before the child's handshake begins), `running` =
-`Ready`, `stopping` = `Closing` **or** a termination-pending record whose
+`Ready`, `stopping` = `Closing`, **or** a termination-pending record whose
 process termination is not yet confirmed (its handle may already be
-`Closed` or gone), `failed` = `Failed`, and `stopped` =
+`Closed` or gone), **or** a settling `Spawning` entry or configured
+cleanup record being wound down (each also answers control calls with
+`clientNotReady`, `data.status: "stopping"`), `failed` = `Failed`, and `stopped` =
 pinned until an explicit `restart` — by a user's `stop`, or by the
 fenced retry tombstone a failed `restart` leaves (the enumeration does
 not distinguish who pinned it; both revive the same way — see below). Stopped slots **are included** in
@@ -736,7 +738,8 @@ namespace.
   parsing. The last three all live in the lifecycle actor's state, read
   through a snapshot it publishes atomically per transition. Owner
   precedence for enumeration is live handle > termination-pending record
-  (`stopping`) > stopped set > in-flight operation, deduplicated to one
+  (`stopping`) > settling/cleanup record (`stopping`) > stopped set >
+  in-flight operation, deduplicated to one
   row — a `Closed` handle awaiting removal is ignored and falls through
   that same order (`Closed` deliberately has no `Client.status` of its
   own). The in-flight-operation entry matters during the restart window,
