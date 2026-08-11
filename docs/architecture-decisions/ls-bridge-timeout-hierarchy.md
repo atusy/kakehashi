@@ -92,7 +92,7 @@ Global Shutdown overrides all (highest priority)
 ```
 
 **Global Shutdown Design:**
-- Single ceiling for entire shutdown (not per-server)
+- Single ceiling for connection/process termination during pool teardown (not per-server; local cleanup falls outside)
 - Graceful attempts → SIGTERM → SIGKILL escalation
 - Reserve ~20% of timeout for SIGTERM/SIGKILL (e.g., 10s total → 8s graceful + 2s forced)
 

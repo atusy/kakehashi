@@ -269,15 +269,18 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
     // its task is benign — shutdown_by_state on Closing/Closed is a
     // compare-transition no-op). When the remaining budget is shorter
     // than the normal SIGTERM grace, the grace is shortened or skipped.
+    // cancel_join_or_abort FINALIZES before returning: for any task it
+    // had to hard-abort, it runs the post-abort finalizer
+    // (bridge-client-control-protocol) settling ARM, tombstone,
+    // replacement, and registry state to what the last commit point
+    // implies.
     join!(
         force_kill_remaining_until(deadline, connections, &control_procs),
-        cancel_join_or_abort(&mut control_tasks, deadline),
+        cancel_join_or_abort_then_finalize(&mut control_tasks, deadline),
     );
-    // Only now — with every control task terminated and the live
-    // process registry closed — may pool/router cleanup run, preceded by
-    // the post-abort finalizer (bridge-client-control-protocol) settling
-    // any hard-aborted operation's state; nothing can mutate registries
-    // or tombstones after cleanup.
+    // Only now — every control task terminated, finalized, and the live
+    // process registry closed — may pool/router cleanup run; nothing can
+    // mutate registries or tombstones after it.
 }
 ```
 
@@ -361,9 +364,10 @@ async fn shutdown_router() {
     // same absolute deadline; a task still alive at the deadline is
     // hard-aborted (safe: shared-state effects live only at commit
     // points — see the sketch above and bridge-client-control-protocol)
+    // Finalization included: see the sketch above
     join!(
         force_kill_remaining_until(deadline, all_connections, &control_procs),
-        cancel_join_or_abort(&mut control_tasks, deadline),
+        cancel_join_or_abort_then_finalize(&mut control_tasks, deadline),
     );
 
     // 5. Clean up router resources — runs after every control task has
@@ -415,9 +419,10 @@ async fn shutdown_router() {
 ### Negative
 
 **No Response Draining:**
-- Accepted writes drain to the server, but their responses are not
-  awaited — pending operations fail at connection closure or the
-  deadline, whichever comes first
+- On the graceful path accepted writes drain to the server, but their
+  responses are not awaited — pending operations fail at connection
+  closure or the deadline, whichever comes first (forced termination
+  abandons the queue as well)
 - May surprise users expecting "finish pending work"
 - Trade-off: Predictable shutdown time vs completion
 

@@ -436,10 +436,18 @@ mutate pool state after cleanup; the outer control request then fails per
 the disposal policy.
 
 "Commit point" is a defined term, and the abort-safety above rests on it:
-a control operation's shared-state effects happen **only** inside
-pool-lock critical sections — the tombstone install/remove, the ARM, the
+the control protocol's **own** state effects happen only inside pool-lock
+critical sections — the tombstone install/remove, the ARM, the
 replacement insertion (with its generation revalidation), and the registry
-release with its ownership verification. Between commit points the task
+release with its ownership verification. Effects the operation makes
+through *existing pool primitives* — connection-state transitions,
+liveness accounting, response-router disposal, process registration, the
+purge of per-document state, the panic-count clear — are delegated to
+those primitives, each of which must itself be abort-safe or run inside a
+commit point; in particular, purge paths that today await while holding
+`connections` must be restructured to this discipline before `restart`
+may adopt them. That is an implementation precondition of this protocol,
+recorded here. Between commit points the task
 holds no pool locks and touches no shared state other than its spawned
 process, whose kill handle is registered at spawn time. A commit point's
 critical section contains **no suspension point** — it runs synchronously
