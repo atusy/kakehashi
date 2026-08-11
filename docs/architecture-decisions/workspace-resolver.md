@@ -94,12 +94,15 @@ Key properties:
   document that has no representable filesystem path (a non-`file://` URI, or a
   `file://` path that fails the encoding contract in lua-host-api). Such a
   document is resolved exactly as if no `workspaceResolver` were set — the
-  normal `workspaceMarkers` → `ClientFallback` path. Note the two skip sub-cases
+  normal `workspaceMarkers` walk, then the usual routing (per-root /
+  `ClientFallback`, or the shared instance for a `preferSharedInstance`
+  server: the skip decides which RESOLUTION runs, not #391's routing). Note the two skip sub-cases
   differ underneath: a non-representable `file://` path still has a URL, so the
   Rust-side marker walk runs normally; a **non-`file://` URI** has no file path
   at all, so `resolve_marker_root` returns `None` *immediately*
   (`document_uri?.to_file_path()` fails) and the marker walk never runs — the
-  document lands directly on `ClientFallback`. Either way the result is the
+  document lands directly on `ClientFallback` (or the shared instance for a
+  `preferSharedInstance` server). Either way the result is the
   no-resolver behavior. This skip is distinct from §6 fail-closed: the resolver
   was not run, so the document still attaches; fail-closed applies only when a
   resolver that *did* run errors or times out.
@@ -167,12 +170,22 @@ async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
   - **Shared instance (`preferSharedInstance`, #391).** Marker-rooted documents
     join one `Shared` connection via `workspace/didChangeWorkspaceFolders` (the
     `WorkspaceFolderSet`, defined in `workspace/folder_set.rs`, driven from
-    `pool.rs`). A shared connection that came up **without**
-    `workspace.workspaceFolders.changeNotifications`
+    `pool.rs`); marker-less documents (non-file URIs, no marker hit, no hint)
+    join it too, with the complete CLIENT workspace (folder snapshot, or the
+    bare rootUri when the client sent no folders) announced on their behalf —
+    they carry no marker root of their own. On an incapable connection that
+    announcement is capability-gated away; the possibly out-of-workspace
+    didOpen is an accepted, documented residual. A shared connection that came up **without**
+    the full folder-change capability — `workspace.workspaceFolders.supported
+    == true` AND non-`false` `changeNotifications`
     (`supports_workspace_folder_changes`, static `InitializeResult` capabilities
-    only — no dynamic `client/registerCapability` tracking) cannot take on a new
-    root, so the document is **diverted to its own per-root process** (not
-    dropped). This divert happens at **two** sites, because the shared
+    only — no dynamic `client/registerCapability` tracking) — cannot take on a new
+    root, so a marker-rooted document it does not already serve is **diverted to
+    its own per-root process** (not dropped); marker-less documents are exempt —
+    they bring no MARKER root the capability would be needed for, and their
+    client-workspace announcement is capability-gated away on such a
+    connection (the possibly out-of-workspace `didOpen` is an accepted,
+    documented residual). This divert happens at **two** sites, because the shared
     connection's capability is only known once it is `Ready`:
     - **Early** in `resolve_acquire` — when the shared handle is *already*
       `Ready` and incapable.
@@ -216,7 +229,8 @@ Deferred to implementation, recorded so they are not lost:
   read, so `kakehashi.fs.read_to_string` needs its own large-file bound (see
   lua-host-api); the exact cap is open.
 - **Non-`file://` documents.** Per §2 these skip the resolver and resolve via
-  `workspaceMarkers` → `ClientFallback`. Open: whether any non-`file://` scheme
+  `workspaceMarkers` → `ClientFallback` (the shared instance for a
+  `preferSharedInstance` server). Open: whether any non-`file://` scheme
   (e.g. a remote/virtual fs) should instead derive a usable path and run the
   resolver after all.
 - **Stuck-worker recovery** (§3, §6): the policy for abandoning and replacing a
@@ -297,7 +311,8 @@ Deferred to implementation, recorded so they are not lost:
   by timeout, so it does not affect semantic-token or diagnostic latency.
 - `workspaceResolver` and `workspaceMarkers` are either/or per server, not
   layered — the one exception being the §2 skip rule (a document with no
-  representable path resolves via `workspaceMarkers`/`ClientFallback`).
+  representable path resolves via `workspaceMarkers`/`ClientFallback`, or the
+  shared instance for a `preferSharedInstance` server).
 
 ## Decision–Implementation Gap
 

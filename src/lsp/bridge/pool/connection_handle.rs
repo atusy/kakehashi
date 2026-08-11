@@ -33,13 +33,30 @@ use crate::lsp::bridge::protocol::{
 };
 use crate::lsp::bridge::workspace::WorkspaceFolderSet;
 
+/// Whether `caps` advertises `workspace.workspaceFolders.supported == true` —
+/// the server accepts the folders supplied at `initialize`, whether or not it
+/// also acts on later `didChangeWorkspaceFolders` (that stricter question is
+/// [`supports_workspace_folder_changes`]). The incapable-shared divert uses
+/// this to widen its served-root proof: the spawn root always proves service,
+/// and initialize-listed folders prove it additionally for a server that
+/// declared it supports them.
+pub(crate) fn supports_initial_workspace_folders(caps: &ServerCapabilities) -> bool {
+    caps.workspace
+        .as_ref()
+        .and_then(|ws| ws.workspace_folders.as_ref())
+        .is_some_and(|folders| folders.supported == Some(true))
+}
+
 /// Whether `caps` advertises everything the shared-instance opt-in (#391)
 /// needs to drive one connection across roots via
 /// `workspace/didChangeWorkspaceFolders`: `workspace.workspaceFolders` with
 /// `supported == true` AND `changeNotifications` set to a value other than the
 /// explicit `false` (either `true` or a registration id string). Anything
 /// missing or `Left(false)` means the server will not act on folder-change
-/// notifications, so the bridge must keep it on per-root instances.
+/// notifications, so the bridge diverts new, unserved marker roots to
+/// per-root instances — roots the connection already serves (its spawn root,
+/// and initialize-listed folders under `supported == true`) and marker-less
+/// riders stay on the shared connection (`incapable_shared_serves`).
 pub(crate) fn supports_workspace_folder_changes(caps: &ServerCapabilities) -> bool {
     let Some(folders) = caps
         .workspace
@@ -144,6 +161,16 @@ pub(crate) struct ConnectionHandle {
     /// `settings` is ignored when comparing this snapshot on reload because it
     /// can be propagated at runtime; every other field is spawn-time state.
     launch_config: OnceLock<crate::config::settings::BridgeServerConfig>,
+    /// The workspace root this connection's `initialize` was rooted at (the
+    /// marker root, or the client root for a marker-less/fallback spawn).
+    /// `None` until recorded — and deliberately DISTINCT from the folder set:
+    /// the set is the protocol snapshot (initialize folders plus later joins,
+    /// answering `workspace/workspaceFolders` pulls), while this is the one
+    /// root an INCAPABLE server is guaranteed to serve, which is what the
+    /// incapable-shared divert needs as proof (told-at-initialize folders
+    /// beyond the rootUri promise nothing for a server that advertises no
+    /// workspaceFolders support).
+    spawn_root: OnceLock<Option<String>>,
 }
 
 impl ConnectionHandle {
@@ -212,6 +239,7 @@ impl ConnectionHandle {
             incapable_fallback_logged: AtomicBool::new(false),
             settings,
             launch_config: OnceLock::new(),
+            spawn_root: OnceLock::new(),
         }
     }
 
@@ -230,6 +258,18 @@ impl ConnectionHandle {
             enabled: config.enabled,
         };
         let _ = self.launch_config.set(snapshot);
+    }
+
+    /// Record the workspace root the spawn's `initialize` used. Set once at
+    /// spawn, before the handle is published; see the field doc for why this
+    /// exists separately from the folder set.
+    pub(super) fn record_spawn_root(&self, root: Option<String>) {
+        let _ = self.spawn_root.set(root);
+    }
+
+    /// The root this connection's `initialize` was rooted at, when recorded.
+    pub(super) fn spawn_root(&self) -> Option<&str> {
+        self.spawn_root.get().and_then(|root| root.as_deref())
     }
 
     pub(super) fn launch_config(&self) -> Option<&crate::config::settings::BridgeServerConfig> {
@@ -524,9 +564,21 @@ impl ConnectionHandle {
             .is_some_and(supports_workspace_folder_changes)
     }
 
+    /// Whether the server declared `workspace.workspaceFolders.supported`,
+    /// accepting the folders supplied at `initialize` even if it ignores later
+    /// change notifications. See [`supports_initial_workspace_folders`].
+    pub(crate) fn supports_initial_workspace_folders(&self) -> bool {
+        self.server_capabilities()
+            .is_some_and(supports_initial_workspace_folders)
+    }
+
     /// Log, at most once per connection, that a `preferSharedInstance` server
-    /// lacks the `workspaceFolders` capability and is therefore staying on the
-    /// per-root-instance model (#391). Returns `true` on the first call.
+    /// lacks the `workspaceFolders` capability, so marker-rooted documents its
+    /// connection does not already serve divert to the per-root-instance model
+    /// (#391). Marker-less documents stay aboard — they bring no marker root
+    /// (their client-workspace announcement is capability-gated away on such
+    /// a connection, an accepted residual) — so both divert sites call this
+    /// only when a divert actually happens. Returns `true` on the first call.
     pub(crate) fn log_incapable_fallback_once(&self, server: &str) -> bool {
         let first = self
             .incapable_fallback_logged

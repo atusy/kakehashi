@@ -100,13 +100,68 @@ pub(crate) fn workspace_from_marker(
     }
 }
 
+/// Whether two workspace-root spellings name the same root: filesystem-path
+/// identity when both parse as `file` URLs, URI-text identity otherwise. A
+/// client-supplied string and a marker walk's regenerated URL can spell the
+/// same directory with a trailing slash or different percent-encoding, and
+/// treating those as distinct either forks a per-root process (the divert
+/// proof) or re-announces a folder the server was already told about at
+/// initialize (`add_and_announce`).
+pub(crate) fn same_root_uri(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let file_path = |s: &str| Url::parse(s).ok().and_then(|url| url.to_file_path().ok());
+    match (file_path(a), file_path(b)) {
+        (Some(a), Some(b)) => same_file_path(&a, &b),
+        _ => false,
+    }
+}
+
+/// Filesystem-path identity, platform-aware without touching the filesystem
+/// (`fs::canonicalize` would resolve symlinks and fail on paths that do not
+/// exist yet — both wrong for a root-identity question). On Windows the drive
+/// letter is case-folded (`C:\repo` and `c:\repo` decode from equally valid
+/// URL spellings of one directory); the rest of the path is compared verbatim
+/// — folding it wholesale would merge genuinely distinct directories on
+/// case-sensitive volumes, and the conservative failure direction here is the
+/// false NEGATIVE (a re-announce or an extra per-root process), never the
+/// false positive (two different roots treated as one).
+#[cfg(not(windows))]
+fn same_file_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b
+}
+
+#[cfg(windows)]
+fn same_file_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::path::{Component, Prefix};
+    let mut components_a = a.components();
+    let mut components_b = b.components();
+    match (components_a.next(), components_b.next()) {
+        (Some(Component::Prefix(prefix_a)), Some(Component::Prefix(prefix_b))) => {
+            let prefix_eq = match (prefix_a.kind(), prefix_b.kind()) {
+                (
+                    Prefix::Disk(drive_a) | Prefix::VerbatimDisk(drive_a),
+                    Prefix::Disk(drive_b) | Prefix::VerbatimDisk(drive_b),
+                ) => drive_a.eq_ignore_ascii_case(&drive_b),
+                (kind_a, kind_b) => kind_a == kind_b,
+            };
+            prefix_eq && components_a.eq(components_b)
+        }
+        _ => a == b,
+    }
+}
+
 /// Resolve the marker root **and** its `WorkspaceFolder` for a spawn, as a
 /// single unit — `Some` only when a marker root is found *and* parses as an LSP
-/// `Uri`. Returning both together means the connection-pool key (issue #382) and
-/// the spawn handshake derive from the exact same decision: when this is `Some`,
-/// the key roots at `root` and the server spawns rooted there; when it is `None`
-/// (no hint, no marker, the `[]` kill switch, or an unparseable URI), the key
-/// roots at the client-root fallback and so does the spawn. They never disagree.
+/// `Uri`. Returning both together means the per-root connection-pool key (issue
+/// #382) and the spawn handshake derive from the exact same decision: when this
+/// is `Some`, the per-root key roots at `root` and the server spawns rooted
+/// there; when it is `None` (no hint, no marker, the `[]` kill switch, or an
+/// unparseable URI), the per-root key is the client-root fallback and the spawn
+/// uses the client root. They never disagree. (#391's shared-instance routing
+/// layers on top in `resolve_acquire` and can replace the per-root KEY with the
+/// shared one; the spawn-root rule is unchanged by it.)
 pub(crate) fn resolve_marker_workspace(
     root_markers: Option<&[RootMarker]>,
     document_uri: Option<&Url>,
@@ -505,5 +560,24 @@ mod tests {
 
         assert_eq!(root_uri.as_deref(), Some("file:///client/root"));
         assert_eq!(folders, Some(vec![fallback_folder]));
+    }
+
+    /// Windows drive letters are case-insensitive: two equally valid URL
+    /// spellings of one directory decode to `C:\\repo` and `c:\\repo`, and
+    /// treating them as distinct re-announces folders or forks per-root
+    /// processes. Only the DRIVE folds — differently cased remaining
+    /// components stay distinct (case-sensitive volumes exist), as do
+    /// different drives. The portable equivalence tests derive both spellings
+    /// from one path, so their drive casing is identical and this folding
+    /// needs its own pin.
+    #[cfg(windows)]
+    #[test]
+    fn same_root_uri_folds_only_the_windows_drive_letter() {
+        assert!(same_root_uri("file:///C:/repo", "file:///c:/repo"));
+        assert!(!same_root_uri("file:///C:/repo", "file:///D:/repo"));
+        assert!(
+            !same_root_uri("file:///C:/Repo", "file:///C:/repo"),
+            "non-drive components must not fold"
+        );
     }
 }

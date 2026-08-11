@@ -56,13 +56,28 @@ client-root connection (the pre-#382 behavior).
 **Shared-instance opt-in** (#391): a per-server `preferSharedInstance` boolean
 (default `false`) routes a server's documents to one shared connection
 (`ConnectionKey::shared`, kept distinct from the client-root fallback) instead
-of one per marker root. It is honored only when the downstream server
-advertises `workspace.workspaceFolders.{supported, changeNotifications}`
+of one per marker root. Marker-less documents (non-file URIs such as an
+editor's `untitled:` scratch documents, files with no marker up the tree, or
+acquisitions with no document hint) join the shared instance too — the complete
+client workspace (the folder snapshot, or the bare `rootUri` when the client
+sent no folders) is announced on their behalf, so a shared connection spawned
+under some marker root still learns the workspace such documents belong to. Keeping them on the client-root fallback would fork a
+second process whose session-wide state (e.g. a completion corpus over every
+open document) never meets the shared instance's. Root-JOINING is honored only when the downstream server advertises
+`workspace.workspaceFolders.{supported, changeNotifications}`
 (`ConnectionHandle::supports_workspace_folder_changes`); the acquire path
 (`resolve_acquire`) checks the existing shared connection's capability and, if
 it is `Ready` but incapable, logs once and falls back to the per-root key — so a
 misconfigured opt-in degrades to per-root instances rather than wedging the
-2nd+ root on a server that ignores `rootUri`. The shared connection's folder set
+2nd+ root on a server that ignores `rootUri`. Marker-less documents are exempt
+from that divert: they bring no marker root, so the missing capability never
+blocks them and they ride the incapable shared connection rather than fork the
+fallback — accepting that their didOpen may fall outside such a connection's
+folders (their client-workspace announcement is capability-gated away;
+out-of-workspace documents are LSP-legal, and diverting instead would re-split
+the session-wide state this routing unifies). On capable connections the
+complete client workspace (folder snapshot, or the bare rootUri when the
+client sent no folders) is announced on their behalf. The shared connection's folder set
 (`WorkspaceFolderSet`, shared with the reader task that answers
 `workspace/workspaceFolders` pulls) grows as new roots join: on acquiring the
 shared connection for a not-yet-known root, the pool CAS-inserts the root and
@@ -518,6 +533,31 @@ languageServers:
 - **2026-07-13**: Added one workspace-wide `window/logMessage` severity policy
   for downstream-forwarded and kakehashi-originated messages (#852). The
   default is `info`; `window/showMessage` remains unaffected.
+- **2026-08-11**: Marker-less documents of a `preferSharedInstance` server now
+  join the shared instance instead of the client-root fallback. The exclusion
+  dated from #391's framing of shared-membership as "roots that join via
+  `didChangeWorkspaceFolders`" — but announcing is what new ROOTS need, not
+  what admission needs, and the fallback fork split session-wide downstream
+  state: an editor's `untitled:` scratch document landed on a second server
+  process that never saw the documents on the shared one (observed as a
+  completion corpus missing every open buffer's words). Marker-less documents
+  are also exempt from the incapable-shared divert, since they bring no marker
+  root the capability would be needed for (their client-workspace announcement
+  is capability-gated away there — the possibly out-of-workspace `didOpen` is
+  the accepted residual recorded above). Non-opted-in servers keep the client-root
+  fallback for marker-less documents. Known consequence: a shared connection
+  spawned by a marker-less FIRST acquisition seeds its folder set and
+  initialize handshake with the full client snapshot of that moment, and
+  `apply_workspace_folder_change` deliberately does not keep that seed current
+  (the folder set has one writer after spawn — acquisitions; forwarding client
+  changes would need per-folder provenance). Served-root proof for the
+  incapable divert is a separate, tiered fact (`incapable_shared_serves`):
+  initialize-listed folders count for a server that declared
+  `workspaceFolders.supported` (only change notifications missing), while a
+  server with no folder support at all is only ever proven for its recorded
+  spawn root (compared by filesystem path, so trailing-slash or
+  percent-encoding differences between a client root string and a marker
+  walk's URL cannot fake a mismatch).
 - **2026-07-01**: Renamed the `languageServers.*.rootMarkers` config key to
   `workspaceMarkers` (aligning with the LSP spec's `workspaceFolders`); the old
   `rootMarkers` is accepted as a deprecated serde alias for backward

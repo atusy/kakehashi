@@ -71,7 +71,12 @@ impl WorkspaceFolderSet {
             .recover_poison("WorkspaceFolderSet::replace") = Self::deduplicate(folders);
     }
 
-    /// Whether a folder with `folder`'s URI is already in the set.
+    /// Whether a folder with `folder`'s URI is already in the set. Test-only:
+    /// the incapable-shared divert compares path-normalized roots against
+    /// `snapshot()` (raw URI equality would fake mismatches), and production
+    /// membership checks during announce live inside `add_and_announce`'s
+    /// atomic section.
+    #[cfg(test)]
     pub(crate) fn contains(&self, folder: &WorkspaceFolder) -> bool {
         self.inner
             .lock()
@@ -122,7 +127,18 @@ impl WorkspaceFolderSet {
             .lock()
             .recover_poison("WorkspaceFolderSet::add_and_announce");
         if let Some(folders) = guard.as_ref()
-            && folders.iter().any(|existing| existing.uri == folder.uri)
+            // Path-normalized, not raw URI text: a marker walk's regenerated
+            // URL and a client-seeded initialize folder can spell the same
+            // directory with a trailing slash or different percent-encoding,
+            // and treating them as distinct would announce a folder the
+            // server was already told about at initialize — and keep both
+            // spellings in the set (duplicate indexing downstream).
+            && folders.iter().any(|existing| {
+                crate::lsp::bridge::root_markers::same_root_uri(
+                    existing.uri.as_str(),
+                    folder.uri.as_str(),
+                )
+            })
         {
             return true;
         }
@@ -148,6 +164,52 @@ mod tests {
             uri: Uri::from_str(uri).unwrap(),
             name: uri.rsplit('/').next().unwrap_or(uri).to_string(),
         }
+    }
+
+    /// Membership is path identity, not URI text: a folder already present
+    /// under one spelling must swallow an equivalent spelling silently — no
+    /// second announce (the server was told at initialize), no second entry
+    /// (duplicate indexing downstream). Reachable since marker-less
+    /// acquisitions spawn shared connections seeded with client-spelled
+    /// folders that marker walks later regenerate in canonical form.
+    #[test]
+    fn add_and_announce_swallows_an_equivalent_spelling_of_a_present_folder() {
+        // Build both spellings from a real platform path: a drive-less
+        // "file:///repo/x" literal would not decode to a file path on
+        // Windows, silently voiding the equivalence this test pins.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("x");
+        let slashed = url::Url::from_directory_path(&dir).unwrap(); // trailing slash
+        let plain = url::Url::from_file_path(&dir).unwrap(); // no trailing slash
+
+        let set = WorkspaceFolderSet::new(Some(vec![folder(slashed.as_str())]));
+        let mut announced = false;
+        let committed = set.add_and_announce(folder(plain.as_str()), || {
+            announced = true;
+            true
+        });
+        assert!(
+            committed,
+            "an equivalent folder counts as already committed"
+        );
+        assert!(
+            !announced,
+            "no didChangeWorkspaceFolders for a served folder"
+        );
+        assert_eq!(
+            set.snapshot().unwrap().len(),
+            1,
+            "the set must not accumulate a second spelling of the same root"
+        );
+
+        // A genuinely different root still announces and commits.
+        let mut announced_new = false;
+        assert!(set.add_and_announce(folder("file:///repo/y"), || {
+            announced_new = true;
+            true
+        }));
+        assert!(announced_new);
+        assert_eq!(set.snapshot().unwrap().len(), 2);
     }
 
     #[test]

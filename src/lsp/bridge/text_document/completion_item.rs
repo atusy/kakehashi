@@ -111,11 +111,12 @@ impl LanguageServerPool {
         // `host_uri` comes from client-supplied `data` (the resolve params echo
         // the item's envelope), so an unparseable value fails soft rather than
         // falling through to `get_or_create_connection(.., None)`, whose `None`
-        // document hint routes to the rootless client-fallback key. The bridge
-        // only ever mints a valid `Url::as_str()` here, so a parse failure means
+        // document hint routes to the rootless client-fallback key (the shared
+        // instance for a `preferSharedInstance` server). The bridge only ever
+        // mints a valid `Url::as_str()` here, so a parse failure means
         // a corrupt or foreign envelope. This rejects only UNPARSEABLE strings:
         // a well-formed non-file URL parses, then fails root resolution and
-        // lands on that same fallback key anyway — the host path is fail-soft
+        // lands on that same rootless key anyway — the host path is fail-soft
         // throughout, so that costs a wasted round trip, not correctness.
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             warn!(
@@ -190,7 +191,9 @@ impl LanguageServerPool {
         // ran on (#382): the envelope carries the originating host URI, which
         // resolves to the same connection key. Without it (legacy envelope with
         // an empty host_uri), this falls back to the server's client-root
-        // connection — a different process in a multi-root monorepo. The origin
+        // connection (its shared instance for a `preferSharedInstance` server)
+        // — a different process in a multi-root monorepo of per-root servers.
+        // The origin
         // is normally already pooled by the completion request that produced the
         // item; only if it died in between does this respawn.
         let host_uri = Url::parse(&envelope.host_uri).ok();

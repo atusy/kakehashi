@@ -457,18 +457,21 @@ impl LanguageServerPool {
             // there, preserving its workspace root/context.
             Some(handle) => handle,
             // Not Ready or gone. Reconnect ONLY for a plain client-root fallback:
-            // `get_or_create_connection(.., None)` resolves back to that exact
-            // ClientFallback key, so the command runs in the same context. A
-            // SHARED key (`preferSharedInstance`) does NOT round-trip through
-            // `None` — `resolve_acquire` returns the client-fallback key for a
-            // marker-less acquisition, so reconnecting with `None` would spawn a
-            // client-root process instead of the shared instance and run the
-            // command in the wrong workspace. A MARKER-rooted key has the same
-            // problem here; the encoded-command path solves it with
+            // `get_or_create_connection(.., None)` resolves back to that same
+            // client-rooted context. A ClientFallback registry key implies the
+            // server was NOT opted into `preferSharedInstance` when the command
+            // registered — an opted-in server's marker-less acquisitions route
+            // to the shared key and never mint one — so the `None` re-resolution
+            // lands back on the ClientFallback key. Should the opt-in flip
+            // between registration and reconnect, it lands on the shared
+            // instance instead: the same client root, on the routing the new
+            // config asks for. A MARKER-rooted key cannot round-trip through
+            // `None` at all; the encoded-command path solves that with
             // `reconnect_by_key` (which rebuilds the workspace from the root the
             // token carries), but a palette command's registry entry is only a
-            // key, so wiring this path to the same helper is a follow-up.
-            // Shared keys cannot be re-rooted without a document either way.
+            // key, so wiring this path to the same helper is a follow-up. A
+            // SHARED key that is gone stays refused (`reconnect_by_key`): which
+            // marker roots it served died with the connection.
             None if key.is_client_fallback() => {
                 // No spawnability re-check here: the chosen key passed the
                 // identical predicate against this same borrowed snapshot a few
@@ -480,6 +483,14 @@ impl LanguageServerPool {
                 // `has_capability` check below would then spuriously fail-soft to
                 // `null` even though it would be Ready moments later. Fails soft on
                 // timeout/spawn error like every other branch.
+                //
+                // A key-CHANGING reconnect spawns under a key that never had
+                // a predecessor to arm its re-open debt; arm it BEFORE
+                // acquiring so the spawn's handshake claims the debt and the
+                // barrier below genuinely waits on the repair (see
+                // `arm_reopen_if_key_changed` for the full rationale).
+                let (_marker, resolved_key) = self.resolve_acquire(origin, &config, None).await;
+                self.arm_reopen_if_key_changed(&key, &resolved_key);
                 match self
                     .get_or_create_connection_wait_ready(
                         origin,
@@ -511,8 +522,20 @@ impl LanguageServerPool {
         // Same ordering requirement as the encoded path: a palette command can
         // reference a document too (a downstream is free to take a URI argument),
         // and this connection may have just respawned with its re-open still in
-        // flight. Bounded, and a no-op when nothing is pending.
-        if !self.wait_for_pending_reopen(&key).await {
+        // flight. Bounded, and a no-op when nothing is pending. Watch the key of
+        // the connection actually ACQUIRED, not the registry key: the reconnect
+        // branch can legitimately come back with a shared-keyed handle (a
+        // preferSharedInstance flip between registration and reconnect), and a
+        // barrier on the stale ClientFallback key would be vacuously satisfied
+        // while the acquired connection's re-opens are still in flight. The
+        // reconnect branch arms the resolved key before acquiring for exactly
+        // that case, so a key-changing reconnect's fresh spawn claims the debt
+        // and this wait covers its repair. The residue is a key-changing
+        // reconnect that finds the resolved key's connection already LIVE:
+        // armed-but-unclaimed debt is invisible to this wait, per-document
+        // eager repair owns correctness there, and a command naming a document
+        // untouched since the flip fails soft downstream.
+        if !self.wait_for_pending_reopen(handle.key()).await {
             warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: origin {origin:?} is still re-opening its documents; \
