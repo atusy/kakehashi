@@ -53,7 +53,11 @@ A purge ARMS its key. The replacement's handshake CLAIMS it. The re-open then
 asks, of every currently open document, whether it belongs to this connection,
 and opens the ones that do.
 
-Nothing is remembered about documents, so nothing about them can go stale.
+No captured re-open *target list* is remembered, so no such list can go
+stale. (Per-document route bindings — bridge-routing-protocol — *are*
+remembered for a document's open lifetime and are consulted by the
+belongs-here question below; their staleness is that decision's recorded
+trade-off, not a captured-list resurrection.)
 
 ### Arming is unconditional, and that is the load-bearing part
 

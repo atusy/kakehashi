@@ -152,7 +152,12 @@ The result layers a "kakehashi decides" default at every granularity:
   warning: a result that does not deserialize to `RoutingResult` at all is
   treated as `null`; a well-typed entry whose `workspaceFolders` fails
   validation (below) is dropped whole (kakehashi decides for that server);
-  an entry naming an unknown server is ignored. An answer is also
+  an entry naming an unknown server is ignored. The answer is also
+  bounded *before* normalization: an implementation-defined ceiling on
+  the response's total size and on the number of `routing` entries
+  examined — an answer beyond either is discarded whole as malformed
+  (`null` + warn), so a provider cannot make kakehashi allocate for or
+  walk unboundedly many entries it would only discard. An answer is also
   re-screened when applied: an entry whose server is no longer a current
   candidate (deleted, disabled, or no longer language-matching after a
   reload) is dropped with a warning.
@@ -286,13 +291,19 @@ stopped-set checks, the route binding, the folder announce, and the
 spawn. Two spellings of one directory (symlink, percent-encoding, case,
 trailing slash) can therefore never mint two keys or slip past an
 equivalent stopped key. Canonicalization is admission-time work, and
-binding-driven *reuse* does not trust it forever: every binding-driven
-spawn or folder announce (a retained-key retry, a restart's folder
-re-add) **re-canonicalizes** the retained URI and revalidates the result
-against the admission-time canonical roots retained beside it — a
-directory swapped for a symlink between admission and reuse resolves
-elsewhere, and the route reads not applicable, with a warning, rather
-than following the link outside its trust universe. The folder `name` is the basename of the
+binding-driven *reuse* does not trust it forever: **every** binding-driven
+acquire or open — a retained-key retry, a restart's folder re-add, and
+the fast paths that find an already-live per-root handle or an
+already-announced folder — **re-canonicalizes** the retained URI and
+requires the result to **equal** the admission-time canonical URI
+(containment is not enough: a directory swapped for a symlink to a
+*sibling* inside the same trust root still canonicalizes elsewhere, and
+equality catches it where containment would not). A mismatch reads not
+applicable, with a warning. The residual window is named honestly: like
+any path-based check, a swap landing between revalidation and the OS
+call that uses the path narrows to a race, not to zero — closing it
+outright needs filesystem-identity enforcement (device/inode pinning),
+recorded here as an implementation option, not a v1 requirement. The folder `name` is the basename of the
 canonical root, exactly as `root_markers::workspace_at_root` derives it
 for a marker-rooted spawn (falling back to the URI string for a root with
 no basename).
@@ -486,11 +497,15 @@ structures with different lifetimes carry the outcome:
   fails *after* the route was decided — waiters proceed without the
   server, and later opens retry the retained key through the ordinary
   respawn path rather than falling through to a different resolution;
-  and a decision that ends with no answer settles every remaining entry
-  as *kakehashi-decides*. Every settlement write is a **compare-and-set
-  against the exact pending (incarnation, flight) it settles**: a task
-  outlived by a close/re-open finds the new incarnation's record and
-  writes nothing. A lazy request-path open that finds a *pending* entry
+  and a decision that ends with no answer does **not** settle entries
+  keyless: each open task proceeds by kakehashi's own resolution, and
+  that ordinary acquire's commit settles *routed(key)* or
+  *retained(key)* exactly as above — every settled entry carries a key
+  or a suppression, so a lazy waiter can never resolve a different key
+  than the eager open landed on. Every settlement write is a
+  **compare-and-set against the exact pending (incarnation, flight) it
+  settles**: a task outlived by a close/re-open finds the new
+  incarnation's record and writes nothing. A lazy request-path open that finds a *pending* entry
   awaits its settlement (bounded by the decision's remaining deadline)
   instead of default-opening — without that, a hover-class request
   racing the decision window could open the document on a server the
@@ -548,12 +563,18 @@ Decision-cache lifecycle:
   alternatives are provider queries resurrecting on hover-class request
   paths, or a thundering herd of every open document re-deciding at once
   after a provider restart.
-- **Triple anchor, checked at application.** A single-flight query
-  captures (config generation, flush epoch, document open incarnation)
-  when it starts — the epoch is a monotonic counter bumped by every
+- **Triple anchor, checked at application.** A single-flight query is
+  anchored on (config generation, flush epoch, document open
+  incarnation) — the epoch is a monotonic counter bumped by every
   flush; the incarnation is the per-open token the document store
-  already mints — and its answer is **applied and inserted only while
-  the anchors hold**, with a mismatch handled by kind:
+  already mints. The incarnation anchor is fixed when the pending
+  record is created; the generation and epoch anchors are captured at
+  **first dispatch** (the first poll that fans out), so provider-set
+  churn between record creation and dispatch — a provider reaching
+  `Ready` just before the first poll — folds into the dispatch-time
+  selection instead of invalidating a flight that never dispatched.
+  The answer is **applied and inserted only while the anchors hold**,
+  with a mismatch handled by kind:
   - a **generation or epoch** move (the document is still the same
     open) discards the flight's answer and the waiting open tasks fall
     open to kakehashi-decided routing — one wasted round trip, never a
@@ -611,6 +632,13 @@ provider must degrade routing, never drive a `Ready` connection to
 inside Tier-1's trigger once Phase 3 lands, and a 2-5s per-request bound
 would preempt a longer routing deadline): the routing deadline is the sole
 bound on these requests.
+
+Filesystem validation (the canonicalization above) runs off the async
+executor, charged against the decision's remaining budget; at the
+deadline the decision falls open and the orphaned blocking call's result
+is discarded — the *decision's* latency stays bounded even where an OS
+filesystem call (a network mount, an automount) cannot be cancelled and
+outlives it detached.
 
 Because they carry no tier accounting, outstanding provider requests are
 cleaned up on **every terminal outcome of the decision**, not only
