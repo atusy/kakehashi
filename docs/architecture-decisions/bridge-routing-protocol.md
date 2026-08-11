@@ -55,8 +55,8 @@ only subtract servers or redirect roots (see Trust Model).
 ### The Request
 
 One **decision** — one logical fan-out, carrying one JSON-RPC request per
-selected provider — is issued per **(host document, language)**, not per
-injection region. All injection regions of one language in one host document
+selected provider — is issued per **(host document, layer, language)**,
+not per injection region. All injection regions of one language in one host document
 route to the same connections, so the decision is genuinely per language;
 querying per region would multiply one decision by the region count (the
 shipped markdown injection query emits hundreds of `markdown_inline` regions
@@ -458,8 +458,13 @@ candidates at all likewise queries nothing.
   complete within the decision's remaining budget (or acquire pool
   capacity) is dropped with a warning — the answer's other, already
   normalized entries stand, and the predicate runs on whatever
-  normalization produced by the deadline. Whole-answer discard is
-  reserved for an answer that never arrived or never deserialized. For routing the predicate is: the `routing` map
+  normalization produced by the deadline. Folder-entry validations
+  launch **concurrently** onto the pool (admission is FIFO per
+  decision), so one blocked entry cannot serially starve later entries
+  of the deadline, and no JSON object order becomes an accidental
+  priority. Whole-answer discard is reserved for an answer that never
+  arrived, never deserialized, or failed the structural bounds (the
+  entry cap). For routing the predicate is: the `routing` map
   holds at least one operative entry, per the operative rule above.
   `null`, `{ routing: {} }`, an entry with no fields, an error response,
   a timeout, and a malformed answer all mean "no opinion" and fall
@@ -799,10 +804,13 @@ deadline, not a sum) and any initialization waits inside it. A provider
 reaching `Ready` with less than a minimum remaining budget
 (implementation-defined floor) is skipped rather than queried into a
 guaranteed timeout. On expiry kakehashi sends `$/cancelRequest` for every
-still-pending routing request and retires those entries atomically with
-synthesizing the fallback answer — a late response has nowhere to land and
-is dropped and logged — then proceeds with kakehashi-decided routing plus a
-warning. Routing requests are **excluded from Tier-2 liveness accounting**,
+still-pending routing request and retires those entries, drops the
+folder entries still stuck in validation (per-entry, as normalization
+defines), and runs the fan-in over whatever normalized results exist —
+a completed suppression or affirmation from an answered provider still
+wins its position; the **whole** fallback is synthesized, atomically
+with the retirements so a late response has nowhere to land, only when
+nothing operative arrived at all — then proceeds, warned. Routing requests are **excluded from Tier-2 liveness accounting**,
 exactly as bridge-client-control-protocol excludes pass-through and via the
 same per-entry classification: they carry their own deadline, and a slow
 provider must degrade routing, never drive a `Ready` connection to
@@ -858,7 +866,15 @@ driver and the per-server open tasks are additionally covered by a
 requires for its detached operations: an abnormal exit — panic or
 abort — CAS-settles the exact flight to the fallback and retires its
 retained (handle, id) registrations, so no crash can leave a flight,
-a router entry, or a pending binding stuck until shutdown.
+a router entry, or a pending binding stuck until shutdown. The guard
+finalizes **per entry** too: an open task that dies *after* the flight
+settled leaves its (incarnation, flight, server) binding entry to the
+guard, which settles it *retained(key)* when a route was decided for
+that server (later opens retry the key) and *not-applicable*
+otherwise — the guard settles records, it never performs opens. And a
+(handle, id) registration is attached to the guard's cleanup ownership
+**atomically with the router insertion**, so a panic between the two
+cannot leak an unretained registration.
 
 **Where the await lives.** The decision is *not* awaited on the `didOpen`
 handler. The handler's candidate enumeration stays synchronous and the

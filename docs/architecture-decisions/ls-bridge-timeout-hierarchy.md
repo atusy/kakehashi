@@ -118,12 +118,15 @@ Global Shutdown overrides all (highest priority)
 
 **Routing Decision Deadline** (bridge-routing-protocol):
 - One deadline bounds an entire routing decision: the concurrent provider
-  fan-out and any bounded initialization waits inside it
+  fan-out, any bounded initialization waits, and the per-entry answer
+  normalization (folder validation and marker-anchor work on the bounded
+  validation pool) inside it
 - **Duration**: implementation-defined, documented default in the
   low-seconds class
 - On expiry the pending provider requests are cancelled
-  (`$/cancelRequest`) and their entries retired atomically with the
-  fallback answer; the decision falls open to kakehashi-decided routing
+  (`$/cancelRequest`) and retired, unfinished folder entries drop
+  per-entry, and fan-in runs over the normalized results that exist;
+  the whole fallback is synthesized only when nothing operative arrived
 - Routing requests are excluded from Tier-2 liveness accounting (same
   per-entry classification as pass-through): they carry their own
   deadline, and a slow provider must never drive a `Ready` connection to
