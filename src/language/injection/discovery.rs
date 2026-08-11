@@ -542,6 +542,7 @@ fn extract_content_and_language<'a>(
 fn find_injection_at_position<'a>(
     injections: &'a [InjectionRegionInfo<'a>],
     byte_offset: usize,
+    doc_len: usize,
     boundary: RegionBoundary,
 ) -> Option<(usize, &'a InjectionRegionInfo<'a>)> {
     let half_open = injections.iter().enumerate().find(|(_, inj)| {
@@ -553,13 +554,17 @@ fn find_injection_at_position<'a>(
         RegionBoundary::HalfOpen => half_open,
         RegionBoundary::CaretEndFallback => half_open.or_else(|| {
             // No region contains the byte: accept a region whose trailing edge
-            // the caret sits on, provided that edge is mid-line (see the
-            // variant doc for why column 0 stays outside). Same iteration
-            // order as above, so nested regions ending at the same byte keep
-            // the established first-match (outermost) tie-break.
+            // the caret sits on, provided that edge is mid-line — or at the
+            // document's end, where a column-0 edge means an unclosed block
+            // whose content ends on the newline just typed, not a closing
+            // fence (see the variant doc). Same iteration order as above, so
+            // nested regions ending at the same byte keep the established
+            // first-match (outermost) tie-break. The second scan runs only on
+            // the miss path, over the handful of regions a document has — not
+            // worth fusing into one pass.
             injections.iter().enumerate().find(|(_, inj)| {
                 inj.content_node.end_byte() == byte_offset
-                    && inj.content_node.end_position().column > 0
+                    && (inj.content_node.end_position().column > 0 || byte_offset == doc_len)
             })
         }),
     }
@@ -581,10 +586,14 @@ pub(crate) enum RegionBoundary {
     HalfOpen,
     /// Half-open first; only when that finds nothing, accept a region whose
     /// end byte equals the cursor **and** whose end sits mid-line (a non-zero
-    /// end column). A region ending at column 0 (fenced-block shape) keeps the
-    /// caret on the closing fence outside: every caret position on its last
-    /// content line is already inside half-open, so the fallback would only
-    /// ever add the fence line itself.
+    /// end column) or at the document's end. A region ending at column 0
+    /// (fenced-block shape) keeps the caret on the closing fence outside:
+    /// every caret position on its last content line is already inside
+    /// half-open, so the fallback would only ever add the fence line itself.
+    /// The end-of-document case is the one column-0 shape with no fence line
+    /// to protect — an unclosed block whose content ends on the newline the
+    /// user just typed — and mirrors the node-reference-protocol ADR's
+    /// end-of-document exception (`b == L && e == L`).
     CaretEndFallback,
 }
 
@@ -633,7 +642,7 @@ impl InjectionResolver {
     ) -> Option<ResolvedInjection> {
         let injections = collect_all_injections(&tree.root_node(), text, Some(injection_query))?;
         let (_region_index, region) =
-            find_injection_at_position(&injections, byte_offset, boundary)?;
+            find_injection_at_position(&injections, byte_offset, text.len(), boundary)?;
         if region.combined {
             let group: Vec<_> = injections
                 .iter()
@@ -2372,7 +2381,12 @@ mod tests {
 
         // Test finding position inside first Lua block
         let lua1_byte = nodes[0].start_byte() + 1; // Inside first string
-        let result = find_injection_at_position(&injections, lua1_byte, RegionBoundary::HalfOpen);
+        let result = find_injection_at_position(
+            &injections,
+            lua1_byte,
+            text.len(),
+            RegionBoundary::HalfOpen,
+        );
         assert!(result.is_some(), "Should find injection at lua1 position");
         let (idx, region) = result.unwrap();
         assert_eq!(idx, 0, "Should be at index 0");
@@ -2380,7 +2394,8 @@ mod tests {
 
         // Test finding position inside Python block
         let py_byte = nodes[1].start_byte() + 1;
-        let result = find_injection_at_position(&injections, py_byte, RegionBoundary::HalfOpen);
+        let result =
+            find_injection_at_position(&injections, py_byte, text.len(), RegionBoundary::HalfOpen);
         assert!(result.is_some(), "Should find injection at python position");
         let (idx, region) = result.unwrap();
         assert_eq!(idx, 1, "Should be at index 1");
@@ -2388,7 +2403,12 @@ mod tests {
 
         // Test finding position inside second Lua block
         let lua2_byte = nodes[2].start_byte() + 1;
-        let result = find_injection_at_position(&injections, lua2_byte, RegionBoundary::HalfOpen);
+        let result = find_injection_at_position(
+            &injections,
+            lua2_byte,
+            text.len(),
+            RegionBoundary::HalfOpen,
+        );
         assert!(result.is_some(), "Should find injection at lua2 position");
         let (idx, region) = result.unwrap();
         assert_eq!(idx, 2, "Should be at index 2");
@@ -2396,8 +2416,12 @@ mod tests {
 
         // Test position outside all injections
         let outside_byte = 5; // Position before any string
-        let result =
-            find_injection_at_position(&injections, outside_byte, RegionBoundary::HalfOpen);
+        let result = find_injection_at_position(
+            &injections,
+            outside_byte,
+            text.len(),
+            RegionBoundary::HalfOpen,
+        );
         assert!(
             result.is_none(),
             "Should not find injection outside regions"
@@ -2597,15 +2621,23 @@ mod tests {
         ];
 
         // byte 5 == end(A) == start(B): containment in B wins, not A's end.
-        let (_, region) =
-            find_injection_at_position(&injections, 5, RegionBoundary::CaretEndFallback)
-                .expect("B contains byte 5");
+        let (_, region) = find_injection_at_position(
+            &injections,
+            5,
+            text.len(),
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("B contains byte 5");
         assert_eq!(region.language, "python");
 
         // byte 6 == end(B), mid-line, contained nowhere: the fallback fires.
-        let (_, region) =
-            find_injection_at_position(&injections, 6, RegionBoundary::CaretEndFallback)
-                .expect("caret fallback at the trailing edge of B");
+        let (_, region) = find_injection_at_position(
+            &injections,
+            6,
+            text.len(),
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("caret fallback at the trailing edge of B");
         assert_eq!(region.language, "python");
     }
 
