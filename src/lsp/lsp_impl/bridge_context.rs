@@ -112,11 +112,16 @@ fn normalize_client_position(mapper: &PositionMapper, position: Position) -> Opt
     (normalized.line == position.line).then_some(normalized)
 }
 
-/// [`normalize_client_position`] over both endpoints of a range, flooring the
-/// end at the start so a degenerate all-overlong input stays well-formed.
+/// The range-endpoint defense: unlike a caret ([`normalize_client_position`]),
+/// range endpoints are BOUNDS — a line past the document's end clamps to the
+/// document end rather than rejecting, because the whole-document idiom
+/// `(0,0)..(u32::MAX, u32::MAX)` (codeActionsOnSave and friends) is a valid
+/// request whose intent is "everything". Over-long characters still clamp
+/// within their own lines. The end is floored at the start so a degenerate
+/// all-overlong input stays well-formed.
 fn normalize_range_endpoints(mapper: &PositionMapper, range: Range) -> Option<Range> {
-    let start = normalize_client_position(mapper, range.start)?;
-    let end = normalize_client_position(mapper, range.end)?;
+    let start = mapper.byte_to_position(mapper.position_to_byte_clamped(range.start))?;
+    let end = mapper.byte_to_position(mapper.position_to_byte_clamped(range.end))?;
     Some(Range {
         start,
         end: end.max(start),
@@ -827,9 +832,12 @@ impl Kakehashi {
         let mapper = PositionMapper::new(snapshot.text());
         let position = normalize_client_position(&mapper, position)?;
         let byte_offset = mapper.position_to_byte(position)?;
+        // The range END is a bound, not a caret: clamp a past-EOF line to the
+        // document end (see `normalize_range_endpoints`) instead of rejecting
+        // the whole request.
         let range_end = match range_end {
             None => None,
-            Some(end) => Some(normalize_client_position(&mapper, end)?),
+            Some(end) => Some(mapper.byte_to_position(mapper.position_to_byte_clamped(end))?),
         };
 
         let Some(resolved) = crate::language::InjectionResolver::resolve_at_byte_offset(

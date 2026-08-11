@@ -563,7 +563,11 @@ fn find_injection_at_position<'a>(
             // nested regions ending at the same byte keep the established
             // first-match (outermost) tie-break. The second scan runs only on
             // the miss path, over the handful of regions a document has — not
-            // worth fusing into one pass.
+            // worth fusing into one pass. Known divergence: the column is a
+            // tree-sitter byte column counted from the last `\n`, so a region
+            // ending right after a LONE `\r` (an LSP line break, not a
+            // tree-sitter one) reads as mid-line here — the translation
+            // pipeline shares that lone-CR divergence; tracked in #996.
             injections.iter().enumerate().find(|(_, inj)| {
                 inj.content_node.end_byte() == byte_offset
                     && (inj.content_node.end_position().column > 0 || byte_offset == doc_len)
