@@ -37,11 +37,11 @@ downstream connections by an opaque id derived from the pool's `ConnectionKey`.
 | Method | Kind | Input | Output |
 |---|---|---|---|
 | `kakehashi/bridge/client` | request | `{ textDocument?, name? }` | `Client[]` |
-| `kakehashi/bridge/client/request` | request | `{ id, method, params? }` | `{ result?, error? }` |
+| `kakehashi/bridge/client/request` | request | `{ id, method, params? }` | `ForwardResult` |
 | `kakehashi/bridge/client/notify` | notification | `{ id, method, params? }` | — |
-| `kakehashi/bridge/client/documents` | request | `{ id, documentSelectors? }` | `OpenDocument[]` |
+| `kakehashi/bridge/client/documents` | request | `{ id, documentSelector? }` | `OpenDocument[]` |
 | `kakehashi/bridge/client/serverInfo` | request | `{ id }` | `ServerInfo \| null` |
-| `kakehashi/bridge/client/workspaceFolders` | request | `{ id }` | `WorkspaceFolder[] \| null` |
+| `kakehashi/bridge/client/workspaceFolders` | request | `{ id }` | `WorkspaceFolder[]` |
 | `kakehashi/bridge/client/stop` | request | `{ id }` | `null` |
 | `kakehashi/bridge/client/restart` | request | `{ id }` | `null` |
 
@@ -90,11 +90,13 @@ Configuration loading therefore rejects `languageServers` names containing
 `@` or `#`.
 
 **`status`** mirrors the connection state machine
-(ls-bridge-graceful-shutdown): `starting` = Initializing, `running` = Ready,
-`stopping` = Closing, `failed` = Failed, and `stopped` = explicitly stopped via
-`stop` (see below). Stopped slots **are included** in the enumeration — they
-are absent from the live pool, and the enumeration is the only way to recover
-their id for a later `restart`.
+(ls-bridge-graceful-shutdown): `starting` = `Initializing`, `running` =
+`Ready`, `stopping` = `Closing`, `failed` = `Failed`, and `stopped` =
+explicitly stopped via `stop` (see below). Stopped slots **are included** in
+the enumeration — they are absent from the live pool, so the enumeration is
+the only way to recover their id for a later `restart`. `Failed` connections
+stay pool-resident until a later acquire replaces them, so `failed` is
+observable, if transient.
 
 ### Enumeration: `kakehashi/bridge/client`
 
@@ -102,7 +104,8 @@ Both parameters are optional and compose as AND:
 
 - `textDocument?: TextDocumentIdentifier` — only clients that serve this
   document: the document (or one of its injections) bridges to the server
-  *and* resolves to this connection's root.
+  *and* resolves to this connection's root. A document kakehashi does not
+  have open matches nothing — the parameter is a filter, not a lookup.
 - `name?: string` — only clients spawned from this `languageServers` entry.
 
 With neither parameter, all clients (including stopped slots) are returned.
@@ -115,31 +118,53 @@ mapping, no capability filtering, no document-lifecycle bookkeeping. This is
 the deliberate boundary between the bridge's managed domain and the caller's
 self-responsibility domain:
 
-- The bridge guarantees its *own* state stays coherent (its didOpen/didChange
-  sync, its virtual documents, its capability records are untouched by
-  pass-through traffic).
-- The bridge does **not** guarantee the downstream's view stays coherent with
-  the caller's expectations. A pass-through `textDocument/didOpen` creates a
-  document the bridge does not know about; a request naming a document the
-  bridge never opened is forwarded anyway (this holds after `restart` too — the
-  derived re-open restores only bridge-managed documents).
+- The bridge guarantees its own *records* stay coherent: pass-through
+  traffic never mutates the bridge's document registry, virtual documents,
+  or capability records.
+- The bridge does **not** guarantee the bridge↔downstream *agreement* stays
+  coherent. A pass-through `textDocument/didOpen` creates a downstream
+  document the bridge does not know about; a pass-through
+  `textDocument/didClose` on a bridge-managed URI makes the downstream
+  forget a document the bridge still believes is open, degrading every
+  bridge-managed feature for it until it is re-opened. Both are the caller's
+  responsibility; a request naming a document the bridge never opened is
+  forwarded anyway (this holds after `restart` too — the derived re-open
+  restores only bridge-managed documents).
 
-**Denied methods.** Five methods would not extend the downstream's state but
-corrupt the bridge's own protocol state machine, and are rejected:
-`initialize`, `initialized`, `shutdown`, `exit`, and `$/cancelRequest`
-(cancellation is expressed by cancelling the outer request — below). A denied
-`request` fails with `data.reason: "methodDenied"`; a denied `notify` is
-dropped and logged (notifications have no response channel).
+**Denied methods.** Five methods would not merely extend the downstream's
+state — they would corrupt the bridge's own protocol state machine — and are
+rejected: `initialize`, `initialized`, `shutdown`, `exit`, and
+`$/cancelRequest` (cancellation is expressed by cancelling the outer
+request — below). A denied `request` fails with
+`data.reason: "methodDenied"`; a denied `notify` is dropped and logged
+(notifications have no response channel).
 
-**Response envelope.** The outer request succeeds whenever forwarding
-succeeded, and its result wraps the downstream's answer:
+**Message-kind and params validity.** The bridge cannot know whether an
+arbitrary method name is a request or a notification, so it does not
+validate the kind: `request` always emits a downstream request, `notify`
+always emits a downstream notification. A `request` carrying a
+notification-kind method will never receive a downstream response and
+resolves only through cancellation; a `notify` carrying a request-kind
+method is a well-formed JSON-RPC notification the server will most likely
+ignore. Both are the caller's responsibility. The inner `params` must be an
+object, an array, or absent — the only shapes JSON-RPC permits — and
+anything else is rejected at the outer level with `InvalidParams`
+(`-32602`) before anything is forwarded.
+
+**Response envelope.** Except on cancellation or connection loss (below),
+the outer request succeeds whenever forwarding succeeded, and its result
+wraps the downstream's answer:
 
 ```typescript
-type ForwardResult = {
-  result?: LSPAny;         // exactly one of the two is present
-  error?: ResponseError;   // the downstream's error, verbatim
-};
+type ForwardResult =
+  | { result: LSPAny }         // includes result: null — always serialized
+  | { error: ResponseError };  // the downstream's error, verbatim
 ```
+
+Exactly one of the two keys is present, and on the success branch `result`
+is always emitted — explicitly `null` when the downstream answered `null`,
+a routine LSP outcome (hover misses, empty definitions) — so an empty
+envelope can never masquerade as a null result.
 
 The JSON-RPC framing fields (`jsonrpc`, `id`) are stripped: the downstream
 `id` is a bridge-internal request id, unrelated to the caller's, and echoing
@@ -147,17 +172,42 @@ it would only invite confusion. Outer-level errors (unknown id, stopped
 client, denied method) use the error model below, so callers can distinguish
 "the bridge could not forward" from "the server answered with an error".
 
-**Cancellation.** A `$/cancelRequest` for the *outer* request id is forwarded
-to the downstream as a cancel of the inner request, via the existing cancel
-registry (ls-bridge-message-ordering § Cancellation Forwarding). Without this,
-a hung downstream would pin the outer request forever.
+**Cancellation, timeouts, and connection loss.** A `$/cancelRequest` for the
+*outer* request id is forwarded to the downstream as a cancel of the inner
+request (ls-bridge-message-ordering § Cancellation Forwarding; mechanically,
+the handler remembers the downstream id it minted and calls
+`forward_cancel_downstream`). The outer request then fails with
+`RequestCancelled` (`-32800`); a downstream answer arriving after the cancel
+was issued is dropped and logged. Without forwarding, a hung downstream
+would pin the outer request forever — which matters because the outer
+request carries **no bridge-imposed timeout**: the bridge cannot know the
+expected latency of an arbitrary method, so the caller decides how long a
+pass-through may take, and cancellation is the only way out. For the same
+reason pass-through requests are excluded from Tier-2 liveness accounting
+(ls-bridge-timeout-hierarchy): a deliberately slow custom request is not
+evidence of a hung server and must not drive a healthy connection to
+`Failed`. `notify`, having no response, is not cancellable. If the
+connection dies after forwarding (crash, disposal), the outer request fails
+with `data.reason: "connectionLost"` rather than fabricating a downstream
+error.
+
+**Pass-through is caller→downstream only.** Server-initiated traffic that a
+pass-through call provokes — `$/progress`, `workspace/configuration`,
+`workspace/applyEdit`, any server→client request — flows through the
+bridge's normal inbound handling under bridge policy, exactly as if a
+bridged request had provoked it. In particular, a caller-minted
+`workDoneToken` riding the inner params is unknown to the bridge's progress
+aggregation, so its progress is dropped; callers must not rely on progress
+or server-request round trips through the escape hatch.
 
 ### Error Model
 
 Bridge-level failures use `RequestFailed` (`-32803`) with a machine-readable
-discriminator in `data`:
+discriminator in `data`. The `bridge/client:` message prefix marks
+control-protocol failures; bridged LSP requests keep their existing
+`bridge:` messages from ls-bridge-graceful-shutdown:
 
-```jsonc
+```json
 { "code": -32803, "message": "bridge/client: <human summary>",
   "data": { "reason": "unknownClient" } }
 ```
@@ -165,12 +215,21 @@ discriminator in `data`:
 | `data.reason` | Meaning |
 |---|---|
 | `unknownClient` | id matches no current slot |
+| `clientNotReady` | slot is `starting`, `stopping`, or `failed`; `data.status` carries which |
 | `clientStopped` | slot explicitly stopped; `restart` revives it |
 | `clientRestarting` | slot is mid-`restart`; retry after it returns |
+| `restartFailed` | the `restart` replacement reached `Failed` instead of `Ready` |
+| `connectionLost` | the connection died after the inner request was forwarded |
 | `methodDenied` | inner method is on the deny list |
 
-`notify` never errors: during `stopping`/`stopped`/`restarting` it is silently
-dropped (logged at debug level), matching JSON-RPC notification semantics.
+The bridge never queues or waits on behalf of a control call: a slot that is
+not `running` fails fast with the reasons above.
+
+`notify` never errors. It is forwarded while the slot is `starting` or
+`running` (the order queue already accepts notifications during
+initialization) and silently dropped — logged at debug level — during
+`stopping`/`stopped`/`failed`, the restart window, and for unknown ids,
+matching JSON-RPC notification semantics.
 
 ### Inspection: `documents`, `serverInfo`, `workspaceFolders`
 
@@ -184,18 +243,24 @@ type OpenDocument = {
 ```
 
 - `documents` returns the bridge-managed open documents of the connection —
-  virtual documents included, distinguished by `hostUri`. Documents opened via
-  pass-through are invisible here (outside the managed domain, by the boundary
-  above). `documentSelectors?: DocumentSelector[]` filters with standard LSP
-  DocumentSelector semantics against the downstream-facing `uri`/`languageId`;
-  omitted or `null` returns all.
+  virtual documents included, distinguished by `hostUri`. Documents opened
+  via pass-through are invisible here (outside the managed domain, by the
+  boundary above). `documentSelector?: DocumentSelector` filters with
+  standard LSP `DocumentSelector` semantics against the downstream-facing
+  `uri`/`languageId`; omitted or `null` returns all. A `stopped` slot holds
+  nothing open, so it answers `[]`.
 - `serverInfo` returns the `serverInfo` field of the downstream's initialize
-  result, which is optional in LSP — hence nullable.
+  result. `null` means exactly one thing — the downstream omitted the
+  optional field. A slot that is not `running` fails with
+  `clientStopped`/`clientNotReady` instead, so the two cases never blur.
 - `workspaceFolders` returns the folder set the bridge maintains for the
-  connection (`WorkspaceFolderSet` for shared instances, the single root
-  otherwise), as `WorkspaceFolder[] | null`. A dedicated request — rather than
-  a `rootUri` field on `Client` — because a `preferSharedInstance` connection
-  serves *many* folders and a scalar field cannot represent that.
+  connection, as `WorkspaceFolder[]`. Every connection carries a
+  `WorkspaceFolderSet` seeded at spawn (it grows only for shared instances),
+  so there is no null case; a workspace-less client-fallback connection
+  answers `[]`. This is a dedicated request — rather than a `rootUri` field
+  on `Client` — because a `preferSharedInstance` connection serves *many*
+  folders and a scalar field cannot represent that. Like `serverInfo`, it
+  fails for slots that are not `running`.
 
 ### `stop`: Graceful, and Pinned Until Explicit Restart
 
@@ -221,11 +286,28 @@ This is a deliberate behavior change to the normal path: without it, the next
 keystroke in a matching document would resurrect the server and `stop` would
 be advisory. `stop` on an already-stopped slot returns `null` (idempotent).
 
+Two lifecycle rules keep the set coherent:
+
+- **Control calls are single-flight per key.** `stop` and `restart` both
+  span a handshake and mutate the same entry, so the bridge serializes them:
+  a control call arriving while another is in flight on the same key fails
+  fast (`clientRestarting` during a restart; `clientNotReady` with
+  `data.status: "stopping"` during a stop) instead of interleaving into a
+  state where a slot is simultaneously live and stopped.
+- **The set is process-lifetime and config-checked.** A configuration reload
+  drops stopped entries whose server name no longer exists in
+  `languageServers` — their ids then resolve as `unknownClient` — while
+  entries whose server survives the reload stay stopped. Nothing is
+  persisted across kakehashi restarts.
+
 ### `restart`: Same Key, Current Config, Derived Re-Open
 
 `restart` = graceful stop (if running) + clear the stopped entry + respawn the
-**same** `ConnectionKey` under the configuration current at that moment, then
-return `null` once the replacement reaches Ready.
+**same** `ConnectionKey` under the configuration current at that moment. The
+outer request resolves when the replacement reaches `Ready` (result `null`)
+or `Failed` (error `restartFailed`), bounded by the existing initialization
+timeout (ls-bridge-timeout-hierarchy). On failure the stopped entry stays
+cleared, so the ordinary crash-respawn path still applies to the slot.
 
 - **Process-level configuration applies.** `command`, `args`,
   `initializationOptions`, settings — whatever the config says *now* is what
@@ -376,6 +458,9 @@ namespace.
   id; no parsing.
 - The stopped set lives beside the pool's per-connection maps, keyed by
   `ConnectionKey`; the acquire path checks it before any spawn decision.
+- `restart` clears the slot's entry in `consecutive_panic_counts` before
+  respawning; `stop` drives `force_kill_with_escalation` from a new
+  per-connection timeout rather than the pool-wide teardown path.
 - Pass-through cancellation reuses `forward_cancel_downstream` keyed by
   `(ConnectionKey, downstream id)`. As in the formatting pipeline, the
   handler itself records the downstream id it minted for each in-flight
@@ -394,9 +479,9 @@ namespace.
 | **Client id** | `ConnectionKey` Display string; contractually opaque; slot-stable across restarts |
 | **Name validation** | `languageServers` keys may not contain `@` or `#` |
 | **Pass-through** | Verbatim, untranslated; deny `initialize`/`initialized`/`shutdown`/`exit`/`$/cancelRequest` |
-| **Response envelope** | `{ result?, error? }` — framing fields stripped |
-| **Errors** | `RequestFailed` (`-32803`) + `data.reason` discriminator |
-| **Cancellation** | Outer `$/cancelRequest` forwarded to the inner downstream request |
-| **`stop`** | Graceful handshake; stopped set pins the slot until explicit `restart` |
-| **`restart`** | Same key, current process-level config, no re-key; derived re-open (ARM/CLAIM) |
-| **Discovery** | Announced under `capabilities.experimental` |
+| **Response envelope** | `ForwardResult`: exactly one of `result` (always emitted, may be `null`) or `error`; framing fields stripped |
+| **Errors** | `RequestFailed` (`-32803`) + `data.reason` discriminator; fail fast, never queue |
+| **Cancellation** | Outer `$/cancelRequest` forwarded to the inner downstream request; outer fails `RequestCancelled`; no bridge-imposed timeout, no Tier-2 liveness accounting |
+| **`stop`** | Graceful handshake bounded by a new per-connection timeout, then forced escalation; stopped set pins the slot until explicit `restart`; single-flight per key |
+| **`restart`** | Same key, current process-level config, no re-key; derived re-open (ARM/CLAIM); resolves at `Ready` or `Failed` (`restartFailed`); clears the panic count |
+| **Discovery** | Announced as `capabilities.experimental.kakehashi.bridgeClient: true` |
