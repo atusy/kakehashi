@@ -522,7 +522,7 @@ languageServers:
   - Handles single-server ordering; ls-bridge-server-pool-coordination coordinates multiple servers
 - **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Graceful Shutdown
   - Defines shutdown coordination for multiple concurrent connections
-  - Router broadcasts shutdown; ls-bridge-graceful-shutdown specifies per-connection sequence
+  - Router sends one `Teardown` message to the lifecycle actor, which launches per-connection shutdown sub-tasks; ls-bridge-graceful-shutdown specifies the per-connection sequence
 
 ## Amendment History
 

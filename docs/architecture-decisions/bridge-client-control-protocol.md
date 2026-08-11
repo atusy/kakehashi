@@ -458,15 +458,19 @@ their sub-tasks (handshakes, kills, waits) within the deadline, and the
 escalation reserve covers every process the actor's state records. A
 wedged per-slot `stop` can therefore neither stall teardown, nor outlive
 it, nor mutate pool state after cleanup; the outer control request then
-settles `stopFailed`/`restartFailed` per the settlement rules below
-(deadline shape: ls-bridge-timeout-hierarchy § Per-Slot Control
-Shutdown).
+settles `stopFailed`/`restartFailed` per the settlement rules below —
+**answering the outer request only while its reply is still live**: a
+caller already released by `RequestCancelled` sees nothing more, and the
+settlement is then internal lifecycle bookkeeping (deadline shape:
+ls-bridge-timeout-hierarchy § Per-Slot Control Shutdown).
 
 The abort-safety story is short because the actor makes it so: **all
 lifecycle state effects happen inside the actor's message handling, which
-is serialized and non-suspending per message.** Sub-tasks own only what the transition hands them — a process handle,
-the connection's I/O endpoints for a handshake, a reply channel — and no
-lifecycle state; the writer's stdin handoff travels
+is serialized and non-suspending per message.** Sub-tasks carry only their job parameters and borrowed resources (a
+shared `Arc` of the process handle, I/O endpoints a handshake transition
+lends) — the authoritative process handle and the reply sender stay in
+the actor's state entry, so a panicked or stale sub-task can lose
+neither; the writer's stdin handoff travels
 inside such a sub-task, so an aborted receiver returns the process to the
 actor as a completion message rather than losing it into a channel
 buffer — and a sub-task that dies (panic, cancellation, crash) is

@@ -271,9 +271,14 @@ machinery, serialization **removes** them by construction.
 
 **The actor loop never blocks.** Long operations — the LSP shutdown
 handshake, SIGTERM/SIGKILL escalation, `Child::wait` — run as spawned
-sub-tasks that own only what the transition hands them (a process handle,
-the connection's I/O endpoints for a handshake, a reply channel) and no
-lifecycle state; each completion comes back to the actor as a message. A
+sub-tasks. **Resources never travel**: the authoritative process handle,
+the reply sender, and every record live in the actor's state entry for
+the key; a sub-task borrows what it needs (a shared `Arc` of the process
+handle, the I/O endpoints a handshake transition lends it) and carries
+only its job parameters, so a panicked, aborted, or stale sub-task can
+lose nothing — its completion is a *report* referencing the key and
+generation, not a container of resources. Each completion comes back to
+the actor as a message. A
 multi-step operation (`restart` = stop phase → respawn → verify) is a
 small per-key state machine advanced by those messages, so every state
 mutation is atomic at message granularity and there is no lock to hold,
@@ -290,14 +295,18 @@ What the previous machinery bought, the actor gives structurally:
   actor transition, no child can come into existence behind an escalation
   scan. Sub-tasks the actor spawns are the delegation, tracked in its
   `JoinSet`; a "revoked claim" is just the actor ignoring a stale
-  completion message.
+  completion message — safe to ignore outright, because completions
+  carry reports, never resources (those stay in the state entry).
 - **Spawn commit is an actor transition** — the acquire path may use an
   existing `Ready` connection lock-free, but *creating* one goes through
   the actor, which checks the stopped set, termination-pending records,
   in-flight operations, and teardown sealing in-queue. An acquire can
   never race a committing `stop` into spawning beside a tombstone.
-- **Teardown is a message** — `Teardown(mode)` seals admission and drives
-  the parallel per-connection shutdowns as sub-tasks. Sealing means the
+- **Teardown is a message** — `Teardown` carries the mode and the
+  **caller-captured absolute deadline** (anchored at shutdown initiation,
+  so mailbox delay spends the budget rather than extending it), seals
+  admission, and drives the parallel per-connection shutdowns as
+  sub-tasks. Sealing means the
   actor *answers differently*, not that it stops reading its queue: a
   post-seal spawn commit fails the acquire, and a post-seal
   `Stop`/`Restart` answers `clientNotReady` with
@@ -308,7 +317,11 @@ What the previous machinery bought, the actor gives structurally:
   armed for — a token whose generation no longer matches is stale and
   dropped. A second `Teardown` upgrades the mode monotonically
   (`ProcessExit` dominates); the actor owns the single completion watch,
-  hands every caller a receiver, and publishes only after cleanup.
+  hands every caller a receiver, and publishes only after cleanup. A
+  `Teardown(ProcessExit)` arriving **after** a completed `ServerRemains`
+  run is a new transition, not a lost upgrade: it adopts the retained
+  termination-pending records, log-abandons them (§ Unconfirmed
+  termination), and publishes its own completion.
 - **Abnormal outcomes settle in one place** — the actor polls its
   sub-task `JoinSet` alongside the mailbox, so a sub-task that panics
   (and therefore never sends its completion) still surfaces as a
@@ -326,11 +339,17 @@ so cannot be re-derived from it), nor termination-pending kill handles,
 nor in-flight `Child::wait`s. The pool's supervisor restarts the actor;
 the new incarnation resumes from that storage plus its mailbox, and
 re-derives only what pool state can supply (connection states) — the same
-derive-don't-remember posture as respawn-reopen-derives-its-targets. The
-one thing a dying incarnation *can* drop is a reply channel it was about
-to answer; the caller's closed receiver maps to `RequestFailed`
-(`stopFailed`/`restartFailed`), so settlement is at-most-once and no
-caller is ever left pending.
+derive-don't-remember posture as respawn-reopen-derives-its-targets.
+Transitions themselves are **unwind-contained**: a transition stages its
+mutations on a scratch copy of the key's entry and its final act is the
+paired **commit-and-reply swap**, so a panic anywhere before that pair
+leaves the entry unchanged with the message merely consumed. That pairing
+is what keeps the closed-receiver mapping truthful: a caller whose
+receiver closes learns `RequestFailed`
+(`stopFailed`/`restartFailed`), and because reply and commit are one act,
+a closed receiver always means *not committed* — never a committed
+success misreported as failure. Settlement is at-most-once and no caller
+is ever left pending.
 
 **Sketch** (illustrative, target design):
 
@@ -345,7 +364,8 @@ enum LifecycleMsg {
     Restart { key: ConnectionKey, reply: Reply },
     CommitSpawn { key: ConnectionKey, reply: Reply },   // acquire's spawn path
     Reload { generation: ConfigGeneration, reply: Reply },
-    Teardown { mode: ShutdownMode, reply: Reply<WatchRx> }, // actor owns the one watch
+    Teardown { mode: ShutdownMode, deadline: Instant, reply: Reply<WatchRx> },
+    // ^ deadline captured by the caller at initiation; actor owns the one watch
     DeadlineExpired { token: DeadlineToken },           // generation-stamped
 }
 
