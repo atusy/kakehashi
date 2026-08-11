@@ -95,7 +95,7 @@ the timeout expires.
 |-------------------|-----------------|
 | **Order queue - Not yet dequeued** | Drained: sent before `shutdown`, preserving FIFO order |
 | **Order queue - Currently writing** | Complete write (never abort mid-stream) |
-| **Pending responses** | Fail with `REQUEST_FAILED` ("bridge: connection closing") when the timeout expires |
+| **Pending responses** | Fail with `REQUEST_FAILED` ("bridge: connection closing") at connection closure or when the timeout expires, whichever comes first |
 | **New operations** | Reject with `REQUEST_FAILED` ("bridge: connection closing") when attempting to enqueue |
 
 **Why not abort mid-write**: Operations in the order queue may be partially written to stdin. Aborting mid-write corrupts the protocol stream.
@@ -146,7 +146,15 @@ async fn graceful_shutdown(&self) {
         self.writer_idle_rx.recv()
     ).await {
         Ok(_) => log::debug!("Writer loop idle"),
-        Err(_) => log::warn!("Writer loop timeout, forcing shutdown"),
+        Err(_) => {
+            // The writer may still own stdin or sit mid-write; writing
+            // the shutdown request now could interleave with a partial
+            // frame. Skip the LSP handshake entirely and force
+            // terminate (SIGTERM → SIGKILL) — exclusive access was
+            // never acquired, so no LSP goodbye is possible.
+            log::warn!("Writer loop timeout; skipping LSP handshake");
+            return self.force_terminate().await;
+        }
     }
 
     // Phase 3: Exclusive stdin access...
@@ -196,21 +204,27 @@ All connections shut down in parallel under a single global ceiling. This is int
 
 **Timeout Application:**
 ```rust
-async fn shutdown_all_connections(connections: Vec<Connection>) {
+async fn shutdown_all_connections(pool: &ConnectionPool) {
     let global_timeout = Duration::from_secs(IMPL_DEFINED);
-    // Reserve part of the single ceiling for forced escalation
+    let deadline = Instant::now() + global_timeout;   // ONE absolute ceiling
+    // Reserve part of the ceiling for forced escalation
     // (ls-bridge-timeout-hierarchy: ~20% for SIGTERM/SIGKILL)
     let graceful_budget = global_timeout.mul_f32(0.8);
 
-    // Seal control admission first: no new per-slot stop/restart
-    // (bridge-client-control-protocol) may begin, ownership of in-flight
-    // control operations transfers to this teardown, and the seal also
-    // blocks replacement insertion — an adopted restart aborts at its
-    // next commit point, and any process it already spawned is returned
-    // here as a kill handle rather than becoming a live replacement.
+    // Seal control admission FIRST, before any snapshot: no new per-slot
+    // stop/restart (bridge-client-control-protocol) may begin, ownership
+    // of in-flight control operations transfers to this teardown, and
+    // the seal blocks replacement insertion — an adopted restart aborts
+    // at its next commit point. Control operations register every
+    // process they spawn in the teardown-owned `control_procs` registry
+    // AT SPAWN TIME, so a restart crossing its spawn point can never
+    // lose its kill handle.
     let (control_ops, control_procs) = seal_and_take_control_operations();
 
-    let _ = tokio::time::timeout(graceful_budget, async {
+    // Snapshot AFTER the seal: nothing can be inserted past it.
+    let connections = pool.all_connections();
+
+    let graceful = tokio::time::timeout(graceful_budget, async {
         // Shutdown all connections in parallel (best-effort).
         // Each task uses the state-aware dispatch below (§ Multi-Connection
         // Shutdown): Failed → cleanup_only, Initializing →
@@ -218,15 +232,21 @@ async fn shutdown_all_connections(connections: Vec<Connection>) {
         let tasks = connections.iter()
             .map(|conn| conn.shutdown_by_state());
 
-        // Join adopted control operations alongside — a registry-only
-        // restart must not escape the snapshot of live connections.
         futures::future::join_all(tasks.chain(control_ops)).await;
     }).await;
 
-    // Escalation runs inside the reserved remainder of the SAME ceiling,
-    // covering the snapshot and the adopted control processes alike
-    // (a no-op for connections that already reached Closed).
-    force_kill_remaining(connections, control_procs);
+    if graceful.is_err() {
+        // Abort adopted control tasks and JOIN them before killing, so
+        // none can mutate registries or tombstones after cleanup.
+        abort_and_join_control_tasks().await;
+    }
+
+    // Escalation runs against the SAME absolute deadline, covering the
+    // snapshot and every registered control process alike (no-op for
+    // connections already Closed). When the remaining budget is shorter
+    // than the normal SIGTERM grace, the grace is shortened or skipped —
+    // the ceiling wins over politeness.
+    force_kill_remaining_until(deadline, connections, control_procs);
 }
 ```
 
@@ -273,16 +293,18 @@ async fn shutdown_router() {
     //    operations (bridge-client-control-protocol): the seal blocks
     //    replacement insertion, so a registry-only restart can neither
     //    escape the connection snapshot below nor leave a live
-    //    replacement behind; its spawned process comes back as a kill
-    //    handle
+    //    replacement behind; every process a control operation spawns is
+    //    registered in the teardown-owned control_procs registry at
+    //    spawn time
     let (control_ops, control_procs) = seal_and_take_control_operations();
+    let deadline = Instant::now() + GLOBAL_TIMEOUT;
 
-    // 4. Shutdown all connections in parallel
+    // 4. Shutdown all connections in parallel (snapshot AFTER the seal)
     let all_connections = connection_pool.all_connections();
 
     // Reserve part of the single ceiling for forced escalation
     // (ls-bridge-timeout-hierarchy: ~20% for SIGTERM/SIGKILL)
-    let _ = tokio::time::timeout(GLOBAL_TIMEOUT.mul_f32(0.8), async {
+    let graceful = tokio::time::timeout(GLOBAL_TIMEOUT.mul_f32(0.8), async {
         let tasks = all_connections.iter()
             .map(|conn| async move {
                 // Atomic compare-transition: each arm commits its
@@ -298,10 +320,17 @@ async fn shutdown_router() {
         futures::future::join_all(tasks.chain(control_ops)).await;
     }).await;
 
-    // Escalation inside the reserved remainder of the same ceiling;
-    // covers stragglers and adopted control processes alike (no-op for
-    // connections already Closed)
-    force_kill_remaining(all_connections, control_procs);
+    if graceful.is_err() {
+        // Abort adopted control tasks and JOIN them before killing, so
+        // none can mutate registries or tombstones after cleanup below
+        abort_and_join_control_tasks().await;
+    }
+
+    // Escalation against the same absolute deadline; covers stragglers
+    // and every registered control process alike (no-op for connections
+    // already Closed). A remaining budget shorter than the normal
+    // SIGTERM grace shortens or skips the grace — the ceiling wins.
+    force_kill_remaining_until(deadline, all_connections, control_procs);
 
     // 5. Clean up router resources
     cleanup_router_state();

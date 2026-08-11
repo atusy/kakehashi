@@ -309,8 +309,9 @@ otherwise wait forever, and a wedged server is precisely this method's
 motivating case. On expiry the forced escalation applies (SIGTERM → SIGKILL
 on Unix; immediate kill on Windows). Operations follow that decision's disposal policy, with the timeout being
 this per-connection one: the already-accepted order queue drains ahead of
-`shutdown`, pending responses fail when the timeout expires, and newly
-arriving operations are rejected immediately. The result `null` is returned when
+`shutdown`, pending responses fail at connection closure or the timeout —
+whichever comes first — and newly arriving operations are rejected
+immediately. The result `null` is returned when
 the slot reaches `Closed`, whichever path got it there. `stop` on a
 `starting` slot is legal and aborts initialization with **no LSP message
 at all**: the spec forbids the client every additional request *and*
