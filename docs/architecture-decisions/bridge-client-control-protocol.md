@@ -208,8 +208,11 @@ connection dies after forwarding (crash, disposal), the outer request fails
 with `data.reason: "connectionLost"` rather than fabricating a downstream
 error. Because there is no bridge-imposed timeout and no liveness
 accounting, pending pass-throughs need their own bound: a **per-connection
-in-flight limit** caps concurrent pass-through requests, each slot released
-on downstream response, outer cancellation, or connection loss; a request
+in-flight limit** caps concurrent pass-through requests, each slot (and
+its downstream-id mapping) released on **every terminal outcome of the
+outer request** — downstream response, outer cancellation, connection
+loss, or `forwardFailed` (a failed forward never retains the slot, so
+repeated writer-full rejections cannot leak the limit away); a request
 beyond the limit fails fast with `data.reason: "passThroughLimit"` — a
 downstream that accepts requests but never answers can therefore pin at
 most the limit, never unbounded outer requests and id mappings.
@@ -619,7 +622,16 @@ lock-bounded settlement work, never inside the abortable task set.
   replacement no longer advertises workspace-folder change support,
   pool-coordination's existing capability fallback applies: subsequent
   acquires degrade to per-root connections and the restarted shared slot
-  simply serves nothing new.
+  simply serves nothing new. One piece of routing metadata **is**
+  retained across the stopped, termination-pending, and control records:
+  the shared slot's workspace-folder **capability verdict**, which that
+  fallback consults. The live decision reads it from the `Ready` handle,
+  and the handle dies with a stop — without the retained verdict,
+  non-seed roots of an *incapable* shared server would resolve
+  optimistically to the shared key while it is stopped and hit its
+  fence, blacking out per-root clients other roots already use. With
+  it, their acquires keep resolving to per-root keys exactly as when
+  the handle was live.
 
 During the restart window, `request` fails with `clientRestarting` and
 `notify` is silently dropped. `restart` on a `stopped` slot is simply a
