@@ -202,9 +202,12 @@ async fn shutdown_all_connections(connections: Vec<Connection>) {
     let global_timeout = Duration::from_secs(IMPL_DEFINED);
 
     tokio::time::timeout(global_timeout, async {
-        // Shutdown all connections in parallel (best-effort)
+        // Shutdown all connections in parallel (best-effort).
+        // Each task uses the state-aware dispatch below (§ Multi-Connection
+        // Shutdown): Failed → cleanup_only, Initializing →
+        // terminate_without_lsp, otherwise graceful_shutdown.
         let tasks = connections.iter()
-            .map(|conn| conn.graceful_shutdown());
+            .map(|conn| conn.shutdown_by_state());
 
         futures::future::join_all(tasks).await;
     }).await.unwrap_or_else(|_| {
