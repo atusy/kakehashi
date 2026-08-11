@@ -83,10 +83,13 @@ type RoutingParams = {
   // language — any-language-server-wildcard), projected to the
   // routing-relevant fields, with wildcard inheritance already resolved.
   // The `_` wildcard entry is a template, never a server, and is excluded.
+  // All three fields are always serialized, carrying the effective
+  // wildcard-resolved values with built-in defaults materialized —
+  // omission has no meaning on this wire.
   languageServers: Record<string, {
-    languages?: string[];
-    workspaceMarkers?: (string | string[])[];
-    preferSharedInstance?: boolean;
+    languages: string[];
+    workspaceMarkers: (string | string[])[];
+    preferSharedInstance: boolean;
   }>;
 };
 
@@ -404,8 +407,12 @@ advertising**; when none exists and the initialization wait applies, the
 wait targets the first **wait-eligible `Initializing`** handle in the
 same order (an `Initializing` handle cannot advertise yet — its
 eligibility comes from the per-name memo, an explicit `priorities`
-entry, or `forceStart`). An arbitrary but stable choice, recorded as
-such.
+entry, or `forceStart`) — but the wait's *subscription* is
+**per name, not per handle**: any eligible handle of the name reaching
+`Ready` (and advertising) wakes the flight and re-enumerates that
+name, so a later-ordered handle coming up first can serve the decision
+rather than the flight burning its deadline on the one handle it
+happened to pick. An arbitrary but stable choice, recorded as such.
 
 Provider order is configured through the existing per-method aggregation
 map — `languages.<host>.bridge.<lang>.aggregation`, abbreviated

@@ -108,7 +108,8 @@ with the work that belongs to the connection.
 3. Does the unit route to *this* connection? A marker resolution, paid per
    unit surviving (2). Read-only: it never spawns, so asking about a document
    belonging to another root cannot bring that root's server up.
-   bridge-routing-protocol amends this stage: when the document holds an
+   bridge-routing-protocol amends this stage (target state, landing with
+   that protocol's implementation): when the document holds an
    active route binding for the server, the binding answers instead of the
    marker walk — a suppressed server is "not applicable", a bound key must
    match this connection's — and an entry-less server (this exact (host,

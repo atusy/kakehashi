@@ -118,7 +118,9 @@ observable, if transient.
 Both parameters are optional and compose as AND:
 
 - `textDocument?: TextDocumentIdentifier` — only clients that **serve or
-  retain an assignment for** this document: the document (or one of its
+  retain an assignment for** this document (the route-binding
+  consultation below is target state, landing with
+  bridge-routing-protocol's implementation): the document (or one of its
   injections) bridges to the server *and* resolves to this connection's
   root — consulting the document's active route bindings first, matched
   per exact **server entry** within the (host, layer, language)
