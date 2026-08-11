@@ -133,6 +133,13 @@ Global Shutdown overrides all (highest priority)
   routing deadline is the sole bound on these requests
 - Global teardown overrides: decisions waiting on provider handshakes
   resolve to the fallback immediately
+- The binding-reuse validation budget composes as a **minimum**: the
+  effective bound on a lazy-open/retry validation is min(its configured
+  budget, the enclosing request's deadline — including Tier-1 once
+  Phase 3 lands — and the global shutdown ceiling); an upstream
+  cancellation discards the waiter and its result but never releases
+  the validation-pool worker permit early (the permit returns only when
+  the OS call does)
 
 **Writer-Idle Timeout** (within the applicable shutdown deadline):
 - **Duration**: 2s fixed

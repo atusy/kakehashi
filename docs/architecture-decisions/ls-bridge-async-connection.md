@@ -89,6 +89,21 @@ loses a consumed header on every liveness tick and then resyncs onto the
 message body, reporting a framing error against a well-framed stream and
 killing the connection.
 
+**Framing size ceilings** (amended with bridge-routing-protocol): the reader
+enforces three incrementally checked bounds — a maximum header-line length, a
+maximum total header-block size, and a maximum declared `Content-Length` —
+each violation being a framing error with the same fatal disposition as every
+other framing violation: the connection fails; an oversized body is never
+drained (draining an attacker-sized body can hang the reader), and the
+header-line bound is enforced as bytes accumulate, never after an unbounded
+buffer already grew. The body ceiling's default is implementation-defined and
+deliberately generous — well above the largest legitimate payloads observed
+(multi-megabyte diagnostics bursts are real) — so it trips on runaway or
+adversarial peers, not on big workspaces; a configuration knob can follow if a
+legitimate deployment ever meets it. A peer whose honest traffic exceeds the
+ceiling fails repeatedly through respawn — accepted: such a peer is
+indistinguishable from a runaway one at the framing layer.
+
 **Writer Pattern:**
 - Write requests to server stdin using async mutex-protected writer
 - Single writer task ensures no byte-level corruption

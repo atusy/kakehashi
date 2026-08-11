@@ -1051,8 +1051,13 @@ a slot a routing provider left in play.
   header declaring more than the ceiling is a **framing error and
   fails the downstream connection**, never a drain (draining an
   attacker-sized body can hang the reader) — the same fatal posture
-  every downstream framing violation already gets; the rule lands in
-  the reader's decision record alongside the implementation.
+  every downstream framing violation already gets. Header-side
+  allocation is bounded the same way: maximum header-line and total
+  header-block sizes, enforced incrementally as bytes accumulate. The
+  ceilings' values and compatibility consequences are recorded in the
+  reader's decision (ls-bridge-async-connection, amended with this
+  ADR): generous implementation-defined defaults that trip on runaway
+  peers, not big workspaces.
 - ls-bridge-timeout-hierarchy gains the routing decision deadline
   (registered beside the per-slot control shutdown timeout) and the
   Tier-2 exclusion note; that edit lands with this ADR.
