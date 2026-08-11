@@ -127,8 +127,10 @@ Both parameters are optional and compose as AND:
   *pending* tuple (its decision still in flight) matches nothing yet —
   the document is not open there — rather than falling through. A
   *retained* tuple (the route decided but its acquire failed —
-  bridge-routing-protocol) **matches its retained key**: the slot is
-  enumerable as `failed`, and surfacing it as the client assigned to
+  bridge-routing-protocol) **matches its retained key when a slot for
+  that key is enumerable** (a `Failed` handle is; a pre-handle spawn
+  failure leaves no row to match, and the tuple then matches nothing
+  until a retry produces one): surfacing the failed client assigned to
   the document is exactly what a user diagnosing missing features
   needs, unlike `pending`, whose assignment does not exist yet. A document kakehashi does not
   have open matches nothing — the parameter is a filter, not a lookup.
