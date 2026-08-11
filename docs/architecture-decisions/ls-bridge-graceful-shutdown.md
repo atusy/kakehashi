@@ -214,9 +214,10 @@ async fn shutdown_all_connections(connections: Vec<Connection>) {
 }
 ```
 
-### Initialization Shutdown: Abort Immediately
+### Initialization Shutdown: Abort Immediately, No LSP Message
 
-**Decision**: Abort initialization and proceed to shutdown.
+**Decision**: Abort initialization and terminate directly, sending no LSP
+message at all.
 
 **Sequence:**
 ```
@@ -224,16 +225,19 @@ Connection state: Initializing
 Shutdown signal arrives
 ├─ Transition: Initializing → Closing
 ├─ Fail pending initialization request (if sent)
-├─ Send exit notification (skip shutdown request - server not initialized)
-├─ Kill process (SIGTERM → SIGKILL)
+├─ Kill process (SIGTERM → SIGKILL) — no shutdown request, no exit notification
 └─ Transition: Closing → Closed
 ```
 
 **Rationale:**
 - Initialization may hang (slow server, network issue)
 - Waiting for initialization during shutdown adds unbounded latency
-- Server hasn't completed initialization—LSP shutdown request invalid
-- Exit notification sufficient for cleanup
+- Until the server has responded to `initialize`, LSP forbids the client
+  every additional request **and notification** — `exit` included — so the
+  only conformant abort is process termination with no LSP message. (An
+  earlier revision of this rule sent `exit` in this window; that was
+  non-conformant and was corrected alongside
+  bridge-client-control-protocol, whose per-slot `stop` shares this path.)
 
 ### Multi-Connection Shutdown: Parallel with Global Timeout
 

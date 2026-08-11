@@ -275,15 +275,19 @@ type OpenDocument = {
   via pass-through are invisible here (outside the managed domain, by the
   boundary above). `documentSelector?: DocumentSelector` filters against the
   downstream-facing `uri`/`languageId`, accepting the text-document filter
-  forms (`language`/`scheme`/`pattern`, absolute-glob semantics); notebook
-  filters and relative patterns need notebook or base-URI context the
-  bridge does not hold for virtual documents and are rejected with
-  `InvalidParams`. Omitted or `null` returns all. A `stopped` slot holds
+  forms (`language`/`scheme`/`pattern`); `pattern` may be a plain glob or
+  a `RelativePattern`, which is self-contained — it carries its own
+  `baseUri`. Notebook filters are the one rejected variant (they need
+  notebook context the bridge does not hold for virtual documents) and
+  answer `InvalidParams`. Omitted or `null` returns all. A `stopped` slot holds
   nothing open, so it answers `[]`.
 - `serverInfo` returns the `serverInfo` field of the downstream's initialize
-  result. `null` means exactly one thing — the downstream omitted the
-  optional field. A slot that is not `running` fails with
-  `clientStopped`/`clientNotReady` instead, so the two cases never blur.
+  result. `null` means the downstream provided no usable value — omitted,
+  JSON `null`, or malformed and dropped under the initialize parser's
+  existing tolerance policy (malformed metadata never fails
+  initialization; only capabilities are load-bearing). A slot that is not
+  `running` fails with `clientStopped`/`clientNotReady` instead, so "no
+  usable `serverInfo`" and "no live connection" never blur.
 - `workspaceFolders` returns the folder set the bridge maintains for the
   connection, as `WorkspaceFolder[]`. Every connection carries a
   `WorkspaceFolderSet` seeded at spawn (it grows only for shared instances),
@@ -315,7 +319,10 @@ response receipt: `Initializing → Closing` always means direct
 termination, and only a slot that already committed `Initializing → Ready`
 — initialize response processed *and* `initialized` enqueued — takes the
 normal `shutdown` → `exit` sequence, so `shutdown` can never jump the
-queue ahead of `initialized`. Two invariants make that arbitration sound:
+queue ahead of `initialized`. ls-bridge-graceful-shutdown's
+initialization-abort rule is amended alongside this decision — its
+earlier revision sent `exit` in that window, which the same LSP ordering
+forbids. Two invariants make that arbitration sound:
 every handshake terminal transition — `Ready`, and `Failed` from error,
 timeout, or task failure alike — commits **conditionally from
 `Initializing`**, so once `Closing` wins nothing overwrites it (today the
@@ -323,10 +330,7 @@ timeout and task-failure paths write `Failed` unconditionally and the
 error path is check-then-write); and the `initialized` enqueue commits
 **atomically with the `Ready` transition**, while the direct-abort path
 does not drain the queue — a losing handshake can neither enqueue
-`initialized` after `Closing` won nor have the abort flush it downstream. This deliberately diverges
-from ls-bridge-graceful-shutdown's `Initializing → Closing` rule, which
-sends `exit` in that window and is itself non-conformant on this point;
-correcting that decision is a follow-up. `stop` on a `failed` slot skips the LSP
+`initialized` after `Closing` won nor have the abort flush it downstream. `stop` on a `failed` slot skips the LSP
 handshake — the `Failed → Closed` bypass ls-bridge-graceful-shutdown already
 defines — cleans up the process, and records the stopped entry: pinning a
 repeatedly failing slot before the next acquire respawns it is a
