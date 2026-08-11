@@ -595,8 +595,10 @@ structures with different lifetimes carry the outcome:
   either);
   *routed(key)* settles at that server's acquire commit, recording the
   key actually landed on (a capability-fallback downgrade records the
-  downgraded per-root key); *retained(key)* settles when an acquire
-  fails *after* the route was decided — waiters proceed without the
+  downgraded per-root key); *retained(key)* settles when the decided
+  route's acquire failed — or, under abnormal finalization, was never
+  attempted because its owner died; the settlement record carries
+  which — waiters proceed without the
   server, and later opens retry the retained key through the ordinary
   respawn path rather than falling through to a different resolution;
   *not-applicable* settles when a server is genuinely rejected
@@ -925,14 +927,19 @@ adoption and settlement ownerless. Deletion — a terminal event, not a
 silent removal: waiters subscribed to the entry are woken with "retry
 as absent", atomically with the removal, and the absent-record
 semantics (ordinary resolution, lazy retry) apply — happens only once
-the flight has terminally established that no directive applies to
-the entry, or on the retryable generation/stopped mismatches. This is
-the one **recorded narrowing of the freezing guarantee**: a normal
-no-answer decision settles a key and freezes it, but an abnormally
-dead open task never ran its acquire and the guard must not acquire
-on its behalf, so the entry ends absent instead of frozen — the next
-open to consult the absent record re-resolves and establishes the
-freeze then. The guard settles records; it never
+the flight has terminally established that no **route-affecting**
+directive (no suppression, no override — an affirmation-only win
+included) applies to the entry, or on the retryable generation/stopped
+mismatches. This is the one **recorded narrowing of the freezing
+guarantee**, stated at its honest width: a normal no-answer decision
+settles a key and freezes it, but an abnormally dead open task never
+ran its acquire and the guard must not acquire on its behalf, so the
+entry ends absent — and absence promises no single frozen route:
+subsequent retriers run ordinary resolution, whose outcome can vary
+with live filesystem state, and the read-only sweep consuming the
+absence establishes nothing; the tuple is simply unbound until some
+later open's admission settles a record, exactly as if routing had
+never spoken for it. The guard settles records; it never
 performs opens or acquires. Cancellation ownership is **exclusively
 the driver/flight side's**: open tasks are passive subscribers and
 their guard touches no provider request; the flight's cleanup honors
