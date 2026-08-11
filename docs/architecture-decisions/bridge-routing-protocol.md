@@ -525,15 +525,17 @@ structures with different lifetimes carry the outcome:
   **before** any acquire runs — a configuration removal or disablement
   that ends its candidacy for the document — and is consumed like a
   suppression (waiters proceed without the server; distinct provenance
-  in the logs). Every **winning answer** is logged once at apply time
-  with the answering provider, the (document, layer, language), and its
-  effects per server — a suppression taking hold, an override landing on
-  its key, and equally an affirmation-only win, which vetoes every
-  lower-priority provider while changing nothing and would otherwise
-  leave no trace at all. This is what makes a valid-but-wrong policy
-  diagnosable from the logs (warnings cover the rejected, invalid, and
-  timed-out outcomes; a *successful* misroute would otherwise be
-  silent). Method-level capability prefilters are deliberately
+  in the logs). The winning answer is logged in two stages, because its
+  effects are not all known at once: a **decision record** when the
+  fan-in decides — the answering provider, the (document, layer,
+  language), and the normalized directives, including an
+  affirmation-only win, which vetoes every lower-priority provider
+  while changing nothing and would otherwise leave no trace — and a
+  **settlement record** per server as its entry settles (the landed or
+  downgraded key, a retained failure, a suppression taking hold). This
+  is what makes a valid-but-wrong policy diagnosable from the logs
+  (warnings cover the rejected, invalid, and timed-out outcomes; a
+  *successful* misroute would otherwise be silent). Method-level capability prefilters are deliberately
   *not* a cause — they are per-request facts (lacking hover does not
   mean lacking completion) and never settle the binding. It is **not** the
   generation-mismatch outcome: a mismatch whose server is still a
@@ -573,8 +575,9 @@ structures with different lifetimes carry the outcome:
   (one that became a candidate after the open, say via reload) falls
   through to kakehashi's ordinary resolution. The binding governs
   **every** site that derives a connection from the host URI — the
-  resolve envelopes (`completionItem/resolve`, `codeLens/resolve`)
-  included, whose host-URI re-resolution would otherwise reach the
+  resolve envelopes (`completionItem/resolve`, `codeAction/resolve`,
+  `codeLens/resolve` — every envelope that re-derives a connection from
+  a host URI) included, whose re-resolution would otherwise reach the
   config-root process instead of the one that produced the item
   (ls-bridge-server-pool-coordination is amended accordingly). The
   envelope must carry enough identity to *hit the right binding*: the

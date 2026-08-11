@@ -86,7 +86,11 @@ with the work that belongs to the connection.
 
 1. Could a document in this HOST language bridge to this server at all? Pure
    configuration, answered from the per-snapshot memo — no parse, no tree, no
-   pool lookup, no filesystem access. It rejects hosts whose configured `bridge`
+   pool lookup, no filesystem access. The screen accepts the **union** of
+   injection reachability and the host layer's own candidacy (`_self`
+   enabled with a host-language-matching server — bridge-routing-protocol's
+   host units), so a host-only route is not pre-rejected by an
+   injection-shaped filter. It rejects hosts whose configured `bridge`
    filter blocks every language the server declares, and servers no longer
    configured. How much that narrows depends entirely on the configuration: on
    the shipped defaults the bridge filter allows everything, so a workspace of

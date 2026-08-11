@@ -47,16 +47,18 @@ The `ConnectionKey` is stored on each connection handle, so the request,
 `didChange`, host, and cancel paths route per-connection state via
 `handle.key()` without re-resolving the root.
 
-`completionItem/resolve` and `codeLens/resolve` carry no `textDocument`, so the
-originating host URI is stashed in their routing envelope (`KakehashiEnvelope` /
-`CodeLensEnvelope`) and used to re-resolve the same `(server, root)` connection
-that produced the item. A legacy envelope without that field falls back to the
-client-root connection (the pre-#382 behavior). This re-resolution — like
-every site that derives a connection from the host URI — consults the active
-route binding first when one exists (bridge-routing-protocol): with a root
-override in force, marker re-resolution would reach the config-root process
-rather than the one that produced the item; a resolve arriving after the
-binding's eviction fails soft exactly as an unroutable envelope does today.
+`completionItem/resolve`, `codeAction/resolve`, and `codeLens/resolve` carry
+no `textDocument`, so the originating host URI is stashed in their routing
+envelopes (`KakehashiEnvelope` / `CodeActionEnvelope` / `CodeLensEnvelope`)
+and used to re-resolve the same `(server, root)` connection that produced the
+item. A legacy envelope without that field falls back to the client-root
+connection (the pre-#382 behavior). Amended with bridge-routing-protocol:
+this re-resolution — like every site that derives a connection from the host
+URI — consults the active route binding first, matched by the envelope's
+layer/language and open-incarnation stamp; a missing, legacy, evicted, or
+mismatched stamp **fails soft** rather than falling back to marker or
+client-root resolution, which under a root override would reach the
+config-root process instead of the one that produced the item.
 
 **Shared-instance opt-in** (#391): a per-server `preferSharedInstance` boolean
 (default `false`) routes a server's documents to one shared connection
