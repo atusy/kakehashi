@@ -143,8 +143,9 @@ request — below). A denied `request` fails with
 arbitrary method name is a request or a notification, so it does not
 validate the kind: `request` always emits a downstream request, `notify`
 always emits a downstream notification. A `request` carrying a
-notification-kind method will never receive a downstream response and
-resolves only through cancellation; a `notify` carrying a request-kind
+notification-kind method may never receive a downstream response — though a
+server seeing the unexpected `id` may answer with a result or an error —
+and can remain pending until cancelled; a `notify` carrying a request-kind
 method is a well-formed JSON-RPC notification the server will most likely
 ignore. Both are the caller's responsibility. The inner `params` must be an
 object, an array, or absent — the only shapes JSON-RPC permits — and
@@ -200,13 +201,15 @@ error.
 pass-through call provokes — `$/progress`, `workspace/configuration`,
 `workspace/applyEdit`, any server→client request — flows through the
 bridge's normal inbound handling under bridge policy, exactly as if a
-bridged request had provoked it. In particular, the bridge does not rewrite a caller-minted
-`workDoneToken` riding the inner params: progress for a token the bridge
-does not recognize is dropped, and a token that collides with a live
-bridge-minted token — whose shapes are predictable strings — is misrouted
-into that token's aggregation. Minting collision-safe tokens is the
-caller's responsibility, and callers must not rely on progress or
-server-request round trips through the escape hatch.
+bridged request had provoked it. In particular, the bridge does not rewrite, reserve, or namespace a
+caller-minted `workDoneToken` riding the inner params: progress for a token
+the bridge does not recognize is dropped, and a collision misroutes it.
+There are two collision domains — the bridge's own minted client-progress
+tokens (predictable strings) and the connection's server-declared progress
+registry, whose live tokens the caller cannot enumerate — so deterministic
+collision avoidance is impossible; high-entropy random tokens make it
+negligible, not zero. Callers must not rely on progress or server-request
+round trips through the escape hatch.
 
 ### Error Model
 
@@ -226,7 +229,8 @@ control-protocol failures; bridged LSP requests keep their existing
 | `clientNotReady` | slot is `starting`, `stopping`, or `failed`; `data.status` carries which |
 | `clientStopped` | slot explicitly stopped; `restart` revives it |
 | `clientRestarting` | slot is mid-`restart`; retry after it returns |
-| `restartFailed` | the `restart` replacement reached `Failed` instead of `Ready` |
+| `restartFailed` | the `restart` respawn failed — at spawn (missing or unspawnable command) or during initialization |
+| `forwardFailed` | the inner message could not be handed to the connection (bounded writer full, send error); nothing was forwarded |
 | `connectionLost` | the connection died after the inner request was forwarded |
 | `methodDenied` | inner method is on the deny list |
 
@@ -320,8 +324,13 @@ Three lifecycle rules keep the set coherent:
 - **The set is process-lifetime and config-checked.** A configuration reload
   drops stopped entries whose server name no longer exists in
   `languageServers` — their ids then resolve as `unknownClient` — while
-  entries whose server survives the reload stay stopped. Nothing is
-  persisted across kakehashi restarts.
+  entries whose server survives the reload stay stopped. Reload is not a
+  control call, so it is not covered by single-flight; instead the tombstone
+  install revalidates against the current configuration inside the same
+  critical section: a `stop` committing after a reload deleted its server
+  installs no entry (the slot is already gone and its id resolves
+  `unknownClient`), never a stale one. Nothing is persisted across
+  kakehashi restarts.
 
 ### `restart`: Same Key, Current Config, Derived Re-Open
 
@@ -329,9 +338,19 @@ Three lifecycle rules keep the set coherent:
 if the slot is already stopped) + clear the stopped entry + respawn the
 **same** `ConnectionKey` under the configuration current at that moment. The
 outer request resolves when the replacement reaches `Ready` (result `null`)
-or `Failed` (error `restartFailed`), bounded by the existing initialization
-timeout (ls-bridge-timeout-hierarchy). On failure the stopped entry stays
-cleared, so the ordinary crash-respawn path still applies to the slot.
+or fails (error `restartFailed`), bounded by the existing initialization
+timeout (ls-bridge-timeout-hierarchy). `restartFailed` covers every failure
+shape — a spawn that dies before a handle exists (missing binary, invalid
+or unspawnable current configuration) as much as a handle that reaches
+`Failed` — with the underlying cause in the error message. On any failure
+the stopped entry stays cleared, so the ordinary acquire-driven respawn
+path still applies to the slot.
+
+Neither `stop` nor `restart` is abortable mid-mutation: a `$/cancelRequest`
+for the outer request may fail it with `RequestCancelled`, but the
+operation itself runs to completion detached, and the single-flight guard
+releases only when it finishes — a dropped handler can never leave a slot
+half-stopped or release the guard midway.
 
 - **Process-level configuration applies.** `command`, `args`,
   `initializationOptions`, settings — whatever the config says *now* is what
@@ -353,11 +372,17 @@ cleared, so the ordinary crash-respawn path still applies to the slot.
   like all pass-through — the caller's own risk.
 - **A shared instance re-seeds; nothing is remembered.** A `#shared` key
   carries no root, and the old handle's accumulated folder set dies with
-  it. The replacement is seeded exactly as a fresh spawn would be, and the
-  set regrows through the existing add-only acquire path
+  it. Because no triggering document exists to resolve a marker root — the
+  existing acquire path cannot revive a dead shared key without one — the
+  replacement is seeded from the client root (the fallback every spawn path
+  has), and the set regrows through the existing add-only acquire path
   (`workspace/didChangeWorkspaceFolders` per
   ls-bridge-server-pool-coordination) as roots re-acquire the shared
-  connection — derive, don't remember, applied to folders.
+  connection — derive, don't remember, applied to folders. If the
+  replacement no longer advertises workspace-folder change support,
+  pool-coordination's existing capability fallback applies: subsequent
+  acquires degrade to per-root connections and the restarted shared slot
+  simply serves nothing new.
 
 During the restart window, `request` fails with `clientRestarting` and
 `notify` is silently dropped. `restart` on a `stopped` slot is simply a
@@ -446,7 +471,8 @@ namespace.
   `forward_cancel_downstream`, the graceful-shutdown state machine, the
   ARM/CLAIM derived re-open. The genuinely new state is the stopped set, the
   per-connection shutdown timeout, the in-flight pass-through id map, the
-  per-handle `serverInfo`, and the deny list.
+  per-handle `serverInfo`, the per-key control-operation registry, and the
+  deny list.
 - Held ids survive restarts, so tooling built on the protocol needs no
   re-enumeration choreography.
 
@@ -503,6 +529,10 @@ namespace.
 - `serverInfo` needs new per-handle state: the handshake currently retains
   only `ServerCapabilities`, so the initialize result's `serverInfo` must be
   parsed and stored on the connection handle.
+- Single-flight and `clientRestarting` need a per-key control-operation
+  registry: the stopped entry is cleared before the respawn begins and
+  `ConnectionState` exposes only `Initializing`, so nothing existing
+  distinguishes a restart in flight from an ordinary first spawn.
 - Pass-through cancellation reuses `forward_cancel_downstream` keyed by
   `(ConnectionKey, downstream id)`. As in the formatting pipeline, the
   handler itself records the downstream id it minted for each in-flight
