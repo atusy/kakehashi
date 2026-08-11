@@ -441,10 +441,13 @@ candidates at all likewise queries nothing.
   `null`, `{ routing: {} }`, an entry with no fields, an error response,
   a timeout, and a malformed answer all mean "no opinion" and fall
   through to the next position. The priority walk's entries are **pruned
-  to the selected provider set** before dispatch: a named entry whose
-  server does not advertise or is not `Ready` drops out of the walk
-  entirely, rather than sitting as a position no task will ever fill and
-  stalling the fan-in until the whole set drains. Named `priorities`
+  to the selected provider set** before dispatch — where "selected"
+  spans both the dispatchable (`Ready` and advertising) and the
+  **wait-eligible `Initializing`** providers: a wait-eligible position
+  stays in the walk until its bounded wait terminates (it may yet
+  answer), and only an entry that is neither dispatchable nor
+  wait-eligible drops out, rather than sitting as a position no task
+  will ever fill and stalling the fan-in until the whole set drains. Named `priorities`
   entries are strict positions; within the `"*"` rest group the winner
   is the **earliest arrival**, not a ranking — deterministic provider
   ordering requires naming providers explicitly. One consequence is
@@ -522,12 +525,14 @@ structures with different lifetimes carry the outcome:
   **before** any acquire runs — a configuration removal or disablement
   that ends its candidacy for the document — and is consumed like a
   suppression (waiters proceed without the server; distinct provenance
-  in the logs). Every **applied** effect — a suppression taking hold, an
-  override landing on its key — is logged once at apply time with the
-  answering provider, the (document, layer, language), the target
-  server, and the effect, which is what makes a valid-but-wrong policy
-  diagnosable from the logs at all (a warning fires only on the
-  malformed/mismatch paths; a *successful* misroute would otherwise be
+  in the logs). Every **winning answer** is logged once at apply time
+  with the answering provider, the (document, layer, language), and its
+  effects per server — a suppression taking hold, an override landing on
+  its key, and equally an affirmation-only win, which vetoes every
+  lower-priority provider while changing nothing and would otherwise
+  leave no trace at all. This is what makes a valid-but-wrong policy
+  diagnosable from the logs (warnings cover the rejected, invalid, and
+  timed-out outcomes; a *successful* misroute would otherwise be
   silent). Method-level capability prefilters are deliberately
   *not* a cause — they are per-request facts (lacking hover does not
   mean lacking completion) and never settle the binding. It is **not** the
@@ -571,9 +576,14 @@ structures with different lifetimes carry the outcome:
   resolve envelopes (`completionItem/resolve`, `codeLens/resolve`)
   included, whose host-URI re-resolution would otherwise reach the
   config-root process instead of the one that produced the item
-  (ls-bridge-server-pool-coordination is amended accordingly); a
-  resolve arriving after eviction fails soft as an unroutable envelope
-  does today.
+  (ls-bridge-server-pool-coordination is amended accordingly). The
+  envelope must carry enough identity to *hit the right binding*: the
+  layer/language pair and the open incarnation (or the exact key plus
+  incarnation), matched exactly — after a close/re-open the same URI
+  holds a *new* binding, and an unstamped stale item would silently
+  resolve through it. A resolve whose stamp no longer matches — the
+  binding evicted, or a newer incarnation in its place — fails soft as
+  an unroutable envelope does today.
 
 Decision-cache lifecycle:
 
@@ -977,8 +987,10 @@ a slot a routing provider left in play.
   install a provider, it advertises, it works — zero configuration in the
   common case, `priorities` only to order or allowlist providers.
 - Transport-level fail-open: no provider, a slow provider, a crashed
-  provider, or a malformed answer all reproduce today's routing, at worst
-  one decision deadline later.
+  provider, or a malformed answer all reproduce today's *initial* routing
+  decision, at worst one decision deadline later (the resulting fallback
+  binding still freezes the root for the document's lifetime — the
+  Decision section's recorded difference).
 - Per-language provider policy falls out of the aggregation machinery for
   free, as does the ordered-allowlist vocabulary users already know.
 - The policy-server pattern needs no self-referential tricks: candidacy
