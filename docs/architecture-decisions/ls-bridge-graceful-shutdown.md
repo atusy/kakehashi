@@ -355,11 +355,14 @@ sealing, tombstone sweeps) — and its final act is the single
 **commit-and-reply swap**, so a panic anywhere before that pair leaves
 every affected value unchanged with the message merely consumed.
 External effects are not staged, because an OS child cannot be rolled
-back: a spawn first **commits a `Spawning` intent** (the entry owns the
-would-be child before it exists), the tracked sub-task then creates the
-process, and the tracked completion records its handle — a panic between
-intent and completion settles from the intent record (kill-and-reap on
-sight), never by pretending the child away. The pairing applies to the
+back: a spawn first **commits a `Spawning` intent** whose entry carries
+an actor-owned **escrow slot**, and the tracked sub-task's first act on a
+successful spawn — atomically with observing it, before any suspension
+point — is to store the child's handle into that slot. At every instant,
+therefore, either no child exists or its handle is in actor-owned state;
+the completion stays a pure report, and a panic at any point settles
+from the entry (kill-and-reap whatever the escrow holds), never by
+pretending the child away. The pairing applies to the
 **terminal, caller-visible transition** of an operation: a multi-step
 `stop`/`restart` commits its initial and intermediate transitions
 state-only, the entry retaining the live reply sender for terminal

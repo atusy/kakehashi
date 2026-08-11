@@ -91,7 +91,9 @@ Configuration loading therefore rejects `languageServers` names containing
 `@` or `#`.
 
 **`status`** mirrors the connection state machine
-(ls-bridge-graceful-shutdown): `starting` = `Initializing`, `running` =
+(ls-bridge-graceful-shutdown): `starting` = `Initializing` **or** a
+pre-handle `Spawning` intent entry (an ordinary acquire's spawn commit
+before the child's handshake begins), `running` =
 `Ready`, `stopping` = `Closing` **or** a termination-pending record whose
 process termination is not yet confirmed (its handle may already be
 `Closed` or gone), `failed` = `Failed`, and `stopped` =
@@ -727,7 +729,10 @@ namespace.
   `stopping` for an in-flight `stop` and for a restart still in its stop
   phase (a reload can purge the `Closing` handle, leaving the operation
   as sole owner in either case), `starting` once a restart's respawn has
-  begun. `ConnectionState` alone could never provide this: it exposes
+  begun — and an ordinary acquire's pre-handle `Spawning` intent entry
+  is an in-flight-operation record like any other: it enumerates as
+  `starting`, resolves its id, and fences acquires until the handle
+  lands or the intent settles. `ConnectionState` alone could never provide this: it exposes
   only `Initializing`, which cannot distinguish a restart in flight from
   an ordinary first spawn.
 - Acquire keeps using existing `Ready` connections lock-free; the
