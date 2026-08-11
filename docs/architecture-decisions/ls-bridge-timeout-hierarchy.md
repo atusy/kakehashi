@@ -125,6 +125,11 @@ Global Shutdown overrides all (highest priority)
   per-entry classification as pass-through): they carry their own
   deadline, and a slow provider must never drive a `Ready` connection to
   `Failed`
+- Also exempt from the Tier-1 per-request timeout (whose fan-out trigger
+  would otherwise cover a routing fan-out once Phase 3 lands): the
+  routing deadline is the sole bound on these requests
+- Global teardown overrides: decisions waiting on provider handshakes
+  resolve to the fallback immediately
 
 **Writer-Idle Timeout** (within the applicable shutdown deadline):
 - **Duration**: 2s fixed

@@ -10,6 +10,7 @@
 - [wildcard-config-inheritance](wildcard-config-inheritance.md) — the inheritance resolution applied before the config projection goes on the wire
 - [host-document-bridge](host-document-bridge.md) — the `_self` layer whose `enabled` gate and aggregation entry govern host-document routing decisions
 - [language-server-bridge](language-server-bridge.md) — the security model this protocol's trust model extends
+- [any-language-server-wildcard](any-language-server-wildcard.md) — the `"*"` language element and explicit-empty `languages` semantics the projection and the policy-server pattern rely on
 
 ## Context
 
@@ -23,8 +24,8 @@ project state: a monorepo tool that knows which sub-project owns a file, a
 policy layer that enables a server only for directories that opt in, or a
 meta-server that computes workspace topology cannot express any of that
 through kakehashi's config alone. (An earlier decision attacked the same gap
-with a per-server Lua hook; it is rejected and deleted alongside this one —
-see Considered Options.)
+with a per-server Lua hook; it is rejected, and its records deleted, as
+this decision lands — see Considered Options.)
 
 bridge-client-control-protocol opened the connection pool to the editor-side
 client. This decision opens the *routing policy* in the other direction:
@@ -124,20 +125,24 @@ The result layers a "kakehashi decides" default at every granularity:
 - A server missing from `routing`, or present with `enabled` absent —
   kakehashi decides that server's forwarding.
 - `enabled: false` — the document's `didOpen` is not forwarded to that
-  server for this language. Suppression is enforced at **candidate
-  selection**, the choke point every open path funnels through — the eager
-  `didOpen`/parse fan-out, the lazy per-request open (the
-  `ensure_document_opened` call on the request-execute path), and the
-  derived re-open sweep alike — so no later request can open the document
-  there through a side door. This is **per-document forwarding
+  server for this language. Suppression is enforced at the **routing
+  gate**, a per-decision point every open path consults before sending
+  any `didOpen` — the eager per-server open tasks, the lazy per-request
+  open (the `ensure_document_opened` call on the request-execute path),
+  and the derived re-open sweep alike — so no later request can open the
+  document there through a side door (the gate's placement is specified
+  under the deadline section below). This is **per-document forwarding
   suppression**, not slot control: the connection (if any) is untouched
   and other documents route normally. It is deliberately weaker than
   bridge-client-control-protocol's `stop`, which pins a whole slot.
-- `enabled: true` — an explicit no-op: the server stays in kakehashi's
+- `enabled: true` — a forwarding no-op: the server stays in kakehashi's
   hands, exactly as if the field were absent. It never overrides
   kakehashi's other gates (the per-host bridge filter, capability
   prefilters, spawnability); it exists so a provider can attach a
-  `workspaceFolders` override while explicitly not suppressing.
+  `workspaceFolders` override while explicitly not suppressing. Its
+  *presence* is not a no-op, however: any present field — `enabled: true`
+  included — makes the entry **operative** for the fan-in predicate
+  (below), so an affirmation-only answer still counts as an answer.
 - Malformed input is handled at three levels, all fail-open with a
   warning: a result that does not deserialize to `RoutingResult` at all is
   treated as `null`; a well-typed entry whose `workspaceFolders` fails
@@ -161,10 +166,11 @@ bounds below.
 Concretely: a routing answer never resurrects a stopped slot, and the
 stopped-set check covers **both** keys a routing answer can involve — the
 key kakehashi's own resolution would produce *and* the key the
-`workspaceFolders` override names. If either is stopped, the answer's entry
-for that server is discarded (the configuration-resolved stop wins; a
-provider cannot steer a document around a user's pin by naming a different
-root). For a shared-instance server the two keys are the same
+`workspaceFolders` override names — for a per-root server, the key of the
+override's first element, checked after the truncation below. If either is
+stopped, the answer's entry for that server is discarded (the
+configuration-resolved stop wins; a provider cannot steer a document
+around a user's pin by naming a different root). For a shared-instance server the two keys are the same
 root-independent `ConnectionKey::shared`, so the double check collapses to
 one. Without it, `stop` would be advisory against a root-redirecting
 provider — the failure mode that decision's own "auto-respawn" rejection
@@ -286,8 +292,9 @@ client may still forward the method through
 the managed routing path, and needs no deny-list entry — it merely asks the
 server the same question and corrupts no bridge state.) A server that
 advertised but answers `MethodNotFound` (`-32601`) has its retained
-advertisement cleared for the connection's lifetime, so a lying
-advertisement stops costing round trips after the first.
+advertisement cleared — both the per-connection flag and the per-name
+session memo that earns initialization waits (below) — so a lying
+advertisement stops costing round trips, and waits, after the first.
 
 Method dispatch is **per side**: the editor-facing custom methods
 (`kakehashi/bridge/client/*` and the rest) are not registered on downstream
@@ -363,18 +370,23 @@ candidates at all likewise queries nothing.
   that is non-`null` and non-empty under the caller-supplied predicate
   every `preferred` dispatch provides. For routing the predicate is: the
   `routing` map holds at least one entry carrying at least one operative
-  field. `null`, `{ routing: {} }`, an entry with no fields, an error
-  response, a timeout, and a malformed answer all mean "no opinion" and
-  fall through to the next position. Named `priorities` entries are
-  strict positions; within the `"*"` rest group the winner is the
-  **earliest arrival**, not a ranking — deterministic provider ordering
-  requires naming providers explicitly. One consequence is deliberate
-  and worth naming: any operative answer wins the *whole* decision, so a
-  high-priority provider that answers only affirmations thereby vetoes
-  every lower-priority provider — priority is authority. The decision
-  resolves as soon as every selected provider has answered or been
-  skipped; the deadline is a bound, not a wait. The winning answer is
-  attributed to the provider that produced it.
+  field — `enabled: true` included, per the operative rule above.
+  `null`, `{ routing: {} }`, an entry with no fields, an error response,
+  a timeout, and a malformed answer all mean "no opinion" and fall
+  through to the next position. The priority walk's entries are **pruned
+  to the selected provider set** before dispatch: a named entry whose
+  server does not advertise or is not `Ready` drops out of the walk
+  entirely, rather than sitting as a position no task will ever fill and
+  stalling the fan-in until the whole set drains. Named `priorities`
+  entries are strict positions; within the `"*"` rest group the winner
+  is the **earliest arrival**, not a ranking — deterministic provider
+  ordering requires naming providers explicitly. One consequence is
+  deliberate and worth naming: any operative answer wins the *whole*
+  decision, so a high-priority provider that answers only affirmations
+  thereby vetoes every lower-priority provider — priority is authority.
+  The decision resolves as soon as every selected provider has answered
+  or been skipped; the deadline is a bound, not a wait. The winning
+  answer is attributed to the provider that produced it.
 - Because the key space of `bridge.<lang>.aggregation` is method names, a
   per-language provider order works with no new machinery. This is the
   first non-LSP method in that key space.
@@ -412,7 +424,7 @@ Cache lifecycle:
   document is discarded. A configuration reload flushes the whole cache —
   superseded-generation entries are unreadable under the new generation
   and would otherwise sit resident until their document closes. The cache
-  is therefore bounded by open documents × languages.
+  is therefore bounded by open documents × layers × languages.
 - **Flushed wholesale whenever the set of `Ready` advertising providers
   changes** — a provider reaching `Ready`, being replaced by restart or
   respawn, being stopped, failing, or having its advertisement cleared by
@@ -471,13 +483,28 @@ warning. Routing requests are **excluded from Tier-2 liveness accounting**,
 exactly as bridge-client-control-protocol excludes pass-through and via the
 same per-entry classification: they carry their own deadline, and a slow
 provider must degrade routing, never drive a `Ready` connection to
-`Failed`. Two latency couplings are worth naming: the host decision is
-awaited on the `didOpen` path, which holds the per-URI ingress writer
-ticket (the mechanism that serializes same-document lifecycle messages in
-wire order), so the routing timeout also bounds how long one document's
-subsequent `didChange` traffic can stall behind its open; and the
-injection decision sits on the parse path (virtual-document creation), so
-the same deadline bounds how long a parse cycle can stall on routing.
+`Failed`. They are likewise **exempt from the Tier-1 per-request timeout**
+(a routing fan-out is multi-server aggregation, which would otherwise fall
+inside Tier-1's trigger once Phase 3 lands, and a 2-5s per-request bound
+would preempt a longer routing deadline): the routing deadline is the sole
+bound on these requests.
+
+**Where the await lives.** The decision is *not* awaited on the `didOpen`
+handler. The handler's candidate enumeration stays synchronous and the
+per-URI ingress writer ticket stays await-free — the posture the open
+path deliberately keeps (a slow await under the ticket wedges later
+same-URI readers and writers; the codebase records exactly this hazard
+for auto-install). Instead, the eager per-server open tasks — already
+fire-and-forget off the ticket — share the decision: the first task to
+consult the routing gate starts the single-flight query, its siblings
+await the same future, and each task applies the answer (suppression,
+root override, then its acquire) before sending its `didOpen`. The
+injection-layer decision is awaited the same way by the virtual-document
+open tasks, off the parse loop; the lazy request-path open and the
+re-open sweep consult the cache only, as above. The deadline's cost is
+therefore **deferred feature availability** — downstream opens, and the
+features they enable, land up to one deadline later than today — not a
+stalled writer ticket or parse cycle.
 
 ### Cold Start: `forceStart`
 
@@ -567,7 +594,7 @@ channel is unaffected (document-independent traffic, above).
 An earlier decision (workspace-resolver, with its lua-host-api companion
 surface) attached a sandboxed, user-authored Lua function to each server
 entry, returning per-document `(attach, workspace)` with the document text
-in hand. **Rejected and deleted alongside this decision**
+in hand. **Rejected; both records are deleted as this decision lands**
 (delete-on-supersede; neither was implemented). It answers the same gap —
 content-dependent per-document attach and rooting — but from the wrong
 side, on two counts. Authoring: the resolver is program code embedded in a
@@ -699,12 +726,13 @@ a slot a routing provider left in play.
 
 ### Negative
 
-- A configured provider sits on the `didOpen` hot path by design: the
+- A configured provider defers first feature availability by design: the
   first decision per (document, layer, language) costs concurrent round
-  trips to every advertising provider, bounded by one routing deadline —
-  a deadline that also bounds how long same-document `didChange` traffic
-  can stall behind the open (the ingress writer ticket is held across the
-  await) and how long a parse cycle can stall on an injection decision.
+  trips to every advertising provider, bounded by one routing deadline,
+  and the downstream opens that decision gates land up to that deadline
+  later than today. (The ingress writer ticket and the parse loop are
+  deliberately not stalled — the await lives in the fire-and-forget open
+  tasks.)
 - Fail-open bounds transport failure, not provider policy: a *successful*
   answer subtracts servers or redirects roots, and a buggy provider
   therefore silently thins routing. Until the deferred introspection
@@ -749,25 +777,31 @@ a slot a routing provider left in play.
 - The projection is a dedicated wire struct (camelCase serde, additive
   evolution), built from effective config after wildcard resolution — not
   a `serde` view of `BridgeServerConfig`.
-- Suppression and root overrides apply at candidate selection
-  (`get_host_configs_for_language` in the coordinator and the virt
-  candidate enumeration), the choke point shared by the eager open
-  fan-out, the lazy per-request open (`ensure_document_opened`, a pool
-  function called from the request-execute path), and the re-open sweep —
-  not at individual `didOpen` call sites.
-- The routing query is awaited before the acquire and holds no pool lock;
-  the acquire critical section re-validates the answer's config
-  generation (discard on mismatch) alongside its existing stopped-set and
-  control-registry checks. The single-flight map (keyed like the cache,
-  carrying the (generation, flush-epoch) anchor) and the decision cache
-  are new state beside the pool's per-connection maps.
+- Candidate enumeration (`get_host_configs_for_language` in the
+  coordinator, and the virt candidate enumeration) stays synchronous.
+  Suppression and root overrides apply at the routing gate: one shared
+  per-decision future awaited inside the per-server open tasks, and
+  consulted cache-only by the lazy per-request open
+  (`ensure_document_opened`, a pool function called from the
+  request-execute path) and the re-open sweep — one gate, not scattered
+  per-call-site checks, and never an await under the ingress ticket.
+- The routing query is awaited inside the open task, before that task's
+  acquire, holding no pool lock; the acquire critical section
+  re-validates the answer's config generation (discard on mismatch)
+  alongside its existing stopped-set and control-registry checks. The
+  single-flight map (keyed like the cache, carrying the (generation,
+  flush-epoch) anchor) and the decision cache are new state beside the
+  pool's per-connection maps.
 - Fan-out/fan-in reuse `fan_out` + the `preferred` collector over the
   expanded priority walk, with the routing-specific provider universe
   (all spawnable configured servers, advertisement-filtered) and the
-  operative-entry predicate supplied as the non-empty check. Expiry
-  cancellation uses `forward_cancel_downstream` per pending provider
-  request; retirement must be atomic with the fallback synthesis so late
-  answers drop.
+  operative-entry predicate supplied as the non-empty check. One
+  routing-specific step precedes dispatch: the expanded entries are
+  pruned to the selected provider set (`expand_priorities` does not do
+  this, and the `maxFanOut` truncation step is deliberately skipped).
+  Expiry cancellation uses `forward_cancel_downstream` per pending
+  provider request; retirement must be atomic with the fallback
+  synthesis so late answers drop.
 - The Tier-2 exclusion rides the per-entry liveness classification the
   control protocol introduces for pass-through; routing entries carry the
   same non-liveness class.
@@ -801,7 +835,7 @@ a slot a routing provider left in play.
 | **Trust** | providers are trusted-by-configuration; folder overrides bounded to canonicalized `file:` URIs at-or-below client workspace folders or the config-resolved root, count-capped |
 | **Folders↔Key** | shared instance: union-only join; per-root: first element, rest warned+ignored; at most one connection per server name per document |
 | **Providers** | all spawnable configured servers ∩ advertising ∩ `Ready` (Initializing awaited only when the advertisement is known or the server is named), ordered by routing `priorities` (no `"_"` method-wildcard inheritance); concurrent fan-out, `preferred` fan-in, operative-entry rule |
-| **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy); expiry cancels pending requests, retires entries, falls open; excluded from Tier-2 liveness |
+| **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy); expiry cancels pending requests, retires entries, falls open; exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
 | **Caching** | per (host URI, layer, languageId, config generation); single-flight; evicted on `didClose`, flushed on reload and on `Ready`-provider-set change; (generation, flush-epoch)-anchored insert + apply-time revalidation; misses outside query points fail open; never retroactive |
 | **Cold start** | `forceStart` (post-config-publication get-or-create, marker-less fallback root shape, warm-up scope limited to shared/marker-less/policy servers) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
 | **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; re-open reads the cache only |

@@ -507,3 +507,4 @@ See language-server-bridge-request-strategies for per-method implementation deta
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md): How multiple injections are represented as virtual documents
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md): Per-method bridge strategies
 - [any-language-server-wildcard](any-language-server-wildcard.md): The `languages = ["*"]` marker for servers not tied to one language
+- [bridge-routing-protocol](bridge-routing-protocol.md): Extends the security model's trust boundary — a configured downstream provider may influence routing within recorded bounds
