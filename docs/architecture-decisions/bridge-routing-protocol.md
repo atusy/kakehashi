@@ -565,10 +565,11 @@ Decision-cache lifecycle:
   per-candidate-server payloads (a normalized answer's routing map, a
   binding's settlements) and capped folder lists, so the byte bound
   multiplies by the candidate-server count and the folder cap. The
-  framing ceilings bound the *answer-originated* strings; keys and
-  values that originate elsewhere — host URIs from upstream traffic,
-  server names from configuration — are bounded by their own sources,
-  not by downstream framing.
+  framing ceilings bound the *answer-originated* strings; server names
+  are bounded by the configuration-read ceiling, while host-URI bytes
+  are proportional to upstream URI lengths, which no protocol ceiling
+  bounds — the same proportionality every per-URI structure in the
+  server already carries, not a new exposure.
 - **Flushed wholesale whenever the set of `Ready` advertising providers
   changes** — a provider reaching `Ready`, being replaced by restart or
   respawn, being stopped, failing, or having its advertisement cleared by
@@ -1071,8 +1072,10 @@ a slot a routing provider left in play.
 - The cache flush hook fires on `Ready`-set transitions of advertising
   servers: handshake completion, replacement insertion, stop, failure,
   and `-32601` advertisement clearing. Each is already a pool-lock commit
-  point; the flush (a map clear, an epoch bump, and an O(1) cause-ring
-  append) is synchronous, safe to run inside them.
+  point; the flush is O(1) under the lock — the map is *taken* (swapped
+  for an empty one) with the epoch bump and cause-ring append, and the
+  taken map is dropped outside the critical section, so provider churn
+  never stalls pool operations on entry-drop cost.
 - The frame reader currently allocates the declared `Content-Length`
   before parsing anything, so the answer-size bound needs a
   **framing-level ceiling on downstream message size** — a transport
