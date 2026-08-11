@@ -1066,7 +1066,14 @@ configured. Two pieces close most of the gap:
   server simply serves nothing new, per the existing fallback. It
   observes the stopped set and control registry exactly as a lazy
   acquire does, colliding rather than double-spawning when one races
-  it. That fallback shape is also the
+  it. Its `Initializing` handle is registered **before the
+  configuration that mandates it becomes observable to `didOpen`
+  processing** — the insertion rides the same publication fence that
+  already serializes settings with acquires, so no first `didOpen` can
+  slip between the config publishing and its `forceStart` slots
+  existing, enumerate an empty provider set, and commit a fallback
+  binding that the freeze would then retain past the provider's
+  arrival. That fallback shape is also the
   honest scope of the warm-up: documents under marker roots resolve
   *marker* keys and will not reuse the warmed connection, so `forceStart`
   warms a usable connection only for shared-instance servers, marker-less
