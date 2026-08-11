@@ -382,7 +382,12 @@ because publication and insertion are mutually ordered, no window remains
 where a newer generation publishes between validation and insertion. The
 outer request resolves when the replacement reaches `Ready` (result `null`)
 or fails (error `restartFailed`), bounded by the existing initialization
-timeout (ls-bridge-timeout-hierarchy). `restartFailed` covers every failure
+timeout (ls-bridge-timeout-hierarchy). Success is linearized with registry
+release: releasing the control registry atomically verifies that the exact
+replacement is still pool-resident and `Ready`, and only then returns
+`null` — if a reload removed it in the gap, the operation applies the
+ownership recovery below instead of reporting success for a slot that no
+longer runs. `restartFailed` covers every failure
 shape — a spawn that dies before a handle exists (missing binary, invalid
 or unspawnable current configuration) as much as a handle that reaches
 `Failed` — with the underlying cause in the error message. The slot's id
