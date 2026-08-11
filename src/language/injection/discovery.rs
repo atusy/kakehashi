@@ -531,14 +531,16 @@ fn extract_content_and_language<'a>(
     None
 }
 
-/// Find the injection region containing the given byte offset.
+/// Find the injection region at the given byte offset under `boundary`'s
+/// end-boundary rule: half-open containment, optionally falling back to a
+/// region whose trailing edge the offset sits on (see [`RegionBoundary`]).
 ///
 /// Regions are sorted by query pattern index, so same-range alternate
 /// languages use explicit query-order priority for single-result bridge APIs.
 /// Whole-document and hierarchy discovery still retain every language layer.
 ///
-/// Returns `(index, region)` for use with `calculate_region_id`, or `None` when the
-/// position is not within any injection region.
+/// Returns `(index, region)` for use with `calculate_region_id`, or `None`
+/// when no region matches under the boundary rule.
 fn find_injection_at_position<'a>(
     injections: &'a [InjectionRegionInfo<'a>],
     byte_offset: usize,
@@ -623,11 +625,14 @@ pub(crate) struct ResolvedInjection {
 pub(crate) struct InjectionResolver;
 
 impl InjectionResolver {
-    /// Resolve the injection region (if any) covering `byte_offset`. Shared by
+    /// Resolve the injection region (if any) covering `byte_offset` — or,
+    /// under [`RegionBoundary::CaretEndFallback`], ending at it. Shared by
     /// LSP handlers (hover, completion, definition, …) at a cursor position.
     ///
     /// Does not hold any Document lock: inputs (`tree`, `text`) must be pre-cloned,
     /// typically via `DocumentSnapshot`.
+    // Pre-cloned snapshot inputs (no Document lock) plus the boundary rule; a
+    // params struct would just relocate the list.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve_at_byte_offset(
         coordinator: &LanguageCoordinator,

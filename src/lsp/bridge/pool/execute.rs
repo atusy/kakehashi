@@ -291,8 +291,9 @@ impl LanguageServerPool {
     ///
     /// A line *above* the region almost certainly means stale region data (a
     /// concurrent host edit) and is logged at `warn`; a position merely before
-    /// the start column is a normal cursor location outside the content and is
-    /// logged at `debug` to avoid flooding logs during ordinary editing.
+    /// a region line's content start column, or past the region's content end,
+    /// is a normal cursor location outside the content and is logged at
+    /// `debug` to avoid flooding logs during ordinary editing.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_position_bridge_request_with_handle<T, P: serde::Serialize>(
         &self,
@@ -333,9 +334,9 @@ impl LanguageServerPool {
                     region_end.character,
                 );
             } else {
-                // On the start line but left of the start column (fence backticks,
-                // blockquote prefix). A normal cursor location just outside the
-                // injected content — debug, not warn.
+                // On a region line but left of that line's content start
+                // column (fence backticks, blockquote prefix). A normal cursor
+                // location just outside the injected content — debug, not warn.
                 let virtual_line = host_position.line - offset.line();
                 log::debug!(
                     target: "kakehashi::bridge",

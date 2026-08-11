@@ -244,10 +244,12 @@ pub(crate) fn strip_bridge_local_versions(edit: &mut WorkspaceEdit) {
     }
 }
 
-/// The exclusive host-document end of an injection region: the position just
-/// past its `virtual_content`, mapped back to host coordinates — the
-/// position-precise (line AND column) upper bound for
-/// [`workspace_edit_within_region`].
+/// An injection region's end-of-content in host coordinates: the position
+/// one past the last character of its `virtual_content` — itself a valid LSP
+/// position (the virtual document's EOF). Consumers compare against it
+/// INCLUSIVELY (`<=`): the position-precise (line AND column) upper bound for
+/// [`workspace_edit_within_region`] edit containment and for
+/// position-request dispatch (`host_position_within_region_bounds`).
 pub(crate) fn region_host_end(virtual_content: &str, offset: &RegionOffset) -> Position {
     let mut end = crate::text::PositionMapper::new(virtual_content)
         .byte_to_position(virtual_content.len())

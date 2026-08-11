@@ -95,13 +95,17 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
 // =============================================================================
 
 /// Whether `host_position` can be translated into virtual coordinates without
-/// underflow, i.e. it lies within the injection region's boundary.
+/// underflow, i.e. it does not fall before the injection region's *leading*
+/// boundary. This checks the lower bound only — a position past the region's
+/// end still returns `true` here; for the trailing bound see
+/// [`host_position_within_region_bounds`].
 ///
 /// A position *above* the region (`line < region start line`) signals stale
 /// region data — typically an in-flight request whose region was shifted by a
-/// concurrent host edit. A position *on* the start line but *before* the region's
-/// start column (e.g. the cursor is on the markdown fence backticks or inside a
-/// blockquote `> ` prefix rather than the injected content) is likewise outside.
+/// concurrent host edit. A position on a region line but *before* that line's
+/// content start column (e.g. the cursor is on the markdown fence backticks or
+/// inside a blockquote `> ` prefix rather than the injected content) is
+/// likewise outside.
 ///
 /// Either case would otherwise be silently mistranslated by the `saturating_sub`
 /// in [`translate_host_position_to_virtual`] and forwarded as wrong coordinates:
