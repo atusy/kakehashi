@@ -720,8 +720,8 @@ impl LanguageServerPool {
                 // marker-root walk, not this client snapshot. A shared
                 // connection's folder set is acquisition-driven after spawn
                 // (roots join via `announce_shared_root`) — and when a
-                // marker-less acquisition spawned it, its INITIAL folders were
-                // seeded from the client snapshot of that moment. This loop
+                // marker-less acquisition spawned it, its INITIAL seed is the
+                // client snapshot's PRIMARY folder (`spawn_folder_seed`). This loop
                 // deliberately does not keep that seed current: the set has
                 // one writer after spawn (acquisitions), and forwarding client
                 // changes would need per-folder provenance to avoid removing a
@@ -2580,9 +2580,11 @@ impl LanguageServerPool {
         // matches `connection_key`.
         // Resolved before the reader task spawns because the reader answers
         // downstream `workspace/workspaceFolders` queries with these folders.
+        let has_marker = marker.is_some();
         let (root_uri, init_folders) = super::root_markers::workspace_from_marker(marker, || {
             (self.root_uri(), self.workspace_folders())
         });
+        let init_folders = spawn_folder_seed(&connection_key, has_marker, init_folders);
         log::debug!(
             target: "kakehashi::bridge::init",
             "[{}] workspace root for spawn: {:?}",
@@ -3345,6 +3347,31 @@ impl LanguageServerPool {
     }
 }
 
+/// The workspace-folder seed for a new connection's folder set and its
+/// `initialize` handshake.
+///
+/// A client-seeded SHARED spawn (a marker-less acquisition of a
+/// `preferSharedInstance` server, so the client snapshot is the fallback)
+/// keeps only the PRIMARY client folder: the folder set doubles as
+/// served-root proof for the incapable-shared divert, and "told at
+/// initialize" only guarantees the rootUri — seeding every client folder
+/// would vouch for secondary roots the server never promised to serve.
+/// Marker roots still join (and are vouched for) explicitly via
+/// `announce_shared_root`. A marker spawn keeps its folders verbatim (the
+/// seed is exactly its one marker folder), and so does a ClientFallback
+/// spawn (its routing never consults the set as served-root proof).
+fn spawn_folder_seed(
+    connection_key: &ConnectionKey,
+    has_marker: bool,
+    folders: Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>,
+) -> Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>> {
+    if connection_key.is_shared() && !has_marker {
+        folders.map(|folders| folders.into_iter().take(1).collect())
+    } else {
+        folders
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3888,6 +3915,61 @@ mod tests {
         assert!(
             Arc::ptr_eq(&result, &per_root),
             "a root the incapable shared connection does not serve must divert to its per-root connection"
+        );
+    }
+
+    /// A client-seeded SHARED spawn (marker-less acquisition) keeps only the
+    /// PRIMARY client folder in its seed. The folder set doubles as
+    /// served-root proof for the incapable-shared divert, and "told at
+    /// initialize" only guarantees the rootUri: seeding every client folder
+    /// would keep a later marker-rooted document under a SECONDARY client
+    /// folder aboard a server that never promised to serve it. Marker roots
+    /// still join (and are vouched for) explicitly via announce_shared_root.
+    #[test]
+    fn client_seeded_shared_spawn_seeds_only_the_primary_folder() {
+        let folder = |name: &str| tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: format!("file:///repo/{name}").parse().unwrap(),
+            name: name.to_string(),
+        };
+        let folders = Some(vec![folder("a"), folder("b")]);
+
+        let seeded = spawn_folder_seed(&ConnectionKey::shared("lua"), false, folders.clone());
+        assert_eq!(
+            seeded,
+            Some(vec![folder("a")]),
+            "a marker-less shared spawn vouches only for the primary client folder"
+        );
+
+        // A marker spawn and a ClientFallback spawn keep their folders
+        // verbatim: the former's seed is exactly its one marker folder, and
+        // the latter's divert never consults the set.
+        assert_eq!(
+            spawn_folder_seed(&ConnectionKey::shared("lua"), true, folders.clone()),
+            folders
+        );
+        assert_eq!(
+            spawn_folder_seed(&ConnectionKey::for_server("lua"), false, folders.clone()),
+            folders
+        );
+        assert_eq!(
+            spawn_folder_seed(&ConnectionKey::shared("lua"), false, None),
+            None
+        );
+    }
+
+    /// Pins the user-visible limitation of shared-key routing: a routing token
+    /// naming a DEAD shared connection is refused rather than revived (which
+    /// marker roots it was serving died with its folder set). The next document
+    /// acquisition revives the instance; commands fail soft until then.
+    #[tokio::test]
+    async fn reconnect_by_key_refuses_a_dead_shared_key() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::shared("lua");
+        assert!(
+            pool.reconnect_by_key(&key, &shared_config())
+                .await
+                .is_none(),
+            "a dead shared connection must not be revived without a document"
         );
     }
 
