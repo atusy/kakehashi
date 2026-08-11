@@ -222,7 +222,8 @@ Deferred to implementation, recorded so they are not lost:
   read, so `kakehashi.fs.read_to_string` needs its own large-file bound (see
   lua-host-api); the exact cap is open.
 - **Non-`file://` documents.** Per §2 these skip the resolver and resolve via
-  `workspaceMarkers` → `ClientFallback`. Open: whether any non-`file://` scheme
+  `workspaceMarkers` → `ClientFallback` (the shared instance for a
+  `preferSharedInstance` server). Open: whether any non-`file://` scheme
   (e.g. a remote/virtual fs) should instead derive a usable path and run the
   resolver after all.
 - **Stuck-worker recovery** (§3, §6): the policy for abandoning and replacing a
@@ -303,7 +304,8 @@ Deferred to implementation, recorded so they are not lost:
   by timeout, so it does not affect semantic-token or diagnostic latency.
 - `workspaceResolver` and `workspaceMarkers` are either/or per server, not
   layered — the one exception being the §2 skip rule (a document with no
-  representable path resolves via `workspaceMarkers`/`ClientFallback`).
+  representable path resolves via `workspaceMarkers`/`ClientFallback`, or the
+  shared instance for a `preferSharedInstance` server).
 
 ## Decision–Implementation Gap
 

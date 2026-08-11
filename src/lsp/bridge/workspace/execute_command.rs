@@ -483,6 +483,20 @@ impl LanguageServerPool {
                 // `has_capability` check below would then spuriously fail-soft to
                 // `null` even though it would be Ready moments later. Fails soft on
                 // timeout/spawn error like every other branch.
+                //
+                // A key-CHANGING reconnect (preferSharedInstance flipped on
+                // since registration) is about to spawn under a key that never
+                // had a predecessor, so nothing armed its re-open debt — arm it
+                // BEFORE acquiring so the spawn's handshake claims the debt and
+                // runs the derive-from-current-open-documents repair ahead of
+                // this command; the barrier below then genuinely waits on it.
+                // Idempotent, and harmless when the resolved key's connection
+                // is already live: an armed-but-unclaimed key is invisible to
+                // the wait, and the next respawn under that key claims it.
+                let (_marker, resolved_key) = self.resolve_acquire(origin, &config, None).await;
+                if resolved_key != key {
+                    self.arm_pending_reopen(&resolved_key);
+                }
                 match self
                     .get_or_create_connection_wait_ready(
                         origin,
@@ -519,14 +533,14 @@ impl LanguageServerPool {
         // branch can legitimately come back with a shared-keyed handle (a
         // preferSharedInstance flip between registration and reconnect), and a
         // barrier on the stale ClientFallback key would be vacuously satisfied
-        // while the acquired connection's re-opens are still in flight. What a
-        // key-CHANGING reconnect cannot recover is the old key's re-open debt:
-        // its document records were purged with the invalidated connection, so
-        // that debt is unfulfillable in principle (nothing knows what to
-        // re-open) and invisible to this wait (only CLAIMED re-opens are).
-        // Per-document eager repair on the new key owns document correctness
-        // from here; a command naming a document untouched since the flip
-        // fails soft downstream.
+        // while the acquired connection's re-opens are still in flight. The
+        // reconnect branch arms the resolved key before acquiring for exactly
+        // that case, so a key-changing reconnect's fresh spawn claims the debt
+        // and this wait covers its repair. The residue is a key-changing
+        // reconnect that finds the resolved key's connection already LIVE:
+        // armed-but-unclaimed debt is invisible to this wait, per-document
+        // eager repair owns correctness there, and a command naming a document
+        // untouched since the flip fails soft downstream.
         if !self.wait_for_pending_reopen(handle.key()).await {
             warn!(
                 target: "kakehashi::bridge",

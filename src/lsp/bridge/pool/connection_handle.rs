@@ -144,6 +144,16 @@ pub(crate) struct ConnectionHandle {
     /// `settings` is ignored when comparing this snapshot on reload because it
     /// can be propagated at runtime; every other field is spawn-time state.
     launch_config: OnceLock<crate::config::settings::BridgeServerConfig>,
+    /// The workspace root this connection's `initialize` was rooted at (the
+    /// marker root, or the client root for a marker-less/fallback spawn).
+    /// `None` until recorded — and deliberately DISTINCT from the folder set:
+    /// the set is the protocol snapshot (initialize folders plus later joins,
+    /// answering `workspace/workspaceFolders` pulls), while this is the one
+    /// root an INCAPABLE server is guaranteed to serve, which is what the
+    /// incapable-shared divert needs as proof (told-at-initialize folders
+    /// beyond the rootUri promise nothing for a server that advertises no
+    /// workspaceFolders support).
+    spawn_root: OnceLock<Option<String>>,
 }
 
 impl ConnectionHandle {
@@ -212,6 +222,7 @@ impl ConnectionHandle {
             incapable_fallback_logged: AtomicBool::new(false),
             settings,
             launch_config: OnceLock::new(),
+            spawn_root: OnceLock::new(),
         }
     }
 
@@ -230,6 +241,18 @@ impl ConnectionHandle {
             enabled: config.enabled,
         };
         let _ = self.launch_config.set(snapshot);
+    }
+
+    /// Record the workspace root the spawn's `initialize` used. Set once at
+    /// spawn, before the handle is published; see the field doc for why this
+    /// exists separately from the folder set.
+    pub(super) fn record_spawn_root(&self, root: Option<String>) {
+        let _ = self.spawn_root.set(root);
+    }
+
+    /// The root this connection's `initialize` was rooted at, when recorded.
+    pub(super) fn spawn_root(&self) -> Option<&str> {
+        self.spawn_root.get().and_then(|root| root.as_deref())
     }
 
     pub(super) fn launch_config(&self) -> Option<&crate::config::settings::BridgeServerConfig> {
