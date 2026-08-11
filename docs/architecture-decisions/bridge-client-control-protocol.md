@@ -427,9 +427,11 @@ releases only when it finishes — a dropped handler can never leave a slot
 half-stopped or release the guard midway. Pool-wide shutdown does not wait
 behind them either: global teardown takes ownership of in-flight control
 operations, cancels them **cooperatively at their next commit point**,
-joins them concurrently with its escalation phase, and hard-aborts at its
-final deadline any task that never reached a commit point — after which
-router cleanup may run, never before the tasks are gone
+joins them concurrently with its escalation phase, and hard-aborts at the
+producer cutoff (the graceful deadline) any task that never reached a
+commit point — closing the process registry so the escalation reserve
+kills a closed set — after which router cleanup may run, never before the
+tasks are gone
 (ls-bridge-timeout-hierarchy § Per-Slot Control Shutdown). A wedged
 per-slot `stop` can therefore neither stall teardown, nor outlive it, nor
 mutate pool state after cleanup; the outer control request then fails per
@@ -447,18 +449,26 @@ those primitives, each of which must itself be abort-safe or run inside a
 commit point; in particular, purge paths that today await while holding
 `connections` must be restructured to this discipline before `restart`
 may adopt them. That is an implementation precondition of this protocol,
-recorded here. Between commit points the task
-holds no pool locks and touches no shared state other than its spawned
-process, whose kill handle is registered at spawn time. A commit point's
+recorded here. Each completed primitive effect counts as a **recorded
+commit**: recovery derives from the last recorded commit — protocol
+commit point or primitive effect alike — so the finalizer inspects the
+actual pool state it finds rather than replaying a script. Between
+commit points and primitive calls the task holds no pool locks and
+touches no shared state other than its spawned process, whose kill
+handle is registered at spawn time. A commit point's
 critical section contains **no suspension point** — it runs synchronously
 under the pool lock — which is what makes a Tokio hard-cancel atomic with
 respect to it. Cancellation is observed on entry to each commit point; a
 cancel — cooperative or hard — landing between commit points leaves
 shared state exactly as the last commit point left it. Because a
-hard-aborted task can no longer run its own recovery, **teardown owns a
-post-abort finalizer**: it applies the ownership-at-completion rule on
-the aborted operation's behalf, settling the ARM state, tombstone,
-replacement, and registry entries to whatever the last commit point
+terminated task can no longer run its own recovery, **teardown owns a
+finalizer backed by a durable record of every adopted operation** —
+independent of the task's JoinHandle, so a panic already reaped by the
+graceful join phase is still on file. The finalizer runs for every
+non-normal terminal outcome — hard abort, cooperative cancellation short
+of completion, or panic — applying the ownership-at-completion rule on
+the operation's behalf and settling the ARM state, tombstone,
+replacement, and registry entries to whatever the last recorded commit
 implies.
 
 - **Process-level configuration applies.** `command`, `args`,
@@ -650,10 +660,11 @@ namespace.
   cleared and no handle exists yet — the registry is the key's only owner
   then, so without it the slot would vanish from enumeration and calls
   would answer `unknownClient` instead of `clientRestarting`. A
-  registry-only key enumerates by its registered operation — `stopping`
-  for an in-flight `stop` (a reload can purge the `Closing` handle,
-  leaving the registry as sole owner), `starting` for a restart's respawn
-  phase. When a key has several owners, precedence is live handle >
+  registry-only key enumerates by its registered operation *phase* —
+  `stopping` for an in-flight `stop` **and for a restart still in its
+  stop phase** (a reload can purge the `Closing` handle, leaving the
+  registry as sole owner in either case), `starting` once a restart's
+  respawn has begun. When a key has several owners, precedence is live handle >
   stopped set > control registry, deduplicated to one row — except that a
   `Closed` handle awaiting removal is ignored, so during that window the
   registry's operation supplies the status (`Closed` deliberately has no
