@@ -214,7 +214,7 @@ it):**
 
 ### Shutdown Timeout Policy
 
-**Global timeout**: Implementation-defined duration (typically 5-15 seconds) bounding the termination *attempt* — escalation and ownership disposition — across all connections. Local cleanup (registries, router state) needs no server cooperation and falls outside the ceiling.
+**Global timeout**: Implementation-defined duration (typically 5-15 seconds) bounding the termination *attempt* (escalation) across all connections. Ownership disposition and local cleanup (registries, router state) are lock-bounded local work needing no server cooperation; they run immediately after and fall outside the ceiling.
 
 **Best-Effort Parallel Shutdown:**
 All connections shut down in parallel under a single global ceiling. This is intentionally best-effort:
@@ -236,6 +236,11 @@ enum ShutdownMode {
     ProcessExit,   // exit notification / signal path: kakehashi is ending
     ServerRemains, // LSP shutdown request: server stays alive awaiting exit
 }
+// Teardown is a SHARED single-flight operation: concurrent callers join
+// the same run rather than returning early; the effective mode upgrades
+// monotonically (ProcessExit dominates ServerRemains, even mid-run), and
+// every caller joins completion before proceeding — an exit path racing
+// an in-progress ServerRemains teardown cannot terminate around it.
 
 async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
     // Both deadlines are absolute and anchored at FUNCTION ENTRY, so
@@ -330,9 +335,11 @@ async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
     );
 
     // Mode-dependent disposition of children still unconfirmed at the
-    // deadline (§ Unconfirmed termination). The exit-notification path
-    // later re-enters with ProcessExit to dispose records retained
-    // here; a Drop owner covers abnormal process end.
+    // deadline (§ Unconfirmed termination). Disposition is lock-bounded
+    // local work — like cleanup, it runs right after the ceiling rather
+    // than inside it. Records retained under ServerRemains are disposed
+    // at actual process end by their Drop owner; no teardown re-entry
+    // is promised or required.
     match mode {
         ShutdownMode::ProcessExit  => log_and_abandon(unresolved),
         ShutdownMode::ServerRemains =>
@@ -341,7 +348,11 @@ async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
 
     // Only now — every control task terminated, finalized, and the live
     // process registry closed or handed back — may pool/router cleanup
-    // run; nothing can mutate registries or tombstones after it.
+    // run. The invariant is scoped to ADOPTED CONTROL TASKS: none of
+    // them can mutate registries or tombstones after cleanup; the
+    // termination-pending registry and its background waiter
+    // deliberately survive it (ServerRemains) and keep converting
+    // records to tombstones as waits complete.
 }
 ```
 
@@ -377,7 +388,7 @@ Shutdown signal arrives
 **Coordination Strategy:**
 
 ```rust
-async fn shutdown_router() {
+async fn shutdown_router(mode: ShutdownMode) {
     // 0. One absolute ceiling, anchored before any teardown work begins;
     //    the escalation reserve is the gap to graceful_deadline
     let deadline = Instant::now() + GLOBAL_TIMEOUT;
@@ -442,10 +453,12 @@ async fn shutdown_router() {
     dispose_unresolved(mode, unresolved);
 
     // 5. Clean up router resources — runs after every control task has
-    //    terminated (the join above), so nothing can mutate registries
-    //    or tombstones behind it. Cleanup is local, lock-bounded work:
-    //    the shutdown ceiling scopes connection/process termination, not
-    //    this step, which needs no server cooperation.
+    //    terminated (the join above), so no ADOPTED CONTROL TASK can
+    //    mutate registries or tombstones behind it; the
+    //    termination-pending registry and its waiter survive cleanup
+    //    under ServerRemains, as in the sketch above. Cleanup is local,
+    //    lock-bounded work: the shutdown ceiling scopes the termination
+    //    attempt, not this step, which needs no server cooperation.
     cleanup_router_state();
 }
 ```
