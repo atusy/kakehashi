@@ -101,6 +101,28 @@ fn region_boundary_for_method(method: &str) -> crate::language::injection::Regio
     }
 }
 
+/// Apply the LSP position defense to one client-supplied position: a
+/// `character` past its line's end defaults back to the line length (LSP
+/// 3.18), re-derived through the byte mapping so the caller sees the defended
+/// location; a `line` past the document's end has no such spec default and
+/// yields `None` (an invalid position, not a defended one).
+fn normalize_client_position(mapper: &PositionMapper, position: Position) -> Option<Position> {
+    let byte = mapper.position_to_byte_clamped(position);
+    let normalized = mapper.byte_to_position(byte)?;
+    (normalized.line == position.line).then_some(normalized)
+}
+
+/// [`normalize_client_position`] over both endpoints of a range, flooring the
+/// end at the start so a degenerate all-overlong input stays well-formed.
+fn normalize_range_endpoints(mapper: &PositionMapper, range: Range) -> Option<Range> {
+    let start = normalize_client_position(mapper, range.start)?;
+    let end = normalize_client_position(mapper, range.end)?;
+    Some(Range {
+        start,
+        end: end.max(start),
+    })
+}
+
 /// RAII sweep of the upstream-request registry for one request id: on drop,
 /// removes every entry a dropped/aborted layer future did not get to
 /// unregister itself. Idempotent with the arms' own refcounted unregisters.
@@ -795,37 +817,19 @@ impl Kakehashi {
         // Get injection query to detect injection regions
         let injection_query = self.language.injection_query(&language_name)?;
 
-        // Resolve injection region at position. Clamped conversion: per LSP
-        // 3.18 a `character` past the line's end defaults back to the line
-        // length instead of failing, and the clamp also keeps an over-long
-        // column from spilling into a later line's bytes and
-        // containment-matching a region the caret is not visually in. The
-        // position is re-derived from the clamped byte so every later
-        // consumer sees the defended location, not the client's raw one.
-        // The defense is CHARACTER-scoped only: the spec mandates no such
-        // default for a line past the document's end, and letting one clamp
-        // to EOF would resolve the final injection for an unrelated line —
-        // a changed line means an invalid position, not a defended one.
+        // Resolve injection region at position, after the LSP position
+        // defense (see [`normalize_client_position`]): the clamp also keeps
+        // an over-long column from spilling into a later line's bytes and
+        // containment-matching a region the caret is not visually in, and
+        // every later consumer sees the defended location, not the client's
+        // raw one. A range request's end gets the identical defense with the
+        // same mapper.
         let mapper = PositionMapper::new(snapshot.text());
-        let byte_offset = mapper.position_to_byte_clamped(position);
-        let normalized = mapper.byte_to_position(byte_offset)?;
-        if normalized.line != position.line {
-            return None;
-        }
-        let position = normalized;
-        // A range request's end gets the identical defense with the same
-        // mapper: character clamped to its line, a changed line meaning an
-        // invalid position (no virtual context).
+        let position = normalize_client_position(&mapper, position)?;
+        let byte_offset = mapper.position_to_byte(position)?;
         let range_end = match range_end {
             None => None,
-            Some(end) => {
-                let end_byte = mapper.position_to_byte_clamped(end);
-                let normalized_end = mapper.byte_to_position(end_byte)?;
-                if normalized_end.line != end.line {
-                    return None;
-                }
-                Some(normalized_end)
-            }
+            Some(end) => Some(normalize_client_position(&mapper, end)?),
         };
 
         let Some(resolved) = crate::language::InjectionResolver::resolve_at_byte_offset(
@@ -1542,6 +1546,16 @@ impl Kakehashi {
         let upstream_request_id = current_upstream_id();
 
         let mapper = PositionMapper::new(snapshot.text());
+        // The same LSP position defense the single-region preamble applies:
+        // an over-long `character` defaults to its line's end; an endpoint
+        // whose line does not exist means an invalid range (no regions). This
+        // path never goes through `resolve_bridge_preamble`, so without it a
+        // raw over-long offset would survive `clamp_range_to_region` (which
+        // bounds by the region's ends, not the line's) and reach the
+        // downstream server as an invalid virtual coordinate.
+        let Some(range) = normalize_range_endpoints(&mapper, range) else {
+            return Vec::new();
+        };
         let mut contexts = Vec::new();
         for resolved in regions {
             if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
