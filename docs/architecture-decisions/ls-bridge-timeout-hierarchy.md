@@ -180,7 +180,7 @@ Let implementation details determine which timeout wins.
 - **[ls-bridge-message-ordering](ls-bridge-message-ordering.md)**: Connection state machine (state-based timeout gating)
 - **[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)**: Per-request timeout *(Phase 3)*
 - **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Global shutdown timeout
-- **[bridge-routing-protocol](bridge-routing-protocol.md)**: Routing decision deadline; Tier-2 exclusion for routing queries
+- **[bridge-routing-protocol](bridge-routing-protocol.md)**: Routing decision deadline; Tier-1/Tier-2 exemptions for routing queries
 
 ## Summary
 

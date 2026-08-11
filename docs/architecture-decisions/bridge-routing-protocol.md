@@ -5,7 +5,7 @@
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md) — the `ConnectionKey` model, per-root pooling, shared instances, and the workspace-folder capability fallback that a `workspaceFolders` override interacts with
 - [aggregation-priorities-wildcard](aggregation-priorities-wildcard.md) — the ordered-allowlist `priorities` semantics reused for provider selection
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — the `preferred` strategy whose fan-out/fan-in machinery this protocol dispatches
-- [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) — registers the routing decision deadline and the Tier-2 liveness exclusion
+- [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) — registers the routing decision deadline and the Tier-1/Tier-2 exemptions
 - [respawn-reopen-derives-its-targets](respawn-reopen-derives-its-targets.md) — the derived re-open, which consults only cached routing decisions
 - [wildcard-config-inheritance](wildcard-config-inheritance.md) — the inheritance resolution applied before the config projection goes on the wire
 - [host-document-bridge](host-document-bridge.md) — the `_self` layer whose `enabled` gate and aggregation entry govern host-document routing decisions
@@ -129,9 +129,11 @@ The result layers a "kakehashi decides" default at every granularity:
   gate**, a per-decision point every open path consults before sending
   any `didOpen` — the eager per-server open tasks, the lazy per-request
   open (the `ensure_document_opened` call on the request-execute path),
-  and the derived re-open sweep alike — so no later request can open the
-  document there through a side door (the gate's placement is specified
-  under the deadline section below). This is **per-document forwarding
+  and the derived re-open sweep alike — so, while the decision is
+  cached, no later request can open the document there through a side
+  door (a post-flush miss at the cache-only sites fails open — see
+  Caching below; the gate's placement is specified under the deadline
+  section). This is **per-document forwarding
   suppression**, not slot control: the connection (if any) is untouched
   and other documents route normally. It is deliberately weaker than
   bridge-client-control-protocol's `stop`, which pins a whole slot.
@@ -171,8 +173,8 @@ override's first element, checked after the truncation below. If either is
 stopped, the answer's entry for that server is discarded (the
 configuration-resolved stop wins; a provider cannot steer a document
 around a user's pin by naming a different root). For a shared-instance server the two keys are the same
-root-independent `ConnectionKey::shared`, so the double check collapses to
-one. Without it, `stop` would be advisory against a root-redirecting
+root-independent `ConnectionKey::shared`, so the double check collapses
+to one. Without it, `stop` would be advisory against a root-redirecting
 provider — the failure mode that decision's own "auto-respawn" rejection
 exists to prevent.
 
@@ -384,9 +386,12 @@ candidates at all likewise queries nothing.
   deliberate and worth naming: any operative answer wins the *whole*
   decision, so a high-priority provider that answers only affirmations
   thereby vetoes every lower-priority provider — priority is authority.
-  The decision resolves as soon as every selected provider has answered
-  or been skipped; the deadline is a bound, not a wait. The winning
-  answer is attributed to the provider that produced it.
+  The decision resolves as soon as the priority walk can decide — every
+  higher-priority position answered or failed and some position holding
+  an operative answer — and at the latest when the last selected
+  provider has answered or been skipped; the deadline is the outer
+  bound, not a wait. The winning answer is attributed to the provider
+  that produced it.
 - Because the key space of `bridge.<lang>.aggregation` is method names, a
   per-language provider order works with no new machinery. This is the
   first non-LSP method in that key space.
@@ -728,7 +733,7 @@ a slot a routing provider left in play.
 
 - A configured provider defers first feature availability by design: the
   first decision per (document, layer, language) costs concurrent round
-  trips to every advertising provider, bounded by one routing deadline,
+  trips to every selected provider, bounded by one routing deadline,
   and the downstream opens that decision gates land up to that deadline
   later than today. (The ingress writer ticket and the parse loop are
   deliberately not stalled — the await lives in the fire-and-forget open
@@ -830,7 +835,7 @@ a slot a routing provider left in play.
 | **Method** | `kakehashi/bridge/routing`, kakehashi→downstream request; dispatch strictly per side |
 | **Decision unit** | one query per (host document, layer, language); `textDocument = { uri: host URI, languageId }` + `layer` |
 | **Params** | `textDocument` + `layer` + `languageServers` projection `{languages, workspaceMarkers, preferSharedInstance}` of spawnable, language-matching servers (`_` excluded) |
-| **Answer** | `null`/missing entry/absent `enabled` = kakehashi decides; `enabled: false` = per-document `didOpen` suppression at candidate selection; non-empty `workspaceFolders` = root override; `[]` invalid in v1 |
+| **Answer** | `null`/missing entry/absent `enabled` = kakehashi decides; `enabled: false` = per-document `didOpen` suppression at the routing gate; non-empty `workspaceFolders` = root override; `[]` invalid in v1 |
 | **Precedence** | membership: stopped set > configuration > answer (subtract only); root: answer overrides marker resolution, both resolved keys checked against the stopped set |
 | **Trust** | providers are trusted-by-configuration; folder overrides bounded to canonicalized `file:` URIs at-or-below client workspace folders or the config-resolved root, count-capped |
 | **Folders↔Key** | shared instance: union-only join; per-root: first element, rest warned+ignored; at most one connection per server name per document |
