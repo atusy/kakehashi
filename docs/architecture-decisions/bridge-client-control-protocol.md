@@ -478,8 +478,9 @@ generation — never a resource, so nothing can strand in a channel
 buffer — and a sub-task that dies (panic, cancellation, crash) is
 observed via the actor's `JoinSet` and settled like any other completion:
 the actor applies the ownership-at-completion rule to its own state
-entry, settles the tombstone/ARM/replacement records, and **answers the
-outer result channel exactly once**. `stop` answers `null` when the slot
+entry, settles the tombstone/ARM/replacement records, and **settles the
+outer result exactly once — answering only while the reply is still
+live** (a cancelled caller was already released and sees nothing more). `stop` answers `null` when the slot
 verifiably reached `Closed` — with its tombstone installed, or with the
 tombstone legitimately omitted because a reload deleted the server
 (closure is what `stop` promises; the tombstone is bookkeeping) — and

@@ -271,7 +271,9 @@ machinery, serialization **removes** them by construction.
 
 **The actor loop never blocks.** Long operations — the LSP shutdown
 handshake, SIGTERM/SIGKILL escalation, `Child::wait` — run as spawned
-sub-tasks. **Resources never travel**: the authoritative process handle,
+sub-tasks. **Authoritative lifecycle resources never travel** (borrowed
+working material — an `Arc` of a handle, lent I/O endpoints — does): the
+authoritative process handle,
 the reply sender, and every record live in the actor's state entry for
 the key; a sub-task borrows what it needs (a shared `Arc` of the process
 handle, the I/O endpoints a handshake transition lends it) and carries
@@ -290,9 +292,11 @@ What the previous machinery bought, the actor gives structurally:
   messages; the second is answered from the key's current state
   (`clientRestarting`, `clientNotReady`, …). No registry, no guard to
   release, no half-mutated slot for a dropped handler to leave behind.
-- **No lease-owner map** — the actor is the only entity that spawns,
-  signals, or waits a process: because spawning itself is a non-suspending
-  actor transition, no child can come into existence behind an escalation
+- **No lease-owner map** — the actor is the sole lifecycle
+  **authority**: every spawn, signal, and wait happens either inside one
+  of its transitions or in exactly one tracked sub-task acting on its
+  delegation, and because the spawn *intent* commits as a non-suspending
+  transition, no child can come into existence behind an escalation
   scan. Sub-tasks the actor spawns are the delegation, tracked in its
   `JoinSet`; a "revoked claim" is just the actor ignoring a stale
   completion message — safe to ignore outright, because completions
@@ -349,16 +353,25 @@ control transition; the entry plus its pool-map insertion for a spawn
 commit; the global sections a `Reload` or `Teardown` touches (mode,
 sealing, tombstone sweeps) — and its final act is the single
 **commit-and-reply swap**, so a panic anywhere before that pair leaves
-every affected value unchanged with the message merely consumed. The pairing governs what a
-**live** caller can observe, not whether the actor may commit: a
-transition whose reply is already gone — the caller released by
-`RequestCancelled`, or a reply-less message (`Reload`,
-`DeadlineExpired`, internal settlement) — commits **state-only**. For a
-live request, reply and commit are one act, so a caller whose receiver
-closes (an incarnation died before the pair) learns `RequestFailed`
-(`stopFailed`/`restartFailed`) and that reading is always truthful:
-*not committed*, never a committed success misreported as failure.
-Settlement is at-most-once and no caller is ever left pending.
+every affected value unchanged with the message merely consumed.
+External effects are not staged, because an OS child cannot be rolled
+back: a spawn first **commits a `Spawning` intent** (the entry owns the
+would-be child before it exists), the tracked sub-task then creates the
+process, and the tracked completion records its handle — a panic between
+intent and completion settles from the intent record (kill-and-reap on
+sight), never by pretending the child away. The pairing applies to the
+**terminal, caller-visible transition** of an operation: a multi-step
+`stop`/`restart` commits its initial and intermediate transitions
+state-only, the entry retaining the live reply sender for terminal
+settlement. A transition with no live reply — the caller released by
+`RequestCancelled`, or a reply-less message (`DeadlineExpired`, internal
+settlement) — likewise commits state-only. For the terminal transition
+of a live request, reply and commit are one act, so a caller whose
+receiver closes (an incarnation died before the pair) learns
+`RequestFailed` (`stopFailed`/`restartFailed`) and that reading is
+always truthful: *terminal outcome not committed*, never a committed
+success misreported as failure. Settlement is at-most-once and no caller
+is ever left pending.
 
 **Sketch** (illustrative, target design):
 
@@ -395,8 +408,11 @@ async fn lifecycle_actor(pool: Arc<ConnectionPool>) {
 }
 ```
 
-**Latency**: lifecycle transitions are rare, human-initiated events;
-serializing them costs nothing observable. The per-connection shutdown
+**Latency**: control and teardown events are rare and human-initiated;
+the automatic transitions (spawn commits, respawn decisions, reload
+purges) cost one message round trip each — the per-spawn round trip
+already recorded in bridge-client-control-protocol's consequences.
+Serializing them costs nothing else observable. The per-connection shutdown
 handshakes themselves still run in parallel as sub-tasks — the actor
 serializes *decisions*, not process I/O.
 
