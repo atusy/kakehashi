@@ -561,10 +561,11 @@ Decision-cache lifecycle:
   flushes the whole cache: superseded-generation entries are unreadable
   under the new generation and would otherwise sit resident until their
   document closes. Cache and binding are each bounded in top-level keys
-  by open documents × layers × languages; a binding entry additionally
-  carries per-candidate-server settlements and, for shared overrides,
-  the capped folder list, so the byte bound multiplies by the
-  candidate-server count and the folder cap.
+  by open documents × layers × languages; entries in **both** carry
+  per-candidate-server payloads (a normalized answer's routing map, a
+  binding's settlements) and capped folder lists, so the byte bound
+  multiplies by the candidate-server count and the folder cap, with the
+  framing ceilings bounding the strings themselves.
 - **Flushed wholesale whenever the set of `Ready` advertising providers
   changes** — a provider reaching `Ready`, being replaced by restart or
   respawn, being stopped, failing, or having its advertisement cleared by
@@ -622,9 +623,14 @@ Decision-cache lifecycle:
     — so a flight re-anchors only when each advance since its anchor is
     a recorded Ready transition of a handle it awaited; any other
     cause, another provider's arrival or a workspace-folder change,
-    discards as usual. Cause records are bounded, not session-long:
-    they are retained back to the oldest live flight's anchor and
-    pruned as flights settle;
+    discards as usual. The bookkeeping is **per-flight eligibility
+    state, not a cause log**: the same pool critical section that
+    bumps the epoch walks the live flights and either marks each
+    still-eligible (this bump was an awaited handle's Ready) or
+    invalidates it, and flight registration, re-anchoring, settlement,
+    and this marking all share that lock — so eligibility can neither
+    grow with flush churn nor race a flight's registration, and a
+    flight whose provenance is missing discards, never re-anchors;
   - an **incarnation** move (`didClose`, or close/re-open) **aborts**
     the waiting tasks outright — no `didOpen` is sent at all, and the
     incarnation is re-checked at the open's enqueue commit point, so an
@@ -697,9 +703,11 @@ returns — a timed-out *waiter* abandoning the call must not free
 capacity for the next caller to hang another worker — so permanently
 hung calls can exhaust the pool for unrelated providers. That is the
 recorded failure mode, and its effects are the contract's, not a
-blanket fail-open: *new decisions* fail open, while bound-key reuse
-that cannot validate stays dark and sweep barriers fail soft until
-capacity returns. Teardown never blocks on the pool.
+blanket fail-open: a new decision's *folder-bearing* entries fail open
+(root overrides need validation), while suppression-only entries need
+no filesystem work and stay effective; override-bound reuse that cannot
+validate stays dark and sweep barriers fail soft until capacity
+returns. Teardown never blocks on the pool.
 
 Because they carry no tier accounting, outstanding provider requests are
 cleaned up on **every terminal outcome of the decision**, not only
