@@ -71,6 +71,24 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
     )
 }
 
+/// Methods whose request position is the insert-mode caret, which sits *after*
+/// the last typed character — for an injection region ending mid-line that is
+/// exactly the region's end byte, outside the default half-open containment.
+/// These resolve with [`RegionBoundary::CaretEndFallback`] so typing at the
+/// tail of a `vim` `!cmd` or an embedded string still reaches the injected
+/// language's server. Point-shaped methods (hover, definition, …) keep strict
+/// half-open containment per node-reference-protocol § Half-Open Intervals.
+///
+/// [`RegionBoundary::CaretEndFallback`]: crate::language::injection::RegionBoundary::CaretEndFallback
+fn method_accepts_region_end_position(method: &str) -> bool {
+    matches!(
+        method,
+        "textDocument/completion"
+            | "textDocument/signatureHelp"
+            | "textDocument/linkedEditingRange"
+    )
+}
+
 /// RAII sweep of the upstream-request registry for one request id: on drop,
 /// removes every entry a dropped/aborted layer future did not get to
 /// unregister itself. Idempotent with the arms' own refcounted unregisters.
@@ -761,6 +779,11 @@ impl Kakehashi {
             injection_query.as_ref(),
             byte_offset,
             snapshot.incarnation(),
+            if method_accepts_region_end_position(method_name) {
+                crate::language::injection::RegionBoundary::CaretEndFallback
+            } else {
+                crate::language::injection::RegionBoundary::HalfOpen
+            },
         ) else {
             // Not in an injection region - return None
             return None;
@@ -2759,6 +2782,27 @@ mod tests {
             "textDocument/signatureHelp",
         ] {
             assert!(!method_requires_contiguous_injection(method), "{method}");
+        }
+    }
+
+    #[test]
+    fn caret_shaped_methods_accept_region_end_position() {
+        for method in [
+            "textDocument/completion",
+            "textDocument/signatureHelp",
+            "textDocument/linkedEditingRange",
+        ] {
+            assert!(method_accepts_region_end_position(method), "{method}");
+        }
+        // Point-shaped methods keep strict half-open containment.
+        for method in [
+            "textDocument/definition",
+            "textDocument/hover",
+            "textDocument/references",
+            "textDocument/documentHighlight",
+            "textDocument/rename",
+        ] {
+            assert!(!method_accepts_region_end_position(method), "{method}");
         }
     }
 
