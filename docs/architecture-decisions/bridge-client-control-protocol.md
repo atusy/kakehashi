@@ -148,8 +148,9 @@ resolves only through cancellation; a `notify` carrying a request-kind
 method is a well-formed JSON-RPC notification the server will most likely
 ignore. Both are the caller's responsibility. The inner `params` must be an
 object, an array, or absent — the only shapes JSON-RPC permits — and
-anything else is rejected at the outer level with `InvalidParams`
-(`-32602`) before anything is forwarded.
+anything else is rejected before forwarding: `request` fails with
+`InvalidParams` (`-32602`); `notify`, having no response channel, drops and
+logs it.
 
 **Response envelope.** Except on cancellation or connection loss (below),
 the outer request succeeds whenever forwarding succeeded, and its result
@@ -177,8 +178,12 @@ client, denied method) use the error model below, so callers can distinguish
 request (ls-bridge-message-ordering § Cancellation Forwarding; mechanically,
 the handler remembers the downstream id it minted and calls
 `forward_cancel_downstream`). The outer request then fails with
-`RequestCancelled` (`-32800`); a downstream answer arriving after the cancel
-was issued is dropped and logged. Without forwarding, a hung downstream
+`RequestCancelled` (`-32800`); the pending entry is retired atomically with
+that error, so a downstream answer arriving later has nowhere to land and
+is dropped and logged. This is a deliberate exception to
+ls-bridge-message-ordering's forward-the-late-response rule — that rule
+serves callers still waiting for a result, and this caller has already
+abandoned it. Without forwarding, a hung downstream
 would pin the outer request forever — which matters because the outer
 request carries **no bridge-imposed timeout**: the bridge cannot know the
 expected latency of an arbitrary method, so the caller decides how long a
@@ -195,10 +200,13 @@ error.
 pass-through call provokes — `$/progress`, `workspace/configuration`,
 `workspace/applyEdit`, any server→client request — flows through the
 bridge's normal inbound handling under bridge policy, exactly as if a
-bridged request had provoked it. In particular, a caller-minted
-`workDoneToken` riding the inner params is unknown to the bridge's progress
-aggregation, so its progress is dropped; callers must not rely on progress
-or server-request round trips through the escape hatch.
+bridged request had provoked it. In particular, the bridge does not rewrite a caller-minted
+`workDoneToken` riding the inner params: progress for a token the bridge
+does not recognize is dropped, and a token that collides with a live
+bridge-minted token — whose shapes are predictable strings — is misrouted
+into that token's aggregation. Minting collision-safe tokens is the
+caller's responsibility, and callers must not rely on progress or
+server-request round trips through the escape hatch.
 
 ### Error Model
 
@@ -229,11 +237,14 @@ deliberate exception). `stop` and `restart` do wait — but only on the
 shutdown and initialization handshakes they themselves initiate, never on a
 status change someone else must cause.
 
-`notify` never errors. It is forwarded while the slot is `starting` or
-`running` (the order queue already accepts notifications during
-initialization) and silently dropped — logged at debug level — during
-`stopping`/`stopped`/`failed`, the restart window, and for unknown ids,
-matching JSON-RPC notification semantics.
+`notify` never errors — including for malformed inner `params`, which are
+dropped and logged rather than rejected (`InvalidParams` applies to
+`request` only). It is forwarded only while the slot is `running`: during
+`starting` a pass-through notification could land between `initialize` and
+`initialized`, which LSP forbids, so it is dropped there like everywhere
+else — silently, logged at debug level — during
+`starting`/`stopping`/`stopped`/`failed`, the restart window, and for
+unknown ids.
 
 ### Inspection: `documents`, `serverInfo`, `workspaceFolders`
 
@@ -283,8 +294,8 @@ the slot reaches `Closed`, whichever path got it there. `stop` on a
 and likewise returns at `Closed`. `stop` on a `failed` slot skips the LSP
 handshake — the `Failed → Closed` bypass ls-bridge-graceful-shutdown already
 defines — cleans up the process, and records the stopped entry: pinning a
-crash-looping slot before its next automatic respawn is a first-class use of
-this method, not an edge case.
+repeatedly failing slot before the next acquire respawns it is a
+first-class use of this method, not an edge case.
 
 What is new is the **stopped set**: the pool records the `ConnectionKey` as
 explicitly stopped, and the normal routing path consults it — a `didOpen` (or
@@ -294,8 +305,12 @@ This is a deliberate behavior change to the normal path: without it, the next
 keystroke in a matching document would resurrect the server and `stop` would
 be advisory. `stop` on an already-stopped slot returns `null` (idempotent).
 
-Two lifecycle rules keep the set coherent:
+Three lifecycle rules keep the set coherent:
 
+- **The pin shares the acquire path's critical section.** The stopped-set
+  check happens inside the same `connections` critical section where the
+  acquire path decides, removes, and spawns — an acquire cannot observe
+  "not stopped", lose the race to a committing `stop`, and spawn anyway.
 - **Control calls are single-flight per key.** `stop` and `restart` both
   span a handshake and mutate the same entry, so the bridge serializes them:
   a control call arriving while another is in flight on the same key fails
@@ -332,13 +347,25 @@ cleared, so the ordinary crash-respawn path still applies to the slot.
   respawn-reopen-derives-its-targets. Only the `workspace/executeCommand`
   routes wait on the re-open barrier (execute-command-routing-token, fail-soft
   if unsettled); other request paths open their own documents and do not
-  wait.
+  wait. Restoration is therefore an observable catch-up window: `restart`
+  resolves at `Ready`, the re-open sweep runs after it, `documents` may
+  briefly under-report, and a pass-through request racing the sweep is —
+  like all pass-through — the caller's own risk.
+- **A shared instance re-seeds; nothing is remembered.** A `#shared` key
+  carries no root, and the old handle's accumulated folder set dies with
+  it. The replacement is seeded exactly as a fresh spawn would be, and the
+  set regrows through the existing add-only acquire path
+  (`workspace/didChangeWorkspaceFolders` per
+  ls-bridge-server-pool-coordination) as roots re-acquire the shared
+  connection — derive, don't remember, applied to folders.
 
 During the restart window, `request` fails with `clientRestarting` and
 `notify` is silently dropped. `restart` on a `stopped` slot is simply a
-start. `restart` on a `failed` slot replaces the process like a crash
-respawn, and additionally **clears the slot's consecutive-panic count**: the
-pool disables a slot after `MAX_CONSECUTIVE_PANICS` crash respawns, and an
+start. `restart` on a `failed` slot replaces the process the way a later
+acquire would — `Failed` connections respawn on acquire, not on a timer —
+and additionally **clears the slot's consecutive-panic count**: the pool
+disables a slot after `MAX_CONSECUTIVE_PANICS` consecutive initialization
+handshake panics (the counter resets on a successful handshake), and an
 explicit user-initiated `restart` is exactly the signal that should re-arm
 it. For the same reason, `restart` is exempt from any future crash-storm
 rate limiter (ls-bridge-server-pool-coordination Phase 2): a human asking is
@@ -418,8 +445,8 @@ namespace.
 - Nearly every mechanism is reuse: `ConnectionKey` routing,
   `forward_cancel_downstream`, the graceful-shutdown state machine, the
   ARM/CLAIM derived re-open. The genuinely new state is the stopped set, the
-  per-connection shutdown timeout, the in-flight pass-through id map, and the
-  deny list.
+  per-connection shutdown timeout, the in-flight pass-through id map, the
+  per-handle `serverInfo`, and the deny list.
 - Held ids survive restarts, so tooling built on the protocol needs no
   re-enumeration choreography.
 
@@ -473,6 +500,9 @@ namespace.
 - `restart` clears the slot's entry in `consecutive_panic_counts` before
   respawning; `stop` drives `force_kill_with_escalation` from a new
   per-connection timeout rather than the pool-wide teardown path.
+- `serverInfo` needs new per-handle state: the handshake currently retains
+  only `ServerCapabilities`, so the initialize result's `serverInfo` must be
+  parsed and stored on the connection handle.
 - Pass-through cancellation reuses `forward_cancel_downstream` keyed by
   `(ConnectionKey, downstream id)`. As in the formatting pipeline, the
   handler itself records the downstream id it minted for each in-flight
