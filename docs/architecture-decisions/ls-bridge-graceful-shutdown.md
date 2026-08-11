@@ -448,9 +448,14 @@ enum LifecycleMsg {
     //   commits — the settling entry already fences spawn commits, so
     //   the re-acquire cannot spawn beside the superseded producer
     //   (the reload-origin record then dissolves per the origin rule).
-    //   The re-acquire re-resolves current configuration and spends the
-    //   REMAINING budget of the original acquisition deadline — reload
-    //   churn cannot reset the timeout; reload DELETION removes the row instead, and the
+    //   The re-acquire re-resolves current configuration, spends the
+    //   REMAINING budget of the original acquisition deadline (reload
+    //   churn cannot reset the timeout), and — finding the settling
+    //   fence still up — subscribes to the same (key, generation')
+    //   notify path everything else uses: cleanup dissolution wakes it
+    //   to spawn under the new generation, deletion wakes it with the
+    //   deleted-server error, teardown with the sealed error, and the
+    //   deadline expiring first fails it like any timed-out acquire; reload DELETION removes the row instead, and the
     //   removal itself notifies waiters of that (key, generation) with
     //   the deleted-server acquire error — the notification carries the
     //   terminal answer, so no row needs to remain. No pending reply
