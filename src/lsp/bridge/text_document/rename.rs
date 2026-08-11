@@ -53,7 +53,6 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/rename") {
             return Ok(None);
         }
-        let region_end = region_host_end(virtual_content, &offset);
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -75,6 +74,11 @@ impl LanguageServerPool {
                 )
             },
             |response, ctx| {
+                // The position dispatch derived region_end for the trailing
+                // bound; recompute only on the (unreachable here) None path.
+                let region_end = ctx
+                    .region_end
+                    .unwrap_or_else(|| region_host_end(virtual_content, ctx.offset));
                 transform_workspace_edit_response_to_host_bounded(
                     response,
                     &ctx.virtual_uri_string,

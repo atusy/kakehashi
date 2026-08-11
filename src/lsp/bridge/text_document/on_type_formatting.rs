@@ -81,7 +81,6 @@ impl LanguageServerPool {
             return Ok(None);
         }
         let virtual_line_count = count_lines(virtual_content);
-        let region_end = region_host_end(virtual_content, &offset);
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -106,6 +105,11 @@ impl LanguageServerPool {
             // malformed payloads to `Err` (request failure) — only the
             // capability/trigger early returns above yield `Ok(None)`.
             |response, ctx| {
+                // The position dispatch derived region_end for the trailing
+                // bound; recompute only on the (unreachable here) None path.
+                let region_end = ctx
+                    .region_end
+                    .unwrap_or_else(|| region_host_end(virtual_content, ctx.offset));
                 transform_formatting_response_to_host(
                     response,
                     ctx.offset,

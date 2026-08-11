@@ -33,6 +33,14 @@ pub(crate) struct BridgeResponseContext<'a> {
     pub host_uri_lsp: &'a Uri,
     /// The injection region offset for coordinate translation back to host space.
     pub offset: &'a RegionOffset,
+    /// The region's end-of-content in host coordinates
+    /// (`region_host_end(virtual_content, offset)`), when the dispatch path
+    /// already derived it — the position path computes it for the trailing
+    /// bound, and the formatting paths compute it for edit containment.
+    /// Deriving it is O(virtual_content), so transformers that need it reuse
+    /// this instead of recomputing per request. `None` on paths that never
+    /// derived it.
+    pub region_end: Option<Position>,
 }
 
 struct RequestHostLifecycle<'a> {
@@ -106,6 +114,7 @@ impl LanguageServerPool {
             build_request,
             transform_response,
             None,
+            None,
         )
         .await
     }
@@ -130,6 +139,7 @@ impl LanguageServerPool {
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
         downstream_id_probe: Option<&std::sync::OnceLock<RequestId>>,
+        region_end: Option<Position>,
     ) -> io::Result<T> {
         // Route all per-connection state by this handle's pool key
         // `(server_name, root)` rather than a separately-threaded server name,
@@ -256,6 +266,7 @@ impl LanguageServerPool {
             virtual_uri_string: virtual_uri.to_uri_string(),
             host_uri_lsp: &host_uri_lsp,
             offset,
+            region_end,
         };
 
         Ok(transform_response(response?, &context))
@@ -343,6 +354,7 @@ impl LanguageServerPool {
                 virtual_uri_string: virtual_uri.to_uri_string(),
                 host_uri_lsp: &host_uri_lsp,
                 offset,
+                region_end: Some(region_end),
             };
             return Ok(transform_response(
                 serde_json::json!({ "result": null }),
@@ -350,7 +362,7 @@ impl LanguageServerPool {
             ));
         }
 
-        self.execute_bridge_request_with_handle(
+        self.execute_bridge_request_observed(
             handle,
             host_uri,
             injection_language,
@@ -360,6 +372,8 @@ impl LanguageServerPool {
             upstream_request_id,
             build_request,
             transform_response,
+            None,
+            Some(region_end),
         )
         .await
     }
@@ -402,6 +416,7 @@ mod tests {
                 },
                 |_, _| (),
                 Some(&request_probe),
+                None,
             )
             .await
         });
@@ -758,6 +773,7 @@ mod tests {
             virtual_uri_string: "file:///project/virtual.lua".to_string(),
             host_uri_lsp: &host_uri,
             offset: &offset,
+            region_end: None,
         };
         assert_eq!(ctx.virtual_uri_string, "file:///project/virtual.lua");
         assert_eq!(ctx.host_uri_lsp, &host_uri);

@@ -68,7 +68,11 @@ impl LanguageServerPool {
                 build_completion_request(virtual_uri, host_position, &offset, request_id)
             },
             |response, ctx| {
-                let region_end = region_host_end(virtual_content, ctx.offset);
+                // The position dispatch derived region_end for the trailing
+                // bound; recompute only on the (unreachable here) None path.
+                let region_end = ctx
+                    .region_end
+                    .unwrap_or_else(|| region_host_end(virtual_content, ctx.offset));
                 transform_completion_response_to_host(
                     response,
                     ctx.offset,

@@ -104,6 +104,7 @@ impl LanguageServerPool {
                 .map(Some)
             },
             downstream_id_probe,
+            Some(region_end),
         )
         .await?
     }
