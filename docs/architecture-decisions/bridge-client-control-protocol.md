@@ -125,7 +125,12 @@ Both parameters are optional and compose as AND:
   route filters by where the document actually opened; ordinary
   resolution applies only to a tuple with no binding at all, and a
   *pending* tuple (its decision still in flight) matches nothing yet —
-  the document is not open there — rather than falling through. A document kakehashi does not
+  the document is not open there — rather than falling through. A
+  *retained* tuple (the route decided but its acquire failed —
+  bridge-routing-protocol) **matches its retained key**: the slot is
+  enumerable as `failed`, and surfacing it as the client assigned to
+  the document is exactly what a user diagnosing missing features
+  needs, unlike `pending`, whose assignment does not exist yet. A document kakehashi does not
   have open matches nothing — the parameter is a filter, not a lookup.
 - `name?: string` — only clients spawned from this `languageServers` entry.
 
