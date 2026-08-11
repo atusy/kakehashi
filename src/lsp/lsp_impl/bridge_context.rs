@@ -2799,6 +2799,9 @@ mod tests {
             "textDocument/completion",
             "textDocument/signatureHelp",
             "textDocument/linkedEditingRange",
+            // onTypeFormatting has no point-invocation mode at all: its
+            // position is the caret right after the typed trigger character.
+            "textDocument/onTypeFormatting",
         ] {
             assert_eq!(
                 region_boundary_for_method(method),
