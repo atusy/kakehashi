@@ -395,17 +395,23 @@ async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
     // operation and receives the RAII lease back before the new owner
     // may act, so a mid-flight SIGTERM or pending Child::wait is never
     // preempted by a mere map edit. No process ever has two escalation
-    // owners. The force result is recorded IN PLACE (a transactional
-    // phase-guard store — no join! temporary is ever the sole owner
-    // across a panic point).
-    state.record_kill_unresolved(join!(
+    // owners. Acquisition places a lease with the central owner-map
+    // SYNCHRONOUSLY; the acquiring task holds it as a transfer from the
+    // map, so ownership is never ambiguous even if the task dies while
+    // an acknowledgement is pending — and a revoker awaits that
+    // acknowledgement with the owner-map lock RELEASED. The force arm
+    // writes survivors DIRECTLY into a supervisor-owned slot as it
+    // goes, before returning — the join! never owns them, so a panic in
+    // the other arm after the force arm finishes cannot drop them.
+    join!(
         force_kill_remaining_until(
             deadline,
             teardown.lease_owners().claim_ordinary(&state.connections),
             &state.control_procs,
+            &mut state.kill_unresolved, // direct writes, not a return value
         ),
         abort_survivors_and_finalize(&mut state.control_tasks, graceful_deadline),
-    ).0);
+    );
 
     // Both arms have joined: no control task is alive, so no RAII
     // wrapper can hand a process back later. Only NOW close the live
@@ -431,8 +437,10 @@ async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
     // the commit receives the already-reinserted records back from
     // join_or_start as its late-exit claim (the Joined arm above).
     // dispose_locked_adopting ADOPTS the survivor set under its own
-    // lock BEFORE any panic-prone work; an unwind inside the closure
-    // rolls the set back into supervisor state instead of dropping it.
+    // lock BEFORE any panic-prone work, and the branch commits PER
+    // RECORD with an ownership checkpoint: an unwind mid-batch rolls
+    // back only records not yet published — a published lease/waiter is
+    // never duplicated, an uncommitted record never dropped.
     teardown.dispose_locked_adopting(state, |final_mode, records| match final_mode {
         ShutdownMode::ProcessExit  => log_and_abandon(records),
         ShutdownMode::ServerRemains =>

@@ -465,7 +465,11 @@ commit points and primitive calls the task holds no pool locks and
 touches no shared state other than the processes it owns, whose kill
 handles are registered **atomically at acquisition** — at spawn for a
 new process, at reclaim for a pre-existing writer or process — so no
-abort window exists between owning a process and having it on record. A
+abort window exists between owning a process and having it on record.
+Registration is the synchronous placement of the lease with the central
+owner-map; the task then holds it as a transfer from the map
+(ls-bridge-graceful-shutdown), so ownership stays unambiguous even
+across an asynchronous revocation handshake. A
 handle in flight through a channel (the writer's stdin handoff) travels
 as a **pre-registered RAII wrapper**: an aborted receiver drops the
 wrapper and the process returns to the registry instead of vanishing
