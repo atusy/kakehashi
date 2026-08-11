@@ -729,12 +729,18 @@ impl Kakehashi {
     ///
     /// Returns `None` for any early-exit condition (invalid URI, no document,
     /// no language, no injection at position).
+    /// Returns the preamble plus the NORMALIZED position: per LSP 3.18 a
+    /// `character` past the line's end (or a line past the document's end)
+    /// defaults back to the nearest real location rather than failing, so the
+    /// byte lookup, the bounds precheck, and the downstream dispatch must all
+    /// see the same defended position — position-based callers thread it into
+    /// their request context in place of the client's raw position.
     fn resolve_bridge_preamble(
         &self,
         lsp_uri: &Uri,
         position: Position,
         method_name: &str,
-    ) -> Option<PreambleResult> {
+    ) -> Option<(PreambleResult, Position)> {
         // Convert ls_types::Uri to url::Url for internal use
         let Ok(uri) = uri_to_url(lsp_uri) else {
             log::warn!("Invalid URI in {}: {}", method_name, lsp_uri.as_str());
@@ -778,13 +784,16 @@ impl Kakehashi {
         // Get injection query to detect injection regions
         let injection_query = self.language.injection_query(&language_name)?;
 
-        // Resolve injection region at position. Strict conversion: a
-        // client-supplied column past the line's end must mean "no such
-        // location" (virt layer silent), not spill into a later line's bytes
-        // and containment-match a region the caret is not visually in —
-        // same policy as kakehashi/node position resolution.
+        // Resolve injection region at position. Clamped conversion: per LSP
+        // 3.18 an out-of-bounds position defaults back to the line's (or
+        // document's) end instead of failing, and the clamp also keeps an
+        // over-long column from spilling into a later line's bytes and
+        // containment-matching a region the caret is not visually in. The
+        // position is re-derived from the clamped byte so every later
+        // consumer sees the defended location, not the client's raw one.
         let mapper = PositionMapper::new(snapshot.text());
-        let byte_offset = mapper.position_to_byte_strict(position)?;
+        let byte_offset = mapper.position_to_byte_clamped(position);
+        let position = mapper.byte_to_position(byte_offset)?;
 
         let Some(resolved) = crate::language::InjectionResolver::resolve_at_byte_offset(
             &self.language,
@@ -837,12 +846,15 @@ impl Kakehashi {
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
         let upstream_request_id = current_upstream_id();
 
-        Some(PreambleResult {
-            uri,
-            resolved,
-            language_name,
-            upstream_request_id,
-        })
+        Some((
+            PreambleResult {
+                uri,
+                resolved,
+                language_name,
+                upstream_request_id,
+            },
+            position,
+        ))
     }
 
     /// Resolve the cross-layer config (cross-layer-aggregation) for a host
@@ -1383,7 +1395,7 @@ impl Kakehashi {
         // request (hover / definition / completion / …) issued in the reparse window
         // would find `snapshot()` empty and return null after every edit.
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
-        let preamble = self.resolve_bridge_preamble(lsp_uri, position, method_name)?;
+        let (preamble, position) = self.resolve_bridge_preamble(lsp_uri, position, method_name)?;
         let document = self
             .preamble_to_document_context(preamble, method_name)
             .await?;
@@ -1410,7 +1422,9 @@ impl Kakehashi {
         method_name: &str,
     ) -> Option<RangeRequestContext> {
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
-        let preamble = self.resolve_bridge_preamble(lsp_uri, range.start, method_name)?;
+        // The normalized position is lookup-only here; the handler's range is
+        // clamped to the region by its own path.
+        let (preamble, _) = self.resolve_bridge_preamble(lsp_uri, range.start, method_name)?;
         let document = self
             .preamble_to_document_context(preamble, method_name)
             .await?;

@@ -240,6 +240,19 @@ fn test_lua_completion_at_caret_end_of_unclosed_fence() {
         items.len()
     );
 
+    // An over-long column must default back to the line's end (LSP 3.18
+    // position defense), landing on the same caret-end position — not drop
+    // the injected layer, and not spill into another line's bytes.
+    let overlong_response = poll_for_completions(&mut client, markdown_uri, 3, 999, 10, 500)
+        .expect("an over-long column defaults to the line end and still completes");
+    let overlong_result = overlong_response
+        .get("result")
+        .expect("Completion should have result field");
+    assert!(
+        !overlong_result.is_null(),
+        "over-long column must not lose the injected-language layer"
+    );
+
     // Clean shutdown
     shutdown_client(&mut client);
 }
