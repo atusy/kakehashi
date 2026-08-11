@@ -249,26 +249,30 @@ async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
     let now = Instant::now();
 
     // join_or_start applies this caller's mode atomically (monotonic
-    // upgrade; ProcessExit dominates) and distinguishes owner from
-    // joiner:
-    let teardown = match pool.teardown_run().join_or_start(mode, now) {
-        // Joiner: if this upgrade raced past an already-committed
-        // ServerRemains disposition, the SAME linearized call hands
-        // back the reinserted records as a late-exit claim for THIS
-        // caller to dispose (process::exit runs no destructors, so the
-        // Drop owner cannot be relied on there); then await final
-        // completion — published only AFTER cleanup — so an exiting
-        // joiner can never terminate around the owner's cleanup.
-        Joined { late_exit_claim, completion } => {
-            log_and_abandon(late_exit_claim);
-            completion.await;
-            return;
-        }
-        // Owner: runs the body below under the run's own deadlines;
-        // joiners never mint deadlines of their own.
-        Started(run) => run,
-    };
-    let deadline = teardown.deadline;               // = now + GLOBAL_TIMEOUT
+    // upgrade; ProcessExit dominates). The owner BODY (teardown_body,
+    // below) always runs in a POOL-OWNED task spawned by the first
+    // join_or_start — never inline in a caller's request future — so a
+    // cancelled or panicking caller cannot drop adopted tasks or
+    // process leases mid-teardown, and a panicking owner task completes
+    // the run AS FAILED, releasing every joiner instead of wedging
+    // them. Every caller, starter included, is a joiner:
+    let Joined { late_exit_claim, completion } =
+        pool.teardown_run().join_or_start(mode, now);
+
+    // If this caller's upgrade raced past an already-committed
+    // ServerRemains disposition, the same linearized call hands back
+    // the reinserted records for THIS caller to dispose (process::exit
+    // runs no destructors, so the Drop owner cannot be relied on
+    // there); completion is published only after cleanup, so an
+    // exiting caller can never terminate around it.
+    log_and_abandon(late_exit_claim);
+    completion.await;
+}
+
+// The owner body, spawned once per run into a pool-owned task by
+// join_or_start:
+async fn teardown_body(teardown: TeardownRun, pool: &ConnectionPool) {
+    let deadline = teardown.deadline;      // = starter's now + GLOBAL_TIMEOUT
     let graceful_deadline = teardown.graceful_deadline;
 
     // Gate ordinary admission: the pool-wide shutting_down flag stops
@@ -450,7 +454,9 @@ async fn shutdown_router(mode: ShutdownMode) {
     //    canonical body is deliberate: two parallel sketches of this
     //    sequence drifted repeatedly.
     shutdown_all_connections(&connection_pool, mode).await;
-    cleanup_router_state();
+    // No trailing cleanup here: run_pool_and_router_cleanup() inside the
+    // owner body is the single cleanup site, executed exactly once
+    // before completion publication.
 }
 ```
 
