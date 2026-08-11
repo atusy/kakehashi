@@ -237,7 +237,7 @@ control-protocol failures; bridged LSP requests keep their existing
 | `clientNotReady` | slot is `starting`, `stopping`, or `failed`; `data.status` carries which |
 | `clientStopped` | slot explicitly stopped; `restart` revives it |
 | `clientRestarting` | slot is mid-`restart`; retry after it returns |
-| `restartFailed` | the `restart` respawn failed — at spawn (missing or unspawnable command) or during initialization |
+| `restartFailed` | the `restart` respawn failed — at spawn (missing or unspawnable command), during initialization, or at completion, when the ownership check found the replacement displaced (e.g. by a reload); the message names the cause |
 | `forwardFailed` | the inner message could not be handed to the connection (bounded writer full, send error); nothing was forwarded |
 | `connectionLost` | the connection died after the inner request was forwarded |
 | `malformedResponse` | the downstream answered with an invalid JSON-RPC response |
