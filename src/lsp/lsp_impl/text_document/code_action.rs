@@ -432,6 +432,7 @@ impl Kakehashi {
                         context,
                         &t.injection_language,
                         &t.region_id,
+                        t.region_end(),
                         t.offset,
                         &t.virtual_content,
                         t.upstream_id,

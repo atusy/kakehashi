@@ -34,8 +34,8 @@ use url::Url;
 use super::super::pool::{ConnectionHandle, ConnectionKey, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
-    host_position_within_region, region_host_end, response_has_jsonrpc_error,
-    strip_bridge_local_versions, transform_workspace_edit_to_host, translate_host_range_to_virtual,
+    host_position_within_region, response_has_jsonrpc_error, strip_bridge_local_versions,
+    transform_workspace_edit_to_host, translate_host_range_to_virtual,
     translate_virtual_range_to_host, virtual_uri_to_lsp_uri, workspace_edit_has_effect,
     workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
@@ -417,6 +417,7 @@ impl LanguageServerPool {
         context: CodeActionContext,
         injection_language: &str,
         region_id: &str,
+        region_end: Position,
         offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
@@ -433,7 +434,6 @@ impl LanguageServerPool {
         // Phase 1: send the request and parse the raw actions (still in virtual
         // coordinates, no policy applied) — the bridge policy is deferred to
         // phase 3 so phase 2 can eager-resolve lazy actions asynchronously.
-        let region_end = region_host_end(virtual_content, &offset);
         let raw = self
             .execute_bridge_request_with_handle(
                 Arc::clone(&handle),
