@@ -62,7 +62,8 @@ A thin bridge that forwards requests and relies on client-driven cancellation:
 │                    ▼                                     │
 │  ┌──────────────────────────────────────────────────┐    │
 │  │           Unified Order Queue (FIFO)             │    │
-│  │  Bounded capacity (256)                          │    │
+│  │  Bounded capacity (4096; 256 caused routine      │    │
+│  │  fan-out loss)                                   │    │
 │  │  - Ensures FIFO ordering                         │    │
 │  │  - Non-blocking backpressure (try_send)          │    │
 │  └─────────────────┬────────────────────────────────┘    │
@@ -149,7 +150,7 @@ The bridge tracks pending requests for response correlation only:
 
 ### 3. Non-Blocking Backpressure
 
-The bounded order queue (capacity: 256) uses `try_send()` to prevent deadlocks during slow initialization.
+The bounded order queue (capacity: 4096 — raised from the original 256, which caused routine fan-out loss) uses `try_send()` to prevent deadlocks during slow initialization.
 
 **Strategy by Operation Type:**
 
@@ -270,16 +271,27 @@ Operations are gated at two levels: **server lifecycle** and **document lifecycl
     immediately because withholding them could deadlock the handshake —
     reaches the wire until `initialized` has been written (LSP forbids
     the client any other request or notification before the initialize
-    response). The `initialized` enqueue, the holding-queue transfer
-    into the FIFO (arrival order), and the admission cutover happen
-    under **one exclusion** — a `Flushing` sub-state of the
-    `Initializing → Ready` commit — so a producer that observes `Ready`
-    can never enter the FIFO ahead of older held notifications
-    (bridge-client-control-protocol). The holding queue is bounded by
-    the same class of bound as the wire FIFO; on overflow the newest
-    notification is dropped with a warn log — deterministic and
-    self-healing, since bridge-managed document sync re-establishes
-    state through the derived open paths once `Ready` lands
+    response; a `window/workDoneProgress/create` in this window is a
+    *nonconforming* server — the bridge answers it anyway, logged, as
+    tolerance, since refusing could wedge initialization). The
+    `initialized` enqueue, the holding-queue transfer into the FIFO
+    (arrival order), and the admission cutover happen under **one
+    exclusion** — a `Flushing` sub-state of the `Initializing → Ready`
+    commit — so a producer that observes `Ready` can never enter the
+    FIFO ahead of older held notifications
+    (bridge-client-control-protocol). The transfer is a **splice with
+    reserved capacity**: the FIFO's bound governs *admission*, never the
+    splice — a splice cannot be refused and never drives
+    `Flushing → Failed`; if the combined depth exceeds the bound,
+    admission simply stays closed until the writer drains below it.
+    State-replacement notifications (`workspace/didChangeConfiguration`)
+    are **not held at all**: the pool already retains current settings
+    and pushes the latest value after `initialized`, and holding stale
+    copies would invert latest-value semantics. The holding queue —
+    which therefore carries only sequence-dependent document sync — is
+    bounded (4096, the wire FIFO's bound); on overflow the newest
+    notification is dropped with a warn log, self-healing because the
+    derived open paths re-establish document state once `Ready` lands
   - `Closing`/`Closed` → DROP (writer loop stopped, see ls-bridge-graceful-shutdown)
   - Subject to document lifecycle gating below
 
