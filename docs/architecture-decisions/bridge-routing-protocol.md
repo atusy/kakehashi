@@ -621,9 +621,13 @@ structures with different lifetimes carry the outcome:
   (ls-bridge-server-pool-coordination is amended accordingly). The
   envelope must carry enough identity to *hit the right binding*: the
   layer/language pair, the open incarnation, and the tuple's **binding
-  generation** — a counter bumped each time the tuple's binding is
-  (re)created, because an injection language can leave and re-enter the
-  document without the host incarnation moving — matched exactly: after
+  generation** — drawn from one per-host monotonic 64-bit counter that
+  is never reset and never reused (no per-tuple state survives
+  eviction, so no tombstones; monotonicity rules out collision and a
+  64-bit space cannot wrap in practice), stamped anew each time a
+  tuple's binding is created, because an injection language can leave
+  and re-enter the document without the host incarnation moving —
+  matched exactly: after
   a close/re-open or a tuple re-creation the same URI holds a *new*
   binding, and an unstamped stale item would silently resolve through
   it. A resolve whose stamp no longer matches — the
@@ -679,7 +683,8 @@ Decision-cache lifecycle:
 - **A flush affects only future decision points.** A document already
   open keeps its binding; a cold-start document that was decided by
   defaults is re-decided only at its next genuine decision point, which
-  for an already-open document is close/re-open. Accepted: the
+  for an already-open document is close/re-open — or, for one injection
+  language, its authoritative disappearance and re-entry. Accepted: the
   alternatives are provider queries resurrecting on hover-class request
   paths, or a thundering herd of every open document re-deciding at once
   after a provider restart.
@@ -729,8 +734,11 @@ Decision-cache lifecycle:
     provenance is missing for any reason — discards, never re-anchors;
   - an **incarnation** move (`didClose`, or close/re-open) **aborts**
     the waiting tasks outright — no `didOpen` is sent at all, and the
-    incarnation is re-checked at the open's enqueue commit point, so an
-    old task can never emit a ghost open for a closed document. A
+    open's enqueue commit re-checks the incarnation **and, for a
+    virtual open, the tuple's current binding generation** (the
+    incarnation alone does not move when an injection language leaves
+    and re-enters), so an old task can never emit a ghost open for a
+    closed document or a removed region. A
     re-opened document never receives the previous open's answer:
     the anchors are part of the flight's identity, so a caller arriving
     after a flush or re-open never joins the stale flight — it starts a
@@ -1151,8 +1159,10 @@ a slot a routing provider left in play.
   incarnation) — the incarnation is the per-open token the document
   store's open tracker already mints), the decision cache, and the
   active route binding are new state beside the pool's per-connection
-  maps; the binding rides the same per-document lifecycle the
-  open-incarnation tracker maintains.
+  maps; the binding rides the per-document lifecycle the
+  open-incarnation tracker maintains, with the injection-tuple
+  last-region eviction (and its per-host binding-generation counter)
+  layered on top.
 - Fan-out/fan-in reuse `fan_out` + the `preferred` collector over the
   expanded priority walk, with the routing-specific provider universe
   (all spawnable configured servers, advertisement-filtered) and the
@@ -1230,6 +1240,6 @@ a slot a routing provider left in play.
 | **Folders↔Key** | shared instance: union-only join; per-root: first element, rest warned+ignored; at most one connection per server name per document |
 | **Providers** | all spawnable configured servers ∩ advertising ∩ `Ready` (Initializing awaited only when the advertisement is known, the server is named, or it carries `forceStart`), ordered by routing `priorities` (no `"_"` method-wildcard inheritance); concurrent fan-out, `preferred` fan-in, operative-entry rule |
 | **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy, plus a separate binding-reuse validation budget); expiry cancels pending requests, retires entries, falls open; exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
-| **Caching** | decision cache per (host URI, layer, languageId, config generation), single-flight, evicted on `didClose`, flushed on reload / `Ready`-provider-set / workspace-folder-set change, (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until `didClose` (injection tuples: also last-region disappearance); never retroactive |
+| **Caching** | decision cache per (host URI, layer, languageId, config generation), single-flight, evicted on `didClose` and on an injection tuple's authoritative last-region disappearance, flushed on reload / `Ready`-provider-set / workspace-folder-set change, (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until `didClose` (injection tuples: also last-region disappearance); never retroactive |
 | **Cold start** | `forceStart` (post-config-publication get-or-create; `#shared` + primary-root seed for `preferSharedInstance` servers, the marker-less fallback shape otherwise; warm-up scope limited to shared/marker-less/policy servers; wait-eligible for the initialization wait) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
 | **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; re-open reads the binding only |
