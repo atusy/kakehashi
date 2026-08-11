@@ -250,7 +250,7 @@ Transitions:
 
 **Why drop instead of queue**: The `didOpen` notification contains the complete document text at send time. Accumulated client edits are included. Dropping `didChange` before `didOpen` avoids duplicate state updates.
 
-**Connection Termination**: When a connection enters `Closed` state (graceful shutdown, crash, or respawn), all document lifecycle entries for that downstream are discarded. A respawned connection starts with all documents in `Closed` (default) state, requiring fresh `didOpen` notifications.
+**Connection Termination**: When a connection enters `Closed` state (graceful shutdown or respawn replacement), all document lifecycle entries for that downstream are discarded. A crash or panic enters pool-resident `Failed` instead — the handle stays addressable until a later acquire replaces it or cleanup/shutdown closes it (ls-bridge-message-ordering § Connection State Tracking) — and its document entries are discarded when that replacement or closure lands. A respawned connection starts with all documents in `Closed` (default) state, requiring fresh `didOpen` notifications.
 
 ### Server-to-Client Notification Forwarding
 

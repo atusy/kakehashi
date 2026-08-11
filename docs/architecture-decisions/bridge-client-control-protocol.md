@@ -428,10 +428,10 @@ half-stopped or release the guard midway. Pool-wide shutdown does not wait
 behind them either: global teardown takes ownership of in-flight control
 operations, cancels them **cooperatively at their next commit point**,
 joins them concurrently with its escalation phase, and hard-aborts at the
-producer cutoff (the graceful deadline) any task that never reached a
-commit point — closing the process registry so the escalation reserve
-kills a closed set — after which router cleanup may run, never before the
-tasks are gone
+producer cutoff (the graceful deadline) **every task still alive there**,
+wherever it wedged relative to its commit points — closing the process
+registry so the escalation reserve kills a closed set — after which
+router cleanup may run, never before the tasks are gone
 (ls-bridge-timeout-hierarchy § Per-Slot Control Shutdown). A wedged
 per-slot `stop` can therefore neither stall teardown, nor outlive it, nor
 mutate pool state after cleanup; the outer control request then fails per
@@ -469,7 +469,12 @@ non-normal terminal outcome — hard abort, cooperative cancellation short
 of completion, or panic — applying the ownership-at-completion rule on
 the operation's behalf and settling the ARM state, tombstone,
 replacement, and registry entries to whatever the last recorded commit
-implies.
+implies. The record's owner runs during **normal service**, not only at
+teardown: a pool-owned control-task reaper observes each detached
+operation's terminal outcome as it happens and finalizes abnormal exits
+immediately — without it, a panicking detached `restart` would leave the
+single-flight guard, ARM state, and tombstone stuck until shutdown.
+Teardown adopts whatever the reaper still holds.
 
 - **Process-level configuration applies.** `command`, `args`,
   `initializationOptions`, settings — whatever the config says *now* is what

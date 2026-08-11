@@ -151,11 +151,11 @@ async fn graceful_shutdown(&self) {
     // is not enough: Phase 3 needs the returned stdin handle for
     // exclusive access, and a CLOSED channel means the writer died
     // without handing off — treat it exactly like a timeout.
-    match tokio::time::timeout(
+    let stdin = match tokio::time::timeout(
         Duration::from_secs(2),
         self.writer_idle_rx.recv()
     ).await {
-        Ok(Some(stdin)) => { /* handoff complete — Phase 3 owns stdin */ },
+        Ok(Some(stdin)) => stdin, // handoff complete
         Ok(None) | Err(_) => {
             // The writer may still own stdin or sit mid-write; writing
             // the shutdown request now could interleave with a partial
@@ -165,9 +165,9 @@ async fn graceful_shutdown(&self) {
             log::warn!("Writer loop timeout; skipping LSP handshake");
             return self.force_terminate().await;
         }
-    }
+    };
 
-    // Phase 3: Exclusive stdin access...
+    // Phase 3: Exclusive stdin access via the handed-back `stdin`...
 }
 ```
 
@@ -175,8 +175,9 @@ async fn graceful_shutdown(&self) {
 ```rust
 // Shutdown sequence continues
 async fn graceful_shutdown(&self) {
-    // NOW safe to write to stdin (writer loop stopped)
-    self.send_shutdown_request().await?;
+    // NOW safe: `stdin` is the handle Phase 2 received from the writer —
+    // ownership, not just quiescence
+    self.send_shutdown_request(&mut stdin).await?;
 
     // Wait for shutdown response...
     // Send exit notification...
@@ -234,13 +235,16 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
     // the seal blocks replacement insertion. Control operations register
     // every process they spawn in the teardown-owned `control_procs`
     // registry AT SPAWN TIME, so a restart crossing its spawn point can
-    // never lose its kill handle. `control_tasks` is a teardown-owned
-    // JoinSet living OUTSIDE the timed future below, so a timeout drops
-    // only the polling future, never the task handles; both phases poll
-    // the same set. `control_procs` is a LIVE registry with
-    // kill-on-register from this point on — a child spawned after any
-    // scan is killed at registration — and it closes only when the last
-    // control task terminates.
+    // never lose its kill handle. Adoption SIGNALS cooperative
+    // cancellation immediately — the seal is the signal each task
+    // observes at its next commit point — so the graceful phase below
+    // doubles as the cooperative drain. `control_tasks` is a
+    // teardown-owned JoinSet living OUTSIDE the timed future below, so
+    // a timeout drops only the polling future, never the task handles;
+    // both phases poll the same set. `control_procs` is a LIVE registry
+    // with kill-on-register from this point on — a child spawned after
+    // any scan is killed at registration — and it closes only when the
+    // last control task terminates.
     let (mut control_tasks, control_procs) = seal_and_take_control_operations();
 
     // Snapshot AFTER both gates: nothing can be inserted past them.
@@ -260,28 +264,31 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
               drain_join_set(&mut control_tasks));
     }).await;
 
-    // Cooperative cancellation runs CONCURRENTLY with escalation.
-    // PRODUCER CUTOFF: a control task still alive at graceful_deadline
-    // is hard-aborted THERE (not at the final deadline), which closes
-    // the process registry — so the escalation reserve always kills a
-    // CLOSED set and a child registered near expiry cannot outrun
-    // confirmed termination. Cancellation is observed at commit points
-    // (bridge-client-control-protocol defines them); hard-abort is safe
-    // for the same commit-point reason. Escalation covers the snapshot
-    // and every registered control process alike (no-op for connections
-    // already Closed; a control-owned key contributing both a Closing
-    // handle and its task is benign — shutdown_by_state on
+    // Survivor handling runs CONCURRENTLY with escalation. PRODUCER
+    // CUTOFF: cancellation was signalled at adoption and the graceful
+    // phase was the cooperative drain, so EVERY task still alive at
+    // graceful_deadline — wedged before, between, or after commit
+    // points — is hard-aborted at the cutoff (not the final deadline),
+    // closing the process registry; the escalation reserve always kills
+    // a CLOSED set and a child registered near expiry cannot outrun
+    // confirmed termination. Hard-abort is safe by commit-point
+    // atomicity (bridge-client-control-protocol). Escalation covers the
+    // snapshot and every registered control process alike (no-op for
+    // connections already Closed; a control-owned key contributing both
+    // a Closing handle and its task is benign — shutdown_by_state on
     // Closing/Closed is a compare-transition no-op). When the remaining
     // budget is shorter than the normal SIGTERM grace, the grace is
     // shortened or skipped.
-    // cancel_join_or_abort FINALIZES before returning: for any task it
-    // had to hard-abort, it runs the post-abort finalizer
-    // (bridge-client-control-protocol) settling ARM, tombstone,
-    // replacement, and registry state to what the last commit point
-    // implies.
+    // abort_survivors_and_finalize FINALIZES before returning: per
+    // bridge-client-control-protocol it runs the finalizer for EVERY
+    // non-normal terminal outcome (hard abort, cancellation short of
+    // completion, panic — even one already reaped by the graceful
+    // drain, via the durable operation record), settling ARM,
+    // tombstone, replacement, and registry state to what the last
+    // recorded commit implies.
     join!(
         force_kill_remaining_until(deadline, connections, &control_procs),
-        cancel_join_or_abort_then_finalize(&mut control_tasks, graceful_deadline),
+        abort_survivors_and_finalize(&mut control_tasks, graceful_deadline),
     );
     // Only now — every control task terminated, finalized, and the live
     // process registry closed — may pool/router cleanup run; nothing can
@@ -369,11 +376,12 @@ async fn shutdown_router() {
     // same absolute deadline; a task still alive at the deadline is
     // hard-aborted (safe: shared-state effects live only at commit
     // points — see the sketch above and bridge-client-control-protocol)
-    // Finalization included; producer cutoff at graceful_deadline —
+    // Cancellation signalled at adoption; producer cutoff at
+    // graceful_deadline; finalization for every non-normal outcome —
     // see the sketch above
     join!(
         force_kill_remaining_until(deadline, all_connections, &control_procs),
-        cancel_join_or_abort_then_finalize(&mut control_tasks, graceful_deadline),
+        abort_survivors_and_finalize(&mut control_tasks, graceful_deadline),
     );
 
     // 5. Clean up router resources — runs after every control task has
@@ -480,8 +488,10 @@ Continue processing pending operations until complete before shutting down.
 
 **Scope note**: what is rejected here is waiting for operation
 *completion* — server responses. Draining the already-accepted write queue
-is retained (§ Operation Disposal Policy): it is local, FIFO-bounded work,
-distinct from waiting on a server.
+is retained (§ Operation Disposal Policy): its work is FIFO-bounded and
+distinct from waiting for responses, though the write side is still
+bounded by the applicable deadline — a full pipe can stall it into forced
+termination.
 
 **Rejected Reasons:**
 
