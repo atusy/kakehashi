@@ -51,7 +51,7 @@ The methods are announced in the initialize result as
 before use. This sets a new precedent rather than following one: the existing
 `kakehashi/node*` and `kakehashi/captures/*` families are announced nowhere.
 
-### Client Identity: the `ConnectionKey` Display String
+### Client Identity: the `ConnectionKey` `Display` String
 
 ```typescript
 type Client = {
@@ -349,14 +349,15 @@ A generation id would distinguish "the process before restart" from "after".
 Rejected: the protocol's contracts (stable handle across `restart`,
 `restart → null`, stopped slots addressable for revival) all want *slot*
 semantics; a generation id would invalidate every held handle on each restart
-and force a re-enumeration loop into every client. It would also need a new
+and force every client to carry a re-enumeration loop. It would also need a new
 id→connection registry, where `ConnectionKey` already keys everything.
 
 ### Embed `rootUri` in the enumeration result instead of a `workspaceFolders` request
 
 Rejected: a shared-instance connection serves a growing *set* of folders; a
-scalar field misrepresents it. The Display id already gives humans the root
-at a glance; programs that need the folder set ask the dedicated request.
+scalar field misrepresents it. The `Display` id already gives humans the
+root at a glance; programs that need the folder set ask the dedicated
+request.
 
 ### Return the downstream `ResponseMessage` verbatim
 
@@ -375,10 +376,11 @@ enumeration.
 
 ### Re-key `restart` under current rooting configuration
 
-If `preferSharedInstance` was enabled since the spawn, "restart" could tear
-down `tsgo@file:///repo/a` and bring up `tsgo#shared`. Rejected: the held id
-would dangle, so `restart` would have to return a new id (breaking the stable
-handle contract), and every other holder of the old id would silently rot.
+If `preferSharedInstance` has been enabled since the spawn, "restart" could
+tear down `tsgo@file:///repo/a` and bring up `tsgo#shared`. Rejected: the
+held id would dangle, so `restart` would have to return a new id (breaking
+the stable handle contract), and every held copy of the old id would
+silently rot.
 Spawning the replacement under the identical key is simpler and honest:
 rooting changes apply to newly routed documents. A restarted slot under
 changed rooting re-opens nothing — derivation runs against current settings —
@@ -426,10 +428,11 @@ namespace.
   spawn decision, but a new coupling between the control protocol and the hot
   path.
 - The id is contractually opaque, yet its rendering is legible and users will
-  inevitably parse it (Hyrum's law). Renaming the Display format later will
+  inevitably parse it (Hyrum's law). Changing the `Display` format later will
   break such clients — documented as unsupported, not prevented.
 - The deny list is a judgment call that must track protocol evolution: a
-  future LSP lifecycle method would corrupt bridge state until added.
+  future LSP lifecycle method would corrupt bridge state until it is added
+  to the list.
 
 ### Neutral
 
@@ -476,7 +479,7 @@ namespace.
 | Aspect | Decision |
 |---|---|
 | **Namespace** | `kakehashi/bridge/client`, `kakehashi/bridge/client/{request,notify,documents,serverInfo,workspaceFolders,stop,restart}` |
-| **Client id** | `ConnectionKey` Display string; contractually opaque; slot-stable across restarts |
+| **Client id** | `ConnectionKey` `Display` string; contractually opaque; slot-stable across restarts |
 | **Name validation** | `languageServers` keys may not contain `@` or `#` |
 | **Pass-through** | Verbatim, untranslated; deny `initialize`/`initialized`/`shutdown`/`exit`/`$/cancelRequest` |
 | **Response envelope** | `ForwardResult`: exactly one of `result` (always emitted, may be `null`) or `error`; framing fields stripped |
