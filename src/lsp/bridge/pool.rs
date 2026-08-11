@@ -5246,6 +5246,51 @@ mod tests {
         );
     }
 
+    /// prepareRename's rename-only capability fallback must not report a
+    /// past-end position as renameable: the trailing bound runs before the
+    /// fallback, so a caret past the region's content end yields None — a
+    /// phantom `DefaultBehavior` would win preferred aggregation and mask
+    /// real results from lower-priority layers.
+    #[tokio::test]
+    async fn prepare_rename_capability_fallback_respects_region_bounds() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let config = lua_ls_config();
+        let host_uri = Url::parse("file:///project/prepare_rename.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        // Ready fake connection advertising rename WITHOUT prepareRename —
+        // the shape that takes the DefaultBehavior shortcut.
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities {
+            rename_provider: Some(tower_lsp_server::ls_types::OneOf::Left(true)),
+            ..Default::default()
+        });
+        pool.insert_connection(handle).await;
+
+        // Single-line content ends at host (3, 14); (3, 20) is past it.
+        let result = pool
+            .send_prepare_rename_request(
+                "lua",
+                &config,
+                &host_uri,
+                tower_lsp_server::ls_types::Position {
+                    line: 3,
+                    character: 20,
+                },
+                "lua",
+                TEST_ULID_LUA_0,
+                RegionOffset::new(3, 0),
+                "print('hello')",
+                Some(UpstreamId::Number(1)),
+            )
+            .await;
+        assert!(
+            matches!(result, Ok(None)),
+            "a past-end caret must not be reported renameable, got {result:?}"
+        );
+    }
+
     /// Test that forward_didchange_to_opened_docs completes quickly with channel-based sending.
     ///
     /// ls-bridge-message-ordering: Channel-based sends via try_send() are non-blocking.
