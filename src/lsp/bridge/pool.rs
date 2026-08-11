@@ -2318,11 +2318,14 @@ impl LanguageServerPool {
     /// Surfacing it as an error makes the acquire fail and retry, re-attempting
     /// the announce once the queue drains.
     ///
-    /// A marker-less acquisition announces the CLIENT root in place of a
-    /// marker root (when the editor supplied one): such documents previously
-    /// lived on a client-rooted fallback process, and without this a shared
-    /// connection spawned under some marker root would receive didOpens for
-    /// documents outside every folder it was ever told about.
+    /// A marker-less acquisition announces the CLIENT WORKSPACE in place of
+    /// a marker root — the complete folder snapshot, or the bare `rootUri`
+    /// when the client sent no folders: such documents previously lived on a
+    /// fallback process whose initialize carried exactly that, and without
+    /// this a shared connection spawned under some marker root would receive
+    /// didOpens for documents outside every folder it was ever told about.
+    /// (An INCAPABLE connection receives no announcement — that residual is
+    /// accepted and documented at the divert exemption.)
     ///
     /// `Ok(())` no-op for per-root keys, rootless sessions (no client root to
     /// name), capability-less servers, or a root already in the set —
@@ -2350,16 +2353,26 @@ impl LanguageServerPool {
         // acquisition after the first.
         let folders: Vec<tower_lsp_server::ls_types::WorkspaceFolder> = match marker {
             Some((_root, folder)) => vec![folder.clone()],
-            None => match self.workspace_folders() {
-                // The editor supplied no folders at all: nothing to name,
-                // and none is needed to open a document.
-                None => return Ok(()),
-                Some(folders) => folders,
-            },
+            None => {
+                let snapshot = self.workspace_folders().unwrap_or_default();
+                if !snapshot.is_empty() {
+                    snapshot
+                } else if let Some((_root, folder)) = self
+                    .root_uri()
+                    .and_then(|root| Url::parse(&root).ok())
+                    .and_then(super::root_markers::workspace_at_root)
+                {
+                    // rootUri without workspaceFolders: the one root the
+                    // session has — the same root a fallback spawn would have
+                    // initialized with.
+                    vec![folder]
+                } else {
+                    // A truly rootless session: nothing to name, and none is
+                    // needed to open a document.
+                    return Ok(());
+                }
+            }
         };
-        if folders.is_empty() {
-            return Ok(());
-        }
         if !handle.supports_workspace_folder_changes() {
             return Ok(());
         }
@@ -3875,8 +3888,8 @@ mod tests {
     /// `untitled:` scratch document, or no document hint at all) joins the
     /// shared instance rather than forking a client-root fallback process.
     ///
-    /// It has no root to announce — but announcing is what NEW ROOTS need, not
-    /// what admission needs: opening the document is enough. The fallback
+    /// It brings no MARKER root — admission needs none (the client workspace
+    /// is announced on its behalf on capable connections). The fallback
     /// process this used to fork split session-wide downstream state (a
     /// server whose completion reads every open document never saw the
     /// documents living on the other connection) and paid a whole extra
@@ -4320,6 +4333,42 @@ mod tests {
         .await
         .expect("still Ready");
         assert_eq!(handle.workspace_folders().snapshot().unwrap().len(), 2);
+    }
+
+    /// A client that sent `rootUri` but no `workspaceFolders` (a legal LSP
+    /// shape) still has one root to name: the marker-less acquisition
+    /// announces it, exactly as the fallback spawn would have initialized
+    /// with. An empty folder LIST behaves the same as an absent one.
+    #[tokio::test]
+    async fn marker_less_acquisition_announces_the_root_uri_when_folders_absent() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+
+        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+        let (client_root, client_folder) = marker.expect("tmp dir has a marker root");
+        pool.set_root_uri(Some(String::from(client_root)));
+        pool.set_workspace_folders(Some(Vec::new())); // rootUri only, empty folder list
+
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        handle.set_server_capabilities(capable_workspace_folders_caps());
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        let cmdline = Url::parse("untitled://cmdline").unwrap();
+        pool.get_or_create_connection_wait_ready(
+            "lua",
+            &config,
+            Some(&cmdline),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the capable shared connection is Ready");
+        let folders = handle.workspace_folders().snapshot().unwrap_or_default();
+        assert!(
+            folders.iter().any(|folder| folder.uri == client_folder.uri),
+            "the bare rootUri must be announced when the client sent no folders"
+        );
     }
 
     /// A rootless session (the editor supplied no root) has nothing to name:

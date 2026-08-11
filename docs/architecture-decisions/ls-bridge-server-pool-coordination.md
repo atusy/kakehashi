@@ -70,9 +70,14 @@ open document) never meets the shared instance's. Root-JOINING is honored only w
 it is `Ready` but incapable, logs once and falls back to the per-root key — so a
 misconfigured opt-in degrades to per-root instances rather than wedging the
 2nd+ root on a server that ignores `rootUri`. Marker-less documents are exempt
-from that divert: they add no root, so the missing capability is never needed
-for them and they ride the incapable shared connection rather than fork the
-fallback. The shared connection's folder set
+from that divert: they bring no marker root, so the missing capability never
+blocks them and they ride the incapable shared connection rather than fork the
+fallback — accepting that their didOpen may fall outside such a connection's
+folders (their client-workspace announcement is capability-gated away;
+out-of-workspace documents are LSP-legal, and diverting instead would re-split
+the session-wide state this routing unifies). On capable connections the
+complete client workspace (folder snapshot, or the bare rootUri when the
+client sent no folders) is announced on their behalf. The shared connection's folder set
 (`WorkspaceFolderSet`, shared with the reader task that answers
 `workspace/workspaceFolders` pulls) grows as new roots join: on acquiring the
 shared connection for a not-yet-known root, the pool CAS-inserts the root and
