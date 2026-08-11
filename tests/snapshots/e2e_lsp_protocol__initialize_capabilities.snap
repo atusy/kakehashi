@@ -117,10 +117,5 @@ expression: capabilities
   "diagnosticProvider": {
     "interFileDependencies": false,
     "workspaceDiagnostics": false
-  },
-  "experimental": {
-    "kakehashi": {
-      "wrappedDidChangeConfigurationSettings": true
-    }
   }
 }

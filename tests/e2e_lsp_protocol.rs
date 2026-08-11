@@ -47,7 +47,7 @@ fn test_initialize_returns_capabilities() {
 }
 
 #[test]
-fn test_initialize_exposes_kakehashi_version_and_wrapped_didchange_capability() {
+fn test_initialize_exposes_kakehashi_version() {
     let mut client = LspClient::new();
 
     let response = client.send_request(
@@ -67,11 +67,6 @@ fn test_initialize_exposes_kakehashi_version_and_wrapped_didchange_capability() 
         result["serverInfo"]["version"],
         json!(env!("CARGO_PKG_VERSION")),
         "clients use serverInfo.version to distinguish old flat-only servers"
-    );
-    assert_eq!(
-        result["capabilities"]["experimental"]["kakehashi"]["wrappedDidChangeConfigurationSettings"],
-        json!(true),
-        "clients should be able to choose wrapped didChangeConfiguration payloads without parsing versions"
     );
 }
 
