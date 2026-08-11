@@ -462,10 +462,17 @@ candidates at all likewise queries nothing.
   normalization produced by the deadline. Folder-entry validations
   launch **concurrently** onto the pool (admission is FIFO per
   decision), so one blocked entry cannot serially starve later entries
-  of the deadline. Admission order is canonical across answers — jobs
-  enqueue by (the answering provider's priority-walk position, then
-  server name within the answer), never by JSON object order or
-  response-arrival race — and the non-starvation
+  of the deadline. Admission is an online **priority queue**, not
+  arrival-order FIFO: among jobs simultaneously awaiting a permit, the
+  canonical key (the answering provider's priority-walk position, then
+  server name, then provider name as the total tie-breaker within a
+  `"*"` group) decides who is admitted next — a later-arriving
+  higher-position answer sorts ahead of *waiting* jobs but never
+  recalls running ones, so nothing is buffered against the budget
+  waiting for answers that may never come, JSON object order confers
+  nothing, and `"*"` fan-in's earliest-arrival semantics are untouched
+  (this order governs validation admission only) — and the
+  non-starvation
   claim is scoped honestly: concurrency removes *serial* dependency
   between entries, while pool *capacity* can still gate them (a hung
   validation retains its permit), in which case entries denied
@@ -873,9 +880,12 @@ decision's settlement — a hung losing provider can never pin an entry
 indefinitely, and a late answer always finds its entry gone. The
 driver and the per-server open tasks are additionally covered by a
 **pool-owned completion guard** of the same class the control protocol
-requires for its detached operations, with the two roles split: an
-abnormal exit of the **driver** CAS-settles the exact *flight* — to
-its partial results when some exist, the fallback otherwise — while an
+requires for its detached operations, with the two roles split. An
+abnormal exit of the **driver** runs the same algorithm deadline
+expiry runs: cancel and retire the outstanding provider requests, drop
+validations still unfinished, fan-in over the **completed normalized**
+results (raw or half-validated answers never count), and synthesize
+the fallback only when no operative normalized result remains. An
 abnormal exit of one **open task** finalizes only that task's own
 (incarnation, flight, server) *entry*, never discarding a
 still-running or already-decided shared flight. Entry finalization is
@@ -883,22 +893,26 @@ by the stage the dead task reached, and it commits **through the same
 route-admission critical section as the live path** — the locked
 candidacy, generation, and both-key stopped checks included, so an
 abnormal exit cannot grandfather a directive a reload or `stop` has
-since rejected (a check that misses simply deletes the entry): a
-decided suppression commits as *suppressed*; a decided route settles
-*retained(key)* — later opens retry the key; and an entry whose task
-died before any directive or key was persisted, or whose admission
-checks miss, is **deleted** — the absent-record semantics already
-defined (ordinary resolution, lazy retry) apply, with no new state to
-consume. The guard settles records; it never performs opens or
-acquires. It also **owns cancellation**, honoring
-ls-bridge-message-ordering's queued-versus-sent distinction: work
+since rejected: a decided suppression commits as *suppressed*; a
+decided route settles *retained(key)* — later opens retry the key; a
+**candidacy** rejection settles *not-applicable* exactly as the live
+path would (deletion would let a later re-add resurrect what the live
+rule freezes); and an entry whose task died before any directive was
+persisted, or whose generation/stopped checks miss (the retryable
+mismatches), is **deleted** — a terminal event, not a silent removal:
+waiters subscribed to the entry are woken with "retry as absent",
+atomically with the removal, and the absent-record semantics (ordinary
+resolution, lazy retry) apply. The guard settles records; it never
+performs opens or acquires. Cancellation ownership is **exclusively
+the driver/flight side's**: open tasks are passive subscribers and
+their guard touches no provider request; the flight's cleanup honors
+ls-bridge-message-ordering's queued-versus-sent distinction — work
 still queued at the writer is atomically marked for writer-side skip,
-work writing-or-sent gets its `$/cancelRequest`, and either happens
-before the entry's retirement — never a bare "not written" test that a
-queued item could race past. A (handle, id) registration is attached
-to the guard's cleanup ownership **atomically with the router
-insertion**, so a panic between the two cannot leak an unretained
-registration.
+work writing-or-sent gets its `$/cancelRequest`, either before
+retirement, never a bare "not written" test a queued item could race
+past. A (handle, id) registration is attached to the flight guard's
+cleanup ownership **atomically with the router insertion**, so a panic
+between the two cannot leak an unretained registration.
 
 **Where the await lives.** The decision is *not* awaited on the `didOpen`
 handler. The handler's candidate enumeration stays synchronous and the
