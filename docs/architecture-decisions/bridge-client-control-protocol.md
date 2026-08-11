@@ -426,14 +426,26 @@ operation itself runs to completion detached, and the single-flight guard
 releases only when it finishes — a dropped handler can never leave a slot
 half-stopped or release the guard midway. Pool-wide shutdown does not wait
 behind them either: global teardown takes ownership of in-flight control
-operations, cancels them **cooperatively at their next commit point** —
-the same commit points that make them non-abortable mid-mutation, so
-neither cancellation nor the deadline force-kill can leave a slot
-half-mutated — joins them within its remaining budget, and force-kills at
-its own deadline whatever the per-slot timeout has not finished
+operations, cancels them **cooperatively at their next commit point**,
+joins them concurrently with its escalation phase, and hard-aborts at its
+final deadline any task that never reached a commit point — after which
+router cleanup may run, never before the tasks are gone
 (ls-bridge-timeout-hierarchy § Per-Slot Control Shutdown). A wedged
-per-slot `stop` can therefore neither stall teardown nor outlive it; the
-outer control request then fails per the disposal policy.
+per-slot `stop` can therefore neither stall teardown, nor outlive it, nor
+mutate pool state after cleanup; the outer control request then fails per
+the disposal policy.
+
+"Commit point" is a defined term, and the abort-safety above rests on it:
+a control operation's shared-state effects happen **only** inside
+pool-lock critical sections — the tombstone install/remove, the ARM, the
+replacement insertion (with its generation revalidation), and the registry
+release with its ownership verification. Between commit points the task
+holds no pool locks and touches no shared state other than its spawned
+process, whose kill handle is registered at spawn time. Cancellation is
+observed on entry to each commit point; a cancel — cooperative or hard —
+landing between commit points leaves shared state exactly as the last
+commit point left it, and the ownership-at-completion recovery rule
+classifies whatever the operation had gotten to.
 
 - **Process-level configuration applies.** `command`, `args`,
   `initializationOptions`, settings — whatever the config says *now* is what

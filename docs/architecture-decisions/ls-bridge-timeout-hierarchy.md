@@ -74,7 +74,7 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 - Liveness timeout **STOPS** when entering `Closing` state
 - Initialization timeout **CANCELLED** on shutdown (global takes over)
 - Per-request timeout **STOPS** on shutdown (futures receive `RecvError` from closed channels)
-- Late responses accepted until global timeout (server is responsive, not hung)
+- Late responses accepted until the connection closes or the applicable deadline expires (server is responsive, not hung)
 
 ## Configuration Recommendations
 

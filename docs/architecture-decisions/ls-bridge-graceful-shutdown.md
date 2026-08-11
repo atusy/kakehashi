@@ -181,7 +181,9 @@ async fn graceful_shutdown(&self) {
 }
 ```
 
-**Guarantees (graceful path — a forced termination voids the last two):**
+**Guarantees (graceful path — a forced termination forfeits the queue
+drain and current-write completion; the bounded wait is what enforces
+it):**
 - ✅ Writer loop stops dequeuing **before** shutdown writes to stdin
 - ✅ No concurrent writes to stdin (sequential: writer → shutdown)
 - ✅ Bounded wait (2s timeout prevents indefinite hang)
@@ -246,24 +248,24 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
         futures::future::join_all(tasks.chain(control_ops)).await;
     }).await;
 
-    if graceful.is_err() {
-        // Cancel adopted control tasks COOPERATIVELY: each observes the
-        // seal at its next commit point and stops there — mutations are
-        // atomic between commit points, so no tombstone, ARM state, or
-        // registry is left half-written. The join is bounded by the
-        // remaining budget; a straggler past it is left to force-kill,
-        // which is safe for the same commit-point reason.
-        let _ = tokio::time::timeout_at(
-            deadline, cancel_and_join_control_tasks_at_commit_points()
-        ).await;
-    }
-
-    // Escalation runs against the SAME absolute deadline, covering the
-    // snapshot and every registered control process alike (no-op for
-    // connections already Closed). When the remaining budget is shorter
-    // than the normal SIGTERM grace, the grace is shortened or skipped —
-    // the ceiling wins over politeness.
-    force_kill_remaining_until(deadline, connections, control_procs).await;
+    // Cooperative cancellation runs CONCURRENTLY with escalation, both
+    // against the same absolute deadline, so joining stragglers cannot
+    // eat the escalation reserve. Cancellation is observed at commit
+    // points (bridge-client-control-protocol defines them: all shared-
+    // state effects live inside pool-lock critical sections); a task
+    // still alive at the deadline is hard-aborted, which is safe for the
+    // same commit-point reason. Escalation covers the snapshot and every
+    // registered control process alike (no-op for connections already
+    // Closed; a control-owned key contributing both a Closing handle and
+    // its task is benign — shutdown_by_state on Closing/Closed is a
+    // compare-transition no-op). When the remaining budget is shorter
+    // than the normal SIGTERM grace, the grace is shortened or skipped.
+    join!(
+        force_kill_remaining_until(deadline, connections, control_procs),
+        cancel_join_or_abort_control_tasks(deadline),
+    );
+    // Only now — with every control task terminated — may pool/router
+    // cleanup run; nothing can mutate registries or tombstones after it.
 }
 ```
 
@@ -341,21 +343,20 @@ async fn shutdown_router() {
         futures::future::join_all(tasks.chain(control_ops)).await;
     }).await;
 
-    if graceful.is_err() {
-        // Cooperative cancellation at commit points (see the sketch
-        // above); the join is bounded by the remaining budget
-        let _ = tokio::time::timeout_at(
-            deadline, cancel_and_join_control_tasks_at_commit_points()
-        ).await;
-    }
+    // Cancellation/join runs concurrently with escalation against the
+    // same absolute deadline; a task still alive at the deadline is
+    // hard-aborted (safe: shared-state effects live only at commit
+    // points — see the sketch above and bridge-client-control-protocol)
+    join!(
+        force_kill_remaining_until(deadline, all_connections, control_procs),
+        cancel_join_or_abort_control_tasks(deadline),
+    );
 
-    // Escalation against the same absolute deadline; covers stragglers
-    // and every registered control process alike (no-op for connections
-    // already Closed). A remaining budget shorter than the normal
-    // SIGTERM grace shortens or skips the grace — the ceiling wins.
-    force_kill_remaining_until(deadline, all_connections, control_procs).await;
-
-    // 5. Clean up router resources
+    // 5. Clean up router resources — runs after every control task has
+    //    terminated (the join above), so nothing can mutate registries
+    //    or tombstones behind it. Cleanup is local, lock-bounded work:
+    //    the shutdown ceiling scopes connection/process termination, not
+    //    this step, which needs no server cooperation.
     cleanup_router_state();
 }
 ```
