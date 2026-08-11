@@ -175,9 +175,16 @@ key kakehashi's own resolution would produce *and* the key the
 override's first element, checked after the truncation below. If either is
 stopped, the answer's entry for that server is discarded (the
 configuration-resolved stop wins; a provider cannot steer a document
-around a user's pin by naming a different root). For a shared-instance server the two keys are the same
-root-independent `ConnectionKey::shared`, so the double check collapses
-to one. Without it, `stop` would be advisory against a root-redirecting
+around a user's pin by naming a different root). Both checks run
+**inside the one acquire critical section** that admits the route —
+never as a separate look-then-acquire, which a concurrently committing
+`stop` could slip between — and the binding retains **both** keys, so
+every later binding-driven acquire (the lazy open, the re-open sweep)
+re-checks both in its own critical section: a key stopped after
+admission makes the bound route not applicable, exactly as ordinary
+resolution against a stopped key opens nothing. For a shared-instance
+server the two keys are the same root-independent
+`ConnectionKey::shared`, so the double check collapses to one. Without it, `stop` would be advisory against a root-redirecting
 provider — the failure mode that decision's own "auto-respawn" rejection
 exists to prevent.
 
@@ -305,9 +312,10 @@ client may still forward the method through
 the managed routing path, and needs no deny-list entry — it merely asks the
 server the same question and corrupts no bridge state.) A server that
 advertised but answers `MethodNotFound` (`-32601`) has its retained
-advertisement cleared — both the per-connection flag and the per-name
-session memo that earns initialization waits (below) — so a lying
-advertisement stops costing round trips, and waits, after the first.
+advertisement cleared — the per-connection flag always, and the per-name
+session memo that earns initialization waits (below) once no other live
+handle of that name still advertises — so a lying advertisement stops
+costing round trips, and waits, after the first.
 
 Method dispatch is **per side**: the editor-facing custom methods
 (`kakehashi/bridge/client/*` and the rest) are not registered on downstream
@@ -333,9 +341,9 @@ would tax exactly the fleets that have no providers at all. Slots that are
 (bridge-client-control-protocol's states) are skipped, never parked on. A
 provider *name* can own several live connections at once (per-root
 pooling, plus a `forceStart` spawn); the routing query rides exactly
-**one** of them, picked by a total order over the name's handles —
-shared, then client-fallback, then the remainder by ascending key
-rendering — taking the first `Ready` handle, and, when the
+**one** of them, picked by a total order over the name's **advertising**
+handles — shared, then client-fallback, then the remainder by ascending
+key rendering — taking the first `Ready` handle, and, when the
 initialization wait applies, awaiting the first `Initializing` handle in
 that same order. An arbitrary but stable choice, recorded as such.
 
@@ -450,19 +458,34 @@ structures with different lifetimes carry the outcome:
   per (host document, layer, language), which servers were suppressed,
   which `ConnectionKey` each open landed on, and — for a shared-instance
   override — the canonical override folders themselves, all stamped with
-  the document's open incarnation. The binding record is installed
-  **synchronously at the query point, in a pending state**, and settles
-  when the decision applies: a lazy request-path open that finds a
-  *pending* binding awaits the in-flight decision (inheriting its
-  remaining deadline) instead of default-opening — without that, a
-  hover-class request racing the decision window could open the document
-  on a server the arriving answer suppresses. The settled binding is
+  the document's open incarnation. The pending binding record is
+  installed **synchronously in the `didOpen` handler (respectively the
+  virtual-document creation path), before the open tasks are spawned
+  and before the writer ticket is released** — installing it inside the
+  first spawned task would leave a scheduling gap in which a request
+  running after the handler returns sees no record at all. It settles
+  **per server, at that server's acquire commit**: the recorded key is
+  the key the acquire actually landed on (a capability-fallback
+  downgrade records the downgraded per-root key), and an acquire that
+  fails *after* the route was decided retains the decided key — later
+  opens retry that key through the ordinary respawn path rather than
+  falling through to a different resolution. A lazy request-path open
+  that finds a *pending* entry awaits that server's settlement
+  (bounded by the decision's remaining deadline) instead of
+  default-opening — without that, a hover-class request racing the
+  decision window could open the document on a server the arriving
+  answer suppresses. The settled binding is
   *identity*, not policy: the lazy open and the derived re-open sweep
   consult it — a suppressed server stays suppressed, a bound key stays
   the key, and a shared replacement's re-open re-adds and announces the
   binding's folders before the `didOpen` (a `#shared` key carries no
   folders and a restart loses the old set, so the binding is the only
-  place the override survives). It is evicted only by the host
+  place the override survives). If the replacement no longer supports
+  workspace folders — the capability fallback downgraded it — the bound
+  shared route is **not applicable**: the sweep neither opens with
+  unannounced folders nor silently re-roots to a per-root key; the
+  document's features on that server stay dark until close/re-open runs
+  a fresh decision under the new capability reality. It is evicted only by the host
   document's `didClose`, never by a flush — this is what makes
   invalidation non-retroactive without opening side doors: a flushed
   *cache* cannot lift a suppression or re-root an open document onto a
@@ -539,10 +562,10 @@ Decision-cache lifecycle:
   answer is discarded and the acquire proceeds by kakehashi's own rules
   (fail-open). A stale answer is never applied across a reload.
 
-Invalidation is **not retroactive**: it affects future decisions —
-subsequent opens, re-opens, and the derived re-open after a restart (which
-reads the binding) — but never tears down routes already established for an
-open document. Re-routing a live document is a close/re-open, initiated by
+Invalidation is **not retroactive**: it affects only *new* decisions —
+first opens and close/re-opens; the derived re-open after a restart reads
+the binding and is untouched by cache invalidation — and never tears down
+routes already established for an open document. Re-routing a live document is a close/re-open, initiated by
 whoever holds the document, not by the bridge. Providers have no push
 channel to signal policy changes (deferred — below), so a decision can be
 stale for a document's whole open lifetime; that is recorded as a
@@ -568,6 +591,15 @@ provider must degrade routing, never drive a `Ready` connection to
 inside Tier-1's trigger once Phase 3 lands, and a 2-5s per-request bound
 would preempt a longer routing deadline): the routing deadline is the sole
 bound on these requests.
+
+Because they carry no tier accounting, outstanding provider requests are
+cleaned up on **every terminal outcome of the decision**, not only
+deadline expiry: an early winner (fan-in decided while lower-priority
+requests were still pending), an incarnation abort, global teardown, and
+expiry alike cancel every still-pending routing request
+(`$/cancelRequest`) and retire its router entry atomically with the
+decision's settlement — a hung losing provider can never pin an entry
+indefinitely, and a late answer always finds its entry gone.
 
 **Where the await lives.** The decision is *not* awaited on the `didOpen`
 handler. The handler's candidate enumeration stays synchronous and the
@@ -868,12 +900,17 @@ a slot a routing provider left in play.
   per-decision future awaited inside the per-server open tasks; the lazy
   per-request open (`ensure_document_opened`, a pool function called
   from the request-execute path) and the re-open sweep consult the route
-  binding, awaiting it while pending — one gate, not scattered
+  binding, awaiting a pending entry bounded by the lesser of the
+  decision's remaining deadline and (for the sweep) its own fixed
+  budget — still pending at that bound reads as not applicable for this
+  pass; the ordinary lazy path re-opens later. One gate, not scattered
   per-call-site checks, and never an await under the ingress ticket.
 - The routing query is awaited inside the open task, before that task's
   acquire, holding no pool lock; the acquire critical section
-  re-validates the answer's config generation (discard on mismatch)
-  alongside its existing stopped-set and control-registry checks. The
+  re-validates the answer's config generation (discard on mismatch) and
+  checks the stopped set for **both** retained keys — the target and the
+  configuration-resolved one — alongside its existing control-registry
+  checks, in that one critical section. The
   single-flight map (anchored (generation, flush epoch, open
   incarnation) — the incarnation is the per-open token the document
   store's open tracker already mints), the decision cache, and the

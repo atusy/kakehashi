@@ -154,7 +154,7 @@ Global Shutdown overrides all (highest priority)
 
 ### Neutral
 
-- **LSP compliant**: Timeouts trigger explicit error responses, not silent hangs
+- **LSP compliant**: Request timeouts trigger explicit error responses, not silent hangs (the routing decision deadline is the exception by design — it falls open to kakehashi-decided routing with a warning, never an upstream error)
 
 ## Alternatives Considered
 
