@@ -801,6 +801,35 @@ impl Kakehashi {
             return None;
         }
 
+        // Bounds precheck at the resolution choke point: a position inside the
+        // raw capture but outside the extracted content (excluded trailing
+        // children, `#offset!` trims) would otherwise be rejected only
+        // per-server by the dispatch guard — after every fan-out arm has
+        // acquired (possibly spawned) its connection. Rejecting here keeps the
+        // virt layer silent without touching any connection. The dispatch
+        // guard stays: it covers callers that bypass this preamble
+        // (stored-region paths) and remains the stale-race backstop.
+        let precheck_offset = crate::lsp::bridge::RegionOffset::with_per_line_offsets(
+            resolved.region.line_range.start,
+            resolved.line_column_offsets.clone(),
+        );
+        let region_end =
+            crate::lsp::bridge::region_host_end(&resolved.virtual_content, &precheck_offset);
+        if !crate::lsp::bridge::host_position_within_region_bounds(
+            position,
+            &precheck_offset,
+            region_end,
+        ) {
+            log::debug!(
+                "{}: position (line {}, char {}) is outside the region's content bounds; \
+                 skipping the virt layer",
+                method_name,
+                position.line,
+                position.character,
+            );
+            return None;
+        }
+
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
         let upstream_request_id = current_upstream_id();
 
