@@ -151,7 +151,7 @@ The bridge tracks pending requests for response correlation only:
 
 ### 3. Non-Blocking Backpressure
 
-The bounded order queue (admission threshold: 4096 — raised from the original 256, which caused routine fan-out loss) uses `try_send()` to prevent deadlocks during slow initialization. The full allocation bound is admission threshold + the pre-ready holding queue's bound + response headroom, where **response headroom equals the pending-request bound**: every loss-intolerant response corresponds to a pending request the router admitted, so headroom exhaustion is structurally impossible and the memory bound is testable as the sum of the three.
+The bounded order queue (admission threshold: 4096 — raised from the original 256, which caused routine fan-out loss) uses `try_send()` to prevent deadlocks during slow initialization. The full allocation bound is admission threshold + the pre-ready holding queue's bound + response headroom. Response headroom serves **downstream-initiated** requests (which the response router deliberately does not track), so it is bounded by reservation, not by the router: **admitting an inbound server request reserves the wire slot its response will use**, making the inbound registry bounded by the reservation pool rather than unbounded; when no slot is reservable the request is answered immediately via a dedicated always-reserved error slot with `RequestFailed`, never silently dropped. The memory bound is testable as the sum of the three.
 
 **Strategy by Operation Type:**
 
@@ -298,10 +298,13 @@ Operations are gated at two levels: **server lifecycle** and **document lifecycl
     the derived `didOpen` would violate the document lifecycle), and
     state-replacement notifications (`workspace/didChangeConfiguration`)
     are not held either — the pool retains current settings and pushes
-    the latest value after `initialized`, and holding stale copies would
-    invert latest-value semantics; `$/setTrace` has the same
-    latest-value shape and is likewise coalesced-to-latest and pushed
-    post-`initialized`, never held. With document sync Ready-gated and
+    the latest value after `initialized` ("latest" within
+    downstream-settings-propagation's accepted race: a reload landing
+    mid-handshake may push the previous revision, converging on the
+    next propagation), and holding stale copies would invert
+    latest-value semantics; `$/setTrace` has the same latest-value shape
+    and follows the same policy — coalesced-to-latest, pushed
+    post-`initialized`, same accepted race, never held. With document sync Ready-gated and
     every latest-value method coalesced, **no currently specified method
     is admissible to the hold** — it is expected empty and exists as the
     structural safety net for future sequence-dependent, non-document
