@@ -1371,10 +1371,10 @@ impl LanguageServerPool {
     /// decoded key straight to the resolved acquisition avoids that re-resolution
     /// entirely.
     ///
-    /// Returns `None` (fail soft, warn-logged) for a SHARED key: it is keyed
-    /// without a root, and announcing its workspace folders needs a marker that
-    /// only a document can produce. Routing to a *live* shared connection works;
-    /// only reviving a dead one does not.
+    /// Returns `None` (fail soft, warn-logged) for a SHARED key: the marker
+    /// roots a dead shared instance was serving died with its folder set, and
+    /// this path has no document to re-derive any root from. Routing to a
+    /// *live* shared connection works; only reviving a dead one is refused.
     pub(super) async fn reconnect_by_key(
         &self,
         key: &ConnectionKey,
@@ -1431,9 +1431,13 @@ impl LanguageServerPool {
             };
         }
         if key.is_shared() {
-            // Reviving a DEAD shared instance needs a marker to announce its
-            // workspace folders, and only a document can produce one. A live
-            // instance is reachable above and via `ready_connection_by_key_for_config`.
+            // Reviving a DEAD shared instance here would re-spawn it rooted at
+            // the client root with no way to recover which marker roots it was
+            // serving — that knowledge died with the connection, and this path
+            // has no document to re-derive any of it from. Refuse conservatively:
+            // a live instance is reachable above and via
+            // `ready_connection_by_key_for_config`, and the next document
+            // acquisition revives the instance with its root intact.
             log::warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: shared-instance connection for {server:?} is gone and \
@@ -1913,10 +1917,14 @@ impl LanguageServerPool {
         // to the per-root key; acquire that connection instead, within the
         // caller's remaining budget.
         if handle.key().is_shared() && !handle.supports_workspace_folder_changes() {
-            let serves_this_root = marker
+            // Divert only a root the incapable connection does not already
+            // serve. A marker-less acquisition adds no root, so it rides the
+            // shared connection regardless of the capability — the same
+            // exemption `resolve_acquire`'s pre-Ready probe applies.
+            let needs_divert = marker
                 .as_ref()
-                .is_some_and(|(_root, folder)| handle.workspace_folders().contains(folder));
-            if !serves_this_root {
+                .is_some_and(|(_root, folder)| !handle.workspace_folders().contains(folder));
+            if needs_divert {
                 handle.log_incapable_fallback_once(server_name);
                 let remaining = timeout.saturating_sub(start.elapsed());
                 // Reuse the already-resolved `marker` to build the per-root key
@@ -2195,14 +2203,13 @@ impl LanguageServerPool {
             return (marker, per_root_key);
         }
         // A marker-less document (no marker root, non-file URI, no document
-        // hint, or the `[]` kill switch) has no root to share and nothing to
-        // announce, so it stays on the client-root fallback (`per_root_key`,
-        // here a `ClientFallback` key). The shared key is reserved for
-        // marker-rooted documents that join via `didChangeWorkspaceFolders`,
-        // keeping `ConnectionRoot::Shared` distinct from the fallback.
-        if marker.is_none() {
-            return (marker, per_root_key);
-        }
+        // hint, or the `[]` kill switch) joins the shared instance too: it has
+        // no root to announce, but announcing is what NEW ROOTS need, not what
+        // admission needs — `announce_shared_root` no-ops on a `None` marker
+        // and the document simply opens on the shared connection. Keeping such
+        // documents on the client-root fallback (as this once did) forked a
+        // second server process whose session-wide state (e.g. a completion
+        // corpus of every open document) never met the shared instance's.
 
         let shared_key = ConnectionKey::shared(server_name);
         // Clone the shared handle out under the lock, then probe its capability
@@ -2220,16 +2227,19 @@ impl LanguageServerPool {
                     && !handle.supports_workspace_folder_changes() =>
             {
                 handle.log_incapable_fallback_once(server_name);
-                // Keep the shared connection's own spawn root on the shared key
-                // (it is already rooted and serving it); divert every other root
-                // to its own per-root process for true per-root isolation.
-                let serves_this_root = marker
+                // Divert only a root the incapable connection does not already
+                // serve: its own spawn root stays on the shared key (it is
+                // already rooted and serving it), and a marker-less acquisition
+                // stays too — it adds no root, so the capability the server
+                // lacks is never needed for it, and diverting it would fork
+                // the very fallback process the opt-in exists to avoid.
+                let needs_divert = marker
                     .as_ref()
-                    .is_some_and(|(_root, folder)| handle.workspace_folders().contains(folder));
-                if serves_this_root {
-                    shared_key
-                } else {
+                    .is_some_and(|(_root, folder)| !handle.workspace_folders().contains(folder));
+                if needs_divert {
                     per_root_key
+                } else {
+                    shared_key
                 }
             }
             // No shared connection yet, still initializing, or Ready+capable:
@@ -3717,25 +3727,105 @@ mod tests {
         assert!(!per_root.is_shared());
     }
 
-    /// A marker-less document (no `.git`, no document hint) has no root to
-    /// share, so even with `preferSharedInstance` it stays on the client-root
-    /// fallback rather than the shared key (#391).
+    /// A marker-less document (no `.git`, a non-file URI like an editor's
+    /// `untitled:` scratch document, or no document hint at all) joins the
+    /// shared instance rather than forking a client-root fallback process.
+    ///
+    /// It has no root to announce — but announcing is what NEW ROOTS need, not
+    /// what admission needs: opening the document is enough. The fallback
+    /// process this used to fork split session-wide downstream state (a
+    /// server whose completion reads every open document never saw the
+    /// documents living on the other connection) and paid a whole extra
+    /// server process for the privilege.
     #[tokio::test]
-    async fn resolve_acquire_keeps_marker_less_docs_on_client_fallback() {
+    async fn resolve_acquire_routes_marker_less_docs_to_shared_key() {
         let tmp = tempfile::tempdir().unwrap();
         // No `.git` up the tree from this orphan file.
         let orphan = Url::from_file_path(tmp.path().join("scratch.lua")).unwrap();
         let pool = LanguageServerPool::new();
         let config = shared_config();
 
-        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&orphan)).await;
-        assert!(
-            !key.is_shared(),
-            "a marker-less document must stay on the client-root fallback, not shared"
+        let (marker, key) = pool.resolve_acquire("lua", &config, Some(&orphan)).await;
+        assert!(marker.is_none());
+        assert_eq!(
+            key,
+            ConnectionKey::shared("lua"),
+            "a marker-less document must join the shared instance, not fork a fallback"
         );
-        // The no-document case likewise stays off the shared key.
+
+        // A non-file URI — the reported scenario: a cmdline-completion plugin's
+        // `untitled://cmdline` scratch document — cannot even start the marker
+        // walk, and must join all the same.
+        let cmdline = Url::parse("untitled://cmdline").unwrap();
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&cmdline)).await;
+        assert_eq!(key, ConnectionKey::shared("lua"));
+
+        // The no-document case joins the same way.
         let (_marker, no_doc_key) = pool.resolve_acquire("lua", &config, None).await;
-        assert!(!no_doc_key.is_shared());
+        assert_eq!(no_doc_key, ConnectionKey::shared("lua"));
+
+        // Without the opt-in there is no shared instance to join: marker-less
+        // documents keep the client-root fallback.
+        let (_marker, fallback) = pool
+            .resolve_acquire("lua", &devnull_config(), Some(&orphan))
+            .await;
+        assert!(fallback.is_client_fallback());
+    }
+
+    /// An incapable shared connection diverts marker-rooted documents whose
+    /// root it does not serve (previous tests) — but a marker-less document
+    /// adds no root, so the capability the server lacks
+    /// (`didChangeWorkspaceFolders`) is never needed for it: it stays on the
+    /// shared connection instead of forking the fallback process.
+    #[tokio::test]
+    async fn resolve_acquire_keeps_marker_less_docs_on_incapable_shared() {
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        // Capabilities set, but WITHOUT workspaceFolders support.
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        pool.insert_connection(handle).await;
+
+        let cmdline = Url::parse("untitled://cmdline").unwrap();
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&cmdline)).await;
+        assert_eq!(
+            key,
+            ConnectionKey::shared("lua"),
+            "a rootless document cannot wedge an incapable shared connection and must ride it"
+        );
+    }
+
+    /// The post-Ready divert in `get_or_create_connection_wait_ready` exempts
+    /// marker-less documents the same way: the divert exists so an incapable
+    /// shared connection is never asked to absorb a root it cannot announce,
+    /// and a rootless document asks for no such thing — wait_ready must hand
+    /// back the shared connection itself, not fork the fallback.
+    #[tokio::test]
+    async fn wait_ready_keeps_marker_less_docs_on_incapable_shared() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = shared_config();
+
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        let cmdline = Url::parse("untitled://cmdline").unwrap();
+        let result = pool
+            .get_or_create_connection_wait_ready(
+                "lua",
+                &config,
+                Some(&cmdline),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("the shared connection is Ready; nothing needs spawning");
+        assert!(
+            Arc::ptr_eq(&result, &handle),
+            "wait_ready must return the incapable shared connection for a rootless document"
+        );
     }
 
     /// A capable, Ready shared connection keeps subsequent roots on the shared

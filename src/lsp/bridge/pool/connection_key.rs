@@ -10,8 +10,10 @@
 //!
 //! `root` is the resolved root URI string from the `root_markers` walk, or
 //! `None` when no marker root applies (no document hint, non-file URI, no
-//! marker found, or the `[]` kill switch) — every such document falls back to
-//! the single client-rooted connection, matching the pre-#382 behavior.
+//! marker found, or the `[]` kill switch) — such a document falls back to the
+//! single client-rooted connection, matching the pre-#382 behavior, unless the
+//! server opted into `preferSharedInstance` (#391), in which case it joins the
+//! shared instance (it has no root to announce, and none is needed to open).
 
 use std::fmt;
 
@@ -27,8 +29,11 @@ enum ConnectionRoot {
     /// single client-rooted fallback connection — the pre-#382 behavior.
     ClientFallback,
     /// One connection shared across *every* root for a `preferSharedInstance`
-    /// server (#391). Kept distinct from `ClientFallback` so a marker-less
-    /// document on the same server does not collide with the shared instance.
+    /// server (#391), and — because they have no root to isolate by — every
+    /// marker-less document of such a server too. Kept distinct from
+    /// `ClientFallback` so a NON-opted-in server's marker-less documents (and
+    /// a per-root fallback after a capability miss) do not collide with the
+    /// shared instance.
     Shared,
 }
 
@@ -167,9 +172,11 @@ mod tests {
         let shared = ConnectionKey::shared("tsgo");
         assert!(shared.is_shared());
         // The shared key must not collide with the client-root fallback for the
-        // same server, nor with any marker root — else a marker-less document
-        // (or a per-root fallback after a capability miss) would be routed to
-        // the shared instance by accident.
+        // same server, nor with any marker root — else a NON-opted-in server's
+        // marker-less document (or a per-root fallback after a capability miss)
+        // would be routed to the shared instance by accident. An OPTED-IN
+        // server's marker-less documents reach the shared key deliberately,
+        // through `resolve_acquire` — not through key collision.
         assert_ne!(shared, ConnectionKey::for_server("tsgo"));
         assert_ne!(
             shared,
