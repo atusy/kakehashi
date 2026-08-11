@@ -460,9 +460,9 @@ candidates at all likewise queries nothing.
   capacity) is dropped with a warning — the answer's other, already
   normalized entries stand, and the predicate runs on whatever
   normalization produced by the deadline. Folder-entry validations
-  launch **concurrently** onto the pool (admission is FIFO per
-  decision), so one blocked entry cannot serially starve later entries
-  of the deadline. Admission is an online **priority queue**, not
+  launch **concurrently** onto the pool — concurrency removes serial
+  dependency between entries; capacity can still gate them, per the
+  caveat below. Admission is an online **priority queue**, not
   arrival-order FIFO: among jobs simultaneously awaiting a permit, the
   canonical key (the answering provider's priority-walk position, then
   server name, then provider name as the total tie-breaker within a
@@ -471,8 +471,14 @@ candidates at all likewise queries nothing.
   recalls running ones, so nothing is buffered against the budget
   waiting for answers that may never come, JSON object order confers
   nothing, and `"*"` fan-in's earliest-arrival semantics are untouched
-  (this order governs validation admission only) — and the
-  non-starvation
+  (this order governs validation admission only). "Arrival" for fan-in
+  purposes is **completed normalization**, not raw receipt: an answer
+  becomes eligible as a whole once every entry has validated or
+  dropped — a suppression-only answer normalizes instantly and so
+  completes at receipt, while an earlier raw response still validating
+  can legitimately lose the `"*"` group's earliest-arrival race to a
+  later answer that finished first; answers never enter fan-in
+  entry-by-entry — and the non-starvation
   claim is scoped honestly: concurrency removes *serial* dependency
   between entries, while pool *capacity* can still gate them (a hung
   validation retains its permit), in which case entries denied
@@ -897,12 +903,17 @@ since rejected: a decided suppression commits as *suppressed*; a
 decided route settles *retained(key)* — later opens retry the key; a
 **candidacy** rejection settles *not-applicable* exactly as the live
 path would (deletion would let a later re-add resurrect what the live
-rule freezes); and an entry whose task died before any directive was
-persisted, or whose generation/stopped checks miss (the retryable
-mismatches), is **deleted** — a terminal event, not a silent removal:
-waiters subscribed to the entry are woken with "retry as absent",
-atomically with the removal, and the absent-record semantics (ordinary
-resolution, lazy retry) apply. The guard settles records; it never
+rule freezes); and an entry whose task died **before any directive was
+persisted** does not settle unilaterally while the shared flight still
+lives — its ownership transfers to the flight, it stays *pending*, and
+its settlement comes from the flight's outcome like any other entry's
+(deleting it early would let a lazy waiter ordinary-open a server the
+flight's answer is about to suppress). Deletion — a terminal event,
+not a silent removal: waiters subscribed to the entry are woken with
+"retry as absent", atomically with the removal, and the absent-record
+semantics (ordinary resolution, lazy retry) apply — happens only once
+the flight has terminally established that no directive applies to
+the entry, or on the retryable generation/stopped mismatches. The guard settles records; it never
 performs opens or acquires. Cancellation ownership is **exclusively
 the driver/flight side's**: open tasks are passive subscribers and
 their guard touches no provider request; the flight's cleanup honors
