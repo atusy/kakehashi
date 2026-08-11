@@ -434,7 +434,8 @@ half-stopped or release the guard midway.
   routes wait on the re-open barrier (execute-command-routing-token, fail-soft
   if unsettled); other request paths open their own documents and do not
   wait. Restoration is therefore an observable catch-up window: `restart`
-  resolves at `Ready`, the re-open sweep runs after it, `documents` may
+  resolves at verified `Ready` (the ownership check above), the re-open
+  sweep runs after it, `documents` may
   briefly under-report, and a pass-through request racing the sweep is —
   like all pass-through — the caller's own risk.
 - **A shared instance re-seeds; nothing is remembered.** A `#shared` key
@@ -667,5 +668,5 @@ namespace.
 | **Errors** | `RequestFailed` (`-32803`) + `data.reason` discriminator; fail fast, never queue |
 | **Cancellation** | Outer `$/cancelRequest` forwarded to the inner downstream request; outer fails `RequestCancelled`; no bridge-imposed timeout, no Tier-2 liveness accounting |
 | **`stop`** | Graceful handshake when `running` (init-abort when `starting`, handshake bypass when `failed`), bounded by a new per-connection timeout, then forced escalation; stopped set pins the slot until explicit `restart`; single-flight per key |
-| **`restart`** | Same key, current process-level config, no re-key; derived re-open (ARM/CLAIM); resolves at `Ready` or returns `restartFailed`; clears the panic count |
+| **`restart`** | Same key, current process-level config, no re-key; derived re-open (ARM/CLAIM); resolves only after the `Ready` replacement is verified pool-resident, else `restartFailed`; clears the panic count |
 | **Discovery** | Announced as `capabilities.experimental.kakehashi.bridgeClient: true` |
