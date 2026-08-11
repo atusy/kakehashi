@@ -3379,28 +3379,6 @@ impl LanguageServerPool {
     }
 }
 
-/// Whether `candidate` (a recorded spawn root or an initialize-listed folder
-/// URI) and `root` (a marker walk's regenerated URL) name the same workspace
-/// root: filesystem-path identity when both parse as file URLs, URI-text
-/// identity otherwise. A client-supplied string and a regenerated URL can
-/// spell the same directory with a trailing slash or different
-/// percent-encoding, and a textual mismatch diverts — safe, but forks the
-/// very process the opt-in exists to avoid.
-fn same_workspace_root(candidate: &str, root: &Url) -> bool {
-    if candidate == root.as_str() {
-        return true;
-    }
-    match (
-        Url::parse(candidate)
-            .ok()
-            .and_then(|url| url.to_file_path().ok()),
-        root.to_file_path().ok(),
-    ) {
-        (Some(candidate_path), Some(root_path)) => candidate_path == root_path,
-        _ => false,
-    }
-}
-
 /// Served-root proof for the incapable-shared divert: whether `handle` — a
 /// Ready shared connection that will not act on `didChangeWorkspaceFolders` —
 /// is already serving the marker root `root`.
@@ -3412,11 +3390,12 @@ fn same_workspace_root(candidate: &str, root: &Url) -> bool {
 /// `workspaceFolders.supported` — the set cannot overstate that list, because
 /// post-spawn additions are gated on the change capability this server lacks.
 /// Told-at-initialize folders prove nothing for a server that declared no
-/// folder support at all. All comparisons go through [`same_workspace_root`].
+/// folder support at all. All comparisons go through
+/// [`same_root_uri`](super::root_markers::same_root_uri).
 fn incapable_shared_serves(handle: &ConnectionHandle, root: &Url) -> bool {
     if handle
         .spawn_root()
-        .is_some_and(|spawn_root| same_workspace_root(spawn_root, root))
+        .is_some_and(|spawn_root| super::root_markers::same_root_uri(spawn_root, root.as_str()))
     {
         return true;
     }
@@ -3426,7 +3405,7 @@ fn incapable_shared_serves(handle: &ConnectionHandle, root: &Url) -> bool {
             .snapshot()
             .unwrap_or_default()
             .iter()
-            .any(|folder| same_workspace_root(folder.uri.as_str(), root))
+            .any(|folder| super::root_markers::same_root_uri(folder.uri.as_str(), root.as_str()))
 }
 
 #[cfg(test)]

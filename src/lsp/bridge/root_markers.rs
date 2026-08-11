@@ -100,6 +100,24 @@ pub(crate) fn workspace_from_marker(
     }
 }
 
+/// Whether two workspace-root spellings name the same root: filesystem-path
+/// identity when both parse as `file` URLs, URI-text identity otherwise. A
+/// client-supplied string and a marker walk's regenerated URL can spell the
+/// same directory with a trailing slash or different percent-encoding, and
+/// treating those as distinct either forks a per-root process (the divert
+/// proof) or re-announces a folder the server was already told about at
+/// initialize (`add_and_announce`).
+pub(crate) fn same_root_uri(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let file_path = |s: &str| Url::parse(s).ok().and_then(|url| url.to_file_path().ok());
+    match (file_path(a), file_path(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Resolve the marker root **and** its `WorkspaceFolder` for a spawn, as a
 /// single unit — `Some` only when a marker root is found *and* parses as an LSP
 /// `Uri`. Returning both together means the per-root connection-pool key (issue
