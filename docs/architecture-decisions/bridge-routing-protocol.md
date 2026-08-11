@@ -285,7 +285,14 @@ spelling — is what flows everywhere downstream: the `ConnectionKey`, the
 stopped-set checks, the route binding, the folder announce, and the
 spawn. Two spellings of one directory (symlink, percent-encoding, case,
 trailing slash) can therefore never mint two keys or slip past an
-equivalent stopped key. The folder `name` is the basename of the
+equivalent stopped key. Canonicalization is admission-time work, and
+binding-driven *reuse* does not trust it forever: every binding-driven
+spawn or folder announce (a retained-key retry, a restart's folder
+re-add) **re-canonicalizes** the retained URI and revalidates the result
+against the admission-time canonical roots retained beside it — a
+directory swapped for a symlink between admission and reuse resolves
+elsewhere, and the route reads not applicable, with a warning, rather
+than following the link outside its trust universe. The folder `name` is the basename of the
 canonical root, exactly as `root_markers::workspace_at_root` derives it
 for a marker-rooted spawn (falling back to the URI string for a root with
 no basename).
@@ -341,11 +348,14 @@ would tax exactly the fleets that have no providers at all. Slots that are
 (bridge-client-control-protocol's states) are skipped, never parked on. A
 provider *name* can own several live connections at once (per-root
 pooling, plus a `forceStart` spawn); the routing query rides exactly
-**one** of them, picked by a total order over the name's **advertising**
-handles — shared, then client-fallback, then the remainder by ascending
-key rendering — taking the first `Ready` handle, and, when the
-initialization wait applies, awaiting the first `Initializing` handle in
-that same order. An arbitrary but stable choice, recorded as such.
+**one** of them, picked from two ordered sets under one total order —
+shared, then client-fallback, then the remainder by ascending key
+rendering. The query goes to the first handle that is **`Ready` and
+advertising**; when none exists and the initialization wait applies, the
+wait targets the first **wait-eligible `Initializing`** handle in the
+same order (an `Initializing` handle cannot advertise yet — its
+eligibility comes from the per-name memo or an explicit `priorities`
+entry). An arbitrary but stable choice, recorded as such.
 
 Provider order is configured through the existing per-method aggregation
 map — `languages.<host>.bridge.<lang>.aggregation`, abbreviated
@@ -463,18 +473,28 @@ structures with different lifetimes carry the outcome:
   virtual-document creation path), before the open tasks are spawned
   and before the writer ticket is released** — installing it inside the
   first spawned task would leave a scheduling gap in which a request
-  running after the handler returns sees no record at all. It settles
-  **per server, at that server's acquire commit**: the recorded key is
-  the key the acquire actually landed on (a capability-fallback
-  downgrade records the downgraded per-root key), and an acquire that
-  fails *after* the route was decided retains the decided key — later
-  opens retry that key through the ordinary respawn path rather than
-  falling through to a different resolution. A lazy request-path open
-  that finds a *pending* entry awaits that server's settlement
-  (bounded by the decision's remaining deadline) instead of
-  default-opening — without that, a hover-class request racing the
-  decision window could open the document on a server the arriving
-  answer suppresses. The settled binding is
+  running after the handler returns sees no record at all. The flight —
+  the single-flight future and its deadline clock — is created
+  **atomically with the pending record**, so an observer of a pending
+  entry always has a future to await and a remaining budget to inherit;
+  the first task to poll it dispatches the fan-out. Every server's
+  entry then reaches a **terminal settlement**, so waiters never hang:
+  *suppressed* settles when the answer applies (no acquire runs);
+  *routed(key)* settles at that server's acquire commit, recording the
+  key actually landed on (a capability-fallback downgrade records the
+  downgraded per-root key); *retained(key)* settles when an acquire
+  fails *after* the route was decided — waiters proceed without the
+  server, and later opens retry the retained key through the ordinary
+  respawn path rather than falling through to a different resolution;
+  and a decision that ends with no answer settles every remaining entry
+  as *kakehashi-decides*. Every settlement write is a **compare-and-set
+  against the exact pending (incarnation, flight) it settles**: a task
+  outlived by a close/re-open finds the new incarnation's record and
+  writes nothing. A lazy request-path open that finds a *pending* entry
+  awaits its settlement (bounded by the decision's remaining deadline)
+  instead of default-opening — without that, a hover-class request
+  racing the decision window could open the document on a server the
+  arriving answer suppresses. The settled binding is
   *identity*, not policy: the lazy open and the derived re-open sweep
   consult it — a suppressed server stays suppressed, a bound key stays
   the key, and a shared replacement's re-open re-adds and announces the
@@ -902,8 +922,12 @@ a slot a routing provider left in play.
   from the request-execute path) and the re-open sweep consult the route
   binding, awaiting a pending entry bounded by the lesser of the
   decision's remaining deadline and (for the sweep) its own fixed
-  budget — still pending at that bound reads as not applicable for this
-  pass; the ordinary lazy path re-opens later. One gate, not scattered
+  budget — still pending at that bound is **applicable-but-unsettled**,
+  never "not applicable" (that outcome is reserved for documents that
+  do not belong — respawn-reopen-derives-its-targets), so the
+  execute-command barrier takes its fail-soft path rather than
+  releasing over a document the settling binding may yet restore; the
+  ordinary lazy path re-opens later. One gate, not scattered
   per-call-site checks, and never an await under the ingress ticket.
 - The routing query is awaited inside the open task, before that task's
   acquire, holding no pool lock; the acquire critical section
@@ -924,9 +948,11 @@ a slot a routing provider left in play.
   routing-specific step precedes dispatch: the expanded entries are
   pruned to the selected provider set (`expand_priorities` does not do
   this, and the `maxFanOut` truncation step is deliberately skipped).
-  Expiry cancellation uses `forward_cancel_downstream` per pending
-  provider request; retirement must be atomic with the fallback
-  synthesis so late answers drop.
+  Cleanup on every terminal outcome of the decision — early winner,
+  incarnation abort, teardown, expiry — uses
+  `forward_cancel_downstream` per still-pending provider request;
+  retirement must be atomic with the decision's settlement so late
+  answers drop.
 - The Tier-2 exclusion rides the per-entry liveness classification the
   control protocol introduces for pass-through; routing entries carry the
   same non-liveness class.
