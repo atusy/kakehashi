@@ -472,7 +472,12 @@ candidates at all likewise queries nothing.
   recalls running ones, so nothing is buffered against the budget
   waiting for answers that may never come, JSON object order confers
   nothing, and `"*"` fan-in's earliest-arrival semantics are untouched
-  (this order governs validation admission only). "Arrival" for fan-in
+  (this order governs validation admission only). The canonical key
+  orders jobs **within one decision**; the shared pool arbitrates
+  **across** decisions — and the binding-reuse validations, which have
+  no provider or position and form their own queue — by fair
+  round-robin over the per-decision queues, and a queue at its bound
+  refuses the enqueue, which reads as that entry's capacity drop. "Arrival" for fan-in
   purposes is **completed normalization**, not raw receipt: an answer
   becomes eligible as a whole once every entry has validated or
   dropped — a suppression-only answer normalizes instantly and so
@@ -525,9 +530,10 @@ Two structural rules keep the protocol from consuming itself:
   routing query itself, never trigger a routing query. Provider
   connections are routed by kakehashi's own rules — the bootstrap base
   case. The derived re-open sweep after a restart **issues no routing
-  query and never spawns as a routing side effect** — it reads the
-  route binding where one exists and falls through to read-only marker
-  resolution where none does (below) — preserving
+  query and never spawns as a routing side effect** — it reads each
+  exact (host, layer, language, server) entry's binding record where
+  one exists and falls through to read-only marker resolution where
+  that entry is absent (below) — preserving
   respawn-reopen-derives-its-targets' read-only, never-spawns stage
   discipline and its fixed budget.
 - **Document-independent traffic.** The routing request rides the
@@ -604,7 +610,7 @@ structures with different lifetimes carry the outcome:
   key actually landed on (a capability-fallback downgrade records the
   downgraded per-root key); *retained(key)* settles when the decided
   route's acquire failed — or, under abnormal finalization, was never
-  attempted because its owner died; the settlement record carries
+  attempted because its owner died; the terminal record carries
   which — waiters proceed without the
   server, and later opens retry the retained key through the ordinary
   respawn path rather than falling through to a different resolution.
@@ -622,8 +628,12 @@ structures with different lifetimes carry the outcome:
   bookkeeping beside it. The claim is covered by the same pool-owned
   completion guard as every detached routing task: any exit short of a
   commit — cancellation, validation timeout, panic, teardown —
-  atomically restores plain *retained*, publishes that outcome, and
-  wakes the waiters, so a dead claimant can never park later retriers. A
+  restores plain *retained* **through the same token-and-incarnation
+  CAS the claimant would use**: on a match it restores and publishes;
+  on a mismatch (the entry moved — close/re-open, eviction, another
+  transition) it leaves the current state untouched and only releases
+  the old claim's waiters. Either way a dead claimant can never park
+  later retriers or overwrite a successor's state. A
   successful retry transitions the entry to *routed* with the key the
   acquire actually landed on; a failed retry re-records
   *retained(actual attempted key)* with fresh provenance — after a
@@ -644,7 +654,8 @@ structures with different lifetimes carry the outcome:
   **terminal record** per server, emitted on settlement and terminal
   deletion alike (the landed or
   downgraded key; a retention, with its failed-versus-owner-died
-  provenance; a suppression taking hold; a deletion, with its
+  provenance; a suppression taking hold; a candidacy rejection's
+  not-applicable; a deletion, with its
   cause — no surviving directive, or the retryable mismatch that
   triggered it). This
   is what makes a valid-but-wrong policy diagnosable from the logs

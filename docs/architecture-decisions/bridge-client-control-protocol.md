@@ -128,13 +128,14 @@ Both parameters are optional and compose as AND:
   server) entry has no record (other servers' settlements on the same
   tuple do not block it) — and a *pending* entry
   (its decision still in flight) matches nothing yet — the document is
-  not open there — rather than falling through. A *retained* tuple (the
-  route decided but its acquire failed, or never ran because its owner
-  died — bridge-routing-protocol)
+  not open there — rather than falling through. A *retained* entry (that
+  server's route decided but its acquire failed, or never ran because
+  its owner died — bridge-routing-protocol; sibling entries stay
+  independently enumerable)
   **matches its retained key when a slot for that key is enumerable**,
   whatever that slot's status (a `Failed` handle, or a `running` shared
   handle whose folder announcement failed; a pre-handle spawn failure
-  leaves no row to match, and the tuple then matches nothing until a
+  leaves no row to match, and the entry then matches nothing until a
   retry produces one): surfacing the slot assigned to the document
   after a failed acquire is exactly what a user diagnosing missing
   features needs, unlike `pending`, whose assignment does not exist
