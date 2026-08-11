@@ -379,7 +379,8 @@ the completion stays a pure report, and a panic at any point settles
 from the entry (kill-and-reap whatever the escrow holds), never by
 pretending the child away. **Escrow closes by claim, not by time**: a
 transition that settles a `Spawning` intent out from under its sub-task
-(teardown, reload deletion, `stop`) marks the entry *settling* but
+(teardown, reload deletion, same-name configuration invalidation,
+`stop`) marks the entry *settling* but
 retains it — slot still writable — until the sub-task's termination
 surfaces through the `JoinSet`; a handle landing in that window is
 killed-and-reaped by the final settlement, so no child can slip in
@@ -443,8 +444,13 @@ enum LifecycleMsg {
     //   spawn-time configuration claims the superseded intent the same
     //   way — producer settled per claim closure, the stale handle
     //   never published — and resolves the receiver with the
-    //   superseded-configuration acquire error, on which the caller
-    //   simply re-acquires under the new generation; reload DELETION removes the row instead, and the
+    //   superseded-configuration acquire error only AFTER the claim
+    //   commits — the settling entry already fences spawn commits, so
+    //   the re-acquire cannot spawn beside the superseded producer
+    //   (the reload-origin record then dissolves per the origin rule).
+    //   The re-acquire re-resolves current configuration and spends the
+    //   REMAINING budget of the original acquisition deadline — reload
+    //   churn cannot reset the timeout; reload DELETION removes the row instead, and the
     //   removal itself notifies waiters of that (key, generation) with
     //   the deleted-server acquire error — the notification carries the
     //   terminal answer, so no row needs to remain. No pending reply
