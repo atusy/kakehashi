@@ -184,11 +184,13 @@ that error, so a downstream answer arriving later has nowhere to land and
 is dropped and logged. This is a deliberate exception to
 ls-bridge-message-ordering's forward-the-late-response rule — that rule
 serves callers still waiting for a result, and this caller has already
-abandoned it. Without forwarding, a hung downstream
-would pin the outer request forever — which matters because the outer
-request carries **no bridge-imposed timeout**: the bridge cannot know the
-expected latency of an arbitrary method, so the caller decides how long a
-pass-through may take, and cancellation is the only way out. For the same
+abandoned it. Forwarding the cancel serves the *downstream*, not the
+caller: the outer request is released by `RequestCancelled` regardless, and
+the forward stops the abandoned computation. Cancellation still matters to
+the caller because the outer request carries **no bridge-imposed timeout**:
+the bridge cannot know the expected latency of an arbitrary method, so the
+caller decides how long a pass-through may take, and cancellation is the
+only way out. For the same
 reason pass-through requests are excluded from Tier-2 liveness accounting
 (ls-bridge-timeout-hierarchy): a deliberately slow custom request is not
 evidence of a hung server and must not drive a healthy connection to
@@ -336,7 +338,11 @@ Three lifecycle rules keep the set coherent:
 
 `restart` = the `stop` sequence above (with its per-status shortcuts; a no-op
 if the slot is already stopped) + clear the stopped entry + respawn the
-**same** `ConnectionKey` under the configuration current at that moment. The
+**same** `ConnectionKey` under the configuration current at that moment —
+"that moment" being replacement insertion: the respawn revalidates the
+configuration generation before inserting, and a reload that superseded its
+snapshot while no handle existed forces a re-read, so a process spawned
+from a configuration the reload never observed can never be inserted. The
 outer request resolves when the replacement reaches `Ready` (result `null`)
 or fails (error `restartFailed`), bounded by the existing initialization
 timeout (ls-bridge-timeout-hierarchy). `restartFailed` covers every failure
@@ -360,10 +366,13 @@ half-stopped or release the guard midway.
   is spawned under the identical key, and rooting changes take effect only for
   newly routed documents. This is what keeps held ids stable; the alternative
   is rejected below.
-- **Document restoration is derived, not remembered.** The respawn goes
-  through the existing purge→ARM, handshake→CLAIM mechanism, so the
-  replacement re-opens whichever currently open documents belong to it, per
-  respawn-reopen-derives-its-targets. Only the `workspace/executeCommand`
+- **Document restoration is derived, not remembered.** The respawn uses the
+  existing ARM/CLAIM mechanism, with one addition: the acquire path ARMs
+  only when it replaces a live entry, and after `stop` the entry is already
+  gone, so `restart` **explicitly ARMs the key** after its purge phase and
+  before the respawn — otherwise the replacement's handshake would find
+  nothing to claim. The replacement then re-opens whichever currently open
+  documents belong to it, per respawn-reopen-derives-its-targets. Only the `workspace/executeCommand`
   routes wait on the re-open barrier (execute-command-routing-token, fail-soft
   if unsettled); other request paths open their own documents and do not
   wait. Restoration is therefore an observable catch-up window: `restart`
@@ -374,8 +383,11 @@ half-stopped or release the guard midway.
   carries no root, and the old handle's accumulated folder set dies with
   it. Because no triggering document exists to resolve a marker root — the
   existing acquire path cannot revive a dead shared key without one — the
-  replacement is seeded from the client root (the fallback every spawn path
-  has), and the set regrows through the existing add-only acquire path
+  replacement is seeded with a **single** root, the client's primary root:
+  the same one-root shape a fresh spawn gets, and deliberately not the
+  client's whole folder list, which the incapable-server capability
+  fallback would misread as already-served. The set regrows through the
+  existing add-only acquire path
   (`workspace/didChangeWorkspaceFolders` per
   ls-bridge-server-pool-coordination) as roots re-acquire the shared
   connection — derive, don't remember, applied to folders. If the
@@ -471,8 +483,8 @@ namespace.
   `forward_cancel_downstream`, the graceful-shutdown state machine, the
   ARM/CLAIM derived re-open. The genuinely new state is the stopped set, the
   per-connection shutdown timeout, the in-flight pass-through id map, the
-  per-handle `serverInfo`, the per-key control-operation registry, and the
-  deny list.
+  per-handle `serverInfo`, the per-key control-operation registry, the
+  liveness classification on router pending entries, and the deny list.
 - Held ids survive restarts, so tooling built on the protocol needs no
   re-enumeration choreography.
 
@@ -518,9 +530,14 @@ namespace.
 - Methods register via `LspService::build().custom_method(...)` following the
   `kakehashi/node*` pattern; handlers live under
   `src/lsp/lsp_impl/kakehashi/bridge/client/`.
-- Id resolution: render each live pool key (and stopped-set key) with
-  `ConnectionKey`'s `Display` and compare for exact equality with the supplied
-  id; no parsing.
+- Id resolution: render each live pool key, stopped-set key, and
+  control-operation-registry key with `ConnectionKey`'s `Display` and
+  compare for exact equality with the supplied id; no parsing. The registry
+  matters during the restart window, when the stopped entry is already
+  cleared and no handle exists yet — the registry is the key's only owner
+  then, so without it the slot would vanish from enumeration and calls
+  would answer `unknownClient` instead of `clientRestarting`. A
+  registry-only key enumerates as `starting`.
 - The stopped set lives beside the pool's per-connection maps, keyed by
   `ConnectionKey`; the acquire path checks it before any spawn decision.
 - `restart` clears the slot's entry in `consecutive_panic_counts` before
@@ -537,7 +554,15 @@ namespace.
   `(ConnectionKey, downstream id)`. As in the formatting pipeline, the
   handler itself records the downstream id it minted for each in-flight
   pass-through — there is no registry to consult — and that
-  outer-id → downstream-id map is part of the protocol's new state.
+  outer-id → downstream-id map is part of the protocol's new state. The
+  handler must consume the request tracker's latched cancellation before,
+  or atomically with, enqueueing the inner request; recording the mapping
+  only after the enqueue leaves a window where an already-latched cancel is
+  lost and the unbounded request it was the only escape from survives.
+- Excluding pass-through from Tier-2 liveness needs a per-entry
+  classification on the response router's pending map — expiry today
+  counts every non-cancelled pending entry, so an unclassified slow
+  pass-through would still fail the connection.
 - Server-name validation is the first key validation `languageServers` gets —
   none exists today. A name containing `@` or `#` is rejected with a
   user-facing notice and the entry is never spawned, matching the
@@ -555,5 +580,5 @@ namespace.
 | **Errors** | `RequestFailed` (`-32803`) + `data.reason` discriminator; fail fast, never queue |
 | **Cancellation** | Outer `$/cancelRequest` forwarded to the inner downstream request; outer fails `RequestCancelled`; no bridge-imposed timeout, no Tier-2 liveness accounting |
 | **`stop`** | Graceful handshake bounded by a new per-connection timeout, then forced escalation; stopped set pins the slot until explicit `restart`; single-flight per key |
-| **`restart`** | Same key, current process-level config, no re-key; derived re-open (ARM/CLAIM); resolves at `Ready` or `Failed` (`restartFailed`); clears the panic count |
+| **`restart`** | Same key, current process-level config, no re-key; derived re-open (ARM/CLAIM); resolves at `Ready` or returns `restartFailed`; clears the panic count |
 | **Discovery** | Announced as `capabilities.experimental.kakehashi.bridgeClient: true` |
