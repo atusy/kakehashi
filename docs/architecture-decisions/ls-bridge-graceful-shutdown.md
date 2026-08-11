@@ -387,9 +387,12 @@ mode instead of waiting indefinitely: `ServerRemains` retains it, and
 claim stays authoritative until its producer is closed, because unlike
 an already-escalated child, an unaborted spawn task could create a
 fresh child with no retained record to kill — joins the abort through
-the `JoinSet`, then log-abandons whatever the escrow holds; a producer
-still unjoined at the final deadline is logged as a potential
-straggler, the honest limit of a process about to exit. The pairing applies to the
+the `JoinSet`, then log-abandons whatever the escrow holds. A producer
+still unjoined at the final deadline gets a coherent terminal
+disposition, not just a log line: teardown **publishes its completion
+as failed** — naming the guarantee it can no longer honor — while the
+record stays authoritative until actual process exit ends ownership;
+the log names the potential straggler. The pairing applies to the
 **terminal, caller-visible transition** of an operation: a multi-step
 `stop`/`restart` commits its initial and intermediate transitions
 state-only, the entry retaining the live reply sender for terminal

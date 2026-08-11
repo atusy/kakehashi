@@ -378,12 +378,15 @@ first-class use of this method, not an edge case. `stop` on a pre-handle
 and retained until the spawn sub-task terminates, any handle its escrow
 receives in the meantime is killed and reaped, and then the tombstone
 installs and `stop` answers (`null`, or `stopFailed` into a
-termination-pending record if the reap is unconfirmed). The wait is
-bounded like everything else: a spawn sub-task still unterminated at the
-per-slot deadline fails the `stop` (`stopFailed`) immediately, the
-entry converting to a fenced cleanup record that keeps the escrow open
-and the eventual child kill-and-reaped
-(ls-bridge-graceful-shutdown § Lifecycle Actor). `restart` on a
+termination-pending record if the reap is unconfirmed). The two outcomes are
+distinct: a **verified reap** before the per-slot deadline installs the
+config-revalidated tombstone and answers `null`; an unconfirmed reap or
+deadline expiry answers `stopFailed` and leaves the entry as a fenced
+cleanup record — no tombstone yet, escrow open, the eventual child is
+killed and reaped on arrival (ls-bridge-graceful-shutdown § Lifecycle
+Actor). `restart` respawns only after a verified pre-deadline
+settlement; short of one it answers `restartFailed` with the same
+fenced record. `restart` on a
 `Spawning` slot is that same settlement followed by its ordinary respawn
 sequence.
 
@@ -752,9 +755,12 @@ namespace.
   while the fenced cleanup record persists internally, unaddressable.
   Visibility follows configuration: a later reload that re-adds the
   same server name makes the surviving record addressable again — it
-  enumerates as `stopping`, still fencing acquires, and converts to the
-  fenced tombstone (`stopped`) when its cleanup completes, from which
-  `restart` revives the slot as usual. `ConnectionState` alone could never provide this: it exposes
+  enumerates as `stopping` and still fences acquires until cleanup
+  completes. What happens then follows the record's **origin**:
+  stop-origin cleanup installs the tombstone (`stopped` means
+  explicitly stopped, and that stop is still in force), while
+  reload-origin cleanup simply **dissolves** — no user ever stopped the
+  slot, so it returns to ordinary acquire-driven spawning. `ConnectionState` alone could never provide this: it exposes
   only `Initializing`, which cannot distinguish a restart in flight from
   an ordinary first spawn.
 - Acquire keeps using existing `Ready` connections lock-free; the
