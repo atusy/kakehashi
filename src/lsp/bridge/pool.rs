@@ -1952,9 +1952,15 @@ impl LanguageServerPool {
         if handle.key().is_shared() && !handle.supports_workspace_folder_changes() {
             // Divert only a root the connection is not already serving, per
             // the tiered proof in `incapable_shared_serves`. A marker-less
-            // acquisition adds no root, so it rides the shared connection
-            // regardless of the capability — the same exemption
-            // `resolve_acquire`'s pre-Ready probe applies.
+            // acquisition brings no marker root of its own, so it rides the
+            // shared connection regardless of the capability — the same
+            // exemption `resolve_acquire`'s pre-Ready probe applies. On an
+            // INCAPABLE connection its client-workspace announcement is also
+            // suppressed, so its didOpen may fall outside the server's
+            // folders: accepted — out-of-workspace documents are LSP-legal
+            // (single-file mode), and diverting to the fallback instead
+            // would re-split the session-wide state this routing exists to
+            // unify.
             let needs_divert = marker
                 .as_ref()
                 .is_some_and(|(root, _folder)| !incapable_shared_serves(&handle, root));
@@ -2267,10 +2273,12 @@ impl LanguageServerPool {
             {
                 // Divert only a root the connection is not already serving,
                 // per the tiered proof in `incapable_shared_serves`; a
-                // marker-less acquisition stays too — it adds no root, so the
-                // capability the server lacks is never needed for it, and
+                // marker-less acquisition stays too — it brings no marker
+                // root, so the missing capability never blocks it, and
                 // diverting it would fork the very fallback process the
-                // opt-in exists to avoid.
+                // opt-in exists to avoid (see the wait_ready site's comment
+                // for the accepted out-of-workspace residual on incapable
+                // connections).
                 let needs_divert = marker
                     .as_ref()
                     .is_some_and(|(root, _folder)| !incapable_shared_serves(&handle, root));
@@ -2328,37 +2336,33 @@ impl LanguageServerPool {
         if !handle.key().is_shared() {
             return Ok(());
         }
-        // A marker-less acquisition still has a workspace to name: the CLIENT
-        // root. A real file with no marker up its tree (or the
+        // A marker-less acquisition still has a workspace to name: the
+        // CLIENT workspace. A real file with no marker up its tree (or the
         // `workspaceMarkers = []` kill switch) previously landed on a
-        // client-rooted fallback process, and an editor scratch document
-        // belongs to the same session — so announce the client root on its
-        // behalf, and a shared connection spawned under some marker root does
-        // not receive didOpens for documents outside every folder it was ever
-        // told about. The set's path-normalized dedup makes this a no-op on a
-        // client-seeded connection (its initialize already listed the client
-        // root) and on every acquisition after the first.
-        let client_fallback;
-        let folder = match marker {
-            Some((_root, folder)) => folder,
-            None => {
-                let Some(fallback) = self
-                    .root_uri()
-                    .and_then(|root| Url::parse(&root).ok())
-                    .and_then(super::root_markers::workspace_at_root)
-                else {
-                    // The editor supplied no root at all: nothing to name,
-                    // and none is needed to open a document.
-                    return Ok(());
-                };
-                client_fallback = fallback;
-                &client_fallback.1
-            }
+        // fallback process whose initialize carried the COMPLETE client
+        // folder snapshot, and an editor scratch document belongs to the same
+        // session — so announce that whole snapshot on its behalf (not just
+        // the primary root: in a multi-root client [A, B], a no-marker file
+        // under B is outside A). A shared connection spawned under some
+        // marker root then knows every folder such documents can live in. The
+        // set's path-normalized dedup makes this a no-op on a client-seeded
+        // connection (its initialize already listed them) and on every
+        // acquisition after the first.
+        let folders: Vec<tower_lsp_server::ls_types::WorkspaceFolder> = match marker {
+            Some((_root, folder)) => vec![folder.clone()],
+            None => match self.workspace_folders() {
+                // The editor supplied no folders at all: nothing to name,
+                // and none is needed to open a document.
+                None => return Ok(()),
+                Some(folders) => folders,
+            },
         };
+        if folders.is_empty() {
+            return Ok(());
+        }
         if !handle.supports_workspace_folder_changes() {
             return Ok(());
         }
-        let folder = folder.clone();
         // The closure runs under the folder-set lock and reports its send
         // outcome out here so the error kind can distinguish retryable
         // backpressure (queue full) from a dead/serialization-failed connection.
@@ -2382,41 +2386,51 @@ impl LanguageServerPool {
                 "bridge: connection was replaced before didChangeWorkspaceFolders",
             ));
         }
-        // Add + announce atomically under the folder-set lock: the folder is
-        // committed only if the `didChangeWorkspaceFolders` actually queued, and
-        // a concurrent caller cannot observe it as announced (and skip its own
-        // announce) until that notification is on the FIFO ahead of any later
-        // `didOpen`. If the queue is full/closed, nothing commits and the error
-        // below makes this acquisition retry rather than open a document for an
-        // unannounced root.
-        let announced = handle
-            .workspace_folders()
-            .add_and_announce(folder.clone(), || {
-                let result =
-                    handle.send_notification(build_did_change_workspace_folders_notification(
-                        vec![folder.clone()],
-                        Vec::new(),
-                    ));
-                send_outcome = result;
-                if result == NotificationSendResult::Queued {
-                    log::debug!(
-                        target: "kakehashi::bridge",
-                        "[{}] announced workspace folder {}",
-                        handle.key(),
-                        folder.uri.as_str()
-                    );
-                    true
-                } else {
-                    log::warn!(
-                        target: "kakehashi::bridge",
-                        "[{}] didChangeWorkspaceFolders for {} not queued ({:?})",
-                        handle.key(),
-                        folder.uri.as_str(),
-                        result
-                    );
-                    false
-                }
-            });
+        // Add + announce atomically under the folder-set lock, one folder at
+        // a time: each folder is committed only if its
+        // `didChangeWorkspaceFolders` actually queued, and a concurrent
+        // caller cannot observe it as announced (and skip its own announce)
+        // until that notification is on the FIFO ahead of any later
+        // `didOpen`. If the queue is full/closed, the remaining folders do
+        // not commit and the error below makes this acquisition retry — the
+        // already-committed prefix simply dedups on the retry, so partial
+        // progress is kept, never repeated.
+        let mut announced = true;
+        let mut failed_folder = None;
+        for folder in &folders {
+            announced = handle
+                .workspace_folders()
+                .add_and_announce(folder.clone(), || {
+                    let result =
+                        handle.send_notification(build_did_change_workspace_folders_notification(
+                            vec![folder.clone()],
+                            Vec::new(),
+                        ));
+                    send_outcome = result;
+                    if result == NotificationSendResult::Queued {
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "[{}] announced workspace folder {}",
+                            handle.key(),
+                            folder.uri.as_str()
+                        );
+                        true
+                    } else {
+                        log::warn!(
+                            target: "kakehashi::bridge",
+                            "[{}] didChangeWorkspaceFolders for {} not queued ({:?})",
+                            handle.key(),
+                            folder.uri.as_str(),
+                            result
+                        );
+                        false
+                    }
+                });
+            if !announced {
+                failed_folder = Some(folder.uri.as_str().to_owned());
+                break;
+            }
+        }
         drop(connections);
 
         if announced {
@@ -2438,7 +2452,7 @@ impl LanguageServerPool {
             kind,
             format!(
                 "bridge: could not queue didChangeWorkspaceFolders for {} ({:?})",
-                folder.uri.as_str(),
+                failed_folder.as_deref().unwrap_or("<unknown folder>"),
                 send_outcome
             ),
         ))
@@ -4245,21 +4259,33 @@ mod tests {
         assert!(pool.pending_reopen.claim(&registry_key).is_none());
     }
 
-    /// A marker-less acquisition announces the CLIENT root on a capable
-    /// shared connection: such documents previously lived on a client-rooted
-    /// fallback process, and without this a shared connection spawned under
-    /// some marker root would receive didOpens for documents outside every
-    /// folder it was ever told about. Dedup keeps it to one announce.
+    /// A marker-less acquisition announces the COMPLETE client workspace
+    /// snapshot on a capable shared connection: such documents previously
+    /// lived on a fallback process whose initialize carried every client
+    /// folder, and without this a shared connection spawned under some marker
+    /// root would receive didOpens for documents outside every folder it was
+    /// ever told about. Dedup keeps repeats to one announce per folder.
     #[tokio::test]
-    async fn marker_less_acquisition_announces_the_client_root() {
-        let (_tmp, doc) = marker_rooted_doc();
+    async fn marker_less_acquisition_announces_the_client_workspace() {
+        let (_tmp_a, doc_a) = marker_rooted_doc();
+        let (_tmp_b, doc_b) = marker_rooted_doc();
         let pool = Arc::new(LanguageServerPool::new());
         let config = shared_config();
 
-        // Use the tmp marker root as the session's client root.
-        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
-        let (client_root, client_folder) = marker.expect("tmp dir has a marker root");
-        pool.set_root_uri(Some(String::from(client_root)));
+        // A multi-root client workspace [A, B]: announcing only the primary
+        // root would leave a no-marker file under B outside everything a
+        // shared connection spawned elsewhere was told about.
+        let folder_a = pool
+            .resolve_marker_and_key("lua", &config, Some(&doc_a))
+            .0
+            .expect("A has a marker root")
+            .1;
+        let folder_b = pool
+            .resolve_marker_and_key("lua", &config, Some(&doc_b))
+            .0
+            .expect("B has a marker root")
+            .1;
+        pool.set_workspace_folders(Some(vec![folder_a.clone(), folder_b.clone()]));
 
         let handle =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
@@ -4279,11 +4305,12 @@ mod tests {
         assert!(Arc::ptr_eq(&result, &handle));
         let folders = handle.workspace_folders().snapshot().unwrap_or_default();
         assert!(
-            folders.iter().any(|folder| folder.uri == client_folder.uri),
-            "the client root must be announced on the marker-less acquisition's behalf"
+            folders.iter().any(|folder| folder.uri == folder_a.uri)
+                && folders.iter().any(|folder| folder.uri == folder_b.uri),
+            "BOTH client folders must be announced, not just the primary"
         );
 
-        // A second acquisition dedups: still exactly one folder.
+        // A second acquisition dedups: still exactly the two folders.
         pool.get_or_create_connection_wait_ready(
             "lua",
             &config,
@@ -4292,7 +4319,7 @@ mod tests {
         )
         .await
         .expect("still Ready");
-        assert_eq!(handle.workspace_folders().snapshot().unwrap().len(), 1);
+        assert_eq!(handle.workspace_folders().snapshot().unwrap().len(), 2);
     }
 
     /// A rootless session (the editor supplied no root) has nothing to name:
