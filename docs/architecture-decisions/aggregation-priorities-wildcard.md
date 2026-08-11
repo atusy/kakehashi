@@ -5,7 +5,7 @@
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — Per-method strategies and merging rules
 - [concatenated-formatting-pipeline](concatenated-formatting-pipeline.md) — The formatting pipeline whose allowlist semantics this decision generalizes
 - [cross-layer-aggregation](cross-layer-aggregation.md) — Layer ordering (`priorities` over layers), which adopts the same allowlist rule
-- [bridge-routing-protocol](bridge-routing-protocol.md) — Reuses the allowlist for routing-provider order under the first non-LSP method key, `kakehashi/bridge/routing`
+- [bridge-routing-protocol](bridge-routing-protocol.md) — Reuses the allowlist for routing-provider order under the first non-LSP method key, `kakehashi/bridge/routing` (exempt from the `"_"` method-wildcard merge; `maxFanOut = 0` does not disable it, only `priorities = []` does)
 
 ## Implementation Status
 

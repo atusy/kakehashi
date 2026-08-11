@@ -4,7 +4,8 @@
 [execute-command-routing-token](execute-command-routing-token.md),
 [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md),
 [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md),
-[host-document-bridge](host-document-bridge.md)
+[host-document-bridge](host-document-bridge.md),
+[bridge-routing-protocol](bridge-routing-protocol.md)
 
 ## Context
 

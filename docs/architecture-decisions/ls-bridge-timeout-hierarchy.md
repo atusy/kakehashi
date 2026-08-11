@@ -43,7 +43,7 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 | Tier | Timeout | Duration | Trigger | Action |
 |------|---------|----------|---------|--------|
 | **0** | Initialization | 30-60s | `initialize` request sent | `Initializing` → `Failed` (pool may spawn replacement) |
-| **2** | Liveness | 30-120s | Ready state + liveness-classified managed pending > 0 (pass-through excluded — target state landing with bridge-client-control-protocol; today every pending entry counts) | `Ready` → `Failed` (pool may spawn replacement) |
+| **2** | Liveness | 30-120s | Ready state + liveness-classified managed pending > 0 (pass-through excluded — target state landing with bridge-client-control-protocol; routing queries excluded via the same classification — bridge-routing-protocol; today every pending entry counts) | `Ready` → `Failed` (pool may spawn replacement) |
 | **3** | Global Shutdown | 5-15s | Shutdown initiated | SIGTERM → SIGKILL, all → `Closed` |
 
 **State-Based Gating:**
@@ -113,6 +113,19 @@ Global Shutdown overrides all (highest priority)
   per-slot operation has not finished (ls-bridge-graceful-shutdown
   § Lifecycle Actor)
 
+**Routing Decision Deadline** (bridge-routing-protocol):
+- One deadline bounds an entire routing decision: the concurrent provider
+  fan-out and any bounded initialization waits inside it
+- **Duration**: implementation-defined, documented default in the
+  low-seconds class
+- On expiry the pending provider requests are cancelled
+  (`$/cancelRequest`) and their entries retired atomically with the
+  fallback answer; routing falls open to kakehashi-decided routing
+- Routing requests are excluded from Tier-2 liveness accounting (same
+  per-entry classification as pass-through): they carry their own
+  deadline, and a slow provider must never drive a `Ready` connection to
+  `Failed`
+
 **Writer-Idle Timeout** (within the applicable shutdown deadline):
 - **Duration**: 2s fixed
 - **Purpose**: Wait for writer loop to finish current operation before taking exclusive stdin access
@@ -162,6 +175,7 @@ Let implementation details determine which timeout wins.
 - **[ls-bridge-message-ordering](ls-bridge-message-ordering.md)**: Connection state machine (state-based timeout gating)
 - **[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)**: Per-request timeout *(Phase 3)*
 - **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Global shutdown timeout
+- **[bridge-routing-protocol](bridge-routing-protocol.md)**: Routing decision deadline; Tier-2 exclusion for routing queries
 
 ## Summary
 

@@ -431,3 +431,4 @@ The original priority order (for reference):
 - [concatenated-formatting-pipeline](concatenated-formatting-pipeline.md): Multi-server formatting via a sequential pipeline (`strategy: "concatenated"`)
 - [aggregation-priorities-wildcard](aggregation-priorities-wildcard.md): Ordered-allowlist semantics and the `"*"` element for `priorities` lists
 - [cross-layer-aggregation](cross-layer-aggregation.md): How native/host/virt layer results combine, one level above the per-target strategies defined here
+- [bridge-routing-protocol](bridge-routing-protocol.md): Routing-provider selection dispatches `preferred` (concurrent fan-out, priority fan-in) under a non-LSP method key
