@@ -53,7 +53,10 @@ pub(crate) fn supports_initial_workspace_folders(caps: &ServerCapabilities) -> b
 /// `supported == true` AND `changeNotifications` set to a value other than the
 /// explicit `false` (either `true` or a registration id string). Anything
 /// missing or `Left(false)` means the server will not act on folder-change
-/// notifications, so the bridge must keep it on per-root instances.
+/// notifications, so the bridge diverts new, unserved marker roots to
+/// per-root instances — roots the connection already serves (its spawn root,
+/// and initialize-listed folders under `supported == true`) and marker-less
+/// riders stay on the shared connection (`incapable_shared_serves`).
 pub(crate) fn supports_workspace_folder_changes(caps: &ServerCapabilities) -> bool {
     let Some(folders) = caps
         .workspace
