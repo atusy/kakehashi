@@ -222,8 +222,12 @@ control-protocol failures; bridged LSP requests keep their existing
 | `connectionLost` | the connection died after the inner request was forwarded |
 | `methodDenied` | inner method is on the deny list |
 
-The bridge never queues or waits on behalf of a control call: a slot that is
-not `running` fails fast with the reasons above.
+The bridge never parks a call to wait for a status change: pass-through and
+inspection requests against a slot that is not `running` fail fast with the
+reasons above (`documents` answering `[]` for a `stopped` slot is the one
+deliberate exception). `stop` and `restart` do wait — but only on the
+shutdown and initialization handshakes they themselves initiate, never on a
+status change someone else must cause.
 
 `notify` never errors. It is forwarded while the slot is `starting` or
 `running` (the order queue already accepts notifications during
@@ -276,7 +280,11 @@ on Unix; immediate kill on Windows). In-flight and newly arriving operations
 fail per that decision's disposal policy. The result `null` is returned when
 the slot reaches `Closed`, whichever path got it there. `stop` on a
 `starting` slot is legal (`Initializing → Closing` is an existing transition)
-and likewise returns at `Closed`.
+and likewise returns at `Closed`. `stop` on a `failed` slot skips the LSP
+handshake — the `Failed → Closed` bypass ls-bridge-graceful-shutdown already
+defines — cleans up the process, and records the stopped entry: pinning a
+crash-looping slot before its next automatic respawn is a first-class use of
+this method, not an edge case.
 
 What is new is the **stopped set**: the pool records the `ConnectionKey` as
 explicitly stopped, and the normal routing path consults it — a `didOpen` (or
@@ -302,7 +310,8 @@ Two lifecycle rules keep the set coherent:
 
 ### `restart`: Same Key, Current Config, Derived Re-Open
 
-`restart` = graceful stop (if running) + clear the stopped entry + respawn the
+`restart` = the `stop` sequence above (with its per-status shortcuts; a no-op
+if the slot is already stopped) + clear the stopped entry + respawn the
 **same** `ConnectionKey` under the configuration current at that moment. The
 outer request resolves when the replacement reaches `Ready` (result `null`)
 or `Failed` (error `restartFailed`), bounded by the existing initialization
