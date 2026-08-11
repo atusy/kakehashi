@@ -506,15 +506,18 @@ structures with different lifetimes carry the outcome:
   fails *after* the route was decided — waiters proceed without the
   server, and later opens retry the retained key through the ordinary
   respawn path rather than falling through to a different resolution;
-  *not-applicable* settles when a server is rejected **before** any
-  acquire runs — a capability prefilter, configuration removal or
-  disablement, a generation-mismatch fallback dropping it — so no
-  entry can stay pending forever; and a decision that ends with no
-  answer does **not** settle entries keyless: each open task proceeds by kakehashi's own resolution, and
-  that ordinary acquire's commit settles *routed(key)* or
-  *retained(key)* exactly as above — every settled entry carries a key
-  or a suppression, so a lazy waiter can never resolve a different key
-  than the eager open landed on. Every settlement write is a
+  *not-applicable* settles when a server is genuinely rejected
+  **before** any acquire runs — a capability prefilter, or a
+  configuration removal/disablement that ends its candidacy — and is
+  consumed like a suppression (waiters proceed without the server;
+  distinct provenance in the logs). It is **not** the
+  generation-mismatch outcome: a mismatch whose server is still a
+  current candidate falls to ordinary resolution, whose acquire commit
+  settles *routed(key)*/*retained(key)* as usual, and a decision that
+  ends with no answer settles the same way — every settled entry
+  carries a key, a suppression, or a not-applicable, so a lazy waiter
+  can never resolve a different key than the eager open landed on, and
+  no entry stays pending forever. Every settlement write is a
   **compare-and-set against the exact pending (incarnation, flight) it
   settles**: a task outlived by a close/re-open finds the new
   incarnation's record and writes nothing. A lazy request-path open that finds a *pending* entry
@@ -587,7 +590,13 @@ Decision-cache lifecycle:
   captured at **first dispatch**, so provider-set churn before dispatch
   — a provider reaching `Ready` just before it — folds into the
   dispatch-time selection instead of invalidating a flight that never
-  dispatched.
+  dispatched. The epoch read and the provider-handle enumeration happen
+  in **one pool critical section**, so a provider cannot commit `Ready`
+  between them and land selected-under-E+1 while the flight anchors to
+  E. The driver re-verifies its exact pending (incarnation, flight) and
+  generation **before dispatching** — a close or reload landing before
+  its first scheduling cancels it without any provider I/O, and
+  `didClose`/teardown signal that cancellation directly.
   The answer is **applied and inserted only while the anchors hold**,
   with a mismatch handled by kind:
   - a **generation or epoch** move (the document is still the same
@@ -659,8 +668,19 @@ never an unbounded worker pile: a caller that cannot acquire pool
 capacity within its budget fails open without launching another orphan.
 Binding-*reuse* revalidation carries its own bound — the sweep's
 remaining budget on sweep paths, and a dedicated, implementation-defined
-validation budget on lazy-open and retained-key retry paths — with
-"exceeded" reading as not applicable for that attempt, warned.
+validation budget on lazy-open and retained-key retry paths (registered
+in ls-bridge-timeout-hierarchy) — and "exceeded" splits by caller: a
+lazy or retry attempt skips the server for that attempt, warned; the
+**sweep** reports the host **applicable-but-unsettled** — the barrier's
+fail-soft path — never a successful omission, because a bound key that
+merely timed out validating is uncertainty, not non-membership. Permit
+ownership makes the pool bound real: the semaphore permit travels
+**into** the blocking task and is released only when the OS call
+returns — a timed-out *waiter* abandoning the call must not free
+capacity for the next caller to hang another worker — so permanently
+hung calls can exhaust the pool for unrelated providers; that is the
+recorded failure mode (everything then fails open), and teardown never
+blocks on the pool.
 
 Because they carry no tier accounting, outstanding provider requests are
 cleaned up on **every terminal outcome of the decision**, not only
@@ -980,8 +1000,9 @@ a slot a routing provider left in play.
   releasing over a document the settling binding may yet restore; the
   ordinary lazy path re-opens later. One gate, not scattered
   per-call-site checks, and never an await under the ingress ticket.
-- The routing query is awaited inside the open task, before that task's
-  acquire, holding no pool lock; the acquire critical section
+- The dedicated driver owns the provider query; each open task only
+  awaits the shared decision future before its own acquire, holding no
+  pool lock while waiting; the acquire critical section
   re-validates the answer's config generation (discard on mismatch) and
   checks the stopped set for **both** retained keys — the target and the
   configuration-resolved one — alongside its existing control-registry
@@ -1023,10 +1044,15 @@ a slot a routing provider left in play.
   to run inside them.
 - The frame reader currently allocates the declared `Content-Length`
   before parsing anything, so the answer-size bound needs a
-  **framing-level ceiling on downstream message size** with defined
-  oversized-frame behavior — a transport hardening recorded here as an
-  implementation prerequisite of this protocol's allocation bound, not
-  a routing-handler check (which would run too late).
+  **framing-level ceiling on downstream message size** — a transport
+  hardening recorded here as an implementation prerequisite of this
+  protocol's allocation bound, not a routing-handler check (which
+  would run too late). Its disposition is chosen, not deferred: a
+  header declaring more than the ceiling is a **framing error and
+  fails the downstream connection**, never a drain (draining an
+  attacker-sized body can hang the reader) — the same fatal posture
+  every downstream framing violation already gets; the rule lands in
+  the reader's decision record alongside the implementation.
 - ls-bridge-timeout-hierarchy gains the routing decision deadline
   (registered beside the per-slot control shutdown timeout) and the
   Tier-2 exclusion note; that edit lands with this ADR.

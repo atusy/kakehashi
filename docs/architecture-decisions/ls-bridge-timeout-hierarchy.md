@@ -28,6 +28,7 @@ The async bridge architecture defines timeout systems across several decisions:
 4. **Per-Request Timeout** (ls-bridge-server-pool-coordination): Bounds user-facing latency for multi-server aggregation *[Phase 3 only]*
 5. **Per-Slot Control Shutdown Timeout** (bridge-client-control-protocol): Bounds a single-slot `stop`/`restart` (see the dedicated section below)
 6. **Routing Decision Deadline** (bridge-routing-protocol): Bounds one routing decision — provider fan-out plus initialization waits (see the dedicated section below)
+7. **Binding-Reuse Validation Budget** (bridge-routing-protocol): Bounds filesystem revalidation on binding-driven reuse paths — capped by the sweep's remaining budget on re-open sweeps, a dedicated implementation-defined budget on lazy-open/retry paths, and the global shutdown ceiling always
 
 ### The Problem
 
