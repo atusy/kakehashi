@@ -92,9 +92,9 @@ Configuration loading therefore rejects `languageServers` names containing
 
 **`status`** mirrors the connection state machine
 (ls-bridge-graceful-shutdown): `starting` = `Initializing` **or** an **active, unclaimed** pre-handle
-`Spawning` intent entry (an ordinary acquire's spawn commit before the
-child's handshake begins; once claimed into settling it reads
-`stopping`), `running` =
+`Spawning` intent entry — an ordinary acquire's spawn commit, or a
+restart's operation-only respawn phase, before the child's handshake
+begins (once claimed into settling it reads `stopping`), `running` =
 `Ready`, `stopping` = `Closing`, **or** a termination-pending record whose
 process termination is not yet confirmed (its handle may already be
 `Closed` or gone), **or** a settling `Spawning` entry or configured

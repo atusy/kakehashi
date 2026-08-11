@@ -439,7 +439,12 @@ enum LifecycleMsg {
     //   errors and simply retries later); a claim by
     //   stop/restart/teardown publishes the key's terminal state in
     //   the snapshot, resolving the wait to that state's ordinary
-    //   acquire error; reload DELETION removes the row instead, and the
+    //   acquire error; a reload that KEEPS the server but changes its
+    //   spawn-time configuration claims the superseded intent the same
+    //   way — producer settled per claim closure, the stale handle
+    //   never published — and resolves the receiver with the
+    //   superseded-configuration acquire error, on which the caller
+    //   simply re-acquires under the new generation; reload DELETION removes the row instead, and the
     //   removal itself notifies waiters of that (key, generation) with
     //   the deleted-server acquire error — the notification carries the
     //   terminal answer, so no row needs to remain. No pending reply
