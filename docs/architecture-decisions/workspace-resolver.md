@@ -176,9 +176,10 @@ async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
     they carry no marker root of their own. On an incapable connection that
     announcement is capability-gated away; the possibly out-of-workspace
     didOpen is an accepted, documented residual. A shared connection that came up **without**
-    `workspace.workspaceFolders.changeNotifications`
+    the full folder-change capability — `workspace.workspaceFolders.supported
+    == true` AND non-`false` `changeNotifications`
     (`supports_workspace_folder_changes`, static `InitializeResult` capabilities
-    only — no dynamic `client/registerCapability` tracking) cannot take on a new
+    only — no dynamic `client/registerCapability` tracking) — cannot take on a new
     root, so a marker-rooted document it does not already serve is **diverted to
     its own per-root process** (not dropped); marker-less documents are exempt —
     they bring no MARKER root the capability would be needed for, and their
