@@ -166,7 +166,10 @@ type ForwardResult =
 Exactly one of the two keys is present, and on the success branch `result`
 is always emitted — explicitly `null` when the downstream answered `null`,
 a routine LSP outcome (hover misses, empty definitions) — so an empty
-envelope can never masquerade as a null result.
+envelope can never masquerade as a null result. The guarantee is scoped to
+valid JSON-RPC responses: a downstream answer carrying both keys, neither
+key, or a malformed error object fails the outer request with
+`data.reason: "malformedResponse"` instead of being relayed.
 
 The JSON-RPC framing fields (`jsonrpc`, `id`) are stripped: the downstream
 `id` is a bridge-internal request id, unrelated to the caller's, and echoing
@@ -234,6 +237,7 @@ control-protocol failures; bridged LSP requests keep their existing
 | `restartFailed` | the `restart` respawn failed — at spawn (missing or unspawnable command) or during initialization |
 | `forwardFailed` | the inner message could not be handed to the connection (bounded writer full, send error); nothing was forwarded |
 | `connectionLost` | the connection died after the inner request was forwarded |
+| `malformedResponse` | the downstream answered with an invalid JSON-RPC response |
 | `methodDenied` | inner method is on the deny list |
 
 The bridge never parks a call to wait for a status change: pass-through and
@@ -266,9 +270,12 @@ type OpenDocument = {
 - `documents` returns the bridge-managed open documents of the connection —
   virtual documents included, distinguished by `hostUri`. Documents opened
   via pass-through are invisible here (outside the managed domain, by the
-  boundary above). `documentSelector?: DocumentSelector` filters with
-  standard LSP `DocumentSelector` semantics against the downstream-facing
-  `uri`/`languageId`; omitted or `null` returns all. A `stopped` slot holds
+  boundary above). `documentSelector?: DocumentSelector` filters against the
+  downstream-facing `uri`/`languageId`, accepting the text-document filter
+  forms (`language`/`scheme`/`pattern`, absolute-glob semantics); notebook
+  filters and relative patterns need notebook or base-URI context the
+  bridge does not hold for virtual documents and are rejected with
+  `InvalidParams`. Omitted or `null` returns all. A `stopped` slot holds
   nothing open, so it answers `[]`.
 - `serverInfo` returns the `serverInfo` field of the downstream's initialize
   result. `null` means exactly one thing — the downstream omitted the
@@ -348,9 +355,15 @@ or fails (error `restartFailed`), bounded by the existing initialization
 timeout (ls-bridge-timeout-hierarchy). `restartFailed` covers every failure
 shape — a spawn that dies before a handle exists (missing binary, invalid
 or unspawnable current configuration) as much as a handle that reaches
-`Failed` — with the underlying cause in the error message. On any failure
-the stopped entry stays cleared, so the ordinary acquire-driven respawn
-path still applies to the slot.
+`Failed` — with the underlying cause in the error message. The slot's id
+must survive either way: a failure that reached `Failed` leaves the handle
+pool-resident (enumerable as `failed`, healed by the ordinary
+acquire-driven respawn), while a failure that never produced a handle
+**re-installs the stopped entry** — the id stays enumerable as `stopped`
+and a later `restart` retries. Without that retryable tombstone, a
+pre-handle failure would leave no live, stopped, or control-registry owner
+for the key, the slot would vanish from enumeration, and retry would
+answer `unknownClient`.
 
 Neither `stop` nor `restart` is abortable mid-mutation: a `$/cancelRequest`
 for the outer request may fail it with `RequestCancelled`, but the
@@ -390,7 +403,11 @@ half-stopped or release the guard midway.
   existing add-only acquire path
   (`workspace/didChangeWorkspaceFolders` per
   ls-bridge-server-pool-coordination) as roots re-acquire the shared
-  connection — derive, don't remember, applied to folders. If the
+  connection — derive, don't remember, applied to folders. In a
+  workspace-less session (initialize carried neither `rootUri` nor
+  `workspaceFolders`), the replacement spawns rootless with an empty folder
+  seed — the same shape no-workspace sessions already give fresh spawns —
+  and folders join as marker roots acquire it. If the
   replacement no longer advertises workspace-folder change support,
   pool-coordination's existing capability fallback applies: subsequent
   acquires degrade to per-root connections and the restarted shared slot
@@ -560,9 +577,23 @@ namespace.
   only after the enqueue leaves a window where an already-latched cancel is
   lost and the unbounded request it was the only escape from survives.
 - Excluding pass-through from Tier-2 liveness needs a per-entry
-  classification on the response router's pending map — expiry today
-  counts every non-cancelled pending entry, so an unclassified slow
-  pass-through would still fail the connection.
+  classification on the response router's pending map, and the
+  classification must govern the whole accounting lifecycle — the 0→1
+  transition that arms the timer, epoch advancement, and the →0 stop — not
+  just expiry filtering. Today every pending entry counts, so an
+  unclassified slow pass-through would still fail the connection, and a
+  raw-only entry could equally prevent a later managed request from arming
+  liveness at all.
+- The router must return a typed, provenance-bearing outcome: today
+  downstream responses and locally synthesized failures travel the same
+  raw-JSON channel, but the envelope contract needs to tell "the
+  downstream's error, verbatim" apart from bridge-synthesized
+  `connectionLost`/`forwardFailed`.
+- Forwarding "verbatim" includes params omission: the existing typed
+  message builders always serialize a `params` field, so pass-through
+  needs a raw builder that preserves an absent inner `params` instead of
+  normalizing it to `null` (a shape JSON-RPC does not permit and some
+  servers reject).
 - Server-name validation is the first key validation `languageServers` gets —
   none exists today. A name containing `@` or `#` is rejected with a
   user-facing notice and the entry is never spawned, matching the
