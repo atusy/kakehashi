@@ -380,9 +380,11 @@ inside the insertion critical section, **serialized with settings
 publication** — a reload that superseded the snapshot forces a re-read, and
 because publication and insertion are mutually ordered, no window remains
 where a newer generation publishes between validation and insertion. The
-outer request resolves when the replacement reaches `Ready` (result `null`)
-or fails (error `restartFailed`), bounded by the existing initialization
-timeout (ls-bridge-timeout-hierarchy). Success is linearized with registry
+outer request resolves with `null` only after the replacement has reached
+`Ready` *and* the registry-release verification below has confirmed it —
+reaching `Ready` is necessary, not sufficient — or fails (error
+`restartFailed`), bounded by the existing initialization timeout
+(ls-bridge-timeout-hierarchy). Success is linearized with registry
 release: releasing the control registry atomically verifies that the exact
 replacement is still pool-resident and `Ready`, and only then returns
 `null` — if a reload removed it in the gap, the operation applies the
