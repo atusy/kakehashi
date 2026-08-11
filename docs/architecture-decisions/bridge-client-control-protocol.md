@@ -573,9 +573,9 @@ and their waits (ls-bridge-graceful-shutdown § Unconfirmed termination).
   caller's own risk.
 - **A shared instance re-seeds; nothing is remembered** — with one
   recorded exception: a document's active route binding
-  (bridge-routing-protocol) retains the effective canonical folders of
-  every bound shared route (override folders or the ordinarily resolved
-  root recorded at open), and — provided the replacement still supports
+  (bridge-routing-protocol) retains the effective folders of every
+  bound shared route (canonical override folders, or ordinarily
+  resolved roots kept verbatim), and — provided the replacement still supports
   workspace folders — the re-open sweep re-adds and announces them
   before that document's `didOpen`; a replacement the capability
   fallback downgraded gets neither, and the bound route reads not

@@ -514,8 +514,10 @@ structures with different lifetimes carry the outcome:
   canonicalization, no directory requirement, no decision-budget
   charge, and reuse compares it verbatim (a canonical filesystem
   identity beside it is an optional hardening, not a requirement) —
-  so a fallback decision needs no filesystem work at all and non-`file:`
-  client roots remain representable. Retaining the folder for
+  so a fallback decision needs no override-style validation or
+  canonicalization (the marker walk's own metadata reads are the
+  ordinary cost it always had) and non-`file:` client roots remain
+  representable. Retaining the folder for
   non-override shared routes too is what gives a restarted shared
   replacement a folder source for every bound document; live resolution
   serves only tuples with no binding. The pending binding record is
