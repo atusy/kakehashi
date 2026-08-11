@@ -381,200 +381,126 @@ This is a deliberate behavior change to the normal path: without it, the next
 keystroke in a matching document would resurrect the server and `stop` would
 be advisory. `stop` on an already-stopped slot returns `null` (idempotent).
 
-Three lifecycle rules keep the set coherent:
+Three lifecycle rules keep the set coherent, and all three are
+consequences of the pool's **lifecycle actor**
+(ls-bridge-graceful-shutdown § Lifecycle Actor), which owns every
+lifecycle transition — stop, restart, spawn commit, teardown, tombstone
+and termination-pending bookkeeping — and processes them one message at a
+time:
 
-- **The pin shares the acquire path's critical section.** The stopped-set
-  check happens inside the same `connections` critical section where the
-  acquire path decides, removes, and spawns — an acquire cannot observe
-  "not stopped", lose the race to a committing `stop`, and spawn anyway.
-  The same in-section check covers the control-operation registry: an
-  acquire finding the key mid-`stop`/`restart` does not spawn, exactly as
-  for a stopped key. Without that fence, a reload purging the `Closing`
-  handle mid-operation would let an ordinary acquire see a map miss and
-  spawn beside the control operation's own replacement or tombstone.
-- **Control calls are single-flight per key.** `stop` and `restart` both
-  span a handshake and mutate the same entry, so the bridge serializes them:
-  a control call arriving while another is in flight on the same key fails
-  fast (`clientRestarting` during a restart; `clientNotReady` with
-  `data.status: "stopping"` during a stop) instead of interleaving into a
-  state where a slot is simultaneously live and stopped.
-- **The set is process-lifetime and config-checked.** A configuration reload
-  drops stopped entries whose server name no longer exists in
+- **Acquires cannot race a stop.** An existing `Ready` connection is used
+  lock-free, but *creating* one is a spawn-commit message: the actor
+  checks the stopped set — and any in-flight control operation or
+  teardown seal — in-queue, so an acquire can never observe "not
+  stopped", lose the race to a committing `stop`, and spawn beside a
+  tombstone. The two orders are the only orders.
+- **Control calls are single-flight per key** — as a consequence of the
+  queue, not of a guard: a second `stop`/`restart` for a key with an
+  operation in flight is simply the next message, answered from the key's
+  current state (`clientRestarting` during a restart; `clientNotReady`
+  with `data.status: "stopping"` during a stop) instead of interleaving
+  into a state where a slot is simultaneously live and stopped.
+- **The set is process-lifetime and config-checked.** A configuration
+  reload drops stopped entries whose server name no longer exists in
   `languageServers` — their ids then resolve as `unknownClient` — while
-  entries whose server survives the reload stay stopped. Reload is not a
-  control call, so it is not covered by single-flight; instead every
-  tombstone install and reinstall revalidates against the current
-  configuration inside the same critical section, under the same
-  settings-publication fence that replacement insertion uses — a deletion
-  cannot publish between the configuration check and the install. A `stop`
-  committing after a reload deleted its server installs no entry (the slot
-  is already gone and its id resolves `unknownClient`), never a stale one. Nothing is persisted across
-  kakehashi restarts.
+  entries whose server survives the reload stay stopped. Reload's
+  connection purges and the tombstone installs are both actor
+  transitions, mutually ordered by the queue: a `stop` committing after a
+  reload deleted its server installs no entry (the slot is already gone
+  and its id resolves `unknownClient`), never a stale one. Nothing is
+  persisted across kakehashi restarts.
 
 ### `restart`: Same Key, Current Config, Derived Re-Open
 
 `restart` = the `stop` *sequence* above (with its per-status shortcuts; a
 no-op if the slot is already stopped) — but **without installing a
 stopped entry**: the tombstone is `stop`'s artifact, and during a restart
-the control-registry ownership stands in for it, so no interval exists in
-which the slot reads `stopped` or errors `clientStopped` mid-restart. A
-pre-existing entry from an earlier `stop` is cleared atomically with
-acquiring that ownership. Then respawn the
+the key's in-flight operation state stands in for it, so no interval
+exists in which the slot reads `stopped` or errors `clientStopped`
+mid-restart. A pre-existing entry from an earlier `stop` is cleared in
+the same actor transition that begins the restart. Then respawn the
 **same** `ConnectionKey` under the configuration current at that moment —
-"that moment" being replacement insertion: generation revalidation happens
-inside the insertion critical section, **serialized with settings
-publication** — a reload that superseded the snapshot forces a re-read, and
-because publication and insertion are mutually ordered, no window remains
+"that moment" being the replacement-insertion transition: the actor
+re-reads the configuration generation there, and because reload's
+publication into the pool is itself an actor transition, no window exists
 where a newer generation publishes between validation and insertion. The
-outer request resolves with `null` only after the replacement has reached
-`Ready` *and* the registry-release verification below has confirmed it —
-reaching `Ready` is necessary, not sufficient — or fails (error
+outer request resolves with `null` only at the **completion transition**,
+where the actor verifies the exact replacement is still pool-resident and
+`Ready` — reaching `Ready` is necessary, not sufficient — or fails (error
 `restartFailed`), bounded by the existing initialization timeout
-(ls-bridge-timeout-hierarchy). Success is linearized with registry
-release: releasing the control registry atomically verifies that the exact
-replacement is still pool-resident and `Ready`, and only then returns
-`null` — if a reload removed it in the gap, the operation applies the
-ownership recovery below instead of reporting success for a slot that no
-longer runs. `restartFailed` covers every failure
+(ls-bridge-timeout-hierarchy). `restartFailed` covers every failure
 shape — a spawn that dies before a handle exists (missing binary, invalid
 or unspawnable current configuration) as much as a handle that reaches
 `Failed` — with the underlying cause in the error message. The slot's id
-must survive either way: a failure that reached `Failed` leaves the handle
-pool-resident (enumerable as `failed`, healed by the ordinary
+must survive either way: a failure that reached `Failed` leaves the
+handle pool-resident (enumerable as `failed`, healed by the ordinary
 acquire-driven respawn), while a failure that never produced a handle
 **re-installs the stopped entry** — the id stays enumerable as `stopped`
-and a later `restart` retries. Re-installation obeys the same
-config-revalidation rule as any tombstone install: it happens only when
-the server name still exists in current configuration; if a reload
-deleted the server mid-restart, no entry is installed and the id resolves
-`unknownClient`. Recovery is decided by **pool ownership at completion**,
-which also covers a replacement a reload removed while still
-`Initializing` — the interrupted handshake commits no `Failed` handle, so
-a control operation finding its key unowned at completion installs the
-fenced tombstone when the server is still configured, and only a deleted
-server dissolves the id into `unknownClient`; a still-configured id never
-silently disappears. Without that retryable tombstone, a
-pre-handle failure would leave no live, stopped, or control-registry owner
-for the key, the slot would vanish from enumeration, and retry would
-answer `unknownClient`.
+and a later `restart` retries — under the same config-revalidation rule
+as any tombstone install (a server deleted mid-restart dissolves the id
+into `unknownClient` instead). Recovery is decided by **pool ownership at
+the completion transition**, which also covers a replacement a reload
+removed while still `Initializing`: a still-configured id never silently
+disappears.
 
-Neither `stop` nor `restart` is abortable mid-mutation: a `$/cancelRequest`
-for the outer request may fail it with `RequestCancelled`, but the
-operation itself runs to completion detached, and the single-flight guard
-releases only when it finishes — a dropped handler can never leave a slot
-half-stopped or release the guard midway. Pool-wide shutdown does not wait
-behind them either: global teardown takes ownership of in-flight control
-operations, cancels them **cooperatively at their next commit point**,
-joins them concurrently with its escalation phase, and hard-aborts at the
-producer cutoff (the graceful deadline) **every task still alive there**,
-wherever it wedged relative to its commit points — closing the process
-registry so the escalation reserve kills a closed set — after which
-router cleanup may run, never before the tasks are gone
-(ls-bridge-timeout-hierarchy § Per-Slot Control Shutdown). A wedged
-per-slot `stop` can therefore neither stall teardown, nor outlive it, nor
-mutate pool state after cleanup; the outer control request then fails per
-the disposal policy.
+Neither `stop` nor `restart` is abortable mid-mutation: a
+`$/cancelRequest` for the outer request may fail it with
+`RequestCancelled`, but the operation runs to completion as the key's
+state machine inside the lifecycle actor — a dropped handler drops only
+its reply channel, never the operation. Pool-wide shutdown does not wait
+behind them either: `Teardown` is a message on the same queue, ordered
+against every control transition by construction; the teardown state
+machine advances or settles in-flight operations, awaits or abandons
+their sub-tasks (handshakes, kills, waits) within the deadline, and the
+escalation reserve covers every process the actor's state records. A
+wedged per-slot `stop` can therefore neither stall teardown, nor outlive
+it, nor mutate pool state after cleanup; the outer control request then
+fails per the disposal policy (ls-bridge-timeout-hierarchy § Per-Slot
+Control Shutdown).
 
-"Commit point" is a defined term, and the abort-safety above rests on it:
-the control protocol's **own** state effects happen only inside pool-lock
-critical sections — the tombstone install/remove, the ARM, the
-replacement insertion (with its generation revalidation), and the registry
-release with its ownership verification. Effects the operation makes
-through *existing pool primitives* — connection-state transitions,
-liveness accounting, response-router disposal, process registration, the
-purge of per-document state, the panic-count clear — are delegated to
-those primitives, each of which must itself be abort-safe or run inside a
-commit point; in particular, purge paths that today await while holding
-`connections` must be restructured to this discipline before `restart`
-may adopt them. That is an implementation precondition of this protocol,
-recorded here. Each completed primitive effect counts as a **recorded
-commit**: recovery derives from the last recorded commit — protocol
-commit point or primitive effect alike — so the finalizer inspects the
-actual pool state it finds rather than replaying a script. Between
-commit points and primitive calls the task holds no pool locks and
-touches no shared state other than the processes it owns, whose kill
-handles are registered **atomically at acquisition** — at spawn for a
-new process, at reclaim for a pre-existing writer or process — so no
-abort window exists between owning a process and having it on record.
-Registration is the synchronous placement of the lease with the central
-owner-map; the task then holds it as a transfer from the map
-(ls-bridge-graceful-shutdown), so ownership stays unambiguous even
-across an asynchronous revocation handshake. A
-handle in flight through a channel (the writer's stdin handoff) travels
-as a **pre-registered RAII wrapper**: an aborted receiver drops the
-wrapper and the process returns to the registry instead of vanishing
-into a channel buffer. A commit point's
-critical section contains **no suspension point** — it runs synchronously
-under the pool lock — which is what makes a Tokio hard-cancel atomic with
-respect to it. Cancellation is observed on entry to each commit point; a
-cancel — cooperative or hard — landing between commit points leaves
-shared state exactly as the last commit point left it. Because a
-terminated task can no longer run its own recovery, **teardown owns a
-finalizer backed by a durable record of every adopted operation** —
-independent of the task's JoinHandle, so a panic already reaped by the
-graceful join phase is still on file. The finalizer runs for every
-non-normal terminal outcome — hard abort, cooperative cancellation short
-of completion, or panic — applying the ownership-at-completion rule on
-the operation's behalf and settling the ARM state, tombstone,
-replacement, and registry entries to whatever the last recorded commit
-implies. The durable record also tracks **every process the operation
-owns at any moment** — the pre-existing process whose writer a `stop`
-reclaimed as much as a newly spawned replacement — so an interrupted
-stop phase cannot leak a half-shut-down server that a reload has already
-dropped from the pool snapshot. Process termination has **exactly one
-owner at a time**: outside teardown the finalizer terminates the
-record's processes itself, bounded by the per-slot shutdown timeout
-(SIGTERM → SIGKILL). A child whose **termination is unconfirmed** at the
-deadline — confirmation means exactly that `Child::wait` returned
-`Ok(ExitStatus)`, the one primitive that both observes and reaps; an
-`Err` confirms nothing and the record retries the `wait` with logged,
-bounded backoff, staying fenced however long it fails — the long-term
-posture is operator-visible fencing (the slot enumerates `stopping`),
-never a silent promotion or a hot loop; SIGKILL delivery likewise proves
-nothing — never settles as closed: `stop` settles `stopFailed`,
-`restart` settles `restartFailed`, and the key converts to a pool-owned
-**termination-pending record** that retains the kill handle, enumerates
-as `stopping`, blocks acquires and further control calls
-(`clientNotReady`), survives reload purges, joins teardown, and converts
-to the fenced retry tombstone only when `wait` returns `Ok` (an `Err`
-retains and retries the fenced record). A replacement
-must never spawn while the old process may still hold locks or sockets,
-and a later `restart` must never clear a tombstone that does not exist
-yet; a background task drives the pending `wait`s. This
+The abort-safety story is short because the actor makes it so: **all
+lifecycle state effects happen inside the actor's message handling, which
+is serialized and non-suspending per message.** Sub-tasks own only a
+process handle and a reply channel — the writer's stdin handoff travels
+inside such a sub-task, so an aborted receiver returns the process to the
+actor as a completion message rather than losing it into a channel
+buffer — and a sub-task that dies (panic, cancellation, crash) is
+observed via the actor's `JoinSet` and settled like any other completion:
+the actor applies the ownership-at-completion rule to its own state
+entry, settles the tombstone/ARM/replacement records, and **answers the
+outer result channel exactly once**. `stop` answers `null` when the slot
+verifiably reached `Closed` — with its tombstone installed, or with the
+tombstone legitimately omitted because a reload deleted the server
+(closure is what `stop` promises; the tombstone is bookkeeping) — and
+otherwise `RequestFailed` with `data.reason: "stopFailed"`; `restart`
+answers `null` only after the verified-Ready completion transition and
+`restartFailed` short of it. A panicking sub-task can therefore never
+leave the caller pending, kill a committed replacement, or misreport
+success. One implementation precondition transfers unchanged from the
+earlier lock-based design: purge paths that today await while holding
+`connections` must move into actor transitions (or lose the await) before
+`restart` may adopt them.
+
+Process termination has **exactly one owner: the actor.** Confirmation
+means exactly that `Child::wait` returned `Ok(ExitStatus)` — the one
+primitive that both observes and reaps; SIGKILL delivery proves nothing,
+and a `wait` `Err` retries with logged, bounded backoff, staying fenced
+however long it fails (operator-visible as `stopping`, never a silent
+promotion or a hot loop). A child whose termination is unconfirmed at the
+per-slot deadline never settles as closed: `stop` settles `stopFailed`,
+`restart` settles `restartFailed`, and the key converts to a
+**termination-pending record** in the actor's state that retains the kill
+handle, enumerates as `stopping`, blocks acquires and further control
+calls (`clientNotReady`), survives reload purges, and converts to the
+fenced retry tombstone only when `wait` returns `Ok`; a background
+sub-task drives the pending `wait`s. A replacement must never spawn while
+the old process may still hold locks or sockets, and a later `restart`
+must never clear a tombstone that does not exist yet. This
 never-`Closed`-while-unconfirmed rule is a **steady-state** invariant;
-global teardown's final deadline disposes by mode instead: on the
-process-exit path it logs and abandons the child to the OS, while a
-shutdown-request teardown that leaves the server alive awaiting `exit`
-atomically returns unresolved records to the pool with their waits
-restarted (ls-bridge-graceful-shutdown § Unconfirmed termination). During teardown the termination
-obligation transfers with the
-live process registry to the escalation phase, and finalization settles
-**records and pool state only** — no two paths ever kill or reap one
-child. Settlement itself is idempotent by construction (it inspects the
-state it finds), so record claims are revocable: a claim abandoned by an
-interrupted finalizer reverts and settlement re-runs; exactly-once is an
-optimization, not a correctness requirement. Settlement also includes
-the **outer result channel**: a finalized operation settles its pending
-`stop`/`restart` response exactly once, answering what the last recorded
-commit implies. `stop` answers `null` when the slot verifiably reached
-`Closed` — with its tombstone installed, or with the tombstone
-legitimately omitted because a reload deleted the server (closure is
-what `stop` promises; the tombstone is bookkeeping) — and otherwise
-`RequestFailed` with `data.reason: "stopFailed"`. `restart`'s success
-commit — the verified-Ready registry release — **atomically transfers
-the replacement's process ownership to the pool and records the `null`
-result**, so a failure after that commit settles `null` and the
-finalizer touches no process; anything short of it settles
-`restartFailed`. A panicking detached task can therefore never leave the
-caller pending, kill a committed replacement, or misreport a success. The record's
-owner runs during **normal service**, not only at teardown: a pool-owned
-control-task reaper observes each detached operation's terminal outcome
-as it happens and finalizes abnormal exits immediately — without it, a
-panicking detached `restart` would leave the single-flight guard, ARM
-state, and tombstone stuck until shutdown. Teardown's seal atomically
-**quiesces the reaper** — no new finalization may start past the seal —
-and takes over in-progress finalizations; those run as teardown's own
-lock-bounded settlement work, never inside the abortable task set.
+global teardown's final deadline disposes by mode instead — the
+process-exit path logs and abandons the child to the OS, while a
+shutdown-request teardown that leaves the server alive keeps the records
+and their waits (ls-bridge-graceful-shutdown § Unconfirmed termination).
 
 - **Process-level configuration applies.** `command`, `args`,
   `initializationOptions`, settings — whatever the config says *now* is what
@@ -594,7 +520,7 @@ lock-bounded settlement work, never inside the abortable task set.
   routes wait on the re-open barrier (execute-command-routing-token, fail-soft
   if unsettled); other request paths open their own documents and do not
   wait. Restoration is therefore an observable catch-up window: `restart`
-  resolves at verified `Ready` (the ownership check above), the re-open
+  resolves at verified `Ready` (the completion transition above), the re-open
   sweep runs after it, `documents` may
   briefly under-report, and a pass-through request racing the sweep is —
   like all pass-through — the caller's own risk.
@@ -718,9 +644,10 @@ namespace.
   (mirroring node-reference-protocol's goal for the syntax tree).
 - Nearly every mechanism is reuse: `ConnectionKey` routing,
   `forward_cancel_downstream`, the graceful-shutdown state machine, the
-  ARM/CLAIM derived re-open. The genuinely new state is the stopped set, the
-  per-connection shutdown timeout, the in-flight pass-through id map, the
-  per-handle `serverInfo`, the per-key control-operation registry, the
+  ARM/CLAIM derived re-open. The genuinely new state is the **lifecycle
+  actor** and what it owns (the stopped set, termination-pending records,
+  per-key operation state, the per-connection shutdown timeout), plus the
+  in-flight pass-through id map, the per-handle `serverInfo`, the
   liveness classification on router pending entries, and the deny list.
 - Held ids survive restarts, so tooling built on the protocol needs no
   re-enumeration choreography.
@@ -735,9 +662,10 @@ namespace.
   document until restarted. This is the requested semantic, but it is a
   footgun for a user who forgets a `stop`; the enumeration's
   `status: "stopped"` is the only breadcrumb.
-- The stopped-set check rides the normal acquire path — one map lookup per
-  spawn decision, but a new coupling between the control protocol and the hot
-  path.
+- Spawn commits route through the lifecycle actor — one message round trip
+  per spawn decision, but a new coupling between the control protocol and
+  the acquire path (existing `Ready` connections stay lock-free, so the
+  steady-state hot path is untouched).
 - The id is contractually opaque, yet its rendering is legible and users will
   inevitably parse it (Hyrum's law). Changing the `Display` format later will
   break such clients — documented as unsupported, not prevented.
@@ -768,39 +696,35 @@ namespace.
   `kakehashi/node*` pattern; handlers live under
   `src/lsp/lsp_impl/kakehashi/bridge/client/`.
 - Id resolution: render each live pool key, termination-pending-record
-  key, stopped-set key, and control-operation-registry key with
-  `ConnectionKey`'s `Display` and compare for exact equality with the
-  supplied id; no parsing. Owner precedence for enumeration is live >
-  termination-pending (`stopping`) > stopped > control registry. The registry
-  matters during the restart window, when the stopped entry is already
-  cleared and no handle exists yet — the registry is the key's only owner
-  then, so without it the slot would vanish from enumeration and calls
-  would answer `unknownClient` instead of `clientRestarting`. A
-  registry-only key enumerates by its registered operation *phase* —
-  `stopping` for an in-flight `stop` **and for a restart still in its
-  stop phase** (a reload can purge the `Closing` handle, leaving the
-  registry as sole owner in either case), `starting` once a restart's
-  respawn has begun. When a key has several owners, precedence is live handle >
-  termination-pending record (`stopping`) > stopped set > control
-  registry, deduplicated to one row — a `Closed` handle awaiting removal
-  is ignored and falls through that same order, so a termination-pending
-  record answers `stopping` first and only then does the registry's
-  operation supply the status (`Closed` deliberately has no
-  `Client.status` of its own).
-- The stopped set lives beside the pool's per-connection maps, keyed by
-  `ConnectionKey`; the acquire path checks it — together with the
-  control-operation registry and the termination-pending records —
-  inside the same critical section, before any spawn decision.
+  key, stopped-set key, and in-flight-operation key with `ConnectionKey`'s
+  `Display` and compare for exact equality with the supplied id; no
+  parsing. The last three all live in the lifecycle actor's state, read
+  through a snapshot it publishes atomically per transition. Owner
+  precedence for enumeration is live handle > termination-pending record
+  (`stopping`) > stopped set > in-flight operation, deduplicated to one
+  row — a `Closed` handle awaiting removal is ignored and falls through
+  that same order (`Closed` deliberately has no `Client.status` of its
+  own). The in-flight-operation entry matters during the restart window,
+  when the stopped entry is already cleared and no handle exists yet: it
+  is the key's only owner then, so without it the slot would vanish from
+  enumeration and calls would answer `unknownClient` instead of
+  `clientRestarting`. An operation-only key enumerates by its phase —
+  `stopping` for an in-flight `stop` and for a restart still in its stop
+  phase (a reload can purge the `Closing` handle, leaving the operation
+  as sole owner in either case), `starting` once a restart's respawn has
+  begun. `ConnectionState` alone could never provide this: it exposes
+  only `Initializing`, which cannot distinguish a restart in flight from
+  an ordinary first spawn.
+- Acquire keeps using existing `Ready` connections lock-free; the
+  spawn-commit path becomes a lifecycle-actor message, where the stopped
+  set, termination-pending records, in-flight operations, and teardown
+  sealing are all checked in-queue.
 - `restart` clears the slot's entry in `consecutive_panic_counts` before
   respawning; `stop` drives `force_kill_with_escalation` from a new
   per-connection timeout rather than the pool-wide teardown path.
 - `serverInfo` needs new per-handle state: the handshake currently retains
   only `ServerCapabilities`, so the initialize result's `serverInfo` must be
   parsed and stored on the connection handle.
-- Single-flight and `clientRestarting` need a per-key control-operation
-  registry: the stopped entry is cleared before the respawn begins and
-  `ConnectionState` exposes only `Initializing`, so nothing existing
-  distinguishes a restart in flight from an ordinary first spawn.
 - Pass-through cancellation reuses `forward_cancel_downstream` keyed by
   `(ConnectionKey, downstream id)`. As in the formatting pipeline, the
   handler itself records the downstream id it minted for each in-flight
@@ -846,4 +770,5 @@ namespace.
 | **Cancellation** | Outer `$/cancelRequest` forwarded to the inner downstream request; outer fails `RequestCancelled`; no bridge-imposed timeout, no Tier-2 liveness accounting |
 | **`stop`** | Graceful handshake when `running` (init-abort when `starting`, handshake bypass when `failed`), bounded by a new per-connection timeout, then forced escalation; stopped set pins the slot until explicit `restart`; single-flight per key |
 | **`restart`** | Same key, current process-level config, no re-key; derived re-open (ARM/CLAIM); resolves only after the `Ready` replacement is verified pool-resident, else `restartFailed`; clears the panic count |
+| **Lifecycle control** | Every lifecycle transition serializes through the pool's lifecycle actor (ls-bridge-graceful-shutdown § Lifecycle Actor); single-flight, acquire fencing, and abort-safety are consequences of the queue |
 | **Discovery** | Announced as `capabilities.experimental.kakehashi.bridgeClient: true` |

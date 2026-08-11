@@ -246,239 +246,96 @@ All connections shut down in parallel under a single global ceiling. This is int
 - Fast servers don't wait for slow servers to time out
 - Simplicity: No complex budget-splitting logic
 
-**Timeout Application:**
+**Timeout Application**: see § Lifecycle Actor below — the deadline and the
+escalation reserve are owned by the actor's teardown state machine.
+
+### Lifecycle Actor: All Lifecycle Transitions Serialize
+
+**Decision**: one pool-owned **lifecycle actor** owns every lifecycle
+transition — per-slot `stop`/`restart` (bridge-client-control-protocol),
+pool teardown, spawn commits, respawn decisions, tombstones, and
+termination-pending records. Callers send messages and await replies;
+nothing else mutates lifecycle state.
+
+This replaces the lock-based concurrent design an earlier revision of this
+section specified (see Alternative 4): instead of *handling* the races
+between stop, restart, teardown, reload, and acquire with dedicated
+machinery, serialization **removes** them by construction.
+
+**The actor loop never blocks.** Long operations — the LSP shutdown
+handshake, SIGTERM/SIGKILL escalation, `Child::wait` — run as spawned
+sub-tasks that own only a process handle and a reply channel and touch no
+shared state; each completion comes back to the actor as a message. A
+multi-step operation (`restart` = stop phase → respawn → verify) is a
+small per-key state machine advanced by those messages, so every state
+mutation is atomic at message granularity and there is no lock to hold,
+tear, or lease.
+
+What the previous machinery bought, the actor gives structurally:
+
+- **Single-flight per key** — two control calls for one key are two queued
+  messages; the second is answered from the key's current state
+  (`clientRestarting`, `clientNotReady`, …). No registry, no guard to
+  release, no half-mutated slot for a dropped handler to leave behind.
+- **No lease-owner map** — the actor is the only entity that signals or
+  waits a process. Sub-tasks it spawns are the delegation, tracked in its
+  own `JoinSet`; a "revoked claim" is just the actor not caring about a
+  stale reply message.
+- **Spawn commit is an actor transition** — the acquire path may use an
+  existing `Ready` connection lock-free, but *creating* one goes through
+  the actor, which checks the stopped set, termination-pending records,
+  and teardown sealing in-queue. An acquire can never race a committing
+  `stop` into spawning beside a tombstone.
+- **Teardown is a message** — `Teardown(mode)` seals admission (the actor
+  simply stops accepting spawn/control transitions), snapshots its own
+  state, and drives the parallel per-connection shutdowns as sub-tasks
+  under the absolute deadline (escalation reserve: ~20%,
+  ls-bridge-timeout-hierarchy). A second `Teardown` upgrades the mode
+  monotonically (`ProcessExit` dominates); every caller awaits one shared
+  completion watch, published only after cleanup.
+- **Abnormal outcomes settle in one place** — the actor observes its
+  sub-task `JoinSet`; a panicked or cancelled operation is a completion
+  message like any other, and the actor applies the
+  ownership-at-completion rules (bridge-client-control-protocol) to its
+  own state entry: settle the tombstone/ARM/replacement records, answer
+  the outer request (`stopFailed`/`restartFailed`), keep or convert the
+  termination-pending record. The actor task itself runs under the pool's
+  supervisor: if it panics, the supervisor restarts it and the new
+  incarnation re-derives from pool state and its mailbox — the same
+  derive-don't-remember posture as respawn-reopen-derives-its-targets.
+
+**Sketch** (illustrative, target design):
+
 ```rust
 enum ShutdownMode {
     ProcessExit,   // exit notification / signal path: kakehashi is ending
     ServerRemains, // LSP shutdown request: server stays alive awaiting exit
 }
-// Teardown is a SHARED single-flight operation: concurrent callers join
-// the same run rather than returning early; the effective mode upgrades
-// monotonically (ProcessExit dominates ServerRemains, even mid-run), and
-// every caller joins completion before proceeding — an exit path racing
-// an in-progress ServerRemains teardown cannot terminate around it.
 
-async fn shutdown_all_connections(pool: Arc<ConnectionPool>, mode: ShutdownMode) {
-    // Capture the prospective ceiling BEFORE any coordination, so the
-    // starter's deadlines are anchored ahead of lock traffic; the gap
-    // is the escalation reserve (ls-bridge-timeout-hierarchy: ~20%).
-    let now = Instant::now();
+enum LifecycleMsg {
+    Stop { key: ConnectionKey, reply: Reply },
+    Restart { key: ConnectionKey, reply: Reply },
+    CommitSpawn { key: ConnectionKey, reply: Reply },   // acquire's spawn path
+    Teardown { mode: ShutdownMode, done: WatchTx },
+    SubTaskDone { key: ConnectionKey, outcome: Outcome }, // handshake/kill/wait results
+    DeadlineExpired { token: DeadlineToken },
+}
 
-    // join_or_start applies this caller's mode atomically (monotonic
-    // upgrade; ProcessExit dominates). The owner BODY (teardown_body,
-    // below) always runs in a POOL-OWNED task spawned by the first
-    // join_or_start — never inline in a caller's request future — so a
-    // cancelled or panicking caller cannot drop adopted tasks or
-    // process leases mid-teardown. The pool-owned task runs the body
-    // under a PANIC GUARD (supervisor). Everything the run adopts —
-    // control tasks, the process registry, snapshots, unresolved
-    // leases — lives in SUPERVISOR-OWNED storage on the TeardownRun,
-    // not in locals of the panic-catching future, so unwinding cannot
-    // drop it. On an owner panic the guard re-borrows that storage,
-    // aborts and joins the adopted tasks, recovers process leases,
-    // CONTINUES the deadline-bounded escalation for any recovered
-    // process still running (an owner can panic before or during the
-    // graceful phase), runs
-    // the same idempotent durable-record finalizer as any abnormal
-    // outcome (bridge-client-control-protocol: ARM, tombstone,
-    // replacement, and outer-result settlement), performs mode-aware
-    // disposition and cleanup, and only then publishes completion AS
-    // FAILED — joiners are released with ownership settled, never
-    // around it. Every caller, starter included, is a joiner:
-    let Joined { late_exit_claim, completion } =
-        pool.teardown_run().join_or_start(pool.clone(), mode, now);
-        // ^ the Arc handed over here becomes the spawned owner task's
-        //   pool handle — ownership transfer to the 'static spawn is
-        //   explicit, not borrowed
-
-    // If this caller's upgrade raced past an already-committed
-    // ServerRemains disposition, the same linearized call hands back
-    // the reinserted records for THIS caller to dispose (process::exit
-    // runs no destructors, so the Drop owner cannot be relied on
-    // there); completion is published only after cleanup, so an
-    // exiting caller can never terminate around it.
-    log_and_abandon(late_exit_claim);
-    if let Err(failure) = completion.await {
-        // Failed completion means the panic guard settled ownership and
-        // ran disposition/cleanup on the owner's behalf; surface it so
-        // a failed teardown is distinguishable from success.
-        log::error!("bridge teardown completed as failed: {failure}");
+async fn lifecycle_actor(pool: Arc<ConnectionPool>, mut rx: Receiver<LifecycleMsg>) {
+    let mut state = LifecycleState::default(); // slots, tombstones, pending waits, teardown
+    while let Some(msg) = rx.recv().await {
+        // Every arm is non-suspending state mutation plus sub-task spawns;
+        // long I/O never runs inside the loop.
+        state.step(msg, &pool);
     }
 }
-
-// The owner body, spawned once per run into a pool-owned task by
-// join_or_start (owned Arc — a 'static spawn cannot borrow the pool):
-async fn teardown_body(teardown: TeardownRun, pool: Arc<ConnectionPool>) {
-    let deadline = teardown.deadline;      // = starter's now + GLOBAL_TIMEOUT
-    let graceful_deadline = teardown.graceful_deadline;
-
-    // Gate ordinary admission: the pool-wide shutting_down flag stops
-    // acquires from spawning new connections from here on.
-    pool.mark_shutting_down();
-
-    // Seal control admission before any snapshot: no new per-slot
-    // stop/restart (bridge-client-control-protocol) may begin, ownership
-    // of in-flight control operations transfers to this teardown, and
-    // the seal blocks replacement insertion. Control operations register
-    // every process they spawn in the teardown-owned `control_procs`
-    // registry AT SPAWN TIME, so a restart crossing its spawn point can
-    // never lose its kill handle. Adoption SIGNALS cooperative
-    // cancellation immediately — the seal is the signal each task
-    // observes at its next commit point — so the graceful phase below
-    // doubles as the cooperative drain. `control_tasks` is a
-    // teardown-owned JoinSet living OUTSIDE the timed future below, so
-    // a timeout drops only the polling future, never the task handles;
-    // both phases poll the same set. `control_procs` is a LIVE registry
-    // with kill-on-register from this point on — a child spawned after
-    // any scan is killed at registration — and it closes only when the
-    // last control task terminates. It covers EVERY process a control
-    // operation owns — a pre-existing server whose writer a stop
-    // reclaimed as much as a fresh replacement. The seal also quiesces
-    // the normal-service reaper, takes over its in-progress
-    // finalizations as teardown-run settlement work OUTSIDE this
-    // abortable set (claims revocable, settlement idempotent), and
-    // TRANSFERS existing termination-pending records — kill handles and
-    // pending Child::wait futures from earlier stopFailed slots — into
-    // control_procs, so a child from a failed stop is inside the
-    // escalation set even though it is in neither the connection
-    // snapshot nor the task set.
-    // ALL ownership lives in the ONE supervisor-owned TeardownState —
-    // the body only borrows its fields, and every ownership-moving
-    // phase result below is stored back into it (with a phase marker)
-    // BEFORE the next panic point, so an unwind at any await can never
-    // be the sole owner of adopted tasks, leases, snapshots, or the
-    // post-close unresolved set.
-    let state = teardown.state();
-    state.adopt(seal_and_take_control_operations());
-
-    // Snapshot AFTER both gates: nothing can be inserted past them.
-    state.connections = pool.all_connections();
-
-    let graceful = tokio::time::timeout_at(graceful_deadline, async {
-        // Shutdown all connections in parallel (best-effort).
-        // shutdown_by_state is an atomic compare-transition: each arm
-        // commits its *→Closing transition conditionally (Failed →
-        // cleanup only, Initializing → terminate without LSP, Ready →
-        // full handshake), so a handshake that commits Ready between
-        // observe and act is shut down gracefully, never terminated
-        // without the handshake.
-        let tasks = state.connections.iter()
-            .map(|conn| conn.shutdown_by_state());
-
-        // Poll the supervisor-owned JoinSet alongside; the set itself
-        // outlives this future, so nothing detaches on timeout
-        join!(futures::future::join_all(tasks),
-              drain_join_set(&mut state.control_tasks));
-    }).await;
-
-    // Survivor handling runs CONCURRENTLY with escalation. PRODUCER
-    // CUTOFF: cancellation was signalled at adoption and the graceful
-    // phase was the cooperative drain, so EVERY task still alive at
-    // graceful_deadline — wedged before, between, or after commit
-    // points — is hard-aborted at the cutoff (not the final deadline),
-    // closing the process registry; the escalation reserve always kills
-    // a CLOSED set and a child registered near expiry cannot escape
-    // the escalation set (the kill attempt is what is guaranteed;
-    // confirmation remains the reaped wait). Hard-abort is safe by commit-point
-    // atomicity (bridge-client-control-protocol). Escalation covers the
-    // snapshot and every registered control process alike (no-op for
-    // connections already Closed; a control-owned key contributing both
-    // a Closing handle and its task is benign — shutdown_by_state on
-    // Closing/Closed is a compare-transition no-op). When the remaining
-    // budget is shorter than the normal SIGTERM grace, the grace is
-    // shortened or skipped.
-    // abort_survivors_and_finalize FINALIZES before returning: per
-    // bridge-client-control-protocol it runs settlement for EVERY
-    // non-normal terminal outcome (hard abort, cancellation short of
-    // completion, panic — even one already reaped by the graceful
-    // drain, via the durable operation record), settling ARM,
-    // tombstone, replacement, registry state, and the outer result
-    // channel to what the last recorded commit implies. During teardown
-    // settlement touches RECORDS AND POOL STATE ONLY — process
-    // termination belongs exclusively to the escalation arm via the
-    // live registry (single owner; no double kill/reap) — and it is
-    // synchronous lock-bounded work run by teardown itself, outside the
-    // abortable set, so the expired producer cutoff costs it nothing
-    // and revocable idempotent claims mean an interrupted finalizer
-    // never strands a record.
-    // Both escalation paths claim each process ATOMICALLY from ONE
-    // LIVE lease-owner map shared with the still-open registry — not a
-    // pre-filtered snapshot, which would race a control task reclaiming
-    // a snapshot lease after the filter. The map is the CENTRAL lease
-    // owner and SERIALIZES every signal/wait: a claimant operates only
-    // while holding the lease's operation lock, and revocation is
-    // REVOKE-AND-ACKNOWLEDGE — it cancels and joins the in-progress
-    // operation and receives the RAII lease back before the new owner
-    // may act, so a mid-flight SIGTERM or pending Child::wait is never
-    // preempted by a mere map edit. No process ever has two escalation
-    // owners. Acquisition places a lease with the central owner-map
-    // SYNCHRONOUSLY; the acquiring task holds it as a transfer from the
-    // map, so ownership is never ambiguous even if the task dies while
-    // an acknowledgement is pending — and a revoker awaits that
-    // acknowledgement with the owner-map lock RELEASED. The force arm
-    // writes survivors DIRECTLY into a supervisor-owned slot as it
-    // goes, before returning — the join! never owns them, so a panic in
-    // the other arm after the force arm finishes cannot drop them.
-    join!(
-        force_kill_remaining_until(
-            deadline,
-            teardown.lease_owners().claim_ordinary(&state.connections),
-            &state.control_procs,
-            &mut state.kill_unresolved, // direct writes, not a return value
-        ),
-        abort_survivors_and_finalize(&mut state.control_tasks, graceful_deadline),
-    );
-
-    // Both arms have joined: no control task is alive, so no RAII
-    // wrapper can hand a process back later. Only NOW close the live
-    // registry and take its final contents, and UNION them with the
-    // force arm's unresolved ordinary connections — either set alone
-    // drops survivors. The union deduplicates by **owned process
-    // lease** (the unique per-process token minted at acquisition), not
-    // by ConnectionKey: a control-owned process reachable through both
-    // a Closing handle and the registry carries one lease and appears
-    // once.
-    state.fold_registry_into_unresolved();
-    // ^ close_and_take plus the lease-keyed union happen IN PLACE inside
-    //   supervisor state (take-with-rollback-on-unwind): neither the
-    //   taken registry contents nor the union input is ever the sole
-    //   owner across a panic point.
-
-    // Disposition of children still unconfirmed (§ Unconfirmed
-    // termination) is ONE locked operation: it takes the mode-upgrade
-    // lock, reads the final effective mode, and commits the branch
-    // before releasing — no gap exists between reading the mode and
-    // acting on it. It is lock-bounded local work, running right after
-    // the ceiling rather than inside it. An exit upgrade arriving AFTER
-    // the commit receives the already-reinserted records back from
-    // join_or_start as its late-exit claim (the Joined arm above).
-    // dispose_locked_adopting ADOPTS the survivor set under its own
-    // lock BEFORE any panic-prone work, and the branch commits PER
-    // RECORD with an ownership checkpoint: an unwind mid-batch rolls
-    // back only records not yet published — a published lease/waiter is
-    // never duplicated, an uncommitted record never dropped.
-    teardown.dispose_locked_adopting(state, |final_mode, records| match final_mode {
-        ShutdownMode::ProcessExit  => log_and_abandon(records),
-        ShutdownMode::ServerRemains =>
-            pool.reinsert_termination_pending(records), // atomic; waits restarted
-    });
-
-    // Only now — every control task terminated, finalized, and the live
-    // process registry closed or handed back — may pool/router cleanup
-    // run. The invariant is scoped to ADOPTED CONTROL TASKS: none of
-    // them can mutate registries or tombstones after cleanup; the
-    // termination-pending registry and its background waiter
-    // deliberately survive it (ServerRemains) and keep converting
-    // records to tombstones as waits complete.
-    run_pool_and_router_cleanup();
-
-    // Completion is a SEPARATE state from the disposition commit and is
-    // published only here, after cleanup — a ProcessExit joiner
-    // awaiting it cannot call process::exit while the owner is still
-    // cleaning up.
-    teardown.publish_completion();
-}
 ```
+
+**Latency**: lifecycle transitions are rare, human-initiated events;
+serializing them costs nothing observable. The per-connection shutdown
+handshakes themselves still run in parallel as sub-tasks — the actor
+serializes *decisions*, not process I/O.
+
 
 ### Initialization Shutdown: Abort Immediately, No LSP Message
 
@@ -521,21 +378,21 @@ async fn shutdown_router(mode: ShutdownMode) {
     // 2. Fail all pending routing decisions
     fail_pending_routes();
 
-    // 3. Delegate to the canonical teardown (§ Shutdown Timeout Policy,
-    //    "Timeout Application"): owner/joiner arbitration, deadlines,
-    //    sealing and adoption, snapshot, graceful phase, escalation,
-    //    survivor union, and the locked disposition are exactly
-    //    shutdown_all_connections. Router-specific resource cleanup
-    //    runs inside the owner's cleanup step, BEFORE completion is
-    //    published, so a joiner cannot resume around it. Keeping one
-    //    canonical body is deliberate: two parallel sketches of this
-    //    sequence drifted repeatedly.
-    shutdown_all_connections(connection_pool.clone(), mode).await;
-    // No trailing cleanup here: run_pool_and_router_cleanup() inside the
-    // owner body is the single cleanup site, executed exactly once
-    // before completion publication.
+    // 3. Send Teardown(mode) to the lifecycle actor (§ Lifecycle Actor)
+    //    and await the shared completion watch. Mode upgrade, sealing,
+    //    the parallel per-connection shutdown sub-tasks, escalation
+    //    under the absolute deadline, survivor disposition, and cleanup
+    //    are all the actor's teardown state machine; router-specific
+    //    resource cleanup runs inside its cleanup step, BEFORE
+    //    completion is published, so no caller can resume around it.
+    lifecycle.teardown(mode).await;
 }
 ```
+
+The per-connection shutdowns themselves run in parallel as actor
+sub-tasks — the actor serializes the teardown *decisions* (mode, sealing,
+disposition), not the process I/O, so the O(1) wall-clock property below
+is unaffected.
 
 **Why Parallel:**
 - **Bounded total time**: N servers shut down in O(1) time, not O(N)
@@ -664,6 +521,40 @@ Skip synchronization, just send shutdown request whenever ready.
 
 **Why synchronization is essential**: Protocol correctness requires serialized stdin writes.
 
+### Alternative 4: Lock-Based Concurrent Lifecycle Control
+
+Let stop, restart, teardown, reload, and acquire run concurrently against
+shared pool state, and close each race with dedicated machinery. An
+earlier revision of this decision specified exactly that, and adversarial
+review drove it to its logical conclusion: a single-flight
+control-operation registry, a central lease-owner map with
+revoke-and-acknowledge handoff, supervisor-owned transactional teardown
+state with phase markers and rollback-on-unwind, a durable-record
+finalizer with an always-running reaper, kill-on-register live process
+registries, and owner/joiner teardown arbitration with monotonic mode
+upgrade.
+
+**Rejected Reasons:**
+
+1. **Mechanism per race, forever**: every closed interleaving exposed the
+   next one; ~20 review rounds added machinery without converging,
+   because the concurrency the machinery serves is the problem
+2. **Weight mismatch**: the races' blast radius (a transient zombie, a
+   redundant signal to a dead pid, a slot wedged until restart) never
+   justified database-grade ownership transactions
+3. **Foreign to the codebase**: kakehashi already solves this class with
+   actors (parse actor, writer task, response router); a lock-and-lease
+   subsystem would be the odd one out
+4. **Implementation distance**: none of it existed; an implementer would
+   be committed to the full lattice before the first feature shipped
+
+**Why the actor is better**: serialization removes the races instead of
+handling them; the observable contracts (single-flight answers,
+tombstone/termination-pending semantics, teardown mode upgrade,
+settlement of abnormal outcomes) survive unchanged as consequences of one
+queue. Latency is unaffected because only decisions serialize, not
+process I/O.
+
 ## Related Decisions
 
 - **[ls-bridge-async-connection](ls-bridge-async-connection.md)**: Async Bridge Connection
@@ -695,3 +586,4 @@ Skip synchronization, just send shutdown request whenever ready.
 - **2026-01-06**: Merged Amendment 001 - Added three-phase writer loop shutdown synchronization to prevent stdin corruption during concurrent shutdown writes
 - **2026-08-11**: Corrected Initialization Shutdown - the abort path sends no LSP message at all (the earlier revision sent `exit` before the initialize response, which LSP ordering forbids); adopted alongside bridge-client-control-protocol, whose per-slot `stop` shares the path
 - **2026-08-11**: Reconciled the Operation Disposal Policy with the Closing-state gating and the writer's actual behavior - the accepted order queue drains ahead of `shutdown` (the earlier table said queued operations are never sent, contradicting § Operation Gating and the FIFO writer)
+- **2026-08-12**: Replaced the lock-based concurrent lifecycle-control design with the Lifecycle Actor - all lifecycle transitions (stop/restart/teardown/spawn-commit) serialize through one pool-owned actor, dissolving the single-flight registry, lease-owner map, supervisor-owned transactional teardown state, and durable-record finalizer machinery the earlier revision had accreted (now recorded as rejected Alternative 4); observable contracts in bridge-client-control-protocol are unchanged
