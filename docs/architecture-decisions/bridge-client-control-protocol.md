@@ -5,7 +5,8 @@
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md) — the `ConnectionKey` identity this protocol exposes
 - [ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md) — the shutdown handshake `stop` reuses
 - [respawn-reopen-derives-its-targets](respawn-reopen-derives-its-targets.md) — the derived re-open `restart` relies on
-- [ls-bridge-message-ordering](ls-bridge-message-ordering.md) — cancellation forwarding the pass-through request reuses
+- [ls-bridge-message-ordering](ls-bridge-message-ordering.md) — the cancellation forwarding that the pass-through request reuses
+- [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) — the timeout tiers `stop`, `restart`, and pass-through requests interact with
 
 ## Context
 
@@ -44,14 +45,17 @@ downstream connections by an opaque id derived from the pool's `ConnectionKey`.
 | `kakehashi/bridge/client/stop` | request | `{ id }` | `null` |
 | `kakehashi/bridge/client/restart` | request | `{ id }` | `null` |
 
-The methods are announced under the initialize result's
-`capabilities.experimental` so clients can feature-detect before use.
+The methods are announced in the initialize result as
+`capabilities.experimental.kakehashi.bridgeClient: true`, beside the existing
+`wrappedDidChangeConfigurationSettings` flag, so clients can feature-detect
+before use. This sets a new precedent rather than following one: the existing
+`kakehashi/node*` and `kakehashi/captures/*` families are announced nowhere.
 
 ### Client Identity: the `ConnectionKey` Display String
 
 ```typescript
 type Client = {
-  name: string;    // config server name (the `language_servers` map key)
+  name: string;    // config server name (the `languageServers` map key)
   id: string;      // opaque handle; currently the ConnectionKey Display string
   status: "starting" | "running" | "stopping" | "stopped" | "failed";
 };
@@ -67,9 +71,9 @@ ls-bridge-server-pool-coordination). Three properties motivate this choice:
    restarts, matching the protocol's `restart → null` contract (no new id to
    return).
 2. **Already threaded everywhere.** Every per-connection map in the pool —
-   connections, document versions, the cancel registry, the respawn ARM/CLAIM
-   set — is keyed by `ConnectionKey`, so id-based routing needs no new
-   registry.
+   connections, document versions, host-document sync state, the respawn
+   ARM/CLAIM set — is keyed by `ConnectionKey`, alone or inside a composite
+   key, so id-based routing needs no new registry.
 3. **Human-legible.** The rendering carries the root, so two same-name clients
    in a monorepo are distinguishable at a glance in the enumeration result
    without an extra round trip.
@@ -82,7 +86,7 @@ may change between kakehashi versions.
 **Server-name validation.** The `Display` rendering is injective only if
 server names cannot collide with its markers: a server literally named
 `a#shared` would render identically to the shared-instance key of server `a`.
-Configuration loading therefore rejects `language_servers` names containing
+Configuration loading therefore rejects `languageServers` names containing
 `@` or `#`.
 
 **`status`** mirrors the connection state machine
@@ -99,7 +103,7 @@ Both parameters are optional and compose as AND:
 - `textDocument?: TextDocumentIdentifier` — only clients that serve this
   document: the document (or one of its injections) bridges to the server
   *and* resolves to this connection's root.
-- `name?: string` — only clients spawned from this `language_servers` entry.
+- `name?: string` — only clients spawned from this `languageServers` entry.
 
 With neither parameter, all clients (including stopped slots) are returned.
 
@@ -174,7 +178,7 @@ dropped (logged at debug level), matching JSON-RPC notification semantics.
 type OpenDocument = {
   uri: string;         // as the downstream sees it (virtual URI for injections)
   languageId: string;
-  version: number;     // last version sent downstream
+  version: number;     // current tracked version for this connection
   hostUri?: string;    // host document a bridge-minted virtual document derives from
 };
 ```
@@ -195,11 +199,19 @@ type OpenDocument = {
 
 ### `stop`: Graceful, and Pinned Until Explicit Restart
 
-`stop` runs the existing graceful shutdown (ls-bridge-graceful-shutdown):
-`Closing` → LSP `shutdown`/`exit` handshake → `Closed`, with the forced
-SIGTERM/SIGKILL escalation on timeout. In-flight and newly arriving operations
+`stop` runs the graceful shutdown sequence (ls-bridge-graceful-shutdown):
+`Closing` → LSP `shutdown`/`exit` handshake → `Closed`. The handshake is
+bounded by a **per-connection shutdown timeout**, which is new state: today
+the per-connection path deliberately carries no timeout of its own — only the
+pool-wide `GlobalShutdownTimeout` bounds it, via the teardown-only
+`force_kill_all` — so a single-slot `stop` against a wedged server would
+otherwise wait forever, and a wedged server is precisely this method's
+motivating case. On expiry the forced escalation applies (SIGTERM → SIGKILL
+on Unix; immediate kill on Windows). In-flight and newly arriving operations
 fail per that decision's disposal policy. The result `null` is returned when
-the slot reaches `Closed`.
+the slot reaches `Closed`, whichever path got it there. `stop` on a
+`starting` slot is legal (`Initializing → Closing` is an existing transition)
+and likewise returns at `Closed`.
 
 What is new is the **stopped set**: the pool records the `ConnectionKey` as
 explicitly stopped, and the normal routing path consults it — a `didOpen` (or
@@ -218,7 +230,7 @@ return `null` once the replacement reaches Ready.
 - **Process-level configuration applies.** `command`, `args`,
   `initializationOptions`, settings — whatever the config says *now* is what
   the replacement is spawned with.
-- **No re-key.** Key-*defining* configuration (`root_markers`,
+- **No re-key.** Key-*defining* configuration (`workspaceMarkers`,
   `preferSharedInstance`) does not re-route the existing slot: the replacement
   is spawned under the identical key, and rooting changes take effect only for
   newly routed documents. This is what keeps held ids stable; the alternative
@@ -226,12 +238,20 @@ return `null` once the replacement reaches Ready.
 - **Document restoration is derived, not remembered.** The respawn goes
   through the existing purge→ARM, handshake→CLAIM mechanism, so the
   replacement re-opens whichever currently open documents belong to it, per
-  respawn-reopen-derives-its-targets. First requests after `restart` may wait
-  on that decision's barrier.
+  respawn-reopen-derives-its-targets. Only the `workspace/executeCommand`
+  routes wait on the re-open barrier (execute-command-routing-token, fail-soft
+  if unsettled); other request paths open their own documents and do not
+  wait.
 
 During the restart window, `request` fails with `clientRestarting` and
-`notify` is silently dropped. `restart` on a `stopped` slot is simply a start;
-`restart` on a `failed` slot replaces the process like any respawn.
+`notify` is silently dropped. `restart` on a `stopped` slot is simply a
+start. `restart` on a `failed` slot replaces the process like a crash
+respawn, and additionally **clears the slot's consecutive-panic count**: the
+pool disables a slot after `MAX_CONSECUTIVE_PANICS` crash respawns, and an
+explicit user-initiated `restart` is exactly the signal that should re-arm
+it. For the same reason, `restart` is exempt from any future crash-storm
+rate limiter (ls-bridge-server-pool-coordination Phase 2): a human asking is
+not a storm.
 
 ## Considered Options
 
@@ -278,17 +298,19 @@ down `tsgo@file:///repo/a` and bring up `tsgo#shared`. Rejected: the held id
 would dangle, so `restart` would have to return a new id (breaking the stable
 handle contract), and every other holder of the old id would silently rot.
 Spawning the replacement under the identical key is simpler and honest:
-rooting changes apply to newly routed documents, and the old slot drains
-naturally as documents close.
+rooting changes apply to newly routed documents. A restarted slot under
+changed rooting re-opens nothing — derivation runs against current settings —
+so it comes up empty and sits idle rather than serving stale routes.
 
 ### Bridge-defined error codes instead of `data.reason`
 
 A custom code per failure (`-32001` stopped, `-32002` restarting, …) is
 machine-readable without parsing `data`. Rejected: `RequestFailed` is the
-LSP-blessed code for exactly this class ("the request failed for reasons that
-are not the client's fault"), the bridge already uses it for its other
-failures, and a `data` discriminator extends without burning through a scarce
-code namespace.
+LSP-blessed code for exactly this class — per the spec, "a request failed but
+it was syntactically correct, e.g the method name was known and the
+parameters were valid" — the bridge already uses it for its other failures,
+and a `data` discriminator extends without burning through a scarce code
+namespace.
 
 ## Consequences
 
@@ -300,9 +322,11 @@ code namespace.
 - Pass-through opens downstream capabilities the bridge does not yet
   translate, making the bridge a platform rather than a bottleneck
   (mirroring node-reference-protocol's goal for the syntax tree).
-- Nearly every mechanism is reuse: `ConnectionKey` routing, the cancel
-  registry, the graceful-shutdown state machine, the ARM/CLAIM derived
-  re-open. The genuinely new state is one stopped set and the deny list.
+- Nearly every mechanism is reuse: `ConnectionKey` routing,
+  `forward_cancel_downstream`, the graceful-shutdown state machine, the
+  ARM/CLAIM derived re-open. The genuinely new state is the stopped set, the
+  per-connection shutdown timeout, the in-flight pass-through id map, and the
+  deny list.
 - Held ids survive restarts, so tooling built on the protocol needs no
   re-enumeration choreography.
 
@@ -327,8 +351,18 @@ code namespace.
 
 ### Neutral
 
-- Custom methods under the `kakehashi/` namespace, announced via
-  `capabilities.experimental` — consistent with the existing families.
+- Custom methods under the `kakehashi/` namespace, with a
+  kakehashi-native domain (`bridge/client`) in the scope slot — the precedent
+  set by `kakehashi/node*` and `kakehashi/captures/*`, which also name
+  kakehashi-defined domains rather than LSP scopes. A pending convention
+  (branch `feat/scope-first-custom-methods`) mandates LSP scopes
+  (`textDocument/`, `workspace/`) for methods that shadow LSP features;
+  whichever lands second must reconcile explicitly — these methods shadow no
+  LSP feature, so the intended reading is that the LSP-scope rule does not
+  apply to them, and this ADR records that intent.
+- The `capabilities.experimental` announcement is a new discovery
+  convention, not an existing one; the older `kakehashi/*` families remain
+  undiscoverable until someone backfills them.
 - Server-name validation (`@`/`#` rejected) constrains configuration slightly;
   no known real-world server name uses either character.
 
@@ -343,9 +377,14 @@ code namespace.
 - The stopped set lives beside the pool's per-connection maps, keyed by
   `ConnectionKey`; the acquire path checks it before any spawn decision.
 - Pass-through cancellation reuses `forward_cancel_downstream` keyed by
-  `(ConnectionKey, downstream id)`, as the formatting pipeline already does.
-- Server-name validation lands in configuration loading with the other
-  `language_servers` key checks.
+  `(ConnectionKey, downstream id)`. As in the formatting pipeline, the
+  handler itself records the downstream id it minted for each in-flight
+  pass-through — there is no registry to consult — and that
+  outer-id → downstream-id map is part of the protocol's new state.
+- Server-name validation is the first key validation `languageServers` gets —
+  none exists today. A name containing `@` or `#` is rejected with a
+  user-facing notice and the entry is never spawned, matching the
+  warn-and-continue posture of the existing config advisories.
 
 ## Summary
 
@@ -353,7 +392,7 @@ code namespace.
 |---|---|
 | **Namespace** | `kakehashi/bridge/client`, `kakehashi/bridge/client/{request,notify,documents,serverInfo,workspaceFolders,stop,restart}` |
 | **Client id** | `ConnectionKey` Display string; contractually opaque; slot-stable across restarts |
-| **Name validation** | `language_servers` keys may not contain `@` or `#` |
+| **Name validation** | `languageServers` keys may not contain `@` or `#` |
 | **Pass-through** | Verbatim, untranslated; deny `initialize`/`initialized`/`shutdown`/`exit`/`$/cancelRequest` |
 | **Response envelope** | `{ result?, error? }` — framing fields stripped |
 | **Errors** | `RequestFailed` (`-32803`) + `data.reason` discriminator |
