@@ -572,7 +572,9 @@ structures with different lifetimes carry the outcome:
   representable. Retaining the folder for
   non-override shared routes too is what gives a restarted shared
   replacement a folder source for every bound document; live resolution
-  serves only tuples with no binding. The pending binding record is
+  serves only a (host, layer, language, server) entry with no record —
+  a terminally deleted entry falls through even while sibling entries
+  stay settled. The pending binding record is
   installed **synchronously in the `didOpen` handler (respectively the
   virtual-document creation path), before the open tasks are spawned
   and before the writer ticket is released** — installing it inside the
@@ -606,13 +608,18 @@ structures with different lifetimes carry the outcome:
   which — waiters proceed without the
   server, and later opens retry the retained key through the ordinary
   respawn path rather than falling through to a different resolution.
-  A successful retry **transitions the entry to *routed*** with the key
-  the acquire actually landed on — a capability downgrade records the
-  downgraded per-root key, so enumeration and folder announcements
-  follow the real connection, never a stale `#shared` name — committed
-  through the same route-admission critical section at the same
-  incarnation; a failed retry re-records *retained* with fresh
-  provenance;
+  Retries are **single-flight per entry**: a retry claims the entry's
+  exact state (an exact-state CAS under the admission lock) before
+  acquiring, concurrent would-be retriers await and consume the
+  claimant's outcome, and a commit that finds the state moved writes
+  nothing — a late failed retry can never regress a `routed` entry. A
+  successful retry transitions the entry to *routed* with the key the
+  acquire actually landed on; a failed retry re-records
+  *retained(actual attempted key)* with fresh provenance — after a
+  capability downgrade that is the downgraded per-root key, initial
+  attempt or retry alike, never a stale `#shared` name, with the
+  route's folders preserved — so enumeration and later retries always
+  follow the key really being attempted;
   *not-applicable* settles when a server is genuinely rejected
   **before** any acquire runs — a configuration removal or disablement
   that ends its candidacy for the document — and is consumed like a
@@ -625,7 +632,9 @@ structures with different lifetimes carry the outcome:
   while changing nothing and would otherwise leave no trace — and a
   **settlement record** per server as its entry settles (the landed or
   downgraded key; a retention, with its failed-versus-owner-died
-  provenance; a suppression taking hold). This
+  provenance; a suppression taking hold; a terminal deletion, with its
+  cause — no surviving directive, or the retryable mismatch that
+  triggered it). This
   is what makes a valid-but-wrong policy diagnosable from the logs
   (warnings cover the rejected, invalid, and timed-out outcomes; a
   *successful* misroute would otherwise be silent). Method-level capability prefilters are deliberately

@@ -240,11 +240,13 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
   marker resolution walks the live filesystem uncached, so creating a marker
   (`git init` in a subdirectory, a submodule checkout, scaffolding a nested
   project) re-roots a host with settings untouched. Both apply only to
-  documents *without* an active route binding: a bound document
-  (bridge-routing-protocol) keeps its bound key for the binding's
-  lifetime — the host's close, or an injection tuple's authoritative
-  last-region disappearance — and is not re-rooted by live marker
-  changes while it lives.
+  (host, layer, language, server) entries *without* an active route
+  binding record — a terminally deleted entry falls through to marker
+  resolution even while sibling entries stay bound: a bound entry
+  (bridge-routing-protocol) keeps its key for the binding's lifetime —
+  the host's close, or an injection tuple's authoritative last-region
+  disappearance — and is not re-rooted by live marker changes while it
+  lives.
 - The re-open considers every open document rather than a pre-narrowed set. The
   configuration question is answered first and from a memo, so the cost is a
   map lookup per open document, but it does scale with the workspace rather
