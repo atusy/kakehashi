@@ -360,7 +360,11 @@ must survive either way: a failure that reached `Failed` leaves the handle
 pool-resident (enumerable as `failed`, healed by the ordinary
 acquire-driven respawn), while a failure that never produced a handle
 **re-installs the stopped entry** — the id stays enumerable as `stopped`
-and a later `restart` retries. Without that retryable tombstone, a
+and a later `restart` retries. Re-installation obeys the same
+config-revalidation rule as any tombstone install: it happens only when
+the server name still exists in current configuration; if a reload
+deleted the server mid-restart, no entry is installed and the id resolves
+`unknownClient`. Without that retryable tombstone, a
 pre-handle failure would leave no live, stopped, or control-registry owner
 for the key, the slot would vanish from enumeration, and retry would
 answer `unknownClient`.
@@ -403,7 +407,12 @@ half-stopped or release the guard midway.
   existing add-only acquire path
   (`workspace/didChangeWorkspaceFolders` per
   ls-bridge-server-pool-coordination) as roots re-acquire the shared
-  connection — derive, don't remember, applied to folders. In a
+  connection — derive, don't remember, applied to folders. One ordering
+  obligation falls on the re-open sweep: it acquires the replacement by
+  key, bypassing the ordinary acquire path that announces new shared
+  roots, so for a shared replacement the sweep must add-and-announce each
+  document's root before that root's first `didOpen` — otherwise non-seed
+  documents reopen on a server that was never told about their folder. In a
   workspace-less session (initialize carried neither `rootUri` nor
   `workspaceFolders`), the replacement spawns rootless with an empty folder
   seed — the same shape no-workspace sessions already give fresh spawns —
