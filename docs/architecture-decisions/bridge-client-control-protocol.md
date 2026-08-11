@@ -310,8 +310,12 @@ the slot reaches `Closed`, whichever path got it there. `stop` on a
 at all**: the spec forbids the client every additional request *and*
 notification — `exit` included — until the initialize response arrives, so
 the process is terminated directly (the forced escalation, minus the
-handshake). If the initialize response wins the race, the normal
-`shutdown` → `exit` sequence applies instead. This deliberately diverges
+handshake). The race is decided by the lifecycle transition, not by
+response receipt: `Initializing → Closing` always means direct
+termination, and only a slot that already committed `Initializing → Ready`
+— initialize response processed *and* `initialized` enqueued — takes the
+normal `shutdown` → `exit` sequence, so `shutdown` can never jump the
+queue ahead of `initialized`. This deliberately diverges
 from ls-bridge-graceful-shutdown's `Initializing → Closing` rule, which
 sends `exit` in that window and is itself non-conformant on this point;
 correcting that decision is a follow-up. `stop` on a `failed` slot skips the LSP
@@ -349,11 +353,13 @@ Three lifecycle rules keep the set coherent:
   drops stopped entries whose server name no longer exists in
   `languageServers` — their ids then resolve as `unknownClient` — while
   entries whose server survives the reload stay stopped. Reload is not a
-  control call, so it is not covered by single-flight; instead the tombstone
-  install revalidates against the current configuration inside the same
-  critical section: a `stop` committing after a reload deleted its server
-  installs no entry (the slot is already gone and its id resolves
-  `unknownClient`), never a stale one. Nothing is persisted across
+  control call, so it is not covered by single-flight; instead every
+  tombstone install and reinstall revalidates against the current
+  configuration inside the same critical section, under the same
+  settings-publication fence that replacement insertion uses — a deletion
+  cannot publish between the configuration check and the install. A `stop`
+  committing after a reload deleted its server installs no entry (the slot
+  is already gone and its id resolves `unknownClient`), never a stale one. Nothing is persisted across
   kakehashi restarts.
 
 ### `restart`: Same Key, Current Config, Derived Re-Open
