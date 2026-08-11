@@ -7,7 +7,7 @@
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — the `preferred` strategy whose fan-out/fan-in machinery this protocol dispatches
 - [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) — registers the routing decision deadline, the binding-reuse validation budget, and the Tier-1/Tier-2 exemptions
 - [ls-bridge-async-connection](ls-bridge-async-connection.md) — the framing size ceilings (amended with this decision) that the answer-allocation bound depends on
-- [respawn-reopen-derives-its-targets](respawn-reopen-derives-its-targets.md) — the derived re-open, which issues no routing query and never spawns: bindings answer where they exist, marker resolution where they do not
+- [respawn-reopen-derives-its-targets](respawn-reopen-derives-its-targets.md) — the derived re-open, which issues no routing query and never spawns: bound server entries answer from their binding, entry-less servers from marker resolution
 - [wildcard-config-inheritance](wildcard-config-inheritance.md) — the inheritance resolution applied before the config projection goes on the wire
 - [host-document-bridge](host-document-bridge.md) — the `_self` layer whose `enabled` gate and aggregation entry govern host-document routing decisions
 - [language-server-bridge](language-server-bridge.md) — the security model this protocol's trust model extends
@@ -608,11 +608,22 @@ structures with different lifetimes carry the outcome:
   which — waiters proceed without the
   server, and later opens retry the retained key through the ordinary
   respawn path rather than falling through to a different resolution.
-  Retries are **single-flight per entry**: a retry claims the entry's
-  exact state (an exact-state CAS under the admission lock) before
-  acquiring, concurrent would-be retriers await and consume the
-  claimant's outcome, and a commit that finds the state moved writes
-  nothing — a late failed retry can never regress a `routed` entry. A
+  Retries are **single-flight per entry**: a retry claims the entry
+  under the admission lock with a **unique claim token fenced by the
+  open incarnation** (a byte-identical retained value recreated by a
+  close/re-open can never satisfy an old claimant's commit — the token
+  and incarnation must both match), concurrent would-be retriers await
+  and consume the claimant's published outcome under their own
+  budgets, and a commit whose token or incarnation moved writes
+  nothing — a late failed retry can never regress a `routed` entry.
+  The claim does not change what consumers see: the entry remains
+  observably *retained* (its key and folders keep answering
+  enumeration, the sweep, and lazy lookups), with the claim token as
+  bookkeeping beside it. The claim is covered by the same pool-owned
+  completion guard as every detached routing task: any exit short of a
+  commit — cancellation, validation timeout, panic, teardown —
+  atomically restores plain *retained*, publishes that outcome, and
+  wakes the waiters, so a dead claimant can never park later retriers. A
   successful retry transitions the entry to *routed* with the key the
   acquire actually landed on; a failed retry re-records
   *retained(actual attempted key)* with fresh provenance — after a
@@ -630,9 +641,10 @@ structures with different lifetimes carry the outcome:
   language), and the normalized directives, including an
   affirmation-only win, which vetoes every lower-priority provider
   while changing nothing and would otherwise leave no trace — and a
-  **settlement record** per server as its entry settles (the landed or
+  **terminal record** per server, emitted on settlement and terminal
+  deletion alike (the landed or
   downgraded key; a retention, with its failed-versus-owner-died
-  provenance; a suppression taking hold; a terminal deletion, with its
+  provenance; a suppression taking hold; a deletion, with its
   cause — no surviving directive, or the retryable mismatch that
   triggered it). This
   is what makes a valid-but-wrong policy diagnosable from the logs
@@ -1399,4 +1411,4 @@ a slot a routing provider left in play.
 | **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy, plus a separate binding-reuse validation budget); expiry is partial-result (cancel unanswered, drop unfinished entries, fan-in over what normalized; whole fallback only when no operative normalized result remains); exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
 | **Caching** | decision cache per (host URI, layer, languageId, config generation), single-flight, evicted on `didClose` and on an injection tuple's authoritative last-region disappearance, flushed on reload / `Ready`-provider-set / workspace-folder-set change, (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until `didClose` (injection tuples: also last-region disappearance); never retroactive |
 | **Cold start** | `forceStart` (post-config-publication get-or-create; `#shared` + primary-root seed for `preferSharedInstance` servers, the marker-less fallback shape otherwise; warm-up scope limited to shared/marker-less/policy servers; wait-eligible for the initialization wait) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
-| **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; the sweep reads bindings where they exist, marker resolution where they do not, and never spawns |
+| **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; the sweep reads each exact server entry's binding where one exists, marker resolution where none does, and never spawns |

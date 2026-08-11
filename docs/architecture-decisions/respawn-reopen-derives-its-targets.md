@@ -254,9 +254,10 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
   cost off the barrier's budget; a future change that moves work ahead of the
   stage-1 screen re-couples them, and the symptom is every command on a
   respawned connection failing soft on a large workspace.
-- Marker resolution now runs during the re-open for hosts that bridge to the
-  respawned server — those without a route binding; bound hosts answer from
-  the binding instead. The pre-existing eager path already resolves markers
+- Marker resolution now runs during the re-open for the server entries that
+  lack a route binding record; bound entries answer from the binding
+  instead (per exact (host, layer, language, server) entry — a tuple can
+  hold both kinds at once). The pre-existing eager path already resolves markers
   per open, so this is not a new kind of work, but it is work the
   captured-list design skipped.
 
