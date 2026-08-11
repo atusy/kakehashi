@@ -523,6 +523,8 @@ languageServers:
 - **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Graceful Shutdown
   - Defines shutdown coordination for multiple concurrent connections
   - Router sends one `Teardown` message to the lifecycle actor, which launches per-connection shutdown sub-tasks; ls-bridge-graceful-shutdown specifies the per-connection sequence
+- **[bridge-routing-protocol](bridge-routing-protocol.md)**: Downstream routing delegation
+  - A routing provider's `workspaceFolders` answer overrides the marker-walk root resolution for one (document, server) decision; `forceStart` spawns eagerly with the primary-root seed
 
 ## Amendment History
 
