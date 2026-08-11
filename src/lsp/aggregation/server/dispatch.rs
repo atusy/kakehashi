@@ -349,6 +349,7 @@ mod tests {
                 line_column_offsets: vec![],
                 contiguous: true,
             },
+            region_end: None,
             configs: vec![],
             upstream_request_id: None,
             priorities: vec![],

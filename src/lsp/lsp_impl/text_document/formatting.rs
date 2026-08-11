@@ -362,6 +362,7 @@ impl Kakehashi {
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),
                 resolved: resolved.clone(),
+                region_end: None,
                 configs,
                 upstream_request_id: upstream_request_id.clone(),
                 priorities: agg.priorities,

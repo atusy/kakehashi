@@ -140,6 +140,12 @@ pub(crate) struct DocumentRequestContext {
     pub(crate) uri: Url,
     /// The resolved injection region with virtual content and region metadata.
     pub(crate) resolved: ResolvedInjection,
+    /// The region's end-of-content in host coordinates, when the producing
+    /// path already derived it (the position/range preamble derives it for
+    /// the bounds precheck). `None` on paths that never need it (diagnostics,
+    /// whole-document fan-outs) — deriving it is O(virtual_content), so it is
+    /// carried, not recomputed; the fan-out seeds its shared cell from this.
+    pub(crate) region_end: Option<Position>,
     /// All matching bridge server configs for this injection language.
     pub(crate) configs: Vec<ResolvedServerConfig>,
     /// The upstream JSON-RPC request ID for cancel forwarding.
@@ -222,6 +228,9 @@ struct PreambleResult {
     resolved: ResolvedInjection,
     language_name: String,
     upstream_request_id: Option<UpstreamId>,
+    /// End-of-content derived for the bounds precheck, carried so no later
+    /// stage re-derives it.
+    region_end: Position,
 }
 
 fn resolve_bridge_language_config_from_settings(
@@ -739,8 +748,9 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         position: Position,
+        range_end: Option<Position>,
         method_name: &str,
-    ) -> Option<(PreambleResult, Position)> {
+    ) -> Option<(PreambleResult, Position, Option<Position>)> {
         // Convert ls_types::Uri to url::Url for internal use
         let Ok(uri) = uri_to_url(lsp_uri) else {
             log::warn!("Invalid URI in {}: {}", method_name, lsp_uri.as_str());
@@ -802,6 +812,20 @@ impl Kakehashi {
             return None;
         }
         let position = normalized;
+        // A range request's end gets the identical defense with the same
+        // mapper: character clamped to its line, a changed line meaning an
+        // invalid position (no virtual context).
+        let range_end = match range_end {
+            None => None,
+            Some(end) => {
+                let end_byte = mapper.position_to_byte_clamped(end);
+                let normalized_end = mapper.byte_to_position(end_byte)?;
+                if normalized_end.line != end.line {
+                    return None;
+                }
+                Some(normalized_end)
+            }
+        };
 
         let Some(resolved) = crate::language::InjectionResolver::resolve_at_byte_offset(
             &self.language,
@@ -860,8 +884,10 @@ impl Kakehashi {
                 resolved,
                 language_name,
                 upstream_request_id,
+                region_end,
             },
             position,
+            range_end,
         ))
     }
 
@@ -1004,6 +1030,7 @@ impl Kakehashi {
         Some(DocumentRequestContext {
             uri: preamble.uri,
             resolved: preamble.resolved,
+            region_end: Some(preamble.region_end),
             configs,
             upstream_request_id: preamble.upstream_request_id,
             priorities: agg.priorities,
@@ -1403,7 +1430,8 @@ impl Kakehashi {
         // request (hover / definition / completion / …) issued in the reparse window
         // would find `snapshot()` empty and return null after every edit.
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
-        let (preamble, position) = self.resolve_bridge_preamble(lsp_uri, position, method_name)?;
+        let (preamble, position, _) =
+            self.resolve_bridge_preamble(lsp_uri, position, None, method_name)?;
         let document = self
             .preamble_to_document_context(preamble, method_name)
             .await?;
@@ -1430,19 +1458,21 @@ impl Kakehashi {
         method_name: &str,
     ) -> Option<RangeRequestContext> {
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
-        let (preamble, start) = self.resolve_bridge_preamble(lsp_uri, range.start, method_name)?;
+        let (preamble, start, end) =
+            self.resolve_bridge_preamble(lsp_uri, range.start, Some(range.end), method_name)?;
         let document = self
             .preamble_to_document_context(preamble, method_name)
             .await?;
 
-        // Dispatch must see the same defended start the region was resolved
-        // with — this path (inlay hints, color presentations) forwards the
-        // range verbatim, with no later clamp. Character clamping only ever
-        // moves the start left, so `max` keeps the range well-formed even
-        // for a degenerate all-overlong input.
+        // Dispatch must see the same defended endpoints the region was
+        // resolved with — this path (inlay hints, color presentations)
+        // forwards the range verbatim, with no later clamp. Both endpoints
+        // are normalized by the preamble; `max` keeps the range well-formed
+        // even for a degenerate all-overlong input.
+        let end = end.unwrap_or(range.end);
         let range = Range {
             start,
-            end: range.end.max(start),
+            end: end.max(start),
         };
         Some(RangeRequestContext { document, range })
     }
@@ -1524,6 +1554,13 @@ impl Kakehashi {
 
             let preamble = PreambleResult {
                 uri: uri.clone(),
+                region_end: crate::lsp::bridge::region_host_end(
+                    &resolved.virtual_content,
+                    &crate::lsp::bridge::RegionOffset::with_per_line_offsets(
+                        resolved.region.line_range.start,
+                        resolved.line_column_offsets.clone(),
+                    ),
+                ),
                 resolved,
                 language_name: language_name.clone(),
                 upstream_request_id: upstream_request_id.clone(),

@@ -117,10 +117,14 @@ where
     Fut: Future<Output = io::Result<T>> + Send + 'static,
 {
     let mut join_set = JoinSet::new();
-    // One shared cell per request: the first position-shaped arm derives the
-    // end-of-content once; non-position fan-outs never touch it.
+    // One shared cell per request, seeded from the preamble's precheck
+    // derivation when the producing path carried it — then no arm ever
+    // re-derives; the lazy init remains for contexts built without one.
     let region_end_cell =
         std::sync::Arc::new(std::sync::OnceLock::<tower_lsp_server::ls_types::Position>::new());
+    if let Some(region_end) = ctx.region_end {
+        let _ = region_end_cell.set(region_end);
+    }
     for config in selected {
         let server_name = config.server_name.clone();
         let task = FanOutTask {
