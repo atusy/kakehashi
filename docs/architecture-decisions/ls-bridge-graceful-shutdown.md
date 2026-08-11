@@ -387,9 +387,14 @@ killed-and-reaped by the final settlement, so no child can slip in
 behind an escalation scan, and teardown publishes completion only after
 its adopted `Spawning` entries have settled this way (or, at the final
 deadline, publishes as failed per the disposition below). Claim closure is
-**deadline-bounded like everything else**: a spawn sub-task that has not
-terminated by the applicable deadline (per-slot for `stop`/`restart`,
-the absolute deadline for teardown) fails the operation
+**deadline-bounded like everything else** — with the deadline belonging
+to whoever is waiting. `stop`/`restart` wait under the per-slot
+deadline and teardown under its absolute one; a **reload** claim has no
+waiter of its own — the reload reply commits with the claim, an
+acquisition deadline terminates only its acquire waiter, and the
+reload-origin cleanup record stays authoritative and fenced until its
+producer terminates or teardown adopts it. A spawn sub-task that has not
+terminated by the applicable waiter's deadline fails the operation
 (`stopFailed`/`restartFailed`) and converts the entry to a fenced
 cleanup record — escrow still open, the eventual child still
 killed-and-reaped on arrival — while teardown disposes that record by
