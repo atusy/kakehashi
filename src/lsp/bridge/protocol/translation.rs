@@ -135,9 +135,7 @@ pub(crate) fn host_position_within_region_bounds(
     offset: &RegionOffset,
     region_end: Position,
 ) -> bool {
-    // RED scaffold: the trailing bound is enforced in the GREEN commit.
-    let _ = region_end;
-    host_position_within_region(host_position, offset)
+    host_position_within_region(host_position, offset) && host_position <= region_end
 }
 
 /// Translate a single host position to virtual coordinates.

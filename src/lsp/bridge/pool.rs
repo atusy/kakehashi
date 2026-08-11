@@ -5129,20 +5129,22 @@ mod tests {
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
         pool.open_host_incarnation(&host_uri, 1).await;
 
-        // First, send hover requests to establish connection and open virtual docs
-        // Use positions that are within the code block (position.line >= region_start_line)
+        // First, send hover requests to establish connection and open virtual docs.
+        // Positions must fall inside the virtual content's bounds (the dispatch
+        // rejects positions past the region's content end) — the content is a
+        // single line, so the position sits on each region's start line.
         let result = pool
             .send_hover_request(
                 "lua", // server_name
                 &config,
                 &host_uri,
                 tower_lsp_server::ls_types::Position {
-                    line: 4,
+                    line: 3,
                     character: 5,
                 },
                 "lua",
                 TEST_ULID_LUA_0,
-                RegionOffset::new(3, 0), // region starts at line 3, position is at line 4, so virtual line = 1
+                RegionOffset::new(3, 0), // single-line region at line 3, virtual line = 0
                 "print('hello')",
                 Some(UpstreamId::Number(1)),
             )
@@ -5155,12 +5157,12 @@ mod tests {
                 &config,
                 &host_uri,
                 tower_lsp_server::ls_types::Position {
-                    line: 8,
+                    line: 7,
                     character: 5,
                 },
                 "lua",
                 TEST_ULID_LUA_1,
-                RegionOffset::new(7, 0), // region starts at line 7, position is at line 8, so virtual line = 1
+                RegionOffset::new(7, 0), // single-line region at line 7, virtual line = 0
                 "print('world')",
                 Some(UpstreamId::Number(2)),
             )
