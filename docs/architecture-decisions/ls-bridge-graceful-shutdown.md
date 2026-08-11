@@ -243,18 +243,33 @@ enum ShutdownMode {
 // an in-progress ServerRemains teardown cannot terminate around it.
 
 async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
-    // Join-or-start the SHARED teardown run and apply this caller's
-    // mode to the shared state at entry (monotonic upgrade; ProcessExit
-    // dominates). Everything below reads mode only through that state.
-    let teardown = pool.teardown_run().join_or_start();
-    teardown.upgrade(mode);
+    // Capture the prospective ceiling BEFORE any coordination, so the
+    // starter's deadlines are anchored ahead of lock traffic; the gap
+    // is the escalation reserve (ls-bridge-timeout-hierarchy: ~20%).
+    let now = Instant::now();
 
-    // Both deadlines are absolute and anchored at FUNCTION ENTRY, so
-    // sealing/snapshot work spends the same ceiling it lives under.
-    // The gap between them is the escalation reserve
-    // (ls-bridge-timeout-hierarchy: ~20% for SIGTERM/SIGKILL).
-    let deadline = Instant::now() + GLOBAL_TIMEOUT;
-    let graceful_deadline = deadline - GLOBAL_TIMEOUT.mul_f32(0.2);
+    // join_or_start applies this caller's mode atomically (monotonic
+    // upgrade; ProcessExit dominates) and distinguishes owner from
+    // joiner:
+    let teardown = match pool.teardown_run().join_or_start(mode, now) {
+        // Joiner: if this upgrade raced past an already-committed
+        // ServerRemains disposition, the SAME linearized call hands
+        // back the reinserted records as a late-exit claim for THIS
+        // caller to dispose (process::exit runs no destructors, so the
+        // Drop owner cannot be relied on there); then await final
+        // completion — published only AFTER cleanup — so an exiting
+        // joiner can never terminate around the owner's cleanup.
+        Joined { late_exit_claim, completion } => {
+            log_and_abandon(late_exit_claim);
+            completion.await;
+            return;
+        }
+        // Owner: runs the body below under the run's own deadlines;
+        // joiners never mint deadlines of their own.
+        Started(run) => run,
+    };
+    let deadline = teardown.deadline;               // = now + GLOBAL_TIMEOUT
+    let graceful_deadline = teardown.graceful_deadline;
 
     // Gate ordinary admission: the pool-wide shutting_down flag stops
     // acquires from spawning new connections from here on.
@@ -293,9 +308,12 @@ async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
 
     let graceful = tokio::time::timeout_at(graceful_deadline, async {
         // Shutdown all connections in parallel (best-effort).
-        // Each task uses the state-aware dispatch below (§ Multi-Connection
-        // Shutdown): Failed → cleanup_only, Initializing →
-        // terminate_without_lsp, otherwise graceful_shutdown.
+        // shutdown_by_state is an atomic compare-transition: each arm
+        // commits its *→Closing transition conditionally (Failed →
+        // cleanup only, Initializing → terminate without LSP, Ready →
+        // full handshake), so a handshake that commits Ready between
+        // observe and act is shut down gracefully, never terminated
+        // without the handshake.
         let tasks = connections.iter()
             .map(|conn| conn.shutdown_by_state());
 
@@ -344,20 +362,21 @@ async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
     // wrapper can hand a process back later. Only NOW close the live
     // registry and take its final contents, and UNION them with the
     // force arm's unresolved ordinary connections — either set alone
-    // drops survivors (control processes live only in the registry;
-    // snapshot connections only in the force arm's return).
-    let unresolved = kill_unresolved.union(control_procs.close_and_take());
+    // drops survivors. The union deduplicates by **owned process
+    // lease** (the unique per-process token minted at acquisition), not
+    // by ConnectionKey: a control-owned process reachable through both
+    // a Closing handle and the registry carries one lease and appears
+    // once.
+    let unresolved = kill_unresolved.union_by_lease(control_procs.close_and_take());
 
     // Disposition of children still unconfirmed (§ Unconfirmed
     // termination) is ONE locked operation: it takes the mode-upgrade
-    // lock, reads the final effective mode, commits the branch, and
-    // publishes completion before releasing — no gap exists between
-    // reading the mode and acting on it. It is lock-bounded local work,
-    // running right after the ceiling rather than inside it. An exit
-    // upgrade arriving AFTER the commit must itself claim and log the
-    // already-reinserted records before returning: the signal path ends
-    // in process::exit, which runs no destructors, so the Drop owner
-    // covers only ordinary process end.
+    // lock, reads the final effective mode, and commits the branch
+    // before releasing — no gap exists between reading the mode and
+    // acting on it. It is lock-bounded local work, running right after
+    // the ceiling rather than inside it. An exit upgrade arriving AFTER
+    // the commit receives the already-reinserted records back from
+    // join_or_start as its late-exit claim (the Joined arm above).
     teardown.dispose_locked(unresolved, |final_mode, records| match final_mode {
         ShutdownMode::ProcessExit  => log_and_abandon(records),
         ShutdownMode::ServerRemains =>
@@ -371,6 +390,13 @@ async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
     // termination-pending registry and its background waiter
     // deliberately survive it (ServerRemains) and keep converting
     // records to tombstones as waits complete.
+    run_pool_and_router_cleanup();
+
+    // Completion is a SEPARATE state from the disposition commit and is
+    // published only here, after cleanup — a ProcessExit joiner
+    // awaiting it cannot call process::exit while the owner is still
+    // cleaning up.
+    teardown.publish_completion();
 }
 ```
 
@@ -407,14 +433,6 @@ Shutdown signal arrives
 
 ```rust
 async fn shutdown_router(mode: ShutdownMode) {
-    // 0. Join-or-start the shared teardown run and apply this caller's
-    //    mode (monotonic upgrade); one absolute ceiling anchored before
-    //    any teardown work begins, escalation reserve as the gap
-    let teardown = connection_pool.teardown_run().join_or_start();
-    teardown.upgrade(mode);
-    let deadline = Instant::now() + GLOBAL_TIMEOUT;
-    let graceful_deadline = deadline - GLOBAL_TIMEOUT.mul_f32(0.2);
-
     // 1. Stop accepting new requests (also gates ordinary acquires via
     //    the pool-wide shutting_down flag)
     mark_router_shutting_down();
@@ -422,67 +440,16 @@ async fn shutdown_router(mode: ShutdownMode) {
     // 2. Fail all pending routing decisions
     fail_pending_routes();
 
-    // 3. Seal control admission and adopt in-flight stop/restart
-    //    operations (bridge-client-control-protocol): the seal blocks
-    //    replacement insertion, so a registry-only restart can neither
-    //    escape the connection snapshot below nor leave a live
-    //    replacement behind; every process a control operation spawns is
-    //    registered in the teardown-owned live control_procs registry at
-    //    spawn time (kill-on-register once teardown begins). The
-    //    registry covers EVERY process a control operation owns —
-    //    reclaimed pre-existing servers included — and the seal also
-    //    quiesces the normal-service reaper, takes over in-progress
-    //    finalizations as teardown-run settlement work, and transfers
-    //    existing termination-pending records; unresolved survivors
-    //    hand back per the sketch above. The JoinSet outlives the timed
-    //    future, as in the sketch above
-    let (mut control_tasks, control_procs) = seal_and_take_control_operations();
-
-    // 4. Shutdown all connections in parallel (snapshot AFTER both gates)
-    let all_connections = connection_pool.all_connections();
-
-    // Graceful phase bounded by the absolute graceful deadline
-    let graceful = tokio::time::timeout_at(graceful_deadline, async {
-        let tasks = all_connections.iter()
-            .map(|conn| async move {
-                // Atomic compare-transition: each arm commits its
-                // *→Closing transition conditionally (Failed → cleanup
-                // only, Initializing → terminate without LSP, Ready →
-                // full handshake), so a handshake that commits Ready
-                // between observe and act is shut down gracefully,
-                // never terminated without the handshake.
-                conn.shutdown_by_state().await
-            });
-
-        // Adopted control operations are polled from the outer JoinSet
-        join!(futures::future::join_all(tasks),
-              drain_join_set(&mut control_tasks));
-    }).await;
-
-    // Cancellation/join runs concurrently with escalation against the
-    // same absolute deadline; a task still alive at the deadline is
-    // hard-aborted (safe: shared-state effects live only at commit
-    // points — see the sketch above and bridge-client-control-protocol)
-    // Cancellation signalled at adoption; producer cutoff at
-    // graceful_deadline; finalization for every non-normal outcome —
-    // see the sketch above
-    let (kill_unresolved, _) = join!(
-        force_kill_remaining_until(deadline, all_connections, &control_procs),
-        abort_survivors_and_finalize(&mut control_tasks, graceful_deadline),
-    );
-    // Close-and-take AFTER both arms join, unioned with the force arm's
-    // unresolved connections; disposition is the single locked
-    // choose-and-commit operation — see the sketch above
-    let unresolved = kill_unresolved.union(control_procs.close_and_take());
-    teardown.dispose_locked(unresolved, dispose_by_mode);
-
-    // 5. Clean up router resources — runs after every control task has
-    //    terminated (the join above), so no ADOPTED CONTROL TASK can
-    //    mutate registries or tombstones behind it; the
-    //    termination-pending registry and its waiter survive cleanup
-    //    under ServerRemains, as in the sketch above. Cleanup is local,
-    //    lock-bounded work: the shutdown ceiling scopes the termination
-    //    attempt, not this step, which needs no server cooperation.
+    // 3. Delegate to the canonical teardown (§ Shutdown Timeout Policy,
+    //    "Timeout Application"): owner/joiner arbitration, deadlines,
+    //    sealing and adoption, snapshot, graceful phase, escalation,
+    //    survivor union, and the locked disposition are exactly
+    //    shutdown_all_connections. Router-specific resource cleanup
+    //    runs inside the owner's cleanup step, BEFORE completion is
+    //    published, so a joiner cannot resume around it. Keeping one
+    //    canonical body is deliberate: two parallel sketches of this
+    //    sequence drifted repeatedly.
+    shutdown_all_connections(&connection_pool, mode).await;
     cleanup_router_state();
 }
 ```
