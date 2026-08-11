@@ -505,10 +505,14 @@ candidates at all likewise queries nothing.
   decision, so a high-priority provider that answers only affirmations
   thereby vetoes every lower-priority provider — priority is authority.
   The decision resolves as soon as the priority walk can decide — every
-  higher-priority position answered or failed and some position holding
-  an operative answer — and at the latest when the last selected
-  provider has answered or been skipped; the deadline is the outer
-  bound, not a wait. The winning answer is attributed to the provider
+  higher-priority position **normalization-complete** (its answer fully
+  validated or dropped, or the provider failed; a raw answer still
+  validating is not exhausted, since its folder entries may yet
+  normalize into the higher-priority operative result) and some
+  position holding an operative normalized answer — and at the latest
+  when the last selected provider's answer has completed normalization
+  or been dropped or skipped; the deadline is the outer bound, not a
+  wait. The winning answer is attributed to the provider
   that produced it.
 - Because the key space of `bridge.<lang>.aggregation` is method names, a
   per-language provider order works with no new machinery. This is the
@@ -883,7 +887,11 @@ requests were still pending), an incarnation abort, global teardown, and
 expiry alike cancel every still-pending routing request
 (`$/cancelRequest`) and retire its router entry atomically with the
 decision's settlement — a hung losing provider can never pin an entry
-indefinitely, and a late answer always finds its entry gone. The
+indefinitely, and a late answer always finds its entry gone. The same
+terminal outcomes also **remove the decision's queued validation jobs**
+and discard their waiters and eventual results; only an
+uninterruptible filesystem call already running stays detached, with
+its permit, until it returns. The
 driver and the per-server open tasks are additionally covered by a
 **pool-owned completion guard** of the same class the control protocol
 requires for its detached operations, with the two roles split. An
@@ -905,15 +913,26 @@ decided route settles *retained(key)* — later opens retry the key; a
 path would (deletion would let a later re-add resurrect what the live
 rule freezes); and an entry whose task died **before any directive was
 persisted** does not settle unilaterally while the shared flight still
-lives — its ownership transfers to the flight, it stays *pending*, and
-its settlement comes from the flight's outcome like any other entry's
-(deleting it early would let a lazy waiter ordinary-open a server the
-flight's answer is about to suppress). Deletion — a terminal event,
-not a silent removal: waiters subscribed to the entry are woken with
-"retry as absent", atomically with the removal, and the absent-record
+lives — the guard's adoption check and the flight's terminalization
+share **one locked handshake**: under that lock the guard either finds
+the flight non-terminal and transfers the entry to it (the flight's
+outcome then settles it like any other entry — deleting it early would
+let a lazy waiter ordinary-open a server the flight's answer is about
+to suppress), or finds the flight already terminal and finalizes the
+entry immediately from that outcome; a driver settling concurrently
+scans owned entries under the same lock, so no entry can slip between
+adoption and settlement ownerless. Deletion — a terminal event, not a
+silent removal: waiters subscribed to the entry are woken with "retry
+as absent", atomically with the removal, and the absent-record
 semantics (ordinary resolution, lazy retry) apply — happens only once
 the flight has terminally established that no directive applies to
-the entry, or on the retryable generation/stopped mismatches. The guard settles records; it never
+the entry, or on the retryable generation/stopped mismatches. This is
+the one **recorded narrowing of the freezing guarantee**: a normal
+no-answer decision settles a key and freezes it, but an abnormally
+dead open task never ran its acquire and the guard must not acquire
+on its behalf, so the entry ends absent instead of frozen — the next
+open to consult the absent record re-resolves and establishes the
+freeze then. The guard settles records; it never
 performs opens or acquires. Cancellation ownership is **exclusively
 the driver/flight side's**: open tasks are passive subscribers and
 their guard touches no provider request; the flight's cleanup honors
