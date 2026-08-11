@@ -1079,7 +1079,7 @@ a slot a routing provider left in play.
 - Transport-level fail-open: no provider, a slow provider, a crashed
   provider, or a malformed answer all reproduce today's *initial* routing
   decision, at worst one decision deadline later (the resulting fallback
-  binding still freezes the root for the document's lifetime — the
+  binding still freezes the root for the binding's lifetime — the
   Decision section's recorded difference).
 - Per-language provider policy falls out of the aggregation machinery for
   free, as does the ordered-allowlist vocabulary users already know.
@@ -1173,8 +1173,8 @@ a slot a routing provider left in play.
   active route binding are new state beside the pool's per-connection
   maps; the binding rides the per-document lifecycle the
   open-incarnation tracker maintains, with the injection-tuple
-  last-region eviction (and its per-host binding-generation counter)
-  layered on top.
+  last-region eviction layered on top (the binding-generation counter
+  is session-global, not per-document state).
 - Fan-out/fan-in reuse `fan_out` + the `preferred` collector over the
   expanded priority walk, with the routing-specific provider universe
   (all spawnable configured servers, advertisement-filtered) and the
