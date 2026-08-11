@@ -39,7 +39,8 @@ and a downstream server is the answering authority.
 
 Introduce a kakehashi-initiated custom request, `kakehashi/bridge/routing`,
 sent to downstream servers that advertise support. The answer refines
-kakehashi's own routing decision for one (document, language) pair; every
+kakehashi's own routing decision for one (document, layer, language)
+tuple; every
 absence — no provider, `null` answer, missing server entry, timeout, error —
 falls back to kakehashi's existing behavior. The protocol is fail-open on
 the transport: absence or failure of providers reproduces today's
@@ -461,8 +462,10 @@ candidates at all likewise queries nothing.
   normalization produced by the deadline. Folder-entry validations
   launch **concurrently** onto the pool (admission is FIFO per
   decision), so one blocked entry cannot serially starve later entries
-  of the deadline. Admission order is canonical — entries enqueue in
-  server-name order, not JSON object order — and the non-starvation
+  of the deadline. Admission order is canonical across answers — jobs
+  enqueue by (the answering provider's priority-walk position, then
+  server name within the answer), never by JSON object order or
+  response-arrival race — and the non-starvation
   claim is scoped honestly: concurrency removes *serial* dependency
   between entries, while pool *capacity* can still gate them (a hung
   validation retains its permit), in which case entries denied
@@ -816,7 +819,7 @@ defines), and runs the fan-in over whatever normalized results exist —
 a completed suppression or affirmation from an answered provider still
 wins its position; the **whole** fallback is synthesized, atomically
 with the retirements so a late response has nowhere to land, only when
-nothing operative arrived at all — then proceeds, warned. Routing requests are **excluded from Tier-2 liveness accounting**,
+no operative normalized result remains — then proceeds, warned. Routing requests are **excluded from Tier-2 liveness accounting**,
 exactly as bridge-client-control-protocol excludes pass-through and via the
 same per-entry classification: they carry their own deadline, and a slow
 provider must degrade routing, never drive a `Ready` connection to
@@ -870,24 +873,32 @@ decision's settlement — a hung losing provider can never pin an entry
 indefinitely, and a late answer always finds its entry gone. The
 driver and the per-server open tasks are additionally covered by a
 **pool-owned completion guard** of the same class the control protocol
-requires for its detached operations: an abnormal exit — panic or
-abort — CAS-settles the exact flight to the fallback and retires its
-retained (handle, id) registrations, so no crash can leave a flight,
-a router entry, or a pending binding stuck until shutdown. The guard
-finalizes **per entry** too, by the stage the dead task reached: a
-decided suppression commits as *suppressed* (a record-only admission
-the guard can perform); a decided route settles *retained(key)* —
-later opens retry the key; an entry whose task died before any
-directive or key was persisted settles ***unresolved***, consumed
-exactly like an absent record so ordinary resolution and lazy retry
-still work — never *not-applicable*, which stays reserved for genuine
-candidacy rejection. The guard settles records; it never performs
-opens or acquires. It also **owns cancellation**: a finalized entry's
-transmitted-but-pending request gets its `$/cancelRequest` atomically
-with retirement (skipped only when the request was never written), and
-a (handle, id) registration is attached to the guard's cleanup
-ownership **atomically with the router insertion**, so a panic between
-the two cannot leak an unretained registration.
+requires for its detached operations, with the two roles split: an
+abnormal exit of the **driver** CAS-settles the exact *flight* — to
+its partial results when some exist, the fallback otherwise — while an
+abnormal exit of one **open task** finalizes only that task's own
+(incarnation, flight, server) *entry*, never discarding a
+still-running or already-decided shared flight. Entry finalization is
+by the stage the dead task reached, and it commits **through the same
+route-admission critical section as the live path** — the locked
+candidacy, generation, and both-key stopped checks included, so an
+abnormal exit cannot grandfather a directive a reload or `stop` has
+since rejected (a check that misses simply deletes the entry): a
+decided suppression commits as *suppressed*; a decided route settles
+*retained(key)* — later opens retry the key; and an entry whose task
+died before any directive or key was persisted, or whose admission
+checks miss, is **deleted** — the absent-record semantics already
+defined (ordinary resolution, lazy retry) apply, with no new state to
+consume. The guard settles records; it never performs opens or
+acquires. It also **owns cancellation**, honoring
+ls-bridge-message-ordering's queued-versus-sent distinction: work
+still queued at the writer is atomically marked for writer-side skip,
+work writing-or-sent gets its `$/cancelRequest`, and either happens
+before the entry's retirement — never a bare "not written" test that a
+queued item could race past. A (handle, id) registration is attached
+to the guard's cleanup ownership **atomically with the router
+insertion**, so a panic between the two cannot leak an unretained
+registration.
 
 **Where the await lives.** The decision is *not* awaited on the `didOpen`
 handler. The handler's candidate enumeration stays synchronous and the
