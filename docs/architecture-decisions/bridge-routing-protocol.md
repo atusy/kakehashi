@@ -564,8 +564,11 @@ Decision-cache lifecycle:
   by open documents × layers × languages; entries in **both** carry
   per-candidate-server payloads (a normalized answer's routing map, a
   binding's settlements) and capped folder lists, so the byte bound
-  multiplies by the candidate-server count and the folder cap, with the
-  framing ceilings bounding the strings themselves.
+  multiplies by the candidate-server count and the folder cap. The
+  framing ceilings bound the *answer-originated* strings; keys and
+  values that originate elsewhere — host URIs from upstream traffic,
+  server names from configuration — are bounded by their own sources,
+  not by downstream framing.
 - **Flushed wholesale whenever the set of `Ready` advertising providers
   changes** — a provider reaching `Ready`, being replaced by restart or
   respawn, being stopped, failing, or having its advertisement cleared by
@@ -623,14 +626,15 @@ Decision-cache lifecycle:
     — so a flight re-anchors only when each advance since its anchor is
     a recorded Ready transition of a handle it awaited; any other
     cause, another provider's arrival or a workspace-folder change,
-    discards as usual. The bookkeeping is **per-flight eligibility
-    state, not a cause log**: the same pool critical section that
-    bumps the epoch walks the live flights and either marks each
-    still-eligible (this bump was an awaited handle's Ready) or
-    invalidates it, and flight registration, re-anchoring, settlement,
-    and this marking all share that lock — so eligibility can neither
-    grow with flush churn nor race a flight's registration, and a
-    flight whose provenance is missing discards, never re-anchors;
+    discards as usual. The bookkeeping is a **bounded cause ring**, not
+    a log and not a per-flush walk: the epoch-bumping critical section
+    appends one (epoch, cause, handle) record in O(1) — never touching
+    the live flights, whose count scales with open documents — and a
+    flight re-anchors by reading only the causes in its own anchor gap,
+    under the same lock that registers, re-anchors, and settles
+    flights. The ring's capacity is an implementation-defined small
+    constant; a flight whose gap has overflowed the ring — or whose
+    provenance is missing for any reason — discards, never re-anchors;
   - an **incarnation** move (`didClose`, or close/re-open) **aborts**
     the waiting tasks outright — no `didOpen` is sent at all, and the
     incarnation is re-checked at the open's enqueue commit point, so an
@@ -1067,8 +1071,8 @@ a slot a routing provider left in play.
 - The cache flush hook fires on `Ready`-set transitions of advertising
   servers: handshake completion, replacement insertion, stop, failure,
   and `-32601` advertisement clearing. Each is already a pool-lock commit
-  point; the flush (a map clear plus an epoch bump) is synchronous, safe
-  to run inside them.
+  point; the flush (a map clear, an epoch bump, and an O(1) cause-ring
+  append) is synchronous, safe to run inside them.
 - The frame reader currently allocates the declared `Content-Length`
   before parsing anything, so the answer-size bound needs a
   **framing-level ceiling on downstream message size** — a transport
