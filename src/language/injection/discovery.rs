@@ -551,8 +551,17 @@ fn find_injection_at_position<'a>(
     });
     match boundary {
         RegionBoundary::HalfOpen => half_open,
-        // Fallback not yet wired (RED scaffold).
-        RegionBoundary::CaretEndFallback => half_open,
+        RegionBoundary::CaretEndFallback => half_open.or_else(|| {
+            // No region contains the byte: accept a region whose trailing edge
+            // the caret sits on, provided that edge is mid-line (see the
+            // variant doc for why column 0 stays outside). Same iteration
+            // order as above, so nested regions ending at the same byte keep
+            // the established first-match (outermost) tie-break.
+            injections.iter().enumerate().find(|(_, inj)| {
+                inj.content_node.end_byte() == byte_offset
+                    && inj.content_node.end_position().column > 0
+            })
+        }),
     }
 }
 
