@@ -1430,13 +1430,20 @@ impl Kakehashi {
         method_name: &str,
     ) -> Option<RangeRequestContext> {
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
-        // The normalized position is lookup-only here; the handler's range is
-        // clamped to the region by its own path.
-        let (preamble, _) = self.resolve_bridge_preamble(lsp_uri, range.start, method_name)?;
+        let (preamble, start) = self.resolve_bridge_preamble(lsp_uri, range.start, method_name)?;
         let document = self
             .preamble_to_document_context(preamble, method_name)
             .await?;
 
+        // Dispatch must see the same defended start the region was resolved
+        // with — this path (inlay hints, color presentations) forwards the
+        // range verbatim, with no later clamp. Character clamping only ever
+        // moves the start left, so `max` keeps the range well-formed even
+        // for a degenerate all-overlong input.
+        let range = Range {
+            start,
+            end: range.end.max(start),
+        };
         Some(RangeRequestContext { document, range })
     }
 
