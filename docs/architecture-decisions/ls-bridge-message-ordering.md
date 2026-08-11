@@ -264,34 +264,44 @@ Operations are gated at two levels: **server lifecycle** and **document lifecycl
   - During `Initializing`, accepted notifications enter a **pre-ready
     holding queue**, separate from the wire FIFO — a strict single FIFO
     could not reorder traffic accepted before the initialize response
-    behind the later `initialized`. Only handshake-owned traffic — plus
-    **responses to server-initiated requests LSP permits during
-    initialization** (`window/showMessageRequest`,
-    `window/workDoneProgress/create`), which travel the wire FIFO
-    immediately because withholding them could deadlock the handshake —
-    reaches the wire until `initialized` has been written (LSP forbids
-    the client any other request or notification before the initialize
-    response; a `window/workDoneProgress/create` in this window is a
-    *nonconforming* server — the bridge answers it anyway, logged, as
-    tolerance, since refusing could wedge initialization). The
-    `initialized` enqueue, the holding-queue transfer into the FIFO
-    (arrival order), and the admission cutover happen under **one
-    exclusion** — a `Flushing` sub-state of the `Initializing → Ready`
-    commit — so a producer that observes `Ready` can never enter the
-    FIFO ahead of older held notifications
-    (bridge-client-control-protocol). The transfer is a **splice with
-    reserved capacity**: the FIFO's bound governs *admission*, never the
-    splice — a splice cannot be refused and never drives
-    `Flushing → Failed`; if the combined depth exceeds the bound,
-    admission simply stays closed until the writer drains below it.
-    State-replacement notifications (`workspace/didChangeConfiguration`)
-    are **not held at all**: the pool already retains current settings
-    and pushes the latest value after `initialized`, and holding stale
-    copies would invert latest-value semantics. The holding queue —
-    which therefore carries only sequence-dependent document sync — is
-    bounded (4096, the wire FIFO's bound); on overflow the newest
-    notification is dropped with a warn log, self-healing because the
-    derived open paths re-establish document state once `Ready` lands
+    behind the later `initialized`. Only handshake-owned traffic reaches
+    the wire until `initialized` has been written, with exactly two
+    exemptions, categorized separately: the **conforming exception** —
+    responses to `window/showMessageRequest`, the one server-initiated
+    request LSP permits before the initialize response, travel the wire
+    FIFO immediately because withholding them could deadlock the
+    handshake — and a **tolerated extension**: a
+    `window/workDoneProgress/create` in this window is a nonconforming
+    server, which the bridge nevertheless answers (logged) since
+    refusing could wedge initialization. The `initialized` enqueue, the
+    holding-queue transfer into the FIFO (arrival order), and the
+    admission cutover happen under **one exclusion**: `Flushing` is
+    **lock-private and non-suspending** — the interior of the
+    `Initializing → Ready` commit's critical section, not an observable
+    `ConnectionState` value — so shutdown, initialization-timeout, and
+    writer-failure arbitration still race only the existing conditional
+    `Initializing → Closing/Failed` transitions, and a commit that loses
+    that race never publishes `Ready` or flushes. A producer that
+    observes `Ready` can never enter the FIFO ahead of older held
+    notifications (bridge-client-control-protocol). Capacity semantics:
+    **4096 is the admission threshold, not the allocation** — the FIFO's
+    memory bound is the admission threshold plus the holding queue's
+    bound plus headroom for loss-intolerant responses, and the splice
+    consumes capacity reserved at hold time, so it can neither be
+    refused nor exceed allocation, and never drives a failure; while the
+    combined depth sits above the admission threshold, admission stays
+    closed until the writer drains below it. What may legally enter the
+    hold is narrow: **document lifecycle notifications keep their
+    Ready-only gating and are never held** (they arrive via the
+    post-Ready derived open paths — flushing a held `didChange` ahead of
+    the derived `didOpen` would violate the document lifecycle), and
+    state-replacement notifications (`workspace/didChangeConfiguration`)
+    are not held either — the pool retains current settings and pushes
+    the latest value after `initialized`, and holding stale copies would
+    invert latest-value semantics. The hold therefore carries only the
+    residue of non-document, non-state-replacement notifications (e.g.
+    `$/setTrace`) and is expected to be near-empty; its bound (4096) is
+    a safety net, with drop-newest-and-warn overflow
   - `Closing`/`Closed` → DROP (writer loop stopped, see ls-bridge-graceful-shutdown)
   - Subject to document lifecycle gating below
 
@@ -435,7 +445,7 @@ awaits only cancel-safe primitives.
 - Trade-off: Better than silent permanent hang
 
 **Notification Dropping Under Extreme Backpressure:**
-- Notifications can be dropped if queue full (256+ operations)
+- Notifications can be dropped if queue full (4096+ operations at the admission threshold)
 - Only under extreme conditions
 - Recoverable via subsequent notifications
 
