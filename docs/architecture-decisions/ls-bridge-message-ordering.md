@@ -62,8 +62,9 @@ A thin bridge that forwards requests and relies on client-driven cancellation:
 │                    ▼                                     │
 │  ┌──────────────────────────────────────────────────┐    │
 │  │           Unified Order Queue (FIFO)             │    │
-│  │  Bounded capacity (4096; 256 caused routine      │    │
-│  │  fan-out loss)                                   │    │
+│  │  Bounded admission threshold (4096; 256 caused   │    │
+│  │  routine fan-out loss) — see § Non-Blocking      │    │
+│  │  Backpressure for the full allocation bound      │    │
 │  │  - Ensures FIFO ordering                         │    │
 │  │  - Non-blocking backpressure (try_send)          │    │
 │  └─────────────────┬────────────────────────────────┘    │
@@ -150,7 +151,7 @@ The bridge tracks pending requests for response correlation only:
 
 ### 3. Non-Blocking Backpressure
 
-The bounded order queue (capacity: 4096 — raised from the original 256, which caused routine fan-out loss) uses `try_send()` to prevent deadlocks during slow initialization.
+The bounded order queue (admission threshold: 4096 — raised from the original 256, which caused routine fan-out loss) uses `try_send()` to prevent deadlocks during slow initialization. The full allocation bound is admission threshold + the pre-ready holding queue's bound + response headroom, where **response headroom equals the pending-request bound**: every loss-intolerant response corresponds to a pending request the router admitted, so headroom exhaustion is structurally impossible and the memory bound is testable as the sum of the three.
 
 **Strategy by Operation Type:**
 
@@ -298,10 +299,14 @@ Operations are gated at two levels: **server lifecycle** and **document lifecycl
     state-replacement notifications (`workspace/didChangeConfiguration`)
     are not held either — the pool retains current settings and pushes
     the latest value after `initialized`, and holding stale copies would
-    invert latest-value semantics. The hold therefore carries only the
-    residue of non-document, non-state-replacement notifications (e.g.
-    `$/setTrace`) and is expected to be near-empty; its bound (4096) is
-    a safety net, with drop-newest-and-warn overflow
+    invert latest-value semantics; `$/setTrace` has the same
+    latest-value shape and is likewise coalesced-to-latest and pushed
+    post-`initialized`, never held. With document sync Ready-gated and
+    every latest-value method coalesced, **no currently specified method
+    is admissible to the hold** — it is expected empty and exists as the
+    structural safety net for future sequence-dependent, non-document
+    notifications; its bound (4096) backs that safety net, with
+    drop-newest-and-warn overflow
   - `Closing`/`Closed` → DROP (writer loop stopped, see ls-bridge-graceful-shutdown)
   - Subject to document lifecycle gating below
 
