@@ -460,8 +460,10 @@ commit**: recovery derives from the last recorded commit — protocol
 commit point or primitive effect alike — so the finalizer inspects the
 actual pool state it finds rather than replaying a script. Between
 commit points and primitive calls the task holds no pool locks and
-touches no shared state other than its spawned process, whose kill
-handle is registered at spawn time. A commit point's
+touches no shared state other than the processes it owns, whose kill
+handles are registered **atomically at acquisition** — at spawn for a
+new process, at reclaim for a pre-existing writer or process — so no
+abort window exists between owning a process and having it on record. A commit point's
 critical section contains **no suspension point** — it runs synchronously
 under the pool lock — which is what makes a Tokio hard-cancel atomic with
 respect to it. Cancellation is observed on entry to each commit point; a
@@ -482,10 +484,15 @@ stop phase cannot leak a half-shut-down server that a reload has already
 dropped from the pool snapshot. Process termination has **exactly one
 owner at a time**: outside teardown the finalizer terminates the
 record's processes itself, bounded by the per-slot shutdown timeout
-(SIGTERM → SIGKILL; a child whose reap is still unconfirmed at the
-deadline — uninterruptible sleep, pending `wait` — transfers to a
-background zombie reaper rather than blocking settlement); during
-teardown that obligation transfers with the
+(SIGTERM → SIGKILL). A child whose **termination is unconfirmed** at the
+deadline never settles as closed: the slot stays non-`Closed`, `stop`
+settles `stopFailed`, and `restart` settles `restartFailed` and restores
+the fenced retry tombstone — a replacement must not spawn while the old
+process may still hold locks or sockets. Only a **confirmed-exited**
+child whose `wait` is still pending may transfer to the pool-owned
+background zombie reaper (reap-only, never live processes; its pending
+reaps join teardown's cleanup). During teardown the termination
+obligation transfers with the
 live process registry to the escalation phase, and finalization settles
 **records and pool state only** — no two paths ever kill or reap one
 child. Settlement itself is idempotent by construction (it inspects the
