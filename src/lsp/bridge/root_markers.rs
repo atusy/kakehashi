@@ -561,4 +561,23 @@ mod tests {
         assert_eq!(root_uri.as_deref(), Some("file:///client/root"));
         assert_eq!(folders, Some(vec![fallback_folder]));
     }
+
+    /// Windows drive letters are case-insensitive: two equally valid URL
+    /// spellings of one directory decode to `C:\\repo` and `c:\\repo`, and
+    /// treating them as distinct re-announces folders or forks per-root
+    /// processes. Only the DRIVE folds — differently cased remaining
+    /// components stay distinct (case-sensitive volumes exist), as do
+    /// different drives. The portable equivalence tests derive both spellings
+    /// from one path, so their drive casing is identical and this folding
+    /// needs its own pin.
+    #[cfg(windows)]
+    #[test]
+    fn same_root_uri_folds_only_the_windows_drive_letter() {
+        assert!(same_root_uri("file:///C:/repo", "file:///c:/repo"));
+        assert!(!same_root_uri("file:///C:/repo", "file:///D:/repo"));
+        assert!(
+            !same_root_uri("file:///C:/Repo", "file:///C:/repo"),
+            "non-drive components must not fold"
+        );
+    }
 }
