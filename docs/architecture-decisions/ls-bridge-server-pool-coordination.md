@@ -537,7 +537,7 @@ languageServers:
   - Router sends one `Teardown` message to the lifecycle actor, which launches per-connection shutdown sub-tasks; ls-bridge-graceful-shutdown specifies the per-connection sequence
 - **[bridge-routing-protocol](bridge-routing-protocol.md)**: Downstream routing delegation
   - A routing provider's `workspaceFolders` answer overrides the marker-walk root resolution
-  - `forceStart` spawns eagerly under the marker-less fallback root shape
+  - `forceStart` spawns eagerly — the `#shared` key with the primary-root seed for `preferSharedInstance` servers, the marker-less fallback shape otherwise
 
 ## Amendment History
 

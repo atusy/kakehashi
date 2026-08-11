@@ -136,9 +136,11 @@ The result layers a "kakehashi decides" default at every granularity:
   any `didOpen` — the eager per-server open tasks, the lazy per-request
   open (the `ensure_document_opened` call on the request-execute path),
   and the derived re-open sweep alike. The applied decision is recorded
-  as an **active route binding** that lives until the document closes
-  (see Caching below), so no later request can open the document there
-  through a side door for as long as it stays open (the gate's placement
+  as an **active route binding** that lives for the binding's lifetime
+  — until the host's `didClose` for the host layer; until `didClose` or
+  the language's last region disappearing for an injection tuple (see
+  Caching below) — so no later request can open the document there
+  through a side door while the binding lives (the gate's placement
   is specified under the deadline section). This is **per-document forwarding
   suppression**, not slot control: the connection (if any) is untouched
   and other documents route normally. It is deliberately weaker than
@@ -392,8 +394,9 @@ rendering. The query goes to the first handle that is **`Ready` and
 advertising**; when none exists and the initialization wait applies, the
 wait targets the first **wait-eligible `Initializing`** handle in the
 same order (an `Initializing` handle cannot advertise yet — its
-eligibility comes from the per-name memo or an explicit `priorities`
-entry). An arbitrary but stable choice, recorded as such.
+eligibility comes from the per-name memo, an explicit `priorities`
+entry, or `forceStart`). An arbitrary but stable choice, recorded as
+such.
 
 Provider order is configured through the existing per-method aggregation
 map — `languages.<host>.bridge.<lang>.aggregation`, abbreviated
@@ -597,8 +600,9 @@ structures with different lifetimes carry the outcome:
   shared route is **not applicable**: the sweep neither opens with
   unannounced folders nor silently re-roots to a per-root key; the
   document's features on that server stay dark until close/re-open runs
-  a fresh decision under the new capability reality. It is evicted only by the host
-  document's `didClose`, never by a flush — this is what makes
+  a fresh decision under the new capability reality. It is evicted only
+  at the end of its lifetime — the host's `didClose`, or an injection
+  tuple's last-region disappearance — never by a flush — this is what makes
   invalidation non-retroactive without opening side doors: a flushed
   *cache* cannot lift a suppression or re-root an open document onto a
   second same-name connection, because those sites read the *binding*.
@@ -616,10 +620,13 @@ structures with different lifetimes carry the outcome:
   config-root process instead of the one that produced the item
   (ls-bridge-server-pool-coordination is amended accordingly). The
   envelope must carry enough identity to *hit the right binding*: the
-  layer/language pair and the open incarnation (or the exact key plus
-  incarnation), matched exactly — after a close/re-open the same URI
-  holds a *new* binding, and an unstamped stale item would silently
-  resolve through it. A resolve whose stamp no longer matches — the
+  layer/language pair, the open incarnation, and the tuple's **binding
+  generation** — a counter bumped each time the tuple's binding is
+  (re)created, because an injection language can leave and re-enter the
+  document without the host incarnation moving — matched exactly: after
+  a close/re-open or a tuple re-creation the same URI holds a *new*
+  binding, and an unstamped stale item would silently resolve through
+  it. A resolve whose stamp no longer matches — the
   binding evicted, or a newer incarnation in its place — fails soft as
   an unroutable envelope does today.
 
@@ -633,7 +640,13 @@ Decision-cache lifecycle:
   pending flight through the same cleanup path a `didClose` uses, so a
   flight whose subscribers vanished with their regions still reaches a
   terminal state, and a document that churns through language ids does
-  not accumulate tuples for its whole open lifetime. A configuration reload
+  not accumulate tuples for its whole open lifetime. "Disappears" means
+  an **authoritative parse result without the language** — transient
+  tree-less states (a reload-invalidation placeholder, a parse failure,
+  a missing parser) preserve bindings, and the parse-state
+  discriminator that distinction requires, which the re-open decision
+  records as not existing today, is an implementation prerequisite of
+  this eviction rule. A configuration reload
   flushes the whole cache: superseded-generation entries are unreadable
   under the new generation and would otherwise sit resident until their
   document closes. Cache and binding are each bounded in top-level keys
@@ -734,9 +747,12 @@ Decision-cache lifecycle:
   (fail-open). A stale answer is never applied across a reload.
 
 Invalidation is **not retroactive**: it affects only *new* decisions —
-first opens and close/re-opens; the derived re-open after a restart reads
-the binding and is untouched by cache invalidation — and never tears down
-routes already established for an open document. Re-routing a live document is a close/re-open, initiated by
+first opens and close/re-opens (for an injection language, also its
+leaving and re-entering the document); the derived re-open after a
+restart reads the binding and is untouched by cache invalidation — and
+never tears down routes already established for an open document.
+Re-routing a live document is a close/re-open — or, for one injection
+language, an edit that removes and re-introduces it — initiated by
 whoever holds the document, not by the bridge. Providers have no push
 channel to signal policy changes (deferred — below), so a decision can be
 stale for a document's whole open lifetime; that is recorded as a
@@ -863,8 +879,9 @@ configured. Two pieces close most of the gap:
   never stops an already-running server — within a session the flag is
   effectively one-way; `stop` is the lever that stops.
 - **Bounded initialization wait**: a provider whose advertisement is
-  known (or that is explicitly named in `priorities` — the filter above)
-  and that is still `Initializing` at query time is awaited **within the
+  known, that is explicitly named in `priorities`, or that carries
+  `forceStart` (the filter above), and that is still `Initializing` at
+  query time is awaited **within the
   decision deadline** by subscribing to the handshake's terminal
   transition. The subscription wakes on *any* exit from `Initializing`:
   `Ready` (fan out if the advertisement holds), `Failed`, and `Closing`
@@ -1071,8 +1088,9 @@ a slot a routing provider left in play.
 - Routing is pull-only and non-retroactive: a document's decision can be
   stale for its whole open lifetime as project state moves under it; the
   provider has no way to say so (deferred invalidation notification),
-  and an open document keeps its route binding until close/re-open even
-  when a newer provider would decide differently.
+  and an open document keeps its route binding until close/re-open (an
+  injection tuple: until its language leaves the document) even when a
+  newer provider would decide differently.
 - Under the default `priorities = ["*"]`, a server upgrade that adds the
   advertisement silently promotes an installed server to routing
   authority, and ordering between multiple `"*"`-group providers is
@@ -1210,8 +1228,8 @@ a slot a routing provider left in play.
 | **Precedence** | membership: stopped set > configuration > answer (subtract only); root: answer overrides marker resolution, both resolved keys checked against the stopped set |
 | **Trust** | providers are trusted-by-configuration; folder overrides bounded to canonicalized `file:` URIs at-or-below client workspace folders or the config-resolved root, count-capped |
 | **Folders↔Key** | shared instance: union-only join; per-root: first element, rest warned+ignored; at most one connection per server name per document |
-| **Providers** | all spawnable configured servers ∩ advertising ∩ `Ready` (Initializing awaited only when the advertisement is known or the server is named), ordered by routing `priorities` (no `"_"` method-wildcard inheritance); concurrent fan-out, `preferred` fan-in, operative-entry rule |
+| **Providers** | all spawnable configured servers ∩ advertising ∩ `Ready` (Initializing awaited only when the advertisement is known, the server is named, or it carries `forceStart`), ordered by routing `priorities` (no `"_"` method-wildcard inheritance); concurrent fan-out, `preferred` fan-in, operative-entry rule |
 | **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy, plus a separate binding-reuse validation budget); expiry cancels pending requests, retires entries, falls open; exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
-| **Caching** | decision cache per (host URI, layer, languageId, config generation), single-flight, evicted on `didClose`, flushed on reload / `Ready`-provider-set / workspace-folder-set change, (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until `didClose`; never retroactive |
-| **Cold start** | `forceStart` (post-config-publication get-or-create, marker-less fallback root shape, warm-up scope limited to shared/marker-less/policy servers) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
+| **Caching** | decision cache per (host URI, layer, languageId, config generation), single-flight, evicted on `didClose`, flushed on reload / `Ready`-provider-set / workspace-folder-set change, (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until `didClose` (injection tuples: also last-region disappearance); never retroactive |
+| **Cold start** | `forceStart` (post-config-publication get-or-create; `#shared` + primary-root seed for `preferSharedInstance` servers, the marker-less fallback shape otherwise; warm-up scope limited to shared/marker-less/policy servers; wait-eligible for the initialization wait) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
 | **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; re-open reads the binding only |

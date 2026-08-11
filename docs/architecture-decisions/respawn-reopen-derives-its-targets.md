@@ -55,7 +55,8 @@ and opens the ones that do.
 
 No captured re-open *target list* is remembered, so no such list can go
 stale. (Per-document route bindings — bridge-routing-protocol — *are*
-remembered for a document's open lifetime and are consulted by the
+remembered for each binding's lifetime — the host's close, or an
+injection tuple's last-region disappearance — and are consulted by the
 belongs-here question below; their staleness is that decision's recorded
 trade-off, not a captured-list resurrection.)
 
@@ -116,10 +117,14 @@ with the work that belongs to the connection.
    the injection units are the resolved injections stage 2 already
    produces, and the host layer is its own unit — screened by
    `_self`/host-language candidacy rather than injections — with each
-   unit routed to its own `didOpen`; one host can suppress a server for
-   one injection language while another language — or the host layer —
-   routes to a different key, and the sweep re-opens only the units whose
-   own binding names this connection. A binding still *pending* at the sweep's bounded
+   unit routed to its own opens — an injection unit carries **all** of its
+   language's current regions and enqueues every one of their virtual
+   `didOpen`s, the host unit enqueues the host `didOpen`; any
+   required-open failure fails the applicable host, while a host with
+   zero applicable units reads NotApplicable. One host can suppress a
+   server for one injection language while another language — or the
+   host layer — routes to a different key, and the sweep re-opens only
+   the units whose own binding names this connection. A binding still *pending* at the sweep's bounded
    wait is applicable-but-unsettled, not "not applicable": the barrier's
    fail-soft path applies, never a successful omission. The stage stays
    read-only either way: the sweep never issues a routing query.
