@@ -386,9 +386,9 @@ surfaces through the `JoinSet`; a handle landing in that window is
 killed-and-reaped by the final settlement, so no child can slip in
 behind an escalation scan, and teardown publishes completion only after
 its adopted `Spawning` entries have settled this way (or, at the final
-deadline, publishes as failed per the disposition below). Claim closure is
-**deadline-bounded like everything else** — with the deadline belonging
-to whoever is waiting. `stop`/`restart` wait under the per-slot
+deadline, publishes as failed per the disposition below). **Operations waiting for claim closure are deadline-bounded**; claim
+closure itself may outlive a reload. The deadline belongs to whoever is
+waiting. `stop`/`restart` wait under the per-slot
 deadline and teardown under its absolute one; a **reload** claim has no
 waiter of its own — the reload reply commits with the claim, an
 acquisition deadline terminates only its acquire waiter, and the
@@ -460,7 +460,8 @@ enum LifecycleMsg {
     //   notify path everything else uses: cleanup dissolution wakes it
     //   to spawn under the new generation, deletion wakes it with the
     //   deleted-server error, teardown with the sealed error, and the
-    //   deadline expiring first fails it like any timed-out acquire; reload DELETION removes the row instead, and the
+    //   deadline expiring first fails it like any timed-out acquire.
+    //   Reload DELETION is its own case: it removes the row, and the
     //   removal itself notifies waiters of that (key, generation) with
     //   the deleted-server acquire error — the notification carries the
     //   terminal answer, so no row needs to remain. No pending reply
