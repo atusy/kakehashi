@@ -153,6 +153,8 @@ All position-to-node resolution uses **half-open intervals** `[start, end)`:
 
 This makes "cursor at the closing fence of a code block" unambiguously **outside** the injection.
 
+**Bridge routing divergence (caret-shaped methods).** This section governs *node containment* — the question "which node is the cursor on?". Bridge *routing* asks a different question — "where is the user typing?" — and for exactly three methods whose request position is the insert-mode caret (completion, signatureHelp, linkedEditingRange), the bridge's region lookup adds a fallback: when no region contains the byte half-open, a region whose end byte equals the cursor **and** whose end sits mid-line (non-zero end column) is accepted (`RegionBoundary::CaretEndFallback` in `src/language/injection/discovery.rs`). The caret after the last typed character of a mid-line-ending injection (a vim `!cmd`, an embedded string) is that region's end byte, and it maps to the virtual document's end-of-content — a valid LSP position. A region ending at column 0 is deliberately excluded, so "cursor at the closing fence" stays outside, and half-open containment always wins first, so an adjacency `end(A) == start(B)` still resolves to B. Node resolution (`kakehashi/node`) is unaffected.
+
 #### End-of-Document Exception
 
 LSP positions allow the cursor to sit **after the last byte** of the document (`b == L`, where `L` is the document length). This is the position users reach via End-of-file motions and is naturally produced when appending text. Under the strict half-open rule, no node — not even the root — would contain `b == L`, so every node query at end-of-document would return `null`. This breaks AST-walking commands at end-of-file.
