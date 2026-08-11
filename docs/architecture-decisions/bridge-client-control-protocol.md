@@ -121,12 +121,12 @@ Both parameters are optional and compose as AND:
   retain an assignment for** this document: the document (or one of its
   injections) bridges to the server *and* resolves to this connection's
   root — consulting the document's active route bindings first, matched
-  per exact (host, layer, language, server) tuple
-  (bridge-routing-protocol), so an overridden or suppressed route
-  filters by where the document actually opened; ordinary resolution
-  applies per exact entry — only where that (host, layer, language,
-  server) entry has no record (other servers' settlements on the same
-  tuple do not block it) — and a *pending* entry
+  per exact **server entry** within the (host, layer, language)
+  decision tuple (bridge-routing-protocol), so an overridden or
+  suppressed route filters by where the document actually opened;
+  ordinary resolution applies per exact entry — only where this
+  server's entry has no record (sibling servers' settlements on the
+  same decision tuple never affect it) — and a *pending* entry
   (its decision still in flight) matches nothing yet — the document is
   not open there — rather than falling through. A *retained* entry (that
   server's route decided but its acquire failed, or never ran because

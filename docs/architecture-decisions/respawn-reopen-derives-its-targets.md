@@ -125,9 +125,12 @@ with the work that belongs to the connection.
    zero applicable units reads NotApplicable. One host can suppress a
    server for one injection language while another language — or the
    host layer — routes to a different key, and the sweep re-opens only
-   the units whose own binding names this connection. A binding still *pending* at the sweep's bounded
-   wait is applicable-but-unsettled, not "not applicable": the barrier's
-   fail-soft path applies, never a successful omission. The stage stays
+   the units whose own **server entry** (within the unit's decision
+   tuple) names this connection. A server entry still *pending* at the
+   sweep's bounded wait is applicable-but-unsettled, not "not
+   applicable": the barrier's fail-soft path applies, never a
+   successful omission; a sibling entry's state never decides this
+   server's applicability. The stage stays
    read-only either way: the sweep never issues a routing query.
 
 Stage 1 is deliberately conservative — a server declaring the `*` wildcard is

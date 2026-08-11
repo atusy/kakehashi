@@ -476,8 +476,11 @@ candidates at all likewise queries nothing.
   orders jobs **within one decision**; the shared pool arbitrates
   **across** decisions — and the binding-reuse validations, which have
   no provider or position and form their own queue — by fair
-  round-robin over the per-decision queues, and a queue at its bound
-  refuses the enqueue, which reads as that entry's capacity drop. "Arrival" for fan-in
+  round-robin over the per-decision queues. The queue bound is
+  **global** — one implementation-defined cap on queued jobs across
+  all decisions and the reuse queue, with the per-decision structure
+  only ordering fairness beneath it — and a refusal at either level
+  reads as that entry's capacity drop. "Arrival" for fan-in
   purposes is **completed normalization**, not raw receipt: an answer
   becomes eligible as a whole once every entry has validated or
   dropped — a suppression-only answer normalizes instantly and so
@@ -631,16 +634,22 @@ structures with different lifetimes carry the outcome:
   restores plain *retained* **through the same token-and-incarnation
   CAS the claimant would use**: on a match it restores and publishes;
   on a mismatch (the entry moved — close/re-open, eviction, another
-  transition) it leaves the current state untouched and only releases
-  the old claim's waiters. Either way a dead claimant can never park
-  later retriers or overwrite a successor's state. A
+  transition) it leaves the current state untouched and publishes a
+  typed **superseded** outcome to the old claim's waiters, who must
+  revalidate their own incarnation and binding identity before acting
+  — an old-incarnation waiter never consumes a successor binding.
+  Either way a dead claimant can never park later retriers or
+  overwrite a successor's state. A
   successful retry transitions the entry to *routed* with the key the
   acquire actually landed on; a failed retry re-records
   *retained(actual attempted key)* with fresh provenance — after a
   capability downgrade that is the downgraded per-root key, initial
   attempt or retry alike, never a stale `#shared` name, with the
   route's folders preserved — so enumeration and later retries always
-  follow the key really being attempted;
+  follow the key really being attempted, and **every retry commit
+  emits a terminal record of its own** (the actual key and outcome
+  provenance), so the log never strands the obsolete key or the
+  original owner-died attribution as the last word;
   *not-applicable* settles when a server is genuinely rejected
   **before** any acquire runs — a configuration removal or disablement
   that ends its candidacy for the document — and is consumed like a

@@ -141,9 +141,10 @@ Global Shutdown overrides all (highest priority)
   effective bound on a lazy-open/retry validation is min(its configured
   budget, the enclosing request's deadline — including Tier-1 once
   Phase 3 lands — and the global shutdown ceiling); an upstream
-  cancellation discards the waiter and its result but never releases
-  the validation-pool worker permit early (the permit returns only when
-  the OS call does)
+  cancellation that leaves a job with no remaining waiter **removes it
+  from the queue while still queued** (no permit is ever spent on work
+  nobody wants), and only a job whose filesystem call is already
+  running keeps its permit until the call returns, its result discarded
 
 **Writer-Idle Timeout** (within the applicable shutdown deadline):
 - **Duration**: 2s fixed
