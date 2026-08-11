@@ -376,9 +376,14 @@ repeatedly failing slot before the next acquire respawns it is a
 first-class use of this method, not an edge case. `stop` on a pre-handle
 `Spawning` entry **settles the intent**: the entry is marked settling
 and retained until the spawn sub-task terminates, any handle its escrow
-receives in the meantime is killed and reaped, and only then does the
-tombstone install and `stop` answer (`null`, or `stopFailed` into a
-termination-pending record if the reap is unconfirmed). `restart` on a
+receives in the meantime is killed and reaped, and then the tombstone
+installs and `stop` answers (`null`, or `stopFailed` into a
+termination-pending record if the reap is unconfirmed). The wait is
+bounded like everything else: a spawn sub-task still unterminated at the
+per-slot deadline fails the `stop` (`stopFailed`) immediately, the
+entry converting to a fenced cleanup record that keeps the escrow open
+and the eventual child kill-and-reaped
+(ls-bridge-graceful-shutdown § Lifecycle Actor). `restart` on a
 `Spawning` slot is that same settlement followed by its ordinary respawn
 sequence.
 
@@ -744,7 +749,12 @@ namespace.
   enumerates as `stopping` — it is being wound down — with one
   exception: reload deletion follows the reload rule, dropping the
   entry from the published snapshot so the id resolves `unknownClient`
-  while the fenced cleanup record persists internally, unaddressable. `ConnectionState` alone could never provide this: it exposes
+  while the fenced cleanup record persists internally, unaddressable.
+  Visibility follows configuration: a later reload that re-adds the
+  same server name makes the surviving record addressable again — it
+  enumerates as `stopping`, still fencing acquires, and converts to the
+  fenced tombstone (`stopped`) when its cleanup completes, from which
+  `restart` revives the slot as usual. `ConnectionState` alone could never provide this: it exposes
   only `Initializing`, which cannot distinguish a restart in flight from
   an ordinary first spawn.
 - Acquire keeps using existing `Ready` connections lock-free; the

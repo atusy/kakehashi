@@ -319,7 +319,11 @@ What the previous machinery bought, the actor gives structurally:
   phase runs to `deadline − reserve`, escalation gets the remainder, and
   each `DeadlineExpired` token carries the operation generation it was
   armed for — a token whose generation no longer matches is stale and
-  dropped. A second `Teardown` upgrades the mode monotonically
+  dropped. The mailbox token is an optimization, not the record: the
+  **absolute deadline itself persists on the entry**, and an incarnation
+  recheck at startup settles any entry already past its deadline — so an
+  expiry consumed by a pre-commit panic can never leave an operation
+  beyond its ceiling. A second `Teardown` upgrades the mode monotonically
   (`ProcessExit` dominates) but can never extend the ceiling — an active
   run retains the **earliest** deadline it has been offered. The actor
   owns the single completion watch, hands every caller a receiver, and
@@ -327,8 +331,10 @@ What the previous machinery bought, the actor gives structurally:
   surface or log a failed teardown rather than mistaking it for success. A
   `Teardown(ProcessExit)` arriving **after** a completed `ServerRemains`
   run is a new transition, not a lost upgrade: it adopts the retained
-  termination-pending records, log-abandons them (§ Unconfirmed
-  termination), and publishes its own completion.
+  termination-pending records **and spawn-cleanup records**, disposes
+  them per this section (abort-join-abandon for open intents,
+  log-abandon for known children — § Unconfirmed termination), and
+  publishes its own completion.
 - **Abnormal outcomes settle in one place** — the actor polls its
   sub-task `JoinSet` alongside the mailbox, so a sub-task that panics
   (and therefore never sends its completion) still surfaces as a
@@ -376,8 +382,14 @@ the absolute deadline for teardown) fails the operation
 (`stopFailed`/`restartFailed`) and converts the entry to a fenced
 cleanup record — escrow still open, the eventual child still
 killed-and-reaped on arrival — while teardown disposes that record by
-mode (`ProcessExit` logs and abandons the intent; `ServerRemains`
-retains it) instead of waiting indefinitely. The pairing applies to the
+mode instead of waiting indefinitely: `ServerRemains` retains it, and
+`ProcessExit` **aborts the producer first** — an open-escrow intent's
+claim stays authoritative until its producer is closed, because unlike
+an already-escalated child, an unaborted spawn task could create a
+fresh child with no retained record to kill — joins the abort through
+the `JoinSet`, then log-abandons whatever the escrow holds; a producer
+still unjoined at the final deadline is logged as a potential
+straggler, the honest limit of a process about to exit. The pairing applies to the
 **terminal, caller-visible transition** of an operation: a multi-step
 `stop`/`restart` commits its initial and intermediate transitions
 state-only, the entry retaining the live reply sender for terminal
