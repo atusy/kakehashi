@@ -206,7 +206,13 @@ evidence of a hung server and must not drive a healthy connection to
 `Failed`. `notify`, having no response, is not cancellable. If the
 connection dies after forwarding (crash, disposal), the outer request fails
 with `data.reason: "connectionLost"` rather than fabricating a downstream
-error.
+error. Because there is no bridge-imposed timeout and no liveness
+accounting, pending pass-throughs need their own bound: a **per-connection
+in-flight limit** caps concurrent pass-through requests, each slot released
+on downstream response, outer cancellation, or connection loss; a request
+beyond the limit fails fast with `data.reason: "passThroughLimit"` — a
+downstream that accepts requests but never answers can therefore pin at
+most the limit, never unbounded outer requests and id mappings.
 
 **Pass-through is caller→downstream only.** Server-initiated traffic that a
 pass-through call provokes — `$/progress`, `workspace/configuration`,
@@ -246,6 +252,7 @@ control-protocol failures; bridged LSP requests keep their existing
 | `connectionLost` | the connection died after the inner request was forwarded |
 | `malformedResponse` | the downstream answered with an invalid JSON-RPC response |
 | `methodDenied` | inner method is on the deny list |
+| `passThroughLimit` | the per-connection in-flight pass-through limit is reached; retry after earlier requests settle |
 
 The bridge never parks a call to wait for a status change: pass-through and
 inspection requests against a slot that is not `running` fail fast with the
@@ -279,11 +286,12 @@ type OpenDocument = {
   via pass-through are invisible here (outside the managed domain, by the
   boundary above). `documentSelector?: DocumentSelector | null` filters against the
   downstream-facing `uri`/`languageId`, accepting the text-document filter
-  forms (`language`/`scheme`/`pattern`); `pattern` may be a plain glob or
-  a `RelativePattern`, which is self-contained — it carries its own
-  `baseUri`. Notebook filters are the one rejected variant (they need
-  notebook context the bridge does not hold for virtual documents) and
-  answer `InvalidParams`. Omitted or `null` returns all. A `stopped` slot holds
+  forms (`language`/`scheme`/`pattern`); `pattern` is a **plain glob
+  string** — the vendored filter type declares a string pattern, so an
+  object-valued 3.18 `RelativePattern` would not even deserialize and is
+  rejected as `InvalidParams`, exactly like notebook filters (which need
+  notebook context the bridge does not hold for virtual documents).
+  Omitted or `null` returns all. A `stopped` slot holds
   nothing open, so it answers `[]`.
 - `serverInfo` returns the `serverInfo` field of the downstream's initialize
   result. `null` means the downstream provided no usable value — omitted,

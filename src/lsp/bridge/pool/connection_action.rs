@@ -29,9 +29,10 @@ pub(crate) enum BridgeError {
     // === ls-bridge-message-ordering Single-Writer Loop variants ===
     /// Request queue is full; request rejected with REQUEST_FAILED.
     ///
-    /// Per ls-bridge-message-ordering Section 3, when the bounded order queue (capacity 256)
-    /// is full, requests are rejected with this error. Notifications are
-    /// dropped instead (with WARN logging).
+    /// Per ls-bridge-message-ordering Section 3, when the bounded order queue
+    /// (admission threshold `OUTBOUND_QUEUE_CAPACITY` = 4096) is full, requests
+    /// are rejected with this error. Notifications are dropped instead (with
+    /// WARN logging).
     QueueFull,
     /// Writer channel closed; connection is being torn down.
     ///

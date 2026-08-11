@@ -231,7 +231,9 @@ enum ConnectionState {
 | `Closing` | (graceful or timeout) | `Closed` |
 | `Closing` | panic | `Closed` |
 
-The timeout and panic rows mark the **handle** `Closed` unconditionally —
+The **`Closing` → `Closed`** timeout and panic rows (and only those —
+initialization timeout/failure/crash/panic go to pool-resident `Failed`,
+exactly as the table says) mark the **handle** `Closed` unconditionally —
 that is connection-object bookkeeping. Slot-level termination
 confirmation is tracked separately: when the process is unconfirmed, a
 termination-pending record keeps the *slot* at `stopping` even though the
@@ -262,8 +264,11 @@ Operations are gated at two levels: **server lifecycle** and **document lifecycl
   - `Closing` → `REQUEST_FAILED` ("bridge: connection closing") [See ls-bridge-graceful-shutdown]
   - `Closed` → `REQUEST_FAILED` ("bridge: connection closed")
 - **Notifications**: Accepted by writer loop in `Initializing` or `Ready` state only
-  - During `Initializing`, accepted notifications enter a **pre-ready
-    holding queue**, separate from the wire FIFO — a strict single FIFO
+  - **Target semantics, adopted with bridge-client-control-protocol**
+    (the current implementation is a single bounded mpsc feeding the
+    writer; this mechanism is required before that protocol's
+    pass-through ships): during `Initializing`, accepted notifications
+    enter a **pre-ready holding queue**, separate from the wire FIFO — a strict single FIFO
     could not reorder traffic accepted before the initialize response
     behind the later `initialized`. Only handshake-owned traffic reaches
     the wire until `initialized` has been written, with exactly two

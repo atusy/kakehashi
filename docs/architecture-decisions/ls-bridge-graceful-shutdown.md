@@ -135,6 +135,14 @@ abandoned, and its tracked requests fail exactly like pending responses.
 
 **Solution**: Three-phase shutdown coordination.
 
+> **Target design.** The sketches in this section (and § Shutdown Timeout
+> Policy / § Multi-Connection Shutdown below) record the protocol adopted
+> alongside bridge-client-control-protocol. The current implementation
+> differs — a stop oneshot with `try_recv` drain, a separate writer
+> return channel, no per-connection handoff timeout — and converges as
+> that protocol lands (adrs-are-aspirational is the repo's standing
+> convention: ADRs run ahead of code).
+
 **Phase 1: Signal Stop**
 ```rust
 // Shutdown sequence
@@ -151,8 +159,8 @@ async fn graceful_shutdown(&self) {
     // Phase 2: Wait for writer to become idle...
 }
 
-// Writer loop — owns its state by value (incl. stdin), matching the
-// actual writer task; ownership is what makes the handoff transfer real
+// Writer loop — owns its state by value (incl. stdin); ownership is what
+// makes the handoff transfer real (target design — see note above)
 async fn writer_loop(mut self) {
     // recv() on a closed queue yields the remaining accepted items in
     // FIFO order, then None — so the loop drains everything accepted
