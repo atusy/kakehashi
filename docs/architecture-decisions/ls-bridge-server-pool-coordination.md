@@ -51,7 +51,12 @@ The `ConnectionKey` is stored on each connection handle, so the request,
 originating host URI is stashed in their routing envelope (`KakehashiEnvelope` /
 `CodeLensEnvelope`) and used to re-resolve the same `(server, root)` connection
 that produced the item. A legacy envelope without that field falls back to the
-client-root connection (the pre-#382 behavior).
+client-root connection (the pre-#382 behavior). This re-resolution — like
+every site that derives a connection from the host URI — consults the active
+route binding first when one exists (bridge-routing-protocol): with a root
+override in force, marker re-resolution would reach the config-root process
+rather than the one that produced the item; a resolve arriving after the
+binding's eviction fails soft exactly as an unroutable envelope does today.
 
 **Shared-instance opt-in** (#391): a per-server `preferSharedInstance` boolean
 (default `false`) routes a server's documents to one shared connection

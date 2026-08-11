@@ -119,7 +119,11 @@ Both parameters are optional and compose as AND:
 
 - `textDocument?: TextDocumentIdentifier` — only clients that serve this
   document: the document (or one of its injections) bridges to the server
-  *and* resolves to this connection's root. A document kakehashi does not
+  *and* resolves to this connection's root — consulting the document's
+  active per-layer/language route bindings first where they exist
+  (bridge-routing-protocol), so an overridden or suppressed route filters
+  by where the document actually opened, with ordinary resolution only
+  for unbound (document, server) pairs. A document kakehashi does not
   have open matches nothing — the parameter is a filter, not a lookup.
 - `name?: string` — only clients spawned from this `languageServers` entry.
 
@@ -565,7 +569,11 @@ and their waits (ls-bridge-graceful-shutdown § Unconfirmed termination).
   sweep runs after it, `documents` may briefly under-report, and a
   pass-through request racing the sweep is — like all pass-through — the
   caller's own risk.
-- **A shared instance re-seeds; nothing is remembered.** A `#shared` key
+- **A shared instance re-seeds; nothing is remembered** — with one
+  recorded exception: a document's active route binding
+  (bridge-routing-protocol) retains its override folders, and the
+  re-open sweep re-adds and announces them before that document's
+  `didOpen`. A `#shared` key
   carries no root, and the old handle's accumulated folder set dies with
   it. Because no triggering document exists to resolve a marker root — the
   existing acquire path cannot revive a dead shared key without one — the

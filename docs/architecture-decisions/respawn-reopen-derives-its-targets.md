@@ -103,7 +103,11 @@ with the work that belongs to the connection.
    active route binding for the server, the binding answers instead of the
    marker walk — a suppressed server is "not applicable", a bound key must
    match this connection's — and a document with no binding falls through to
-   the marker rule above. A binding still *pending* at the sweep's bounded
+   the marker rule above. Bindings are keyed per (host, layer, language),
+   so stages 2-3 evaluate each layer/language binding **independently**:
+   one host can suppress a server for one injection language while another
+   language — or the host layer — routes to a different key, and the sweep
+   re-opens only the documents whose own binding names this connection. A binding still *pending* at the sweep's bounded
    wait is applicable-but-unsettled, not "not applicable": the barrier's
    fail-soft path applies, never a successful omission. The stage stays
    read-only either way: the sweep never issues a routing query.

@@ -42,8 +42,13 @@ sent to downstream servers that advertise support. The answer refines
 kakehashi's own routing decision for one (document, language) pair; every
 absence — no provider, `null` answer, missing server entry, timeout, error —
 falls back to kakehashi's existing behavior. The protocol is fail-open on
-the transport: absence or failure of providers reproduces today's routing,
-at worst one decision deadline later. A *successful* answer, by design, can
+the transport: absence or failure of providers reproduces today's
+*initial* routing decision, at worst one decision deadline later — with
+one recorded difference in what happens afterwards: the decision settles
+into the document's route binding either way, so even a fallback route is
+frozen for the document's open lifetime, where today a restart's re-open
+re-resolves live markers (respawn-reopen-derives-its-targets records the
+same freeze from its side). A *successful* answer, by design, can
 only subtract servers or redirect roots (see Trust Model).
 
 ### The Request
@@ -517,7 +522,13 @@ structures with different lifetimes carry the outcome:
   **before** any acquire runs — a configuration removal or disablement
   that ends its candidacy for the document — and is consumed like a
   suppression (waiters proceed without the server; distinct provenance
-  in the logs); method-level capability prefilters are deliberately
+  in the logs). Every **applied** effect — a suppression taking hold, an
+  override landing on its key — is logged once at apply time with the
+  answering provider, the (document, layer, language), the target
+  server, and the effect, which is what makes a valid-but-wrong policy
+  diagnosable from the logs at all (a warning fires only on the
+  malformed/mismatch paths; a *successful* misroute would otherwise be
+  silent). Method-level capability prefilters are deliberately
   *not* a cause — they are per-request facts (lacking hover does not
   mean lacking completion) and never settle the binding. It is **not** the
   generation-mismatch outcome: a mismatch whose server is still a
@@ -555,7 +566,14 @@ structures with different lifetimes carry the outcome:
   scoped to admission time; revoking an open document's route is
   close/re-open, or `stop`). Only a server with no binding record at all
   (one that became a candidate after the open, say via reload) falls
-  through to kakehashi's ordinary resolution.
+  through to kakehashi's ordinary resolution. The binding governs
+  **every** site that derives a connection from the host URI — the
+  resolve envelopes (`completionItem/resolve`, `codeLens/resolve`)
+  included, whose host-URI re-resolution would otherwise reach the
+  config-root process instead of the one that produced the item
+  (ls-bridge-server-pool-coordination is amended accordingly); a
+  resolve arriving after eviction fails soft as an unroutable envelope
+  does today.
 
 Decision-cache lifecycle:
 
@@ -982,7 +1000,9 @@ a slot a routing provider left in play.
 - Fail-open bounds transport failure, not provider policy: a *successful*
   answer subtracts servers or redirects roots, and a buggy provider
   therefore silently thins routing. Until the deferred introspection
-  hook exists, diagnosing a misroute means reading the warn-level logs.
+  hook exists, diagnosing a misroute means reading the logs — the
+  apply-time records for successful effects, the warnings for
+  rejected ones.
 - Routing is pull-only and non-retroactive: a document's decision can be
   stale for its whole open lifetime as project state moves under it; the
   provider has no way to say so (deferred invalidation notification),
@@ -1059,7 +1079,10 @@ a slot a routing provider left in play.
   this, and the `maxFanOut` truncation step is deliberately skipped).
   Routing request ids are bridge-minted like every downstream id
   (each handle's `next_request_id` allocator — the pool ADR's old
-  upstream-id-reuse sketch is amended alongside this decision), but
+  upstream-id-reuse sketch is amended alongside this decision; note
+  the allocator must stay within LSP's integer range, −2³¹..2³¹−1 —
+  the current unconstrained `i64` is a latent conformance gap that
+  wrapping-with-collision-check or string ids closes), but
   registered with no upstream cancellation mapping and with routing's
   non-liveness classification; the driver retains the **exact handle**
   and id for each dispatch, and a registration failure counts as that
