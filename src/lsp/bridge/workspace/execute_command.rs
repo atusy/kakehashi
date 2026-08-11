@@ -519,7 +519,14 @@ impl LanguageServerPool {
         // branch can legitimately come back with a shared-keyed handle (a
         // preferSharedInstance flip between registration and reconnect), and a
         // barrier on the stale ClientFallback key would be vacuously satisfied
-        // while the acquired connection's re-opens are still in flight.
+        // while the acquired connection's re-opens are still in flight. What a
+        // key-CHANGING reconnect cannot recover is the old key's re-open debt:
+        // its document records were purged with the invalidated connection, so
+        // that debt is unfulfillable in principle (nothing knows what to
+        // re-open) and invisible to this wait (only CLAIMED re-opens are).
+        // Per-document eager repair on the new key owns document correctness
+        // from here; a command naming a document untouched since the flip
+        // fails soft downstream.
         if !self.wait_for_pending_reopen(handle.key()).await {
             warn!(
                 target: "kakehashi::bridge",

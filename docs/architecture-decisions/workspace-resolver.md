@@ -94,12 +94,15 @@ Key properties:
   document that has no representable filesystem path (a non-`file://` URI, or a
   `file://` path that fails the encoding contract in lua-host-api). Such a
   document is resolved exactly as if no `workspaceResolver` were set — the
-  normal `workspaceMarkers` → `ClientFallback` path. Note the two skip sub-cases
+  normal `workspaceMarkers` walk, then the usual routing (per-root /
+  `ClientFallback`, or the shared instance for a `preferSharedInstance`
+  server: the skip decides which RESOLUTION runs, not #391's routing). Note the two skip sub-cases
   differ underneath: a non-representable `file://` path still has a URL, so the
   Rust-side marker walk runs normally; a **non-`file://` URI** has no file path
   at all, so `resolve_marker_root` returns `None` *immediately*
   (`document_uri?.to_file_path()` fails) and the marker walk never runs — the
-  document lands directly on `ClientFallback`. Either way the result is the
+  document lands directly on `ClientFallback` (or the shared instance for a
+  `preferSharedInstance` server). Either way the result is the
   no-resolver behavior. This skip is distinct from §6 fail-closed: the resolver
   was not run, so the document still attaches; fail-closed applies only when a
   resolver that *did* run errors or times out.
