@@ -41,6 +41,7 @@ downstream connections by an opaque id derived from the pool's `ConnectionKey`.
 | `kakehashi/bridge/client/notify` | notification | `{ id, method, params? }` | — |
 | `kakehashi/bridge/client/documents` | request | `{ id, documentSelector? }` | `OpenDocument[]` |
 | `kakehashi/bridge/client/serverInfo` | request | `{ id }` | `ServerInfo \| null` |
+| `kakehashi/bridge/client/serverCapabilities` | request | `{ id }` | `{ static: ServerCapabilities, dynamic: Registration[] }` |
 | `kakehashi/bridge/client/workspaceFolders` | request | `{ id }` | `WorkspaceFolder[]` |
 | `kakehashi/bridge/client/stop` | request | `{ id }` | `null` |
 | `kakehashi/bridge/client/restart` | request | `{ id }` | `null` |
@@ -291,6 +292,15 @@ type OpenDocument = {
   initialization; only capabilities are load-bearing). A slot that is not
   `running` fails with `clientStopped`/`clientNotReady` instead, so "no
   usable `serverInfo`" and "no live connection" never blur.
+- `serverCapabilities` returns the downstream's static
+  `InitializeResult.capabilities` verbatim as `static`, plus the
+  bridge's record of currently active dynamic registrations
+  (`client/registerCapability`, minus later unregistrations) as
+  `dynamic`. This is what makes the pass-through escape hatch
+  discoverable: the protocol's own motivation — reaching capabilities
+  the bridge does not yet translate — requires the caller to *see*
+  those capabilities, and `serverInfo` alone names the server without
+  them. Like `serverInfo`, it fails for slots that are not `running`.
 - `workspaceFolders` returns the folder set the bridge maintains for the
   connection, as `WorkspaceFolder[]`. Every connection carries a
   `WorkspaceFolderSet` seeded at spawn (it grows only for shared instances),
@@ -310,7 +320,14 @@ pool-wide `GlobalShutdownTimeout` bounds it, via the teardown-only
 `force_kill_all` — so a single-slot `stop` against a wedged server would
 otherwise wait forever, and a wedged server is precisely this method's
 motivating case. On expiry the forced escalation applies (SIGTERM → SIGKILL
-on Unix; immediate kill on Windows). Operations follow that decision's disposal policy, with the timeout being
+on Unix; immediate kill on Windows). The timeout's duration is
+implementation-defined with a documented default in the same 5–15 s
+class as the global teardown ceiling (a configuration knob can follow if
+needed), and it is **one deadline** covering queue drain, the shutdown
+handshake, and escalation initiation; termination *confirmation* is
+deliberately outside it — a child unconfirmed at the deadline takes the
+termination-pending path below, so `stop` latency stays predictable
+while confirmation stays honest. Operations follow that decision's disposal policy, with the timeout being
 this per-connection one: the already-accepted order queue drains ahead of
 `shutdown` (graceful path only — a forced termination abandons the
 remainder, which then fails like pending work), pending responses fail at
@@ -798,7 +815,7 @@ namespace.
 
 | Aspect | Decision |
 |---|---|
-| **Namespace** | `kakehashi/bridge/client`, `kakehashi/bridge/client/{request,notify,documents,serverInfo,workspaceFolders,stop,restart}` |
+| **Namespace** | `kakehashi/bridge/client`, `kakehashi/bridge/client/{request,notify,documents,serverInfo,serverCapabilities,workspaceFolders,stop,restart}` |
 | **Client id** | `ConnectionKey` `Display` string; contractually opaque; slot-stable across restarts |
 | **Name validation** | `languageServers` keys may not contain `@` or `#` |
 | **Pass-through** | Verbatim, untranslated; deny `initialize`/`initialized`/`shutdown`/`exit`/`$/cancelRequest` |

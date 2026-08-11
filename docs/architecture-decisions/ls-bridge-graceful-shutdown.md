@@ -31,9 +31,16 @@ This decision defines behavior for `Closing` and `Closed` states. See ls-bridge-
 ```
 Ready → Closing          (graceful shutdown initiated)
 Initializing → Closing   (abort initialization, shutdown)
-Closing → Closed         (shutdown completed or timed out)
+Closing → Closed         (shutdown completed or timed out — see below)
 Failed → Closed          (skip shutdown handshake, cleanup only)
 ```
+
+`Closing → Closed` on timeout is **mode-scoped**: a per-slot `stop`
+(bridge-client-control-protocol) reaches `Closed` only after `Child::wait`
+returned `Ok` — an unconfirmed termination converts to a
+termination-pending record (`stopping`) and settles
+`stopFailed`/`restartFailed` instead. Only global teardown may take the
+bookkeeping-only `Closed` (§ Unconfirmed termination).
 
 **Operation Gating in Closing State:**
 - New operations: Reject with `REQUEST_FAILED` ("bridge: connection closing")
@@ -66,7 +73,8 @@ Follow LSP specification's two-phase shutdown:
 │ 1. Send SIGTERM to server process                       │
 │ 2. Wait for process death (implementation-defined)      │
 │ 3. Send SIGKILL if still alive                          │
-│ 4. Transition to Closed state                           │
+│ 4. Transition to Closed state (per-slot: only after     │
+│    wait returns Ok — see mode-scoped note above)        │
 └─────────────────────────────────────────────────────────┘
 ```
 

@@ -43,7 +43,7 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 | Tier | Timeout | Duration | Trigger | Action |
 |------|---------|----------|---------|--------|
 | **0** | Initialization | 30-60s | `initialize` request sent | `Initializing` → `Failed` (pool may spawn replacement) |
-| **2** | Liveness | 30-120s | Ready state + pending > 0 | `Ready` → `Failed` (pool may spawn replacement) |
+| **2** | Liveness | 30-120s | Ready state + liveness-classified managed pending > 0 (pass-through requests are excluded — bridge-client-control-protocol) | `Ready` → `Failed` (pool may spawn replacement) |
 | **3** | Global Shutdown | 5-15s | Shutdown initiated | SIGTERM → SIGKILL, all → `Closed` |
 
 **State-Based Gating:**
@@ -99,6 +99,10 @@ Global Shutdown overrides all (highest priority)
 **Per-Slot Control Shutdown** (bridge-client-control-protocol):
 - A single-slot `stop`/`restart` runs under its own per-connection shutdown
   timeout with the same graceful → SIGTERM → SIGKILL shape
+- **Duration**: implementation-defined, default in the same 5-15s class
+  as the global ceiling; one deadline covers queue drain, handshake, and
+  escalation initiation — a child unconfirmed beyond it converts to a
+  termination-pending record rather than extending the deadline
 - This is not the rejected per-server teardown timeout: it bounds one
   user-initiated control operation while the rest of the pool keeps
   serving; pool teardown keeps the single global ceiling above

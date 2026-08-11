@@ -220,7 +220,7 @@ enum ConnectionState {
 
 | From | Trigger | To |
 |------|---------|-----|
-| `Initializing` | success (init response received) | `Ready` |
+| `Initializing` | success — commits atomically with the `initialized` enqueue (bridge-client-control-protocol) | `Ready` |
 | `Initializing` | timeout / failure / crash / panic | `Failed` |
 | `Initializing` | shutdown signal | `Closing` |
 | `Ready` | shutdown signal | `Closing` |
@@ -253,6 +253,12 @@ Operations are gated at two levels: **server lifecycle** and **document lifecycl
   - `Closing` → `REQUEST_FAILED` ("bridge: connection closing") [See ls-bridge-graceful-shutdown]
   - `Closed` → `REQUEST_FAILED` ("bridge: connection closed")
 - **Notifications**: Accepted by writer loop in `Initializing` or `Ready` state only
+  - During `Initializing`, acceptance means QUEUED, not sent: only
+    handshake-owned traffic reaches the wire until `initialized` has been
+    written — LSP forbids the client any other request or notification
+    before the initialize response — and the `Initializing → Ready`
+    transition commits atomically with the `initialized` enqueue, so
+    held traffic can never overtake it (bridge-client-control-protocol)
   - `Closing`/`Closed` → DROP (writer loop stopped, see ls-bridge-graceful-shutdown)
   - Subject to document lifecycle gating below
 
