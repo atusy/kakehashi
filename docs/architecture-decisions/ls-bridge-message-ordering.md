@@ -263,13 +263,23 @@ Operations are gated at two levels: **server lifecycle** and **document lifecycl
   - During `Initializing`, accepted notifications enter a **pre-ready
     holding queue**, separate from the wire FIFO — a strict single FIFO
     could not reorder traffic accepted before the initialize response
-    behind the later `initialized`. Only handshake-owned traffic reaches
-    the wire until `initialized` has been written (LSP forbids the
-    client any other request or notification before the initialize
-    response); the holding queue is flushed into the FIFO, in arrival
-    order, only after the `initialized` enqueue — which commits
-    atomically with `Initializing → Ready`
-    (bridge-client-control-protocol)
+    behind the later `initialized`. Only handshake-owned traffic — plus
+    **responses to server-initiated requests LSP permits during
+    initialization** (`window/showMessageRequest`,
+    `window/workDoneProgress/create`), which travel the wire FIFO
+    immediately because withholding them could deadlock the handshake —
+    reaches the wire until `initialized` has been written (LSP forbids
+    the client any other request or notification before the initialize
+    response). The `initialized` enqueue, the holding-queue transfer
+    into the FIFO (arrival order), and the admission cutover happen
+    under **one exclusion** — a `Flushing` sub-state of the
+    `Initializing → Ready` commit — so a producer that observes `Ready`
+    can never enter the FIFO ahead of older held notifications
+    (bridge-client-control-protocol). The holding queue is bounded by
+    the same class of bound as the wire FIFO; on overflow the newest
+    notification is dropped with a warn log — deterministic and
+    self-healing, since bridge-managed document sync re-establishes
+    state through the derived open paths once `Ready` lands
   - `Closing`/`Closed` → DROP (writer loop stopped, see ls-bridge-graceful-shutdown)
   - Subject to document lifecycle gating below
 
