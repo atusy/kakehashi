@@ -95,7 +95,8 @@ fn region_boundary_for_method(method: &str) -> crate::language::injection::Regio
     match method {
         "textDocument/completion"
         | "textDocument/signatureHelp"
-        | "textDocument/linkedEditingRange" => RegionBoundary::CaretEndFallback,
+        | "textDocument/linkedEditingRange"
+        | "textDocument/onTypeFormatting" => RegionBoundary::CaretEndFallback,
         _ => RegionBoundary::HalfOpen,
     }
 }
