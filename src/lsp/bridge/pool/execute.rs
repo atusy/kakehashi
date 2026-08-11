@@ -15,7 +15,8 @@ use url::Url;
 use super::{ConnectionHandle, ConnectionHandleSender, LanguageServerPool, UpstreamId};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
+    host_position_within_region_bounds, region_host_end,
 };
 
 /// Context provided to response transformers during bridge request execution.
@@ -263,10 +264,12 @@ impl LanguageServerPool {
     /// Like [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle)
     /// but for position-based requests (hover, completion, definition, …): aborts
     /// before contacting the downstream server when `host_position` falls outside
-    /// the injection region — either *above* its start line, or on the start line
-    /// but *before* its start column (e.g. the cursor is on the markdown fence
-    /// backticks or inside a blockquote `> ` prefix). See
-    /// [`host_position_within_region`].
+    /// the injection region — *above* its start line, on the start line but
+    /// *before* its start column (e.g. the cursor is on the markdown fence
+    /// backticks or inside a blockquote `> ` prefix), or *past* the region's
+    /// end-of-content (a caret inside a trailing child the query excluded, or
+    /// stale region data after an edit shrank the region). See
+    /// [`host_position_within_region_bounds`].
     ///
     /// Translating an out-of-region position would silently mistranslate it
     /// (clamping line and/or character via `saturating_sub`) and forward
@@ -294,7 +297,8 @@ impl LanguageServerPool {
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
     ) -> io::Result<T> {
-        if !host_position_within_region(host_position, offset) {
+        let region_end = region_host_end(virtual_content, offset);
+        if !host_position_within_region_bounds(host_position, offset, region_end) {
             if host_position.line < offset.line() {
                 // Line above the region → almost certainly stale region data
                 // (a concurrent host edit shifted the region). Unexpected.
@@ -304,6 +308,18 @@ impl LanguageServerPool {
                      aborting request — stale region data",
                     host_position.line,
                     offset.line(),
+                );
+            } else if host_position > region_end {
+                // Past the region's end-of-content: no virtual coordinate
+                // exists for it (end-of-content itself is accepted, inclusive).
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "{method}: host position (line {}, char {}) is past the region's content \
+                     end (line {}, char {}); aborting request",
+                    host_position.line,
+                    host_position.character,
+                    region_end.line,
+                    region_end.character,
                 );
             } else {
                 // On the start line but left of the start column (fence backticks,
