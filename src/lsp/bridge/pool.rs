@@ -2246,9 +2246,10 @@ impl LanguageServerPool {
         // A marker-less document (no marker root, non-file URI, no document
         // hint, or the `[]` kill switch) joins the shared instance too: it has
         // no MARKER root to announce, and admission needs none —
-        // `announce_shared_root` announces the client root on its behalf when
-        // the editor supplied one, and the document opens on the shared
-        // connection either way. Keeping such documents on the client-root
+        // `announce_shared_root` announces the complete client workspace on
+        // its behalf (folder snapshot, or the bare rootUri when the client
+        // sent no folders), and the document opens on the shared connection
+        // either way. Keeping such documents on the client-root
         // fallback (as this once did) forked a second server process whose
         // session-wide state (e.g. a completion corpus of every open
         // document) never met the shared instance's.
