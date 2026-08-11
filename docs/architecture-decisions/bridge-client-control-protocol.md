@@ -117,22 +117,25 @@ observable, if transient.
 
 Both parameters are optional and compose as AND:
 
-- `textDocument?: TextDocumentIdentifier` — only clients that serve this
-  document: the document (or one of its injections) bridges to the server
-  *and* resolves to this connection's root — consulting the document's
-  active route bindings first, matched per exact (host, layer, language,
-  server) tuple (bridge-routing-protocol), so an overridden or suppressed
-  route filters by where the document actually opened; ordinary
-  resolution applies only to a tuple with no binding at all, and a
-  *pending* tuple (its decision still in flight) matches nothing yet —
-  the document is not open there — rather than falling through. A
-  *retained* tuple (the route decided but its acquire failed —
-  bridge-routing-protocol) **matches its retained key when a slot for
-  that key is enumerable** (a `Failed` handle is; a pre-handle spawn
-  failure leaves no row to match, and the tuple then matches nothing
-  until a retry produces one): surfacing the failed client assigned to
-  the document is exactly what a user diagnosing missing features
-  needs, unlike `pending`, whose assignment does not exist yet. A document kakehashi does not
+- `textDocument?: TextDocumentIdentifier` — only clients that **serve or
+  retain an assignment for** this document: the document (or one of its
+  injections) bridges to the server *and* resolves to this connection's
+  root — consulting the document's active route bindings first, matched
+  per exact (host, layer, language, server) tuple
+  (bridge-routing-protocol), so an overridden or suppressed route
+  filters by where the document actually opened; ordinary resolution
+  applies only to a tuple with no binding at all, and a *pending* tuple
+  (its decision still in flight) matches nothing yet — the document is
+  not open there — rather than falling through. A *retained* tuple (the
+  route decided but its acquire failed — bridge-routing-protocol)
+  **matches its retained key when a slot for that key is enumerable**,
+  whatever that slot's status (a `Failed` handle, or a `running` shared
+  handle whose folder announcement failed; a pre-handle spawn failure
+  leaves no row to match, and the tuple then matches nothing until a
+  retry produces one): surfacing the slot assigned to the document
+  after a failed acquire is exactly what a user diagnosing missing
+  features needs, unlike `pending`, whose assignment does not exist
+  yet. A document kakehashi does not
   have open matches nothing — the parameter is a filter, not a lookup.
 - `name?: string` — only clients spawned from this `languageServers` entry.
 
