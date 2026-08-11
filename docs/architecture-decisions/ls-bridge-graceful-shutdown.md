@@ -316,8 +316,11 @@ What the previous machinery bought, the actor gives structurally:
   each `DeadlineExpired` token carries the operation generation it was
   armed for — a token whose generation no longer matches is stale and
   dropped. A second `Teardown` upgrades the mode monotonically
-  (`ProcessExit` dominates); the actor owns the single completion watch,
-  hands every caller a receiver, and publishes only after cleanup. A
+  (`ProcessExit` dominates) but can never extend the ceiling — an active
+  run retains the **earliest** deadline it has been offered. The actor
+  owns the single completion watch, hands every caller a receiver, and
+  publishes the run's **success-or-failure** only after cleanup; callers
+  surface or log a failed teardown rather than mistaking it for success. A
   `Teardown(ProcessExit)` arriving **after** a completed `ServerRemains`
   run is a new transition, not a lost upgrade: it adopts the retained
   termination-pending records, log-abandons them (§ Unconfirmed
@@ -341,15 +344,21 @@ the new incarnation resumes from that storage plus its mailbox, and
 re-derives only what pool state can supply (connection states) — the same
 derive-don't-remember posture as respawn-reopen-derives-its-targets.
 Transitions themselves are **unwind-contained**: a transition stages its
-mutations on a scratch copy of the key's entry and its final act is the
-paired **commit-and-reply swap**, so a panic anywhere before that pair
-leaves the entry unchanged with the message merely consumed. That pairing
-is what keeps the closed-receiver mapping truthful: a caller whose
-receiver closes learns `RequestFailed`
-(`stopFailed`/`restartFailed`), and because reply and commit are one act,
-a closed receiver always means *not committed* — never a committed
-success misreported as failure. Settlement is at-most-once and no caller
-is ever left pending.
+mutations on a scratch copy of its **write set** — one keyed entry for a
+control transition; the entry plus its pool-map insertion for a spawn
+commit; the global sections a `Reload` or `Teardown` touches (mode,
+sealing, tombstone sweeps) — and its final act is the single
+**commit-and-reply swap**, so a panic anywhere before that pair leaves
+every affected value unchanged with the message merely consumed. The pairing governs what a
+**live** caller can observe, not whether the actor may commit: a
+transition whose reply is already gone — the caller released by
+`RequestCancelled`, or a reply-less message (`Reload`,
+`DeadlineExpired`, internal settlement) — commits **state-only**. For a
+live request, reply and commit are one act, so a caller whose receiver
+closes (an incarnation died before the pair) learns `RequestFailed`
+(`stopFailed`/`restartFailed`) and that reading is always truthful:
+*not committed*, never a committed success misreported as failure.
+Settlement is at-most-once and no caller is ever left pending.
 
 **Sketch** (illustrative, target design):
 
@@ -425,6 +434,11 @@ Shutdown signal arrives
 
 ```rust
 async fn shutdown_router(mode: ShutdownMode) {
+    // 0. Capture the absolute deadline FIRST: every later step — router
+    //    gating, mailbox delay, the actor's transitions — spends this
+    //    budget rather than extending it
+    let deadline = Instant::now() + GLOBAL_TIMEOUT;
+
     // 1. Stop accepting new requests (also gates ordinary acquires via
     //    the pool-wide shutting_down flag)
     mark_router_shutting_down();
@@ -432,14 +446,17 @@ async fn shutdown_router(mode: ShutdownMode) {
     // 2. Fail all pending routing decisions
     fail_pending_routes();
 
-    // 3. Send Teardown(mode) to the lifecycle actor (§ Lifecycle Actor)
-    //    and await the shared completion watch. Mode upgrade, sealing,
-    //    the parallel per-connection shutdown sub-tasks, escalation
-    //    under the absolute deadline, survivor disposition, and cleanup
-    //    are all the actor's teardown state machine; router-specific
-    //    resource cleanup runs inside its cleanup step, BEFORE
-    //    completion is published, so no caller can resume around it.
-    pool.lifecycle().teardown(mode).await;
+    // 3. Send Teardown to the lifecycle actor (§ Lifecycle Actor) and
+    //    await the shared completion watch. Mode upgrade (earliest
+    //    deadline retained), sealing, the parallel per-connection
+    //    shutdown sub-tasks, escalation under the deadline, survivor
+    //    disposition, and cleanup are all the actor's teardown state
+    //    machine; router-specific resource cleanup runs inside its
+    //    cleanup step, BEFORE completion is published, so no caller can
+    //    resume around it.
+    if let Err(failure) = pool.lifecycle().teardown(mode, deadline).await {
+        log::error!("bridge teardown completed as failed: {failure}");
+    }
 }
 ```
 

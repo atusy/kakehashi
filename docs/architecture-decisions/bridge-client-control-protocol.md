@@ -465,14 +465,16 @@ settlement is then internal lifecycle bookkeeping (deadline shape:
 ls-bridge-timeout-hierarchy § Per-Slot Control Shutdown).
 
 The abort-safety story is short because the actor makes it so: **all
-lifecycle state effects happen inside the actor's message handling, which
-is serialized and non-suspending per message.** Sub-tasks carry only their job parameters and borrowed resources (a
+actor-owned lifecycle state effects happen inside the actor's message
+handling, which is serialized and non-suspending per message** (the one
+boundary: per-connection handshake terminal compare-transitions stay
+outside the actor, per ls-bridge-graceful-shutdown's stated boundary). Sub-tasks carry only their job parameters and borrowed resources (a
 shared `Arc` of the process handle, I/O endpoints a handshake transition
 lends) — the authoritative process handle and the reply sender stay in
 the actor's state entry, so a panicked or stale sub-task can lose
-neither; the writer's stdin handoff travels
-inside such a sub-task, so an aborted receiver returns the process to the
-actor as a completion message rather than losing it into a channel
+neither; the writer's stdin handoff is likewise consumed inside such a
+sub-task, and a completion message reports only the outcome and its
+generation — never a resource, so nothing can strand in a channel
 buffer — and a sub-task that dies (panic, cancellation, crash) is
 observed via the actor's `JoinSet` and settled like any other completion:
 the actor applies the ownership-at-completion rule to its own state
