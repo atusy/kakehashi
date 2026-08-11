@@ -323,11 +323,13 @@ What the previous machinery bought, the actor gives structurally:
   **absolute deadline itself persists on the entry**, and an incarnation
   recheck at startup settles any entry already past its deadline — so an
   expiry consumed by a pre-commit panic can never leave an operation
-  beyond its ceiling. The same reconciliation launches **exactly one
-  producer for any committed `Spawning` intent that has none** in the
-  `JoinSet`: producer existence is derived from the intent, never
-  remembered, so an incarnation dying between commit and launch cannot
-  orphan an accepted intent. A second `Teardown` upgrades the mode monotonically
+  beyond its ceiling. The same reconciliation — after
+  first processing any pending-settlement markers — launches **exactly
+  one producer for each active, unclaimed `Spawning` intent that has
+  none** in the `JoinSet`: producer existence is derived from the
+  intent, never remembered, so an incarnation dying between commit and
+  launch cannot orphan an accepted intent. Claimed or settling entries
+  and cleanup records never relaunch a producer. A second `Teardown` upgrades the mode monotonically
   (`ProcessExit` dominates) but can never extend the ceiling — an active
   run retains the **earliest** deadline it has been offered. The actor
   owns the single completion watch, hands every caller a receiver, and
@@ -431,9 +433,13 @@ enum LifecycleMsg {
     //   the key's pool entry (the ordinary acquire notify path), which
     //   ALWAYS terminates: a handle landing resolves it, and an intent
     //   that settles without one — spawn failure, or a claim by
-    //   stop/restart/reload/teardown — publishes the key's terminal
-    //   state in the snapshot, resolving the wait to that state's
-    //   ordinary acquire error. No pending reply exists to error.
+    //   stop/restart/teardown — publishes the key's terminal state in
+    //   the snapshot, resolving the wait to that state's ordinary
+    //   acquire error; reload DELETION removes the row instead, and the
+    //   removal itself notifies waiters of that (key, generation) with
+    //   the deleted-server acquire error — the notification carries the
+    //   terminal answer, so no row needs to remain. No pending reply
+    //   exists to error.
     Reload { generation: ConfigGeneration, reply: Reply },
     Teardown { mode: ShutdownMode, deadline: Instant, reply: Reply<WatchRx> },
     // ^ deadline captured by the caller at initiation; actor owns the one watch

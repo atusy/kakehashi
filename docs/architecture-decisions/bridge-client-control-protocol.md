@@ -251,7 +251,7 @@ control-protocol failures; bridged LSP requests keep their existing
 |---|---|
 | `unknownClient` | id matches no current slot |
 | `clientNotReady` | slot is `starting`, `stopping`, or `failed`; `data.status` carries which |
-| `clientStopped` | slot explicitly stopped; `restart` revives it |
+| `clientStopped` | slot pinned until restart — by a user's `stop` or a failed restart's retry tombstone; `restart` revives it |
 | `clientRestarting` | slot is mid-`restart`; retry after it returns |
 | `restartFailed` | the `restart` failed — in its stop phase before respawn, at spawn (missing or unspawnable command), during initialization, or at completion, when the ownership check found the replacement displaced (e.g. by a reload); the message names the cause |
 | `stopFailed` | a `stop` failed to reach a verified `Closed` — abnormal sub-task outcome (panic, cancellation) or termination unconfirmed at the per-slot deadline |
@@ -392,8 +392,9 @@ settlement followed by its ordinary respawn sequence, respawning only
 after a verified settlement and answering `restartFailed` with the
 corresponding record short of one.
 
-What is new is the **stopped set**: the pool records the `ConnectionKey` as
-explicitly stopped, and the normal routing path consults it — a `didOpen` (or
+What is new is the **stopped set**: the pool records the `ConnectionKey`
+as pinned (a user's `stop`, or a failed restart's retry tombstone), and
+the normal routing path consults it — a `didOpen` (or
 any acquire) that resolves to a stopped key does **not** spawn. The slot's
 features stay dark until a `kakehashi/bridge/client/restart` clears the entry.
 This is a deliberate behavior change to the normal path: without it, the next
@@ -760,8 +761,7 @@ namespace.
   enumerates as `stopping` and still fences acquires until cleanup
   completes. What happens then follows the record's **origin**, which
   survives reload deletion and re-addition: stop-origin cleanup installs
-  the tombstone (`stopped` means explicitly stopped, and that stop is
-  still in force); restart-origin cleanup installs the
+  the tombstone (the user's stop is still in force); restart-origin cleanup installs the
   config-revalidated **retry** tombstone the ownership-at-completion
   rule requires, so a later `restart` retries; reload-origin cleanup
   simply **dissolves** — no user ever stopped the slot, so it returns to
