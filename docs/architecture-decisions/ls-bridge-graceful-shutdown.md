@@ -329,18 +329,28 @@ async fn shutdown_all_connections(pool: &ConnectionPool, mode: ShutdownMode) {
     // abortable set, so the expired producer cutoff costs it nothing
     // and revocable idempotent claims mean an interrupted finalizer
     // never strands a record.
-    let (unresolved, _) = join!(
+    join!(
         force_kill_remaining_until(deadline, connections, &control_procs),
         abort_survivors_and_finalize(&mut control_tasks, graceful_deadline),
     );
 
-    // Mode-dependent disposition of children still unconfirmed at the
-    // deadline (§ Unconfirmed termination). Disposition is lock-bounded
-    // local work — like cleanup, it runs right after the ceiling rather
-    // than inside it. Records retained under ServerRemains are disposed
-    // at actual process end by their Drop owner; no teardown re-entry
-    // is promised or required.
-    match mode {
+    // Both arms have joined: no control task is alive, so no RAII
+    // wrapper can hand a process back later. Only NOW close the live
+    // registry and take its final contents — capturing the unresolved
+    // set from the force arm's last scan would miss a late hand-back.
+    let unresolved = control_procs.close_and_take();
+
+    // Mode-dependent disposition of children still unconfirmed
+    // (§ Unconfirmed termination). Disposition is lock-bounded local
+    // work — like cleanup, it runs right after the ceiling rather than
+    // inside it — and it COMMITS UNDER THE SAME LOCK the shared-mode
+    // upgrade takes, so it observes the FINAL effective mode: an
+    // upgrade racing the commit either lands first and is honored, or
+    // lands after and finds ordinary termination-pending records whose
+    // Drop owner disposes them at process end anyway. Records retained
+    // under ServerRemains are likewise Drop-disposed at actual process
+    // end; no teardown re-entry is promised or required.
+    match effective_mode() { // shared, monotonically upgraded — not the caller's copy
         ShutdownMode::ProcessExit  => log_and_abandon(unresolved),
         ShutdownMode::ServerRemains =>
             pool.reinsert_termination_pending(unresolved), // atomic; waits restarted
@@ -443,14 +453,17 @@ async fn shutdown_router(mode: ShutdownMode) {
     // hard-aborted (safe: shared-state effects live only at commit
     // points — see the sketch above and bridge-client-control-protocol)
     // Cancellation signalled at adoption; producer cutoff at
-    // graceful_deadline; finalization for every non-normal outcome; the
-    // caller passes the same ShutdownMode and the unresolved set takes
-    // the same mode branch — see the sketch above
-    let (unresolved, _) = join!(
+    // graceful_deadline; finalization for every non-normal outcome —
+    // see the sketch above
+    join!(
         force_kill_remaining_until(deadline, all_connections, &control_procs),
         abort_survivors_and_finalize(&mut control_tasks, graceful_deadline),
     );
-    dispose_unresolved(mode, unresolved);
+    // Close-and-take AFTER both arms join (late RAII hand-backs land in
+    // the final contents); dispose against the shared effective mode,
+    // linearized with the upgrade lock — see the sketch above
+    let unresolved = control_procs.close_and_take();
+    dispose_unresolved(effective_mode(), unresolved);
 
     // 5. Clean up router resources — runs after every control task has
     //    terminated (the join above), so no ADOPTED CONTROL TASK can
