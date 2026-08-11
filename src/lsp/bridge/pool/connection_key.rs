@@ -13,9 +13,9 @@
 //! marker found, or the `[]` kill switch) — such a document falls back to the
 //! single client-rooted connection, matching the pre-#382 behavior, unless the
 //! server opted into `preferSharedInstance` (#391), in which case it joins the
-//! shared instance (the complete client workspace — folder snapshot, or the
-//! bare rootUri when the client sent no folders — is announced on its behalf;
-//! admission itself needs no root).
+//! shared instance (on capable connections the complete client workspace —
+//! folder snapshot, or the bare rootUri when the client sent no folders — is
+//! announced on its behalf; admission itself needs no root).
 
 use std::fmt;
 
