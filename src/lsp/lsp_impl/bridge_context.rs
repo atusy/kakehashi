@@ -785,15 +785,23 @@ impl Kakehashi {
         let injection_query = self.language.injection_query(&language_name)?;
 
         // Resolve injection region at position. Clamped conversion: per LSP
-        // 3.18 an out-of-bounds position defaults back to the line's (or
-        // document's) end instead of failing, and the clamp also keeps an
-        // over-long column from spilling into a later line's bytes and
+        // 3.18 a `character` past the line's end defaults back to the line
+        // length instead of failing, and the clamp also keeps an over-long
+        // column from spilling into a later line's bytes and
         // containment-matching a region the caret is not visually in. The
         // position is re-derived from the clamped byte so every later
         // consumer sees the defended location, not the client's raw one.
+        // The defense is CHARACTER-scoped only: the spec mandates no such
+        // default for a line past the document's end, and letting one clamp
+        // to EOF would resolve the final injection for an unrelated line —
+        // a changed line means an invalid position, not a defended one.
         let mapper = PositionMapper::new(snapshot.text());
         let byte_offset = mapper.position_to_byte_clamped(position);
-        let position = mapper.byte_to_position(byte_offset)?;
+        let normalized = mapper.byte_to_position(byte_offset)?;
+        if normalized.line != position.line {
+            return None;
+        }
+        let position = normalized;
 
         let Some(resolved) = crate::language::InjectionResolver::resolve_at_byte_offset(
             &self.language,
