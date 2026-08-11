@@ -514,8 +514,13 @@ impl LanguageServerPool {
         // Same ordering requirement as the encoded path: a palette command can
         // reference a document too (a downstream is free to take a URI argument),
         // and this connection may have just respawned with its re-open still in
-        // flight. Bounded, and a no-op when nothing is pending.
-        if !self.wait_for_pending_reopen(&key).await {
+        // flight. Bounded, and a no-op when nothing is pending. Watch the key of
+        // the connection actually ACQUIRED, not the registry key: the reconnect
+        // branch can legitimately come back with a shared-keyed handle (a
+        // preferSharedInstance flip between registration and reconnect), and a
+        // barrier on the stale ClientFallback key would be vacuously satisfied
+        // while the acquired connection's re-opens are still in flight.
+        if !self.wait_for_pending_reopen(handle.key()).await {
             warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: origin {origin:?} is still re-opening its documents; \
