@@ -441,11 +441,17 @@ pool-lock critical sections — the tombstone install/remove, the ARM, the
 replacement insertion (with its generation revalidation), and the registry
 release with its ownership verification. Between commit points the task
 holds no pool locks and touches no shared state other than its spawned
-process, whose kill handle is registered at spawn time. Cancellation is
-observed on entry to each commit point; a cancel — cooperative or hard —
-landing between commit points leaves shared state exactly as the last
-commit point left it, and the ownership-at-completion recovery rule
-classifies whatever the operation had gotten to.
+process, whose kill handle is registered at spawn time. A commit point's
+critical section contains **no suspension point** — it runs synchronously
+under the pool lock — which is what makes a Tokio hard-cancel atomic with
+respect to it. Cancellation is observed on entry to each commit point; a
+cancel — cooperative or hard — landing between commit points leaves
+shared state exactly as the last commit point left it. Because a
+hard-aborted task can no longer run its own recovery, **teardown owns a
+post-abort finalizer**: it applies the ownership-at-completion rule on
+the aborted operation's behalf, settling the ARM state, tombstone,
+replacement, and registry entries to whatever the last commit point
+implies.
 
 - **Process-level configuration applies.** `command`, `args`,
   `initializationOptions`, settings — whatever the config says *now* is what

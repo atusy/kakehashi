@@ -195,7 +195,7 @@ it):**
 
 ### Shutdown Timeout Policy
 
-**Global timeout**: Implementation-defined duration (typically 5-15 seconds) for entire shutdown sequence across all connections.
+**Global timeout**: Implementation-defined duration (typically 5-15 seconds) bounding connection and process termination across all connections. Local cleanup (registries, router state) needs no server cooperation and falls outside the ceiling.
 
 **Best-Effort Parallel Shutdown:**
 All connections shut down in parallel under a single global ceiling. This is intentionally best-effort:
@@ -231,8 +231,14 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
     // the seal blocks replacement insertion. Control operations register
     // every process they spawn in the teardown-owned `control_procs`
     // registry AT SPAWN TIME, so a restart crossing its spawn point can
-    // never lose its kill handle.
-    let (control_ops, control_procs) = seal_and_take_control_operations();
+    // never lose its kill handle. `control_tasks` is a teardown-owned
+    // JoinSet living OUTSIDE the timed future below, so a timeout drops
+    // only the polling future, never the task handles; both phases poll
+    // the same set. `control_procs` is a LIVE registry with
+    // kill-on-register from this point on — a child spawned after any
+    // scan is killed at registration — and it closes only when the last
+    // control task terminates.
+    let (mut control_tasks, control_procs) = seal_and_take_control_operations();
 
     // Snapshot AFTER both gates: nothing can be inserted past them.
     let connections = pool.all_connections();
@@ -245,7 +251,10 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
         let tasks = connections.iter()
             .map(|conn| conn.shutdown_by_state());
 
-        futures::future::join_all(tasks.chain(control_ops)).await;
+        // Poll the teardown-owned JoinSet alongside; the set itself
+        // outlives this future, so nothing detaches on timeout
+        join!(futures::future::join_all(tasks),
+              drain_join_set(&mut control_tasks));
     }).await;
 
     // Cooperative cancellation runs CONCURRENTLY with escalation, both
@@ -261,11 +270,14 @@ async fn shutdown_all_connections(pool: &ConnectionPool) {
     // compare-transition no-op). When the remaining budget is shorter
     // than the normal SIGTERM grace, the grace is shortened or skipped.
     join!(
-        force_kill_remaining_until(deadline, connections, control_procs),
-        cancel_join_or_abort_control_tasks(deadline),
+        force_kill_remaining_until(deadline, connections, &control_procs),
+        cancel_join_or_abort(&mut control_tasks, deadline),
     );
-    // Only now — with every control task terminated — may pool/router
-    // cleanup run; nothing can mutate registries or tombstones after it.
+    // Only now — with every control task terminated and the live
+    // process registry closed — may pool/router cleanup run, preceded by
+    // the post-abort finalizer (bridge-client-control-protocol) settling
+    // any hard-aborted operation's state; nothing can mutate registries
+    // or tombstones after cleanup.
 }
 ```
 
@@ -319,9 +331,10 @@ async fn shutdown_router() {
     //    replacement insertion, so a registry-only restart can neither
     //    escape the connection snapshot below nor leave a live
     //    replacement behind; every process a control operation spawns is
-    //    registered in the teardown-owned control_procs registry at
-    //    spawn time
-    let (control_ops, control_procs) = seal_and_take_control_operations();
+    //    registered in the teardown-owned live control_procs registry at
+    //    spawn time (kill-on-register once teardown begins); the
+    //    JoinSet outlives the timed future, as in the sketch above
+    let (mut control_tasks, control_procs) = seal_and_take_control_operations();
 
     // 4. Shutdown all connections in parallel (snapshot AFTER both gates)
     let all_connections = connection_pool.all_connections();
@@ -339,8 +352,9 @@ async fn shutdown_router() {
                 conn.shutdown_by_state().await
             });
 
-        // Adopted control operations are joined alongside
-        futures::future::join_all(tasks.chain(control_ops)).await;
+        // Adopted control operations are polled from the outer JoinSet
+        join!(futures::future::join_all(tasks),
+              drain_join_set(&mut control_tasks));
     }).await;
 
     // Cancellation/join runs concurrently with escalation against the
@@ -348,8 +362,8 @@ async fn shutdown_router() {
     // hard-aborted (safe: shared-state effects live only at commit
     // points — see the sketch above and bridge-client-control-protocol)
     join!(
-        force_kill_remaining_until(deadline, all_connections, control_procs),
-        cancel_join_or_abort_control_tasks(deadline),
+        force_kill_remaining_until(deadline, all_connections, &control_procs),
+        cancel_join_or_abort(&mut control_tasks, deadline),
     );
 
     // 5. Clean up router resources — runs after every control task has
@@ -376,10 +390,11 @@ async fn shutdown_router() {
 - Prevents cache corruption from abrupt termination
 
 **Bounded Shutdown Latency:**
-- Global timeout ensures shutdown completes in bounded time
-- Fail-fast disposal of pending and new operations prevents hang; the
-  accepted write queue drains, but that is local FIFO work bounded by
-  queue length, not by server speed
+- Global timeout bounds connection/process termination (local cleanup
+  falls outside the ceiling and needs no server cooperation)
+- Fail-fast disposal of pending and new operations prevents hang; on the
+  graceful path the accepted write queue drains, but that is local FIFO
+  work bounded by queue length, not by server speed
 - Parallel multi-connection shutdown: O(1) not O(N)
 
 **Clear Error Semantics:**
