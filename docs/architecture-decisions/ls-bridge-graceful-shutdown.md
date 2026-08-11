@@ -393,10 +393,12 @@ deadline and teardown under its absolute one; a **reload** claim has no
 waiter of its own — the reload reply commits with the claim, an
 acquisition deadline terminates only its acquire waiter, and the
 reload-origin cleanup record stays authoritative and fenced until its
-producer terminates or teardown adopts it. A spawn sub-task that has not
-terminated by the applicable waiter's deadline fails the operation
+producer terminates or teardown adopts it. A spawn sub-task that has not terminated by a
+**`stop`/`restart` or teardown** waiter's deadline fails that operation
 (`stopFailed`/`restartFailed`) and converts the entry to a fenced
-cleanup record — escrow still open, the eventual child still
+cleanup record; an **acquire** timeout, by contrast, only drops its own
+subscription and leaves the entry — reload-origin cleanup included —
+unchanged. The converted record keeps the escrow open, the eventual child still
 killed-and-reaped on arrival — while teardown disposes that record by
 mode instead of waiting indefinitely: `ServerRemains` retains it, and
 `ProcessExit` **aborts the producer first** — an open-escrow intent's
