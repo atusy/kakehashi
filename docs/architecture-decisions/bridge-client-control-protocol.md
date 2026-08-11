@@ -739,7 +739,12 @@ namespace.
   begun — and an ordinary acquire's pre-handle `Spawning` intent entry
   is an in-flight-operation record like any other: it enumerates as
   `starting`, resolves its id, and fences acquires until the handle
-  lands or the intent settles. `ConnectionState` alone could never provide this: it exposes
+  lands or the intent settles. A `Spawning` entry retained in its
+  **settling** phase (claimed by `stop`, `restart`, or teardown)
+  enumerates as `stopping` — it is being wound down — with one
+  exception: reload deletion follows the reload rule, dropping the
+  entry from the published snapshot so the id resolves `unknownClient`
+  while the fenced cleanup record persists internally, unaddressable. `ConnectionState` alone could never provide this: it exposes
   only `Initializing`, which cannot distinguish a restart in flight from
   an ordinary first spawn.
 - Acquire keeps using existing `Ready` connections lock-free; the

@@ -369,7 +369,15 @@ retains it — slot still writable — until the sub-task's termination
 surfaces through the `JoinSet`; a handle landing in that window is
 killed-and-reaped by the final settlement, so no child can slip in
 behind an escalation scan, and teardown publishes completion only after
-its adopted `Spawning` entries have settled this way. The pairing applies to the
+its adopted `Spawning` entries have settled this way. Claim closure is
+**deadline-bounded like everything else**: a spawn sub-task that has not
+terminated by the applicable deadline (per-slot for `stop`/`restart`,
+the absolute deadline for teardown) fails the operation
+(`stopFailed`/`restartFailed`) and converts the entry to a fenced
+cleanup record — escrow still open, the eventual child still
+killed-and-reaped on arrival — while teardown disposes that record by
+mode (`ProcessExit` logs and abandons the intent; `ServerRemains`
+retains it) instead of waiting indefinitely. The pairing applies to the
 **terminal, caller-visible transition** of an operation: a multi-step
 `stop`/`restart` commits its initial and intermediate transitions
 state-only, the entry retaining the live reply sender for terminal
@@ -408,7 +416,17 @@ async fn lifecycle_actor(pool: Arc<ConnectionPool>) {
     loop {
         select! {
             Some(msg) = rx.recv() => state.step(msg, &pool, tasks),
-            Some(done) = tasks.join_next() => state.settle(done, &pool),
+            Some(done) = tasks.join_next() => {
+                // The join outcome is recorded on the entry as a
+                // non-fallible first act (a pending-settlement marker),
+                // THEN the settlement transition runs: join_next removed
+                // the only terminal event, so if settlement panics the
+                // marker survives and a restarted incarnation re-runs
+                // settlement from markers at startup — no caller is
+                // left pending.
+                state.record_outcome(&done);
+                state.settle(done, &pool);
+            }
             // Every arm is non-suspending state mutation plus sub-task
             // spawns; long I/O never runs inside the loop. A panicked
             // sub-task never sends a completion message — join_next is
