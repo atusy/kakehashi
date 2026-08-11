@@ -260,8 +260,9 @@ async fn shutdown_router() {
         let tasks = all_connections.iter()
             .map(|conn| async move {
                 match conn.state() {
-                    Failed => conn.cleanup_only(),      // Skip LSP handshake
-                    _ => conn.graceful_shutdown(),      // Full LSP sequence
+                    Failed => conn.cleanup_only(),       // Skip LSP handshake
+                    Initializing => conn.terminate_without_lsp(), // No LSP message (see Initialization Shutdown)
+                    _ => conn.graceful_shutdown(),       // Full LSP sequence
                 }
             });
 
@@ -411,3 +412,4 @@ Skip synchronization, just send shutdown request whenever ready.
 ## Amendment History
 
 - **2026-01-06**: Merged Amendment 001 - Added three-phase writer loop shutdown synchronization to prevent stdin corruption during concurrent shutdown writes
+- **2026-08-11**: Corrected Initialization Shutdown - the abort path sends no LSP message at all (the earlier revision sent `exit` before the initialize response, which LSP ordering forbids); adopted alongside bridge-client-control-protocol, whose per-slot `stop` shares the path
