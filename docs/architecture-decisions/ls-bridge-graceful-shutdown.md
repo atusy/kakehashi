@@ -90,7 +90,12 @@ Failed → Closed (skip LSP handshake)
 transitions to `Closed` for bookkeeping. What happens to the child
 depends on whether the kakehashi process is actually exiting:
 log-and-abandon applies **only on the process-exit path** (the `exit`
-notification, or teardown that ends the process). When a `Teardown(ServerRemains)`
+notification, or teardown that ends the process) — and it is safe there
+for exactly one reason: the parent's imminent exit reparents the child
+to init, which reaps it, so neither a live straggler nor a zombie can
+persist. A teardown after which kakehashi keeps running is by
+definition `ServerRemains` and retains its records; delivery of SIGTERM
+or SIGKILL never substitutes for the reaped `wait`. When a `Teardown(ServerRemains)`
 runs while the server stays alive — the LSP `shutdown` request is
 answered and the process then waits for `exit`, possibly indefinitely —
 ownership of every unconfirmed child is **retained**: its
@@ -371,9 +376,12 @@ sealing, tombstone sweeps) — and its final act is the single
 every affected value unchanged with the message merely consumed.
 External effects are not staged, because an OS child cannot be rolled
 back: a spawn first **commits a `Spawning` intent** whose entry carries
-an actor-owned **escrow slot**, and the tracked sub-task's first act on a
-successful spawn — atomically with observing it, before any suspension
-point — is to store the child's handle into that slot. At every instant,
+an actor-owned **escrow slot**; the tracked sub-task creates the child
+**under a kill-on-drop guard**, and its first act on a successful spawn —
+atomically with observing it, before any suspension point — is to store
+the child's handle into that slot, disarming the guard. A panic in the
+create-to-store window therefore drops the guard and kills the child:
+no process can exist outside actor records even across an unwind. At every instant,
 therefore, either no child exists or its handle is in actor-owned state;
 the completion stays a pure report, and a panic at any point settles
 from the entry (kill-and-reap whatever the escrow holds), never by
