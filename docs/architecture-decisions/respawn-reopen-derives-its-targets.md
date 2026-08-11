@@ -95,6 +95,12 @@ with the work that belongs to the connection.
 3. Does it route to *this* connection? A marker resolution, paid only by hosts
    that survived (2). Read-only: it never spawns, so asking about a document
    belonging to another root cannot bring that root's server up.
+   bridge-routing-protocol amends this stage: when the document holds an
+   active route binding for the server, the binding answers instead of the
+   marker walk — a suppressed server is "not applicable", a bound key must
+   match this connection's — and a document with no binding falls through to
+   the marker rule above. The stage stays read-only either way: the sweep
+   never issues a routing query.
 
 Stage 1 is deliberately conservative — a server declaring the `*` wildcard is
 never pre-rejected, and inheritance from the `_` template is resolved before the

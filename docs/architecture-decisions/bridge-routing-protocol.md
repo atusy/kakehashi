@@ -129,11 +129,11 @@ The result layers a "kakehashi decides" default at every granularity:
   gate**, a per-decision point every open path consults before sending
   any `didOpen` — the eager per-server open tasks, the lazy per-request
   open (the `ensure_document_opened` call on the request-execute path),
-  and the derived re-open sweep alike — so, while the decision is
-  cached, no later request can open the document there through a side
-  door (a post-flush miss at the cache-only sites fails open — see
-  Caching below; the gate's placement is specified under the deadline
-  section). This is **per-document forwarding
+  and the derived re-open sweep alike. The applied decision is recorded
+  as an **active route binding** that lives until the document closes
+  (see Caching below), so no later request can open the document there
+  through a side door for as long as it stays open (the gate's placement
+  is specified under the deadline section). This is **per-document forwarding
   suppression**, not slot control: the connection (if any) is untouched
   and other documents route normally. It is deliberately weaker than
   bridge-client-control-protocol's `stop`, which pins a whole slot.
@@ -142,9 +142,12 @@ The result layers a "kakehashi decides" default at every granularity:
   kakehashi's other gates (the per-host bridge filter, capability
   prefilters, spawnability); it exists so a provider can attach a
   `workspaceFolders` override while explicitly not suppressing. Its
-  *presence* is not a no-op, however: any present field — `enabled: true`
-  included — makes the entry **operative** for the fan-in predicate
-  (below), so an affirmation-only answer still counts as an answer.
+  *presence* is not a no-op, however: an entry is **operative** for the
+  fan-in predicate (below) when it carries `enabled` (either value) or a
+  `workspaceFolders` value that is non-`null` and survives validation —
+  so an affirmation-only answer still counts as an answer, while
+  `workspaceFolders: null` alone, or an entry whose only content was
+  dropped by validation, decides nothing.
 - Malformed input is handled at three levels, all fail-open with a
   warning: a result that does not deserialize to `RoutingResult` at all is
   treated as `null`; a well-typed entry whose `workspaceFolders` fails
@@ -268,10 +271,17 @@ ls-bridge-server-pool-coordination's model as follows:
   variant exists in a rooted session's pool model. The entry is dropped
   with a warning (a rootless override is deferred — below).
 
-Folder strings are workspace folder URIs; the folder `name` is the basename
-of the root, exactly as `root_markers::workspace_at_root` derives it for a
-marker-rooted spawn (falling back to the URI string for a root with no
-basename).
+Folder strings are workspace folder URIs. Canonicalization is identity,
+not merely a validation step: each element must resolve to an existing
+**directory**, and the canonicalized URI — not the answer's original
+spelling — is what flows everywhere downstream: the `ConnectionKey`, the
+stopped-set checks, the route binding, the folder announce, and the
+spawn. Two spellings of one directory (symlink, percent-encoding, case,
+trailing slash) can therefore never mint two keys or slip past an
+equivalent stopped key. The folder `name` is the basename of the
+canonical root, exactly as `root_markers::workspace_at_root` derives it
+for a marker-rooted spawn (falling back to the URI string for a root with
+no basename).
 
 ### Discovery
 
@@ -281,10 +291,11 @@ the downstream-facing side, the convention bridge-client-control-protocol
 set on the client-facing side, and like `serverInfo` there, the flag is
 parsed from the initialize result and retained per connection handle.
 Kakehashi in turn declares `experimental.kakehashi.bridgeRouting: true` in
-the **client capabilities** it sends at `initialize` — unless routing is
-disabled for every language at spawn time (`priorities = []` everywhere) —
-so a provider can skip building routing state under clients that will never
-ask.
+the **client capabilities** it sends at `initialize`, unconditionally — a
+configuration reload can enable routing mid-session without reinitializing
+existing connections, so the declaration must not encode current config —
+letting a provider skip building routing state only under clients that
+genuinely never speak the protocol.
 
 Kakehashi never **initiates** a routing query to a server that did not
 advertise — which is also what makes the default configuration free of
@@ -319,7 +330,12 @@ session and remembered per server name — or it is named explicitly
 after the handshake, and awaiting every initializing server to find out
 would tax exactly the fleets that have no providers at all. Slots that are
 `stopping`, `stopped`, `failed`, or mid-`restart`
-(bridge-client-control-protocol's states) are skipped, never parked on.
+(bridge-client-control-protocol's states) are skipped, never parked on. A
+provider *name* can own several live connections at once (per-root
+pooling, plus a `forceStart` spawn); the routing query rides exactly
+**one** of them, picked deterministically — the shared or client-fallback
+handle when it is `Ready`, otherwise the `Ready` handle whose key
+rendering sorts first — an arbitrary but stable choice, recorded as such.
 
 Provider order is configured through the existing per-method aggregation
 map — `languages.<host>.bridge.<lang>.aggregation`, abbreviated
@@ -370,9 +386,11 @@ candidates at all likewise queries nothing.
   **concurrent fan-out** to every selected provider, then the
   priority-aware fan-in picks the winner — the highest-priority answer
   that is non-`null` and non-empty under the caller-supplied predicate
-  every `preferred` dispatch provides. For routing the predicate is: the
-  `routing` map holds at least one entry carrying at least one operative
-  field — `enabled: true` included, per the operative rule above.
+  every `preferred` dispatch provides. Each answer is validated and
+  normalized (Answer Semantics) **before** the predicate runs, so an
+  answer whose only content validation dropped cannot win the walk and
+  block lower providers. For routing the predicate is: the `routing` map
+  holds at least one operative entry, per the operative rule above.
   `null`, `{ routing: {} }`, an entry with no fields, an error response,
   a timeout, and a malformed answer all mean "no opinion" and fall
   through to the next position. The priority walk's entries are **pruned
@@ -410,63 +428,90 @@ Two structural rules keep the protocol from consuming itself:
   document. A provider that answers `enabled: false` for itself therefore
   keeps working: its documents are suppressed, its policy channel is not.
 
-### The Query Point, Caching, and Staleness
+### The Query Point, the Decision Cache, and the Route Binding
 
 Kakehashi queries at the **first routing decision** for a (host document,
 layer, language) tuple: the host `didOpen` (when host bridging is enabled)
-and the first virtual-document creation per injection language. The
-decision is cached per `(host URI, layer, languageId, config generation)`
-with **single-flight** dedup — concurrent decision points for the same key
-await one in-flight query rather than racing their own (no existing lock
-covers this: the per-URI `edit_lock` is released before the bridge's open
-fan-out begins, so the protocol brings its own serialization). A joiner
-inherits the in-flight decision's remaining deadline, never a fresh one.
+and the first virtual-document creation per injection language. Two
+structures with different lifetimes carry the outcome:
 
-Cache lifecycle:
+- The **decision cache** holds pre-application answers, keyed
+  `(host URI, layer, languageId, config generation)` with **single-flight**
+  dedup — concurrent decision points for the same key await one in-flight
+  query rather than racing their own (no existing lock covers this: the
+  per-URI `edit_lock` is released before the bridge's open fan-out
+  begins, so the protocol brings its own serialization). A joiner
+  inherits the in-flight decision's remaining deadline, never a fresh
+  one. The cache is policy, and policy is invalidatable — flushed and
+  evicted by the rules below.
+- The **active route binding** records the outcome actually applied when
+  the open tasks ran: per (host document, layer, language), which servers
+  were suppressed and which `ConnectionKey` each open landed on, stamped
+  with the document's open incarnation. The binding is *identity*, not
+  policy: the lazy request-path open and the derived re-open sweep
+  consult it — a suppressed server stays suppressed, a bound key stays
+  the key — and it is evicted only by the host document's `didClose`,
+  never by a flush. This is what makes invalidation non-retroactive
+  without opening side doors: a flushed *cache* cannot lift a
+  suppression or re-root an open document onto a second same-name
+  connection, because those sites read the *binding*. A server with no
+  binding record (one that became a candidate only after the open, say
+  via reload) falls through to kakehashi's ordinary resolution.
 
-- **Evicted on the host document's `didClose`** (all its layers' and
-  languages' entries at once); an answer arriving for an already-closed
-  document is discarded. A configuration reload flushes the whole cache —
-  superseded-generation entries are unreadable under the new generation
-  and would otherwise sit resident until their document closes. The cache
-  is therefore bounded by open documents × layers × languages.
+Decision-cache lifecycle:
+
+- **Evicted on the host document's `didClose`** — all its layers' and
+  languages' entries, and its binding, at once. A configuration reload
+  flushes the whole cache: superseded-generation entries are unreadable
+  under the new generation and would otherwise sit resident until their
+  document closes. Cache and binding are each bounded by open documents
+  × layers × languages.
 - **Flushed wholesale whenever the set of `Ready` advertising providers
   changes** — a provider reaching `Ready`, being replaced by restart or
   respawn, being stopped, failing, or having its advertisement cleared by
-  `-32601`. The flush is deliberately coarse: the cache is small,
-  per-entry provenance tracking is not worth its bookkeeping, and the
-  rule uniformly covers the cases a finer rule mishandles (a
-  `null`-chained answer whose *losing* higher-priority provider restarts;
-  a provider that was absent at query time appearing later). Fallback
-  outcomes — no provider was available, or every provider declined — are
-  cached like any answer and healed by the same flush.
-- **A flush affects only future decision points.** A cache miss anywhere
-  else — the lazy request-path open or the re-open sweep reading a
-  flushed cache — **fails open**: kakehashi decides, and no query is
-  issued outside the two query points above. A provider-ordered
-  suppression can therefore lift for an already-open document after a
-  flush, until that document's next close/re-open; likewise a cold-start
-  document that was decided by defaults is re-decided only at its next
-  genuine decision point, which for an already-open document is
-  close/re-open. Both are accepted: the alternatives are provider queries
-  resurrecting on hover-class request paths, or a thundering herd of
-  every open document re-deciding at once after a provider restart.
-- **Anchored insert**: a single-flight query captures the pair (config
-  generation, flush epoch) when it starts — the epoch is a monotonic
-  counter bumped by every flush — and its answer is inserted only if
-  neither has moved; otherwise the insert is invisible (one wasted round
-  trip, never a wrong serve). Generation anchoring alone — the discipline
-  the bridge's `cached_configs` snapshot cache records for this race —
-  would not cover a flush, which changes no generation.
-- **Generation revalidation at apply time**: the acquire path re-reads the
-  current config generation inside its critical section and compares it
-  to the answer's; on mismatch the answer is discarded and the acquire
-  proceeds by kakehashi's own rules (fail-open). A stale answer is never
-  applied across a reload.
+  `-32601` — **and whenever the effective client workspace-folder set
+  changes** (`workspace/didChangeWorkspaceFolders`, or config paths that
+  adjust it): the folder set is part of the trust universe, so decisions
+  validated against the old set must not be reused. The flush is
+  deliberately coarse: the cache is small, per-entry provenance tracking
+  is not worth its bookkeeping, and the rule uniformly covers the cases a
+  finer rule mishandles (a `null`-chained answer whose *losing*
+  higher-priority provider restarts; a provider that was absent at query
+  time appearing later). Fallback outcomes — no provider was available,
+  or every provider declined — are cached like any answer and healed by
+  the same flush.
+- **A flush affects only future decision points.** A document already
+  open keeps its binding; a cold-start document that was decided by
+  defaults is re-decided only at its next genuine decision point, which
+  for an already-open document is close/re-open. Accepted: the
+  alternatives are provider queries resurrecting on hover-class request
+  paths, or a thundering herd of every open document re-deciding at once
+  after a provider restart.
+- **Triple anchor, checked at application.** A single-flight query
+  captures (config generation, flush epoch, document open incarnation)
+  when it starts — the epoch is a monotonic counter bumped by every
+  flush; the incarnation is the per-open token the document store
+  already mints — and its answer is **applied and inserted only while
+  all three still hold**. Otherwise the flight's result is discarded
+  whole: waiting open tasks fall open to kakehashi-decided routing (one
+  wasted round trip, never a wrong serve), and because the anchors are
+  part of the flight's identity, a caller arriving after a flush or
+  re-open never joins the stale flight — it starts a fresh one.
+  `didClose` retires in-flight flights the same way, which closes the
+  close/reopen ABA: a re-opened document can never receive the previous
+  open's answer. Generation anchoring alone — the discipline the
+  bridge's `cached_configs` snapshot cache records for this race —
+  covers neither a flush (which changes no generation) nor a re-open
+  (which changes neither).
+- **Generation revalidation at apply time**: the acquire path
+  additionally re-reads the current config generation inside its
+  critical section and compares it to the answer's; on mismatch the
+  answer is discarded and the acquire proceeds by kakehashi's own rules
+  (fail-open). A stale answer is never applied across a reload.
 
 Invalidation is **not retroactive**: it affects future decisions —
 subsequent opens, re-opens, and the derived re-open after a restart (which
-reads the cache) — but never tears down routes already established for an
+reads the binding) — but never tears down routes already established for an
 open document. Re-routing a live document is a close/re-open, initiated by
 whoever holds the document, not by the bridge. Providers have no push
 channel to signal policy changes (deferred — below), so a decision can be
@@ -506,7 +551,7 @@ await the same future, and each task applies the answer (suppression,
 root override, then its acquire) before sending its `didOpen`. The
 injection-layer decision is awaited the same way by the virtual-document
 open tasks, off the parse loop; the lazy request-path open and the
-re-open sweep consult the cache only, as above. The deadline's cost is
+re-open sweep consult the binding only, as above. The deadline's cost is
 therefore **deferred feature availability** — downstream opens, and the
 features they enable, land up to one deadline later than today — not a
 stalled writer ticket or parse cycle.
@@ -600,7 +645,9 @@ An earlier decision (workspace-resolver, with its lua-host-api companion
 surface) attached a sandboxed, user-authored Lua function to each server
 entry, returning per-document `(attach, workspace)` with the document text
 in hand. **Rejected; both records are deleted as this decision lands**
-(delete-on-supersede; neither was implemented). It answers the same gap —
+(delete-on-supersede; the Lua resolver and its host API were never
+implemented — the `rootMarkers` → `workspaceMarkers` rename that ADR also
+carried had already shipped, and stays). It answers the same gap —
 content-dependent per-document attach and rooting — but from the wrong
 side, on two counts. Authoring: the resolver is program code embedded in a
 TOML string — no syntax highlighting, no formatter, no linting, no unit
@@ -612,7 +659,11 @@ curated `kakehashi.*` host API (the whole lua-host-api surface) — all of
 it existing for that one hook. A routing provider moves the same logic
 into a long-lived project-side process that tooling can ship, version, and
 test independently of any user's config, decides across all servers in one
-answer, and adds no runtime to kakehashi.
+answer, and adds no runtime to kakehashi. One narrowing is accepted and
+recorded: the resolver saw the unsaved buffer (`document_info.text`),
+while `RoutingParams` carries no document text and the query precedes the
+`didOpen` — a provider decides from project state and document identity,
+reading disk, never unsaved content.
 
 ### A top-level `bridge.routing` config block
 
@@ -744,10 +795,9 @@ a slot a routing provider left in play.
   hook exists, diagnosing a misroute means reading the warn-level logs.
 - Routing is pull-only and non-retroactive: a document's decision can be
   stale for its whole open lifetime as project state moves under it; the
-  provider has no way to say so (deferred invalidation notification).
-  After a provider-set flush, already-open documents fail open at
-  non-query-point sites — a provider-ordered suppression can lift until
-  the document is re-opened.
+  provider has no way to say so (deferred invalidation notification),
+  and an open document keeps its route binding until close/re-open even
+  when a newer provider would decide differently.
 - Under the default `priorities = ["*"]`, a server upgrade that adds the
   advertisement silently promotes an installed server to routing
   authority, and ordering between multiple `"*"`-group providers is
@@ -794,9 +844,12 @@ a slot a routing provider left in play.
   acquire, holding no pool lock; the acquire critical section
   re-validates the answer's config generation (discard on mismatch)
   alongside its existing stopped-set and control-registry checks. The
-  single-flight map (keyed like the cache, carrying the (generation,
-  flush-epoch) anchor) and the decision cache are new state beside the
-  pool's per-connection maps.
+  single-flight map (anchored (generation, flush epoch, open
+  incarnation) — the incarnation is the per-open token the document
+  store's open tracker already mints), the decision cache, and the
+  active route binding are new state beside the pool's per-connection
+  maps; the binding rides the same per-document lifecycle the
+  open-incarnation tracker maintains.
 - Fan-out/fan-in reuse `fan_out` + the `preferred` collector over the
   expanded priority walk, with the routing-specific provider universe
   (all spawnable configured servers, advertisement-filtered) and the
@@ -841,6 +894,6 @@ a slot a routing provider left in play.
 | **Folders↔Key** | shared instance: union-only join; per-root: first element, rest warned+ignored; at most one connection per server name per document |
 | **Providers** | all spawnable configured servers ∩ advertising ∩ `Ready` (Initializing awaited only when the advertisement is known or the server is named), ordered by routing `priorities` (no `"_"` method-wildcard inheritance); concurrent fan-out, `preferred` fan-in, operative-entry rule |
 | **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy); expiry cancels pending requests, retires entries, falls open; exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
-| **Caching** | per (host URI, layer, languageId, config generation); single-flight; evicted on `didClose`, flushed on reload and on `Ready`-provider-set change; (generation, flush-epoch)-anchored insert + apply-time revalidation; misses outside query points fail open; never retroactive |
+| **Caching** | decision cache per (host URI, layer, languageId, config generation), single-flight, evicted on `didClose`, flushed on reload / `Ready`-provider-set / workspace-folder-set change, (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until `didClose`; never retroactive |
 | **Cold start** | `forceStart` (post-config-publication get-or-create, marker-less fallback root shape, warm-up scope limited to shared/marker-less/policy servers) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
 | **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; re-open reads the cache only |
