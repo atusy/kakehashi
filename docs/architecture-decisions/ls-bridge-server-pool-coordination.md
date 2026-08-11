@@ -537,7 +537,13 @@ languageServers:
   completion corpus missing every open buffer's words). Marker-less documents
   are also exempt from the incapable-shared divert, since they add no root the
   capability would be needed for. Non-opted-in servers keep the client-root
-  fallback for marker-less documents.
+  fallback for marker-less documents. Known consequence: a shared connection
+  spawned by a marker-less FIRST acquisition seeds its initial folders from the
+  client snapshot, and `apply_workspace_folder_change` deliberately does not
+  keep that seed current (the folder set has one writer after spawn —
+  acquisitions; forwarding client changes would need per-folder provenance) —
+  such a connection answers workspace-folder pulls from its initialize-time
+  snapshot until marker roots join.
 - **2026-07-01**: Renamed the `languageServers.*.rootMarkers` config key to
   `workspaceMarkers` (aligning with the LSP spec's `workspaceFolders`); the old
   `rootMarkers` is accepted as a deprecated serde alias for backward

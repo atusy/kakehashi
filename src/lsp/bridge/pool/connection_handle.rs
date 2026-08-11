@@ -525,8 +525,11 @@ impl ConnectionHandle {
     }
 
     /// Log, at most once per connection, that a `preferSharedInstance` server
-    /// lacks the `workspaceFolders` capability and is therefore staying on the
-    /// per-root-instance model (#391). Returns `true` on the first call.
+    /// lacks the `workspaceFolders` capability, so marker-rooted documents its
+    /// connection does not already serve divert to the per-root-instance model
+    /// (#391). Marker-less documents stay aboard — they add no root, so both
+    /// divert sites call this only when a divert actually happens. Returns
+    /// `true` on the first call.
     pub(crate) fn log_incapable_fallback_once(&self, server: &str) -> bool {
         let first = self
             .incapable_fallback_logged

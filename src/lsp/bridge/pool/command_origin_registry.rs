@@ -17,7 +17,9 @@
 //! - **"If nothing is live, what can I reconnect?"** — the entry's VALUE. Only
 //!   `ConnectionKey::is_client_fallback` keys are recorded, because those are the
 //!   only ones the dispatcher's reconnect branch can revive: acquiring with
-//!   `document_uri: None` round-trips to that exact key, while a marker-rooted or
+//!   `document_uri: None` resolves back to that key (or, after a mid-session
+//!   `preferSharedInstance` flip, to the shared instance at the same client
+//!   root — the routing the new config asks for), while a marker-rooted or
 //!   shared key cannot be rebuilt without a document. Storing a key the branch
 //!   will reject anyway would let it out-vote the one key that works.
 //!

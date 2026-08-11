@@ -439,8 +439,11 @@ pub struct BridgeServerConfig {
     /// changeNotifications}`: when it does, kakehashi routes all roots to a
     /// single connection and announces each new root with
     /// `workspace/didChangeWorkspaceFolders`; when it does not, kakehashi logs
-    /// once and silently falls back to the per-root-instance model. That
-    /// universal fallback makes a blanket `languageServers._` opt-in safe.
+    /// once and silently falls back to the per-root-instance model for
+    /// marker-rooted documents (marker-less documents — e.g. non-file URIs —
+    /// stay on the shared connection: they add no root, so the missing
+    /// capability is never needed for them). That universal fallback makes a
+    /// blanket `languageServers._` opt-in safe.
     ///
     /// `None` = inherit (built-in default `false` = per-root instances). Like
     /// `workspace_markers`, a concrete server's explicit value overrides the

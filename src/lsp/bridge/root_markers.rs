@@ -102,11 +102,14 @@ pub(crate) fn workspace_from_marker(
 
 /// Resolve the marker root **and** its `WorkspaceFolder` for a spawn, as a
 /// single unit — `Some` only when a marker root is found *and* parses as an LSP
-/// `Uri`. Returning both together means the connection-pool key (issue #382) and
-/// the spawn handshake derive from the exact same decision: when this is `Some`,
-/// the key roots at `root` and the server spawns rooted there; when it is `None`
-/// (no hint, no marker, the `[]` kill switch, or an unparseable URI), the key
-/// roots at the client-root fallback and so does the spawn. They never disagree.
+/// `Uri`. Returning both together means the per-root connection-pool key (issue
+/// #382) and the spawn handshake derive from the exact same decision: when this
+/// is `Some`, the per-root key roots at `root` and the server spawns rooted
+/// there; when it is `None` (no hint, no marker, the `[]` kill switch, or an
+/// unparseable URI), the per-root key is the client-root fallback and the spawn
+/// uses the client root. They never disagree. (#391's shared-instance routing
+/// layers on top in `resolve_acquire` and can replace the per-root KEY with the
+/// shared one; the spawn-root rule is unchanged by it.)
 pub(crate) fn resolve_marker_workspace(
     root_markers: Option<&[RootMarker]>,
     document_uri: Option<&Url>,
