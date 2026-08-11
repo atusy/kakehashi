@@ -113,7 +113,8 @@ async fn graceful_shutdown(&self) {
     // 1. Transition to Closing state (new operations rejected)
     self.state.set(Closing);
 
-    // 2. Signal writer loop to STOP dequeuing
+    // 2. Signal writer loop to stop once the accepted queue has drained
+    //    (§ Operation Disposal Policy: accepted writes are sent, in order)
     let _ = self.writer_stop_tx.send(());
 
     // Phase 2: Wait for writer to become idle...
@@ -205,6 +206,11 @@ All connections shut down in parallel under a single global ceiling. This is int
 async fn shutdown_all_connections(connections: Vec<Connection>) {
     let global_timeout = Duration::from_secs(IMPL_DEFINED);
 
+    // Seal control admission first: no new per-slot stop/restart
+    // (bridge-client-control-protocol) may begin, and ownership of
+    // in-flight control operations transfers to this teardown.
+    let control_ops = seal_and_take_control_operations();
+
     tokio::time::timeout(global_timeout, async {
         // Shutdown all connections in parallel (best-effort).
         // Each task uses the state-aware dispatch below (§ Multi-Connection
@@ -213,9 +219,12 @@ async fn shutdown_all_connections(connections: Vec<Connection>) {
         let tasks = connections.iter()
             .map(|conn| conn.shutdown_by_state());
 
-        futures::future::join_all(tasks).await;
+        // Join adopted control operations alongside — a registry-only
+        // restart must not escape the snapshot of live connections.
+        futures::future::join_all(tasks.chain(control_ops)).await;
     }).await.unwrap_or_else(|_| {
-        // Global timeout expired - force kill remaining
+        // Global timeout expired - force kill remaining, including
+        // processes owned by adopted control operations
         force_kill_all(connections);
     });
 }
@@ -260,7 +269,12 @@ async fn shutdown_router() {
     // 2. Fail all pending routing decisions
     fail_pending_routes();
 
-    // 3. Shutdown all connections in parallel
+    // 3. Seal control admission and adopt in-flight stop/restart
+    //    operations (bridge-client-control-protocol) so a registry-only
+    //    restart cannot escape the connection snapshot below
+    let control_ops = seal_and_take_control_operations();
+
+    // 4. Shutdown all connections in parallel
     let all_connections = connection_pool.all_connections();
 
     tokio::time::timeout(GLOBAL_TIMEOUT, async {
@@ -272,16 +286,18 @@ async fn shutdown_router() {
                 // full handshake), so a handshake that commits Ready
                 // between observe and act is shut down gracefully,
                 // never terminated without the handshake.
-                conn.shutdown_by_state()
+                conn.shutdown_by_state().await
             });
 
-        futures::future::join_all(tasks).await;
+        // Adopted control operations are joined alongside
+        futures::future::join_all(tasks.chain(control_ops)).await;
     }).await.unwrap_or_else(|_| {
-        // Global timeout - force kill stragglers
+        // Global timeout - force kill stragglers, including processes
+        // owned by adopted control operations
         force_kill_all(all_connections);
     });
 
-    // 4. Clean up router resources
+    // 5. Clean up router resources
     cleanup_router_state();
 }
 ```
@@ -302,7 +318,9 @@ async fn shutdown_router() {
 
 **Bounded Shutdown Latency:**
 - Global timeout ensures shutdown completes in bounded time
-- Fail-fast operation disposal (no draining) prevents hang
+- Fail-fast disposal of pending and new operations prevents hang; the
+  accepted write queue drains, but that is local FIFO work bounded by
+  queue length, not by server speed
 - Parallel multi-connection shutdown: O(1) not O(N)
 
 **Clear Error Semantics:**
@@ -322,8 +340,9 @@ async fn shutdown_router() {
 
 ### Negative
 
-**No Operation Draining:**
-- Queued operations never reach server (writer loop stops dequeuing)
+**No Response Draining:**
+- Accepted writes drain to the server, but their responses are not
+  awaited — pending operations fail when the timeout expires
 - May surprise users expecting "finish pending work"
 - Trade-off: Predictable shutdown time vs completion
 
@@ -370,6 +389,11 @@ Shut down connections one at a time with individual timeouts.
 ### Alternative 2: Drain Operations Before Shutdown
 
 Continue processing pending operations until complete before shutting down.
+
+**Scope note**: what is rejected here is waiting for operation
+*completion* — server responses. Draining the already-accepted write queue
+is retained (§ Operation Disposal Policy): it is local, FIFO-bounded work,
+distinct from waiting on a server.
 
 **Rejected Reasons:**
 
