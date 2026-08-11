@@ -5198,6 +5198,54 @@ mod tests {
         }
     }
 
+    /// A position past the region's content end must abort at the dispatch
+    /// boundary: synthetic null result, and no virtual document opened on the
+    /// downstream server. Pins the trailing bound at the pool level — the
+    /// single-line content ends at host (3, 14), so (3, 20) has no virtual
+    /// coordinate. Without the bound, the request would forward a
+    /// beyond-EOF position and open the virtual document as a side effect.
+    #[tokio::test]
+    async fn position_past_region_end_aborts_without_opening_virtual_doc() {
+        if !is_lua_ls_available() {
+            return;
+        }
+
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let config = lua_ls_config();
+
+        let host_uri = Url::parse("file:///project/past_end.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        let result = pool
+            .send_hover_request(
+                "lua",
+                &config,
+                &host_uri,
+                tower_lsp_server::ls_types::Position {
+                    line: 3,
+                    character: 20,
+                },
+                "lua",
+                TEST_ULID_LUA_0,
+                RegionOffset::new(3, 0),
+                "print('hello')",
+                Some(UpstreamId::Number(1)),
+            )
+            .await;
+        let hover = result.expect("past-end hover must not error");
+        assert!(
+            hover.is_none(),
+            "past-end hover must produce the synthetic null result"
+        );
+
+        let closed_docs = pool.close_host_document(&host_uri).await;
+        assert!(
+            closed_docs.is_empty(),
+            "no virtual document may be opened for a past-end request, got {}",
+            closed_docs.len()
+        );
+    }
+
     /// Test that forward_didchange_to_opened_docs completes quickly with channel-based sending.
     ///
     /// ls-bridge-message-ordering: Channel-based sends via try_send() are non-blocking.
