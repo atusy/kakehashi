@@ -362,7 +362,14 @@ point — is to store the child's handle into that slot. At every instant,
 therefore, either no child exists or its handle is in actor-owned state;
 the completion stays a pure report, and a panic at any point settles
 from the entry (kill-and-reap whatever the escrow holds), never by
-pretending the child away. The pairing applies to the
+pretending the child away. **Escrow closes by claim, not by time**: a
+transition that settles a `Spawning` intent out from under its sub-task
+(teardown, reload deletion, `stop`) marks the entry *settling* but
+retains it — slot still writable — until the sub-task's termination
+surfaces through the `JoinSet`; a handle landing in that window is
+killed-and-reaped by the final settlement, so no child can slip in
+behind an escalation scan, and teardown publishes completion only after
+its adopted `Spawning` entries have settled this way. The pairing applies to the
 **terminal, caller-visible transition** of an operation: a multi-step
 `stop`/`restart` commits its initial and intermediate transitions
 state-only, the entry retaining the live reply sender for terminal

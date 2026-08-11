@@ -373,7 +373,14 @@ does not drain the queue — a losing handshake can neither enqueue
 handshake — the `Failed → Closed` bypass ls-bridge-graceful-shutdown already
 defines — cleans up the process, and records the stopped entry: pinning a
 repeatedly failing slot before the next acquire respawns it is a
-first-class use of this method, not an edge case.
+first-class use of this method, not an edge case. `stop` on a pre-handle
+`Spawning` entry **settles the intent**: the entry is marked settling
+and retained until the spawn sub-task terminates, any handle its escrow
+receives in the meantime is killed and reaped, and only then does the
+tombstone install and `stop` answer (`null`, or `stopFailed` into a
+termination-pending record if the reap is unconfirmed). `restart` on a
+`Spawning` slot is that same settlement followed by its ordinary respawn
+sequence.
 
 What is new is the **stopped set**: the pool records the `ConnectionKey` as
 explicitly stopped, and the normal routing path consults it — a `didOpen` (or
