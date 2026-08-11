@@ -17,7 +17,8 @@ mod helpers;
 
 use helpers::lsp_polling::poll_for_completions;
 use helpers::lua_bridge::{
-    create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
+    create_lua_configured_client, create_lua_configured_client_with_workspace, shutdown_client,
+    skip_if_lua_ls_unavailable,
 };
 use serde_json::json;
 
@@ -167,12 +168,22 @@ fn test_lua_completion_at_caret_end_of_unclosed_fence() {
         return;
     }
 
-    let (mut client, _config_dir) = create_lua_configured_client();
+    // The workspace variant: a real rootUri lets lua-ls index the virtual
+    // document, which is what makes a NON-NULL completion reliable enough to
+    // hard-assert on (this test's point is that null == the routing
+    // regression; the rootless helper documents null as a soft possibility).
+    let (mut client, workspace_dir, _config_dir) = create_lua_configured_client_with_workspace();
 
     // No newline after "print(" — the document ends mid-line inside the
     // unclosed block, so the region's end byte is EOF with a non-zero column.
     let markdown_content = "# Test Document\n\n```lua\nprint(";
-    let markdown_uri = "file:///test_caret_end.md";
+    let markdown_path = workspace_dir.path().join("test_caret_end.md");
+    std::fs::write(&markdown_path, markdown_content).expect("write workspace fixture");
+    let markdown_uri = format!(
+        "file://{}",
+        markdown_path.to_str().expect("utf-8 workspace path")
+    );
+    let markdown_uri = markdown_uri.as_str();
 
     client.send_notification(
         "textDocument/didOpen",
@@ -197,11 +208,11 @@ fn test_lua_completion_at_caret_end_of_unclosed_fence() {
         500, // delay_ms between attempts
     );
 
-    // The sibling test above passes under these same poll parameters, so
-    // lua-ls warm-up is not a plausible cause of a persistent null here — a
-    // null isolates the routing regression. (Error responses are retried
-    // away inside poll_for_lsp_result, so no separate error check is
-    // meaningful on the returned value.)
+    // With a real workspace root, lua-ls reliably answers completions (see
+    // create_lua_configured_client_with_workspace), so a persistent null
+    // isolates the routing regression rather than warm-up. (Error responses
+    // are retried away inside poll_for_lsp_result, so no separate error
+    // check is meaningful on the returned value.)
     let completion_response = completion_response.expect(
         "completion at the caret end of an unclosed fence must reach lua-ls \
          via the caret-end fallback; null means the request was routed away \
