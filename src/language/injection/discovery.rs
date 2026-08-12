@@ -147,9 +147,13 @@ fn position_of_byte(
 /// (`kakehashi/node`'s `injection_stack` does subtract gaps, because it parses
 /// with real `included_ranges` and has no such flat mapping.)
 ///
-/// Cheap enough for the per-keystroke lookup path: the offset branch is skipped
-/// entirely when the pattern has no directive, and the boundary snaps iterate
-/// at most three bytes.
+/// Cheap enough for the per-keystroke lookup path. Without a directive the
+/// offset branch is skipped entirely and the boundary snaps iterate at most
+/// three bytes. With one, the cost is `calculate_effective_range`'s: O(1) for a
+/// column-only directive, and for a row-shaped one (markdown frontmatter's
+/// `1 0 -1 0`) a walk between the node edge and the target row — bounded by the
+/// directive's row distance, never the document. Either way it is dwarfed by
+/// the `collect_all_injections` tree walk the caller runs first.
 pub(crate) fn effective_content_range(info: &InjectionRegionInfo<'_>, text: &str) -> Range<usize> {
     let node = &info.content_node;
     let (start, end) = match info.offset {
@@ -604,11 +608,24 @@ fn find_injection_at_position<'a>(
             // the caret sits on, provided that edge is mid-line — or at the
             // document's end, where a column-0 edge means an unclosed block
             // whose content ends on the newline just typed, not a closing
-            // fence (see the variant doc). Same iteration order as above, so
-            // nested regions ending at the same byte keep the established
-            // first-match (outermost) tie-break. The second scan runs only on
-            // the miss path, over the handful of regions a document has — not
-            // worth fusing into one pass.
+            // fence (see the variant doc). Same iteration order as above —
+            // `collect_all_injections`'s document order, sorted by RAW span —
+            // so regions ending at the same byte resolve to the first of them.
+            // That is the outermost region only while no directive shifts a
+            // span: raw order tracks effective nesting exactly when the
+            // effective spans equal the raw ones. The half-open scan above
+            // shares that property, and same-range alternate languages depend
+            // on the raw/pattern order for their documented query-order
+            // priority, so both scans keep it.
+            //
+            // The second scan runs only on the miss path, over the handful of
+            // regions a document has. It recomputes each effective range
+            // rather than caching the first scan's: with no `#offset!` that is
+            // two boundary snaps, and with one it is a walk bounded by the
+            // directive's row distance — cheaper than allocating a per-region
+            // range vector on every lookup, hit path included. Both scans are
+            // dwarfed by the `collect_all_injections` tree walk that precedes
+            // them.
             injections.iter().enumerate().find(|(_, inj)| {
                 let range = effective_content_range(inj, text);
                 // No `start < end` condition: a region an `#offset!` collapses
@@ -628,13 +645,22 @@ fn find_injection_at_position<'a>(
 /// Whether the byte offset `end` sits mid-line — i.e. tree-sitter would report
 /// a non-zero column there.
 ///
-/// Deliberately byte-for-byte the tree-sitter rule (a column counted from the
-/// last `\n`) rather than the LSP one, so it stays consistent with the
-/// coordinate-translation pipeline, which shares the same convention. The
-/// divergence that follows from it — a region ending right after a LONE `\r`,
-/// an LSP line break but not a tree-sitter one, reads as mid-line — is
-/// preserved on purpose and tracked as #996 item 4; fixing it here alone would
-/// only split the lookup from translation.
+/// Applies tree-sitter's column rule (a column counted from the last `\n`) to
+/// `text`, rather than the LSP one, so it stays consistent with the
+/// coordinate-translation pipeline, which shares that convention. The
+/// divergence that follows — a region ending right after a LONE `\r`, an LSP
+/// line break but not a tree-sitter one, reads as mid-line — is preserved on
+/// purpose and tracked as #996 item 4; fixing it here alone would only split
+/// the lookup from translation.
+///
+/// Reads `text` rather than the node's parse-time `end_position()`, because an
+/// `#offset!`-shifted boundary has no tree-sitter `Point` to consult. On a
+/// stale tree the two can therefore disagree — this answer is the better one,
+/// being derived from the text actually being served.
+///
+/// Callers must pass an in-bounds `end`; a value past `text.len()` reads as
+/// column 0. The `end > 0` guard keeps the function total — without it
+/// `end - 1` underflows — and `false` is also the right answer at byte 0.
 fn ends_mid_line(text: &str, end: usize) -> bool {
     end > 0 && text.as_bytes().get(end - 1).is_some_and(|&b| b != b'\n')
 }
@@ -647,16 +673,23 @@ fn ends_mid_line(text: &str, end: usize) -> bool {
 /// methods (the `region_boundary_for_method` set: completion, signatureHelp,
 /// linkedEditingRange, onTypeFormatting) fire with the insert-mode caret
 /// sitting *after* the last typed byte — for a region that ends mid-line (a
-/// vim `!cmd`, an embedded string) that caret is exactly the end byte, and a
-/// strict half-open lookup routes the request away from the injection the
-/// user is visibly typing in.
+/// vim `!cmd`, an embedded string) that caret is exactly the region's
+/// effective end byte, and a strict half-open lookup routes the request away
+/// from the injection the user is visibly typing in.
+///
+/// Both variants measure the effective post-`#offset!` span, never the raw
+/// `@injection.content` node — see [`effective_content_range`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RegionBoundary {
     /// Strict half-open `[start, end)`: a cursor at the end byte is outside.
     HalfOpen,
     /// Half-open first; only when that finds nothing, accept a region whose
-    /// end byte equals the cursor **and** whose end sits mid-line (a non-zero
-    /// end column) or at the document's end. A region ending at column 0
+    /// **effective** (post-`#offset!`) end byte equals the cursor **and** whose
+    /// end sits mid-line (a non-zero end column) or at the document's end.
+    /// Both conditions are measured on the effective span, so a directive that
+    /// trims the end moves the byte this fires at — and one that trims it back
+    /// across a `\n` makes it stop firing, the region having become the
+    /// column-0 shape below. A region ending at column 0
     /// (fenced-block shape) keeps the caret on the closing fence outside:
     /// every caret position on its last content line is already inside
     /// half-open, so the fallback would only ever add the fence line itself.
@@ -664,6 +697,10 @@ pub(crate) enum RegionBoundary {
     /// to protect — an unclosed block whose content ends on the newline the
     /// user just typed — and mirrors the node-reference-protocol ADR's
     /// end-of-document exception (`b == L && e == L`).
+    ///
+    /// A region an `#offset!` collapses to zero width has no interior for
+    /// half-open to match, but the caret still routes at the byte it collapses
+    /// to: that position is the whole (empty) injection.
     CaretEndFallback,
 }
 
@@ -747,6 +784,14 @@ impl InjectionResolver {
     /// same-range identity slot. This keeps alternate language/query layers at
     /// identical host coordinates distinct without colliding with real parse
     /// injection depths used by `kakehashi/node`.
+    ///
+    /// Deliberately keyed on the **raw** `content_node` bytes, not the
+    /// effective post-`#offset!` span that [`find_injection_at_position`]
+    /// measures. This is a tracker identity key — "which host node is this?" —
+    /// not a containment question, and [`Self::resolve_by_region_id`] looks the
+    /// region back up by those same raw bytes. Re-keying it on the effective
+    /// span would break region-id stability across the mint/resolve pair for
+    /// every offset-bearing region.
     pub(crate) fn calculate_region_id(
         tracker: &NodeTracker,
         uri: &Url,
