@@ -10,6 +10,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
+pub(in crate::lsp::bridge) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
     CodeActionOptions, CodeActionProviderCapability, ColorProviderCapability,
@@ -1157,8 +1159,6 @@ impl ConnectionHandle {
         response_rx: tokio::sync::oneshot::Receiver<serde_json::Value>,
     ) -> io::Result<serde_json::Value> {
         use tokio::time::timeout;
-
-        const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
         match timeout(REQUEST_TIMEOUT, response_rx).await {
             Ok(Ok(response)) => {
