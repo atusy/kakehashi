@@ -210,9 +210,8 @@ fn strip_inherited_aggregation_map(
     let mut stripped = HashMap::new();
 
     for (method, current_config) in current {
-        let inherited_config = inherited.and_then(|base| {
-            merge::resolve_with_wildcard(base, method, merge::merge_aggregation_configs)
-        });
+        let inherited_config =
+            inherited.and_then(|base| settings::resolve_aggregation_in_map(base, method));
 
         let stripped_config = match inherited_config {
             Some(base) => strip_inherited_aggregation_config(&base, current_config),
@@ -1454,6 +1453,37 @@ mod strip_inherited_tests {
         assert!(
             result.contains_key("textDocument/diagnostic"),
             "diagnostic should be preserved (strategy differs)"
+        );
+    }
+
+    /// Stripping asks "would this entry come back the same by inheritance?",
+    /// so it has to ask the same resolver the runtime does. The routing key
+    /// inherits nothing, so an entry that merely *looks* like the layer above
+    /// it is not redundant — dropping it would leave routing at its own
+    /// default instead of the list the user wrote.
+    #[test]
+    fn aggregation_map_keeps_a_routing_entry_matching_the_wildcard() {
+        let wildcard = AggregationConfig {
+            priorities: Some(vec!["policy-server".to_string()]),
+            ..Default::default()
+        };
+        let inherited = HashMap::from([(WILDCARD_KEY.to_string(), wildcard.clone())]);
+        let current = HashMap::from([
+            (WILDCARD_KEY.to_string(), wildcard.clone()),
+            (settings::BRIDGE_ROUTING_METHOD.to_string(), wildcard),
+        ]);
+
+        let result = strip_inherited_aggregation_map(Some(&inherited), Some(&current)).unwrap();
+        assert!(
+            !result.contains_key(WILDCARD_KEY),
+            "the wildcard itself still strips against its own inherited copy"
+        );
+        assert_eq!(
+            result
+                .get(settings::BRIDGE_ROUTING_METHOD)
+                .and_then(|entry| entry.priorities.as_deref()),
+            Some(["policy-server".to_string()].as_slice()),
+            "the routing entry inherits nothing, so nothing about it is redundant"
         );
     }
 

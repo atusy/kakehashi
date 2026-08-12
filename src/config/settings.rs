@@ -30,6 +30,40 @@ pub(crate) const PRIORITIES_WILDCARD: &str = "*";
 /// [`PRIORITIES_WILDCARD`].
 pub(crate) const LANGUAGES_WILDCARD: &str = "*";
 
+/// The kakehashi→downstream routing request (bridge-routing-protocol), which
+/// takes its provider order from the `aggregation` map under this key.
+///
+/// The first non-LSP method name in that key space, and the only key exempt
+/// from the map's `"_"` method wildcard — see
+/// [`resolve_aggregation_in_map`].
+pub(crate) const BRIDGE_ROUTING_METHOD: &str = "kakehashi/bridge/routing";
+
+/// Resolve one method's aggregation entry out of an `aggregation` map,
+/// applying the map's `"_"` method wildcard — except for
+/// [`BRIDGE_ROUTING_METHOD`], which reads its own key or nothing.
+///
+/// The exemption is deliberate (bridge-routing-protocol). Every
+/// `aggregation."_"` entry written before routing existed is an LSP fan-out
+/// allowlist naming *language servers*; inheriting one at the routing key
+/// would exclude every dedicated routing provider from routing for that
+/// language, turning the protocol off with no signal. The inverse is the
+/// recorded cost: a deliberate global allowlist or kill switch at
+/// `aggregation."_"` does not gate routing either.
+///
+/// Both the runtime lookup and the config round-trip's inherited-value
+/// stripping resolve through here — a routing entry that merely *equals* the
+/// `"_"` entry would otherwise be stripped as redundant on serialization and
+/// come back meaning something else.
+pub(crate) fn resolve_aggregation_in_map(
+    map: &HashMap<String, AggregationConfig>,
+    method: &str,
+) -> Option<AggregationConfig> {
+    if method == BRIDGE_ROUTING_METHOD {
+        return map.get(method).cloned();
+    }
+    crate::config::resolve_with_wildcard(map, method, crate::config::merge_aggregation_configs)
+}
+
 /// The resolved default for an absent `priorities`: `["*"]`, i.e. fan out to
 /// every configured server with no ranking (first-win).
 fn default_priorities() -> Vec<String> {
@@ -291,11 +325,11 @@ fn default_layer_strategy_for_method(method: &str) -> AggregationStrategy {
 impl BridgeLanguageConfig {
     /// Look up the aggregation entry for a method with field-level wildcard merge.
     ///
-    /// Uses [`crate::config::resolve_with_wildcard`] so that a method-specific entry
-    /// inherits any unset fields from the `_` wildcard entry (wildcard-config-inheritance).
+    /// A method-specific entry inherits any unset fields from the `_` wildcard
+    /// entry (wildcard-config-inheritance) — except at
+    /// [`BRIDGE_ROUTING_METHOD`]; see [`resolve_aggregation_in_map`].
     fn resolve_aggregation_entry(&self, method: &str) -> Option<AggregationConfig> {
-        let map = self.aggregation.as_ref()?;
-        crate::config::resolve_with_wildcard(map, method, crate::config::merge_aggregation_configs)
+        resolve_aggregation_in_map(self.aggregation.as_ref()?, method)
     }
 
     /// Resolve all aggregation settings for a specific LSP method in a single call.
@@ -2983,6 +3017,94 @@ kind = "locals""#;
         };
         let agg = config.resolve_aggregation("textDocument/hover");
         assert_eq!(agg.priorities, &["server_b".to_string()]);
+    }
+
+    /// Existing `aggregation."_"` entries were written as LSP fan-out
+    /// allowlists naming *language servers*. Folding one into the routing key
+    /// would exclude every dedicated routing provider from routing for that
+    /// language — a common config shape silently turning the protocol off. So
+    /// the routing key alone does not inherit the method wildcard
+    /// (bridge-routing-protocol). The language axis is untouched: this is an
+    /// exception to the `aggregation` map's `"_"` merge, nothing else.
+    #[test]
+    fn routing_priorities_do_not_inherit_the_method_wildcard() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    priorities: Some(vec!["lua_ls".to_string()]),
+                    max_fan_out: Some(1),
+                    ..Default::default()
+                },
+            )])),
+        };
+
+        assert_eq!(
+            config.resolve_aggregation("textDocument/hover").priorities,
+            &["lua_ls".to_string()],
+            "every other method still inherits the wildcard"
+        );
+        assert_eq!(
+            config.resolve_aggregation(BRIDGE_ROUTING_METHOD).priorities,
+            vec![PRIORITIES_WILDCARD.to_string()],
+            "routing falls to its own default, not the LSP allowlist"
+        );
+    }
+
+    /// The exemption is only about inheritance: an entry written *at* the
+    /// routing key is what governs routing, at any language level.
+    #[test]
+    fn routing_priorities_come_from_the_routing_key_itself() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    AggregationConfig {
+                        priorities: Some(vec!["lua_ls".to_string()]),
+                        max_fan_out: Some(1),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    BRIDGE_ROUTING_METHOD.to_string(),
+                    AggregationConfig {
+                        priorities: Some(vec!["policy-server".to_string()]),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+        };
+
+        let agg = config.resolve_aggregation(BRIDGE_ROUTING_METHOD);
+        assert_eq!(agg.priorities, &["policy-server".to_string()]);
+        assert_eq!(
+            agg.max_fan_out, None,
+            "no field of the wildcard entry reaches the routing key"
+        );
+    }
+
+    /// `[]` at the routing key is the documented per-language kill switch, and
+    /// must survive resolution as itself.
+    #[test]
+    fn routing_priorities_preserve_the_explicit_kill_switch() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                BRIDGE_ROUTING_METHOD.to_string(),
+                AggregationConfig {
+                    priorities: Some(vec![]),
+                    ..Default::default()
+                },
+            )])),
+        };
+        assert!(
+            config
+                .resolve_aggregation(BRIDGE_ROUTING_METHOD)
+                .priorities
+                .is_empty()
+        );
     }
 
     #[test]
