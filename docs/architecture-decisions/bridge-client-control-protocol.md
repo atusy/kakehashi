@@ -402,16 +402,19 @@ repeatedly failing slot before the next acquire respawns it is a
 first-class use of this method, not an edge case.
 
 `stop` on a slot whose spawn is still in flight — accepted, no process
-handle yet — is legal and **claims the spawn**: it can neither be
-completed nor left to complete, since either would resurrect the slot the
-user just stopped. Three outcomes, discriminated by what is known about
-the child:
+handle yet — is legal and **claims the spawn**: it can neither be completed
+nor allowed to publish a connection, since either would resurrect the slot
+the user just stopped. The outcome branches on **whether the spawn has
+ended** first, and only then on what is known about the child. That order is
+what makes the three cases exhaustive and mutually exclusive — a live spawn
+can still produce a child, so it cannot be settled on an observation of the
+one it has produced so far:
 
-| What is known | `stop` answers | Slot afterwards |
-|---|---|---|
-| The spawn ended without ever creating a child, or created one whose termination is confirmed | `null` | config-revalidated tombstone (`stopped`) |
-| A child exists and its termination is unconfirmed | `stopFailed` | termination-pending record (`stopping`), as for any known handle |
-| The spawn has not ended by the deadline | `stopFailed` | fenced cleanup record (`stopping`) — no tombstone yet, and any child the spawn still produces is terminated and reaped on arrival |
+| Has the spawn ended? | Then | `stop` answers | Slot afterwards |
+|---|---|---|---|
+| Yes | no child was ever created, or one was and its termination is confirmed | `null` | config-revalidated tombstone (`stopped`) |
+| Yes | a child exists and its termination is unconfirmed | `stopFailed` | termination-pending record (`stopping`), as for any known handle |
+| No, by the deadline | — | `stopFailed` | fenced cleanup record (`stopping`) — no tombstone yet, and any child the spawn still produces is terminated and reaped on arrival |
 
 `restart` on such a slot is that same claim followed by its ordinary
 respawn, respawning only after the claim resolves and answering
@@ -639,22 +642,16 @@ not a storm.
 > The invariants below are normative; the mechanisms that satisfy them are
 > deliberately unspecified.
 
-Adding user-initiated stop and restart to a pool that previously only ever
-grew connections is what surfaced these. They are the traps, not the
-implementation.
-
 **Winning the race must stick**
 
-- **Every handshake terminal transition commits conditionally from
-  `Initializing`** — `Ready`, and `Failed` from error, timeout, or task
-  failure alike. Once a `stop` has won the transition to `Closing`, a
-  handshake finishing afterwards must not overwrite it, or a slot the user
-  stopped silently comes back to life.
-- **The `initialized` enqueue commits atomically with the `Ready`
-  transition, and the abort path never flushes the queue.** Otherwise a
-  losing handshake enqueues `initialized` after `Closing` won, or the abort
-  flushes it downstream — either way an LSP message goes out on behalf of a
-  connection being torn down.
+- **Once a `stop` has won the transition to `Closing`, nothing may
+  overwrite it** — not `Ready`, and not `Failed` from error, timeout, or
+  task failure. A handshake that finishes afterwards has lost, and a lost
+  handshake that still writes brings a slot the user stopped back to life.
+- **No LSP message may go out on behalf of a connection already being torn
+  down.** `initialized` is the one at risk: a handshake that lost the race
+  must be unable to send it afterwards, and an abort must be unable to
+  release one it had already prepared.
 - **Until the server has answered `initialize`, LSP forbids the client every
   further request *and* notification** — `exit` included. The only
   conformant abort in that window is direct process termination.
@@ -682,24 +679,25 @@ implementation.
 
 **Answering callers**
 
-- **A control operation is not abortable mid-mutation.** Cancelling the
-  request may release the caller; it must not leave the slot half
-  transitioned.
-- **Settlement is exactly once, and only while the reply is live.** A caller
-  already released by `RequestCancelled` is never answered again, and no
-  caller is ever left pending.
+- **Cancelling a control request releases the caller, never the
+  operation.** A `stop` abandoned halfway leaves a slot that is neither live
+  nor stopped — enumerating as one and behaving as the other — which no
+  later `restart` has a defined recovery from.
+- **Settlement is at-most-once, and only while the reply is live.** A
+  caller already released by `RequestCancelled` is never answered again, and
+  no caller waiting on a live reply is ever left pending.
 
 **Accounting**
 
-- **Latched cancellation must be consumed before, or atomically with,
-  enqueueing the inner pass-through request.** Record the mapping after the
-  enqueue and an already-latched cancel is lost — along with the only escape
-  from a request the bridge deliberately does not time out.
-- **A liveness classification must govern the whole accounting lifecycle** —
-  the 0→1 transition that arms the timer, epoch advancement, and the →0 stop
-  — not just expiry filtering. Filter only at expiry and an unclassified slow
-  pass-through still fails the connection, while a raw-only entry can prevent
-  a later managed request from arming liveness at all.
+- **A cancellation that arrived before the inner request went out must
+  still cancel it.** Pass-through carries no bridge-imposed timeout, so that
+  cancel is the only escape from the request; losing it to the gap between
+  dispatching and becoming cancellable strands the caller indefinitely.
+- **A liveness classification must govern the whole accounting lifecycle,
+  not just expiry.** Applying it only when the timer fires leaves a slow
+  pass-through able to fail the connection anyway, and leaves a
+  pass-through-only period able to suppress liveness for a later managed
+  request that should have had it.
 
 ## Considered Options
 
@@ -891,7 +889,8 @@ namespace.
   to the latched-cancellation ordering in § Invariants.
 - Excluding pass-through from Tier-2 liveness needs a per-entry
   classification on the response router's pending map, governing the whole
-  accounting lifecycle per § Invariants. Today every pending entry counts.
+  accounting lifecycle per § Invariants. Today every non-cancelled pending
+  entry counts.
 - The router must return a typed, provenance-bearing outcome: today
   downstream responses and locally synthesized failures travel the same
   raw-JSON channel, but the envelope contract needs to tell "the
