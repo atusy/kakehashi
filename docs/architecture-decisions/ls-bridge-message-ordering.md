@@ -62,7 +62,9 @@ A thin bridge that forwards requests and relies on client-driven cancellation:
 │                    ▼                                     │
 │  ┌──────────────────────────────────────────────────┐    │
 │  │           Unified Order Queue (FIFO)             │    │
-│  │  Bounded capacity (256)                          │    │
+│  │  Bounded admission threshold (4096; 256 caused   │    │
+│  │  routine fan-out loss) — see § Non-Blocking      │    │
+│  │  Backpressure for the full allocation bound      │    │
 │  │  - Ensures FIFO ordering                         │    │
 │  │  - Non-blocking backpressure (try_send)          │    │
 │  └─────────────────┬────────────────────────────────┘    │
@@ -149,7 +151,7 @@ The bridge tracks pending requests for response correlation only:
 
 ### 3. Non-Blocking Backpressure
 
-The bounded order queue (capacity: 256) uses `try_send()` to prevent deadlocks during slow initialization.
+The bounded order queue (admission threshold: 4096 — raised from the original 256, which caused routine fan-out loss) uses `try_send()` to prevent deadlocks during slow initialization. The full allocation bound is admission threshold + the pre-ready holding queue's bound + response headroom. Response headroom serves **downstream-initiated** requests (which the response router deliberately does not track), so it is bounded by reservation, not by the router: **admitting an inbound server request reserves the wire slot its response will use**, making the inbound registry bounded by the reservation pool rather than unbounded; when no slot is reservable the request is answered via a dedicated always-reserved error slot with `RequestFailed`, and **the reader admits no further inbound request while that error slot is occupied** — inbound admission serializes on the slot's drain. That wait is **bounded and shutdown-aware**: a paused reader plus a writer blocked on the server's stdin is exactly the full-duplex pipe deadlock this ADR already guards against. The deadline is the existing 5-second-class response-send bound, capped by the earliest active lifecycle deadline; on expiry the connection fails via **conditional compare-transition from its current state** — `Initializing → Failed` (the path is reachable during initialization through permitted `window/showMessageRequest` traffic) or `Ready → Failed`, while a shutdown that already won keeps `Closing`/`Closed`. Within the bound, overflow applies pipe backpressure to the downstream instead of ever dropping silently. The memory bound is testable as the sum of the three.
 
 **Strategy by Operation Type:**
 
@@ -173,7 +175,9 @@ enum ConnectionState {
     Ready,         // Initialization completed successfully
     Failed,        // Initialization failed or writer loop panicked
     Closing,       // Shutdown initiated, draining operations (ls-bridge-graceful-shutdown)
-    Closed,        // Connection fully terminated
+    Closed,        // Connection terminated (bookkeeping-only at the global
+                   // deadline: an unconfirmed child may be retained or
+                   // abandoned — ls-bridge-graceful-shutdown)
 }
 ```
 
@@ -218,14 +222,28 @@ enum ConnectionState {
 
 | From | Trigger | To |
 |------|---------|-----|
-| `Initializing` | success (init response received) | `Ready` |
+| `Initializing` | success — commits atomically with the `initialized` enqueue (bridge-client-control-protocol) | `Ready` |
 | `Initializing` | timeout / failure / crash / panic | `Failed` |
 | `Initializing` | shutdown signal | `Closing` |
 | `Ready` | shutdown signal | `Closing` |
 | `Ready` | crash / panic | `Failed` |
-| `Failed` | (automatic) | `Closed` |
+| `Failed` | cleanup / shutdown (not automatic) | `Closed` |
 | `Closing` | (graceful or timeout) | `Closed` |
 | `Closing` | panic | `Closed` |
+
+The **`Closing` → `Closed`** timeout and panic rows (and only those —
+initialization timeout/failure/crash/panic go to pool-resident `Failed`,
+exactly as the table says) mark the **handle** `Closed` unconditionally —
+that is connection-object bookkeeping. Slot-level termination
+confirmation is tracked separately: when the process is unconfirmed, a
+termination-pending record keeps the *slot* at `stopping` even though the
+handle reads `Closed` (bridge-client-control-protocol; enumeration
+ignores `Closed` handles and lets the record answer).
+
+`Failed` handles stay pool-resident — addressable and enumerable — until a
+later acquire replaces them or cleanup/shutdown closes them;
+bridge-client-control-protocol relies on that residency for its `failed`
+status and `restart` target resolution.
 
 **Key Transition: Failed → Closed (Direct)**
 
@@ -246,6 +264,57 @@ Operations are gated at two levels: **server lifecycle** and **document lifecycl
   - `Closing` → `REQUEST_FAILED` ("bridge: connection closing") [See ls-bridge-graceful-shutdown]
   - `Closed` → `REQUEST_FAILED` ("bridge: connection closed")
 - **Notifications**: Accepted by writer loop in `Initializing` or `Ready` state only
+  - **Target semantics, adopted with bridge-client-control-protocol**
+    (the current implementation is a single bounded mpsc feeding the
+    writer; this mechanism is required before that protocol's
+    pass-through ships): during `Initializing`, accepted notifications
+    enter a **pre-ready holding queue**, separate from the wire FIFO — a strict single FIFO
+    could not reorder traffic accepted before the initialize response
+    behind the later `initialized`. Only handshake-owned traffic reaches
+    the wire until `initialized` has been written, with exactly two
+    exemptions, categorized separately: the **conforming exception** —
+    responses to `window/showMessageRequest`, the one server-initiated
+    request LSP permits before the initialize response, travel the wire
+    FIFO immediately because withholding them could deadlock the
+    handshake — and a **tolerated extension**: a
+    `window/workDoneProgress/create` in this window is a nonconforming
+    server, which the bridge nevertheless answers (logged) since
+    refusing could wedge initialization. The `initialized` enqueue, the
+    holding-queue transfer into the FIFO (arrival order), and the
+    admission cutover happen under **one exclusion**: `Flushing` is
+    **lock-private and non-suspending** — the interior of the
+    `Initializing → Ready` commit's critical section, not an observable
+    `ConnectionState` value — so shutdown, initialization-timeout, and
+    writer-failure arbitration still race only the existing conditional
+    `Initializing → Closing/Failed` transitions, and a commit that loses
+    that race never publishes `Ready` or flushes. A producer that
+    observes `Ready` can never enter the FIFO ahead of older held
+    notifications (bridge-client-control-protocol). Capacity semantics:
+    **4096 is the admission threshold, not the allocation** — the FIFO's
+    memory bound is the admission threshold plus the holding queue's
+    bound plus headroom for loss-intolerant responses, and the splice
+    consumes capacity reserved at hold time, so it can neither be
+    refused nor exceed allocation, and never drives a failure; while the
+    combined depth sits above the admission threshold, admission stays
+    closed until the writer drains below it. What may legally enter the
+    hold is narrow: **document lifecycle notifications keep their
+    Ready-only gating and are never held** (they arrive via the
+    post-Ready derived open paths — flushing a held `didChange` ahead of
+    the derived `didOpen` would violate the document lifecycle), and
+    state-replacement notifications (`workspace/didChangeConfiguration`)
+    are not held either — the pool retains current settings and pushes
+    the latest value after `initialized` ("latest" within
+    downstream-settings-propagation's accepted race: a reload landing
+    mid-handshake may push the previous revision, converging on the
+    next propagation), and holding stale copies would invert
+    latest-value semantics; `$/setTrace` has the same latest-value shape
+    and follows the same policy — coalesced-to-latest, pushed
+    post-`initialized`, same accepted race, never held. With document sync Ready-gated and
+    every latest-value method coalesced, **no currently specified method
+    is admissible to the hold** — it is expected empty and exists as the
+    structural safety net for future sequence-dependent, non-document
+    notifications; its bound (4096) backs that safety net, with
+    drop-newest-and-warn overflow
   - `Closing`/`Closed` → DROP (writer loop stopped, see ls-bridge-graceful-shutdown)
   - Subject to document lifecycle gating below
 
@@ -389,7 +458,7 @@ awaits only cancel-safe primitives.
 - Trade-off: Better than silent permanent hang
 
 **Notification Dropping Under Extreme Backpressure:**
-- Notifications can be dropped if queue full (256+ operations)
+- Notifications can be dropped if queue full (4096+ operations at the admission threshold)
 - Only under extreme conditions
 - Recoverable via subsequent notifications
 

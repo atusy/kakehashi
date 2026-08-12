@@ -24,7 +24,7 @@ The async bridge architecture defines timeout systems across three decisions:
 
 1. **Initialization Timeout** (ls-bridge-async-connection): Bounds server initialization time during startup
 2. **Liveness Timeout** (ls-bridge-async-connection): Detects hung servers (unresponsive to pending requests)
-3. **Global Shutdown Timeout** (ls-bridge-graceful-shutdown): Bounds total shutdown time
+3. **Global Shutdown Timeout** (ls-bridge-graceful-shutdown): Bounds the shutdown termination attempt (escalation); ownership disposition and local cleanup run as actor transitions outside the ceiling
 4. **Per-Request Timeout** (ls-bridge-server-pool-coordination): Bounds user-facing latency for multi-server aggregation *[Phase 3 only]*
 
 ### The Problem
@@ -43,13 +43,13 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 | Tier | Timeout | Duration | Trigger | Action |
 |------|---------|----------|---------|--------|
 | **0** | Initialization | 30-60s | `initialize` request sent | `Initializing` → `Failed` (pool may spawn replacement) |
-| **2** | Liveness | 30-120s | Ready state + pending > 0 | `Ready` → `Failed` (pool may spawn replacement) |
+| **2** | Liveness | 30-120s | Ready state + liveness-classified managed pending > 0 (pass-through excluded — target state landing with bridge-client-control-protocol; today every pending entry counts) | `Ready` → `Failed` (pool may spawn replacement) |
 | **3** | Global Shutdown | 5-15s | Shutdown initiated | SIGTERM → SIGKILL, all → `Closed` |
 
 **State-Based Gating:**
 - **Initialization timeout**: Only during `Initializing` state; disabled on shutdown
 - **Liveness timeout**: Only during `Ready` state with pending requests; disabled on shutdown
-- **Global shutdown**: Overrides all other timeouts (highest priority)
+- **Global shutdown**: Overrides all other timeouts (highest priority), including an in-flight per-slot control shutdown deadline (subsumed by `Teardown`)
 
 ### Phase 3 Addition: Per-Request Timeout (Tier 1)
 
@@ -67,14 +67,14 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 |----------|----------------|----------|
 | Normal operation (Phase 1) | Liveness | Reset on activity; `Ready` → `Failed` on timeout |
 | Normal operation (Phase 3) | Liveness, Per-request | Per-request bounds aggregation; Liveness detects hung servers |
-| Shutdown (any state) | Global only | All other timeouts (Init/Liveness/Per-request) STOP; global enforces termination |
-| Late response during shutdown | Global | ACCEPT until global timeout expires |
+| Shutdown (any state) | Global only | All other timeouts (Init/Liveness/Per-request) STOP; an in-flight per-slot control shutdown is subsumed by the `Teardown` transition, its deadline superseded by the global one; global bounds the termination attempt |
+| Late response during shutdown | Global | ACCEPT until the connection closes or the deadline expires |
 
 **Key Interactions:**
 - Liveness timeout **STOPS** when entering `Closing` state
 - Initialization timeout **CANCELLED** on shutdown (global takes over)
 - Per-request timeout **STOPS** on shutdown (futures receive `RecvError` from closed channels)
-- Late responses accepted until global timeout (server is responsive, not hung)
+- Late responses accepted until the connection closes or the applicable deadline expires (server is responsive, not hung)
 
 ## Configuration Recommendations
 
@@ -92,14 +92,31 @@ Global Shutdown overrides all (highest priority)
 ```
 
 **Global Shutdown Design:**
-- Single ceiling for entire shutdown (not per-server)
+- Single ceiling for the termination attempt during pool teardown (not per-server; local cleanup falls outside)
 - Graceful attempts → SIGTERM → SIGKILL escalation
 - Reserve ~20% of timeout for SIGTERM/SIGKILL (e.g., 10s total → 8s graceful + 2s forced)
 
-**Writer-Idle Timeout** (within Global Shutdown):
+**Per-Slot Control Shutdown** (bridge-client-control-protocol):
+- A single-slot `stop`/`restart` runs under its own per-connection shutdown
+  timeout with the same graceful → SIGTERM → SIGKILL shape
+- **Duration**: implementation-defined, default in the same 5-15s class
+  as the global ceiling; one deadline covers queue drain, handshake, and
+  escalation initiation — a child unconfirmed beyond it converts to a
+  termination-pending record rather than extending the deadline
+- This is not the rejected per-server teardown timeout: it bounds one
+  user-initiated control operation while the rest of the pool keeps
+  serving; pool teardown keeps the single global ceiling above
+- Precedence on overlap: `Teardown` is a message on the same
+  lifecycle-actor queue, so it is ordered against every in-flight control
+  transition by construction; from the teardown transition on, the global
+  deadline governs, and the escalation reserve force-kills whatever a
+  per-slot operation has not finished (ls-bridge-graceful-shutdown
+  § Lifecycle Actor)
+
+**Writer-Idle Timeout** (within the applicable shutdown deadline):
 - **Duration**: 2s fixed
 - **Purpose**: Wait for writer loop to finish current operation before taking exclusive stdin access
-- **Scope**: Counts against global shutdown budget (not additional time)
+- **Scope**: Counts against the applicable shutdown budget — per-slot `stop` or global teardown — not additional time
 - **See**: ls-bridge-graceful-shutdown § Writer Loop Shutdown Synchronization
 
 ## Consequences
@@ -107,7 +124,7 @@ Global Shutdown overrides all (highest priority)
 ### Positive
 
 - **Deterministic behavior**: Clear precedence when multiple timeouts could fire
-- **Bounded shutdown**: Global timeout guarantees termination
+- **Bounded shutdown**: Global timeout bounds the termination attempt; a child unconfirmed at the deadline is retained or abandoned per ls-bridge-graceful-shutdown § Unconfirmed termination
 - **Hung server detection**: Liveness timeout catches unresponsive servers
 
 ### Negative

@@ -145,8 +145,14 @@ The system uses two distinct timeout mechanisms with different purposes:
 - **Purpose**: Detect zombie servers (process alive but unresponsive to pending requests)
 - **Scope**: Connection-level health monitoring
 - **State-Based Gating**:
-  - **Disabled** during: Initializing, Closing, Failed, Closed states, or Ready with pending = 0
-  - **Enabled** during: Ready state with pending requests > 0
+  - **Disabled** during: Initializing, Closing, Failed, Closed states, or Ready with liveness-classified pending = 0
+  - **Enabled** during: Ready state with liveness-classified managed pending requests > 0
+  - The 0→1 start/epoch-advance and →0 stop transitions count only
+    liveness-classified managed entries; pass-through requests are
+    excluded from the count entirely. **Target state**: the per-entry
+    classification is an implementation precondition recorded in
+    bridge-client-control-protocol — today's router counts every
+    non-cancelled pending entry, and this rule lands with that protocol
 - **Timer Lifecycle**:
   - **Start**: First request sent when pending count transitions 0→1
   - **Keep running**: Additional requests sent (pending count increases)
