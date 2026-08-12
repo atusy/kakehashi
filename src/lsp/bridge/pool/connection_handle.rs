@@ -558,11 +558,11 @@ impl ConnectionHandle {
     /// Store whether the downstream advertised bridge routing in `initialize`.
     pub(super) fn set_bridge_routing(&self, advertised: bool) {
         self.bridge_routing.store(advertised, Ordering::Release);
+        debug_assert_eq!(self.supports_bridge_routing(), advertised);
     }
 
     /// Whether the downstream advertised bridge routing during initialization.
     // Kept on the handle for the routing-request slice stacked on this PR.
-    #[allow(dead_code)]
     pub(crate) fn supports_bridge_routing(&self) -> bool {
         self.bridge_routing.load(Ordering::Acquire)
     }
