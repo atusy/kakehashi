@@ -22,6 +22,15 @@ required-features = ["e2e"]
 test = false
 bench = false
 
+# Full debuginfo generation dominates the dev edit-compile loop (measured: a
+# one-line edit in src/lsp rebuilds in ~22s with full debuginfo vs ~7s with
+# line-tables-only on a 10-core machine). Line tables keep file:line in panic
+# backtraces; only interactive debugger variable inspection is lost — override
+# with CARGO_PROFILE_DEV_DEBUG=full for a debugging session. profile.test
+# inherits this, so test builds get the same win.
+[profile.dev]
+debug = "line-tables-only"
+
 # Profiling build: optimized like release but with debug symbols retained (not
 # stripped) so flamegraph/samply + atos can symbolicate the semantic-tokens hot
 # path. Build with `cargo build --profile profiling --bin kakehashi`.
