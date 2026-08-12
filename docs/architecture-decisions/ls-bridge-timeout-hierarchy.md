@@ -54,7 +54,7 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 **State-Based Gating:**
 - **Initialization timeout**: Only during `Initializing` state; disabled on shutdown
 - **Liveness timeout**: Only during `Ready` state with pending requests; disabled on shutdown
-- **Global shutdown**: Overrides all other timeouts (highest priority), including an in-flight per-slot control shutdown deadline (subsumed by `Teardown`)
+- **Global shutdown**: Overrides all other timeout *tiers* (highest priority), and subsumes an in-flight per-slot control shutdown deadline (`Teardown`). It does not cancel a per-downstream response cap already counting — that runs to its own expiry or to connection closure
 
 ### Phase 3 Addition: Per-Request Timeout (Tier 1)
 
@@ -69,7 +69,7 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 
 ### Precedence Rules
 
-**Global shutdown overrides all other timeouts.**
+**Global shutdown overrides all other timeout tiers**, and subsumes the per-slot control shutdown deadline. Non-tier bounds already running are not cancelled by it.
 
 | Scenario | Active Timeouts | Behavior |
 |----------|----------------|----------|
