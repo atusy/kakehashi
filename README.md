@@ -12,6 +12,7 @@ kakehashi is a bridge (架け橋) across your editors, your languages, and the l
 ---
 config:
   flowchart:
+    padding: 5
     rankSpacing: 5
 ---
 flowchart TB
