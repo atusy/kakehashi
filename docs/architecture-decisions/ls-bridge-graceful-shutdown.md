@@ -135,7 +135,7 @@ connection closure or the applicable deadline, whichever comes first.
 **Why not abort mid-write**: Operations in the order queue may be partially written to stdin. Aborting mid-write corrupts the protocol stream.
 
 **Forced-termination exception**: the drain and complete-write rows describe
-the graceful path. A forced termination (writer-idle timeout, deadline
+the graceful path. A forced termination (stdin never acquired, deadline
 expiry) kills the process regardless of queue state — the remaining queue is
 abandoned, and its tracked requests fail exactly like pending responses.
 
@@ -165,9 +165,10 @@ be the only writer is unspecified; that it must be, before step 4, is
 
 Draining before the handshake is what makes `shutdown` unable to overtake a
 message the bridge already committed to send (§ Operation Disposal Policy).
-The bound on step 3 is the writer-idle timeout of
-ls-bridge-timeout-hierarchy § Writer-Idle Timeout, which counts against the
-applicable shutdown budget — per-slot `stop` or global teardown — rather than adding to it.
+Step 3 is bounded by the applicable shutdown deadline — per-slot `stop` or
+global teardown. Whether an implementation carves a smaller per-connection
+share out of that budget is its own affair; what matters is that the wait
+cannot be unbounded (§ Invariants).
 
 **Guarantees (graceful path — a forced termination forfeits the queue
 drain and current-write completion; the bounded wait is what enforces
@@ -598,7 +599,7 @@ unaffected because only decisions serialize, not process I/O.
 
 The `Ready`-state LSP handshake, the writer handoff with its queue drain,
 the SIGTERM → SIGKILL escalation, and parallel teardown are implemented.
-Seven parts of this decision run ahead of the code, which is the ordinary
+Six parts of this decision run ahead of the code, which is the ordinary
 state of an ADR here:
 
 - **The lifecycle actor does not exist yet.** Teardown today is a pool-wide
@@ -607,11 +608,6 @@ state of an ADR here:
   `stop`/`restart`, so most of the serialization this section describes has
   nothing yet to serialize. It converges as bridge-client-control-protocol
   lands.
-- **The wait for the writer handoff is unbounded per connection.** Nothing
-  inside the connection bounds it; only the enclosing teardown budget does —
-  the graceful ceiling, or the force-kill bound if escalation reaches it. So
-  one wedged writer can spend the whole graceful budget instead of its own
-  writer-idle share.
 - **Initialization shutdown does not take the direct-termination path.**
   Teardown sends `Initializing` handles through the same graceful sequence as
   `Ready` ones, so a connection still awaiting its initialize response is
@@ -680,4 +676,4 @@ state of an ADR here:
 - **2026-08-11**: Corrected Initialization Shutdown - the abort path sends no LSP message at all (the earlier revision sent `exit` before the initialize response, which LSP ordering forbids); adopted alongside bridge-client-control-protocol, whose per-slot `stop` shares the path
 - **2026-08-11**: Reconciled the Operation Disposal Policy with the Closing-state gating and the writer's actual behavior - the accepted order queue drains ahead of `shutdown` (the earlier table said queued operations are never sent, contradicting § Operation Gating and the FIFO writer)
 - **2026-08-12**: Replaced the lock-based concurrent lifecycle-control design with the Lifecycle Actor as the **target design** (implementation pending — see § Decision–Implementation Gap) - all lifecycle transitions (stop/restart/teardown/spawn-commit) serialize through one pool-owned actor, dissolving the single-flight registry, lease-owner map, supervisor-owned transactional teardown state, and durable-record finalizer machinery the earlier revision had accreted (now recorded as rejected Alternative 4); observable contracts in bridge-client-control-protocol are unchanged
-- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - deleted the lifecycle-actor and writer-handoff implementation mechanics (escrow slots, kill-on-drop guards, scratch-copy staging, commit-and-reply swaps, generation-bound receivers, settlement markers, the message-enum and coordination sketches, the writer-idle constant), and added an Invariants section recording the traps that machinery closed. Replaced the aspirational-design note with a Decision–Implementation Gap section, dropping its stop-oneshot and writer-return-channel divergences as no longer load-bearing and adding the lifecycle-actor and escalation-reserve gaps. No contract changed.
+- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - deleted the lifecycle-actor and writer-handoff implementation mechanics (escrow slots, kill-on-drop guards, scratch-copy staging, commit-and-reply swaps, generation-bound receivers, settlement markers, the message-enum and coordination sketches, and the writer-idle timeout — a per-connection share of the shutdown budget that no peer can observe), and added an Invariants section recording the traps that machinery closed. Replaced the aspirational-design note with a Decision–Implementation Gap section, dropping its stop-oneshot and writer-return-channel divergences as no longer load-bearing and adding the lifecycle-actor and escalation-reserve gaps. No contract changed.
