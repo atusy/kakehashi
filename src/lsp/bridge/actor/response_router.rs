@@ -86,6 +86,7 @@ enum RequestDelivery {
     Writing,
     Sent,
     CancelledQueued,
+    CancelledWriting,
     CancelledSent,
 }
 
@@ -280,7 +281,9 @@ impl ResponseRouter {
                     pending.delivery = RequestDelivery::CancelledQueued;
                 }
                 RequestDelivery::Writing | RequestDelivery::Sent => sent.push(id),
-                RequestDelivery::CancelledQueued | RequestDelivery::CancelledSent => {}
+                RequestDelivery::CancelledQueued
+                | RequestDelivery::CancelledWriting
+                | RequestDelivery::CancelledSent => {}
             }
         }
         (true, sent)
@@ -302,7 +305,10 @@ impl ResponseRouter {
                 pending.delivery = RequestDelivery::Writing;
                 return true;
             }
-            RequestDelivery::Writing | RequestDelivery::Sent | RequestDelivery::CancelledSent => {
+            RequestDelivery::Writing
+            | RequestDelivery::Sent
+            | RequestDelivery::CancelledWriting
+            | RequestDelivery::CancelledSent => {
                 return false;
             }
             RequestDelivery::CancelledQueued => {}
@@ -331,10 +337,12 @@ impl ResponseRouter {
             .state
             .lock()
             .recover_poison("ResponseRouter::mark_sent");
-        if let Some(pending) = state.pending.get_mut(&id)
-            && pending.delivery == RequestDelivery::Writing
-        {
-            pending.delivery = RequestDelivery::Sent;
+        if let Some(pending) = state.pending.get_mut(&id) {
+            pending.delivery = match pending.delivery {
+                RequestDelivery::Writing => RequestDelivery::Sent,
+                RequestDelivery::CancelledWriting => RequestDelivery::CancelledSent,
+                delivery => delivery,
+            };
         }
     }
 
@@ -441,28 +449,39 @@ impl ResponseRouter {
 
     /// Retire a peer request on outer cancellation and report whether its
     /// downstream write had started, requiring an exact `$/cancelRequest`.
-    pub(crate) fn cancel_and_remove(&self, id: RequestId) -> bool {
+    pub(crate) fn cancel_peer(&self, id: RequestId) -> Option<bool> {
         let mut state = self
             .state
             .lock()
             .recover_poison("ResponseRouter::cancel_and_remove");
-        let Some(pending) = state.pending.get_mut(&id) else {
-            return false;
-        };
+        let pending = state.pending.get_mut(&id)?;
         match pending.delivery {
             RequestDelivery::Queued | RequestDelivery::CancelledQueued => {
                 state.pending.remove(&id);
                 state.failures.remove(&id);
                 state.failure_tracked.remove(&id);
                 Self::remove_cancel_mapping_inner(&mut state, id);
-                false
+                Some(false)
             }
-            RequestDelivery::Writing | RequestDelivery::Sent => {
+            RequestDelivery::Writing => {
+                pending.delivery = RequestDelivery::CancelledWriting;
+                Some(true)
+            }
+            RequestDelivery::Sent => {
                 pending.delivery = RequestDelivery::CancelledSent;
-                true
+                Some(true)
             }
-            RequestDelivery::CancelledSent => false,
+            RequestDelivery::CancelledWriting | RequestDelivery::CancelledSent => Some(false),
         }
+    }
+
+    pub(crate) fn peer_cancel_is_writing(&self, id: RequestId) -> bool {
+        self.state
+            .lock()
+            .recover_poison("ResponseRouter::peer_cancel_is_writing")
+            .pending
+            .get(&id)
+            .is_some_and(|pending| pending.delivery == RequestDelivery::CancelledWriting)
     }
 
     pub(crate) fn take_failure(&self, id: RequestId) -> Option<BridgeFailure> {
@@ -718,8 +737,8 @@ mod tests {
         let _writing_rx = router.register(writing).unwrap();
         assert!(router.claim_for_write(writing));
 
-        assert!(!router.cancel_and_remove(queued));
-        assert!(router.cancel_and_remove(writing));
+        assert_eq!(router.cancel_peer(queued), Some(false));
+        assert_eq!(router.cancel_peer(writing), Some(true));
         assert_eq!(router.pending_count(), 1);
         assert_eq!(router.awaiting_downstream_count(), 1);
     }
