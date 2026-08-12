@@ -3,10 +3,6 @@
 //! Provides reusable markdown file fixtures with Rust code blocks for testing
 //! different LSP features (hover, completion, references, etc.).
 
-// These functions are shared across multiple test binaries but not all tests use every function.
-// Allow dead_code to suppress per-binary warnings.
-#![allow(dead_code)]
-
 /// Create a temporary markdown file with Rust code block for hover testing.
 ///
 /// Content: fn main() { println!("Hello, world!"); }
@@ -80,27 +76,6 @@ fn example() {
 
 fn main() {
     example();
-}
-```
-"#;
-
-    create_markdown_file(content)
-}
-
-/// Create a temporary markdown file with Rust code block for signature help testing.
-///
-/// Content: fn greet(name: &str, age: u32) { ... }
-/// Cursor target: inside 'greet(' call at line 8, column 10 (after opening paren)
-pub(crate) fn create_signature_help_fixture() -> (String, String, tempfile::NamedTempFile) {
-    let content = r#"# Signature Help Example
-
-```rust
-fn greet(name: &str, age: u32) {
-    println!("Hello, {}! You are {} years old.", name, age);
-}
-
-fn main() {
-    greet(
 }
 ```
 "#;

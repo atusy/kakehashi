@@ -2,10 +2,6 @@
 //!
 //! Provides retry-with-timeout patterns for waiting on async LSP responses.
 
-// These functions are shared across multiple test binaries but not all tests use every function.
-// Allow dead_code to suppress per-binary warnings.
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use super::lsp_client::LspClient;
@@ -158,84 +154,10 @@ pub fn poll_for_completions(
     )
 }
 
-/// Poll for diagnostic results with exponential backoff.
-///
-/// This is used for textDocument/diagnostic requests which may need time
-/// for downstream language servers to analyze the document.
-///
-/// Uses exponential backoff starting at `initial_delay_ms`, doubling each retry
-/// up to `max_attempts` attempts.
-///
-/// # Arguments
-/// * `client` - The LSP client to send requests through
-/// * `uri` - The document URI
-/// * `max_attempts` - Maximum number of polling attempts (default: 5)
-/// * `initial_delay_ms` - Initial delay between attempts in milliseconds (default: 100)
-///
-/// # Returns
-/// * `Some(response)` - The full JSON-RPC response with non-empty diagnostics
-/// * `None` - If max_attempts reached without diagnostics
-pub fn poll_for_diagnostics(
-    client: &mut LspClient,
-    uri: &str,
-    max_attempts: u32,
-    initial_delay_ms: u64,
-) -> Option<serde_json::Value> {
-    let mut delay_ms = initial_delay_ms;
-
-    for attempt in 1..=max_attempts {
-        let response = client.send_request(
-            "textDocument/diagnostic",
-            json!({
-                "textDocument": { "uri": uri }
-            }),
-        );
-
-        if response.get("error").is_some() {
-            eprintln!(
-                "textDocument/diagnostic attempt {}/{}: Error: {:?}",
-                attempt,
-                max_attempts,
-                response.get("error")
-            );
-            std::thread::sleep(Duration::from_millis(delay_ms));
-            delay_ms = delay_ms.saturating_mul(2); // Exponential backoff
-            continue;
-        }
-
-        // Check if result has items (diagnostics)
-        if let Some(result) = response.get("result")
-            && let Some(items) = result.get("items").and_then(|i| i.as_array())
-            && !items.is_empty()
-        {
-            eprintln!(
-                "textDocument/diagnostic succeeded on attempt {}/{} with {} diagnostics",
-                attempt,
-                max_attempts,
-                items.len()
-            );
-            return Some(response);
-        }
-
-        eprintln!(
-            "textDocument/diagnostic attempt {}/{}: no diagnostics yet, retrying in {}ms...",
-            attempt, max_attempts, delay_ms
-        );
-        std::thread::sleep(Duration::from_millis(delay_ms));
-        delay_ms = delay_ms.saturating_mul(2); // Exponential backoff
-    }
-
-    eprintln!(
-        "textDocument/diagnostic exhausted {} attempts without diagnostics",
-        max_attempts
-    );
-    None
-}
-
 /// Wait for the language server to be ready by polling diagnostics.
 ///
-/// Unlike `poll_for_diagnostics`, this waits for the document to be processed
-/// but doesn't require non-empty diagnostics. It just waits for a valid response.
+/// Waits for the document to be processed but doesn't require non-empty
+/// diagnostics. It just waits for a valid response.
 ///
 /// Uses exponential backoff starting at `initial_delay_ms`.
 ///

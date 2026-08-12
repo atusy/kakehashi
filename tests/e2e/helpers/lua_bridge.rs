@@ -3,10 +3,6 @@
 //! Provides reusable initialization and verification patterns for tests that
 //! interact with lua-language-server via the kakehashi bridge.
 
-// These functions are shared across multiple test binaries but not all tests use every function.
-// Allow dead_code to suppress per-binary warnings.
-#![allow(dead_code)]
-
 use super::lsp_client::LspClient;
 use serde_json::json;
 
