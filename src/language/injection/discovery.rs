@@ -2603,6 +2603,59 @@ mod tests {
         );
     }
 
+    /// The mid-line rule is judged at the **effective** end, not at the raw
+    /// node's tree-sitter column. An `#offset!` that trims back across a
+    /// newline leaves the region ending at column 0 — the fenced-block shape
+    /// the fallback must decline — even though the raw node ends mid-line.
+    ///
+    /// This is what makes `ends_mid_line` load-bearing rather than a
+    /// refactor: keeping the old `content_node.end_position().column` here
+    /// would agree with it on every offset-free region, and only diverge when
+    /// a directive moves the end across a `\n`.
+    #[test]
+    fn caret_fallback_judges_the_mid_line_rule_at_the_effective_end() {
+        let mut parser = create_rust_parser();
+        let text = "x\ny";
+        let tree = parse_rust_code(&mut parser, text);
+        let node = tree.root_node();
+        assert_eq!(
+            node.end_byte(),
+            3,
+            "fixture: the raw node spans the document"
+        );
+        assert!(
+            node.end_position().column > 0,
+            "fixture: the raw end is mid-line, so the old rule would fire"
+        );
+
+        let trim_across_newline = InjectionOffset {
+            start_row: 0,
+            start_column: 0,
+            end_row: 0,
+            end_column: -1,
+        };
+        let injections = vec![InjectionRegionInfo {
+            language: "lua".to_string(),
+            content_node: node,
+            pattern_index: 0,
+            include_children: false,
+            offset: Some(trim_across_newline),
+            combined: false,
+            identity_slot: 0,
+        }];
+        assert_eq!(
+            effective_content_range(&injections[0], text),
+            0..2,
+            "fixture: the offset trims the end back onto the newline"
+        );
+
+        assert!(
+            find_injection_at_position(&injections, 2, text, RegionBoundary::CaretEndFallback)
+                .is_none(),
+            "the effective end sits at column 0, so the fallback must decline"
+        );
+    }
+
     /// A region ending with a trailing newline AT EOF (an unclosed block whose
     /// last typed character was Enter): the caret on the file's empty last
     /// line is still *inside* the unclosed injection — there is no closing
@@ -2694,11 +2747,16 @@ mod tests {
         assert_eq!(region.language, "python");
     }
 
-    /// NESTED regions sharing an end byte: the fallback scans in the same
-    /// sorted order as containment (start ascending), so the OUTERMOST region
-    /// wins — the tie-break the fallback comment and the ADR pin.
+    /// Offset-FREE nested regions sharing an end byte: the fallback scans in
+    /// `collect_all_injections`'s order (raw start ascending), so the first
+    /// match wins — which is the outermost region exactly because no directive
+    /// shifts either span here.
+    ///
+    /// Deliberately scoped: with an `#offset!` in play, raw order no longer
+    /// tracks effective nesting, so "first match" and "outermost" can part
+    /// company. See the ordering note on `find_injection_at_position`.
     #[test]
-    fn caret_end_fallback_prefers_outermost_at_shared_end() {
+    fn caret_end_fallback_prefers_first_in_raw_order_at_shared_end_without_offsets() {
         let mut parser = create_rust_parser();
         let text = "fn f(){}";
         let tree = parse_rust_code(&mut parser, text);
@@ -2743,7 +2801,107 @@ mod tests {
                 .expect("shared trailing edge resolves");
         assert_eq!(
             region.language, "lua",
-            "the outermost of the regions sharing the end byte must win"
+            "the first region in raw order — here the outermost — must win"
+        );
+    }
+
+    /// The other half of the fix, and the one with no downstream backstop: a
+    /// trimmed region used to SHADOW its neighbours. Raw containment matched
+    /// the outer region, the request then died at the bridge's bounds
+    /// precheck, and the adjacent region never got a chance. Now the trimmed
+    /// region steps aside and the neighbour wins the byte outright.
+    #[test]
+    fn a_trimmed_end_lets_the_adjacent_region_win_the_byte() {
+        let mut parser = create_rust_parser();
+        let text = "fn f(){}";
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+        // `parameters` "()" spans [4,6); its `)` child spans [5,6).
+        let trimmed = root.descendant_for_byte_range(4, 6).expect("parameters");
+        let neighbour = root.descendant_for_byte_range(5, 6).expect(") token");
+
+        // `0 0 0 -1` pulls the outer region's end back to 5, so byte 5 is the
+        // neighbour's alone rather than contained by both.
+        let injections = vec![
+            InjectionRegionInfo {
+                language: "lua".to_string(),
+                content_node: trimmed,
+                pattern_index: 0,
+                include_children: false,
+                offset: Some(InjectionOffset {
+                    start_row: 0,
+                    start_column: 0,
+                    end_row: 0,
+                    end_column: -1,
+                }),
+                combined: false,
+                identity_slot: 0,
+            },
+            InjectionRegionInfo {
+                language: "python".to_string(),
+                content_node: neighbour,
+                pattern_index: 0,
+                include_children: false,
+                offset: None,
+                combined: false,
+                identity_slot: 0,
+            },
+        ];
+        assert_eq!(
+            effective_content_range(&injections[0], text),
+            4..5,
+            "fixture: the directive trims the outer region off byte 5"
+        );
+
+        for boundary in [RegionBoundary::HalfOpen, RegionBoundary::CaretEndFallback] {
+            let (index, region) = find_injection_at_position(&injections, 5, text, boundary)
+                .expect("byte 5 resolves to the adjacent region");
+            assert_eq!(
+                (index, region.language.as_str()),
+                (1, "python"),
+                "the trimmed region must not shadow its neighbour under {boundary:?}"
+            );
+        }
+    }
+
+    /// The end-of-document exception is judged on the effective end too: a
+    /// directive that trims the end back means the region no longer reaches
+    /// EOF, so the caret past the last byte belongs to the host. The raw node
+    /// still ends at `doc_len` and would have matched.
+    #[test]
+    fn a_trimmed_end_gives_up_the_end_of_document_exception() {
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "---\ntitle: awesome\n---\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &md_language,
+            r#"
+            ((minus_metadata) @injection.content
+              (#set! injection.language "yaml")
+              (#offset! @injection.content 1 0 -1 0))
+            "#,
+        )
+        .expect("valid frontmatter injection query");
+
+        let injections = collect_all_injections(&tree.root_node(), text, Some(&query))
+            .expect("frontmatter injection is found");
+        assert_eq!(
+            injections[0].content_node.end_byte(),
+            text.len(),
+            "fixture: the raw node runs to the document end"
+        );
+
+        assert!(
+            find_injection_at_position(
+                &injections,
+                text.len(),
+                text,
+                RegionBoundary::CaretEndFallback
+            )
+            .is_none(),
+            "the effective end is the closing fence, not EOF — the exception must not fire"
         );
     }
 
@@ -2839,13 +2997,21 @@ mod tests {
         let (injections, _raw_start, raw_end) =
             string_literal_injection_with_offset(&tree, text, trim_quotes, false);
 
+        // Asserted as a PAIR. `.is_some()` alone would pass under the old raw
+        // ranges too — there via half-open containment, not via the fallback —
+        // so it takes the half-open rejection beside it to pin the mechanism.
+        assert!(
+            find_injection_at_position(&injections, raw_end - 1, text, RegionBoundary::HalfOpen)
+                .is_none(),
+            "half-open rejects the trimmed end..."
+        );
         let (_, region) = find_injection_at_position(
             &injections,
             raw_end - 1,
             text,
             RegionBoundary::CaretEndFallback,
         )
-        .expect("the caret after the last injected byte resolves the region");
+        .expect("...and the caret rule accepts the same byte, via the fallback");
         assert_eq!(region.language, "regex");
 
         assert!(
@@ -3011,6 +3177,21 @@ mod tests {
                 "the closing fence must stay outside the YAML region under {boundary:?}"
             );
         }
+        // Pins the effective end from BELOW as well. Without this the test
+        // catches an end one byte too late (byte 19 would become contained)
+        // but not one byte too early — at 18 the fence is still uncontained
+        // and `range.end != 19` keeps the fallback quiet, so every assertion
+        // above would still pass.
+        assert!(
+            find_injection_at_position(
+                &injections,
+                fence_start - 1,
+                text,
+                RegionBoundary::HalfOpen
+            )
+            .is_some(),
+            "the body's trailing newline is the last injected byte"
+        );
     }
 
     /// The same frontmatter case through the bridge's actual entry point, so
