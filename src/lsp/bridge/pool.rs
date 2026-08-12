@@ -277,7 +277,7 @@ pub(super) struct HostDocSyncState {
 }
 
 pub(in crate::lsp::bridge) type HostDocuments =
-    Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>;
+    Mutex<HashMap<String, HashMap<ConnectionKey, HostDocSyncState>>>;
 
 /// Cancellation-safe rollback for the pre-send virtual-document claim.
 /// Eager-open tasks are deliberately aborted when a newer parse supersedes
@@ -843,10 +843,10 @@ impl LanguageServerPool {
             if let Some(handle) = connections.get(&key) {
                 handle.begin_shutdown();
             }
-            self.host_documents
-                .lock()
-                .await
-                .retain(|(_, connection_key), _| connection_key != &key);
+            self.host_documents.lock().await.retain(|_, connections| {
+                connections.remove(&key);
+                !connections.is_empty()
+            });
             self.clear_host_routing_for_connection(&key);
             self.document_tracker.purge_connection(&key).await;
             // Arm before the replacement can claim: what this connection held
@@ -1001,10 +1001,10 @@ impl LanguageServerPool {
             if let Some(handle) = connections.get(&key) {
                 handle.begin_shutdown();
             }
-            self.host_documents
-                .lock()
-                .await
-                .retain(|(_, connection_key), _| connection_key != &key);
+            self.host_documents.lock().await.retain(|_, connections| {
+                connections.remove(&key);
+                !connections.is_empty()
+            });
             self.clear_host_routing_for_connection(&key);
             self.document_tracker.purge_connection(&key).await;
             // Arm before the replacement can claim: what this connection held
@@ -1227,7 +1227,8 @@ impl LanguageServerPool {
     /// request path in `text_document/host.rs`.
     pub(super) async fn host_documents(
         &self,
-    ) -> tokio::sync::MutexGuard<'_, HashMap<(String, ConnectionKey), HostDocSyncState>> {
+    ) -> tokio::sync::MutexGuard<'_, HashMap<String, HashMap<ConnectionKey, HostDocSyncState>>>
+    {
         self.host_documents.lock().await
     }
 
@@ -1348,8 +1349,8 @@ impl LanguageServerPool {
         let key = host_uri.to_string();
         self.host_documents()
             .await
-            .keys()
-            .any(|(uri, connection_key)| uri == &key && connection_key.server() == server_name)
+            .get(&key)
+            .is_some_and(|connections| connections.keys().any(|key| key.server() == server_name))
     }
 
     /// Whether the host document has been synced on this exact pooled
@@ -1361,7 +1362,8 @@ impl LanguageServerPool {
     ) -> bool {
         self.host_documents()
             .await
-            .contains_key(&(host_uri.to_string(), connection_key.clone()))
+            .get(host_uri.as_str())
+            .is_some_and(|connections| connections.contains_key(connection_key))
     }
 
     pub(crate) fn set_host_routing_suppressed(
@@ -1671,10 +1673,9 @@ impl LanguageServerPool {
         let key = host_uri.to_string();
         self.host_documents()
             .await
+            .get(&key)?
             .iter()
-            .find(|((uri, connection_key), _)| {
-                uri == &key && connection_key.server() == server_name
-            })
+            .find(|(connection_key, _)| connection_key.server() == server_name)
             .map(|(_, state)| state.version)
     }
 
@@ -3106,10 +3107,10 @@ impl LanguageServerPool {
                     // sharing the server name keep their state. Lock order:
                     // connections → host_documents / document tracker,
                     // consistent with close_host_bridge_document's prefetch.
-                    self.host_documents
-                        .lock()
-                        .await
-                        .retain(|(_, key), _| key != &connection_key);
+                    self.host_documents.lock().await.retain(|_, connections| {
+                        connections.remove(&connection_key);
+                        !connections.is_empty()
+                    });
                     self.clear_host_routing_for_connection(&connection_key);
                     self.document_tracker
                         .purge_connection(&connection_key)
