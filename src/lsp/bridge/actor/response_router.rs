@@ -77,6 +77,9 @@ struct ResponseRouterState {
 
 struct PendingRequest {
     response_tx: oneshot::Sender<serde_json::Value>,
+    /// Peer cancellation cleanup waits for this sender to be dropped when the
+    /// router entry settles, without retaining the response receiver itself.
+    _settled_tx: Option<oneshot::Sender<()>>,
     delivery: RequestDelivery,
 }
 
@@ -150,14 +153,20 @@ impl ResponseRouter {
         downstream_id: RequestId,
         upstream_id: Option<UpstreamId>,
     ) -> Option<(oneshot::Receiver<serde_json::Value>, Option<u64>)> {
-        self.register_with_upstream_liveness_mode(downstream_id, upstream_id, false)
+        self.register_with_upstream_liveness_mode(downstream_id, upstream_id, false, None)
     }
 
     pub(crate) fn register_peer(
         &self,
         downstream_id: RequestId,
-    ) -> Option<(oneshot::Receiver<serde_json::Value>, Option<u64>)> {
-        self.register_with_upstream_liveness_mode(downstream_id, None, true)
+    ) -> Option<(
+        oneshot::Receiver<serde_json::Value>,
+        Option<u64>,
+        oneshot::Receiver<()>,
+    )> {
+        let (settled_tx, settled_rx) = oneshot::channel();
+        self.register_with_upstream_liveness_mode(downstream_id, None, true, Some(settled_tx))
+            .map(|(response_rx, epoch)| (response_rx, epoch, settled_rx))
     }
 
     fn register_with_upstream_liveness_mode(
@@ -165,6 +174,7 @@ impl ResponseRouter {
         downstream_id: RequestId,
         upstream_id: Option<UpstreamId>,
         track_failure: bool,
+        settled_tx: Option<oneshot::Sender<()>>,
     ) -> Option<(oneshot::Receiver<serde_json::Value>, Option<u64>)> {
         let (tx, rx) = oneshot::channel();
         let mut state = self
@@ -189,6 +199,7 @@ impl ResponseRouter {
             downstream_id,
             PendingRequest {
                 response_tx: tx,
+                _settled_tx: settled_tx,
                 delivery: RequestDelivery::Queued,
             },
         );
@@ -1040,7 +1051,7 @@ mod tests {
         let (_older_rx, epoch) = router
             .register_with_upstream_liveness(RequestId::new(1), None)
             .unwrap();
-        let (_peer_rx, peer_epoch) = router.register_peer(RequestId::new(2)).unwrap();
+        let (_peer_rx, peer_epoch, _settled_rx) = router.register_peer(RequestId::new(2)).unwrap();
         assert_eq!(
             peer_epoch, None,
             "the older request owns the liveness timer"

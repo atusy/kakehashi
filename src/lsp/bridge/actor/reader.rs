@@ -1041,7 +1041,7 @@ async fn handle_server_request(
             return;
         }
         "kakehashi/bridge/peer/request" => {
-            peer::request::handle(&message, id, server_prefix, deps);
+            peer::request::handle(&message, id, server_prefix, deps).await;
             return;
         }
         _ => {}
@@ -2182,6 +2182,45 @@ mod tests {
             0,
             "rejection happens before target router/task state is created"
         );
+    }
+
+    #[tokio::test]
+    async fn peer_rejection_backpressures_reader_without_a_detached_task() {
+        let router = ResponseRouter::new();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        for n in 0..16 {
+            deps.response_tx
+                .try_send(OutboundMessage::Untracked(json!({ "occupied": n })))
+                .unwrap();
+        }
+
+        let mut dispatch = Box::pin(handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 77,
+                "method": "kakehashi/bridge/peer/request",
+                "params": { "id": "missing", "method": "custom/request" }
+            }),
+            &router,
+            "[tsudoi] ",
+            &deps,
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut dispatch => panic!("rejection must not escape into a detached task"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        for _ in 0..16 {
+            let _occupied = response_rx.recv().await.unwrap();
+        }
+        dispatch.await;
+        let OutboundMessage::Untracked(response) = response_rx.recv().await.unwrap() else {
+            panic!("server-request responses are untracked")
+        };
+        assert_eq!(response["id"], 77);
+        assert_eq!(response["error"]["data"]["reason"], "unknownPeer");
     }
 
     #[tokio::test]
