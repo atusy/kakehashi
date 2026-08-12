@@ -364,6 +364,19 @@ impl BridgeCoordinator {
         self.force_start_test_control.store(Some(control));
     }
 
+    /// Retire every in-flight warm-up acquire, without launching new ones.
+    ///
+    /// Call this at the *start* of a settings application, before anything
+    /// that walks the connection map. An acquire is admitted for as long as
+    /// its generation is current, so retiring them only when the new warm-ups
+    /// launch would leave a window — after propagation, before the pass — in
+    /// which a stale acquire can still install a connection propagation has
+    /// already walked past.
+    pub(crate) fn supersede_force_start(&self) {
+        self.force_start_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Spawn every configured server that asks to start without waiting for a
     /// document (`forceStart`), returning how many warm-up acquires were
     /// launched — attempts, not connections: each one is detached, so none of
@@ -406,19 +419,6 @@ impl BridgeCoordinator {
     /// observable once routing decisions and their bindings exist, and buying
     /// it now would mean either blocking publication on process startup or a
     /// third acquire variant with no caller to justify it.
-    /// Retire every in-flight warm-up acquire, without launching new ones.
-    ///
-    /// Call this at the *start* of a settings application, before anything
-    /// that walks the connection map. An acquire is admitted for as long as
-    /// its generation is current, so retiring them only when the new warm-ups
-    /// launch would leave a window — after propagation, before the pass — in
-    /// which a stale acquire can still install a connection propagation has
-    /// already walked past.
-    pub(crate) fn supersede_force_start(&self) {
-        self.force_start_generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub(crate) fn force_start_servers(&self, settings: &WorkspaceSettings) -> usize {
         use std::sync::atomic::Ordering;
 
