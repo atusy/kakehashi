@@ -560,6 +560,8 @@ impl ConnectionHandle {
     }
 
     /// Whether the downstream advertised bridge routing during initialization.
+    // Kept on the handle for the routing-request slice stacked on this PR.
+    #[allow(dead_code)]
     pub(crate) fn supports_bridge_routing(&self) -> bool {
         self.bridge_routing.get().copied().unwrap_or(false)
     }
