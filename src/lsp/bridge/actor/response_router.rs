@@ -682,8 +682,8 @@ mod tests {
     #[test]
     fn new_router_has_no_pending_requests() {
         let router = ResponseRouter::new();
-        assert_eq!(router.pending_count(), 1);
-        assert_eq!(router.awaiting_downstream_count(), 1);
+        assert_eq!(router.pending_count(), 0);
+        assert_eq!(router.awaiting_downstream_count(), 0);
     }
 
     #[test]

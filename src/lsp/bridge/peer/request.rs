@@ -183,6 +183,11 @@ pub(in crate::lsp::bridge) fn handle(
                             outcome
                         );
                     }
+                    let router = peer.router().clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(super::super::pool::REQUEST_TIMEOUT).await;
+                        router.remove(downstream_id);
+                    });
                 }
                 Err(jsonrpc::Error::request_cancelled())
             }
