@@ -669,7 +669,7 @@ impl ResponseRouter {
         let entries: Vec<_> = state.pending.drain().collect();
         for (id, _) in &entries {
             if state.failure_tracked.remove(id) {
-                state.failures.insert(*id, BridgeFailure::RequestTimeout);
+                state.failures.insert(*id, BridgeFailure::ConnectionLost);
             }
         }
         state.upstream_to_downstream.clear();
@@ -1031,6 +1031,29 @@ mod tests {
         assert!(
             router.register(RequestId::new(2)).is_none(),
             "a terminal router must reject new requests"
+        );
+    }
+
+    #[test]
+    fn connection_liveness_expiry_is_not_a_peer_request_deadline() {
+        let router = ResponseRouter::new();
+        let (_older_rx, epoch) = router
+            .register_with_upstream_liveness(RequestId::new(1), None)
+            .unwrap();
+        let (_peer_rx, peer_epoch) = router.register_peer(RequestId::new(2)).unwrap();
+        assert_eq!(
+            peer_epoch, None,
+            "the older request owns the liveness timer"
+        );
+
+        assert!(matches!(
+            router.fail_all_if_awaiting_downstream(epoch.unwrap(), "expired", || {}),
+            LivenessExpiry::Failed { pending_count: 2 }
+        ));
+        assert_eq!(
+            router.take_failure(RequestId::new(2)),
+            Some(BridgeFailure::ConnectionLost),
+            "a later peer request is a victim of connection-wide liveness failure"
         );
     }
 
