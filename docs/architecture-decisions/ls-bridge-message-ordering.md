@@ -533,6 +533,21 @@ awaits only cancel-safe primitives.
 - External LSP interface unchanged
 - Internal refactor only
 
+## Decision–Implementation Gap
+
+- **Inbound admission is neither reserved nor refused.** § Non-Blocking
+  Backpressure decides that a downstream-initiated request is admitted with
+  room for its answer accounted for, or answered up front with
+  `RequestFailed`. Today the reader simply attempts the response send with a
+  five-second bound and, on expiry, warns and drops it — so the server is
+  left waiting on a request the bridge accepted, which is the outcome that
+  decision exists to prevent. The bounded wait also does not fail the
+  connection as specified.
+- **The pre-ready hold does not exist.** Notifications accepted during
+  `Initializing` go to the single writer queue; there is no separate hold and
+  no release at the `Ready` commit. This is target state adopted with
+  bridge-client-control-protocol, as § Operation Gating notes.
+
 ## Alternatives Considered
 
 ### Alternative 1: Bridge-Level Coalescing (Generation-Based Superseding)

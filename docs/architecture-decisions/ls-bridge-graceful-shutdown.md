@@ -381,11 +381,13 @@ I/O, so the O(1) wall-clock property below is unaffected.
 - **The stopped-check and the spawn-decision must be atomic.** Split them
   and an acquire spawns a connection beside a tombstone a concurrent `stop`
   just committed, resurrecting a server the user asked to stay down.
-- **Accepted work must always have exactly one worker.** Neither zero — a
-  crash between accepting the work and starting it must not strand the
-  record with nobody acting on it — nor two, which for a spawn means two
-  children. This is the same hazard respawn-reopen-derives-its-targets
-  addresses by deriving rather than remembering.
+- **Accepted work is neither orphaned nor performed twice.** A crash between
+  accepting the work and beginning it must not strand the record with nobody
+  acting on it; equally, its non-idempotent effects must not be duplicated —
+  for a spawn, that means two children. The authoritative state has to
+  survive abnormal termination until the operation completes or settles
+  terminally. This is the hazard respawn-reopen-derives-its-targets addresses
+  by deriving rather than remembering.
 - **Lifecycle records that cannot be re-derived must outlive the component
   that owns them.** The stopped set is precisely the record of keys *not*
   in the pool, so losing it cannot be repaired by reading the pool;
@@ -596,7 +598,7 @@ unaffected because only decisions serialize, not process I/O.
 
 The `Ready`-state LSP handshake, the writer handoff with its queue drain,
 the SIGTERM → SIGKILL escalation, and parallel teardown are implemented.
-Six parts of this decision run ahead of the code, which is the ordinary
+Seven parts of this decision run ahead of the code, which is the ordinary
 state of an ADR here:
 
 - **The lifecycle actor does not exist yet.** Teardown today is a pool-wide
@@ -618,6 +620,12 @@ state of an ADR here:
   and LSP ordering forbid. This
   is the one gap here that is a live conformance defect rather than a missing
   refinement.
+- **Handshake terminal commits are not conditional.** This decision leans on
+  them being so — it is how the actor's abort path wins or loses cleanly —
+  but the timeout and task-failure paths write `Failed` unconditionally and
+  the error path is check-then-write, so a handshake finishing after a
+  shutdown won can still overwrite it. Also recorded as a precondition in
+  bridge-client-control-protocol § Implementation Notes.
 - **Admission is never sealed.** The enqueue paths do not consult the
   connection's state, so a `Closing` connection still accepts operations
   instead of rejecting them with `REQUEST_FAILED`; and because the drain
@@ -672,4 +680,4 @@ state of an ADR here:
 - **2026-08-11**: Corrected Initialization Shutdown - the abort path sends no LSP message at all (the earlier revision sent `exit` before the initialize response, which LSP ordering forbids); adopted alongside bridge-client-control-protocol, whose per-slot `stop` shares the path
 - **2026-08-11**: Reconciled the Operation Disposal Policy with the Closing-state gating and the writer's actual behavior - the accepted order queue drains ahead of `shutdown` (the earlier table said queued operations are never sent, contradicting § Operation Gating and the FIFO writer)
 - **2026-08-12**: Replaced the lock-based concurrent lifecycle-control design with the Lifecycle Actor as the **target design** (implementation pending — see § Decision–Implementation Gap) - all lifecycle transitions (stop/restart/teardown/spawn-commit) serialize through one pool-owned actor, dissolving the single-flight registry, lease-owner map, supervisor-owned transactional teardown state, and durable-record finalizer machinery the earlier revision had accreted (now recorded as rejected Alternative 4); observable contracts in bridge-client-control-protocol are unchanged
-- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - deleted the lifecycle-actor and writer-handoff implementation mechanics (escrow slots, kill-on-drop guards, scratch-copy staging, commit-and-reply swaps, generation-bound receivers, settlement markers, the message-enum and coordination sketches, the writer-idle constant), and added an Invariants section recording the traps that machinery closed. Replaced the aspirational-design note with a Decision–Implementation Gap section, dropping its stop-oneshot and writer-return-channel divergences as no longer load-bearing and adding the lifecycle-actor and escalation-reserve gaps. No contract changed.
+- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - deleted the lifecycle-actor and writer-handoff implementation mechanics (escrow slots, kill-on-drop guards, scratch-copy staging, commit-and-reply swaps, generation-bound receivers, settlement markers, the message-enum and coordination sketches, and the writer-idle constant — the last relocated to ls-bridge-timeout-hierarchy § Writer-Idle Timeout rather than dropped, since that ADR is where durations live), and added an Invariants section recording the traps that machinery closed. Replaced the aspirational-design note with a Decision–Implementation Gap section, dropping its stop-oneshot and writer-return-channel divergences as no longer load-bearing and adding the lifecycle-actor and escalation-reserve gaps. No contract changed.

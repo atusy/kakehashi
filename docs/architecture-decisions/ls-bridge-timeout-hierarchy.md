@@ -31,6 +31,7 @@ The async bridge architecture defines timeout systems across several decisions:
 7. **Binding-Reuse Validation Budget** (bridge-routing-protocol): Bounds the *caller's wait* on filesystem revalidation along binding-driven reuse paths — capped by the sweep's remaining budget on re-open sweeps, a dedicated implementation-defined budget on lazy-open/retry paths, and the global shutdown ceiling always. It does not bound the underlying OS call or its worker capacity, which may outlive every deadline (capacity returns only when the call does)
 8. **Per-Downstream Response Cap** (language-server-bridge): A flat 30s bound on each bridge-managed downstream request — excluding control-protocol pass-through, the lifecycle handshake, and routing-provider requests; shipped, and not a tier (see the dedicated section below)
 9. **Writer-Idle Timeout** (ls-bridge-graceful-shutdown): Bounds the wait for exclusive stdin access during shutdown, inside the applicable shutdown deadline rather than in addition to it (see the dedicated section below)
+10. **Inbound Response-Send Bound** (ls-bridge-message-ordering): Bounds how long the reader waits to hand a response to a *downstream-initiated* request onto the wire — 5s-class, capped by the earliest active lifecycle deadline, and on expiry the connection fails by conditional compare-transition from its current state
 
 ### The Problem
 
@@ -95,7 +96,8 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 
 **Relationships:**
 ```
-Initialization (60s) > Liveness (30-120s) > Per-request (5s)
+Initialization → Liveness → Per-request   (state-gated, not duration-ordered)
+Global Shutdown overrides all
 Global Shutdown overrides all (highest priority)
 ```
 
@@ -191,7 +193,7 @@ bound this hierarchy did not previously register):
 
 ### Negative
 
-- **Multiple concepts**: Three timeout *tiers* in Phase 1 (four in Phase 3), plus the tier-exempt deadlines registered here (per-slot control shutdown, routing decision, binding-reuse validation, writer-idle, per-downstream response cap)
+- **Multiple concepts**: Three timeout *tiers* in Phase 1 (four in Phase 3), plus the tier-exempt deadlines registered here (per-slot control shutdown, routing decision, binding-reuse validation, writer-idle, per-downstream response cap, inbound response-send bound)
 - **Tuning required**: Implementation-defined values need careful selection
 
 ### Neutral
