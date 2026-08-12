@@ -607,15 +607,28 @@ impl ConnectionHandle {
         self.state_watch.send_replace(new_state);
     }
 
-    pub(in crate::lsp::bridge) fn fail_if_ready(&self) {
+    /// Fail a wedged connection and abort its writer immediately.
+    ///
+    /// Dropping the writer task handle cancels a write parked on a full stdin
+    /// pipe; the writer then drops its owned process handle, which force-kills
+    /// the downstream child. This is required when graceful shutdown cannot
+    /// make progress because the writer itself is the failed resource.
+    pub(in crate::lsp::bridge) fn fail_and_abort_writer(&self) {
         let mut state = self
             .state
             .write()
-            .recover_poison("ConnectionHandle::fail_if_ready");
+            .recover_poison("ConnectionHandle::fail_and_abort_writer");
         if *state == ConnectionState::Ready {
             *state = ConnectionState::Failed;
             self.state_watch.send_replace(ConnectionState::Failed);
         }
+        drop(state);
+        drop(
+            self.writer_handle
+                .lock()
+                .recover_poison("ConnectionHandle::fail_and_abort_writer")
+                .take(),
+        );
     }
 
     /// Complete initialization only while this handle still belongs to its
@@ -1406,6 +1419,33 @@ mod tests {
         // Can access router
         let _router = handle.router();
         // Router is accessible (test passes if no panic)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aborting_a_wedged_writer_kills_its_downstream_process() {
+        use crate::lsp::bridge::pool::test_helpers::{
+            create_handle_with_state_and_pid, process_stat,
+        };
+
+        let (handle, pid) = create_handle_with_state_and_pid(ConnectionState::Ready).await;
+        handle.fail_and_abort_writer();
+        assert_eq!(handle.state(), ConnectionState::Failed);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match process_stat(pid).expect("ps should inspect the test child") {
+                None => break,
+                Some(stat) if stat.starts_with('Z') => break,
+                Some(stat) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "child {pid} survived writer abort (stat {stat})"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
     }
 
     /// Test that liveness timeout triggers Ready->Failed state transition (ls-bridge-async-connection Phase 3).
