@@ -599,7 +599,7 @@ unaffected because only decisions serialize, not process I/O.
 
 The `Ready`-state LSP handshake, the writer handoff with its queue drain,
 the SIGTERM → SIGKILL escalation, and parallel teardown are implemented.
-Six parts of this decision run ahead of the code, which is the ordinary
+Seven parts of this decision run ahead of the code, which is the ordinary
 state of an ADR here:
 
 - **The lifecycle actor does not exist yet.** Teardown today is a pool-wide
@@ -622,6 +622,12 @@ state of an ADR here:
   the error path is check-then-write, so a handshake finishing after a
   shutdown won can still overwrite it. Also recorded as a precondition in
   bridge-client-control-protocol § Implementation Notes.
+- **Pending responses are not disposed as decided.** § Operation Disposal
+  Policy says a pending response fails with `REQUEST_FAILED` and
+  "bridge: connection closing". Today the shutdown transitions only change
+  state, and the pending set is failed later by reader cleanup with
+  `INTERNAL_ERROR` — so a caller cannot tell an orderly shutdown from a
+  crashed connection, which the discriminator exists to distinguish.
 - **Admission is never sealed.** The enqueue paths do not consult the
   connection's state, so a `Closing` connection still accepts operations
   instead of rejecting them with `REQUEST_FAILED`; and because the drain

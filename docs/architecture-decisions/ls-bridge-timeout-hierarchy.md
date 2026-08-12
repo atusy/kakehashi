@@ -75,7 +75,7 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 |----------|----------------|----------|
 | Normal operation (Phase 1) | Liveness, per-downstream response cap | Liveness resets on activity, `Ready` → `Failed` on timeout; the cap fails one request without faulting the connection |
 | Normal operation (Phase 3) | Liveness, per-downstream response cap, Per-request (only when n ≥ 2) | Per-request bounds aggregation; the cap still bounds each individual wait, including single-participant requests Tier 1 never engages for; Liveness detects hung servers |
-| Shutdown (any state) | Global only | All other timeouts (Init/Liveness/Per-request) STOP; an in-flight per-slot control shutdown is subsumed by the `Teardown` transition, its deadline superseded by the global one; global bounds the termination attempt |
+| Shutdown (any state) | Global, plus any response cap already running | The *tiered* timeouts (Init/Liveness/Per-request) STOP; a per-downstream response cap already counting is not cancelled at initiation and runs to its own expiry or to connection closure, whichever comes first; an in-flight per-slot control shutdown is subsumed by the `Teardown` transition, its deadline superseded by the global one; global bounds the termination attempt |
 | Late response during shutdown | Global | ACCEPT until the connection closes or the deadline expires |
 
 **Key Interactions:**
