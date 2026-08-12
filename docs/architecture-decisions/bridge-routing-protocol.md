@@ -1477,7 +1477,7 @@ a slot a routing provider left in play.
 |---|---|
 | **Method** | `kakehashi/bridge/routing`, kakehashi→downstream request; dispatch strictly per side |
 | **Decision unit** | one query per bridged document (host, and each virtual document); `textDocument = { uri: as the downstream sees it, languageId }` + `layer`; per-region volume user-controllable via bridge `enabled = false` / routing `priorities = []` |
-| **Params** | `textDocument` + `layer` + `languageServers` projection `{languages, workspaceMarkers, preferSharedInstance}` of spawnable, language-matching servers (`_` excluded) |
+| **Params** | `textDocument` + `layer` + `hostUri` (injection decisions) + `languageServers` projection `{languages, workspaceMarkers, preferSharedInstance}` of spawnable, language-matching servers (`_` excluded) |
 | **Answer** | `null`/missing entry/absent `enabled` = kakehashi decides; `enabled: false` = per-document `didOpen` suppression at the routing gate; non-empty `workspaceFolders` = root override; `[]` = rootless route to the server's `#shared` connection |
 | **Precedence** | membership: stopped set > configuration > answer (subtract only); root: answer overrides marker resolution, both resolved keys checked against the stopped set |
 | **Trust** | providers are trusted-by-configuration; folder overrides bounded to canonicalized `file:` URIs at-or-below client workspace folders or the config-resolved root, count-capped |
