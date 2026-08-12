@@ -226,9 +226,13 @@ The system uses two distinct timeout mechanisms with different purposes:
 - Multiple connections share the tokio runtime's thread pool
 
 **Clean Cancellation:**
-- `select!` macro unifies shutdown, timeout, and read in one construct
+- Shutdown, timeout, and read are multiplexed in one construct
 - No blocked system calls that ignore cancellation signals
-- Immediate shutdown even when server is silent
+- A silent server never wedges the reader: it stays cancellable while stdout
+  produces nothing. Shutdown itself is not immediate in that case — the
+  handshake's response wait is bounded by the shutdown deadline, not by a
+  per-connection one (§ Decision–Implementation Gap in
+  ls-bridge-graceful-shutdown)
 
 **Dead Server Detection:**
 - Liveness timeout detects hung servers without separate monitoring

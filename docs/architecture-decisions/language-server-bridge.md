@@ -304,6 +304,13 @@ Startup cleanup handles crash recovery: scan `{temp_dir}/kakehashi/` and remove 
 
 ### Workspace Provisioning
 
+> **Superseded in its mechanism, non-normative — retained as history.** The
+> *problem* is real and still shapes the design: servers differ in what
+> project context they need. The *solution* recorded below routes through
+> temp files kakehashi no longer writes (§ Provisioning Flow). Treat the
+> per-server requirements as accurate and the temp-path instructions as
+> historical.
+
 Different language servers have different project structure requirements:
 
 | Server | Requirement | Solution |
