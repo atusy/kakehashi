@@ -33,6 +33,7 @@ pub(crate) use connection::BridgeReader;
 pub(crate) mod coordinator;
 pub(crate) mod envelope;
 mod inbound_request_registry;
+mod peer;
 mod pool;
 pub(crate) use pool::HostLanguageAdmission;
 mod progress_registry;
