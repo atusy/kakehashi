@@ -164,21 +164,19 @@ Client (editor)          kakehashi           Downstream Server
 
 ### Routing (Phase 1)
 
-In Phase 1, routing resolves `languageId` → `server_name` via configuration, then looks up the connection by `server_name`:
+In Phase 1, routing resolves `languageId` → `server_name` via
+configuration, then looks up the connection by `server_name`. The connection
+is therefore keyed by **server name**, not by language — that is the key
+difference from pure language-based routing: several languages sharing one
+`server_name` share one process — `typescript` and `typescriptreact` both
+resolve to `tsgo` and get the same connection.
 
-```rust
-// Phase 1: Server-name-based routing
-fn route_request(language_id: &str) -> Option<&Connection> {
-    // 1. Resolve server_name from config (e.g., "typescript" → "tsgo")
-    let server_name = config.get_server_for_language(language_id)?;
-    // 2. Look up connection by server_name (enables process sharing)
-    self.connections.get(server_name)
-}
-```
+(The full `ConnectionKey` is richer than a bare name — per-root pooling and
+the shared-instance opt-in are above, under § Phase 1: Connection-Key
+Routing. The name is the part
+this comparison turns on.)
 
-**Key difference from pure language-based routing**: Multiple languages can share the same connection when they map to the same `server_name`. For example, `typescript` and `typescriptreact` can both resolve to `tsgo`, sharing a single process.
-
-**Phase 3 Extension**: Multi-LS routing strategies (SingleByCapability, FanOut) — see Future Extensions.
+**Phase 3 Extension**: Multi-LS routing strategies — see Future Extensions.
 
 ### Server Lifecycle Management
 
@@ -303,8 +301,10 @@ no coordinate translation. They reuse the `UpstreamNotification` decoupling
 carrying `workspace/diagnostic/refresh`: a log-flooding downstream server must
 not grow memory without bound, and the forwarding loop's biased select drains
 the refresh channel first so a `window/*` burst cannot starve diagnostics.
-FIFO order is preserved within each channel. Still not forwarded: `$/progress`
-(#379) and push-based `textDocument/publishDiagnostics` (#380).
+FIFO order is preserved within each channel. `$/progress` (#379) and
+push-based `textDocument/publishDiagnostics` (#380) are forwarded too — the
+latter into the diagnostics cache per push-propagation-diagnostic-forwarding
+rather than passed straight through.
 
 ### Cancellation Propagation
 
@@ -332,35 +332,30 @@ Result: State divergence (recoverable via next didChange)
 
 ### Phase 3: Response Aggregation Strategies
 
-> **Note**: This section describes Phase 3 multi-LS-per-language features. Phase 1 uses single-server routing.
+> **Note**: The multi-server aggregation this section introduced as "Phase 3"
+> has since **shipped** — dispatch fans out to every selected server, and the
+> strategies and allowlist are owned by cross-layer-aggregation and
+> aggregation-priorities-wildcard. What remains unimplemented is the
+> per-request timeout tier the stability rules below assume
+> (ls-bridge-timeout-hierarchy places Tier 1 in Phase 3). Read the rules as
+> target state and the capability as current.
 
-For fan-out **requests** (with `id`), configure aggregation per method:
-
-```rust
-enum AggregationStrategy {
-    /// Return first successful response, cancel others.
-    /// On first success: immediately send $/cancelRequest to remaining servers,
-    /// discard any late responses.
-    FirstWins,
-
-    /// Wait for all, merge array results (candidate lists only)
-    MergeAll {
-        dedup_key: Option<String>,  // e.g., 'label' for completions
-        max_items: Option<usize>,
-    },
-
-    /// Wait for all, return highest priority non-null result
-    Ranked {
-        priority: Vec<String>,
-    },
-}
-```
+For fan-out **requests** (with `id`), aggregation is configured per method.
+The strategies and the priority-ordered allowlist that selects participants
+are owned by cross-layer-aggregation and aggregation-priorities-wildcard —
+that is where the shipped names and semantics live. This section adds only
+the *stability* rules a multi-server fan-out needs on top of them.
 
 **Aggregation Stability Rules:**
-- **Per-request timeout conditions**: Timeout applies **only when n ≥ 2 downstream servers participate**
-  - SingleByCapability: No per-request timeout (wait for single server, liveness timeout protects)
-  - FanOut with n=1: No per-request timeout (functionally equivalent to single)
-  - FanOut with n≥2: Per-request timeout applies (default: 5s explicit, 2s incremental)
+- **Per-request timeout conditions**: the timeout applies **only when n ≥ 2
+  downstream servers participate** in aggregating one document request
+  (default: 5s explicit, 2s incremental), whatever strategy selected them.
+  A routing-provider fan-out is not such an aggregation: it stays exempt,
+  bounded solely by its own routing deadline (bridge-routing-protocol,
+  ls-bridge-timeout-hierarchy). A single participant needs no aggregation
+  bound — nothing is being waited *together* — and the per-downstream
+  response cap already bounds its individual wait; liveness separately
+  detects connection silence
 - **Per-request timeout behavior**: On timeout, return whatever results available **without sending $/cancelRequest**
   - Downstream servers continue processing and send responses
   - Late responses **discarded** by router but **reset liveness timeout** (heartbeat for connection health)
@@ -378,34 +373,31 @@ enum AggregationStrategy {
 
 ### Phase 3: Configuration Example
 
-```yaml
-# Phase 3: Multiple servers per language with aggregation
-languages:
-  markdown:
-    bridges:
-      python:
-        # Multiple servers for Python
-        priority: ["ruff", "pyright"]  # Prioritize ruff when capability overlaps
+```toml
+# Phase 3: several servers for one injected language, with per-method
+# aggregation. `priorities` is an ordered allowlist; a server absent from
+# the list does not run (aggregation-priorities-wildcard).
+[languages.markdown.bridge.python.aggregation._]
+priorities = ["ruff", "pyright"]   # ruff first where capabilities overlap
 
-        # Per-method aggregation config:
-        aggregations:
-          textDocument/completion:
-            strategy: concatenated   # Safe: candidates, user selects one
-            dedup_key: label
-          textDocument/codeAction:
-            strategy: concatenated   # Safe: proposals, user executes one
-          # hover, definition: use default (single_by_capability)
-          # rename: MUST use single_by_capability (overlapping WorkspaceEdits)
-          # formatting: see concatenated-formatting-pipeline (planned sequential
-          #   pipeline; user-issued textDocument/rangeFormatting requests unaffected)
+[languages.markdown.bridge.python.aggregation."textDocument/completion"]
+strategy = "concatenated"          # safe: candidates, the user selects one
 
-languageServers:
-  pyright:
-    cmd: [pyright-langserver, --stdio]
-    languages: [python]
-  ruff:
-    cmd: [ruff, server]
-    languages: [python]  # Same language as pyright
+[languages.markdown.bridge.python.aggregation."textDocument/codeAction"]
+strategy = "concatenated"          # safe: proposals, the user executes one
+
+# hover, definition, rename: left to the default `preferred` dispatch — one
+#   server answers, so overlapping WorkspaceEdits cannot arise.
+# formatting: see concatenated-formatting-pipeline (sequential pipeline,
+#   implemented; user-issued textDocument/rangeFormatting unaffected)
+
+[languageServers.pyright]
+cmd = ["pyright-langserver", "--stdio"]
+languages = ["python"]
+
+[languageServers.ruff]
+cmd = ["ruff", "server"]
+languages = ["python"]             # same language as pyright — this is the fan-out
 ```
 
 ## Consequences
@@ -429,13 +421,14 @@ languageServers:
 - Users can diagnose configuration issues immediately
 
 **Extensible Foundation:**
-- Phase 1 architecture supports future multi-LS extension (Phase 3)
+- The Phase 1 architecture was built to admit multi-LS extension, which has since shipped
 - Single-server configurations continue to work unchanged
 
 ### Negative
 
-**Single Server Limitation (Phase 1):**
-- Cannot use multiple servers for same language (e.g., pyright + ruff) until Phase 3
+**Single Server Limitation (Phase 1)** — *historical; multi-server fan-out
+has since shipped:*
+- Could not use multiple servers for the same language (e.g. pyright + ruff) until Phase 3
 
 **Coordination Complexity:**
 - Per-downstream document state tracking required
@@ -593,3 +586,4 @@ languageServers:
 - **2026-01-24**: Changed from language-based to server-name-based pool keying to enable process sharing for related languages (e.g., ts/tsx sharing tsgo). Connection pool is now keyed by `server_name` instead of `languageId`, with configuration resolving `language` → `server_name`.
 - **2026-01-07**: Merged Amendment 002 - Simplified ID namespace by using upstream request IDs directly (no transformation), replaced `pending_correlations` with `pending_responses`
 - **2026-01-06**: Merged Amendment 001 - Updated partial results to use LSP-native fields (isIncomplete), clarified $/cancelRequest semantics, added response guarantees for cancelled requests
+- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - retired two drifted sketches that read as guarantees: the `FirstWins`/`MergeAll`/`Ranked` strategy enum (the shipped strategies are `Preferred`/`Concatenated`, owned by cross-layer-aggregation and aggregation-priorities-wildcard) and the Phase 1 `route_request` snippet; the Phase 3 stability rules now turn on participant count rather than the never-shipped `SingleByCapability`/`FanOut` names; the Phase 3 configuration example was rewritten against the shipped TOML schema (`bridge.<lang>.aggregation`, `priorities`, `strategy`), having drifted to a YAML shape with `priority`/`dedup_key`/`single_by_capability` that never existed

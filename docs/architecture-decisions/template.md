@@ -23,6 +23,35 @@ are unaffected and may appear anywhere):
   links rot into clickable 404s. Plain-text mentions degrade gracefully to a
   stale-but-harmless proper noun, keeping the curated link block the single
   place a link can rot.
+
+Contract / invariant / mechanism — classify EVERY normative statement before
+writing it, and again whenever review pressure adds one. The operative test:
+*could a competent implementer do this differently and still satisfy
+everything observable?* If yes, it is mechanism.
+
+1. **Contract — keep, normative.** Externally observable behavior: wire
+   shapes, status values and their meaning, error discriminators, ordering
+   promises, what an enumeration shows. The test is *observability*, not how
+   low-level the wording sounds — "settling entries enumerate as `stopping`"
+   is a contract; "the entry keeps an escrow slot" is not.
+2. **Invariant — keep, but state *what must hold*, never *how*.** The trap
+   catalog adversarial review actually discovers: LSP forbids any client
+   message before the initialize response; a child process must never exist
+   outside owned records; SIGKILL delivery is not termination, only a reaped
+   `wait` is. One or two sentences each, always with the *why*. These are the
+   durable value of review — keep the traps, drop the machinery that closed
+   them.
+3. **Mechanism — delete.** Anything an implementer could legitimately do
+   differently while satisfying 1 and 2. Body prose naming a concrete API
+   (`JoinSet`, `oneshot`, `select!`, a specific channel or guard type) outside
+   a code fence is almost always mechanism, as is any timing constant that is
+   not itself a promise to a peer.
+
+Why this matters: design-document review asks "what if X races Y", and the
+tempting answer is to specify a mechanism. Doing that repeatedly accretes an
+implementation the ADR was never meant to hold, and it never converges —
+every closed interleaving exposes the next. Recording the *trap* instead
+converges, because the trap catalog is finite.
 -->
 
 ## Context
@@ -32,6 +61,21 @@ What is the issue motivating this decision? What constraints and forces apply?
 ## Decision
 
 What is the change we are proposing and/or doing?
+
+## Invariants
+
+<!-- Include this section whenever the decision carries invariants — in
+practice, whenever adversarial review has surfaced traps the implementation
+must not fall into. Open it with this note, verbatim and byte-identical
+across ADRs so it stays greppable:
+
+> The invariants below are normative; the mechanisms that satisfy them are
+> deliberately unspecified.
+
+Then list the traps, one or two sentences each, each saying what must hold and
+why it bites. Nothing here may say *how*. The note is the anti-regress device:
+a later review finding that demands a mechanism is answered by pointing at it,
+not by specifying machinery. -->
 
 ## Considered Options
 

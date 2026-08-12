@@ -14,7 +14,7 @@ This decision coordinates timeout mechanisms across the bridge architecture. It 
 - Interaction semantics when multiple timeouts are active
 - State transitions triggered by each timeout
 
-**Phase 1 Timeouts** (implemented now): Initialization (Tier 0), Liveness (Tier 2), Global Shutdown (Tier 3)
+**Phase 1 timeout *tiers*** (implemented now): Initialization (Tier 0), Liveness (Tier 2), Global Shutdown (Tier 3). Non-tier bounds are registered separately below and deliberately excluded from this list.
 
 **Phase 3 Timeout** (future): Per-Request (Tier 1) — only needed for multi-server aggregation
 
@@ -28,7 +28,9 @@ The async bridge architecture defines timeout systems across several decisions:
 4. **Per-Request Timeout** (ls-bridge-server-pool-coordination): Bounds user-facing latency for multi-server aggregation *[Phase 3 only]*
 5. **Per-Slot Control Shutdown Timeout** (bridge-client-control-protocol): Bounds a single-slot `stop`/`restart` (see the dedicated section below)
 6. **Routing Decision Deadline** (bridge-routing-protocol): Bounds one routing decision — provider fan-out, initialization waits, and answer normalization (see the dedicated section below)
-7. **Binding-Reuse Validation Budget** (bridge-routing-protocol): Bounds the *caller's wait* on filesystem revalidation along binding-driven reuse paths — capped by the sweep's remaining budget on re-open sweeps, a dedicated implementation-defined budget on lazy-open/retry paths, and the global shutdown ceiling always. It does not bound the underlying OS call or its worker permit, which may outlive every deadline (the permit returns only when the call does)
+7. **Binding-Reuse Validation Budget** (bridge-routing-protocol): Bounds the *caller's wait* on filesystem revalidation along binding-driven reuse paths — capped by the sweep's remaining budget on re-open sweeps, a dedicated implementation-defined budget on lazy-open/retry paths, and the global shutdown ceiling always. It does not bound the underlying OS call or its worker capacity, which may outlive every deadline (capacity returns only when the call does)
+8. **Per-Downstream Response Cap** (language-server-bridge): A flat 30s bound on each bridge-managed downstream request — excluding control-protocol pass-through, the lifecycle handshake, and routing-provider requests; shipped, and not a tier (see the dedicated section below)
+9. **Inbound Response-Send Bound** (ls-bridge-message-ordering): Bounds how long the reader waits to hand a response to a *downstream-initiated* request onto the wire — 5s-class, capped by the earliest active lifecycle deadline, and on expiry the connection fails by conditional compare-transition from its current state
 
 ### The Problem
 
@@ -46,17 +48,20 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 | Tier | Timeout | Duration | Trigger | Action |
 |------|---------|----------|---------|--------|
 | **0** | Initialization | 30-60s | `initialize` request sent | `Initializing` → `Failed` (pool may spawn replacement) |
-| **2** | Liveness | 30-120s | Ready state + liveness-classified managed pending > 0 (pass-through and routing queries excluded via the same per-entry classification — bridge-client-control-protocol, bridge-routing-protocol; today every pending entry counts) | `Ready` → `Failed` (pool may spawn replacement) |
+| **2** | Liveness | 30-120s | Ready state + liveness-classified managed pending > 0 (pass-through and routing queries excluded via the same per-entry classification — bridge-client-control-protocol, bridge-routing-protocol; today every non-cancelled pending entry counts) | `Ready` → `Failed` (pool may spawn replacement) |
 | **3** | Global Shutdown | 5-15s | Shutdown initiated | SIGTERM → SIGKILL, all → `Closed` |
 
 **State-Based Gating:**
 - **Initialization timeout**: Only during `Initializing` state; disabled on shutdown
 - **Liveness timeout**: Only during `Ready` state with pending requests; disabled on shutdown
-- **Global shutdown**: Overrides all other timeouts (highest priority), including an in-flight per-slot control shutdown deadline (subsumed by `Teardown`)
+- **Global shutdown**: Overrides all other timeout *tiers* (highest priority), and subsumes an in-flight per-slot control shutdown deadline (`Teardown`). It does not cancel a per-downstream response cap already counting — that runs to its own expiry or to connection closure
 
 ### Phase 3 Addition: Per-Request Timeout (Tier 1)
 
-> **Note**: Only needed for multi-server aggregation. In Phase 1, liveness timeout provides sufficient protection.
+> **Note**: Tier 1 is needed only to bound multi-server *aggregation*. An
+> individual downstream wait is already bounded by the per-downstream
+> response cap — not by liveness, which bounds connection silence and can
+> reset indefinitely on unrelated messages.
 
 | Tier | Timeout | Duration | Trigger | Action |
 |------|---------|----------|---------|--------|
@@ -64,13 +69,13 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 
 ### Precedence Rules
 
-**Global shutdown overrides all other timeouts.**
+**Global shutdown overrides all other timeout tiers**, and subsumes the per-slot control shutdown deadline. A per-downstream response cap already counting is not cancelled; routing decisions and queued validation work, by contrast, are resolved and removed at teardown (see their sections below).
 
 | Scenario | Active Timeouts | Behavior |
 |----------|----------------|----------|
-| Normal operation (Phase 1) | Liveness | Reset on activity; `Ready` → `Failed` on timeout |
-| Normal operation (Phase 3) | Liveness, Per-request | Per-request bounds aggregation; Liveness detects hung servers |
-| Shutdown (any state) | Global only | All other timeouts (Init/Liveness/Per-request) STOP; an in-flight per-slot control shutdown is subsumed by the `Teardown` transition, its deadline superseded by the global one; global bounds the termination attempt |
+| Normal operation (Phase 1) | Liveness, per-downstream response cap | Liveness resets on activity, `Ready` → `Failed` on timeout; the cap fails one request without faulting the connection |
+| Normal operation (Phase 3) | Liveness, per-downstream response cap, Per-request (only when n ≥ 2) | Per-request bounds aggregation; the cap still bounds each individual wait, including single-participant requests Tier 1 never engages for; Liveness detects hung servers |
+| Shutdown (any state) | Global, plus any response cap already running | The *tiered* timeouts (Init/Liveness/Per-request) STOP; a per-downstream response cap already counting is not cancelled at initiation and runs to its own expiry or to connection closure, whichever comes first; an in-flight per-slot control shutdown is subsumed by the `Teardown` transition, its deadline superseded by the global one; global bounds the termination attempt |
 | Late response during shutdown | Global | ACCEPT until the connection closes or the deadline expires |
 
 **Key Interactions:**
@@ -88,9 +93,17 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 | **Global Shutdown** | 5-15s | Balance clean exit vs user wait time |
 | **Per-Request** *(Phase 3)* | 2-5s | User-facing latency bound for aggregation |
 
-**Relationships:**
+**Relationships:** precedence comes from **state gating, not duration
+ordering**. Initialization and liveness are mutually exclusive — one applies
+while `Initializing`, the other while `Ready`. Per-request is not exclusive
+with liveness: it bounds an in-flight aggregation on a `Ready` connection, so
+both run at once and each fails what it governs. Global shutdown can begin
+during any of them and overrides all. (An earlier revision stated this as
+`Initialization (60s) > Liveness (30-120s) > Per-request (5s)`, an inequality
+that is false wherever liveness is configured above 60s — which this file's
+own table permits — and duration was never what made the tiers safe.)
 ```
-Initialization (60s) > Liveness (30-120s) > Per-request (5s)
+Initializing → Initialization | Ready → Liveness | in-flight → Per-request
 Global Shutdown overrides all (highest priority)
 ```
 
@@ -151,23 +164,35 @@ Global Shutdown overrides all (highest priority)
   filesystem call is already running keeps its permit until the call
   returns, its result discarded
 
-**Writer-Idle Timeout** (within the applicable shutdown deadline):
-- **Duration**: 2s fixed
-- **Purpose**: Wait for writer loop to finish current operation before taking exclusive stdin access
-- **Scope**: Counts against the applicable shutdown budget — per-slot `stop` or global teardown — not additional time
-- **See**: ls-bridge-graceful-shutdown § Writer Loop Shutdown Synchronization
+**Per-Downstream Response Cap** (**not a tier** — an implementation-state
+bound this hierarchy did not previously register):
+- **Duration**: 30s fixed
+- **Scope**: bridge-managed downstream requests, one wait at a time —
+  **not** control-protocol pass-through, which carries no bridge-imposed
+  timeout by contract (bridge-client-control-protocol); not the lifecycle
+  handshake, which the shutdown deadline bounds; and not routing-provider
+  requests, whose routing deadline is their sole bound
+  (bridge-routing-protocol) and is shorter besides. It is also
+  neither tier: Tier 1 engages only for a multi-server fan-out and is still
+  Phase 3, and Tier 2 resets on any decoded server message, so it bounds
+  *silence* rather than a request
+- **On expiry**: that request alone fails; the connection is not faulted
+- **Precedence**: connection closure and the shutdown deadline both cut it
+  short, so it never extends a teardown
+- **Status**: shipped, and the reason the absence of Tier 1 is not currently
+  observable as an unbounded request
 
 ## Consequences
 
 ### Positive
 
 - **Deterministic behavior**: Clear precedence when multiple timeouts could fire
-- **Bounded shutdown**: Global timeout bounds the termination attempt; a child unconfirmed at the deadline is retained or abandoned per ls-bridge-graceful-shutdown § Unconfirmed termination
+- **Bounded shutdown**: Global timeout bounds the termination attempt; a child unconfirmed at the deadline is retained or abandoned per ls-bridge-graceful-shutdown § Unconfirmed Termination
 - **Hung server detection**: Liveness timeout catches unresponsive servers
 
 ### Negative
 
-- **Multiple concepts**: Three timeout *tiers* in Phase 1 (four in Phase 3), plus the tier-exempt deadlines registered here (per-slot control shutdown, routing decision, binding-reuse validation, writer-idle)
+- **Multiple concepts**: Three timeout *tiers* in Phase 1 (four in Phase 3), plus the tier-exempt deadlines registered here (per-slot control shutdown, routing decision, binding-reuse validation, per-downstream response cap, inbound response-send bound)
 - **Tuning required**: Implementation-defined values need careful selection
 
 ### Neutral

@@ -6,9 +6,44 @@ As recorded, only Phase 1 (bridge infrastructure with working go-to-definition)
 was complete. Per-method coverage has since expanded well beyond this; see
 [docs/README.md](../README.md) for the current list of bridge-backed requests.
 
+Two of this record's original mechanisms are obsolete, in different ways.
+The **unconditional temporary workspace** — every injection written to disk
+— shipped in the legacy redirection implementation
+(`src/lsp/redirection.rs`) and was superseded by the virtual-document model,
+under which materialization is conditional on a server needing a real file
+and the ordinary path is in-memory. The
+**multi-signal readiness detector** never shipped as designed: that
+implementation waited on `publishDiagnostics` alone, bounded by a message
+count rather than a timeout, and never treated progress completion as
+readiness — and the current bridge dropped even that in favour of the
+handshake. The architecture diagram, the eager-spawn diagram, and the
+Phase 1 checklist below still show both. Injection content goes to **virtual document URIs** on the ordinary path
+rather than unconditionally to temporary files
+(language-server-bridge-virtual-document-model, which keeps materialization
+for servers that need a real path), so the `TempFileManager` those diagrams
+name does not exist; and readiness is the
+**LSP handshake**, not a multi-signal indexing detector. § Provisioning Flow
+and § Ready Detection are corrected; the diagrams are left as the historical
+record this file is.
+
+**Crash recovery diverges, and two ADRs disagree about it.** This record
+decides immediate respawn on detecting a dead server. The code instead marks
+the connection `Failed` and respawns on the next acquire, and
+bridge-client-control-protocol states acquire-driven recovery as *its*
+decision — so this is not merely code lagging a decision, it is two
+decisions in conflict. The observable difference bites once the protocols that create
+un-reacquired servers land: a `forceStart`-only policy server with
+`languages = []` (bridge-routing-protocol) would stay down under
+acquire-driven recovery until a reload or an explicit `restart`
+(bridge-client-control-protocol). Neither exists in the code yet, so today
+the divergence is latent — every live connection is reachable by some
+acquire.
+Settling it changes behavior, so it is recorded here rather than decided
+while reorganizing this record.
+
 ## Context
 
-Markdown code blocks and other injection regions (e.g., JavaScript inside HTML `<script>` tags, SQL in string literals) currently only receive Tree-sitter-based features from kakehashi. While Tree-sitter provides excellent syntax highlighting via semantic tokens, injection regions lack access to full LSP capabilities such as:
+*Framing, as of when this decision was taken.* Markdown code blocks and other injection regions (e.g., JavaScript inside HTML `<script>` tags, SQL in string literals) received only Tree-sitter-based features from kakehashi. While Tree-sitter provides excellent syntax highlighting via semantic tokens, injection regions lacked access to full LSP capabilities such as:
 
 - Go-to-definition with cross-file resolution
 - Completion with type information
@@ -74,7 +109,11 @@ These constraints mean bridging is not simply "forward request, return response"
 
 - Servers must be listed in user configuration with explicit `cmd` field
 - No shell expansion or command interpolation in server commands
-- Temp files contain only extracted source code, never executable content
+- Injection content reaches servers as in-memory virtual documents on the
+  ordinary path, so no data-at-rest surface is created for it. A server that
+  requires a real file is served by **materialization**, which
+  language-server-bridge-virtual-document-model decides and scopes; where it
+  applies, the temp-file handling below is the reference
 
 ### Server Connection Pool
 
@@ -147,7 +186,7 @@ Spawning can piggyback on these existing code paths.
 
 - **Spawn on injection detection**: Background spawn when new language injection is found
 - **Reuse**: All subsequent requests use warm connection
-- **Crash recovery**: Detect dead servers (broken pipe, exit code) and respawn immediately
+- **Crash recovery**: Detect dead servers (broken pipe, exit code) and respawn immediately (see § Decision–Implementation Gap — recovery is acquire-driven today, and bridge-client-control-protocol decides otherwise)
 
 ### Server Registry and Configuration
 
@@ -224,7 +263,10 @@ The bridge filtering happens at request time: when a request targets an injectio
 
 #### Multiple Servers Per Language
 
-When multiple servers are configured for the same language (e.g., `pyright` + `ruff` for Python), requests are only routed to servers with the required capability. The routing strategy among capable servers is **implementation-defined**:
+When multiple servers are configured for the same language (e.g., `pyright` + `ruff` for Python), requests are only routed to servers with the required capability. The routing strategy among capable servers is decided by
+cross-layer-aggregation and aggregation-priorities-wildcard — `preferred`
+and `concatenated`, selected by a priority-ordered allowlist. The options
+weighed when this record was written, retained for their trade-offs:
 
 | Strategy | Description | Trade-off |
 |----------|-------------|-----------|
@@ -251,6 +293,13 @@ This separation allows:
 - **Per-host filtering**: Each host language can selectively enable/disable bridging via `bridge` field
 
 ### Temporary File Management
+
+> **No longer the default path, and no longer unconditional.** Injection
+> content is not written to disk on the ordinary path; virtual documents are
+> logical. This section remains the reference for **materialized**
+> documents, which language-server-bridge-virtual-document-model still
+> provides for and refers back to here — so read it as scoped to that case,
+> not as a requirement for every injection.
 
 Injection content must be written to disk for servers that require real files.
 
@@ -288,6 +337,13 @@ Example:
 Startup cleanup handles crash recovery: scan `{temp_dir}/kakehashi/` and remove directories older than 24 hours.
 
 ### Workspace Provisioning
+
+> **Scoped to materialized documents.** The *problem* is real and still
+> shapes the design: servers differ in what project context they need. The
+> temp-path handling below applies where
+> language-server-bridge-virtual-document-model calls for materialization —
+> it cites this section for exactly that — and not to the ordinary in-memory
+> path.
 
 Different language servers have different project structure requirements:
 
@@ -345,64 +401,73 @@ kakehashi configuration points rust-analyzer to this file:
 
 #### Provisioning Flow
 
-1. Create temporary file with injection content using deterministic path
-2. Initialize server with user-provided `initializationOptions`
-3. Send `didOpen` notification
-4. Wait for ready signal (see below)
-5. Clean up temp files on document close or shutdown
+This record's original provisioning design is obsolete: its
+unconditional temp-file half shipped once and was superseded by conditional
+materialization, and its multi-signal readiness half never
+shipped as designed. The sections above still describe the world they
+assumed — see § Decision–Implementation Gap.
+
+1. Initialize the server with user-provided `initializationOptions`.
+2. Complete the **LSP handshake** — the initialize response processed and
+   `initialized` sent — and only then treat the connection as ready. No
+   document notification may precede this (ls-bridge-message-ordering), and
+   there is no indexing detector beyond it.
+3. Mint a **virtual document URI** for the injection region and send its
+   current in-memory content in `didOpen`. On this path nothing is written to
+   disk and nothing needs cleaning up beyond the `didClose`.
+   language-server-bridge-virtual-document-model carries the decision, and
+   also decides when a server needing a real path on disk gets a
+   **materialized** document instead — that case routes through
+   § Temporary File Management and § Workspace Provisioning below.
 
 #### Ready Detection
 
-Detecting when a server has finished indexing and is ready for queries:
-
-| Method | Reliability | Timeout |
-|--------|-------------|---------|
-| `publishDiagnostics` received | Medium (some servers don't send for valid code) | 5s |
-| `window/workDoneProgress` completion | High (when supported) | 10s |
-| Configurable delay | Low (guessing) | N/A |
-| Timeout fallback | Always | 5s default |
-
-Implementation uses a multi-signal approach:
-1. Start timeout timer (configurable, default 5s)
-2. Listen for `publishDiagnostics` or `workDoneProgress/end`
-3. Mark ready on first signal OR timeout expiration
-4. Log warning if timeout was hit (suggests misconfiguration)
+A server is ready when its handshake completes, and not by any later signal.
+The original design instead tried to detect *indexing* completion by waiting
+on `publishDiagnostics`, `window/workDoneProgress` end, or a timeout
+fallback. Only the first ever shipped, in the legacy redirection
+implementation and bounded by a message count rather than a clock; the rest
+was rejected in practice: the signals are per-server
+unreliable (many servers publish no diagnostics for valid code), and a
+readiness gate built on them delays every first request by a timeout
+whenever the guess is wrong. Requests instead go out as soon as the
+handshake completes, bounded as described below.
 
 ### Async Communication and Error Handling
 
-Language server communication uses synchronous stdio which blocks the thread. In kakehashi's async runtime (tokio), this requires `spawn_blocking` to avoid stalling other tasks.
+A bridged request never waits on a downstream server indefinitely: a server
+error and an expired wait each log a warning and yield no result *from that
+server*, so a hung server costs one timeout, never a stalled handler.
 
-```rust
-let result = tokio::time::timeout(
-    Duration::from_secs(request_timeout_secs),
-    tokio::task::spawn_blocking(move || {
-        let conn = pool.get_connection("rust")?;
-        conn.request(method, params)
-    })
-).await;
+Whether that becomes a failed host request depends on the aggregation
+strategy, and is cross-layer-aggregation's and
+ls-bridge-server-pool-coordination's subject rather than this one's. In
+outline: a `preferred` fan-in falls through to the next candidate and only
+surfaces an error when nothing answered; a `concatenated` aggregation fails
+if a layer it required fails; and a fan-out whose downstreams all fail
+answers `REQUEST_FAILED`. Degradation is per-server, not per-request. What bounds the wait, today, is a fixed 30-second cap on each
+bridge-managed downstream request — not on control-protocol pass-through,
+which by contract carries no bridge-imposed timeout, and not on
+routing-provider requests, whose routing deadline is their sole bound. It is not either of the named tiers: Tier 1 — the per-request
+aggregation timeout that engages only for a multi-server fan-out — is still
+Phase 3, and Tier 2 is a connection-*health* monitor that resets on any
+decoded server message, so it bounds silence rather than any one request.
+ls-bridge-timeout-hierarchy owns those tiers and the requests deliberately
+exempt from them. The lifecycle handshake is exempt in the other direction:
+the `shutdown` request's response wait is bounded by the shutdown deadline,
+not by any request timeout.
 
-match result {
-    Ok(Ok(response)) => response,
-    Ok(Err(e)) => {
-        // Server error (e.g., invalid request)
-        log::warn!("Bridge request failed: {}", e);
-        None
-    }
-    Err(_) => {
-        // Timeout - server may be hung
-        log::warn!("Bridge request timed out after {}s", request_timeout_secs);
-        None
-    }
-}
-```
+Communication is **pure async** — no blocking stdio, and no OS thread per
+connection. ls-bridge-async-connection carries that decision, its reader and
+writer task patterns, and the timeout tiers this bound sits in.
 
 #### Error Handling Strategy
 
 | Error Type | Detection | Recovery |
 |------------|-----------|----------|
-| Server crash | Broken pipe on read/write | Mark connection dead, respawn immediately |
-| Request timeout | `tokio::time::timeout` | Return `None`, log warning |
-| Malformed response | JSON parse error | Return `None`, log error |
+| Server crash | Broken pipe on read/write | Mark connection dead, respawn immediately (see § Decision–Implementation Gap) |
+| Request timeout | Response wait expires | Return `None`, log warning |
+| Malformed response | JSON decode failure on the wire | Connection-fatal: every pending request fails and the connection reports `Failed` |
 | Server busy | No response within timeout | Return `None`, consider increasing timeout |
 
 Cancellation: When the user moves the cursor before a response arrives, the LSP client typically sends a new request. kakehashi should:
@@ -473,8 +538,13 @@ Translation is straightforward for positions within a single injection. See lang
 
 ### Phase 1: Infrastructure (Complete)
 
+> **Historical ledger, not a status report.** It records what was done at the
+> time of writing, including the temporary-file approach later superseded by
+> virtual documents, and it predates the pooling and crash recovery that have
+> since shipped. See § Decision–Implementation Gap.
+
 - [x] Basic LSP client implementation
-- [x] Temporary source file creation
+- [x] Temporary source file creation (superseded by virtual documents)
 - [x] Offset translation
 - [x] Go-to-definition working
 - [x] `languageServers` configuration at root level (PBI-119)

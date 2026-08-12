@@ -63,10 +63,9 @@ A thin bridge that forwards requests and relies on client-driven cancellation:
 │  ┌──────────────────────────────────────────────────┐    │
 │  │           Unified Order Queue (FIFO)             │    │
 │  │  Bounded admission threshold (4096; 256 caused   │    │
-│  │  routine fan-out loss) — see § Non-Blocking      │    │
-│  │  Backpressure for the full allocation bound      │    │
+│  │  routine fan-out loss)                           │    │
 │  │  - Ensures FIFO ordering                         │    │
-│  │  - Non-blocking backpressure (try_send)          │    │
+│  │  - Non-blocking backpressure                     │    │
 │  └─────────────────┬────────────────────────────────┘    │
 │                    │                                     │
 │                    ▼                                     │
@@ -151,7 +150,28 @@ The bridge tracks pending requests for response correlation only:
 
 ### 3. Non-Blocking Backpressure
 
-The bounded order queue (admission threshold: 4096 — raised from the original 256, which caused routine fan-out loss) uses `try_send()` to prevent deadlocks during slow initialization. The full allocation bound is admission threshold + the pre-ready holding queue's bound + response headroom. Response headroom serves **downstream-initiated** requests (which the response router deliberately does not track), so it is bounded by reservation, not by the router: **admitting an inbound server request reserves the wire slot its response will use**, making the inbound registry bounded by the reservation pool rather than unbounded; when no slot is reservable the request is answered via a dedicated always-reserved error slot with `RequestFailed`, and **the reader admits no further inbound request while that error slot is occupied** — inbound admission serializes on the slot's drain. That wait is **bounded and shutdown-aware**: a paused reader plus a writer blocked on the server's stdin is exactly the full-duplex pipe deadlock this ADR already guards against. The deadline is the existing 5-second-class response-send bound, capped by the earliest active lifecycle deadline; on expiry the connection fails via **conditional compare-transition from its current state** — `Initializing → Failed` (the path is reachable during initialization through permitted `window/showMessageRequest` traffic) or `Ready → Failed`, while a shutdown that already won keeps `Closing`/`Closed`. Within the bound, overflow applies pipe backpressure to the downstream instead of ever dropping silently. The memory bound is testable as the sum of the three.
+The order queue is bounded and admission never blocks, so a slow or
+initializing server cannot deadlock a producer. **Admission threshold: 4096**
+— raised from the original 256, which caused routine fan-out loss. Held and
+reserved traffic count toward that depth, so **while the combined depth sits
+above the threshold, admission stays closed until the writer drains below
+it** — the threshold governs when a producer is refused, not merely how much
+is allocated. The queue's memory bound is testable and covers responses as
+well as outbound traffic.
+
+Responses to **downstream-initiated** requests are the delicate case, because
+the response router deliberately does not track them. So an inbound server
+request is either admitted with room for its answer already accounted for, or
+**answered up front with `RequestFailed`** rather than accepted — never
+accepted and then dropped for want of room. A refusal serializes inbound admission behind its own
+sending, and that wait is **bounded and shutdown-aware**: the deadline is the
+existing 5-second-class response-send bound, capped by the earliest active
+lifecycle deadline. On expiry the connection fails via **conditional
+compare-transition from its current state** — `Initializing → Failed` (the
+path is reachable during initialization through permitted
+`window/showMessageRequest` traffic) or `Ready → Failed`, while a shutdown
+that already won keeps `Closing`/`Closed`. Within the bound, overflow applies
+pipe backpressure to the downstream instead of ever dropping silently.
 
 **Strategy by Operation Type:**
 
@@ -265,55 +285,43 @@ Operations are gated at two levels: **server lifecycle** and **document lifecycl
   - `Closed` → `REQUEST_FAILED` ("bridge: connection closed")
 - **Notifications**: Accepted by writer loop in `Initializing` or `Ready` state only
   - **Target semantics, adopted with bridge-client-control-protocol**
-    (the current implementation is a single bounded mpsc feeding the
-    writer; this mechanism is required before that protocol's
-    pass-through ships): during `Initializing`, accepted notifications
-    enter a **pre-ready holding queue**, separate from the wire FIFO — a strict single FIFO
-    could not reorder traffic accepted before the initialize response
-    behind the later `initialized`. Only handshake-owned traffic reaches
-    the wire until `initialized` has been written, with exactly two
-    exemptions, categorized separately: the **conforming exception** —
-    responses to `window/showMessageRequest`, the one server-initiated
-    request LSP permits before the initialize response, travel the wire
-    FIFO immediately because withholding them could deadlock the
-    handshake — and a **tolerated extension**: a
-    `window/workDoneProgress/create` in this window is a nonconforming
-    server, which the bridge nevertheless answers (logged) since
-    refusing could wedge initialization. The `initialized` enqueue, the
-    holding-queue transfer into the FIFO (arrival order), and the
-    admission cutover happen under **one exclusion**: `Flushing` is
-    **lock-private and non-suspending** — the interior of the
-    `Initializing → Ready` commit's critical section, not an observable
-    `ConnectionState` value — so shutdown, initialization-timeout, and
-    writer-failure arbitration still race only the existing conditional
-    `Initializing → Closing/Failed` transitions, and a commit that loses
-    that race never publishes `Ready` or flushes. A producer that
-    observes `Ready` can never enter the FIFO ahead of older held
-    notifications (bridge-client-control-protocol). Capacity semantics:
-    **4096 is the admission threshold, not the allocation** — the FIFO's
-    memory bound is the admission threshold plus the holding queue's
-    bound plus headroom for loss-intolerant responses, and the splice
-    consumes capacity reserved at hold time, so it can neither be
-    refused nor exceed allocation, and never drives a failure; while the
-    combined depth sits above the admission threshold, admission stays
-    closed until the writer drains below it. What may legally enter the
-    hold is narrow: **document lifecycle notifications keep their
-    Ready-only gating and are never held** (they arrive via the
-    post-Ready derived open paths — flushing a held `didChange` ahead of
-    the derived `didOpen` would violate the document lifecycle), and
-    state-replacement notifications (`workspace/didChangeConfiguration`)
-    are not held either — the pool retains current settings and pushes
-    the latest value after `initialized` ("latest" within
-    downstream-settings-propagation's accepted race: a reload landing
-    mid-handshake may push the previous revision, converging on the
-    next propagation), and holding stale copies would invert
-    latest-value semantics; `$/setTrace` has the same latest-value shape
-    and follows the same policy — coalesced-to-latest, pushed
-    post-`initialized`, same accepted race, never held. With document sync Ready-gated and
-    every latest-value method coalesced, **no currently specified method
-    is admissible to the hold** — it is expected empty and exists as the
-    structural safety net for future sequence-dependent, non-document
-    notifications; its bound (4096) backs that safety net, with
+    (required before that protocol's pass-through ships): during
+    `Initializing`, accepted notifications are **held** rather than
+    written, and only handshake-owned traffic reaches the wire until
+    `initialized` has been written — a strict single FIFO could not
+    reorder traffic accepted before the initialize response behind the
+    later `initialized`. Exactly two exemptions, categorized separately:
+    the **conforming exception** — responses to
+    `window/showMessageRequest`, the one server-initiated request LSP
+    permits before the initialize response, go to the wire immediately,
+    because withholding them could deadlock the handshake — and a
+    **tolerated extension**: a `window/workDoneProgress/create` in this
+    window is a nonconforming server, which the bridge nevertheless
+    answers (logged), since refusing could wedge initialization.
+
+    Held notifications release in arrival order when the connection
+    becomes `Ready`, and that release can neither be refused nor fail
+    (§ Invariants). The hold introduces **no observable state**: a
+    connection reads `Initializing` until it reads `Ready`, with nothing
+    between, so no `flushing`-like status ever appears in the
+    ConnectionState enum or in the client enumeration
+    (bridge-client-control-protocol). What may legally enter the hold is narrow.
+    **Document lifecycle notifications keep their Ready-only gating and
+    are never held**: they arrive via the post-Ready derived open paths,
+    and releasing a held `didChange` ahead of the derived `didOpen`
+    would violate the document lifecycle. **State-replacement
+    notifications are not held either.** The pool retains current
+    settings and pushes the latest value after `initialized` ("latest"
+    within downstream-settings-propagation's accepted race: a reload
+    landing mid-handshake may push the previous revision, converging on
+    the next propagation) — holding stale copies would invert
+    latest-value semantics. `workspace/didChangeConfiguration` and
+    `$/setTrace` both have that shape and both follow that policy:
+    coalesced to latest, pushed post-`initialized`, never held. With
+    document sync Ready-gated and every latest-value method coalesced,
+    **no currently specified method is admissible to the hold** — it is
+    expected empty, and exists as the structural safety net for future
+    sequence-dependent, non-document notifications. It is bounded, with
     drop-newest-and-warn overflow
   - `Closing`/`Closed` → DROP (writer loop stopped, see ls-bridge-graceful-shutdown)
   - Subject to document lifecycle gating below
@@ -375,7 +383,7 @@ standard choice: they either:
 Writer loop panics use fail-fast pattern (not restart) because `ChildStdin` cannot be cloned.
 
 **Strategy:**
-- Panic caught, all pending operations failed with INTERNAL_ERROR
+- Panic caught, all pending operations failed with INTERNAL_ERROR — except a request already cancelled while queued, which keeps `REQUEST_CANCELLED` (§ Cancellation Forwarding)
 - Connection state transitions to `Failed`
 - No restart attempt (stdin consumed, restart creates silent permanent hang)
 - Connection pool spawns new server instance with fresh stdin
@@ -396,10 +404,10 @@ Writer loop panics use fail-fast pattern (not restart) because `ChildStdin` cann
 **Cross-Task Panic Propagation:**
 When the writer task panics, the reader task must also exit to prevent CPU spin on orphaned channels:
 - Use a shared `CancellationToken` (e.g., `tokio_util::sync::CancellationToken`)
-- Writer panic handler: (1) fail pending with `INTERNAL_ERROR`, (2) cancel token, (3) transition state
+- Writer panic handler: (1) fail pending with `INTERNAL_ERROR` (queued-cancelled entries keep `REQUEST_CANCELLED`), (2) cancel token, (3) transition state
 - Reader task includes `token.cancelled()` in its `select!` loop
 - Reader exits when token is cancelled, allowing connection respawn
-- **LSP guarantee**: All pending requests receive `INTERNAL_ERROR` response before reader exits
+- **LSP guarantee**: Every pending request receives a terminal response before the reader exits — `INTERNAL_ERROR`, or `REQUEST_CANCELLED` where that was already its outcome
 
 ```rust
 // Reader task select! loop
@@ -416,6 +424,58 @@ loses a consumed header and resyncs onto the next message body — reporting a
 framing error against a well-framed stream. See
 `BridgeReader::read_message_bytes`, which keeps that progress in the reader and
 awaits only cancel-safe primitives.
+
+## Invariants
+
+> The invariants below are normative; the mechanisms that satisfy them are
+> deliberately unspecified.
+
+**The wire**
+
+- **At most one task writes a connection's wire at any instant.** Interleaved frames
+  corrupt the JSON-RPC stream unrecoverably, and a corrupted stream is not
+  something a peer can resynchronize from — this is why a panicked writer
+  respawns the connection instead of being restarted (Alternative 3).
+- **A paused reader plus a writer blocked on the server's stdin is a
+  full-duplex pipe deadlock.** Anything that stops the reader — including
+  waiting for a refusal to be sent — must therefore be bounded and
+  shutdown-aware.
+
+**Admission**
+
+- **Admission control must never lose a message the bridge already committed
+  to send.** For downstream-initiated requests that means one of two things
+  happens and there is no third: the request is answered with `RequestFailed`
+  instead of being accepted, or it is accepted and remains answerable.
+  Accepting and then discovering there is no room for the answer leaves the
+  server waiting forever.
+- **Releasing held traffic cannot be refusable.** Its capacity is accounted
+  when it is held, not when it is released; a release that can fail turns a
+  bounded queue into silent notification loss at the one moment the
+  connection is most fragile.
+
+**The `Initializing` boundary**
+
+- **Every transition out of `Initializing` commits conditionally.** Handshake
+  success, initialization timeout, writer failure, and shutdown can all fire
+  independently; whichever commits first must win permanently, or a
+  connection that already lost the race writes on behalf of a teardown in
+  progress.
+- **Publishing `Ready`, enqueueing `initialized`, and releasing held
+  notifications are one atomic act.** Split them and a handshake that lost
+  the race still flushes, or a producer that observed `Ready` reaches the
+  wire ahead of older held notifications — reordering exactly the traffic the
+  hold exists to keep in order.
+- **Until the server has answered `initialize`, LSP forbids the client every
+  further request and notification.** Only handshake-owned traffic and the
+  two recorded exemptions may reach the wire in that window.
+
+**Documents**
+
+- **Ordering `didOpen` first is not enough; it must also carry the current
+  snapshot.** The ordering itself is contract (§ Document Lifecycle Gating);
+  the trap is that a correctly-ordered `didOpen` built from content captured
+  earlier desynchronizes the document for as long as it stays open.
 
 ## Consequences
 
@@ -472,6 +532,21 @@ awaits only cancel-safe primitives.
 **Backward Compatibility:**
 - External LSP interface unchanged
 - Internal refactor only
+
+## Decision–Implementation Gap
+
+- **Inbound admission is neither reserved nor refused.** § Non-Blocking
+  Backpressure decides that a downstream-initiated request is admitted with
+  room for its answer accounted for, or answered up front with
+  `RequestFailed`. Today the reader simply attempts the response send with a
+  five-second bound and, on expiry, warns and drops it — so the server is
+  left waiting on a request the bridge accepted, which is the outcome that
+  decision exists to prevent. The bounded wait also does not fail the
+  connection as specified.
+- **The pre-ready hold does not exist.** Notifications accepted during
+  `Initializing` go to the single writer queue; there is no separate hold and
+  no release at the `Ready` commit. This is target state adopted with
+  bridge-client-control-protocol, as § Operation Gating notes.
 
 ## Alternatives Considered
 
@@ -583,3 +658,4 @@ The current design rejects requests with `REQUEST_FAILED` during initialization.
 
 - **2026-01-06**: Merged Amendment 001 - Completed state machine with all transitions, panic handler implementation requirements, and error code corrections
 - **2026-01-06**: Merged Amendment 002 - Added comprehensive notification drop telemetry and state re-synchronization metadata to prevent silent data loss
+- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - deleted the allocation arithmetic, the inbound response-slot reservation pool, and the lock-private `Flushing` phase, and added an Invariants section recording the ordering traps they closed. The admission threshold and the pre-ready hold's admissibility rules are unchanged. Two wire-visible rules were lost in that first pass and restored on review: that admission stays closed while the combined depth sits above the threshold, and that the flush phase is not an observable connection state

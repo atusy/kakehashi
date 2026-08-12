@@ -240,14 +240,14 @@ override's first element, checked after the truncation below. If either is
 stopped, the answer's entry for that server is discarded (the
 configuration-resolved stop wins; a provider cannot steer a document
 around a user's pin by naming a different root). Both checks run
-**inside the acquire's own critical section**, never as a separate
+**atomically with the acquire's own commit**, never as a separate
 look-then-admit, which a concurrently committing `stop` could slip
 between (suppression entries carry no key and skip the stopped check
 entirely — a suppression cannot steer around a stop, and deriving a
 key to check would cost a marker walk; their admission section
 revalidates generation and candidacy only) — and the binding retains **both** keys, so
 every later binding-driven acquire (the lazy open, the re-open sweep)
-re-checks both in its own critical section: a key stopped after
+re-checks both, atomically with its own commit: a key stopped after
 admission makes the bound route not applicable, exactly as ordinary
 resolution against a stopped key opens nothing. For a shared-instance
 server the two keys are the same root-independent
@@ -530,7 +530,7 @@ candidates at all likewise queries nothing.
   launch **concurrently** onto the pool — concurrency removes serial
   dependency between entries; capacity can still gate them, per the
   caveat below. Admission is an online **priority queue**, not
-  arrival-order FIFO: among jobs simultaneously awaiting a permit, the
+  arrival-order FIFO: among jobs simultaneously awaiting capacity, the
   canonical key (the answering provider's priority-walk position, then
   server name, then provider name as the total tie-breaker within a
   `"*"` group) decides who is admitted next — a later-arriving
@@ -556,7 +556,7 @@ candidates at all likewise queries nothing.
   entry-by-entry — and the non-starvation
   claim is scoped honestly: concurrency removes *serial* dependency
   between entries, while pool *capacity* can still gate them (a hung
-  validation retains its permit), in which case entries denied
+  validation still holds its capacity), in which case entries denied
   capacity within budget drop per the capacity rule. Within
   normalization, whole-answer discard is reserved for an answer that
   never arrived, never deserialized, or failed the structural bounds
@@ -663,21 +663,19 @@ structures with different lifetimes carry the outcome:
   the single-flight future and its deadline clock — is created
   **atomically with the pending record**, so an observer of a pending
   entry always has a future to await and a remaining budget to inherit.
-  The flight is driven by a **dedicated driver task** spawned with it;
-  every other party — the open tasks, the lazy open, the re-open sweep —
-  is a passive subscriber, so an observer polling the future can never
-  be the one to initiate provider I/O (in particular, the query-free
-  sweep guarantee cannot be broken by the sweep merely awaiting a
-  pending binding). Every server's
+  **Awaiting a decision never makes the awaiter the one to drive it**:
+  the open tasks, the lazy open, and the re-open sweep are all
+  subscribers, so an observer can never initiate provider I/O — in
+  particular, the sweep's query-free guarantee cannot be broken by the
+  sweep merely awaiting a pending binding. Every server's
   entry then reaches a **terminal settlement or terminal deletion**
   (deletion is logged with per-server provenance like any settlement),
   so waiters never hang:
   *suppressed* settles when the answer applies — no acquire runs, but
-  the settlement still commits inside a **route-admission critical
-  section** under the same pool lock the acquires use, where the
-  config-generation revalidation and the current-candidacy re-screen
-  run atomically with the commit (a stale suppression is never applied
-  across a reload either). Suppression admission deliberately runs
+  the settlement still commits **atomically with its own
+  config-generation revalidation and current-candidacy re-screen**, so
+  a stale suppression is never applied across a reload
+  either. Suppression admission deliberately runs
   **no stopped-key check**: a suppression cannot resurrect or steer
   around a `stop` — it only subtracts, and a stopped slot stays dark
   either way — and deriving the key just to check it would cost a
@@ -692,28 +690,19 @@ structures with different lifetimes carry the outcome:
   which — waiters proceed without the
   server, and later opens retry the retained key through the ordinary
   respawn path rather than falling through to a different resolution.
-  Retries are **single-flight per entry**: a retry claims the entry
-  under the admission lock with a **unique claim token fenced by the
-  open incarnation** (a byte-identical retained value recreated by a
-  close/re-open can never satisfy an old claimant's commit — the token
-  and incarnation must both match), concurrent would-be retriers await
-  and consume the claimant's published outcome under their own
-  budgets, and a commit whose token or incarnation moved writes
-  nothing — a late failed retry can never regress a `routed` entry.
-  The claim does not change what consumers see: the entry remains
-  observably *retained* (its key and folders keep answering
-  enumeration, the sweep, and lazy lookups), with the claim token as
-  bookkeeping beside it. The claim is covered by the same pool-owned
-  completion guard as every detached routing task: any exit short of a
-  commit — cancellation, validation timeout, panic, teardown —
-  restores plain *retained* **through the same token-and-incarnation
-  CAS the claimant would use**: on a match it restores and publishes;
-  on a mismatch (the entry moved — close/re-open, eviction, another
-  transition) it leaves the current state untouched and publishes a
-  typed **superseded** outcome to the old claim's waiters, who must
-  revalidate their own incarnation and binding identity before acting
-  — an old-incarnation waiter never consumes a successor binding.
-  Either way a dead claimant can never park later retriers or
+  Retries are **single-flight per entry**: one retrier claims the
+  entry, concurrent would-be retriers await and consume its published
+  outcome under their own budgets, and a claim that is no longer the
+  entry's current one commits nothing — so a late failed retry can
+  never regress a `routed` entry. The claim is invisible to consumers:
+  the entry remains observably *retained*, its key and folders still
+  answering enumeration, the sweep, and lazy lookups. Any exit short of
+  a commit — cancellation, validation timeout, panic, teardown —
+  restores plain *retained* if the claim is still current, and
+  otherwise leaves the successor untouched and publishes a typed
+  **superseded** outcome to the old claim's waiters, who must
+  revalidate their own incarnation and binding identity before acting.
+  Either way a dead claimant can neither park later retriers nor
   overwrite a successor's state. A
   successful retry transitions the entry to *routed* with the key the
   acquire actually landed on; a failed retry re-records
@@ -753,10 +742,9 @@ structures with different lifetimes carry the outcome:
   ends with no answer settles the same way — every settled entry
   carries a key, a suppression, or a not-applicable, so a lazy waiter
   can never resolve a different key than the eager open landed on, and
-  no entry stays pending forever. Every settlement write is a
-  **compare-and-set against the exact pending (incarnation, flight) it
-  settles**: a task outlived by a close/re-open finds the new
-  incarnation's record and writes nothing. A lazy request-path open that finds a *pending* entry
+  no entry stays pending forever. Every settlement is **conditional on
+  the exact pending decision it settles**: a task outlived by a
+  close/re-open writes nothing. A lazy request-path open that finds a *pending* entry
   awaits its settlement (bounded by the decision's remaining deadline)
   instead of default-opening — without that, a hover-class request
   racing the decision window could open the document on a server the
@@ -860,9 +848,9 @@ Decision-cache lifecycle:
   candidate set are built from that generation, so a reload landing
   before dispatch invalidates the flight rather than blessing a stale
   projection with a fresh generation; only the flush-epoch anchor is
-  captured at **provider enumeration** — one pool critical section
-  shared by the epoch read and the handle walk, run by every flight
-  including one that selects nobody — so provider-set churn before
+  captured at **provider enumeration**, where the epoch read and the
+  provider walk are **one atomic observation** (run by every flight,
+  including one that selects nobody) — so provider-set churn before
   enumeration folds into the selection instead of invalidating a
   flight that never dispatched, and a provider cannot commit `Ready`
   between the read and the walk and land selected-under-E+1 while the
@@ -894,15 +882,13 @@ Decision-cache lifecycle:
     — so a flight re-anchors only when each advance since its anchor is
     a recorded Ready transition of a handle its subscription covers;
     any other cause, another provider's arrival or a workspace-folder
-    change, discards as usual. The bookkeeping is a **bounded cause ring**, not
-    a log and not a per-flush walk: the epoch-bumping critical section
-    appends one (epoch, cause, handle) record in O(1) — never touching
-    the live flights, whose count scales with open documents — and a
-    flight re-anchors by reading only the causes in its own anchor gap,
-    under the same lock that registers, re-anchors, and settles
-    flights. The ring's capacity is an implementation-defined small
-    constant; a flight whose gap has overflowed the ring — or whose
-    provenance is missing for any reason — discards, never re-anchors;
+    change, discards as usual. Cause provenance is **bounded**,
+    retained only for a recent window of epochs and never as a log, and
+    it costs nothing per live flight: a flight consults only the causes
+    in its own anchor gap. The discipline that makes such a bound safe
+    is the default — a flight whose gap reaches past the retained
+    window, or whose provenance is missing for any reason, **discards,
+    never re-anchors**;
   - an **incarnation** move (`didClose`, or close/re-open — for a
     virtual document, its own close when its last region leaves)
     **aborts**
@@ -911,11 +897,11 @@ Decision-cache lifecycle:
     (each virtual document carries its own, and the fence moves only
     when that document actually closes — for a combined document, when
     its last capture leaves; one capture's removal amid surviving
-    siblings moves nothing). The enqueue
-    registration and the document's eviction/close share **one
-    lifecycle critical section** — an old task cannot validate, lose the lock to
-    a cleanup that evicts and closes everything, and then register a
-    ghost open. So a stale task can never open a closed document or a
+    siblings moves nothing). **Enqueue
+    registration and the document's eviction/close are mutually
+    exclusive**, so an old task cannot validate, be overtaken by a
+    cleanup that evicts and closes everything, and then register a
+    ghost open. A stale task can never open a closed document or a
     removed region. The `didOpen` **payload** is likewise re-read at
     the enqueue commit: the task sends the document's *current* text,
     never a snapshot captured before the routing await — the deadline
@@ -934,8 +920,8 @@ Decision-cache lifecycle:
   neither a flush (which changes no generation) nor a re-open (which
   changes neither).
 - **Generation revalidation at apply time**: the acquire path
-  additionally re-reads the current config generation inside its
-  critical section and compares it to the answer's; on mismatch the
+  additionally re-reads the current config generation, atomically with
+  its own commit, and compares it to the answer's; on mismatch the
   answer is discarded and the acquire proceeds by kakehashi's own rules
   (fail-open). A stale answer is never applied across a reload.
 
@@ -980,8 +966,8 @@ ordinary marker resolution an override entry needs to construct its
 trust anchor and its configuration-resolved stopped key (marker walks
 make synchronous metadata calls that a network or automounted path can
 stall) — runs off the async executor on a **globally bounded validation
-pool** (a semaphore with a
-bounded queue), charged against the caller's remaining budget; at the
+pool** with a bounded
+backlog, charged against the caller's remaining budget; at the
 deadline the affected entry drops (per-entry, as normalization defines)
 and the orphaned blocking call's result
 is discarded — the *decision's* latency stays bounded even where an OS
@@ -996,12 +982,12 @@ in ls-bridge-timeout-hierarchy) — and "exceeded" splits by caller: a
 lazy or retry attempt skips the server for that attempt, warned; the
 **sweep** reports the host **applicable-but-unsettled** — the barrier's
 fail-soft path — never a successful omission, because a bound key that
-merely timed out validating is uncertainty, not non-membership. Permit
-ownership makes the pool bound real: the semaphore permit travels
-**into** the blocking task and is released only when the OS call
-returns — a timed-out *waiter* abandoning the call must not free
-capacity for the next caller to hang another worker — so permanently
-hung calls can exhaust the pool for unrelated providers. That is the
+merely timed out validating is uncertainty, not non-membership. Capacity is held by the
+**call**, not by the waiter: a caller that gives up on a blocking call
+does not return its capacity, because the call is still running and
+freeing capacity for the next caller would simply hang another worker.
+The bound is therefore real, and the price of it being real is that
+permanently hung calls can exhaust the pool for unrelated providers. That is the
 recorded failure mode, and its effects are the contract's, not a
 blanket fail-open: a new decision's *folder-bearing* entries fail open
 (root overrides need validation), while suppression-only entries need
@@ -1019,8 +1005,8 @@ decision's settlement — a hung losing provider can never pin an entry
 indefinitely, and a late answer always finds its entry gone. The same
 terminal outcomes also **remove the decision's queued validation jobs**
 and discard their waiters and eventual results; only an
-uninterruptible filesystem call already running stays detached, with
-its permit, until it returns. The
+uninterruptible filesystem call already running stays detached, still holding
+its capacity, until it returns. The
 driver and the per-server open tasks are additionally covered by a
 **pool-owned completion guard** of the same class the control protocol
 requires for its detached operations, with the two roles split. An
@@ -1033,8 +1019,8 @@ abnormal exit of one **open task** finalizes only that task's own
 (incarnation, flight, server) *entry*, never discarding a
 still-running or already-decided shared flight. Entry finalization is
 by the stage the dead task reached, and it commits **through the same
-route-admission critical section as the live path** — the locked
-candidacy and generation checks always, the both-key stopped check for
+route-admission path as the live one** — the candidacy and generation
+checks, atomically with the commit, always, the both-key stopped check for
 route entries (suppressions skip it, as on the live path), so an
 abnormal exit cannot grandfather a directive a reload or `stop` has
 since rejected: a decided suppression commits as *suppressed*; a
@@ -1197,6 +1183,87 @@ a `_`-level `languages = ["*"]` cannot pull the policy server back into
 candidacy. A server that is *both* a document server and a provider can
 still suppress itself per document with `enabled: false`; its policy
 channel is unaffected (document-independent traffic, above).
+
+## Invariants
+
+> The invariants below are normative; the mechanisms that satisfy them are
+> deliberately unspecified.
+
+Routing lets an outside party influence where a document is analyzed, under
+a deadline, against state that keeps moving underneath. Almost every trap here is a variant of one question: *is the thing I
+validated still the thing I am about to act on?*
+
+**Identity across a re-open**
+
+- **A byte-identical value recreated by a close/re-open is a different
+  thing.** Identity comparisons in this protocol therefore cannot rest on
+  value equality — an old claimant, waiter, or resolve envelope must be
+  unable to act on a successor that merely looks the same.
+- **A task outlived by a close, a re-open, or an eviction must write
+  nothing**, and a waiter released by a superseded outcome must revalidate
+  before acting. Neither can tell from the value alone that the world moved
+  under it.
+- **A stale resolve must fail soft, not resolve through a successor.** After
+  a close/re-open the same URI holds a *new* binding, so an item carrying no
+  more than its URI would silently resolve through it — reaching a process
+  that never produced the item. (What the envelope carries to prevent that is
+  contract; see § The Query Point.)
+
+**Validate and act, atomically**
+
+- **Screening and admitting must be one act.** A candidacy re-screen, a
+  config-generation revalidation, and a stopped-key check are worthless if
+  a concurrently committing `stop` or reload can land between the check and
+  the commit — which is exactly what would make `stop` advisory against a
+  root-redirecting provider.
+- **Enqueue registration and a document's close are mutually exclusive**,
+  or a task that validated just before a cleanup can register a ghost open
+  against a closed document.
+- **A delayed open must not carry stale text.** The routing wait can hold an
+  open for as long as its deadline allows, and a payload captured before that
+  wait leaves the downstream analyzing text an intervening `didChange` has
+  already replaced.
+
+**Nobody waits forever, and nobody waits on themselves**
+
+- **Every entry reaches a terminal settlement or a terminal deletion.**
+  Waiters exist for suppressions, retentions, and rejections alike, and
+  each must be released — a pending entry that can persist is a hung
+  request.
+- **The re-open sweep must never initiate provider I/O, including by
+  awaiting a decision someone else is deciding.** Its query-free guarantee is
+  what a restart's document restoration rests on, and an arrangement where
+  observing a pending binding can promote the observer into its driver breaks
+  that guarantee without any call site looking wrong.
+- **A joiner inherits the remaining deadline, never a fresh one**, or
+  single-flight dedup silently becomes a way to extend a bound.
+
+**Bounds that are actually bounds**
+
+- **A caller giving up on an uncancellable call must not let another one
+  start in its place.** The call outlives the waiter, so treating the
+  waiter's departure as free capacity simply adds a second uncancellable
+  call, and the bound stops bounding anything. Enforcing this has an
+  accepted cost: hung calls can exhaust the pool for unrelated providers. The
+  per-caller effects of that exhaustion are specified above, and are
+  deliberately not a blanket fail-open.
+- **Bounded bookkeeping defaults to the safe answer when it runs out.** A
+  flight whose epoch-cause provenance is no longer retained discards; it
+  never re-anchors on an assumption.
+- **A routing request must never drive a healthy connection to `Failed`.**
+  These requests carry their own deadline and are outside both liveness
+  accounting and the per-request timeout, so a slow provider degrades
+  routing and nothing else.
+
+**Trust is scoped to admission**
+
+- **An override is validated against the trust universe as it was at
+  admission, and that verdict does not silently expand.** Bindings are
+  grandfathered against later shrinkage on purpose; revoking a live
+  document's route is a close/re-open, not a background retraction.
+- **A successful misroute must not be silent.** Every decision and every
+  per-server settlement is recorded, because a valid-but-wrong policy is
+  otherwise indistinguishable from a correct one.
 
 ## Considered Options
 
@@ -1478,7 +1545,7 @@ a slot a routing provider left in play.
   servers: handshake completion, replacement insertion, stop, failure,
   and `-32601` advertisement clearing. Each is already a pool-lock commit
   point; the flush is O(1) under the lock — the map is *taken* (swapped
-  for an empty one) with the epoch bump and cause-ring append, and the
+  for an empty one) with the epoch bump and the epoch-cause provenance append, and the
   taken map is dropped outside the critical section, so provider churn
   never stalls pool operations on entry-drop cost.
 - The frame reader currently allocates the declared `Content-Length`
