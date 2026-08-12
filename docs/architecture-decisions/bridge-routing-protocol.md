@@ -906,8 +906,10 @@ Decision-cache lifecycle:
     **aborts**
     the waiting tasks outright — no `didOpen` is sent at all, and the
     open's enqueue commit re-checks the decided document's incarnation
-    (each virtual document carries its own, so one region's removal
-    moves exactly its own decision's fence). The enqueue
+    (each virtual document carries its own, and the fence moves only
+    when that document actually closes — for a combined document, when
+    its last capture leaves; one capture's removal amid surviving
+    siblings moves nothing). The enqueue
     registration and the document's eviction/close share **one
     lifecycle critical section** — an old task cannot validate, lose the lock to
     a cleanup that evicts and closes everything, and then register a
