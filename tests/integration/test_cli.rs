@@ -1898,6 +1898,254 @@ fn test_language_uninstall_all_leaves_unmanaged_artifacts_and_says_so() {
     );
 }
 
+/// A directory-level scan failure means uninstall never observed the
+/// installation, so it must abort before removing anything. The bug this pins:
+/// an unreadable `parser/` beside a readable `queries/` used to remove the
+/// queries, leave the parser, and report success.
+#[test]
+#[cfg(unix)]
+fn test_language_uninstall_all_aborts_when_parser_directory_cannot_be_read() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    let parser_dir = test_dir.path().join("parser");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    let parser_file = parser_dir.join(format!("lua.{ext}"));
+    fs::write(&parser_file, "parser").expect("Failed to write parser");
+    let queries_dir = test_dir.path().join("queries/lua");
+    fs::create_dir_all(&queries_dir).expect("Failed to create queries dir");
+    fs::write(queries_dir.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write queries");
+
+    // Mode 0000: `read_dir` itself fails, which is the directory-level class.
+    let mut permissions = fs::metadata(&parser_dir)
+        .expect("Failed to read permissions")
+        .permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&parser_dir, permissions).expect("Failed to seal parser dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Unseal before asserting so a failure cannot leave an unreadable directory
+    // behind for the temp dir to trip over.
+    let mut permissions = fs::metadata(&parser_dir)
+        .expect("Failed to read permissions")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&parser_dir, permissions).expect("Failed to unseal parser dir");
+
+    assert!(
+        !output.status.success(),
+        "an unobservable parser directory must fail the command: {combined}"
+    );
+    assert!(
+        combined.contains(&parser_dir.display().to_string()),
+        "the failure must name the directory it could not read: {combined}"
+    );
+    assert!(
+        queries_dir.is_dir(),
+        "aborting means removing nothing — the queries must survive: {combined}"
+    );
+    assert!(
+        !combined.contains("Uninstalled"),
+        "a command that removed nothing must not report an uninstall: {combined}"
+    );
+}
+
+/// A per-entry failure must NOT abort the command: that was the regression that
+/// made a real language beside a bad entry unremovable. It is reported, named,
+/// skipped, and the run still fails — a destructive command that could not read
+/// one entry does not know what it left behind.
+#[test]
+#[cfg(unix)]
+fn test_language_uninstall_all_reports_and_skips_an_unreadable_parser_entry() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    let parser_dir = test_dir.path().join("parser");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    let parser_file = parser_dir.join(format!("lua.{ext}"));
+    fs::write(&parser_file, "parser").expect("Failed to write parser");
+
+    // Mode 0644: readable but not searchable. `read_dir` succeeds and yields the
+    // entry name; stat on the entry fails. That is the per-entry class.
+    let mut permissions = fs::metadata(&parser_dir)
+        .expect("Failed to read permissions")
+        .permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&parser_dir, permissions).expect("Failed to seal parser dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut permissions = fs::metadata(&parser_dir)
+        .expect("Failed to read permissions")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&parser_dir, permissions).expect("Failed to unseal parser dir");
+
+    assert!(
+        !output.status.success(),
+        "an entry discovery could not classify must fail the command: {combined}"
+    );
+    assert!(
+        combined.contains(&parser_file.display().to_string()),
+        "the entry at fault must be named, not just its directory: {combined}"
+    );
+    assert!(
+        !combined.contains("Uninstalled all languages."),
+        "'all' is false while an unread entry is still on disk: {combined}"
+    );
+}
+
+/// The regression the earlier fail-closed attempt introduced: ONE dangling
+/// symlink aborted the whole command, so a real language beside it could no
+/// longer be removed. A dangling entry is not an I/O error — it is a directory
+/// entry `unlink` can take — so both must go.
+#[test]
+#[cfg(unix)]
+fn test_language_uninstall_all_removes_a_dangling_parser_entry() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    let parser_dir = test_dir.path().join("parser");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    let real = parser_dir.join(format!("lua.{ext}"));
+    fs::write(&real, "parser").expect("Failed to write parser");
+    let dangling = parser_dir.join(format!("dangling.{ext}"));
+    std::os::unix::fs::symlink(test_dir.path().join("missing-target"), &dangling)
+        .expect("Failed to create dangling symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "uninstall failed: {combined}");
+    assert!(
+        !real.exists(),
+        "a real language beside a dangling entry must still be removed: {combined}"
+    );
+    assert!(
+        fs::symlink_metadata(&dangling).is_err(),
+        "the dangling entry must be unlinked, not stepped over: {combined}"
+    );
+}
+
+/// The queries side of discovery swallowed the same two error classes. A
+/// directory-level failure there must abort too, leaving the parser alone.
+#[test]
+#[cfg(unix)]
+fn test_language_uninstall_all_aborts_when_query_directory_cannot_be_read() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    let parser_dir = test_dir.path().join("parser");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    let parser_file = parser_dir.join(format!("lua.{ext}"));
+    fs::write(&parser_file, "parser").expect("Failed to write parser");
+    let queries_dir = test_dir.path().join("queries");
+    fs::create_dir_all(&queries_dir).expect("Failed to create queries dir");
+
+    let mut permissions = fs::metadata(&queries_dir)
+        .expect("Failed to read permissions")
+        .permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&queries_dir, permissions).expect("Failed to seal queries dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut permissions = fs::metadata(&queries_dir)
+        .expect("Failed to read permissions")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&queries_dir, permissions).expect("Failed to unseal queries dir");
+
+    assert!(
+        !output.status.success(),
+        "an unobservable query directory must fail the command: {combined}"
+    );
+    assert!(
+        parser_file.is_file(),
+        "aborting means removing nothing — the parser must survive: {combined}"
+    );
+    assert!(
+        combined.contains(&queries_dir.display().to_string()),
+        "the failure must name the directory it could not read: {combined}"
+    );
+    // Without the checked scan this run still failed — but only later, when
+    // taking the language lock under the same unreadable directory. Asserting
+    // it never got that far is what distinguishes aborting at discovery from
+    // stumbling into the same error one step downstream.
+    assert!(
+        !combined.contains("Failed to lock"),
+        "discovery must abort before any per-language work begins: {combined}"
+    );
+}
+
 /// The issue's other half: a dangling entry needs SOME way to be removed.
 /// Naming it used to answer "is not installed" and exit 0, because the gate
 /// asked `is_file()`, which follows the link.

@@ -610,10 +610,6 @@ fn safe_parser_language_name(stem: &str) -> Option<String> {
     queries::is_safe_language_name(stem).then(|| stem.to_string())
 }
 
-fn installed_query_language_name(path: &Path) -> Option<String> {
-    installed_query_language_name_checked(path).ok().flatten()
-}
-
 fn installed_query_language_name_checked(path: &Path) -> std::io::Result<Option<String>> {
     let Some(file_name) = path.file_name() else {
         return Ok(None);
@@ -669,40 +665,88 @@ fn run_language_uninstall(
     // one of them is still on disk.
     let mut unmanaged: Vec<PathBuf> = Vec::new();
 
+    // Entries discovery could not classify at all. Distinct from `unmanaged`,
+    // which is a deliberate skip of something understood: these are entries the
+    // command does not know the shape of, so it cannot know what it left.
+    let mut unreadable = false;
+
     // Determine which languages to uninstall
     let languages_to_uninstall: Vec<String> = if all {
         // Collect all installed languages
         let mut languages = BTreeSet::new();
 
-        if let Ok(entries) = fs::read_dir(&parser_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let is_parser = path.is_file()
-                    && path
-                        .extension()
-                        .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION);
-                if is_parser && let Some(stem) = path.file_stem() {
-                    let stem = stem.to_string_lossy();
-                    match safe_parser_language_name(&stem) {
-                        Some(language) => {
-                            languages.insert(language);
+        // Discovery distinguishes two failure classes, and conflating them is
+        // what made this command lie in one direction and seize up in the other:
+        //
+        // - DIRECTORY-level failure means the installation was never observed,
+        //   so there is no honest way to act on a partial view. Abort before
+        //   removing anything, matching `status`. Swallowing it is what let an
+        //   unreadable `parser/` beside a readable `queries/` remove the
+        //   queries, leave the parser, and report success (#953).
+        // - PER-ENTRY failure means one entry is opaque while the rest of the
+        //   directory is plainly legible. Report it, skip it, and carry on:
+        //   aborting here would make a real language sitting beside one bad
+        //   entry unremovable, which is strictly worse than the lie.
+        visit_install_directory(&parser_dir, |entry| {
+            let path = entry.path();
+            if !path
+                .extension()
+                .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION)
+            {
+                return Ok(());
+            }
+            match parser_entry_kind(&path) {
+                Ok(None) => {}
+                Ok(Some(())) => {
+                    if let Some(stem) = path.file_stem() {
+                        let stem = stem.to_string_lossy();
+                        match safe_parser_language_name(&stem) {
+                            Some(language) => {
+                                languages.insert(language);
+                            }
+                            // Remembered, not just skipped: this command goes on
+                            // to say it uninstalled everything, and a parser file
+                            // left on disk makes that false.
+                            None => unmanaged.push(path.clone()),
                         }
-                        // Remembered, not just skipped: this command goes on to
-                        // say it uninstalled everything, and a parser file left
-                        // on disk makes that false.
-                        None => unmanaged.push(path.clone()),
                     }
                 }
-            }
-        }
-
-        if let Ok(entries) = fs::read_dir(&queries_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = installed_query_language_name(&entry.path()) {
-                    languages.insert(name);
+                Err(error) => {
+                    eprintln!("✗ Failed to inspect {}: {}", path.display(), error);
+                    unreadable = true;
                 }
             }
-        }
+            Ok(())
+        })
+        .map_err(|e| {
+            eprintln!(
+                "Error: failed to inspect parser directory '{}': {e}",
+                parser_dir.display()
+            );
+            ExitCode::FAILURE
+        })?;
+
+        visit_install_directory(&queries_dir, |entry| {
+            let path = entry.path();
+            match installed_query_language_name_checked(&path) {
+                Ok(Some(name)) => {
+                    languages.insert(name);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("✗ Failed to inspect {}: {}", path.display(), error);
+                    unreadable = true;
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| {
+            eprintln!(
+                "Error: failed to inspect query directory '{}': {e}",
+                queries_dir.display()
+            );
+            ExitCode::FAILURE
+        })?;
 
         languages.into_iter().collect()
     } else {
@@ -710,6 +754,12 @@ fn run_language_uninstall(
     };
 
     if languages_to_uninstall.is_empty() {
+        // "Nothing installed" is a claim about the whole directory, so it is
+        // only available when the whole directory was legible.
+        if unreadable {
+            eprintln!("Found no languages to uninstall, but some entries could not be read.");
+            return Err(ExitCode::FAILURE);
+        }
         eprintln!("No languages installed to uninstall.");
         return Ok(());
     }
@@ -838,10 +888,9 @@ fn run_language_uninstall(
         }
     }
 
-    if any_failed {
-        return Err(ExitCode::FAILURE);
-    }
-
+    // Before the failure return, not after it: what was left behind is most
+    // worth saying on a run that went wrong, and discovery can now fail on its
+    // own, so a late note block would be the first casualty of its own fix.
     if !unmanaged.is_empty() {
         eprintln!();
         for path in &unmanaged {
@@ -850,6 +899,10 @@ fn run_language_uninstall(
                 path.display()
             );
         }
+    }
+
+    if any_failed || unreadable {
+        return Err(ExitCode::FAILURE);
     }
 
     if any_removed {
@@ -1545,11 +1598,17 @@ mod tests {
         std::fs::create_dir_all(&hidden).unwrap();
 
         assert_eq!(
-            installed_query_language_name(&safe),
+            installed_query_language_name_checked(&safe).unwrap(),
             Some("lua".to_string())
         );
-        assert_eq!(installed_query_language_name(&unsafe_name), None);
-        assert_eq!(installed_query_language_name(&hidden), None);
+        assert_eq!(
+            installed_query_language_name_checked(&unsafe_name).unwrap(),
+            None
+        );
+        assert_eq!(
+            installed_query_language_name_checked(&hidden).unwrap(),
+            None
+        );
     }
 
     /// A dangling parser entry is what uninstall must be able to remove, and
