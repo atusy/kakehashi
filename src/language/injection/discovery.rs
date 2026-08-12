@@ -2938,6 +2938,71 @@ mod tests {
         }
     }
 
+    /// The same frontmatter case through the bridge's actual entry point, so
+    /// the fix is pinned at the API the LSP handlers call — not only at the
+    /// private lookup. The virtual document a body position resolves to must
+    /// also be the trimmed content, with no `---` in it.
+    #[test]
+    fn resolve_at_byte_offset_declines_the_frontmatter_closing_fence() {
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "---\ntitle: awesome\n---\n\n# heading\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+
+        let query = Query::new(
+            &md_language,
+            r#"
+            ((minus_metadata) @injection.content
+              (#set! injection.language "yaml")
+              (#offset! @injection.content 1 0 -1 0))
+            "#,
+        )
+        .expect("valid frontmatter injection query");
+
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("frontmatter_fence");
+        let fence_start = text.rfind("---\n").expect("fixture has a closing fence");
+        let body_start = text.find("title").expect("fixture has a body line");
+
+        for boundary in [RegionBoundary::HalfOpen, RegionBoundary::CaretEndFallback] {
+            assert!(
+                InjectionResolver::resolve_at_byte_offset(
+                    &coordinator,
+                    &tracker,
+                    &uri,
+                    &tree,
+                    text,
+                    &query,
+                    fence_start,
+                    0,
+                    boundary,
+                )
+                .is_none(),
+                "no request may be routed into YAML from the closing fence under {boundary:?}"
+            );
+        }
+
+        let resolved = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            body_start,
+            0,
+            RegionBoundary::HalfOpen,
+        )
+        .expect("the frontmatter body still resolves");
+        assert_eq!(resolved.region.language, "yaml");
+        assert_eq!(
+            resolved.virtual_content, "title: awesome\n",
+            "the virtual document is the trimmed content, fences excluded"
+        );
+    }
+
     #[test]
     fn test_collect_all_injections_respects_lua_match_predicate() {
         // Regression test: #lua-match? is a general predicate (not built-in to tree-sitter).
