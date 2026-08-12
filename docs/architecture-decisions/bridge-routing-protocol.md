@@ -76,8 +76,10 @@ disabling routing fan-out for the language
 (`aggregation."kakehashi/bridge/routing".priorities = []`), on top of the
 advertisement gate that makes provider-less fleets pay nothing. Virtual
 URI identity rides the existing virtual-document lifecycle
-(language-server-bridge-virtual-document-model): a region's close or
-re-mint is a close/re-open of its decision, no more.
+(language-server-bridge-virtual-document-model): the decision closes and
+reopens exactly when its **virtual document** does — for a combined
+document, only when its last capture leaves, so one capture's removal
+or re-mint amid surviving siblings touches nothing — no more.
 
 ```typescript
 type RoutingParams = {
