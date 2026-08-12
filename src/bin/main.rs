@@ -974,10 +974,14 @@ fn run_language_uninstall(
         // Remove the parser entry probed above, still under the same lock.
         if let Some(parser_path) = parser_entry {
             match remove_parser_entry(&parser_path) {
-                Ok(()) => {
+                Ok(true) => {
                     eprintln!("✓ Removed parser: {}", parser_path.display());
                     removed_something = true;
                 }
+                // Already gone. The end state is the one asked for, so this is
+                // not a failure — and claiming the removal would be claiming
+                // work another actor did.
+                Ok(false) => {}
                 Err(e) => {
                     eprintln!("✗ Failed to remove parser {}: {}", parser_path.display(), e);
                     // The queries are already gone by now — the tombstone has
@@ -1135,14 +1139,20 @@ fn parser_entry_kind(path: &Path) -> std::io::Result<Option<ParserEntry>> {
 /// between — the one thing this function must never do. The re-check narrows
 /// that to the window between it and the call, which is the same irreducible
 /// race any unlink runs; closing it fully would need `openat`/`O_NOFOLLOW`.
-fn remove_parser_entry(path: &Path) -> std::io::Result<()> {
+///
+/// `Ok(false)` means the entry was already gone — someone else unlinked it
+/// between classification and here. That is the state this call wanted, so it
+/// is not a failure; reporting it as one would make the command claim a
+/// half-removed language while the filesystem is exactly as asked.
+fn remove_parser_entry(path: &Path) -> std::io::Result<bool> {
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => {
             let still_a_symlink = std::fs::symlink_metadata(path)
                 .is_ok_and(|metadata| metadata.file_type().is_symlink());
             if still_a_symlink && std::fs::remove_dir(path).is_ok() {
-                Ok(())
+                Ok(true)
             } else {
                 Err(error)
             }
