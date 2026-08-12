@@ -47,10 +47,12 @@ downstream connections by an opaque id derived from the pool's `ConnectionKey`.
 | `kakehashi/bridge/client/restart` | request | `{ id }` | `null` |
 
 The methods are announced in the initialize result as
-`capabilities.experimental.kakehashi.bridgeClient: true`, beside the existing
-`wrappedDidChangeConfigurationSettings` flag, so clients can feature-detect
-before use. This sets a new precedent rather than following one: the existing
-`kakehashi/node*` and `kakehashi/captures/*` families are announced nowhere.
+`capabilities.experimental.kakehashi.bridgeClient: true`, so clients can
+feature-detect before use. This sets a new precedent rather than following
+one: the initialize result currently carries no `experimental` object at
+all (its last occupant, `wrappedDidChangeConfigurationSettings`, was
+removed in #995), and the existing `kakehashi/node*` and
+`kakehashi/captures/*` families are announced nowhere.
 
 ### Client Identity: the `ConnectionKey` `Display` String
 
