@@ -47,11 +47,28 @@ The `ConnectionKey` is stored on each connection handle, so the request,
 `didChange`, host, and cancel paths route per-connection state via
 `handle.key()` without re-resolving the root.
 
-`completionItem/resolve` and `codeLens/resolve` carry no `textDocument`, so the
-originating host URI is stashed in their routing envelope (`KakehashiEnvelope` /
-`CodeLensEnvelope`) and used to re-resolve the same `(server, root)` connection
-that produced the item. A legacy envelope without that field falls back to the
-client-root connection (the pre-#382 behavior).
+`completionItem/resolve`, `codeAction/resolve`, and `codeLens/resolve` carry
+no `textDocument`, so the originating host URI is stashed in their routing
+envelopes (`KakehashiEnvelope` / `CodeActionEnvelope` / `CodeLensEnvelope`)
+and used to re-resolve the same `(server, root)` connection that produced the
+item. (A legacy **completion** envelope without that field falls back to
+the client-root connection — the pre-#382 rule, and still the shipped
+behavior today, via the field's serde default; the code-action and
+code-lens envelopes *require* the field, so a stamp-less one fails to
+deserialize and the item is returned unresolved. The fail-soft rule
+below is target state that lands with bridge-routing-protocol's
+implementation.) Amended with
+bridge-routing-protocol:
+this re-resolution — like every site that derives a connection from the host
+URI — consults the active route binding first, matched by the envelope's
+stamp of the decided document's URI (virtual for virt items) and its
+open incarnation; a missing, evicted, or mismatched **binding stamp**
+fails soft under that target-state rule (distinct from the *legacy
+envelope* above — an envelope missing the host-URI field entirely,
+whose shipped client-root fallback predates bindings altogether) rather
+than falling back to marker or
+client-root resolution, which under a root override would reach the
+config-root process instead of the one that produced the item.
 
 **Shared-instance opt-in** (#391): a per-server `preferSharedInstance` boolean
 (default `false`) routes a server's documents to one shared connection
@@ -127,19 +144,23 @@ The shared-instance opt-in mitigates this for capable servers.
 
 ### Request ID Semantics
 
-**Decision**: Use upstream request IDs directly for downstream servers.
+**Decision** (superseded by the implementation; amended with
+bridge-routing-protocol): every downstream request id is
+**bridge-minted** from the connection handle's own allocator
+(`next_request_id`) — fan-out means several downstream requests can
+serve one upstream id, so upstream ids cannot be reused directly.
+Forwarded client traffic additionally records an upstream→downstream
+cancellation mapping; bridge-initiated requests (`kakehashi/bridge/routing`)
+have no upstream id and register with no such mapping. The original
+Phase-1 sketch below reused the upstream id verbatim and is kept only as
+history:
 
-**Phase 1 Flow** (single server per language):
+**Phase 1 Flow** (single server per language, historical):
 ```
 Client (editor)          kakehashi           Downstream Server
      ├─ hover ID=42 ────→ Router ──────────────→ pyright (ID=42)
      ◀─ result ─────────────────────────────────◀
 ```
-
-**Benefits:**
-- Request ID consistent across client → bridge → server
-- Simple state management (one pending entry per request)
-- No ID transformation needed
 
 ### Routing (Phase 1)
 
@@ -523,6 +544,9 @@ languageServers:
 - **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Graceful Shutdown
   - Defines shutdown coordination for multiple concurrent connections
   - Router sends one `Teardown` message to the lifecycle actor, which launches per-connection shutdown sub-tasks; ls-bridge-graceful-shutdown specifies the per-connection sequence
+- **[bridge-routing-protocol](bridge-routing-protocol.md)**: Downstream routing delegation
+  - A routing provider's `workspaceFolders` answer overrides the marker-walk root resolution
+  - `forceStart` spawns eagerly — the `#shared` key with the primary-root seed for `preferSharedInstance` servers, the marker-less fallback shape otherwise
 
 ## Amendment History
 

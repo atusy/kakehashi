@@ -5,6 +5,7 @@
 - [wildcard-config-inheritance](wildcard-config-inheritance.md) — The `_` key inheritance that occupies the empty/absent spelling
 - [aggregation-priorities-wildcard](aggregation-priorities-wildcard.md) — The sigil discipline (`_` for keys, `"*"` for list elements) this decision follows
 - [host-document-bridge](host-document-bridge.md) — The second axis that selects servers through the same `languages` list
+- [bridge-routing-protocol](bridge-routing-protocol.md) — The routing projection matches through the same `"*"` element; explicit-empty `languages` anchors its policy-server pattern
 
 ## Implementation Status
 

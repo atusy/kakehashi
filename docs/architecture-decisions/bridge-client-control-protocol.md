@@ -7,6 +7,7 @@
 - [respawn-reopen-derives-its-targets](respawn-reopen-derives-its-targets.md) — the derived re-open `restart` relies on
 - [ls-bridge-message-ordering](ls-bridge-message-ordering.md) — the cancellation forwarding that the pass-through request reuses
 - [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) — the timeout tiers `stop`, `restart`, and pass-through requests interact with
+- [bridge-routing-protocol](bridge-routing-protocol.md) — the reverse-direction sibling (kakehashi→downstream); reuses this protocol's discovery convention and liveness classification, and the stopped set outranks routing answers
 
 ## Context
 
@@ -116,9 +117,31 @@ observable, if transient.
 
 Both parameters are optional and compose as AND:
 
-- `textDocument?: TextDocumentIdentifier` — only clients that serve this
-  document: the document (or one of its injections) bridges to the server
-  *and* resolves to this connection's root. A document kakehashi does not
+- `textDocument?: TextDocumentIdentifier` — only clients that **serve or
+  retain an assignment for** this document (the route-binding
+  consultation below is target state, landing with
+  bridge-routing-protocol's implementation): the document (or one of its
+  injections) bridges to the server *and* resolves to this connection's
+  root — consulting the active route bindings first, matched
+  per exact **(decided document, server) entry** — the host's or each
+  virtual document's own binding (bridge-routing-protocol) — so an
+  overridden or suppressed route filters by where that document
+  actually opened; ordinary resolution applies per exact entry — only
+  where this server's entry has no record (sibling servers' settlements
+  on the same document never affect it) — and a *pending* entry
+  (its decision still in flight) matches nothing yet — the document is
+  not open there — rather than falling through. A *retained* entry (that
+  server's route decided but its acquire failed, or never ran because
+  its owner died — bridge-routing-protocol; sibling entries stay
+  independently enumerable)
+  **matches its retained key when a slot for that key is enumerable**,
+  whatever that slot's status (a `Failed` handle, or a `running` shared
+  handle whose folder announcement failed; a pre-handle spawn failure
+  leaves no row to match, and the entry then matches nothing until a
+  retry produces one): surfacing the slot assigned to the document
+  after a failed acquire is exactly what a user diagnosing missing
+  features needs, unlike `pending`, whose assignment does not exist
+  yet. A document kakehashi does not
   have open matches nothing — the parameter is a filter, not a lookup.
 - `name?: string` — only clients spawned from this `languageServers` entry.
 
@@ -564,7 +587,19 @@ and their waits (ls-bridge-graceful-shutdown § Unconfirmed termination).
   sweep runs after it, `documents` may briefly under-report, and a
   pass-through request racing the sweep is — like all pass-through — the
   caller's own risk.
-- **A shared instance re-seeds; nothing is remembered.** A `#shared` key
+- **A shared instance re-seeds; nothing is remembered** — with one
+  recorded exception (target state, landing with
+  bridge-routing-protocol's implementation): a document's active route
+  binding
+  (bridge-routing-protocol) retains the effective folders of every
+  bound shared route (canonical override folders, or ordinarily
+  resolved roots kept verbatim), and — provided the replacement still supports
+  workspace folders — the re-open sweep re-adds and announces them
+  before that document's `didOpen`; a replacement the capability
+  fallback downgraded gets neither for a binding **with retained
+  folders**, whose route reads not applicable per that decision, while
+  a rootless `[]` binding retains none, needs no announcement, and
+  reopens on `#shared` untouched. A `#shared` key
   carries no root, and the old handle's accumulated folder set dies with
   it. Because no triggering document exists to resolve a marker root — the
   existing acquire path cannot revive a dead shared key without one — the
@@ -578,8 +613,11 @@ and their waits (ls-bridge-graceful-shutdown § Unconfirmed termination).
   connection — derive, don't remember, applied to folders. One ordering
   obligation falls on the re-open sweep: it acquires the replacement by
   key, bypassing the ordinary acquire path that announces new shared
-  roots, so for a shared replacement the sweep must add-and-announce each
-  document's root before that root's first `didOpen` — otherwise non-seed
+  roots, so for a shared replacement the sweep must add-and-announce, before
+  each document's first `didOpen`, that document's folders — for any bound
+  entry, the folders its binding retains (the override folders, or the
+  ordinarily resolved root recorded at open — bridge-routing-protocol);
+  live resolution only for a server entry with no record — otherwise non-seed
   documents reopen on a server that was never told about their folder. In a
   workspace-less session (initialize carried neither `rootUri` nor
   `workspaceFolders`), the replacement spawns rootless with an empty folder

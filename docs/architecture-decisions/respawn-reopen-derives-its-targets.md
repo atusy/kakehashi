@@ -4,7 +4,8 @@
 [execute-command-routing-token](execute-command-routing-token.md),
 [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md),
 [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md),
-[host-document-bridge](host-document-bridge.md)
+[host-document-bridge](host-document-bridge.md),
+[bridge-routing-protocol](bridge-routing-protocol.md)
 
 ## Context
 
@@ -52,7 +53,12 @@ A purge ARMS its key. The replacement's handshake CLAIMS it. The re-open then
 asks, of every currently open document, whether it belongs to this connection,
 and opens the ones that do.
 
-Nothing is remembered about documents, so nothing about them can go stale.
+No captured re-open *target list* is remembered, so no such list can go
+stale. (Per-document route bindings — bridge-routing-protocol — *are*
+remembered for each binding's lifetime — the decided document's close;
+a virtual document closes when its last region leaves — and are consulted by the
+belongs-here question below; their staleness is that decision's recorded
+trade-off, not a captured-list resurrection.)
 
 ### Arming is unconditional, and that is the load-bearing part
 
@@ -81,19 +87,50 @@ with the work that belongs to the connection.
 
 1. Could a document in this HOST language bridge to this server at all? Pure
    configuration, answered from the per-snapshot memo — no parse, no tree, no
-   pool lookup, no filesystem access. It rejects hosts whose configured `bridge`
+   pool lookup, no filesystem access. The screen accepts the **union** of
+   injection reachability and the host layer's own candidacy (`_self`
+   enabled with a host-language-matching server — bridge-routing-protocol's
+   host units), so a host-only route is not pre-rejected by an
+   injection-shaped filter. It rejects hosts whose configured `bridge`
    filter blocks every language the server declares, and servers no longer
    configured. How much that narrows depends entirely on the configuration: on
    the shipped defaults the bridge filter allows everything, so a workspace of
    same-host-language documents is barely thinned, and the later stages carry
    the load. It must still run before the parse wait and the injection
    resolution, not merely before the open.
-2. Do its resolved injections actually bridge to this server? Also pure
-   configuration, but it needs the injections, so it is paid only by hosts that
-   survived (1).
-3. Does it route to *this* connection? A marker resolution, paid only by hosts
-   that survived (2). Read-only: it never spawns, so asking about a document
+2. Which of its route units bridge to this server? This stage produces
+   **units**, not a host-level verdict (bridge-routing-protocol): each
+   resolved injection language whose `bridge` filter admits the server is an
+   injection unit, and the host layer is a unit of its own when `_self` is
+   enabled with a host-language match — a host-only `_self` route survives
+   with no matching injection at all. Pure configuration, but the injection
+   half needs the injections, so it is paid only by hosts that survived (1).
+3. Does the unit route to *this* connection? A marker resolution, paid per
+   unit surviving (2). Read-only: it never spawns, so asking about a document
    belonging to another root cannot bring that root's server up.
+   bridge-routing-protocol amends this stage (target state, landing with
+   that protocol's implementation): when the document holds an
+   active route binding for the server, the binding answers instead of the
+   marker walk — a suppressed server is "not applicable", a bound key must
+   match this connection's — and an entry-less server (this exact (document, server) entry has no
+   record, whatever the document's other servers settled) falls through
+   to the marker rule above. Bindings
+   are keyed per decided document (the host, and each virtual document),
+   so stages 2-3 evaluate each unit **independently**: every current
+   virtual document is its own unit with its own binding, the host layer
+   is a unit screened by `_self`/host-language candidacy rather than
+   injections, and each unit enqueues its own `didOpen`; any
+   required-open failure fails the applicable host, while a host with
+   zero applicable units reads NotApplicable. One host can suppress a
+   server for one injection language while another language — or the
+   host layer — routes to a different key, and the sweep re-opens only
+   the units whose own **server entry** (within the unit's decision
+   tuple) names this connection. A server entry still *pending* at the
+   sweep's bounded wait is applicable-but-unsettled, not "not
+   applicable": the barrier's fail-soft path applies, never a
+   successful omission; a sibling entry's state never decides this
+   server's applicability. The stage stays
+   read-only either way: the sweep never issues a routing query.
 
 Stage 1 is deliberately conservative — a server declaring the `*` wildcard is
 never pre-rejected, and inheritance from the `_` template is resolved before the
@@ -204,7 +241,14 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
   the barrier is a no-op for it. Re-rooting is not only a configuration change:
   marker resolution walks the live filesystem uncached, so creating a marker
   (`git init` in a subdirectory, a submodule checkout, scaffolding a nested
-  project) re-roots a host with settings untouched.
+  project) re-roots a host with settings untouched. Both apply only to
+  (document, server) entries *without* an active route
+  binding record — a terminally deleted entry falls through to marker
+  resolution even while sibling entries stay bound: a bound entry
+  (bridge-routing-protocol) keeps its key for the binding's lifetime —
+  the decided document's close (a virtual document closes when its
+  last region leaves) — and is not re-rooted by live marker changes while it
+  lives.
 - The re-open considers every open document rather than a pre-narrowed set. The
   configuration question is answered first and from a memo, so the cost is a
   map lookup per open document, but it does scale with the workspace rather
@@ -212,10 +256,12 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
   cost off the barrier's budget; a future change that moves work ahead of the
   stage-1 screen re-couples them, and the symptom is every command on a
   respawned connection failing soft on a large workspace.
-- Marker resolution now runs during the re-open for hosts that bridge to the
-  respawned server. The pre-existing eager path already resolves markers per
-  open, so this is not a new kind of work, but it is work the captured-list
-  design skipped.
+- Marker resolution now runs during the re-open for the server entries that
+  lack a route binding record; bound entries answer from the binding
+  instead (per exact (document, server) entry — one host's units can
+  hold both kinds at once). The pre-existing eager path already resolves markers
+  per open, so this is not a new kind of work, but it is work the
+  captured-list design skipped.
 
 ### Known limits of `done`
 

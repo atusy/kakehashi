@@ -6,6 +6,7 @@
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — Per-method bridge strategies
 - [wildcard-config-inheritance](wildcard-config-inheritance.md) — Wildcard config inheritance (foundation for `_self` resolution)
 - [push-propagation-diagnostic-forwarding](push-propagation-diagnostic-forwarding.md) — Diagnostic forwarding
+- [bridge-routing-protocol](bridge-routing-protocol.md) — Host-document routing queries read the `_self` aggregation entry and are gated on `_self.enabled`
 - [cross-layer-aggregation](cross-layer-aggregation.md) — Cross-layer (native/host/virt) result aggregation; covers what this decision scopes out
 
 ## Implementation Status

@@ -89,6 +89,30 @@ loses a consumed header on every liveness tick and then resyncs onto the
 message body, reporting a framing error against a well-framed stream and
 killing the connection.
 
+**Framing size ceilings** (amended with bridge-routing-protocol; **target
+state** — today's `BridgeReader` enforces none of these bounds and
+allocates the declared `Content-Length` unchecked, which is exactly the
+exposure this amendment closes; the ceilings land with that protocol's
+implementation): the reader
+enforces three incrementally checked bounds — a maximum header-line length, a
+maximum total header-block size, and a maximum declared `Content-Length` —
+each violation being a framing error with the same fatal disposition as every
+other framing violation: the connection fails; an oversized body is never
+drained (draining an attacker-sized body can hang the reader), and the
+header-line bound is enforced as bytes accumulate, never after an unbounded
+buffer already grew. The body ceiling's default is implementation-defined and
+deliberately generous — well above the largest legitimate payloads observed
+(multi-megabyte diagnostics bursts are real) — so it trips on runaway or
+adversarial peers, not on big workspaces; a configuration knob can follow if a
+legitimate deployment ever meets it. The header-line and header-block
+ceilings are likewise implementation-defined, in the small-kilobytes class —
+LSP headers are few and tiny, so any legitimate margin is enormous. A peer
+whose honest traffic exceeds a ceiling fails repeatedly through
+acquire-driven respawn — or, for a connection nothing re-acquires (a
+`forceStart`-only policy server with `languages = []`), stays unavailable
+until a reload or an explicit restart — accepted: such a peer is
+indistinguishable from a runaway one at the framing layer.
+
 **Writer Pattern:**
 - Write requests to server stdin using async mutex-protected writer
 - Single writer task ensures no byte-level corruption
@@ -258,6 +282,7 @@ Use standard library's `std::process` with one blocking OS thread per server rea
 - **[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)**: Server Pool Coordination (uses this I/O foundation for N servers)
 - **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Graceful Shutdown (uses shutdown signal from `select!`, adds LSP handshake and process cleanup)
 - **[ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md)**: Timeout Hierarchy (coordinates liveness timeout with other timeout systems)
+- **[bridge-routing-protocol](bridge-routing-protocol.md)**: Motivated the framing size ceilings amendment (its answer-allocation bound depends on them)
 
 ## Notes
 
@@ -275,3 +300,4 @@ Use standard library's `std::process` with one blocking OS thread per server rea
 - **2026-01-06**: Merged Amendment 001 - Added pending request cleanup requirements and race prevention pattern to prevent indefinite client hangs on reader task exit
 - **2026-01-06**: Merged Amendment 002 - Added state-based liveness timeout gating and separate initialization timeout mechanism to prevent liveness timeout from firing during slow initialization
 - **2026-08-10**: Amendment — reader framing must be cancel-safe across `select!` wake-ups; partial-frame state moved into `BridgeReader`
+- **2026-08-12**: Amendment (with bridge-routing-protocol) — framing size ceilings: incrementally enforced header-line, header-block, and `Content-Length` bounds, each a fatal framing error; see § Framing size ceilings

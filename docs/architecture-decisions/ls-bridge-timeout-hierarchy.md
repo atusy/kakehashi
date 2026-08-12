@@ -20,12 +20,15 @@ This decision coordinates timeout mechanisms across the bridge architecture. It 
 
 ## Context
 
-The async bridge architecture defines timeout systems across three decisions:
+The async bridge architecture defines timeout systems across several decisions:
 
 1. **Initialization Timeout** (ls-bridge-async-connection): Bounds server initialization time during startup
 2. **Liveness Timeout** (ls-bridge-async-connection): Detects hung servers (unresponsive to pending requests)
 3. **Global Shutdown Timeout** (ls-bridge-graceful-shutdown): Bounds the shutdown termination attempt (escalation); ownership disposition and local cleanup run as actor transitions outside the ceiling
 4. **Per-Request Timeout** (ls-bridge-server-pool-coordination): Bounds user-facing latency for multi-server aggregation *[Phase 3 only]*
+5. **Per-Slot Control Shutdown Timeout** (bridge-client-control-protocol): Bounds a single-slot `stop`/`restart` (see the dedicated section below)
+6. **Routing Decision Deadline** (bridge-routing-protocol): Bounds one routing decision — provider fan-out, initialization waits, and answer normalization (see the dedicated section below)
+7. **Binding-Reuse Validation Budget** (bridge-routing-protocol): Bounds the *caller's wait* on filesystem revalidation along binding-driven reuse paths — capped by the sweep's remaining budget on re-open sweeps, a dedicated implementation-defined budget on lazy-open/retry paths, and the global shutdown ceiling always. It does not bound the underlying OS call or its worker permit, which may outlive every deadline (the permit returns only when the call does)
 
 ### The Problem
 
@@ -43,7 +46,7 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 | Tier | Timeout | Duration | Trigger | Action |
 |------|---------|----------|---------|--------|
 | **0** | Initialization | 30-60s | `initialize` request sent | `Initializing` → `Failed` (pool may spawn replacement) |
-| **2** | Liveness | 30-120s | Ready state + liveness-classified managed pending > 0 (pass-through excluded — target state landing with bridge-client-control-protocol; today every pending entry counts) | `Ready` → `Failed` (pool may spawn replacement) |
+| **2** | Liveness | 30-120s | Ready state + liveness-classified managed pending > 0 (pass-through and routing queries excluded via the same per-entry classification — bridge-client-control-protocol, bridge-routing-protocol; today every pending entry counts) | `Ready` → `Failed` (pool may spawn replacement) |
 | **3** | Global Shutdown | 5-15s | Shutdown initiated | SIGTERM → SIGKILL, all → `Closed` |
 
 **State-Based Gating:**
@@ -113,6 +116,41 @@ Global Shutdown overrides all (highest priority)
   per-slot operation has not finished (ls-bridge-graceful-shutdown
   § Lifecycle Actor)
 
+**Routing Decision Deadline** (bridge-routing-protocol):
+- One deadline bounds an entire routing decision: the concurrent provider
+  fan-out, any bounded initialization waits, and the per-entry answer
+  normalization (folder validation and marker-anchor work on the bounded
+  validation pool) inside it
+- **Duration**: implementation-defined, documented default in the
+  low-seconds class
+- On expiry the pending provider requests are cancelled
+  (`$/cancelRequest`) and retired, unfinished folder entries drop
+  per-entry, and fan-in runs over the normalized results that exist;
+  the whole fallback is synthesized only when no operative normalized
+  result remains
+- Routing requests are excluded from Tier-2 liveness accounting (same
+  per-entry classification as pass-through): they carry their own
+  deadline, and a slow provider must never drive a `Ready` connection to
+  `Failed`
+- Also exempt from the Tier-1 per-request timeout (whose fan-out trigger
+  would otherwise cover a routing fan-out once Phase 3 lands): the
+  routing deadline is the sole bound on these requests
+- Global teardown overrides: decisions waiting on provider handshakes
+  resolve to the fallback immediately
+- Exception to the generic late-response rule above: routing requests'
+  entries are retired atomically on every terminal outcome of their
+  decision, so a late routing response is dropped, never accepted or
+  delivered
+- The binding-reuse validation budget composes as a **minimum**: the
+  effective bound on a lazy-open/retry validation is min(its configured
+  budget, the enclosing request's deadline — including Tier-1 once
+  Phase 3 lands — and the global shutdown ceiling); **any** last-waiter
+  departure — upstream cancellation, a lazy/retry or sweep budget
+  expiring, teardown — removes a still-queued job from the queue (no
+  permit is ever spent on work nobody wants), and only a job whose
+  filesystem call is already running keeps its permit until the call
+  returns, its result discarded
+
 **Writer-Idle Timeout** (within the applicable shutdown deadline):
 - **Duration**: 2s fixed
 - **Purpose**: Wait for writer loop to finish current operation before taking exclusive stdin access
@@ -129,12 +167,12 @@ Global Shutdown overrides all (highest priority)
 
 ### Negative
 
-- **Multiple concepts**: Three timeout systems in Phase 1 (four in Phase 3)
+- **Multiple concepts**: Three timeout *tiers* in Phase 1 (four in Phase 3), plus the tier-exempt deadlines registered here (per-slot control shutdown, routing decision, binding-reuse validation, writer-idle)
 - **Tuning required**: Implementation-defined values need careful selection
 
 ### Neutral
 
-- **LSP compliant**: Timeouts trigger explicit error responses, not silent hangs
+- **LSP compliant**: Request timeouts trigger explicit error responses, not silent hangs (the routing decision deadline is the exception by design — expiry resolves the decision from partial results, or kakehashi-decided routing when no operative normalized result remains, with a warning and never an upstream error)
 
 ## Alternatives Considered
 
@@ -162,6 +200,7 @@ Let implementation details determine which timeout wins.
 - **[ls-bridge-message-ordering](ls-bridge-message-ordering.md)**: Connection state machine (state-based timeout gating)
 - **[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)**: Per-request timeout *(Phase 3)*
 - **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Global shutdown timeout
+- **[bridge-routing-protocol](bridge-routing-protocol.md)**: Routing decision deadline and binding-reuse validation budget; Tier-1/Tier-2 exemptions for routing queries
 
 ## Summary
 
