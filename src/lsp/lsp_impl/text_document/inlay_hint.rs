@@ -70,6 +70,7 @@ impl Kakehashi {
                         &t.server_config,
                         &t.uri,
                         range,
+                        t.region_end(),
                         &t.injection_language,
                         &t.region_id,
                         t.offset,

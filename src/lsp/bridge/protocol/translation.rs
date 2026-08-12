@@ -95,13 +95,17 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
 // =============================================================================
 
 /// Whether `host_position` can be translated into virtual coordinates without
-/// underflow, i.e. it lies within the injection region's boundary.
+/// underflow, i.e. it does not fall before the injection region's *leading*
+/// boundary. This checks the lower bound only — a position past the region's
+/// end still returns `true` here; for the trailing bound see
+/// [`host_position_within_region_bounds`].
 ///
 /// A position *above* the region (`line < region start line`) signals stale
 /// region data — typically an in-flight request whose region was shifted by a
-/// concurrent host edit. A position *on* the start line but *before* the region's
-/// start column (e.g. the cursor is on the markdown fence backticks or inside a
-/// blockquote `> ` prefix rather than the injected content) is likewise outside.
+/// concurrent host edit. A position on a region line but *before* that line's
+/// content start column (e.g. the cursor is on the markdown fence backticks or
+/// inside a blockquote `> ` prefix rather than the injected content) is
+/// likewise outside.
 ///
 /// Either case would otherwise be silently mistranslated by the `saturating_sub`
 /// in [`translate_host_position_to_virtual`] and forwarded as wrong coordinates:
@@ -117,6 +121,25 @@ pub(crate) fn host_position_within_region(host_position: Position, offset: &Regi
     }
     let virtual_line = host_position.line - offset.line();
     host_position.character >= offset.column_for_line(virtual_line)
+}
+
+/// [`host_position_within_region`] plus the trailing bound: the position must
+/// also not lie past `region_end` — the region's end-of-content mapped to host
+/// coordinates (`region_host_end(virtual_content, offset)`).
+///
+/// `<=` at the end is INCLUSIVE on purpose: end-of-content is a valid LSP
+/// position (the caret at the tail of the injected text maps to the virtual
+/// document's EOF), the same rule the code-action diagnostic filter pins.
+/// A position past it has no virtual coordinate at all — `saturating_sub`
+/// translation would forward it as a plausible-but-wrong position beyond the
+/// virtual document's end (e.g. inside a trailing named child the query
+/// excluded from the virtual content).
+pub(crate) fn host_position_within_region_bounds(
+    host_position: Position,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> bool {
+    host_position_within_region(host_position, offset) && host_position <= region_end
 }
 
 /// Translate a single host position to virtual coordinates.
@@ -506,5 +529,155 @@ mod tests {
             character: 2,
         };
         assert!(host_position_within_region(at_content, &offset));
+    }
+
+    // ======================================================================
+    // host_position_within_region_bounds
+    // ======================================================================
+
+    #[test]
+    fn bounds_rejects_position_past_region_end() {
+        let offset = RegionOffset::new(2, 4);
+        let region_end = Position {
+            line: 2,
+            character: 10,
+        };
+        // Past the end on the same line, and on a later line: either would
+        // translate to a virtual coordinate beyond the document's EOF.
+        assert!(!host_position_within_region_bounds(
+            Position {
+                line: 2,
+                character: 11,
+            },
+            &offset,
+            region_end,
+        ));
+        assert!(!host_position_within_region_bounds(
+            Position {
+                line: 3,
+                character: 0,
+            },
+            &offset,
+            region_end,
+        ));
+    }
+
+    #[test]
+    fn bounds_accepts_region_end_inclusive_and_keeps_lower_bound() {
+        let offset = RegionOffset::new(2, 4);
+        let region_end = Position {
+            line: 2,
+            character: 10,
+        };
+        // End-of-content is a valid caret position (virtual EOF) — inclusive.
+        assert!(host_position_within_region_bounds(
+            Position {
+                line: 2,
+                character: 10,
+            },
+            &offset,
+            region_end,
+        ));
+        assert!(host_position_within_region_bounds(
+            Position {
+                line: 2,
+                character: 4,
+            },
+            &offset,
+            region_end,
+        ));
+        // The lower bound from host_position_within_region still applies.
+        assert!(!host_position_within_region_bounds(
+            Position {
+                line: 2,
+                character: 3,
+            },
+            &offset,
+            region_end,
+        ));
+        assert!(!host_position_within_region_bounds(
+            Position {
+                line: 1,
+                character: 9,
+            },
+            &offset,
+            region_end,
+        ));
+    }
+
+    #[test]
+    fn bounds_compare_lexicographically_across_lines() {
+        // Multi-line region ending at (4, 2). A component-wise comparison
+        // (line <= end.line && character <= end.character) would wrongly
+        // reject any character above 2 on the earlier lines.
+        let offset = RegionOffset::new(2, 4);
+        let region_end = Position {
+            line: 4,
+            character: 2,
+        };
+        assert!(host_position_within_region_bounds(
+            Position {
+                line: 2,
+                character: 15,
+            },
+            &offset,
+            region_end,
+        ));
+        assert!(host_position_within_region_bounds(
+            Position {
+                line: 3,
+                character: 99,
+            },
+            &offset,
+            region_end,
+        ));
+        // Past the end on the end line itself.
+        assert!(!host_position_within_region_bounds(
+            Position {
+                line: 4,
+                character: 3,
+            },
+            &offset,
+            region_end,
+        ));
+    }
+
+    #[test]
+    fn bounds_compose_with_blockquote_prefix_offsets() {
+        // Blockquote: `> ` prefix width 2 on both virtual lines; region ends
+        // mid-line at (11, 8). The leading (per-line prefix) and trailing
+        // bounds must both hold.
+        let offset = RegionOffset::with_per_line_offsets(10, vec![2, 2]);
+        let region_end = Position {
+            line: 11,
+            character: 8,
+        };
+        // Inside the prefix on the end line: below the leading bound.
+        assert!(!host_position_within_region_bounds(
+            Position {
+                line: 11,
+                character: 1,
+            },
+            &offset,
+            region_end,
+        ));
+        // End-of-content: accepted, inclusive.
+        assert!(host_position_within_region_bounds(
+            Position {
+                line: 11,
+                character: 8,
+            },
+            &offset,
+            region_end,
+        ));
+        // One past the end: rejected.
+        assert!(!host_position_within_region_bounds(
+            Position {
+                line: 11,
+                character: 9,
+            },
+            &offset,
+            region_end,
+        ));
     }
 }

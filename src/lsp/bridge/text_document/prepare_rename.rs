@@ -18,7 +18,7 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
-    response_has_jsonrpc_error,
+    host_position_within_region_bounds, response_has_jsonrpc_error,
 };
 
 impl LanguageServerPool {
@@ -34,6 +34,7 @@ impl LanguageServerPool {
         server_config: &BridgeServerConfig,
         host_uri: &Url,
         host_position: Position,
+        region_end: Position,
         injection_language: &str,
         region_id: &str,
         offset: RegionOffset,
@@ -47,6 +48,13 @@ impl LanguageServerPool {
             // Returning None would cause clients to treat the symbol as "not renameable",
             // silently disabling rename for servers that only advertise textDocument/rename.
             if handle.has_capability("textDocument/rename") {
+                // The shortcut must respect the same bounds the dispatch path
+                // enforces: a caret outside the region's content is not
+                // renameable-at-position, and a phantom DefaultBehavior would
+                // win preferred aggregation over real lower-priority results.
+                if !host_position_within_region_bounds(host_position, &offset, region_end) {
+                    return Ok(None);
+                }
                 return Ok(Some(PrepareRenameResponse::DefaultBehavior {
                     default_behavior: true,
                 }));
@@ -62,6 +70,7 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             host_position,
+            region_end,
             "textDocument/prepareRename",
             |virtual_uri, request_id| {
                 build_prepare_rename_request(virtual_uri, host_position, &offset, request_id)

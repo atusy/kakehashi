@@ -27,9 +27,9 @@ use tower_lsp_server::ls_types::{
 };
 
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
-    response_has_jsonrpc_error, text_edit_safe_in_region, translate_host_range_to_virtual,
-    translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
+    text_edit_safe_in_region, translate_host_range_to_virtual, translate_virtual_position_to_host,
+    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 
 impl LanguageServerPool {
@@ -45,6 +45,7 @@ impl LanguageServerPool {
         server_config: &BridgeServerConfig,
         host_uri: &Url,
         host_range: Range,
+        region_end: Position,
         injection_language: &str,
         region_id: &str,
         offset: RegionOffset,
@@ -76,7 +77,6 @@ impl LanguageServerPool {
                 )
             },
             |response, ctx| {
-                let region_end = region_host_end(virtual_content, ctx.offset);
                 transform_inlay_hint_response_to_host(
                     response,
                     &ctx.virtual_uri_string,

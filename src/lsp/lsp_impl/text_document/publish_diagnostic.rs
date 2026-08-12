@@ -263,6 +263,7 @@ mod tests {
                 line_column_offsets: vec![],
                 contiguous: true,
             },
+            region_end: None,
             configs: vec![ResolvedServerConfig {
                 server_name: server.to_string(),
                 config: Arc::new(BridgeServerConfig {

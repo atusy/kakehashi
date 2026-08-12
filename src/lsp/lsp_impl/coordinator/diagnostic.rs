@@ -352,6 +352,7 @@ impl DiagnosticSnapshotPreparer {
                         contexts.push(DocumentRequestContext {
                             uri: uri.clone(),
                             resolved: resolved.clone(),
+                            region_end: None,
                             configs: configs.clone(),
                             upstream_request_id: None,
                             priorities: agg.priorities.clone(),

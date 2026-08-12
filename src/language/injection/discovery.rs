@@ -531,23 +531,77 @@ fn extract_content_and_language<'a>(
     None
 }
 
-/// Find the injection region containing the given byte offset.
+/// Find the injection region at the given byte offset under `boundary`'s
+/// end-boundary rule: half-open containment, optionally falling back to a
+/// region whose trailing edge the offset sits on (see [`RegionBoundary`]).
 ///
 /// Regions are sorted by query pattern index, so same-range alternate
 /// languages use explicit query-order priority for single-result bridge APIs.
 /// Whole-document and hierarchy discovery still retain every language layer.
 ///
-/// Returns `(index, region)` for use with `calculate_region_id`, or `None` when the
-/// position is not within any injection region.
+/// Returns `(index, region)` for use with `calculate_region_id`, or `None`
+/// when no region matches under the boundary rule.
 fn find_injection_at_position<'a>(
     injections: &'a [InjectionRegionInfo<'a>],
     byte_offset: usize,
+    doc_len: usize,
+    boundary: RegionBoundary,
 ) -> Option<(usize, &'a InjectionRegionInfo<'a>)> {
-    injections.iter().enumerate().find(|(_, inj)| {
+    let half_open = injections.iter().enumerate().find(|(_, inj)| {
         let start = inj.content_node.start_byte();
         let end = inj.content_node.end_byte();
         byte_offset >= start && byte_offset < end
-    })
+    });
+    match boundary {
+        RegionBoundary::HalfOpen => half_open,
+        RegionBoundary::CaretEndFallback => half_open.or_else(|| {
+            // No region contains the byte: accept a region whose trailing edge
+            // the caret sits on, provided that edge is mid-line — or at the
+            // document's end, where a column-0 edge means an unclosed block
+            // whose content ends on the newline just typed, not a closing
+            // fence (see the variant doc). Same iteration order as above, so
+            // nested regions ending at the same byte keep the established
+            // first-match (outermost) tie-break. The second scan runs only on
+            // the miss path, over the handful of regions a document has — not
+            // worth fusing into one pass. Known divergence: the column is a
+            // tree-sitter byte column counted from the last `\n`, so a region
+            // ending right after a LONE `\r` (an LSP line break, not a
+            // tree-sitter one) reads as mid-line here — the translation
+            // pipeline shares that lone-CR divergence; tracked in #996.
+            injections.iter().enumerate().find(|(_, inj)| {
+                inj.content_node.end_byte() == byte_offset
+                    && (inj.content_node.end_position().column > 0 || byte_offset == doc_len)
+            })
+        }),
+    }
+}
+
+/// How [`InjectionResolver::resolve_at_byte_offset`] treats a region's end
+/// boundary.
+///
+/// Node containment is half-open `[start, end)` (node-reference-protocol
+/// § Half-Open Intervals), and that stays the default. But caret-shaped
+/// methods (the `region_boundary_for_method` set: completion, signatureHelp,
+/// linkedEditingRange, onTypeFormatting) fire with the insert-mode caret
+/// sitting *after* the last typed byte — for a region that ends mid-line (a
+/// vim `!cmd`, an embedded string) that caret is exactly the end byte, and a
+/// strict half-open lookup routes the request away from the injection the
+/// user is visibly typing in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RegionBoundary {
+    /// Strict half-open `[start, end)`: a cursor at the end byte is outside.
+    HalfOpen,
+    /// Half-open first; only when that finds nothing, accept a region whose
+    /// end byte equals the cursor **and** whose end sits mid-line (a non-zero
+    /// end column) or at the document's end. A region ending at column 0
+    /// (fenced-block shape) keeps the caret on the closing fence outside:
+    /// every caret position on its last content line is already inside
+    /// half-open, so the fallback would only ever add the fence line itself.
+    /// The end-of-document case is the one column-0 shape with no fence line
+    /// to protect — an unclosed block whose content ends on the newline the
+    /// user just typed — and mirrors the node-reference-protocol ADR's
+    /// end-of-document exception (`b == L && e == L`).
+    CaretEndFallback,
 }
 
 /// Resolved injection region with all necessary context for LSP bridge requests
@@ -576,11 +630,14 @@ pub(crate) struct ResolvedInjection {
 pub(crate) struct InjectionResolver;
 
 impl InjectionResolver {
-    /// Resolve the injection region (if any) covering `byte_offset`. Shared by
+    /// Resolve the injection region (if any) covering `byte_offset` — or,
+    /// under [`RegionBoundary::CaretEndFallback`], ending at it. Shared by
     /// LSP handlers (hover, completion, definition, …) at a cursor position.
     ///
     /// Does not hold any Document lock: inputs (`tree`, `text`) must be pre-cloned,
     /// typically via `DocumentSnapshot`.
+    // Pre-cloned snapshot inputs (no Document lock) plus the boundary rule; a
+    // params struct would just relocate the list.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve_at_byte_offset(
         coordinator: &LanguageCoordinator,
@@ -591,9 +648,11 @@ impl InjectionResolver {
         injection_query: &Query,
         byte_offset: usize,
         incarnation: u64,
+        boundary: RegionBoundary,
     ) -> Option<ResolvedInjection> {
         let injections = collect_all_injections(&tree.root_node(), text, Some(injection_query))?;
-        let (_region_index, region) = find_injection_at_position(&injections, byte_offset)?;
+        let (_region_index, region) =
+            find_injection_at_position(&injections, byte_offset, text.len(), boundary)?;
         if region.combined {
             let group: Vec<_> = injections
                 .iter()
@@ -1848,6 +1907,7 @@ mod tests {
             &query,
             15,
             0,
+            RegionBoundary::HalfOpen,
         )
         .expect("comment position resolves");
 
@@ -2052,6 +2112,7 @@ mod tests {
             &query,
             22,
             0,
+            RegionBoundary::HalfOpen,
         );
         assert!(resolved.is_some(), "Should resolve injection");
         let region_id = resolved.unwrap().region.region_id;
@@ -2101,6 +2162,7 @@ mod tests {
             &query,
             byte_offsets[0],
             0,
+            RegionBoundary::HalfOpen,
         );
         let r2 = InjectionResolver::resolve_at_byte_offset(
             &coordinator,
@@ -2111,6 +2173,7 @@ mod tests {
             &query,
             byte_offsets[1],
             0,
+            RegionBoundary::HalfOpen,
         );
         let r3 = InjectionResolver::resolve_at_byte_offset(
             &coordinator,
@@ -2121,6 +2184,7 @@ mod tests {
             &query,
             byte_offsets[2],
             0,
+            RegionBoundary::HalfOpen,
         );
 
         // Each should have different ULIDs (different ordinals)
@@ -2161,6 +2225,7 @@ mod tests {
             &query,
             byte_offset,
             0,
+            RegionBoundary::HalfOpen,
         );
         let r2 = InjectionResolver::resolve_at_byte_offset(
             &coordinator,
@@ -2171,6 +2236,7 @@ mod tests {
             &query,
             byte_offset,
             0,
+            RegionBoundary::HalfOpen,
         );
 
         assert_eq!(
@@ -2325,7 +2391,12 @@ mod tests {
 
         // Test finding position inside first Lua block
         let lua1_byte = nodes[0].start_byte() + 1; // Inside first string
-        let result = find_injection_at_position(&injections, lua1_byte);
+        let result = find_injection_at_position(
+            &injections,
+            lua1_byte,
+            text.len(),
+            RegionBoundary::HalfOpen,
+        );
         assert!(result.is_some(), "Should find injection at lua1 position");
         let (idx, region) = result.unwrap();
         assert_eq!(idx, 0, "Should be at index 0");
@@ -2333,7 +2404,8 @@ mod tests {
 
         // Test finding position inside Python block
         let py_byte = nodes[1].start_byte() + 1;
-        let result = find_injection_at_position(&injections, py_byte);
+        let result =
+            find_injection_at_position(&injections, py_byte, text.len(), RegionBoundary::HalfOpen);
         assert!(result.is_some(), "Should find injection at python position");
         let (idx, region) = result.unwrap();
         assert_eq!(idx, 1, "Should be at index 1");
@@ -2341,7 +2413,12 @@ mod tests {
 
         // Test finding position inside second Lua block
         let lua2_byte = nodes[2].start_byte() + 1;
-        let result = find_injection_at_position(&injections, lua2_byte);
+        let result = find_injection_at_position(
+            &injections,
+            lua2_byte,
+            text.len(),
+            RegionBoundary::HalfOpen,
+        );
         assert!(result.is_some(), "Should find injection at lua2 position");
         let (idx, region) = result.unwrap();
         assert_eq!(idx, 2, "Should be at index 2");
@@ -2349,10 +2426,285 @@ mod tests {
 
         // Test position outside all injections
         let outside_byte = 5; // Position before any string
-        let result = find_injection_at_position(&injections, outside_byte);
+        let result = find_injection_at_position(
+            &injections,
+            outside_byte,
+            text.len(),
+            RegionBoundary::HalfOpen,
+        );
         assert!(
             result.is_none(),
             "Should not find injection outside regions"
+        );
+    }
+
+    /// The insert-mode caret at the end byte of a mid-line-ending region: the
+    /// default half-open rule keeps it outside (node-reference-protocol), but
+    /// `CaretEndFallback` — the mode caret-shaped methods like completion
+    /// request — must resolve the region the user is visibly typing at the
+    /// tail of.
+    #[test]
+    fn caret_end_fallback_resolves_mid_line_region_end() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let s = "git co"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let query_str = r#"
+            ((string_literal) @injection.content
+              (#set! injection.language "lua"))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("caret_end_mid_line");
+
+        // The string_literal node ends right before the `;`, mid-line.
+        let end = text.find(';').expect("statement end");
+        assert!(
+            InjectionResolver::resolve_at_byte_offset(
+                &coordinator,
+                &tracker,
+                &uri,
+                &tree,
+                text,
+                &query,
+                end,
+                0,
+                RegionBoundary::HalfOpen,
+            )
+            .is_none(),
+            "half-open must keep the end byte outside"
+        );
+        let resolved = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            end,
+            0,
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("caret fallback must resolve the mid-line region end");
+        assert_eq!(resolved.region.language, "lua");
+    }
+
+    /// A region ending at column 0 (fenced-block shape): the caret at that
+    /// byte sits on the closing fence line, the ADR's canonical "outside"
+    /// example. The fallback must NOT fire there — every caret position on the
+    /// block's last content line is already inside half-open.
+    #[test]
+    fn caret_end_fallback_keeps_fence_line_outside() {
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "```lua\nprint(1)\n```\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &md_language,
+            r#"
+                ((fenced_code_block
+                   (info_string (language) @injection.language)
+                   (code_fence_content) @injection.content))
+            "#,
+        )
+        .expect("valid query");
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("caret_end_fence");
+
+        // code_fence_content is "print(1)\n", ending at the start of the
+        // closing-fence line (column 0).
+        let fence_line_start = text.find("\n```").expect("closing fence") + 1;
+        assert!(
+            InjectionResolver::resolve_at_byte_offset(
+                &coordinator,
+                &tracker,
+                &uri,
+                &tree,
+                text,
+                &query,
+                fence_line_start,
+                0,
+                RegionBoundary::CaretEndFallback,
+            )
+            .is_none(),
+            "a column-0 region end is the closing fence — the fallback must not fire"
+        );
+        // Sanity: the last content byte still resolves under the fallback
+        // mode's half-open primary scan — the fallback must not break
+        // ordinary interior containment.
+        assert!(
+            InjectionResolver::resolve_at_byte_offset(
+                &coordinator,
+                &tracker,
+                &uri,
+                &tree,
+                text,
+                &query,
+                fence_line_start - 1,
+                0,
+                RegionBoundary::CaretEndFallback,
+            )
+            .is_some(),
+            "the newline before the fence is inside the region"
+        );
+    }
+
+    /// A region ending with a trailing newline AT EOF (an unclosed block whose
+    /// last typed character was Enter): the caret on the file's empty last
+    /// line is still *inside* the unclosed injection — there is no closing
+    /// fence line for the column-0 rule to protect. The end-of-document
+    /// exception (mirroring the ADR's `b == L && e == L` rule) must let the
+    /// fallback fire.
+    #[test]
+    fn caret_end_fallback_resolves_trailing_newline_region_at_eof() {
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        // Unclosed fence; the document ends right after the newline the user
+        // just typed, so the content node ends at EOF, column 0.
+        let text = "```lua\nprint(\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &md_language,
+            r#"
+                ((fenced_code_block
+                   (info_string (language) @injection.language)
+                   (code_fence_content) @injection.content))
+            "#,
+        )
+        .expect("valid query");
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("caret_end_eof_newline");
+
+        let resolved = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            text.len(),
+            0,
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("the caret on the empty last line of an unclosed block resolves");
+        assert_eq!(resolved.region.language, "lua");
+    }
+
+    /// At an adjacency `end(A) == start(B)`, half-open containment (B) must
+    /// keep winning under `CaretEndFallback` — the fallback only fires when no
+    /// region contains the byte at all.
+    #[test]
+    fn caret_end_fallback_prefers_containing_region_at_adjacency() {
+        let mut parser = create_rust_parser();
+        let text = "fn f(){}";
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+        // The `(` and `)` tokens touch: [4,5) and [5,6).
+        let a = root.descendant_for_byte_range(4, 5).expect("( token");
+        let b = root.descendant_for_byte_range(5, 6).expect(") token");
+        assert_eq!(a.end_byte(), b.start_byte(), "fixture regions must touch");
+
+        let injections = vec![
+            InjectionRegionInfo {
+                language: "lua".to_string(),
+                content_node: a,
+                pattern_index: 0,
+                include_children: false,
+                offset: None,
+                combined: false,
+                identity_slot: 0,
+            },
+            InjectionRegionInfo {
+                language: "python".to_string(),
+                content_node: b,
+                pattern_index: 0,
+                include_children: false,
+                offset: None,
+                combined: false,
+                identity_slot: 0,
+            },
+        ];
+
+        // byte 5 == end(A) == start(B): containment in B wins, not A's end.
+        let (_, region) = find_injection_at_position(
+            &injections,
+            5,
+            text.len(),
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("B contains byte 5");
+        assert_eq!(region.language, "python");
+
+        // byte 6 == end(B), mid-line, contained nowhere: the fallback fires.
+        let (_, region) = find_injection_at_position(
+            &injections,
+            6,
+            text.len(),
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("caret fallback at the trailing edge of B");
+        assert_eq!(region.language, "python");
+    }
+
+    /// NESTED regions sharing an end byte: the fallback scans in the same
+    /// sorted order as containment (start ascending), so the OUTERMOST region
+    /// wins — the tie-break the fallback comment and the ADR pin.
+    #[test]
+    fn caret_end_fallback_prefers_outermost_at_shared_end() {
+        let mut parser = create_rust_parser();
+        let text = "fn f(){}";
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+        // `parameters` "()" spans [4,6); its `)` child spans [5,6) — same end.
+        let outer = root.descendant_for_byte_range(4, 6).expect("parameters");
+        let inner = root.descendant_for_byte_range(5, 6).expect(") token");
+        assert_eq!(
+            outer.end_byte(),
+            inner.end_byte(),
+            "fixture must share the end"
+        );
+        assert!(
+            outer.start_byte() < inner.start_byte(),
+            "outer must start first"
+        );
+
+        // collect_all_injections sorts by (start, end, …) ascending — outer first.
+        let injections = vec![
+            InjectionRegionInfo {
+                language: "lua".to_string(),
+                content_node: outer,
+                pattern_index: 0,
+                include_children: false,
+                offset: None,
+                combined: false,
+                identity_slot: 0,
+            },
+            InjectionRegionInfo {
+                language: "python".to_string(),
+                content_node: inner,
+                pattern_index: 0,
+                include_children: false,
+                offset: None,
+                combined: false,
+                identity_slot: 0,
+            },
+        ];
+
+        let (_, region) = find_injection_at_position(
+            &injections,
+            6,
+            text.len(),
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("shared trailing edge resolves");
+        assert_eq!(
+            region.language, "lua",
+            "the outermost of the regions sharing the end byte must win"
         );
     }
 

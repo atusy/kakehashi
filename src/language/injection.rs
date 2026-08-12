@@ -24,7 +24,7 @@ pub(crate) use content::{
 };
 pub(crate) use discovery::{
     CacheableInjectionRegion, InjectionRegionInfo, InjectionResolver, REGION_IDENTITY_LAYER_BASE,
-    ResolvedInjection, collect_all_injections, collect_all_injections_cancellable,
+    RegionBoundary, ResolvedInjection, collect_all_injections, collect_all_injections_cancellable,
     detect_injection,
 };
 pub(crate) use offset::{InjectionOffset, effective_offset_for_pattern};

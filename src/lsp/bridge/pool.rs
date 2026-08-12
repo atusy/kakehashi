@@ -4600,6 +4600,7 @@ mod tests {
                 &config,
                 &host_uri,
                 host_position,
+                super::super::protocol::region_host_end("print('hello')", &RegionOffset::new(3, 0)),
                 "lua",
                 "region-0",
                 RegionOffset::new(3, 0),
@@ -4623,6 +4624,7 @@ mod tests {
                 &config,
                 &host_uri,
                 host_position,
+                super::super::protocol::region_host_end("print('hello')", &RegionOffset::new(3, 0)),
                 "lua",
                 "region-0",
                 RegionOffset::new(3, 0),
@@ -4674,6 +4676,7 @@ mod tests {
                 &config,
                 &host_uri,
                 host_position,
+                super::super::protocol::region_host_end("print('hello')", &RegionOffset::new(3, 0)),
                 "lua",
                 "region-0",
                 RegionOffset::new(3, 0),
@@ -4707,6 +4710,7 @@ mod tests {
                 &config,
                 &host_uri,
                 host_position,
+                super::super::protocol::region_host_end("print('hello')", &RegionOffset::new(3, 0)),
                 "lua",
                 "region-0",
                 RegionOffset::new(3, 0),
@@ -4749,6 +4753,7 @@ mod tests {
                 &config,
                 &host_uri,
                 host_position,
+                super::super::protocol::region_host_end("print('hello')", &RegionOffset::new(3, 0)),
                 "lua",
                 "region-0",
                 RegionOffset::new(3, 0),
@@ -4784,6 +4789,7 @@ mod tests {
                 &config,
                 &host_uri,
                 host_position,
+                super::super::protocol::region_host_end("print('world')", &RegionOffset::new(3, 0)),
                 "lua",
                 "region-0",
                 RegionOffset::new(3, 0),
@@ -5077,6 +5083,7 @@ mod tests {
                 &config,
                 &host_uri,
                 host_position,
+                super::super::protocol::region_host_end("print('hello')", &RegionOffset::new(3, 0)),
                 "lua",
                 TEST_ULID_LUA_0,
                 RegionOffset::new(3, 0),
@@ -5129,20 +5136,23 @@ mod tests {
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
         pool.open_host_incarnation(&host_uri, 1).await;
 
-        // First, send hover requests to establish connection and open virtual docs
-        // Use positions that are within the code block (position.line >= region_start_line)
+        // First, send hover requests to establish connection and open virtual docs.
+        // Positions must fall inside the virtual content's bounds (the dispatch
+        // rejects positions past the region's content end) — the content is a
+        // single line, so the position sits on each region's start line.
         let result = pool
             .send_hover_request(
                 "lua", // server_name
                 &config,
                 &host_uri,
                 tower_lsp_server::ls_types::Position {
-                    line: 4,
+                    line: 3,
                     character: 5,
                 },
+                super::super::protocol::region_host_end("print('hello')", &RegionOffset::new(3, 0)),
                 "lua",
                 TEST_ULID_LUA_0,
-                RegionOffset::new(3, 0), // region starts at line 3, position is at line 4, so virtual line = 1
+                RegionOffset::new(3, 0), // single-line region at line 3, virtual line = 0
                 "print('hello')",
                 Some(UpstreamId::Number(1)),
             )
@@ -5155,12 +5165,13 @@ mod tests {
                 &config,
                 &host_uri,
                 tower_lsp_server::ls_types::Position {
-                    line: 8,
+                    line: 7,
                     character: 5,
                 },
+                super::super::protocol::region_host_end("print('world')", &RegionOffset::new(7, 0)),
                 "lua",
                 TEST_ULID_LUA_1,
-                RegionOffset::new(7, 0), // region starts at line 7, position is at line 8, so virtual line = 1
+                RegionOffset::new(7, 0), // single-line region at line 7, virtual line = 0
                 "print('world')",
                 Some(UpstreamId::Number(2)),
             )
@@ -5194,6 +5205,101 @@ mod tests {
                 "Connection should remain Ready after close_host_document"
             );
         }
+    }
+
+    /// A position past the region's content end must abort at the dispatch
+    /// boundary: synthetic null result, and no virtual document opened on the
+    /// downstream server. Pins the trailing bound at the pool level — the
+    /// single-line content ends at host (3, 14), so (3, 20) has no virtual
+    /// coordinate. Without the bound, the request would forward a
+    /// beyond-EOF position and open the virtual document as a side effect.
+    #[tokio::test]
+    async fn position_past_region_end_aborts_without_opening_virtual_doc() {
+        if !is_lua_ls_available() {
+            return;
+        }
+
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let config = lua_ls_config();
+
+        let host_uri = Url::parse("file:///project/past_end.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        let result = pool
+            .send_hover_request(
+                "lua",
+                &config,
+                &host_uri,
+                tower_lsp_server::ls_types::Position {
+                    line: 3,
+                    character: 20,
+                },
+                super::super::protocol::region_host_end("print('hello')", &RegionOffset::new(3, 0)),
+                "lua",
+                TEST_ULID_LUA_0,
+                RegionOffset::new(3, 0),
+                "print('hello')",
+                Some(UpstreamId::Number(1)),
+            )
+            .await;
+        let hover = result.expect("past-end hover must not error");
+        assert!(
+            hover.is_none(),
+            "past-end hover must produce the synthetic null result"
+        );
+
+        let closed_docs = pool.close_host_document(&host_uri).await;
+        assert!(
+            closed_docs.is_empty(),
+            "no virtual document may be opened for a past-end request, got {}",
+            closed_docs.len()
+        );
+    }
+
+    /// prepareRename's rename-only capability fallback must not report a
+    /// past-end position as renameable: the trailing bound runs before the
+    /// fallback, so a caret past the region's content end yields None — a
+    /// phantom `DefaultBehavior` would win preferred aggregation and mask
+    /// real results from lower-priority layers.
+    #[tokio::test]
+    async fn prepare_rename_capability_fallback_respects_region_bounds() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let config = lua_ls_config();
+        let host_uri = Url::parse("file:///project/prepare_rename.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        // Ready fake connection advertising rename WITHOUT prepareRename —
+        // the shape that takes the DefaultBehavior shortcut.
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities {
+            rename_provider: Some(tower_lsp_server::ls_types::OneOf::Left(true)),
+            ..Default::default()
+        });
+        pool.insert_connection(handle).await;
+
+        // Single-line content ends at host (3, 14); (3, 20) is past it.
+        let result = pool
+            .send_prepare_rename_request(
+                "lua",
+                &config,
+                &host_uri,
+                tower_lsp_server::ls_types::Position {
+                    line: 3,
+                    character: 20,
+                },
+                super::super::protocol::region_host_end("print('hello')", &RegionOffset::new(3, 0)),
+                "lua",
+                TEST_ULID_LUA_0,
+                RegionOffset::new(3, 0),
+                "print('hello')",
+                Some(UpstreamId::Number(1)),
+            )
+            .await;
+        assert!(
+            matches!(result, Ok(None)),
+            "a past-end caret must not be reported renameable, got {result:?}"
+        );
     }
 
     /// Test that forward_didchange_to_opened_docs completes quickly with channel-based sending.
@@ -6078,6 +6184,7 @@ mod tests {
                 &config,
                 &host_uri,
                 host_position,
+                super::super::protocol::region_host_end("print('hello')", &RegionOffset::new(3, 0)),
                 "lua",
                 "region-0",
                 RegionOffset::new(3, 0),
@@ -6101,6 +6208,7 @@ mod tests {
                 &config,
                 &host_uri,
                 host_position,
+                super::super::protocol::region_host_end("print('hello')", &RegionOffset::new(3, 0)),
                 "lua",
                 "region-0",
                 RegionOffset::new(3, 0),

@@ -25,7 +25,7 @@ use url::Url;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
-    build_text_document_position_params, region_host_end,
+    build_text_document_position_params,
 };
 use super::formatting::{count_lines, transform_formatting_response_to_host};
 
@@ -42,6 +42,7 @@ impl LanguageServerPool {
         server_config: &BridgeServerConfig,
         host_uri: &Url,
         host_position: Position,
+        region_end: Position,
         ch: &str,
         options: FormattingOptions,
         injection_language: &str,
@@ -81,7 +82,6 @@ impl LanguageServerPool {
             return Ok(None);
         }
         let virtual_line_count = count_lines(virtual_content);
-        let region_end = region_host_end(virtual_content, &offset);
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -91,6 +91,7 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             host_position,
+            region_end,
             "textDocument/onTypeFormatting",
             |virtual_uri, request_id| {
                 build_on_type_formatting_request(

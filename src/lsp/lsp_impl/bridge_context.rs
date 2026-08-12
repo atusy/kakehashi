@@ -71,6 +71,63 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
     )
 }
 
+/// The region-boundary rule a method's position resolves under.
+///
+/// Caret-shaped methods — whose request position is the insert-mode caret,
+/// sitting *after* the last typed character — resolve with
+/// [`RegionBoundary::CaretEndFallback`]: for an injection region ending
+/// mid-line that caret is exactly the region's end byte, outside the default
+/// half-open containment, and strict resolution would route the request away
+/// from the injection the user is typing in (a `vim` `!cmd`, an embedded
+/// string). Point-shaped methods (hover, definition, documentHighlight, …)
+/// keep strict [`RegionBoundary::HalfOpen`] containment per
+/// node-reference-protocol § Half-Open Intervals.
+///
+/// This returns the boundary itself (rather than a boolean the caller
+/// branches on) so the unit test pins the exact value the preamble passes to
+/// resolution — there is no untested branch between the tested function and
+/// the resolve call.
+///
+/// [`RegionBoundary::CaretEndFallback`]: crate::language::injection::RegionBoundary::CaretEndFallback
+/// [`RegionBoundary::HalfOpen`]: crate::language::injection::RegionBoundary::HalfOpen
+fn region_boundary_for_method(method: &str) -> crate::language::injection::RegionBoundary {
+    use crate::language::injection::RegionBoundary;
+    match method {
+        "textDocument/completion"
+        | "textDocument/signatureHelp"
+        | "textDocument/linkedEditingRange"
+        | "textDocument/onTypeFormatting" => RegionBoundary::CaretEndFallback,
+        _ => RegionBoundary::HalfOpen,
+    }
+}
+
+/// Apply the LSP position defense to one client-supplied position: a
+/// `character` past its line's end defaults back to the line length (LSP
+/// 3.18), re-derived through the byte mapping so the caller sees the defended
+/// location; a `line` past the document's end has no such spec default and
+/// yields `None` (an invalid position, not a defended one).
+fn normalize_client_position(mapper: &PositionMapper, position: Position) -> Option<Position> {
+    let byte = mapper.position_to_byte_clamped(position);
+    let normalized = mapper.byte_to_position(byte)?;
+    (normalized.line == position.line).then_some(normalized)
+}
+
+/// The range-endpoint defense: unlike a caret ([`normalize_client_position`]),
+/// range endpoints are BOUNDS — a line past the document's end clamps to the
+/// document end rather than rejecting, because the whole-document idiom
+/// `(0,0)..(u32::MAX, u32::MAX)` (codeActionsOnSave and friends) is a valid
+/// request whose intent is "everything". Over-long characters still clamp
+/// within their own lines. The end is floored at the start so a degenerate
+/// all-overlong input stays well-formed.
+fn normalize_range_endpoints(mapper: &PositionMapper, range: Range) -> Option<Range> {
+    let start = mapper.byte_to_position(mapper.position_to_byte_clamped(range.start))?;
+    let end = mapper.byte_to_position(mapper.position_to_byte_clamped(range.end))?;
+    Some(Range {
+        start,
+        end: end.max(start),
+    })
+}
+
 /// RAII sweep of the upstream-request registry for one request id: on drop,
 /// removes every entry a dropped/aborted layer future did not get to
 /// unregister itself. Idempotent with the arms' own refcounted unregisters.
@@ -110,6 +167,12 @@ pub(crate) struct DocumentRequestContext {
     pub(crate) uri: Url,
     /// The resolved injection region with virtual content and region metadata.
     pub(crate) resolved: ResolvedInjection,
+    /// The region's end-of-content in host coordinates, when the producing
+    /// path already derived it (the position/range preamble derives it for
+    /// the bounds precheck). `None` on paths that never need it (diagnostics,
+    /// whole-document fan-outs) — deriving it is O(virtual_content), so it is
+    /// carried, not recomputed; the fan-out seeds its shared cell from this.
+    pub(crate) region_end: Option<Position>,
     /// All matching bridge server configs for this injection language.
     pub(crate) configs: Vec<ResolvedServerConfig>,
     /// The upstream JSON-RPC request ID for cancel forwarding.
@@ -192,6 +255,9 @@ struct PreambleResult {
     resolved: ResolvedInjection,
     language_name: String,
     upstream_request_id: Option<UpstreamId>,
+    /// End-of-content derived for the bounds precheck, carried so no later
+    /// stage re-derives it.
+    region_end: Position,
 }
 
 fn resolve_bridge_language_config_from_settings(
@@ -699,12 +765,20 @@ impl Kakehashi {
     ///
     /// Returns `None` for any early-exit condition (invalid URI, no document,
     /// no language, no injection at position).
+    /// Returns the preamble plus the NORMALIZED position: per LSP 3.18 a
+    /// `character` past the line's end defaults back to the line length
+    /// rather than failing, so the byte lookup, the bounds precheck, and the
+    /// downstream dispatch must all see the same defended position —
+    /// position-based callers thread it into their request context in place
+    /// of the client's raw position. A `line` past the document's end has no
+    /// such spec default and is REJECTED (no virtual context).
     fn resolve_bridge_preamble(
         &self,
         lsp_uri: &Uri,
         position: Position,
+        range_end: Option<Position>,
         method_name: &str,
-    ) -> Option<PreambleResult> {
+    ) -> Option<(PreambleResult, Position, Option<Position>)> {
         // Convert ls_types::Uri to url::Url for internal use
         let Ok(uri) = uri_to_url(lsp_uri) else {
             log::warn!("Invalid URI in {}: {}", method_name, lsp_uri.as_str());
@@ -748,9 +822,23 @@ impl Kakehashi {
         // Get injection query to detect injection regions
         let injection_query = self.language.injection_query(&language_name)?;
 
-        // Resolve injection region at position
+        // Resolve injection region at position, after the LSP position
+        // defense (see [`normalize_client_position`]): the clamp also keeps
+        // an over-long column from spilling into a later line's bytes and
+        // containment-matching a region the caret is not visually in, and
+        // every later consumer sees the defended location, not the client's
+        // raw one. A range request's end gets the identical defense with the
+        // same mapper.
         let mapper = PositionMapper::new(snapshot.text());
+        let position = normalize_client_position(&mapper, position)?;
         let byte_offset = mapper.position_to_byte(position)?;
+        // The range END is a bound, not a caret: clamp a past-EOF line to the
+        // document end (see `normalize_range_endpoints`) instead of rejecting
+        // the whole request.
+        let range_end = match range_end {
+            None => None,
+            Some(end) => Some(mapper.byte_to_position(mapper.position_to_byte_clamped(end))?),
+        };
 
         let Some(resolved) = crate::language::InjectionResolver::resolve_at_byte_offset(
             &self.language,
@@ -761,6 +849,7 @@ impl Kakehashi {
             injection_query.as_ref(),
             byte_offset,
             snapshot.incarnation(),
+            region_boundary_for_method(method_name),
         ) else {
             // Not in an injection region - return None
             return None;
@@ -770,15 +859,49 @@ impl Kakehashi {
             return None;
         }
 
+        // Bounds precheck at the resolution choke point: a position inside the
+        // raw capture but outside the extracted content (excluded trailing
+        // children, `#offset!` trims) would otherwise be rejected only
+        // per-server by the dispatch guard — after every fan-out arm has
+        // acquired (possibly spawned) its connection. Rejecting here keeps the
+        // virt layer silent without touching any connection. The dispatch
+        // guard stays: it covers callers that bypass this preamble
+        // (stored-region paths) and remains the stale-race backstop.
+        let precheck_offset = crate::lsp::bridge::RegionOffset::with_per_line_offsets(
+            resolved.region.line_range.start,
+            resolved.line_column_offsets.clone(),
+        );
+        let region_end =
+            crate::lsp::bridge::region_host_end(&resolved.virtual_content, &precheck_offset);
+        if !crate::lsp::bridge::host_position_within_region_bounds(
+            position,
+            &precheck_offset,
+            region_end,
+        ) {
+            log::debug!(
+                "{}: position (line {}, char {}) is outside the region's content bounds; \
+                 skipping the virt layer",
+                method_name,
+                position.line,
+                position.character,
+            );
+            return None;
+        }
+
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
         let upstream_request_id = current_upstream_id();
 
-        Some(PreambleResult {
-            uri,
-            resolved,
-            language_name,
-            upstream_request_id,
-        })
+        Some((
+            PreambleResult {
+                uri,
+                resolved,
+                language_name,
+                upstream_request_id,
+                region_end,
+            },
+            position,
+            range_end,
+        ))
     }
 
     /// Resolve the cross-layer config (cross-layer-aggregation) for a host
@@ -920,6 +1043,7 @@ impl Kakehashi {
         Some(DocumentRequestContext {
             uri: preamble.uri,
             resolved: preamble.resolved,
+            region_end: Some(preamble.region_end),
             configs,
             upstream_request_id: preamble.upstream_request_id,
             priorities: agg.priorities,
@@ -1319,7 +1443,8 @@ impl Kakehashi {
         // request (hover / definition / completion / …) issued in the reparse window
         // would find `snapshot()` empty and return null after every edit.
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
-        let preamble = self.resolve_bridge_preamble(lsp_uri, position, method_name)?;
+        let (preamble, position, _) =
+            self.resolve_bridge_preamble(lsp_uri, position, None, method_name)?;
         let document = self
             .preamble_to_document_context(preamble, method_name)
             .await?;
@@ -1346,11 +1471,22 @@ impl Kakehashi {
         method_name: &str,
     ) -> Option<RangeRequestContext> {
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
-        let preamble = self.resolve_bridge_preamble(lsp_uri, range.start, method_name)?;
+        let (preamble, start, end) =
+            self.resolve_bridge_preamble(lsp_uri, range.start, Some(range.end), method_name)?;
         let document = self
             .preamble_to_document_context(preamble, method_name)
             .await?;
 
+        // Dispatch must see the same defended endpoints the region was
+        // resolved with — this path (inlay hints, color presentations)
+        // forwards the range verbatim, with no later clamp. Both endpoints
+        // are normalized by the preamble; `max` keeps the range well-formed
+        // even for a degenerate all-overlong input.
+        let end = end.unwrap_or(range.end);
+        let range = Range {
+            start,
+            end: end.max(start),
+        };
         Some(RangeRequestContext { document, range })
     }
 
@@ -1418,6 +1554,16 @@ impl Kakehashi {
         let upstream_request_id = current_upstream_id();
 
         let mapper = PositionMapper::new(snapshot.text());
+        // The same LSP position defense the single-region preamble applies:
+        // an over-long `character` defaults to its line's end; an endpoint
+        // whose line does not exist means an invalid range (no regions). This
+        // path never goes through `resolve_bridge_preamble`, so without it a
+        // raw over-long offset would survive `clamp_range_to_region` (which
+        // bounds by the region's ends, not the line's) and reach the
+        // downstream server as an invalid virtual coordinate.
+        let Some(range) = normalize_range_endpoints(&mapper, range) else {
+            return Vec::new();
+        };
         let mut contexts = Vec::new();
         for resolved in regions {
             if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
@@ -1431,6 +1577,13 @@ impl Kakehashi {
 
             let preamble = PreambleResult {
                 uri: uri.clone(),
+                region_end: crate::lsp::bridge::region_host_end(
+                    &resolved.virtual_content,
+                    &crate::lsp::bridge::RegionOffset::with_per_line_offsets(
+                        resolved.region.line_range.start,
+                        resolved.line_column_offsets.clone(),
+                    ),
+                ),
                 resolved,
                 language_name: language_name.clone(),
                 upstream_request_id: upstream_request_id.clone(),
@@ -2759,6 +2912,120 @@ mod tests {
             "textDocument/signatureHelp",
         ] {
             assert!(!method_requires_contiguous_injection(method), "{method}");
+        }
+    }
+
+    /// Range endpoints are bounds, not carets: the whole-document idiom
+    /// `(0,0)..(u32::MAX, u32::MAX)` (codeActionsOnSave and friends) must
+    /// clamp to the document end, never reject — rejection would silently
+    /// disable the virt layer for exactly those flows.
+    #[test]
+    fn range_endpoints_clamp_rather_than_reject() {
+        let mapper = PositionMapper::new("ab\ncd\n");
+        let range = normalize_range_endpoints(
+            &mapper,
+            Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: u32::MAX,
+                    character: u32::MAX,
+                },
+            },
+        )
+        .expect("a whole-document range is valid");
+        assert_eq!(
+            range.end,
+            Position {
+                line: 2,
+                character: 0
+            },
+            "an end past EOF clamps to the document end"
+        );
+        // An over-long character clamps within its own line.
+        let range = normalize_range_endpoints(
+            &mapper,
+            Range {
+                start: Position {
+                    line: 0,
+                    character: 99,
+                },
+                end: Position {
+                    line: 1,
+                    character: 99,
+                },
+            },
+        )
+        .expect("in-document lines are valid");
+        assert_eq!(
+            (range.start.character, range.end.character),
+            (2, 2),
+            "over-long characters clamp to their lines' ends"
+        );
+    }
+
+    /// The caret defense stays strict: a line past the document's end has no
+    /// LSP default and must reject, while the character clamp applies.
+    #[test]
+    fn caret_position_rejects_line_past_eof() {
+        let mapper = PositionMapper::new("ab\n");
+        assert!(
+            normalize_client_position(
+                &mapper,
+                Position {
+                    line: 5,
+                    character: 0
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(
+            normalize_client_position(
+                &mapper,
+                Position {
+                    line: 0,
+                    character: 99
+                }
+            ),
+            Some(Position {
+                line: 0,
+                character: 2
+            })
+        );
+    }
+
+    #[test]
+    fn caret_shaped_methods_resolve_with_caret_end_fallback() {
+        use crate::language::injection::RegionBoundary;
+        for method in [
+            "textDocument/completion",
+            "textDocument/signatureHelp",
+            "textDocument/linkedEditingRange",
+            // onTypeFormatting has no point-invocation mode at all: its
+            // position is the caret right after the typed trigger character.
+            "textDocument/onTypeFormatting",
+        ] {
+            assert_eq!(
+                region_boundary_for_method(method),
+                RegionBoundary::CaretEndFallback,
+                "{method}"
+            );
+        }
+        // Point-shaped methods keep strict half-open containment.
+        for method in [
+            "textDocument/definition",
+            "textDocument/hover",
+            "textDocument/references",
+            "textDocument/documentHighlight",
+            "textDocument/rename",
+        ] {
+            assert_eq!(
+                region_boundary_for_method(method),
+                RegionBoundary::HalfOpen,
+                "{method}"
+            );
         }
     }
 

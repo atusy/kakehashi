@@ -71,6 +71,7 @@ pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::RequestId;
 pub(crate) use protocol::VirtualDocumentUri;
 pub(crate) use protocol::decode_command;
+pub(crate) use protocol::host_position_within_region_bounds;
 pub(crate) use protocol::location_link_to_location;
 pub(crate) use protocol::region_host_end;
 pub(crate) use protocol::strip_bridge_local_versions;
@@ -127,6 +128,10 @@ mod tests {
                 &server_config,
                 &host_uri,
                 host_position,
+                Position {
+                    line: 5,
+                    character: 3,
+                },
                 "lua",
                 "region-0",
                 RegionOffset::new(3, 0),
@@ -162,6 +167,10 @@ mod tests {
                 &server_config,
                 &host_uri,
                 host_position,
+                Position {
+                    line: 3,
+                    character: 3,
+                },
                 "lua",
                 "region-0",
                 RegionOffset::new(3, 0),

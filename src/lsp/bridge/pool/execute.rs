@@ -15,7 +15,7 @@ use url::Url;
 use super::{ConnectionHandle, ConnectionHandleSender, LanguageServerPool, UpstreamId};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region_bounds,
 };
 
 /// Context provided to response transformers during bridge request execution.
@@ -263,10 +263,13 @@ impl LanguageServerPool {
     /// Like [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle)
     /// but for position-based requests (hover, completion, definition, …): aborts
     /// before contacting the downstream server when `host_position` falls outside
-    /// the injection region — either *above* its start line, or on the start line
-    /// but *before* its start column (e.g. the cursor is on the markdown fence
-    /// backticks or inside a blockquote `> ` prefix). See
-    /// [`host_position_within_region`].
+    /// the *snapshotted* injection region — *above* its start line, on the
+    /// start line but *before* its start column (e.g. the cursor is on the
+    /// markdown fence backticks or inside a blockquote `> ` prefix), or *past*
+    /// the region's end-of-content (a caret inside a trailing child the query
+    /// excluded). The bound is snapshot-scoped — see the comment at the guard
+    /// below for the in-flight-edit window it does not cover — and checked by
+    /// [`host_position_within_region_bounds`].
     ///
     /// Translating an out-of-region position would silently mistranslate it
     /// (clamping line and/or character via `saturating_sub`) and forward
@@ -277,8 +280,9 @@ impl LanguageServerPool {
     ///
     /// A line *above* the region almost certainly means stale region data (a
     /// concurrent host edit) and is logged at `warn`; a position merely before
-    /// the start column is a normal cursor location outside the content and is
-    /// logged at `debug` to avoid flooding logs during ordinary editing.
+    /// a region line's content start column, or past the region's content end,
+    /// is a normal cursor location outside the content and is logged at
+    /// `debug` to avoid flooding logs during ordinary editing.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_position_bridge_request_with_handle<T, P: serde::Serialize>(
         &self,
@@ -290,11 +294,24 @@ impl LanguageServerPool {
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
         host_position: Position,
+        region_end: Position,
         method: &'static str,
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
     ) -> io::Result<T> {
-        if !host_position_within_region(host_position, offset) {
+        // `region_end` is `region_host_end(virtual_content, offset)`, derived
+        // once per request by the fan-out (deriving it is O(virtual_content))
+        // and shared by every arm. The bound is SNAPSHOT-scoped, not
+        // wire-scoped: `virtual_content` and `offset` come from the
+        // preamble's document snapshot, while the open path
+        // (`ensure_document_opened`) deliberately substitutes the latest
+        // published content at enqueue time so later didChanges serialize
+        // behind a current didOpen. An edit landing between the snapshot and
+        // the enqueue can therefore still put this (validated) position past
+        // the content actually opened — the same in-flight staleness every
+        // LSP position request has, which downstream servers clamp. Closing
+        // it needs generation-bound opens (issue #996).
+        if !host_position_within_region_bounds(host_position, offset, region_end) {
             if host_position.line < offset.line() {
                 // Line above the region → almost certainly stale region data
                 // (a concurrent host edit shifted the region). Unexpected.
@@ -305,10 +322,22 @@ impl LanguageServerPool {
                     host_position.line,
                     offset.line(),
                 );
+            } else if host_position > region_end {
+                // Past the region's end-of-content: no virtual coordinate
+                // exists for it (end-of-content itself is accepted, inclusive).
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "{method}: host position (line {}, char {}) is past the region's content \
+                     end (line {}, char {}); aborting request",
+                    host_position.line,
+                    host_position.character,
+                    region_end.line,
+                    region_end.character,
+                );
             } else {
-                // On the start line but left of the start column (fence backticks,
-                // blockquote prefix). A normal cursor location just outside the
-                // injected content — debug, not warn.
+                // On a region line but left of that line's content start
+                // column (fence backticks, blockquote prefix). A normal cursor
+                // location just outside the injected content — debug, not warn.
                 let virtual_line = host_position.line - offset.line();
                 log::debug!(
                     target: "kakehashi::bridge",
@@ -334,7 +363,7 @@ impl LanguageServerPool {
             ));
         }
 
-        self.execute_bridge_request_with_handle(
+        self.execute_bridge_request_observed(
             handle,
             host_uri,
             injection_language,
@@ -344,6 +373,7 @@ impl LanguageServerPool {
             upstream_request_id,
             build_request,
             transform_response,
+            None,
         )
         .await
     }
@@ -355,6 +385,7 @@ mod tests {
     use crate::lsp::bridge::pool::ConnectionKey;
     use crate::lsp::bridge::pool::ConnectionState;
     use crate::lsp::bridge::pool::test_helpers::*;
+    use crate::lsp::bridge::protocol::region_host_end;
     use std::sync::Arc;
 
     fn start_observed_request(
@@ -525,6 +556,7 @@ mod tests {
                     line: 0,
                     character: 0,
                 },
+                region_host_end("print('hello')", &RegionOffset::new(0, 0)),
                 "lua",
                 TEST_ULID_LUA_0,
                 RegionOffset::new(0, 0),
@@ -583,6 +615,7 @@ mod tests {
                     line: 2,
                     character: 0,
                 },
+                region_host_end("print('hello')", &RegionOffset::new(10, 0)),
                 "lua",
                 TEST_ULID_LUA_0,
                 RegionOffset::new(10, 0),
@@ -637,6 +670,7 @@ mod tests {
                     line: 10,
                     character: 1,
                 },
+                region_host_end("print('hello')", &RegionOffset::new(10, 4)),
                 "lua",
                 TEST_ULID_LUA_0,
                 RegionOffset::new(10, 4),
