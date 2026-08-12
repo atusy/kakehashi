@@ -82,6 +82,12 @@ type RoutingParams = {
   // for the host-layer decision, the region's VIRTUAL URI for an
   // injection decision — paired with that document's languageId.
   textDocument: { uri: string; languageId: string };
+  // Present exactly for injection decisions: the real URI of the host
+  // document the region lives in — the identity a provider's
+  // project/path-based routing reasons about, since the virtual URI is
+  // opaque and the editor-facing correlation methods are not
+  // registered on downstream connections.
+  hostUri?: string;
   // Which decision this is. The host-layer and injection-layer decisions
   // are distinct even when languageId coincides (lua-in-lua,
   // markdown-in-markdown): they read different aggregation entries, sit
@@ -124,11 +130,12 @@ type RoutingResult = null | {
   pairing of bridge-client-control-protocol's `OpenDocument` result type.
   A virtual URI is **contractually opaque** to providers, exactly as that
   protocol's client ids are to editors: treat it as an identity token,
-  never parse its rendering, which may change between kakehashi versions
-  — a provider that needs the host document behind a virtual URI
-  correlates through `kakehashi/bridge/client/documents`, whose
-  `OpenDocument` rows carry `uri` + `hostUri`. (A `hostUri` field on this
-  request stays deferred, additively.)
+  never parse its rendering, which may change between kakehashi versions.
+  `hostUri` is what makes an injection decision *decidable*: the
+  editor-facing control methods are not registered on downstream
+  connections (per-side dispatch, below), so a provider has no other way
+  to associate an opaque region with its host, and project/path-based
+  routing reasons from the host's real URI.
 - `languageServers` is a **projection**, not the configuration. Only
   `languages`, `workspaceMarkers`, and `preferSharedInstance` are sent —
   the fields a routing decision can use (`preferSharedInstance` is what
@@ -1317,9 +1324,9 @@ a slot a routing provider left in play.
 - Routing is pull-only and non-retroactive: a document's decision can be
   stale for its whole open lifetime as project state moves under it; the
   provider has no way to say so (deferred invalidation notification),
-  and an open document keeps its route binding until close/re-open (an
-  injection tuple: until its language leaves the document; the
-  abnormal-finalization exception aside) even when a newer provider
+  and each bridged document keeps its route binding until it closes —
+  for a region, until that region leaves or the host closes (the
+  abnormal-finalization exception aside) — even when a newer provider
   would decide differently.
 - Under the default `priorities = ["*"]`, a server upgrade that adds the
   advertisement silently promotes an installed server to routing
@@ -1457,7 +1464,7 @@ a slot a routing provider left in play.
 | **Method** | `kakehashi/bridge/routing`, kakehashi→downstream request; dispatch strictly per side |
 | **Decision unit** | one query per bridged document (host, and each virtual document); `textDocument = { uri: as the downstream sees it, languageId }` + `layer`; per-region volume user-controllable via bridge `enabled = false` / routing `priorities = []` |
 | **Params** | `textDocument` + `layer` + `languageServers` projection `{languages, workspaceMarkers, preferSharedInstance}` of spawnable, language-matching servers (`_` excluded) |
-| **Answer** | `null`/missing entry/absent `enabled` = kakehashi decides; `enabled: false` = per-document `didOpen` suppression at the routing gate; non-empty `workspaceFolders` = root override; `[]` invalid in v1 |
+| **Answer** | `null`/missing entry/absent `enabled` = kakehashi decides; `enabled: false` = per-document `didOpen` suppression at the routing gate; non-empty `workspaceFolders` = root override; `[]` = rootless route to the server's `#shared` connection |
 | **Precedence** | membership: stopped set > configuration > answer (subtract only); root: answer overrides marker resolution, both resolved keys checked against the stopped set |
 | **Trust** | providers are trusted-by-configuration; folder overrides bounded to canonicalized `file:` URIs at-or-below client workspace folders or the config-resolved root, count-capped |
 | **Folders↔Key** | shared instance: union-only join; per-root: first element, rest warned+ignored; at most one connection per server name per document |
