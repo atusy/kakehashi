@@ -14,7 +14,7 @@ pub(crate) mod user;
 
 pub use expand::{set_config_file_override, set_data_dir_override};
 pub(crate) use merge::{
-    is_server_spawnable, merge_aggregation_configs, merge_bridge_language_configs,
+    is_server_spawnable, merge_bridge_language_configs,
     merge_bridge_server_configs, merge_layer_aggregation_configs, merge_workspace_settings,
     resolve_with_wildcard,
 };
@@ -211,7 +211,7 @@ fn strip_inherited_aggregation_map(
 
     for (method, current_config) in current {
         let inherited_config =
-            inherited.and_then(|base| settings::resolve_aggregation_in_map(base, method));
+            inherited.and_then(|base| merge::resolve_aggregation_for_method(base, method));
 
         let stripped_config = match inherited_config {
             Some(base) => strip_inherited_aggregation_config(&base, current_config),

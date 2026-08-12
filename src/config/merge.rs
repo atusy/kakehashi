@@ -28,6 +28,37 @@ pub(crate) fn resolve_with_wildcard<V: Clone>(
     }
 }
 
+/// Resolve one method's entry out of an `aggregation` map, applying the map's
+/// `"_"` method wildcard — except for
+/// [`BRIDGE_ROUTING_METHOD`](super::settings::BRIDGE_ROUTING_METHOD), which reads its
+/// own key or nothing.
+///
+/// The exemption is deliberate (bridge-routing-protocol). Every
+/// `aggregation."_"` entry written before routing existed is an LSP fan-out
+/// allowlist naming *language servers*; inheriting one at the routing key
+/// would exclude every dedicated routing provider from routing for that
+/// language, turning the protocol off with no signal. The inverse is the
+/// recorded cost: a deliberate global allowlist or kill switch at
+/// `aggregation."_"` does not gate routing either.
+///
+/// Both the runtime lookup and the config round-trip's inherited-value
+/// stripping resolve through here, and must — a routing entry that merely
+/// *equals* the `"_"` entry would otherwise be stripped as redundant on
+/// serialization and come back meaning something else.
+///
+/// This is the method axis only. The language axis is untouched: a `bridge._`
+/// entry still supplies the routing key to `bridge.<lang>` like any other,
+/// through [`merge_bridge_language_configs`].
+pub(crate) fn resolve_aggregation_for_method(
+    map: &HashMap<String, AggregationConfig>,
+    method: &str,
+) -> Option<AggregationConfig> {
+    if method == super::settings::BRIDGE_ROUTING_METHOD {
+        return map.get(method).cloned();
+    }
+    resolve_with_wildcard(map, method, merge_aggregation_configs)
+}
+
 /// Cheaply checks whether `name`'s effective config is spawnable (non-empty
 /// `cmd` AND enabled), resolving `_` wildcard inheritance via
 /// [`BridgeServerConfig::is_spawnable_with_wildcard`] without cloning or
