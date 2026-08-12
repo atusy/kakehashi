@@ -594,8 +594,10 @@ and their waits (ls-bridge-graceful-shutdown § Unconfirmed termination).
   resolved roots kept verbatim), and — provided the replacement still supports
   workspace folders — the re-open sweep re-adds and announces them
   before that document's `didOpen`; a replacement the capability
-  fallback downgraded gets neither, and the bound route reads not
-  applicable per that decision. A `#shared` key
+  fallback downgraded gets neither for a binding **with retained
+  folders**, whose route reads not applicable per that decision, while
+  a rootless `[]` binding retains none, needs no announcement, and
+  reopens on `#shared` untouched. A `#shared` key
   carries no root, and the old handle's accumulated folder set dies with
   it. Because no triggering document exists to resolve a marker root — the
   existing acquire path cannot revive a dead shared key without one — the
