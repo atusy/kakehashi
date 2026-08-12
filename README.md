@@ -11,11 +11,11 @@ kakehashi is a bridge (架け橋) across your editors, your languages, and the l
 ```mermaid
 flowchart TB
     subgraph K["🌉 kakehashi"]
-        B["Builtin smart features<br>semantic tokens, smart selection,<br>and more"]
+        B["Builtin smart features"]
     end
 
-    K <-->|Highlighting, selection,<br>and more — everywhere| E["Your editor<br>(any LSP client)"]
-    K <-.->|The additional smarts of<br>real language servers| LS["pyright, rust-analyzer,<br>and friends"]
+    K <-->|Highlighting, selection, and more — everywhere| E["Your editor (any LSP client)"]
+    K <-.->|The additional smarts of real language servers| LS["pyright, rust-analyzer, and friends"]
 ```
 
 ## 🎨 Highlighting & smart selection, for any language
