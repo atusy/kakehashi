@@ -227,6 +227,15 @@ pub(super) async fn apply_shared_settings_locked(
         .pool()
         .set_log_message_level(settings.features.window_log_message)
         .await;
+    // Supersede in-flight warm-ups BEFORE propagation, not with the pass that
+    // launches the new ones. An acquire carrying the previous application's
+    // configuration is admitted for as long as its generation is current, so
+    // one holding the pool lock in the gap between propagation and the warm-up
+    // pass would install a connection propagation has already walked past —
+    // and if this application removed that server, nothing would evict it
+    // until some later application ran. Claiming the generation up front makes
+    // the whole of this application a no-admittance window for stale acquires.
+    bridge.supersede_force_start();
     // Path c: apply downstream config at this single reload choke point
     // (initialize, didChangeConfiguration, auto-install reload): push runtime
     // settings in place and recycle connections whose launch config changed.

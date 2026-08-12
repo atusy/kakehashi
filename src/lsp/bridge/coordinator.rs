@@ -374,6 +374,19 @@ impl BridgeCoordinator {
     /// observable once routing decisions and their bindings exist, and buying
     /// it now would mean either blocking publication on process startup or a
     /// third acquire variant with no caller to justify it.
+    /// Retire every in-flight warm-up acquire, without launching new ones.
+    ///
+    /// Call this at the *start* of a settings application, before anything
+    /// that walks the connection map. An acquire is admitted for as long as
+    /// its generation is current, so retiring them only when the new warm-ups
+    /// launch would leave a window — after propagation, before the pass — in
+    /// which a stale acquire can still install a connection propagation has
+    /// already walked past.
+    pub(crate) fn supersede_force_start(&self) {
+        self.force_start_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn force_start_servers(&self, settings: &WorkspaceSettings) -> usize {
         use std::sync::atomic::Ordering;
 
@@ -381,7 +394,9 @@ impl BridgeCoordinator {
         let wildcard = servers.get(crate::config::WILDCARD_KEY);
         // Claim this pass's generation before launching anything, so every
         // task it spawns can tell whether it still speaks for the current
-        // configuration by the time it reaches the pool.
+        // configuration by the time it reaches the pool. A caller that
+        // superseded earlier in the same transaction claims again here, which
+        // is harmless: only the newest value admits anything.
         let generation = self.force_start_generation.fetch_add(1, Ordering::Relaxed) + 1;
         // Deterministic order, so the log reads the same way every session
         // where the config map's iteration order would not. It orders the
