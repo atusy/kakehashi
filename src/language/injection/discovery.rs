@@ -608,10 +608,14 @@ fn find_injection_at_position<'a>(
             // worth fusing into one pass.
             injections.iter().enumerate().find(|(_, inj)| {
                 let range = effective_content_range(inj, text);
-                // A collapsed effective range has no trailing edge to sit on;
-                // half-open rejects it implicitly, the fallback must say so.
-                range.start < range.end
-                    && range.end == byte_offset
+                // No `start < end` condition: a region an `#offset!` collapses
+                // to zero width is still routable at the byte it collapses to.
+                // That position IS the whole (empty) injection — the first
+                // keystroke inside a block the user just opened — and the
+                // resolved virtual document is empty, so the caret maps to a
+                // valid (0, 0). Half-open declines it by arithmetic alone,
+                // which is the right answer there: no character to hover.
+                range.end == byte_offset
                     && (ends_mid_line(text, range.end) || byte_offset == doc_len)
             })
         }),
