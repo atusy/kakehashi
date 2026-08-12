@@ -12,7 +12,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 
 /// Shared persistent data dir with markdown/lua parsers preinstalled (same
-/// one the LSP e2e suite uses; see `tests/helpers/lsp_client.rs`). Treated as
+/// one the LSP e2e suite uses; see `tests/e2e/helpers/lsp_client.rs`). Treated as
 /// read-only after install so concurrent test processes can share it.
 fn data_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();

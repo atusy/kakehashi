@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 
 /// A spawned `kakehashi` server process plus the JSON-RPC plumbing needed to
 /// initialize it and request semantic tokens. Intentionally minimal — just the
-/// subset of `tests/helpers/lsp_client.rs` the benchmark needs (benches cannot
+/// subset of `tests/e2e/helpers/lsp_client.rs` the benchmark needs (benches cannot
 /// import test helpers).
 struct Server {
     child: Child,
