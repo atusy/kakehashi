@@ -111,9 +111,9 @@ impl PeerDirectory {
             self.host_documents
                 .lock()
                 .await
-                .keys()
-                .filter(|(document_uri, _)| document_uri == uri)
-                .map(|(_, connection_key)| connection_key.clone()),
+                .get(uri)
+                .into_iter()
+                .flat_map(|connections| connections.keys().cloned()),
         );
         connections
     }
@@ -295,20 +295,32 @@ mod tests {
         for handle in [&origin, &denols, &other_root] {
             directory.register(handle);
         }
-        directory.host_documents.lock().await.insert(
-            ("file:///repo/main.ts".to_string(), denols_key),
-            HostDocSyncState {
-                version: 1,
-                fingerprint: 0,
-            },
-        );
-        directory.host_documents.lock().await.insert(
-            ("file:///other/main.ts".to_string(), other_root_key),
-            HostDocSyncState {
-                version: 1,
-                fingerprint: 0,
-            },
-        );
+        directory
+            .host_documents
+            .lock()
+            .await
+            .entry("file:///repo/main.ts".to_string())
+            .or_default()
+            .insert(
+                denols_key,
+                HostDocSyncState {
+                    version: 1,
+                    fingerprint: 0,
+                },
+            );
+        directory
+            .host_documents
+            .lock()
+            .await
+            .entry("file:///other/main.ts".to_string())
+            .or_default()
+            .insert(
+                other_root_key,
+                HostDocSyncState {
+                    version: 1,
+                    fingerprint: 0,
+                },
+            );
 
         let result = list_result(
             &directory,
