@@ -588,7 +588,9 @@ and their waits (ls-bridge-graceful-shutdown § Unconfirmed termination).
   pass-through request racing the sweep is — like all pass-through — the
   caller's own risk.
 - **A shared instance re-seeds; nothing is remembered** — with one
-  recorded exception: a document's active route binding
+  recorded exception (target state, landing with
+  bridge-routing-protocol's implementation): a document's active route
+  binding
   (bridge-routing-protocol) retains the effective folders of every
   bound shared route (canonical override folders, or ordinarily
   resolved roots kept verbatim), and — provided the replacement still supports
