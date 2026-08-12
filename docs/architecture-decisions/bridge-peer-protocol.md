@@ -96,6 +96,7 @@ Bridge-level failures use `RequestFailed` (`-32803`) and `data.reason`:
 | `unknownPeer` | The id is absent, names the caller, or is not currently running |
 | `methodDenied` | The inner method controls the connection lifecycle |
 | `forwardFailed` | The inner request could not be queued |
+| `tooManyRequests` | The caller already has 64 peer requests awaiting settlement |
 | `connectionLost` | The target connection ended before answering |
 | `requestTimeout` | The managed downstream request deadline elapsed |
 | `malformedResponse` | The target returned an invalid JSON-RPC response envelope |
@@ -162,11 +163,16 @@ API from becoming a second routing/spawn policy.
   cannot select a configured but dormant formatter.
 - Slow arbitrary requests share the existing timeout and liveness policy; they
   can contribute to a target connection being classified as failed.
+- Each calling connection may have at most 64 peer requests awaiting settlement,
+  bounding router entries and forwarding tasks even when targets consume input
+  without answering.
 
 ### Neutral
 
-- Discovery is a snapshot. A peer may stop after enumeration; the subsequent
-  request then fails rather than silently selecting a replacement.
+- Discovery is a snapshot of connection slots. A peer may stop after
+  enumeration; a subsequent request fails unless the same configured
+  server/root slot has already been replaced by a new ready process. Peer IDs
+  intentionally identify the stable slot rather than a process generation.
 - The API grants no authority beyond the configured processes already running,
   but one trusted downstream process can ask another to perform any non-denied
   request it supports.
