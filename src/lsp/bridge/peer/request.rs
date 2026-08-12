@@ -85,7 +85,7 @@ async fn cleanup_cancelled_peer(
         _ = settled_rx => {}
         _ = tokio::time::sleep_until(deadline) => {
             if peer.router().expire_peer_cancel(downstream_id) {
-                peer.fail_if_ready();
+                peer.fail_and_abort_writer();
             }
         }
     }
