@@ -36,6 +36,7 @@ pub(in crate::lsp::bridge) struct PeerDirectory {
     host_documents: Arc<HostDocuments>,
 }
 
+#[cfg(test)]
 impl Default for PeerDirectory {
     fn default() -> Self {
         Self::new(
