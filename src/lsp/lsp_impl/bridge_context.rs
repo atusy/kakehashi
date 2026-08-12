@@ -934,18 +934,7 @@ impl Kakehashi {
             region_boundary_for_method(method_name),
         ) else {
             // Not in an injection region — the virt layer stays silent and the
-            // host/native layers own the answer. Logged because this is the
-            // only trace of a declined position: bytes an `#offset!` trims off
-            // a region used to resolve here and get rejected by the precheck
-            // below, which logs; they now never reach it.
-            log::debug!(
-                target: "kakehashi::bridge",
-                "{}: position (line {}, char {}) is in no injection region; \
-                 skipping the virt layer",
-                method_name,
-                position.line,
-                position.character,
-            );
+            // host/native layers own the answer.
             return None;
         };
 
