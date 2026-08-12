@@ -330,7 +330,8 @@ arbitrary non-lifecycle JSON-RPC request with `kakehashi/bridge/peer/request`.
 The caller itself is excluded, including only its exact per-root connection;
 same-name peers at other roots remain visible. These methods exist only on
 downstream connections and cannot be called by the editor. See
-bridge-peer-protocol for the complete wire and error contract.
+[bridge-peer-protocol](architecture-decisions/bridge-peer-protocol.md) for the
+complete wire and error contract.
 
 ---
 
