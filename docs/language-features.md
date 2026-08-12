@@ -321,6 +321,19 @@ without the opt-in the server does not advertise color support.
 
 ---
 
+## Downstream peer requests
+
+Downstream language servers can feature-detect
+`initialize.params.capabilities.experimental.kakehashi.bridgePeer: true`, list
+other running downstream connections with `kakehashi/bridge/peer`, and proxy an
+arbitrary non-lifecycle JSON-RPC request with `kakehashi/bridge/peer/request`.
+The caller itself is excluded, including only its exact per-root connection;
+same-name peers at other roots remain visible. These methods exist only on
+downstream connections and cannot be called by the editor. See
+bridge-peer-protocol for the complete wire and error contract.
+
+---
+
 ## `kakehashi/*` methods
 
 Beyond the standard LSP features, kakehashi exposes custom methods under the
