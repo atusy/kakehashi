@@ -209,8 +209,8 @@ fn merge_upstream_capabilities(
 
     // Preserve editor-provided experimental extensions. Object-shaped values
     // can carry the bridge advertisement alongside the editor's keys; a
-    // non-object value cannot be extended without changing its shape, so it
-    // wins unchanged rather than being silently clobbered.
+    // non-object value is retained under `upstream` while the bridge-owned
+    // advertisement remains present.
     if let Some(upstream_experimental) = &upstream.experimental {
         match upstream_experimental {
             serde_json::Value::Object(upstream_experimental) => {
@@ -222,11 +222,26 @@ fn merge_upstream_capabilities(
                     kakehashi.insert("bridgeRouting".to_string(), serde_json::Value::Bool(true));
                     base.experimental = Some(serde_json::Value::Object(experimental));
                 } else {
-                    base.experimental =
-                        Some(serde_json::Value::Object(upstream_experimental.clone()));
+                    let upstream_kakehashi = experimental
+                        .get("kakehashi")
+                        .cloned()
+                        .expect("kakehashi entry exists");
+                    let mut kakehashi = serde_json::Map::new();
+                    kakehashi.insert("bridgeRouting".to_string(), serde_json::Value::Bool(true));
+                    kakehashi.insert("upstream".to_string(), upstream_kakehashi);
+                    experimental.insert(
+                        "kakehashi".to_string(),
+                        serde_json::Value::Object(kakehashi),
+                    );
+                    base.experimental = Some(serde_json::Value::Object(experimental));
                 }
             }
-            upstream_experimental => base.experimental = Some(upstream_experimental.clone()),
+            upstream_experimental => {
+                base.experimental = Some(serde_json::json!({
+                    "kakehashi": {"bridgeRouting": true},
+                    "upstream": upstream_experimental,
+                }));
+            }
         }
     }
 
@@ -1130,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_preserves_non_object_upstream_experimental_value() {
+    fn merge_preserves_non_object_upstream_experimental_value_and_advertises_routing() {
         let upstream = ClientCapabilities {
             experimental: Some(serde_json::json!("editor-extension-payload")),
             ..Default::default()
@@ -1138,7 +1153,10 @@ mod tests {
 
         assert_eq!(
             build_bridge_client_capabilities(Some(&upstream), false, false).experimental,
-            upstream.experimental,
+            Some(serde_json::json!({
+                "kakehashi": {"bridgeRouting": true},
+                "upstream": "editor-extension-payload",
+            })),
         );
     }
 }
