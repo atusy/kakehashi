@@ -128,11 +128,14 @@ fn position_of_byte(
 ///
 /// `#offset!` narrows (or widens) the raw `@injection.content` span to the
 /// bytes the injection parser actually sees — trimming frontmatter `---`
-/// fences, string quotes, and the like. Every consumer that reasons about
-/// *where the injected content is* must agree on this span, so region lookup
-/// ([`find_injection_at_position`]) and region resolution
-/// ([`CacheableInjectionRegion::from_region_info`]) share this one helper
-/// rather than each deriving it.
+/// fences, string quotes, and the like. The request-routing paths that must
+/// agree on *where the injected content is* share this one helper rather than
+/// each deriving it: region lookup ([`find_injection_at_position`]), region
+/// resolution ([`CacheableInjectionRegion::from_region_info`]), and the native
+/// lexical layer's containment filter (`native_bindings`). The semantic,
+/// selection-range, and `kakehashi/node` paths still call
+/// `calculate_effective_range` themselves — each layers its own gap handling
+/// on top, so they are not folded in here.
 ///
 /// Scope: this applies `#offset!` only. Child-exclusion gaps (blockquote `> `
 /// prefixes, excluded named children) are *not* subtracted here, because the
@@ -147,7 +150,7 @@ fn position_of_byte(
 /// Cheap enough for the per-keystroke lookup path: the offset branch is skipped
 /// entirely when the pattern has no directive, and the boundary snaps iterate
 /// at most three bytes.
-fn effective_content_range(info: &InjectionRegionInfo<'_>, text: &str) -> Range<usize> {
+pub(crate) fn effective_content_range(info: &InjectionRegionInfo<'_>, text: &str) -> Range<usize> {
     let node = &info.content_node;
     let (start, end) = match info.offset {
         Some(offset) => {

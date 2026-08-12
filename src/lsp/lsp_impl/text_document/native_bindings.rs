@@ -218,22 +218,36 @@ impl Kakehashi {
         byte: usize,
     ) -> Option<Option<LayerInputs>> {
         use crate::language::injection::{
-            collect_all_injections, compute_included_ranges, parse_with_ranges,
+            collect_all_injections, compute_included_ranges, effective_content_range,
+            parse_with_ranges,
         };
 
         let injection_query = self.language.injection_query(host_language)?;
         let regions = collect_all_injections(&tree.root_node(), text, Some(&injection_query))?;
         // Innermost containing region: under nesting (an include-children
         // outer region wrapping a fence) the smallest layer owns the cursor.
+        //
+        // Containment is measured on the effective post-`#offset!` span, the
+        // same span the bridge's region lookup uses. Measuring the raw node
+        // here instead would make this layer claim bytes a directive trimmed
+        // off — a frontmatter `---` fence, a string's quotes — and then go
+        // silent on them via the `offset.is_some()` bail below, while the
+        // bridge has already handed those bytes to the host layer. For a
+        // region without a directive the two spans are identical.
         let region = regions
             .iter()
-            .filter(|r| r.content_node.start_byte() <= byte && byte < r.content_node.end_byte())
+            .filter(|r| {
+                let range = effective_content_range(r, text);
+                range.start <= byte && byte < range.end
+            })
             .min_by_key(|r| r.content_node.end_byte() - r.content_node.start_byte())?;
 
         // From here on the cursor IS in a region: every bail is silence.
         if region.offset.is_some() {
             // `#offset!`-shifted regions need window clipping the native
-            // path does not do yet; the bridge keeps owning them.
+            // path does not do yet, so the bridge keeps owning them — and,
+            // now that the filter above measures the effective span, this
+            // only silences bytes that really are inside the shifted content.
             return Some(None);
         }
         let content_range = region.content_node.byte_range();
