@@ -49,12 +49,25 @@ check_dir() {
     echo "       add the matching \`mod <name>;\` line." >&2
     status=1
   fi
+
+  # And the reverse: a `mod` line whose file is gone. This is NOT covered by
+  # cargo the way it would be in ordinary code. `cargo check` and `cargo clippy`
+  # (as `make check` and CI run them) do not build test targets at all, and CI's
+  # `cargo test` builds tests/e2e without `--features e2e`, so the crate-level
+  # `#![cfg(feature = "e2e")]` strips the whole module tree before any `mod` is
+  # resolved. Deleting a test file and leaving its `mod` line would therefore
+  # sail through CI, silently dropping that file's coverage.
+  local name
+  for name in $(sed -n 's/^mod \([a-z_][a-z0-9_]*\);.*/\1/p' "$main"); do
+    # `mod helpers;` resolves to helpers/mod.rs, so accept either spelling.
+    if [ ! -f "${dir}/${name}.rs" ] && [ ! -f "${dir}/${name}/mod.rs" ]; then
+      echo "error: ${main} declares \`mod ${name};\` but neither ${dir}/${name}.rs nor ${dir}/${name}/mod.rs exists." >&2
+      status=1
+    fi
+  done
 }
 
 check_dir tests/e2e tests/e2e/main.rs
 check_dir tests/integration tests/integration/main.rs
-
-# The reverse direction: a `mod` line whose file was deleted or renamed is a
-# hard compile error, so cargo already covers it — no check needed here.
 
 exit "$status"
