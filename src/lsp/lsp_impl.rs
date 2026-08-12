@@ -1108,6 +1108,66 @@ mod tests {
         }
     }
 
+    /// A reload retires an old detached warm-up before propagation walks the
+    /// pool. If the retirement moved after propagation, the paused old acquire
+    /// would be admitted in that gap and resurrect a server removed by the
+    /// reload.
+    #[tokio::test]
+    async fn settings_reload_supersedes_warmups_before_propagation() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let control = std::sync::Arc::new(crate::lsp::bridge::coordinator::ForceStartTestControl {
+            before_admission: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release_admission: std::sync::Arc::new(tokio::sync::Notify::new()),
+            admission_finished: std::sync::Arc::new(tokio::sync::Notify::new()),
+            pause_propagation: std::sync::atomic::AtomicBool::new(false),
+            after_propagation: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release_propagation: std::sync::Arc::new(tokio::sync::Notify::new()),
+        });
+        server
+            .bridge
+            .set_force_start_test_control(std::sync::Arc::clone(&control));
+
+        let mut old_settings = WorkspaceSettings::default();
+        old_settings.language_servers.insert(
+            "policy-server".to_string(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "cat > /dev/null".to_string(),
+                ]),
+                languages: Some(Vec::new()),
+                force_start: Some(true),
+                ..Default::default()
+            },
+        );
+        server
+            .apply_raw_settings(RawWorkspaceSettings::default(), old_settings)
+            .await;
+        control.before_admission.notified().await;
+
+        control
+            .pause_propagation
+            .store(true, std::sync::atomic::Ordering::Release);
+        let reload = server.apply_raw_settings(
+            RawWorkspaceSettings::default(),
+            WorkspaceSettings::default(),
+        );
+        tokio::pin!(reload);
+        tokio::select! {
+            _ = control.after_propagation.notified() => {}
+            _ = &mut reload => panic!("reload reached forceStart before propagation was released"),
+        }
+
+        control.release_admission.notify_one();
+        control.admission_finished.notified().await;
+        assert_eq!(server.bridge.pool().connection_count().await, 0);
+
+        control.release_propagation.notify_one();
+        reload.await;
+    }
+
     #[tokio::test]
     async fn settings_reload_discards_available_document_parsers() {
         let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);

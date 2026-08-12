@@ -112,6 +112,16 @@ struct EagerOpenBatch {
     cancel: CancellationToken,
 }
 
+#[cfg(test)]
+pub(crate) struct ForceStartTestControl {
+    pub(crate) before_admission: Arc<tokio::sync::Notify>,
+    pub(crate) release_admission: Arc<tokio::sync::Notify>,
+    pub(crate) admission_finished: Arc<tokio::sync::Notify>,
+    pub(crate) pause_propagation: std::sync::atomic::AtomicBool,
+    pub(crate) after_propagation: Arc<tokio::sync::Notify>,
+    pub(crate) release_propagation: Arc<tokio::sync::Notify>,
+}
+
 /// Bundles `LanguageServerPool` and `NodeTracker` so LSP handlers see one field.
 /// The pool is `Arc`'d so the cancel-forwarding middleware can share it.
 ///
@@ -150,6 +160,8 @@ pub(crate) struct BridgeCoordinator {
     /// `Relaxed` for the same reason the counter above is: monotonicity is
     /// the whole requirement, and the pool's own lock orders the effects.
     force_start_generation: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    force_start_test_control: arc_swap::ArcSwapOption<ForceStartTestControl>,
     /// Eager-open task batches, keyed by host document URI.
     ///
     /// Each batch contains a generation counter and abort handles. When a new
@@ -233,6 +245,8 @@ impl BridgeCoordinator {
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             force_start_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            force_start_test_control: arc_swap::ArcSwapOption::empty(),
             eager_open_tasks: DashMap::new(),
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
@@ -257,6 +271,8 @@ impl BridgeCoordinator {
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             force_start_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            force_start_test_control: arc_swap::ArcSwapOption::empty(),
             eager_open_tasks: DashMap::new(),
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
@@ -327,9 +343,25 @@ impl BridgeCoordinator {
     /// next use spawns from the new config. Returns the number of settings
     /// notifications pushed (evictions are not counted).
     pub(crate) async fn propagate_settings(&self, settings: &WorkspaceSettings) -> usize {
-        self.pool
+        let pushed = self
+            .pool
             .propagate_settings(|server_name| resolve_reload_server_config(settings, server_name))
-            .await
+            .await;
+        #[cfg(test)]
+        if let Some(control) = self.force_start_test_control.load_full()
+            && control
+                .pause_propagation
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            control.after_propagation.notify_one();
+            control.release_propagation.notified().await;
+        }
+        pushed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_force_start_test_control(&self, control: Arc<ForceStartTestControl>) {
+        self.force_start_test_control.store(Some(control));
     }
 
     /// Spawn every configured server that asks to start without waiting for a
@@ -433,7 +465,14 @@ impl BridgeCoordinator {
             let pool = Arc::clone(&self.pool);
             let name = name.clone();
             let current_generation = Arc::clone(&self.force_start_generation);
+            #[cfg(test)]
+            let test_control = self.force_start_test_control.load_full();
             tokio::spawn(async move {
+                #[cfg(test)]
+                if let Some(control) = &test_control {
+                    control.before_admission.notify_one();
+                    control.release_admission.notified().await;
+                }
                 // The config in hand was resolved from the settings snapshot
                 // of this pass. If a later application has already run, that
                 // snapshot is history: spawning from it would start a server
@@ -449,10 +488,14 @@ impl BridgeCoordinator {
                 // supersedes this one. Evaluated inside that lock, it lands
                 // ahead of the launch-config comparison it exists to prevent.
                 let admit = || current_generation.load(Ordering::Relaxed) == generation;
-                let Err(error) = pool
+                let result = pool
                     .get_or_create_connection_admitted(&name, &config, None, &admit)
-                    .await
-                else {
+                    .await;
+                #[cfg(test)]
+                if let Some(control) = &test_control {
+                    control.admission_finished.notify_one();
+                }
+                let Err(error) = result else {
                     return;
                 };
                 // Two errors mean "someone else is already doing this", not
