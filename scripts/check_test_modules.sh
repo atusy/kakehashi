@@ -23,13 +23,26 @@ status=0
 
 # $1: directory holding the modules, $2: the main.rs declaring them
 check_dir() {
-  local dir="$1" main="$2" stem missing
+  local dir="$1" main="$2" stem missing found
   missing=""
+  found=0
   for f in "$dir"/*.rs; do
     stem="$(basename "$f" .rs)"
     [ "$stem" = "main" ] && continue
+    found=$((found + 1))
     grep -q "^mod ${stem};" "$main" || missing="${missing}  ${f}"$'\n'
   done
+  # A suite of nothing but main.rs would satisfy every check above vacuously,
+  # and CI's plain `cargo test` would happily accept the resulting zero-test
+  # binary. A guard that passes when there is nothing to guard is worse than
+  # no guard, so require the suite to be non-empty.
+  # (A missing directory needs no separate case: bash leaves the unmatched glob
+  # literal, so the "*" stem finds no `mod` line and is reported as missing.)
+  if [ "$found" -eq 0 ]; then
+    echo "error: ${dir} declares no test modules at all — the suite would be empty." >&2
+    status=1
+    return
+  fi
   if [ -n "$missing" ]; then
     echo "error: test file(s) not declared in ${main} — they are silently never run:" >&2
     printf '%s' "$missing" >&2

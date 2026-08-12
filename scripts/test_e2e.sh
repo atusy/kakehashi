@@ -48,6 +48,24 @@ CORES=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 THREADS="${E2E_THREADS:-$(( (CORES * 3 + 1) / 2 ))}"
 RETRIES="${E2E_RETRIES:-1}"
 RUN_TIMEOUT="${E2E_TIMEOUT:-600}"
+RETRY_TIMEOUT="${E2E_RETRY_TIMEOUT:-300}"
+
+# Validate before use. `[ bogus -gt 0 ]` is an ERROR (status 2), not false, and
+# with `-e` absent the caller would fall through to the UNCAPPED branch -- so a
+# typo in E2E_TIMEOUT would silently remove the timeout it was meant to set.
+# Fail loudly on anything that is not a non-negative integer.
+require_uint() {
+  case "$2" in
+    '' | *[!0-9]*)
+      echo "error: $1 must be a non-negative integer (got: '$2')" >&2
+      exit 2
+      ;;
+  esac
+}
+require_uint E2E_THREADS "$THREADS"
+require_uint E2E_RETRIES "$RETRIES"
+require_uint E2E_TIMEOUT "$RUN_TIMEOUT"
+require_uint E2E_RETRY_TIMEOUT "$RETRY_TIMEOUT"
 
 # Honor the Makefile's `CARGO` override (toolchain selector / cargo wrapper),
 # the way the other targets do — `make test_e2e` passes it through.
@@ -192,7 +210,6 @@ fi
 # Bound each retry the way the main run is bounded. Without this a test that
 # hangs only when run alone blocks the gate (and the pre-commit hook) forever:
 # the whole-run cap has already been spent by the time we get here.
-RETRY_TIMEOUT="${E2E_RETRY_TIMEOUT:-300}"
 run_retry() {
   if [ -n "$TIMEOUT_BIN" ] && [ "$RETRY_TIMEOUT" -gt 0 ]; then
     "$TIMEOUT_BIN" "$RETRY_TIMEOUT" "$CARGO" test --features e2e --no-fail-fast \
