@@ -1,0 +1,9 @@
+---
+source: tests/e2e/e2e_lsp_lua_diagnostic.rs
+expression: result
+---
+{
+  "kind": "full",
+  "resultId": "[content hash redacted]",
+  "items": "[0 items redacted]"
+}

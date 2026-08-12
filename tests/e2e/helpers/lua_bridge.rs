@@ -1,0 +1,192 @@
+//! Lua bridge helpers for E2E tests.
+//!
+//! Provides reusable initialization and verification patterns for tests that
+//! interact with lua-language-server via the kakehashi bridge.
+
+use super::lsp_client::LspClient;
+use serde_json::json;
+
+/// Check if lua-language-server is available and working.
+///
+/// # Returns
+/// `true` if `lua-language-server --version` runs successfully, `false` otherwise.
+pub fn is_lua_ls_available() -> bool {
+    std::process::Command::new("lua-language-server")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Print skip message and return early guard for tests requiring lua-ls.
+///
+/// # Returns
+/// `true` if lua-ls is not available or not working (test should skip), `false` if available (test can run).
+///
+/// # Example
+/// ```
+/// if skip_if_lua_ls_unavailable() {
+///     return;
+/// }
+/// // ... test code that requires lua-ls
+/// ```
+pub fn skip_if_lua_ls_unavailable() -> bool {
+    if !is_lua_ls_available() {
+        eprintln!("SKIP: lua-language-server is not available or failed to run successfully");
+        eprintln!("Install lua-language-server to run this test:");
+        eprintln!("  brew install lua-language-server");
+        true
+    } else {
+        false
+    }
+}
+
+/// Create an LspClient initialized with lua-language-server configuration.
+///
+/// This helper encapsulates the common initialization pattern for Lua bridge tests:
+/// - Spawn kakehashi binary with an empty config file for test isolation
+/// - Send initialize request with lua-language-server bridge configuration
+/// - Send initialized notification to complete handshake
+///
+/// Test isolation: Uses `--config-file` with an empty temp file to prevent
+/// the user's `~/.config/kakehashi/kakehashi.toml` from interfering with tests.
+/// For example, a user config with `[languages._.bridge.python]` would create a
+/// restrictive bridge filter that blocks lua, causing all bridge tests to fail.
+///
+/// # Returns
+/// A tuple of an initialized `LspClient` and the `TempDir` holding the config.
+/// Callers must keep the `TempDir` alive (e.g., `let (_client, _config_dir) = ...`)
+/// so the temp directory is not deleted while the server is running.
+pub fn create_lua_configured_client() -> (LspClient, tempfile::TempDir) {
+    let (client, config_dir) = init_lua_client_with(None, false);
+    (client, config_dir)
+}
+
+/// [`create_lua_configured_client`] with `KAKEHASHI_EXPERIMENTAL=true` set on
+/// the spawned server — for tests exercising experimental features
+/// (documentColor / colorPresentation bridging).
+pub fn create_lua_configured_client_experimental() -> (LspClient, tempfile::TempDir) {
+    let (client, config_dir) = init_lua_client_with(None, true);
+    (client, config_dir)
+}
+
+/// Create an LspClient with a real workspace directory for lua-language-server.
+///
+/// Unlike [`create_lua_configured_client`], this provides a real `rootUri` and
+/// `workspaceFolders` so that lua-ls can properly index virtual documents and
+/// return non-null hover/completion results.
+///
+/// # Returns
+/// A tuple of:
+/// - An initialized `LspClient`
+/// - The workspace `TempDir` (callers should write test files here)
+/// - The `TempDir` holding the config file
+///
+/// Callers must keep both `TempDir` values alive for the duration of the test.
+pub fn create_lua_configured_client_with_workspace()
+-> (LspClient, tempfile::TempDir, tempfile::TempDir) {
+    let workspace_dir = tempfile::TempDir::new().expect("Failed to create workspace temp dir");
+    let (client, config_dir) = init_lua_client_with(Some(&workspace_dir), false);
+    (client, workspace_dir, config_dir)
+}
+
+/// Shared initialization logic for lua-language-server client setup.
+///
+/// When `workspace_dir` is `Some`, sets `rootUri` and `workspaceFolders` so lua-ls
+/// can index virtual documents. When `None`, uses `rootUri: null`.
+fn init_lua_client_with(
+    workspace_dir: Option<&tempfile::TempDir>,
+    experimental: bool,
+) -> (LspClient, tempfile::TempDir) {
+    let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
+    let config_path = config_dir.path().join("empty.toml");
+    std::fs::write(&config_path, "").expect("Failed to write empty config");
+    let config_path_str = config_path
+        .to_str()
+        .expect("temp path should be valid UTF-8")
+        .to_string();
+
+    let builder = LspClient::builder()
+        .arg("--config-file")
+        .arg(&config_path_str);
+    let mut client = if experimental {
+        builder.env("KAKEHASHI_EXPERIMENTAL", "true")
+    } else {
+        // Hermetic even when the developer's shell exports the opt-in.
+        builder.env_remove("KAKEHASHI_EXPERIMENTAL")
+    }
+    .build();
+
+    let (root_uri, workspace_folders) = match workspace_dir {
+        Some(dir) => {
+            let uri = format!("file://{}", dir.path().display());
+            let folders = json!([{ "uri": uri, "name": "test" }]);
+            (json!(uri), folders)
+        }
+        None => (json!(null), json!(null)),
+    };
+
+    let _init_response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            "capabilities": {},
+            "workspaceFolders": workspace_folders,
+            "initializationOptions": {
+                "languageServers": {
+                    "lua-language-server": {
+                        "cmd": ["lua-language-server"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    (client, config_dir)
+}
+
+/// Perform clean LSP shutdown sequence.
+///
+/// Sends shutdown request followed by exit notification as required by LSP protocol.
+pub fn shutdown_client(client: &mut LspClient) {
+    let _shutdown_response = client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+/// Verify hover response contains meaningful content.
+///
+/// Handles all valid hover content formats per LSP spec:
+/// - String content
+/// - MarkedString array
+/// - MarkupContent object with value field
+///
+/// # Arguments
+/// * `result` - The `result` field from a hover response
+///
+/// # Returns
+/// `true` if the result contains non-empty content, `false` otherwise.
+pub fn verify_hover_has_content(result: &serde_json::Value) -> bool {
+    if result.is_null() {
+        return false;
+    }
+
+    let contents = match result.get("contents") {
+        Some(c) => c,
+        None => return false,
+    };
+
+    if contents.is_string() {
+        !contents.as_str().unwrap().is_empty()
+    } else if contents.is_array() {
+        !contents.as_array().unwrap().is_empty()
+    } else if contents.is_object() {
+        contents
+            .get("value")
+            .map(|v| !v.as_str().unwrap_or("").is_empty())
+            .unwrap_or(false)
+    } else {
+        false
+    }
+}

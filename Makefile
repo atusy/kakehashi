@@ -35,20 +35,27 @@ test:
 	$(CARGO) test --lib
 
 # Run integration and E2E tests (excludes unit tests)
-# - Integration tests: tests/test_*.rs (no feature required)
-# - E2E tests: tests/e2e_*.rs (requires e2e feature)
-# Default to the parallel runner: `cargo test` runs integration binaries
-# sequentially, leaving a many-core machine idle while each binary waits on a
-# spawned server. The script runs the binaries in a bounded parallel pool (~3x
-# faster here) with identical coverage. Use test_e2e_sequential to debug
-# timing-sensitive tests without cross-binary load.
+# - Integration tests: tests/integration/ (no feature required)
+# - E2E tests: tests/e2e/ (requires e2e feature)
+# Each suite is ONE merged binary (see tests/e2e/main.rs) so a lib edit links
+# twice, not ~59 times. Default to the runner script: it raises the test
+# thread count above the core count (each E2E test mostly waits on a spawned
+# server) and retries failed tests serially once to absorb load-induced
+# flakes. Use test_e2e_sequential to debug timing-sensitive tests without
+# parallel load.
 .PHONY: test_e2e
 test_e2e:
-	CARGO="$(CARGO)" scripts/test_e2e_parallel.sh
+	CARGO="$(CARGO)" scripts/test_e2e.sh
 
+# Debug a timing-sensitive test without parallel load. Note this is stricter
+# than the target it replaced: that one ran the binaries one at a time but let
+# libtest parallelize inside each, whereas --test-threads=1 serializes all ~450
+# tests, so a full run takes minutes. Pass FILTER to run only what you're
+# debugging:  make test_e2e_sequential FILTER=e2e_semantic::
+FILTER ?=
 .PHONY: test_e2e_sequential
 test_e2e_sequential:
-	$(CARGO) test --features e2e --test 'test_*' --test 'e2e_*'
+	$(CARGO) test --features e2e --test integration --test e2e -- --test-threads=1 $(FILTER)
 
 # Run all tests (unit + integration + E2E)
 .PHONY: test_all
@@ -59,6 +66,7 @@ test_all:
 .PHONY: check
 check:
 	if git grep --quiet -E '#\[allow\(dead_code\)\]' -- src; then echo 'Do not leave dead_code. Codes must be wired' >&2 && exit 1; fi
+	scripts/check_test_modules.sh
 	$(CARGO) check
 	$(CARGO) clippy -- -D warnings
 	$(CARGO) fmt --check

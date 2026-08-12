@@ -14,6 +14,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # Not covered by any cargo command: a tests/e2e/*.rs with no `mod` line in
+      # main.rs compiles fine and simply never runs. CI also never builds the
+      # e2e binary (bare `cargo test`, no --features e2e), so this is the only
+      # place the omission can be caught here.
+      - run: scripts/check_test_modules.sh
       - run: cargo check
 
   test:
