@@ -60,6 +60,7 @@ test_all:
 .PHONY: check
 check:
 	if git grep --quiet -E '#\[allow\(dead_code\)\]' -- src; then echo 'Do not leave dead_code. Codes must be wired' >&2 && exit 1; fi
+	scripts/check_test_modules.sh
 	$(CARGO) check
 	$(CARGO) clippy -- -D warnings
 	$(CARGO) fmt --check
