@@ -166,19 +166,16 @@ Client (editor)          kakehashi           Downstream Server
 
 In Phase 1, routing resolves `languageId` → `server_name` via configuration, then looks up the connection by `server_name`:
 
-```rust
-// Phase 1: Server-name-based routing
-fn route_request(language_id: &str) -> Option<&Connection> {
-    // 1. Resolve server_name from config (e.g., "typescript" → "tsgo")
-    let server_name = config.get_server_for_language(language_id)?;
-    // 2. Look up connection by server_name (enables process sharing)
-    self.connections.get(server_name)
-}
-```
+The connection is keyed by **server name**, not by language. That is the key
+difference from pure language-based routing: several languages sharing one
+`server_name` share one process — `typescript` and `typescriptreact` both
+resolve to `tsgo` and get the same connection.
 
-**Key difference from pure language-based routing**: Multiple languages can share the same connection when they map to the same `server_name`. For example, `typescript` and `typescriptreact` can both resolve to `tsgo`, sharing a single process.
+(The full `ConnectionKey` is richer than a bare name — per-root pooling and
+the shared-instance opt-in are above, under § Phase 1. The name is the part
+this comparison turns on.)
 
-**Phase 3 Extension**: Multi-LS routing strategies (SingleByCapability, FanOut) — see Future Extensions.
+**Phase 3 Extension**: Multi-LS routing strategies — see Future Extensions.
 
 ### Server Lifecycle Management
 
@@ -334,33 +331,22 @@ Result: State divergence (recoverable via next didChange)
 
 > **Note**: This section describes Phase 3 multi-LS-per-language features. Phase 1 uses single-server routing.
 
-For fan-out **requests** (with `id`), configure aggregation per method:
+For fan-out **requests** (with `id`), aggregation is configured per method.
+The strategies and the priority-ordered allowlist that selects participants
+are owned by cross-layer-aggregation and aggregation-priorities-wildcard —
+that is where the shipped names and semantics live. This section adds only
+the *stability* rules a multi-server fan-out needs on top of them.
 
-```rust
-enum AggregationStrategy {
-    /// Return first successful response, cancel others.
-    /// On first success: immediately send $/cancelRequest to remaining servers,
-    /// discard any late responses.
-    FirstWins,
-
-    /// Wait for all, merge array results (candidate lists only)
-    MergeAll {
-        dedup_key: Option<String>,  // e.g., 'label' for completions
-        max_items: Option<usize>,
-    },
-
-    /// Wait for all, return highest priority non-null result
-    Ranked {
-        priority: Vec<String>,
-    },
-}
-```
+(An earlier revision sketched a `FirstWins`/`MergeAll`/`Ranked` enum here.
+It never matched what shipped, and a strategy catalog in two places is a
+catalog that disagrees with itself.)
 
 **Aggregation Stability Rules:**
-- **Per-request timeout conditions**: Timeout applies **only when n ≥ 2 downstream servers participate**
-  - SingleByCapability: No per-request timeout (wait for single server, liveness timeout protects)
-  - FanOut with n=1: No per-request timeout (functionally equivalent to single)
-  - FanOut with n≥2: Per-request timeout applies (default: 5s explicit, 2s incremental)
+- **Per-request timeout conditions**: the timeout applies **only when n ≥ 2
+  downstream servers participate**, whatever strategy selected them. A
+  single participant needs no aggregation bound — nothing is being waited
+  *together* — and the liveness timeout already protects it (default: 5s
+  explicit, 2s incremental)
 - **Per-request timeout behavior**: On timeout, return whatever results available **without sending $/cancelRequest**
   - Downstream servers continue processing and send responses
   - Late responses **discarded** by router but **reset liveness timeout** (heartbeat for connection health)

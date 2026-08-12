@@ -370,31 +370,17 @@ Implementation uses a multi-signal approach:
 
 ### Async Communication and Error Handling
 
-Language server communication uses synchronous stdio which blocks the thread. In kakehashi's async runtime (tokio), this requires `spawn_blocking` to avoid stalling other tasks.
+Every downstream request is bounded by a per-request timeout, and **both
+failure shapes degrade rather than propagate**: a server error and an
+expired timeout each log a warning and yield no result, so the host request
+answers with whatever the other layers produced. A hung server costs one
+timeout, never a stalled handler.
 
-```rust
-let result = tokio::time::timeout(
-    Duration::from_secs(request_timeout_secs),
-    tokio::task::spawn_blocking(move || {
-        let conn = pool.get_connection("rust")?;
-        conn.request(method, params)
-    })
-).await;
-
-match result {
-    Ok(Ok(response)) => response,
-    Ok(Err(e)) => {
-        // Server error (e.g., invalid request)
-        log::warn!("Bridge request failed: {}", e);
-        None
-    }
-    Err(_) => {
-        // Timeout - server may be hung
-        log::warn!("Bridge request timed out after {}s", request_timeout_secs);
-        None
-    }
-}
-```
+Communication is **pure async** — no blocking stdio, and no OS thread per
+connection. ls-bridge-async-connection carries that decision, its reader and
+writer task patterns, and the timeout tiers this bound sits in; an earlier
+revision of this section sketched a blocking-pool call, which that decision
+explicitly rejected.
 
 #### Error Handling Strategy
 
