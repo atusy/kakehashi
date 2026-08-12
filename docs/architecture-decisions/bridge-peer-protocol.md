@@ -28,7 +28,7 @@ Introduce two custom requests handled only on downstream connections:
 
 | Method | Input | Output |
 |---|---|---|
-| `kakehashi/bridge/peer` | `{ name?: string }` | `Peer[]` |
+| `kakehashi/bridge/peer` | `{ textDocument?: TextDocumentIdentifier, name?: string }` | `Peer[]` |
 | `kakehashi/bridge/peer/request` | `{ id, method, params? }` | `ForwardResult` |
 
 kakehashi advertises the API to downstream servers as
@@ -46,7 +46,13 @@ type Peer = {
 ```
 
 Discovery returns only connections currently in `running` (`Ready`) state,
-sorted by `id`. `name` optionally filters by the exact configured server name.
+sorted by `id`. Its optional filters compose as AND:
+
+- `textDocument` retains peers that currently serve the exact downstream URI,
+  or an injection belonging to the supplied host URI. A document that is not
+  open matches nothing; discovery does not route, open, or start it.
+- `name` retains peers with the exact configured server name.
+
 The exact calling `ConnectionKey` is always excluded; a same-name connection at
 a different root remains a peer. Initializing, failed, stopping, closed, and
 configured-but-not-running slots are absent. Discovery never starts a process.
