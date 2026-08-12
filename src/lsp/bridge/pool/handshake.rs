@@ -37,7 +37,7 @@ pub(super) async fn perform_lsp_handshake(
     workspace_folders: Option<Vec<WorkspaceFolder>>,
     client_capabilities: Option<ClientCapabilities>,
     advertise_configuration: bool,
-) -> io::Result<ServerCapabilities> {
+) -> io::Result<(ServerCapabilities, bool)> {
     // 1. Build and send initialize request via the single-writer loop
     let init_request = build_initialize_request(
         init_request_id,
@@ -72,6 +72,7 @@ pub(super) async fn perform_lsp_handshake(
             dropped.error,
         );
     }
+    let bridge_routing = parsed.bridge_routing;
     let capabilities = parsed.capabilities;
 
     // 4. Send initialized notification via the single-writer loop
@@ -98,7 +99,7 @@ pub(super) async fn perform_lsp_handshake(
         }
     }
 
-    Ok(capabilities)
+    Ok((capabilities, bridge_routing))
 }
 
 #[cfg(all(test, unix))]
@@ -139,7 +140,7 @@ mod tests {
             }))
             .unwrap();
 
-        let capabilities = perform_lsp_handshake(
+        let (capabilities, bridge_routing) = perform_lsp_handshake(
             &handle,
             RequestId::new(1),
             response_rx,
@@ -154,6 +155,7 @@ mod tests {
 
         assert!(capabilities.hover_provider.is_none());
         assert!(capabilities.completion_provider.is_some());
+        assert!(!bridge_routing);
         let mut messages = String::new();
         for _ in 0..200 {
             messages = std::fs::read_to_string(&output).unwrap_or_default();

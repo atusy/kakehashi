@@ -138,6 +138,7 @@ pub(crate) struct DroppedCapability {
 pub(crate) struct ParsedInitializeCapabilities {
     pub(crate) capabilities: ServerCapabilities,
     pub(crate) dropped: Vec<DroppedCapability>,
+    pub(crate) bridge_routing: bool,
 }
 
 /// Validates a JSON-RPC initialize response and extracts usable capabilities.
@@ -194,6 +195,7 @@ pub(crate) fn parse_initialize_response_capabilities(
         return Ok(ParsedInitializeCapabilities {
             capabilities: ServerCapabilities::default(),
             dropped: Vec::new(),
+            bridge_routing: false,
         });
     };
     let Some(capabilities) = capabilities.as_object() else {
@@ -203,7 +205,16 @@ pub(crate) fn parse_initialize_response_capabilities(
         ));
     };
 
-    recover_server_capabilities(capabilities)
+    let bridge_routing = capabilities
+        .get("experimental")
+        .and_then(|experimental| experimental.get("kakehashi"))
+        .and_then(|kakehashi| kakehashi.get("bridgeRouting"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    let mut parsed = recover_server_capabilities(capabilities)?;
+    parsed.bridge_routing = bridge_routing;
+    Ok(parsed)
 }
 
 fn recover_server_capabilities(
@@ -246,6 +257,7 @@ fn recover_server_capabilities(
     Ok(ParsedInitializeCapabilities {
         capabilities,
         dropped,
+        bridge_routing: false,
     })
 }
 
@@ -628,6 +640,31 @@ mod tests {
             .expect("omitted or null capabilities remain compatible");
 
         assert_eq!(parsed.capabilities, ServerCapabilities::default());
+        assert!(parsed.dropped.is_empty());
+        assert!(!parsed.bridge_routing);
+    }
+
+    #[rstest]
+    #[case::advertised(serde_json::json!(true), true)]
+    #[case::not_advertised(serde_json::json!(false), false)]
+    #[case::malformed(serde_json::json!("yes"), false)]
+    fn parses_bridge_routing_advertisement(
+        #[case] advertisement: serde_json::Value,
+        #[case] expected: bool,
+    ) {
+        let response = serde_json::json!({
+            "result": {
+                "capabilities": {
+                    "experimental": {
+                        "kakehashi": {"bridgeRouting": advertisement}
+                    }
+                }
+            }
+        });
+
+        let parsed = parse_initialize_response_capabilities(&response)
+            .expect("custom routing capability must not affect standard parsing");
+        assert_eq!(parsed.bridge_routing, expected);
         assert!(parsed.dropped.is_empty());
     }
 

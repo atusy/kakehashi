@@ -127,6 +127,9 @@ pub(crate) struct ConnectionHandle {
     /// Server capabilities from the initialize response, used to skip unsupported
     /// requests. `OnceLock` for set-once/read-many.
     server_capabilities: OnceLock<ServerCapabilities>,
+    /// Whether the downstream opted into Kakehashi's bridge-routing protocol.
+    /// `OnceLock` for set-once/read-many after the initialize handshake.
+    bridge_routing: OnceLock<bool>,
     /// Dynamic capability registrations from server-initiated `client/registerCapability` requests.
     ///
     /// Updated by the reader task, queried by request handlers via `has_capability()`.
@@ -237,6 +240,7 @@ impl ConnectionHandle {
             // which is pre-registered before spawning the reader task.
             next_request_id: AtomicI64::new(2),
             server_capabilities: OnceLock::new(),
+            bridge_routing: OnceLock::new(),
             dynamic_capabilities,
             connection_key,
             workspace_folders,
@@ -548,6 +552,16 @@ impl ConnectionHandle {
     /// compile-time-safe capability checks.
     pub(crate) fn server_capabilities(&self) -> Option<&ServerCapabilities> {
         self.server_capabilities.get()
+    }
+
+    /// Store whether the downstream advertised bridge routing in `initialize`.
+    pub(super) fn set_bridge_routing(&self, advertised: bool) {
+        let _ = self.bridge_routing.set(advertised);
+    }
+
+    /// Whether the downstream advertised bridge routing during initialization.
+    pub(crate) fn supports_bridge_routing(&self) -> bool {
+        self.bridge_routing.get().copied().unwrap_or(false)
     }
 
     /// Access the dynamic capability registry for this connection.
@@ -1906,6 +1920,15 @@ mod tests {
 
         // Before setting capabilities, accessor should return None
         assert!(handle.server_capabilities().is_none());
+    }
+
+    #[tokio::test]
+    async fn bridge_routing_support_is_retained_after_handshake() {
+        let handle = spawn_sink_handle().await;
+
+        assert!(!handle.supports_bridge_routing());
+        handle.set_bridge_routing(true);
+        assert!(handle.supports_bridge_routing());
     }
 
     /// Test that server_capabilities returns typed struct with set fields.
