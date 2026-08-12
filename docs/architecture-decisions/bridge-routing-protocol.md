@@ -405,7 +405,9 @@ parsed from the initialize result and retained per connection handle.
 Kakehashi in turn declares
 `capabilities.experimental.kakehashi.bridgeRouting: true` in the **client
 capabilities** it sends at `initialize` (the same relative path, under
-`InitializeParams.capabilities`), unconditionally — a
+`InitializeParams.capabilities`; a new declaration — today's downstream
+initialize builder populates no `experimental` field, and this lands
+with the protocol's implementation), unconditionally — a
 configuration reload can enable routing mid-session without reinitializing
 existing connections, so the declaration must not encode current config —
 letting a provider skip building routing state only under clients that
