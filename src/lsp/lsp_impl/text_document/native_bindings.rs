@@ -843,6 +843,58 @@ mod tests {
         );
     }
 
+    /// Bytes an `#offset!` trims off belong to the host layer, not to this
+    /// one. Claiming them would hit the `offset.is_some()` bail and silence
+    /// the position, while the bridge's region lookup has already handed the
+    /// same byte to the host server — the two layers must agree on where the
+    /// injected content is.
+    #[tokio::test]
+    async fn offset_trimmed_bytes_are_left_to_the_host_layer() {
+        // `minus_metadata` spans 0..23; `#offset! 1 0 -1 0` trims it to 4..19,
+        // so byte 19 (the closing `---`) is host, byte 4 (`title`) is YAML.
+        let text = "---\ntitle: awesome\n---\n";
+        let (service, _uri) = server_with_markdown_doc(text);
+        let server = service.inner();
+        let frontmatter_query = Query::new(
+            &tree_sitter_md::LANGUAGE.into(),
+            r#"
+            ((minus_metadata) @injection.content
+              (#set! injection.language "yaml")
+              (#offset! @injection.content 1 0 -1 0))
+            "#,
+        )
+        .unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(frontmatter_query));
+
+        let url = Url::parse("file:///test/native_bindings.md").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_md::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+
+        assert!(
+            server
+                .injected_bindings_layer(&url, text, &tree, "markdown", 19)
+                .await
+                .is_none(),
+            "the closing fence is outside the injected content: host layer"
+        );
+        assert!(
+            matches!(
+                server
+                    .injected_bindings_layer(&url, text, &tree, "markdown", 4)
+                    .await,
+                Some(None)
+            ),
+            "a body byte IS injected content, and an offset region stays silent \
+             here because the native path does not clip windows yet"
+        );
+    }
+
     #[tokio::test]
     async fn injected_cursor_never_gets_a_host_layer_answer() {
         // The host (markdown) has no bindings query; even if it did, an
