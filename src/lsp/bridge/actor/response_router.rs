@@ -86,6 +86,7 @@ enum RequestDelivery {
     Writing,
     Sent,
     CancelledQueued,
+    CancelledSent,
 }
 
 pub(crate) enum LivenessExpiry {
@@ -279,7 +280,7 @@ impl ResponseRouter {
                     pending.delivery = RequestDelivery::CancelledQueued;
                 }
                 RequestDelivery::Writing | RequestDelivery::Sent => sent.push(id),
-                RequestDelivery::CancelledQueued => {}
+                RequestDelivery::CancelledQueued | RequestDelivery::CancelledSent => {}
             }
         }
         (true, sent)
@@ -301,7 +302,9 @@ impl ResponseRouter {
                 pending.delivery = RequestDelivery::Writing;
                 return true;
             }
-            RequestDelivery::Writing | RequestDelivery::Sent => return false,
+            RequestDelivery::Writing | RequestDelivery::Sent | RequestDelivery::CancelledSent => {
+                return false;
+            }
             RequestDelivery::CancelledQueued => {}
         }
 
@@ -443,17 +446,23 @@ impl ResponseRouter {
             .state
             .lock()
             .recover_poison("ResponseRouter::cancel_and_remove");
-        let should_notify = state.pending.get(&id).is_some_and(|pending| {
-            matches!(
-                pending.delivery,
-                RequestDelivery::Writing | RequestDelivery::Sent
-            )
-        });
-        state.pending.remove(&id);
-        state.failures.remove(&id);
-        state.failure_tracked.remove(&id);
-        Self::remove_cancel_mapping_inner(&mut state, id);
-        should_notify
+        let Some(pending) = state.pending.get_mut(&id) else {
+            return false;
+        };
+        match pending.delivery {
+            RequestDelivery::Queued | RequestDelivery::CancelledQueued => {
+                state.pending.remove(&id);
+                state.failures.remove(&id);
+                state.failure_tracked.remove(&id);
+                Self::remove_cancel_mapping_inner(&mut state, id);
+                false
+            }
+            RequestDelivery::Writing | RequestDelivery::Sent => {
+                pending.delivery = RequestDelivery::CancelledSent;
+                true
+            }
+            RequestDelivery::CancelledSent => false,
+        }
     }
 
     pub(crate) fn take_failure(&self, id: RequestId) -> Option<BridgeFailure> {
@@ -673,7 +682,8 @@ mod tests {
     #[test]
     fn new_router_has_no_pending_requests() {
         let router = ResponseRouter::new();
-        assert_eq!(router.pending_count(), 0);
+        assert_eq!(router.pending_count(), 1);
+        assert_eq!(router.awaiting_downstream_count(), 1);
     }
 
     #[test]
@@ -710,7 +720,8 @@ mod tests {
 
         assert!(!router.cancel_and_remove(queued));
         assert!(router.cancel_and_remove(writing));
-        assert_eq!(router.pending_count(), 0);
+        assert_eq!(router.pending_count(), 1);
+        assert_eq!(router.awaiting_downstream_count(), 1);
     }
 
     #[tokio::test]

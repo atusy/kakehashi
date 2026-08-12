@@ -136,9 +136,31 @@ impl PeerDirectory {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PeerParams {
     #[serde(default)]
-    text_document: Option<TextDocumentIdentifier>,
+    text_document: OptionalFilter<TextDocumentIdentifier>,
     #[serde(default)]
-    name: Option<String>,
+    name: OptionalFilter<String>,
+}
+
+#[derive(Default)]
+enum OptionalFilter<T> {
+    #[default]
+    Missing,
+    Present(T),
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for OptionalFilter<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::Present)
+    }
+}
+
+impl<T> OptionalFilter<T> {
+    fn as_ref(&self) -> Option<&T> {
+        match self {
+            Self::Missing => None,
+            Self::Present(value) => Some(value),
+        }
+    }
 }
 
 pub(in crate::lsp::bridge) async fn list_result(
@@ -156,7 +178,7 @@ pub(in crate::lsp::bridge) async fn list_result(
         directory
             .list(
                 origin,
-                params.name.as_deref(),
+                params.name.as_ref().map(String::as_str),
                 params.text_document.as_ref(),
             )
             .await,
@@ -280,6 +302,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn peer_discovery_rejects_explicit_null_filters() {
+        let directory = PeerDirectory::default();
+        let origin = ConnectionKey::for_server("tsudoi");
+        for filter in ["name", "textDocument"] {
+            let mut params = serde_json::Map::new();
+            params.insert(filter.to_string(), serde_json::Value::Null);
+            let error = list_result(
+                &directory,
+                &origin,
+                &serde_json::json!({ "params": params }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.code,
+                tower_lsp_server::jsonrpc::ErrorCode::InvalidParams
+            );
+        }
     }
 
     #[tokio::test]
