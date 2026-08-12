@@ -1237,12 +1237,13 @@ thing I am about to act on?*
 
 **Bounds that are actually bounds**
 
-- **Capacity is held by the running call, not by the caller waiting on
-  it.** Releasing capacity when a waiter gives up lets the next caller
-  start another call that cannot be cancelled, and the bound stops bounding
-  anything. The accepted consequence — hung calls can exhaust the pool for
-  unrelated providers — is the contract, and its per-caller effects are
-  spelled out above rather than blanket fail-open.
+- **A caller giving up on an uncancellable call must not let another one
+  start in its place.** The call outlives the waiter, so treating the
+  waiter's departure as free capacity simply adds a second uncancellable
+  call, and the bound stops bounding anything. Enforcing this has an
+  accepted cost — hung calls can exhaust the pool for unrelated providers —
+  which is contract, with its per-caller effects spelled out above rather
+  than a blanket fail-open.
 - **Bounded bookkeeping defaults to the safe answer when it runs out.** A
   flight whose epoch-cause provenance is no longer retained discards; it
   never re-anchors on an assumption.

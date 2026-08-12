@@ -366,11 +366,11 @@ however it likes; it may not violate one.
 - **The stopped-check and the spawn-decision must be atomic.** Split them
   and an acquire spawns a connection beside a tombstone a concurrent `stop`
   just committed, resurrecting a server the user asked to stay down.
-- **Accepted work must always have exactly one worker, and that fact must
-  be derivable from the record.** Remembering it separately lets a crash
-  between accepting work and starting it strand the record with nobody
-  acting on it — the derive-don't-remember posture of
-  respawn-reopen-derives-its-targets.
+- **Accepted work must always have exactly one worker.** Neither zero — a
+  crash between accepting the work and starting it must not strand the
+  record with nobody acting on it — nor two, which for a spawn means two
+  children. This is the same hazard respawn-reopen-derives-its-targets
+  addresses by deriving rather than remembering.
 - **Lifecycle records that cannot be re-derived must outlive the component
   that owns them.** The stopped set is precisely the record of keys *not*
   in the pool, so losing it cannot be repaired by reading the pool;
