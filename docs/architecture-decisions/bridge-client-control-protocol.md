@@ -8,6 +8,7 @@
 - [ls-bridge-message-ordering](ls-bridge-message-ordering.md) — the cancellation forwarding that the pass-through request reuses
 - [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) — the timeout tiers `stop`, `restart`, and pass-through requests interact with
 - [bridge-routing-protocol](bridge-routing-protocol.md) — the reverse-direction sibling (kakehashi→downstream); reuses this protocol's discovery convention and liveness classification, and the stopped set outranks routing answers
+- [bridge-peer-protocol](bridge-peer-protocol.md) — the implemented downstream→kakehashi→downstream sibling; reuses the pass-through boundary but exposes only other running peers
 
 ## Context
 
