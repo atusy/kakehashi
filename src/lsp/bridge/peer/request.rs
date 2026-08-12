@@ -168,8 +168,11 @@ pub(in crate::lsp::bridge) fn handle(
                 }
             }
             _ = cancel.cancelled() => {
-                let should_notify = peer.router().cancel_and_remove(downstream_id);
-                router_guard.disarm();
+                let cancellation = peer.router().cancel_peer(downstream_id);
+                let should_notify = cancellation.unwrap_or(false);
+                if cancellation.is_some() {
+                    router_guard.disarm();
+                }
                 if should_notify {
                     let outcome = peer.send_notification(JsonRpcNotification::new(
                         "$/cancelRequest",
@@ -184,9 +187,15 @@ pub(in crate::lsp::bridge) fn handle(
                         );
                     }
                     let router = peer.router().clone();
+                    let peer = peer.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(super::super::pool::REQUEST_TIMEOUT).await;
-                        router.remove(downstream_id);
+                        if router.peer_cancel_is_writing(downstream_id) {
+                            peer.set_state(super::super::pool::ConnectionState::Failed);
+                            router.fail_all("bridge: cancelled peer write timed out");
+                        } else {
+                            router.remove(downstream_id);
+                        }
                     });
                 }
                 Err(jsonrpc::Error::request_cancelled())
