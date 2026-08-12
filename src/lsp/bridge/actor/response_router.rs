@@ -475,13 +475,56 @@ impl ResponseRouter {
         }
     }
 
-    pub(crate) fn peer_cancel_is_writing(&self, id: RequestId) -> bool {
-        self.state
+    /// Expire one cancelled peer request at its original deadline.
+    ///
+    /// Returns true only when its write is still blocked. In that case request
+    /// admission is closed and every waiter is failed under the same lock, so a
+    /// concurrent write completion/response cannot turn a healthy connection
+    /// failure into a false positive.
+    pub(crate) fn expire_peer_cancel(&self, id: RequestId) -> bool {
+        let mut state = self
+            .state
             .lock()
-            .recover_poison("ResponseRouter::peer_cancel_is_writing")
-            .pending
-            .get(&id)
-            .is_some_and(|pending| pending.delivery == RequestDelivery::CancelledWriting)
+            .recover_poison("ResponseRouter::expire_peer_cancel");
+        match state.pending.get(&id).map(|pending| pending.delivery) {
+            Some(RequestDelivery::CancelledWriting) => {}
+            Some(RequestDelivery::CancelledSent) => {
+                state.pending.remove(&id);
+                state.failure_tracked.remove(&id);
+                state.failures.remove(&id);
+                Self::remove_cancel_mapping_inner(&mut state, id);
+                return false;
+            }
+            _ => return false,
+        }
+
+        state.accepting = false;
+        let entries = state.pending.drain().collect::<Vec<_>>();
+        for (request_id, _) in &entries {
+            if state.failure_tracked.remove(request_id) {
+                state
+                    .failures
+                    .insert(*request_id, BridgeFailure::RequestTimeout);
+            }
+        }
+        state.upstream_to_downstream.clear();
+        state.downstream_to_upstream.clear();
+        drop(state);
+        self.terminal.notify_waiters();
+        for (request_id, pending) in entries {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request_id.as_i64(),
+                "error": {
+                    "code": -32603,
+                    "message": "bridge: cancelled peer write timed out"
+                }
+            });
+            if pending.response_tx.send(response).is_err() {
+                self.take_failure(request_id);
+            }
+        }
+        true
     }
 
     pub(crate) fn take_failure(&self, id: RequestId) -> Option<BridgeFailure> {
