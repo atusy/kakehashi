@@ -1151,10 +1151,17 @@ fn remove_parser_entry(path: &Path) -> std::io::Result<bool> {
         Err(error) => {
             let still_a_symlink = std::fs::symlink_metadata(path)
                 .is_ok_and(|metadata| metadata.file_type().is_symlink());
-            if still_a_symlink && std::fs::remove_dir(path).is_ok() {
-                Ok(true)
-            } else {
-                Err(error)
+            if !still_a_symlink {
+                return Err(error);
+            }
+            match std::fs::remove_dir(path) {
+                Ok(()) => Ok(true),
+                // Vanished between the two attempts. Same answer as the
+                // `remove_file` case above and for the same reason: the entry
+                // is gone, so surfacing the first error would report a
+                // half-removed language over a filesystem that is as asked.
+                Err(second) if second.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(_) => Err(error),
             }
         }
     }
