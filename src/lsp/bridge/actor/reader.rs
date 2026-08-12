@@ -2131,6 +2131,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_message_rejects_peer_request_when_origin_limit_is_full() {
+        let router = ResponseRouter::new();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        let peer = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("oxfmt"),
+        )
+        .await;
+        let peer_id = peer.key().peer_id();
+        deps.peer_directory.register(&peer);
+        for n in 0..crate::lsp::bridge::inbound_request_registry::MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION
+        {
+            deps.inbound_request_registry
+                .try_register_peer(
+                    deps.progress_connection_id,
+                    jsonrpc::Id::Number(n as i64),
+                )
+                .expect("fill the per-origin allowance");
+        }
+
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1000,
+                "method": "kakehashi/bridge/peer/request",
+                "params": {
+                    "id": peer_id,
+                    "method": "textDocument/formatting",
+                    "params": { "textDocument": { "uri": "file:///repo/main.ts" } }
+                }
+            }),
+            &router,
+            "[tsudoi] ",
+            &deps,
+        )
+        .await;
+
+        let OutboundMessage::Untracked(response) = response_rx.recv().await.unwrap() else {
+            panic!("server-request responses are untracked")
+        };
+        assert_eq!(response["id"], 1000);
+        assert_eq!(response["error"]["data"]["reason"], "tooManyRequests");
+        assert_eq!(
+            peer.router().pending_count(),
+            0,
+            "rejection happens before target router/task state is created"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_message_unregister_capability_updates_registry() {
         let router = ResponseRouter::new();
         let (response_tx, mut response_rx) = mpsc::channel(16);

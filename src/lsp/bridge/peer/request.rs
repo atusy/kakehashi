@@ -120,9 +120,26 @@ pub(in crate::lsp::bridge) fn handle(
         return;
     };
 
+    let connection_id = deps.progress_connection_id;
+    let registry = deps.inbound_request_registry.clone();
+    let Some((cancel, generation)) = registry.try_register_peer(connection_id, id.clone()) else {
+        tokio::spawn(async move {
+            let response = jsonrpc::Response::from_error(
+                id,
+                request_failed(
+                    "tooManyRequests",
+                    "too many peer requests are awaiting responses",
+                ),
+            );
+            send_server_response(&response_tx, response, &server_prefix, METHOD).await;
+        });
+        return;
+    };
+
     let (downstream_id, response_rx) = match peer.register_peer_request() {
         Ok(registered) => registered,
         Err(error) => {
+            registry.unregister(connection_id, &id, generation);
             tokio::spawn(async move {
                 let response = jsonrpc::Response::from_error(
                     id,
@@ -136,9 +153,6 @@ pub(in crate::lsp::bridge) fn handle(
     let mut router_guard = RouterCleanupGuard::new(peer.clone().router().clone(), downstream_id);
     // Register before the inner send: a $/cancelRequest arriving immediately
     // after the outer request must not fall into a send/register gap.
-    let connection_id = deps.progress_connection_id;
-    let registry = deps.inbound_request_registry.clone();
-    let (cancel, generation) = registry.register(connection_id, id.clone());
     let inner_params = match params.params {
         OptionalParams::Missing => None,
         OptionalParams::Present(value) => Some(value),

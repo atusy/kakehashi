@@ -41,7 +41,16 @@ use crate::error::LockResultExt;
 struct Entry {
     generation: u64,
     token: CancellationToken,
+    kind: EntryKind,
 }
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum EntryKind {
+    Editor,
+    Peer,
+}
+
+pub(crate) const MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION: usize = 64;
 
 /// Shared (cheaply cloneable) registry of in-flight forwarded requests. Nested
 /// `connection → (request id → entry)` so per-id lookups don't clone the id and
@@ -63,21 +72,54 @@ impl InboundRequestRegistry {
         connection_id: ProgressConnectionId,
         request_id: jsonrpc::Id,
     ) -> (CancellationToken, u64) {
+        self.register_kind(connection_id, request_id, EntryKind::Editor)
+            .expect("editor forwarding is not subject to the peer request limit")
+    }
+
+    /// Register peer forwarding while bounding the tasks and router state a
+    /// single downstream connection can keep alive without responses.
+    pub(crate) fn try_register_peer(
+        &self,
+        connection_id: ProgressConnectionId,
+        request_id: jsonrpc::Id,
+    ) -> Option<(CancellationToken, u64)> {
+        self.register_kind(connection_id, request_id, EntryKind::Peer)
+    }
+
+    fn register_kind(
+        &self,
+        connection_id: ProgressConnectionId,
+        request_id: jsonrpc::Id,
+        kind: EntryKind,
+    ) -> Option<(CancellationToken, u64)> {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let token = CancellationToken::new();
-        let replaced = self
+        let mut inner = self
             .inner
             .lock()
-            .recover_poison("InboundRequestRegistry::register")
-            .entry(connection_id)
-            .or_default()
-            .insert(
-                request_id,
-                Entry {
-                    generation,
-                    token: token.clone(),
-                },
-            );
+            .recover_poison("InboundRequestRegistry::register_kind");
+        let requests = inner.entry(connection_id).or_default();
+        let replaces_peer = requests
+            .get(&request_id)
+            .is_some_and(|entry| entry.kind == EntryKind::Peer);
+        if kind == EntryKind::Peer
+            && !replaces_peer
+            && requests
+                .values()
+                .filter(|entry| entry.kind == EntryKind::Peer)
+                .count()
+                >= MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION
+        {
+            return None;
+        }
+        let replaced = requests.insert(
+            request_id,
+            Entry {
+                generation,
+                token: token.clone(),
+                kind,
+            },
+        );
         // A well-behaved downstream never reuses a request id while one is in
         // flight, but if it does, cancel the orphaned forwarding operation so
         // it does not dangle unreachable (including any editor dialog). The orphan's
@@ -85,7 +127,7 @@ impl InboundRequestRegistry {
         if let Some(old) = replaced {
             old.token.cancel();
         }
-        (token, generation)
+        Some((token, generation))
     }
 
     /// Cancel a specific in-flight request (a downstream `$/cancelRequest`). The
@@ -232,5 +274,38 @@ mod tests {
         assert!(a.is_cancelled());
         assert!(b.is_cancelled());
         assert!(!other.is_cancelled());
+    }
+
+    #[test]
+    fn peer_forwarding_is_bounded_per_origin_connection() {
+        let registry = InboundRequestRegistry::default();
+        let mut registrations = Vec::new();
+        for n in 0..MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION {
+            registrations.push(
+                registry
+                    .try_register_peer(conn(1), jsonrpc::Id::Number(n as i64))
+                    .expect("requests up to the limit are admitted"),
+            );
+        }
+        assert!(
+            registry
+                .try_register_peer(conn(1), jsonrpc::Id::Number(1000))
+                .is_none(),
+            "one origin cannot grow peer forwarding state past the limit"
+        );
+        assert!(
+            registry
+                .try_register_peer(conn(2), jsonrpc::Id::Number(1000))
+                .is_some(),
+            "a different origin has its own allowance"
+        );
+
+        registry.unregister(conn(1), &jsonrpc::Id::Number(0), registrations[0].1);
+        assert!(
+            registry
+                .try_register_peer(conn(1), jsonrpc::Id::Number(1000))
+                .is_some(),
+            "settlement releases capacity"
+        );
     }
 }
