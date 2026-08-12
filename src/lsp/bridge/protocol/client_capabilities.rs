@@ -207,6 +207,29 @@ fn merge_upstream_capabilities(
         return base;
     };
 
+    // Preserve editor-provided experimental extensions. Object-shaped values
+    // can carry the bridge advertisement alongside the editor's keys; a
+    // non-object value cannot be extended without changing its shape, so it
+    // wins unchanged rather than being silently clobbered.
+    if let Some(upstream_experimental) = &upstream.experimental {
+        match upstream_experimental {
+            serde_json::Value::Object(upstream_experimental) => {
+                let mut experimental = upstream_experimental.clone();
+                let kakehashi = experimental
+                    .entry("kakehashi".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let serde_json::Value::Object(kakehashi) = kakehashi {
+                    kakehashi.insert("bridgeRouting".to_string(), serde_json::Value::Bool(true));
+                    base.experimental = Some(serde_json::Value::Object(experimental));
+                } else {
+                    base.experimental =
+                        Some(serde_json::Value::Object(upstream_experimental.clone()));
+                }
+            }
+            upstream_experimental => base.experimental = Some(upstream_experimental.clone()),
+        }
+    }
+
     // Helper: replace base option with upstream if upstream is Some
     fn merge_option<T>(base: &mut Option<T>, upstream: Option<T>) {
         if upstream.is_some() {
@@ -1082,5 +1105,40 @@ mod tests {
                 Some(&serde_json::Value::Bool(true)),
             );
         }
+    }
+
+    #[test]
+    fn merge_preserves_upstream_experimental_extensions() {
+        let upstream = ClientCapabilities {
+            experimental: Some(serde_json::json!({
+                "editorFeature": {"enabled": true},
+                "kakehashi": {"other": "preserved"},
+            })),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            build_bridge_client_capabilities(Some(&upstream), false, false).experimental,
+            Some(serde_json::json!({
+                "editorFeature": {"enabled": true},
+                "kakehashi": {
+                    "other": "preserved",
+                    "bridgeRouting": true,
+                },
+            })),
+        );
+    }
+
+    #[test]
+    fn merge_preserves_non_object_upstream_experimental_value() {
+        let upstream = ClientCapabilities {
+            experimental: Some(serde_json::json!("editor-extension-payload")),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            build_bridge_client_capabilities(Some(&upstream), false, false).experimental,
+            upstream.experimental,
+        );
     }
 }
