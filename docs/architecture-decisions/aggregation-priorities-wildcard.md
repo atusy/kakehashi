@@ -5,7 +5,7 @@
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — Per-method strategies and merging rules
 - [concatenated-formatting-pipeline](concatenated-formatting-pipeline.md) — The formatting pipeline whose allowlist semantics this decision generalizes
 - [cross-layer-aggregation](cross-layer-aggregation.md) — Layer ordering (`priorities` over layers), which adopts the same allowlist rule
-- [bridge-routing-protocol](bridge-routing-protocol.md) — Reuses the allowlist for routing-provider order under the first non-LSP method key, `kakehashi/bridge/routing` (target state with that protocol's implementation: the routing key is exempt from the `"_"` method-wildcard merge and from `maxFanOut` — today's generic resolution applies both to every method string, so the exemptions need a routing-specific resolution path)
+- [bridge-routing-protocol](bridge-routing-protocol.md) — Reuses the allowlist for routing-provider order under the first non-LSP method key, `kakehashi/bridge/routing`. That key is **exempt from the `"_"` method-wildcard merge** — shipped: resolution reads the routing key's own entry or nothing, so no field of a `"_"` entry, `maxFanOut` included, reaches it. Skipping the `maxFanOut` *truncation* at dispatch remains target state, along with the dispatch itself
 
 ## Implementation Status
 

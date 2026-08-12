@@ -145,6 +145,23 @@ inherited", because clearing is not widening. Where widening must be
 expressible, it needs a marker *inside* the list: see
 any-language-server-wildcard for `languages = ["*"]`.
 
+### The one exception
+
+One key does not inherit from `_`: the method key
+`kakehashi/bridge/routing` in a `bridge.<lang>.aggregation` map reads its own
+entry or nothing (bridge-routing-protocol). The reason is historical rather
+than structural — every `aggregation."_"` entry written before that protocol
+existed is an LSP fan-out allowlist naming *language servers*, and inheriting
+one would exclude every dedicated routing provider from routing for that
+language, turning the protocol off with no signal. The cost is recorded and
+symmetric: a deliberate global allowlist or kill switch at `aggregation."_"`
+does not gate routing either.
+
+The exception is confined to that one method key on the method axis. The
+language axis is untouched — a `bridge._` entry still supplies the routing key
+to `bridge.<lang>` exactly as it supplies any other — and no other map in the
+configuration has an exempt key.
+
 ## Consequences
 
 ### Positive
@@ -254,4 +271,4 @@ The existing `resolve_capture()` in `legend.rs` already implements lazy fallback
 
 - [configuration-merging-strategy](configuration-merging-strategy.md): Cross-layer configuration merging strategy
 - [any-language-server-wildcard](any-language-server-wildcard.md): Why widening past an inherited `languages` list needs an in-list marker
-- [bridge-routing-protocol](bridge-routing-protocol.md): The wire projection sends wildcard-resolved effective values; the routing method key is exempt from the `"_"` method-wildcard merge (target state — today's resolution applies the generic merge to every method string)
+- [bridge-routing-protocol](bridge-routing-protocol.md): The wire projection sends wildcard-resolved effective values; the routing method key is **exempt from the `"_"` method-wildcard merge** — shipped, and the one live exception to this decision's otherwise universal rule (see § The one exception)

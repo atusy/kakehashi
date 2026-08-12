@@ -599,7 +599,7 @@ Each entry in the `bridge` map configures bridging for one injection language:
 | Field | Description |
 |-------|-------------|
 | `enabled` | Whether bridging is enabled (`true`/`false`). Omit to inherit from the `_` wildcard (defaults to `true`). |
-| `aggregation` | Per-method aggregation config. Key = LSP method name (e.g., `textDocument/completion`) or `_` for default. |
+| `aggregation` | Per-method aggregation config. Key = LSP method name (e.g., `textDocument/completion`) or `_` for default. One key is exempt from `_`: see the note under the aggregation fields below. |
 
 **Host bridging (`bridge._self`):**
 
@@ -645,6 +645,14 @@ When multiple language servers can handle the same injection language, `aggregat
 > servers still participated as fallback. It is now an allowlist: `["pyright"]`
 > runs *only* pyright. Append `"*"` (`["pyright", "*"]`) to keep the old
 > fallback behavior.
+
+> **One key does not inherit from `_`**: `kakehashi/bridge/routing`, the
+> method key that will order routing providers. Every `aggregation._` entry
+> written so far is an allowlist of *language servers*, and inheriting one
+> would exclude every dedicated routing provider — so that key reads its own
+> entry or nothing. The cost is symmetric and worth knowing: a deliberate
+> global restriction at `aggregation._` does not reach routing either. To
+> control routing, write the key itself, at any language level.
 
 Example with per-method priorities, strategy, and maxFanOut:
 

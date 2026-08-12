@@ -1637,6 +1637,19 @@ mod tests {
             error.to_string().contains("header line"),
             "the error must name what tripped: {error}"
         );
+        assert!(
+            error.to_string().contains("xxx"),
+            "and quote the peer's bytes, which this error is the last chance to \
+             read: {error}"
+        );
+
+        // The ceiling itself is legal. Without this, tightening `>` to `>=`
+        // would pass every other assertion here.
+        let mut frame = FrameParseState::default();
+        frame
+            .absorb(&vec![b'x'; MAX_HEADER_LINE_BYTES])
+            .1
+            .expect("a line exactly at the ceiling is not past it");
     }
 
     /// Bounding each line is not enough: a peer can send unboundedly many
@@ -1667,6 +1680,21 @@ mod tests {
             error.to_string().contains("header block"),
             "the error must name what tripped: {error}"
         );
+
+        // The ceiling itself is legal, so a `>` tightened to `>=` fails here
+        // rather than passing everything above.
+        let mut frame = FrameParseState::default();
+        let filler = format!("X-Padding: {}\r\n", "p".repeat(1000));
+        let mut charged = 0;
+        while charged + filler.len() <= MAX_HEADER_BLOCK_BYTES {
+            frame.absorb(filler.as_bytes()).1.unwrap();
+            charged += filler.len();
+        }
+        let exact = vec![b'p'; MAX_HEADER_BLOCK_BYTES - charged];
+        frame
+            .absorb(&exact)
+            .1
+            .expect("a block summing exactly to the ceiling is not past it");
 
         // A completed frame starts the next one's budget from zero, so a busy
         // connection cannot accumulate its way into a false positive.
