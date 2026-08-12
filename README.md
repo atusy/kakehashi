@@ -9,6 +9,11 @@ kakehashi is a bridge (架け橋) across your editors, your languages, and the l
 - bridge to all of the above — even for code embedded inside other code
 
 ```mermaid
+---
+config:
+  flowchart:
+    rankSpacing: 10
+---
 flowchart TB
     subgraph K[" "]
         direction TB
@@ -18,7 +23,7 @@ flowchart TB
     K <-->|Highlighting, selection, and more — everywhere| E["Your editor (any LSP client)"]
     K <-.->|The additional smarts of real language servers| LS["pyright, rust-analyzer, and friends"]
 
-    style K stroke-width:2px
+    style K fill:#e6f7f1,stroke:#5aa88b,stroke-width:2px
     style T fill:transparent,stroke:transparent,font-size:20px,font-weight:bold
     style B fill:transparent,stroke:#aaa,stroke-dasharray:3 3,color:#666,font-size:12px
 ```
