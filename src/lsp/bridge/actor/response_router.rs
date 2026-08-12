@@ -89,6 +89,8 @@ pub(crate) enum LivenessExpiry {
     Failed { pending_count: usize },
 }
 
+const BRIDGE_FAILURE_DATA_KEY: &str = "kakehashiBridgeFailure";
+
 impl ResponseRouter {
     /// Create a new empty ResponseRouter.
     pub(crate) fn new() -> Self {
@@ -447,7 +449,8 @@ impl ResponseRouter {
                     "id": id.as_i64(),
                     "error": {
                         "code": -32803, // REQUEST_FAILED per LSP spec
-                        "message": format!("bridge: {}", reason)
+                        "message": format!("bridge: {}", reason),
+                        "data": { (BRIDGE_FAILURE_DATA_KEY): "connectionLost" }
                     }
                 });
                 let _ = pending.response_tx.send(error_response);
@@ -489,7 +492,8 @@ impl ResponseRouter {
                 "id": id.as_i64(),
                 "error": {
                     "code": code,
-                    "message": message
+                    "message": message,
+                    "data": { (BRIDGE_FAILURE_DATA_KEY): "connectionLost" }
                 }
             });
             let _ = pending.response_tx.send(error_response);
@@ -544,7 +548,8 @@ impl ResponseRouter {
                 "id": id.as_i64(),
                 "error": {
                     "code": code,
-                    "message": message
+                    "message": message,
+                    "data": { (BRIDGE_FAILURE_DATA_KEY): "requestTimeout" }
                 }
             });
             let _ = pending.response_tx.send(error_response);
