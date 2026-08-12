@@ -47,9 +47,15 @@ test:
 test_e2e:
 	CARGO="$(CARGO)" scripts/test_e2e.sh
 
+# Debug a timing-sensitive test without parallel load. Note this is stricter
+# than the target it replaced: that one ran the binaries one at a time but let
+# libtest parallelize inside each, whereas --test-threads=1 serializes all ~450
+# tests, so a full run takes minutes. Pass FILTER to run only what you're
+# debugging:  make test_e2e_sequential FILTER=e2e_semantic::
+FILTER ?=
 .PHONY: test_e2e_sequential
 test_e2e_sequential:
-	$(CARGO) test --features e2e --test integration --test e2e -- --test-threads=1
+	$(CARGO) test --features e2e --test integration --test e2e -- --test-threads=1 $(FILTER)
 
 # Run all tests (unit + integration + E2E)
 .PHONY: test_all
