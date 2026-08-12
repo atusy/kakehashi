@@ -155,10 +155,18 @@ pub(in crate::lsp::bridge) fn handle(
                 let should_notify = peer.router().cancel_and_remove(downstream_id);
                 router_guard.disarm();
                 if should_notify {
-                    peer.send_notification(JsonRpcNotification::new(
+                    let outcome = peer.send_notification(JsonRpcNotification::new(
                         "$/cancelRequest",
                         serde_json::json!({ "id": downstream_id.as_i64() }),
                     ));
+                    if outcome != super::super::pool::NotificationSendResult::Queued {
+                        log::warn!(
+                            target: "kakehashi::bridge::peer",
+                            "Could not queue peer cancellation for request {}: {:?}",
+                            downstream_id.as_i64(),
+                            outcome
+                        );
+                    }
                 }
                 Err(jsonrpc::Error::request_cancelled())
             }
