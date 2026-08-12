@@ -171,7 +171,7 @@ fn peer_keys<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsp::bridge::pool::test_helpers::create_handle_with_key;
+    use crate::lsp::bridge::pool::{HostDocSyncState, test_helpers::create_handle_with_key};
 
     #[test]
     fn peer_list_excludes_only_the_origin_connection() {
@@ -273,6 +273,57 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn peer_request_composes_text_document_and_name_filters() {
+        let directory = PeerDirectory::default();
+        let origin_key = ConnectionKey::for_server("tsudoi");
+        let denols_key = ConnectionKey::for_server("denols");
+        let other_root_key = ConnectionKey::new("denols", Some("file:///other".to_string()));
+        let origin = create_handle_with_key(ConnectionState::Ready, origin_key.clone()).await;
+        let denols = create_handle_with_key(ConnectionState::Ready, denols_key.clone()).await;
+        let other_root =
+            create_handle_with_key(ConnectionState::Ready, other_root_key.clone()).await;
+        for handle in [&origin, &denols, &other_root] {
+            directory.register(handle);
+        }
+        directory.host_documents.lock().await.insert(
+            ("file:///repo/main.ts".to_string(), denols_key),
+            HostDocSyncState {
+                version: 1,
+                fingerprint: 0,
+            },
+        );
+        directory.host_documents.lock().await.insert(
+            ("file:///other/main.ts".to_string(), other_root_key),
+            HostDocSyncState {
+                version: 1,
+                fingerprint: 0,
+            },
+        );
+
+        let result = list_result(
+            &directory,
+            &origin_key,
+            &serde_json::json!({
+                "params": {
+                    "textDocument": { "uri": "file:///repo/main.ts" },
+                    "name": "denols"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!([{
+                "name": "denols",
+                "id": "kakehashi-peer:6:denols:fallback",
+                "workspaceFolders": []
+            }])
+        );
     }
 
     #[tokio::test]
