@@ -1,22 +1,22 @@
-//! Cancellation registry for downstream-initiated requests forwarded to the
-//! editor (`window/showMessageRequest`, `window/showDocument`,
-//! `workspace/applyEdit` — which is registered but answered locally, never
-//! editor-bound, when the editor lacks the capability).
+//! Cancellation registry for downstream-initiated requests forwarded either to
+//! the editor (`window/showMessageRequest`, `window/showDocument`, and
+//! `workspace/applyEdit`) or to another downstream peer.
 //!
 //! When a downstream server sends `$/cancelRequest` for such a request — or its
-//! connection dies while one is in flight — the bridge must tell the editor to
-//! cancel so a `showMessageRequest` dialog is dismissed. tower-lsp's `Client`
+//! connection dies while one is in flight — the bridge must cancel the matching
+//! forwarding operation. For editor-bound requests, tower-lsp's `Client`
 //! exposes no cancel API for an outgoing request, so the forwarding loop instead
 //! sends the request with an id it minted (see `send_editor_request`) and, on
-//! cancel, sends a correlated `$/cancelRequest` to the editor. (A locally
+//! cancel, sends a correlated `$/cancelRequest` to the editor. Peer forwarding
+//! similarly retires its target router entry and cancels a write that started. (A locally
 //! answered request — the capability-gated applyEdit — is unregistered before
 //! its token is ever awaited, so cancellation has nothing to do there.)
 //!
 //! This registry connects the two halves: the per-connection reader (which sees
 //! the downstream `$/cancelRequest` and the connection lifecycle) registers each
-//! in-flight forwarded request and fires its [`CancellationToken`]; the global
-//! forwarding loop awaits that token. Keyed by `(connection, downstream request
-//! id)`.
+//! in-flight forwarded request and fires its [`CancellationToken`]; the relevant
+//! editor or peer forwarding task awaits that token. Keyed by `(connection,
+//! downstream request id)`.
 //!
 //! Registration happens on the reader **before** the request is enqueued, so a
 //! `$/cancelRequest` that races in immediately after can't miss it. The token is

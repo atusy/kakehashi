@@ -304,10 +304,9 @@ pub(crate) struct ServerRequestDeps {
     /// capability). Unbounded: a dropped request would hang the downstream.
     /// See [`UpstreamRequest`].
     pub(crate) upstream_request_tx: mpsc::UnboundedSender<UpstreamRequest>,
-    /// Tracks in-flight forwarded requests so a downstream `$/cancelRequest`
-    /// (or connection death) can cancel the editor-bound request (#404).
-    /// (Capability-gated applyEdits are registered too, though answered
-    /// locally.)
+    /// Tracks in-flight downstream-originated forwarding so a downstream
+    /// `$/cancelRequest` (or connection death) can cancel either the
+    /// editor-bound request (#404) or a peer-bound bridge request.
     pub(crate) inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
     /// The folders this connection currently serves, used to answer downstream
     /// `workspace/workspaceFolders` pulls. Mutable: a `preferSharedInstance`
@@ -960,9 +959,9 @@ async fn handle_message(
 }
 
 /// Handle an inbound downstream `$/cancelRequest`: if it targets a forwarded
-/// request still in flight (`window/showMessageRequest`, `window/showDocument`,
-/// or a supported `workspace/applyEdit`),
-/// cancel the editor-bound request so its dialog is dismissed (#404). The id is
+/// request still in flight (an editor-bound `window/*`/`workspace/applyEdit`
+/// request or a peer-bound bridge request), cancel that forwarding operation.
+/// For editor requests this dismisses an open dialog (#404). The id is
 /// parsed as a [`jsonrpc::Id`] exactly as the original request's id was, so the
 /// registry key matches. Ids that aren't tracked (e.g. the bridge's own outbound
 /// requests *to* the downstream, which the downstream can't cancel this way) are
