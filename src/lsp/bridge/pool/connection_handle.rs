@@ -487,18 +487,8 @@ impl ConnectionHandle {
         params: Option<serde_json::Value>,
         request_id: RequestId,
     ) -> Result<(), BridgeError> {
-        let mut payload = serde_json::Map::with_capacity(4);
-        payload.insert(
-            "jsonrpc".to_string(),
-            serde_json::Value::String("2.0".to_string()),
-        );
-        payload.insert("id".to_string(), serde_json::json!(request_id.as_i64()));
-        payload.insert("method".to_string(), serde_json::Value::String(method));
-        if let Some(params) = params {
-            payload.insert("params".to_string(), params);
-        }
         match self.tx.try_send(OutboundMessage::Tracked {
-            payload: serde_json::Value::Object(payload),
+            payload: build_request_value(method, params, request_id),
             request_id,
         }) {
             Ok(()) => Ok(()),
@@ -1172,6 +1162,24 @@ impl ConnectionHandle {
     }
 }
 
+fn build_request_value(
+    method: String,
+    params: Option<serde_json::Value>,
+    request_id: RequestId,
+) -> serde_json::Value {
+    let mut payload = serde_json::Map::with_capacity(4);
+    payload.insert(
+        "jsonrpc".to_string(),
+        serde_json::Value::String("2.0".to_string()),
+    );
+    payload.insert("id".to_string(), serde_json::json!(request_id.as_i64()));
+    payload.insert("method".to_string(), serde_json::Value::String(method));
+    if let Some(params) = params {
+        payload.insert("params".to_string(), params);
+    }
+    serde_json::Value::Object(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,6 +1189,21 @@ mod tests {
     /// Create a default DynamicCapabilityRegistry for tests that don't need it.
     fn default_dynamic_caps() -> Arc<DynamicCapabilityRegistry> {
         Arc::new(DynamicCapabilityRegistry::new())
+    }
+
+    #[test]
+    fn arbitrary_request_preserves_omitted_params() {
+        let without = build_request_value("custom/noParams".to_string(), None, RequestId::new(7));
+        assert_eq!(without["id"], 7);
+        assert_eq!(without["method"], "custom/noParams");
+        assert!(without.get("params").is_none());
+
+        let with = build_request_value(
+            "custom/withParams".to_string(),
+            Some(serde_json::json!({ "value": 1 })),
+            RequestId::new(8),
+        );
+        assert_eq!(with["params"], serde_json::json!({ "value": 1 }));
     }
 
     /// The settings cell stored on the handle is the *same* `Arc` the reader's
