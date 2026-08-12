@@ -341,8 +341,8 @@ struct ProgressPurgeGuard {
     registry: Arc<crate::lsp::bridge::ProgressRegistry>,
     connection_id: crate::lsp::bridge::ProgressConnectionId,
     upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
-    /// Cancel any forwarded requests still in flight when this connection's
-    /// reader exits, so their editor dialogs don't linger (#404).
+    /// Cancel editor- and peer-bound forwarding when this connection exits;
+    /// editor dialogs are dismissed as part of that cleanup (#404).
     inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
 }
 
