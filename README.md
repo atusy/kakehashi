@@ -12,7 +12,7 @@ kakehashi is a bridge (架け橋) across your editors, your languages, and the l
 ---
 config:
   flowchart:
-    rankSpacing: 10
+    rankSpacing: 30
 ---
 flowchart TB
     subgraph K[" "]
@@ -26,6 +26,7 @@ flowchart TB
     style K fill:#e6f7f1,stroke:#5aa88b,stroke-width:2px
     style T fill:transparent,stroke:transparent,font-size:20px,font-weight:bold
     style B fill:transparent,stroke:#aaa,stroke-dasharray:3 3,color:#666,font-size:12px
+    linkStyle 1,2 font-size:13px
 ```
 
 ## 🎨 Highlighting & smart selection, for any language
