@@ -1152,6 +1152,39 @@ mod tests {
         }
     }
 
+    struct FailingSender;
+
+    impl MessageSender for FailingSender {
+        async fn send_notification<P: serde::Serialize + Send>(
+            &mut self,
+            _notification: JsonRpcNotification<P>,
+        ) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "test backpressure",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_initial_sync_does_not_publish_an_empty_uri_bucket() {
+        let mut docs = std::collections::HashMap::new();
+        let uri = Url::parse("file:///test/failed.md").unwrap();
+
+        let error = sync_host_document(
+            &mut FailingSender,
+            &mut docs,
+            &host_doc(&uri, "text"),
+            None,
+            &ConnectionKey::for_server("srv"),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(!docs.contains_key(uri.as_str()));
+    }
+
     #[tokio::test]
     async fn sync_sends_didopen_once_then_versioned_didchange_on_drift() {
         use crate::lsp::bridge::actor::OutboundMessage;
