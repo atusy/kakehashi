@@ -597,7 +597,7 @@ impl ConnectionHandle {
 
     /// Set the connection state, recovering from poisoned locks per project
     /// convention and notifying watchers via the watch channel.
-    pub(super) fn set_state(&self, new_state: ConnectionState) {
+    pub(in crate::lsp::bridge) fn set_state(&self, new_state: ConnectionState) {
         *self
             .state
             .write()
