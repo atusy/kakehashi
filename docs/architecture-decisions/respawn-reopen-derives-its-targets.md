@@ -112,9 +112,9 @@ with the work that belongs to the connection.
    that protocol's implementation): when the document holds an
    active route binding for the server, the binding answers instead of the
    marker walk — a suppressed server is "not applicable", a bound key must
-   match this connection's — and an entry-less server (this exact (host,
-   layer, language, server) entry has no record, whatever the tuple's
-   other servers settled) falls through to the marker rule above. Bindings
+   match this connection's — and an entry-less server (this exact (document, server) entry has no
+   record, whatever the document's other servers settled) falls through
+   to the marker rule above. Bindings
    are keyed per decided document (the host, and each virtual document),
    so stages 2-3 evaluate each unit **independently**: every current
    virtual document is its own unit with its own binding, the host layer

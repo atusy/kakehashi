@@ -39,8 +39,7 @@ and a downstream server is the answering authority.
 
 Introduce a kakehashi-initiated custom request, `kakehashi/bridge/routing`,
 sent to downstream servers that advertise support. The answer refines
-kakehashi's own routing decision for one (document, layer, language)
-tuple; every
+kakehashi's own routing decision for one bridged document; every
 absence — no provider, `null` answer, missing server entry, timeout, error —
 falls back to kakehashi's existing behavior. The protocol is fail-open on
 the transport: absence or failure of providers reproduces today's
@@ -96,11 +95,6 @@ type RoutingParams = {
     languageId: string;
     host?: { uri: string; languageId: string };
   };
-  // Which decision this is. The host-layer and injection-layer decisions
-  // are distinct even when languageId coincides (lua-in-lua,
-  // markdown-in-markdown): they read different aggregation entries, sit
-  // behind different gates, and cache separately.
-  layer: "host" | "injection";
   // The candidate set the decision is about: every configured server that
   // is spawnable (enabled, with an effective cmd) and whose effective
   // `languages` list matches `languageId` (a `"*"` element matches every
@@ -139,6 +133,11 @@ type RoutingResult = null | {
   A virtual URI is **contractually opaque** to providers, exactly as that
   protocol's client ids are to editors: treat it as an identity token,
   never parse its rendering, which may change between kakehashi versions.
+  `host`'s presence is also the layer discriminator — no separate
+  `layer` field exists, because an injection decision is exactly one
+  whose `textDocument` carries a `host`, and the decided documents'
+  URIs never collide across layers (a virtual URI is never a real one),
+  so even lua-in-lua or markdown-in-markdown decisions stay distinct.
   The nested `host` is what makes an injection decision *decidable*: the
   editor-facing control methods are not registered on downstream
   connections (per-side dispatch, below), so a provider has no other way
@@ -613,8 +612,9 @@ whole group). Two
 structures with different lifetimes carry the outcome:
 
 - The **decision cache** holds pre-application answers, keyed
-  `(document URI, layer, languageId, config generation)` — the decided
-  document's own URI, virtual for regions — with **single-flight**
+  `(document URI, languageId, config generation)` — the decided
+  document's own URI, virtual for regions, distinct across layers by
+  construction — with **single-flight**
   dedup — concurrent decision points for the same key await one in-flight
   query rather than racing their own (no existing lock covers this: the
   per-URI `edit_lock` is released before the bridge's open fan-out
@@ -722,7 +722,7 @@ structures with different lifetimes carry the outcome:
   suppression (waiters proceed without the server; distinct provenance
   in the logs). The winning answer is logged in two stages, because its
   effects are not all known at once: a **decision record** when the
-  fan-in decides — the answering provider, the (document, layer,
+  fan-in decides — the answering provider, the decided (document,
   language), and the normalized directives, including an
   affirmation-only win, which vetoes every lower-priority provider
   while changing nothing and would otherwise leave no trace — and a
@@ -1335,7 +1335,7 @@ a slot a routing provider left in play.
 ### Negative
 
 - A configured provider defers first feature availability by design: the
-  first decision per (document, layer, language) costs concurrent round
+  first decision per bridged document costs concurrent round
   trips to every selected provider, bounded by one routing deadline,
   and the downstream opens that decision gates land up to that deadline
   later than today. (The ingress writer ticket and the parse loop are
@@ -1488,14 +1488,14 @@ a slot a routing provider left in play.
 | Aspect | Decision |
 |---|---|
 | **Method** | `kakehashi/bridge/routing`, kakehashi→downstream request; dispatch strictly per side |
-| **Decision unit** | one query per bridged document (host, and each virtual document); `textDocument = { uri: as the downstream sees it, languageId }` + `layer`; per-region volume user-controllable via bridge `enabled = false` / routing `priorities = []` |
-| **Params** | `textDocument` (with nested `host?` on injection decisions) + `layer` + `languageServers` projection `{languages, workspaceMarkers, preferSharedInstance}` of spawnable, language-matching servers (`_` excluded) |
+| **Decision unit** | one query per bridged document (host, and each virtual document); `textDocument = { uri: as the downstream sees it, languageId, host? }` — `host`'s presence is the layer discriminator; per-region volume user-controllable via bridge `enabled = false` / routing `priorities = []` |
+| **Params** | `textDocument` (with nested `host?` on injection decisions; no separate `layer` field) + `languageServers` projection `{languages, workspaceMarkers, preferSharedInstance}` of spawnable, language-matching servers (`_` excluded) |
 | **Answer** | `null`/missing entry/absent `enabled` = kakehashi decides; `enabled: false` = per-document `didOpen` suppression at the routing gate; non-empty `workspaceFolders` = root override; `[]` = rootless route to the server's `#shared` connection |
 | **Precedence** | membership: stopped set > configuration > answer (subtract only); root: answer overrides marker resolution, both resolved keys checked against the stopped set |
 | **Trust** | providers are trusted-by-configuration; folder overrides bounded to canonicalized `file:` URIs at-or-below client workspace folders or the config-resolved root, count-capped |
 | **Folders↔Key** | shared instance: union-only join; per-root: first element, rest warned+ignored; at most one connection per server name per document |
 | **Providers** | all spawnable configured servers ∩ advertising ∩ `Ready` (Initializing awaited only when the advertisement is known, the server is named, or it carries `forceStart`), ordered by routing `priorities` (no `"_"` method-wildcard inheritance); concurrent fan-out, `preferred` fan-in, operative-entry rule |
 | **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy, plus a separate binding-reuse validation budget); expiry is partial-result (cancel unanswered, drop unfinished entries, fan-in over what normalized; whole fallback only when no operative normalized result remains); exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
-| **Caching** | decision cache per (document URI, layer, languageId, config generation) — the decided document's own URI, virtual for regions; single-flight; evicted on the decided document's close (a region leaving closes its virtual document), flushed on reload / `Ready`-provider-set / workspace-folder-set change; (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until that document closes; never retroactive |
+| **Caching** | decision cache per (document URI, languageId, config generation) — the decided document's own URI, virtual for regions; single-flight; evicted on the decided document's close (a region leaving closes its virtual document), flushed on reload / `Ready`-provider-set / workspace-folder-set change; (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until that document closes; never retroactive |
 | **Cold start** | `forceStart` (publication-fenced get-or-create — the `Initializing` slot registers before the config becomes observable to `didOpen`; `#shared` + primary-root seed for `preferSharedInstance` servers, the marker-less fallback shape otherwise; warm-up scope limited to shared/marker-less/policy servers; wait-eligible for the initialization wait) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
 | **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; the sweep reads each exact server entry's binding where one exists, marker resolution where none does, and never spawns |
