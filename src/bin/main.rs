@@ -604,27 +604,18 @@ fn visit_install_directory(
 ///
 /// Shared by `status` and `uninstall --all` so they agree on which NAMES count —
 /// a name one lists and the other refuses to touch is what made `uninstall --all`
-/// fail partway. They still differ on I/O errors (status propagates, uninstall
-/// swallows); that divergence predates this and is tracked separately.
+/// fail partway. They still differ on a per-entry I/O failure, but no longer in
+/// the direction that hid one: `status` aborts rather than describe an
+/// installation it could not fully observe, while uninstall names the entry,
+/// skips it, and fails the run so what unlink CAN take stays removable (#953).
 fn safe_parser_language_name(stem: &str) -> Option<String> {
     queries::is_safe_language_name(stem).then(|| stem.to_string())
 }
 
-fn installed_query_language_name(path: &Path) -> Option<String> {
-    installed_query_language_name_checked(path).ok().flatten()
-}
-
 fn installed_query_language_name_checked(path: &Path) -> std::io::Result<Option<String>> {
-    let Some(file_name) = path.file_name() else {
+    let Some(name) = safe_query_entry_name(path) else {
         return Ok(None);
     };
-    let name = file_name.to_string_lossy();
-    if name.starts_with('.') {
-        return Ok(None);
-    }
-    if !queries::is_safe_language_name(&name) {
-        return Ok(None);
-    }
     let is_dir = match std::fs::metadata(path) {
         Ok(metadata) => metadata.is_dir(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -640,7 +631,27 @@ fn installed_query_language_name_checked(path: &Path) -> std::io::Result<Option<
     if !is_dir {
         return Ok(None);
     }
-    Ok(Some(name.to_string()))
+    Ok(Some(name))
+}
+
+/// Say what discovery deliberately left on disk, and why.
+///
+/// Called on EVERY exit that makes a claim about the directory — including the
+/// failing ones and the "nothing installed" one — because the claim is exactly
+/// what these notes qualify. An exit that skipped them would be the summary and
+/// the thing it is honest about parting company.
+///
+/// Debug-formatted: these paths are on the list precisely because their names
+/// are unusual, so they are the likeliest place for an ANSI escape to arrive
+/// from the filesystem.
+fn report_unmanaged(unmanaged: &[(PathBuf, &'static str)]) {
+    if unmanaged.is_empty() {
+        return;
+    }
+    eprintln!();
+    for (path, reason) in unmanaged {
+        eprintln!("Note: left {:?} in place — {}.", path, reason);
+    }
 }
 
 /// Run the language uninstall command
@@ -650,11 +661,24 @@ fn run_language_uninstall(
     all: bool,
 ) -> Result<(), ExitCode> {
     use std::collections::BTreeSet;
-    use std::fs;
     use std::io::{self, Write};
 
     let data_dir = default_data_dir().ok_or_else(|| {
         eprintln!("Error: Could not determine data directory. Please specify --data-dir.");
+        ExitCode::FAILURE
+    })?;
+
+    // Same gate `status` applies, and for the stronger reason: a data dir that
+    // is a dangling symlink makes `read_dir` report its children as simply
+    // absent, so without this the command would survey nothing and call the
+    // installation empty. Answering "No languages installed to uninstall." for
+    // a directory it never reached is the completeness claim this whole change
+    // exists to stop.
+    validate_install_root(&data_dir).map_err(|e| {
+        eprintln!(
+            "Error: failed to inspect data directory '{}': {e}",
+            data_dir.display()
+        );
         ExitCode::FAILURE
     })?;
 
@@ -664,45 +688,100 @@ fn run_language_uninstall(
         eprintln!("Warning: failed to recover interrupted query installs: {e}");
     }
 
-    // Parser files discovery walked past because their names are not ones this
-    // CLI manages. Kept so the summary cannot claim it removed everything while
-    // one of them is still on disk.
-    let mut unmanaged: Vec<PathBuf> = Vec::new();
+    // Entries discovery deliberately walked past, with why. Kept so the summary
+    // cannot claim it removed everything while one of them is still on disk.
+    let mut unmanaged: Vec<(PathBuf, &'static str)> = Vec::new();
+
+    // Entries discovery could not classify at all. Distinct from `unmanaged`,
+    // which is a deliberate skip of something understood: these are entries the
+    // command does not know the shape of, so it cannot know what it left.
+    let mut unreadable = false;
 
     // Determine which languages to uninstall
     let languages_to_uninstall: Vec<String> = if all {
         // Collect all installed languages
         let mut languages = BTreeSet::new();
 
-        if let Ok(entries) = fs::read_dir(&parser_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let is_parser = path.is_file()
-                    && path
-                        .extension()
-                        .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION);
-                if is_parser && let Some(stem) = path.file_stem() {
-                    let stem = stem.to_string_lossy();
-                    match safe_parser_language_name(&stem) {
-                        Some(language) => {
-                            languages.insert(language);
+        // Discovery distinguishes two failure classes, and conflating them is
+        // what made this command lie in one direction and seize up in the other:
+        //
+        // - DIRECTORY-level failure means the installation was never observed,
+        //   so there is no honest way to act on a partial view. Abort before
+        //   removing anything, matching `status`. Swallowing it is what let an
+        //   unreadable `parser/` beside a readable `queries/` remove the
+        //   queries, leave the parser, and report success (#953).
+        // - PER-ENTRY failure means one entry is opaque while the rest of the
+        //   directory is plainly legible. Report it, skip it, and carry on:
+        //   aborting here would make a real language sitting beside one bad
+        //   entry unremovable, which is strictly worse than the lie.
+        visit_install_directory(&parser_dir, |entry| {
+            let path = entry.path();
+            if !path
+                .extension()
+                .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION)
+            {
+                return Ok(());
+            }
+            match parser_entry_kind(&path) {
+                Ok(None) => {}
+                Ok(Some(ParserEntry::Removable { .. })) => {
+                    if let Some(stem) = path.file_stem() {
+                        let stem = stem.to_string_lossy();
+                        match safe_parser_language_name(&stem) {
+                            Some(language) => {
+                                languages.insert(language);
+                            }
+                            // Remembered, not just skipped: this command goes on
+                            // to say it uninstalled everything, and a parser file
+                            // left on disk makes that false.
+                            None => unmanaged
+                                .push((path.clone(), "its name is not one this CLI manages")),
                         }
-                        // Remembered, not just skipped: this command goes on to
-                        // say it uninstalled everything, and a parser file left
-                        // on disk makes that false.
-                        None => unmanaged.push(path.clone()),
                     }
                 }
-            }
-        }
-
-        if let Ok(entries) = fs::read_dir(&queries_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = installed_query_language_name(&entry.path()) {
-                    languages.insert(name);
+                Ok(Some(ParserEntry::WrongShape)) => {
+                    unmanaged.push((path.clone(), "it is not a shape this CLI can remove"));
+                }
+                Err(error) => {
+                    // Debug-format: the name comes from the filesystem, so it
+                    // could smuggle ANSI escapes into this line.
+                    eprintln!("✗ Failed to inspect {:?}: {}", path, error);
+                    unreadable = true;
                 }
             }
-        }
+            Ok(())
+        })
+        .map_err(|e| {
+            eprintln!(
+                "Error: failed to inspect parser directory '{}': {e}",
+                parser_dir.display()
+            );
+            report_unmanaged(&unmanaged);
+            ExitCode::FAILURE
+        })?;
+
+        visit_install_directory(&queries_dir, |entry| {
+            let path = entry.path();
+            match query_entry_language_name(&path) {
+                Ok(Some(name)) => {
+                    languages.insert(name);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("✗ Failed to inspect {:?}: {}", path, error);
+                    unreadable = true;
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| {
+            eprintln!(
+                "Error: failed to inspect query directory '{}': {e}",
+                queries_dir.display()
+            );
+            report_unmanaged(&unmanaged);
+            ExitCode::FAILURE
+        })?;
 
         languages.into_iter().collect()
     } else {
@@ -710,7 +789,15 @@ fn run_language_uninstall(
     };
 
     if languages_to_uninstall.is_empty() {
+        // "Nothing installed" is a claim about the whole directory, so it is
+        // only available when the whole directory was legible.
+        if unreadable {
+            eprintln!("Found no languages to uninstall, but some entries could not be read.");
+            report_unmanaged(&unmanaged);
+            return Err(ExitCode::FAILURE);
+        }
         eprintln!("No languages installed to uninstall.");
+        report_unmanaged(&unmanaged);
         return Ok(());
     }
 
@@ -727,9 +814,23 @@ fn run_language_uninstall(
         io::stderr().flush().unwrap();
 
         let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() || !input.trim().eq_ignore_ascii_case("y") {
+        // A failed read is not a declined prompt. Both stop the command, but
+        // one is the user's decision and the other is an I/O error, and
+        // reporting the second as the first is the same lie in miniature.
+        if let Err(e) = io::stdin().read_line(&mut input) {
+            eprintln!("✗ Failed to read the confirmation response: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+        if !input.trim().eq_ignore_ascii_case("y") {
             eprintln!("Cancelled.");
-            return Ok(());
+            // Declining cancels the removal, not the fact that discovery could
+            // not read part of the directory. That finding stands on its own,
+            // so the exit code has to keep carrying it.
+            return if unreadable {
+                Err(ExitCode::FAILURE)
+            } else {
+                Ok(())
+            };
         }
     }
 
@@ -738,7 +839,7 @@ fn run_language_uninstall(
     let mut any_failed = false;
     for lang in &languages_to_uninstall {
         // Reject unsafe names before building any path from them: `lang` is
-        // user input and feeds fs::remove_file via find_parser_file, so a
+        // user input and feeds fs::remove_file via find_parser_entry, so a
         // separator-carrying name must not escape the data dir.
         if !queries::is_safe_language_name(lang) {
             // Debug-format: untrusted input could smuggle ANSI escapes.
@@ -748,6 +849,13 @@ fn run_language_uninstall(
         }
 
         let mut removed_something = false;
+        // Whether removing this language went wrong. "Not installed" is a
+        // claim about the filesystem, and a run that just failed to remove an
+        // artifact has not earned it — the language-level flag is what keeps
+        // that claim from riding on the mere absence of a success. (The cases
+        // where the parser could not be CLASSIFIED never reach it; they leave
+        // the language whole and `continue` above.)
+        let mut lang_failed = false;
 
         // Hold the language's install lock across both removals, so a
         // concurrent install cannot publish one artifact between them and leave
@@ -756,6 +864,64 @@ fn run_language_uninstall(
             Ok(lock) => lock,
             Err(e) => {
                 eprintln!("✗ Failed to lock '{}' for uninstall: {}", lang, e);
+                any_failed = true;
+                continue;
+            }
+        };
+
+        // Look at the parser BEFORE taking the queries, under the same lock
+        // that will still be held when it is removed.
+        //
+        // Order matters for one reason: if we cannot tell what is at the parser
+        // path, removing the queries first would manufacture the parser-only
+        // state this whole transaction exists to avoid — #953's headline shape,
+        // reached through the per-entry door instead of the directory-level
+        // one. Unlike a removal that FAILS, this is knowable before anything is
+        // taken, so the language can simply be left whole. The run still fails,
+        // and the other languages are still removed.
+        let parser_entry = match find_parser_entry(&parser_dir, lang) {
+            Ok(None) => None,
+            Ok(Some((path, ParserEntry::Removable { .. }))) => Some(path),
+            // A shape removal cannot take is not "no parser here" — but #828
+            // settled that such an entry does not count as an installed parser,
+            // and that answer stands when there is nothing else to lose. What
+            // it never considered is queries sitting beside one: taking those
+            // would leave the half-removed language and, on the named path
+            // (which has no leftovers summary), report it as a clean uninstall.
+            // So the refusal is scoped to exactly that case.
+            Ok(Some((path, ParserEntry::WrongShape))) => {
+                // Only a confirmed absence permits going on. Reading any other
+                // error as "no queries here" would hand back the half-removal
+                // this branch exists to prevent, decided on a guess.
+                let queries_present = match std::fs::symlink_metadata(queries_dir.join(lang)) {
+                    Ok(_) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => {
+                        eprintln!(
+                            "✗ Leaving '{}' untouched: {:?} is not a shape this CLI can remove, and whether it has queries could not be determined: {}",
+                            lang, path, e
+                        );
+                        any_failed = true;
+                        continue;
+                    }
+                };
+                if queries_present {
+                    eprintln!(
+                        "✗ Leaving '{}' untouched: {:?} is not a shape this CLI can remove, and taking its queries alone would half-remove it.",
+                        lang, path
+                    );
+                    any_failed = true;
+                    continue;
+                }
+                None
+            }
+            Err(e) => {
+                eprintln!(
+                    "✗ Leaving '{}' untouched: failed to inspect its parser entry at {:?}: {}",
+                    lang,
+                    parser_entry_path(&parser_dir, lang),
+                    e
+                );
                 any_failed = true;
                 continue;
             }
@@ -782,6 +948,7 @@ fn run_language_uninstall(
             Err(failure) => {
                 eprintln!("✗ Failed to remove queries for '{}': {}", lang, failure);
                 any_failed = true;
+                lang_failed = true;
                 removed_something |= failure.removal.removed_anything();
                 // Whether to go on to the parser depends on the state the
                 // removal left, not on whether it did the removing: a language
@@ -804,39 +971,53 @@ fn run_language_uninstall(
             }
         }
 
-        // Remove parser file
-        if let Some(parser_path) = find_parser_file(&parser_dir, lang) {
-            match fs::remove_file(&parser_path) {
-                Ok(()) => {
+        // Remove the parser entry probed above, still under the same lock.
+        if let Some(parser_path) = parser_entry {
+            match remove_parser_entry(&parser_path) {
+                Ok(true) => {
                     eprintln!("✓ Removed parser: {}", parser_path.display());
                     removed_something = true;
                 }
+                // Already gone. The end state is the one asked for, so this is
+                // not a failure — and claiming the removal would be claiming
+                // work another actor did.
+                Ok(false) => {}
                 Err(e) => {
                     eprintln!("✗ Failed to remove parser {}: {}", parser_path.display(), e);
+                    // The queries are already gone by now — the tombstone has
+                    // to be published before the parser, or a concurrent
+                    // install republishes what this just removed. There is no
+                    // rollback, so the state is named instead of implied: the
+                    // language IS half-removed, and the user needs to know
+                    // which half to chase rather than infer it from two lines.
+                    if removed_something {
+                        eprintln!(
+                            "  '{}' is now half-removed: its queries are gone and its parser is not.",
+                            lang
+                        );
+                    }
                     any_failed = true;
+                    lang_failed = true;
                 }
             }
         }
 
         if removed_something {
             any_removed = true;
-        } else if !all {
+        } else if !all && !lang_failed {
+            // Only when nothing went wrong: otherwise the run would be
+            // asserting an absence it just said it could not determine.
             eprintln!("Language '{}' is not installed.", lang);
         }
     }
 
-    if any_failed {
-        return Err(ExitCode::FAILURE);
-    }
+    // Before the failure return, not after it: what was left behind is most
+    // worth saying on a run that went wrong, and discovery can now fail on its
+    // own, so a late note block would be the first casualty of its own fix.
+    report_unmanaged(&unmanaged);
 
-    if !unmanaged.is_empty() {
-        eprintln!();
-        for path in &unmanaged {
-            eprintln!(
-                "Note: left '{}' in place — its name is not one this CLI manages.",
-                path.display()
-            );
-        }
+    if any_failed || unreadable {
+        return Err(ExitCode::FAILURE);
     }
 
     if any_removed {
@@ -857,10 +1038,167 @@ fn run_language_uninstall(
     Ok(())
 }
 
-/// Find the parser file for a language.
+/// Find the LOADABLE parser file for a language.
+///
+/// Used by `status` to fill the parser column, where the question is whether the
+/// language can actually be loaded — so this follows symlinks and answers
+/// loadability, not presence. (For a dangling `parser/` entry `status` never
+/// gets this far: its own scan fails on the entry first.) Uninstall asks a
+/// different question and uses [`find_parser_entry`]; see the note there for
+/// why the two must not be merged.
 fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf> {
-    let path = parser_dir.join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION));
+    let path = parser_entry_path(parser_dir, lang);
     if path.is_file() { Some(path) } else { None }
+}
+
+/// Where a language's parser file would live, whether or not anything is there.
+///
+/// Shared so the path an error message names is the same one the lookup tried;
+/// reporting a failure against a differently built path is how a diagnostic
+/// ends up pointing somewhere the command never looked.
+fn parser_entry_path(parser_dir: &Path, lang: &str) -> PathBuf {
+    parser_dir.join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION))
+}
+
+/// The parser entry `unlink` can take for a language, if there is one.
+///
+/// Uninstall's question is not "can this load" but "is there a directory entry
+/// here to remove", and the two differ exactly where it matters: a dangling
+/// symlink does not load, yet `remove_file` unlinks it happily because unlink
+/// acts on the link rather than its target. Asking `is_file()` — which follows
+/// the link — made the entry invisible, so `uninstall <lang>` answered "is not
+/// installed" and exited 0 while it sat on disk with no CLI path to clear it.
+///
+/// `Err` means the entry could not be classified at all. That is deliberately
+/// distinct from `Ok(None)`: "there is nothing here" and "I could not tell"
+/// must not collapse into the same answer one step before a destructive action.
+fn find_parser_entry(
+    parser_dir: &Path,
+    lang: &str,
+) -> std::io::Result<Option<(PathBuf, ParserEntry)>> {
+    let path = parser_entry_path(parser_dir, lang);
+    Ok(parser_entry_kind(&path)?.map(|entry| (path, entry)))
+}
+
+/// What a path in `parser/` is, as far as uninstall is concerned.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParserEntry {
+    /// An entry removal can take: a regular file, or a symlink.
+    Removable { is_symlink: bool },
+    /// An entry that is plainly there but is not a shape removal can take —
+    /// a directory (#828), or a special file. Discovery must remember these
+    /// rather than skip them silently, because the summary goes on to claim
+    /// it removed everything and one of these on disk makes that false.
+    WrongShape,
+}
+
+/// Classify a path in `parser/` for uninstall.
+///
+/// `symlink_metadata` rather than `metadata`, so a dangling symlink is a normal
+/// answer instead of a `NotFound` error; and rather than `DirEntry::file_type`,
+/// which can be served from `readdir`'s cached `d_type` and so would report
+/// success on some filesystems and fail on others for an unreadable directory.
+///
+/// A regular file or a symlink is removable — install produces the first, and a
+/// hand-pointed local build the second. Everything else is [`WrongShape`]:
+/// `remove_file` cannot take a directory (#828), and a FIFO or socket named
+/// `lua.dylib` is not an install this CLI created, so removing it would be
+/// discovery inventing one.
+///
+/// [`WrongShape`]: ParserEntry::WrongShape
+fn parser_entry_kind(path: &Path) -> std::io::Result<Option<ParserEntry>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            Ok(Some(if file_type.is_file() || file_type.is_symlink() {
+                ParserEntry::Removable {
+                    is_symlink: file_type.is_symlink(),
+                }
+            } else {
+                ParserEntry::WrongShape
+            }))
+        }
+        // Absent is the ordinary "not installed" answer; every other failure
+        // means we could not tell, which must not read as absent.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Remove a parser entry, taking the entry itself and never its target.
+///
+/// `remove_file` is `unlink`, which acts on the final component, so a symlink
+/// loses the link and whatever it pointed at survives. Windows is the exception
+/// worth naming: a directory symlink or junction is a reparse point that
+/// `DeleteFileW` refuses, and `RemoveDirectoryW` is what removes the link there
+/// — also without touching the target.
+///
+/// The symlink test is re-taken here rather than carried from discovery. A flag
+/// decided earlier is a statement about what the path WAS, and `remove_dir`
+/// acting on a stale one could take a real directory that replaced the link in
+/// between — the one thing this function must never do. The re-check narrows
+/// that to the window between it and the call, which is the same irreducible
+/// race any unlink runs; closing it fully would need `openat`/`O_NOFOLLOW`.
+///
+/// `Ok(false)` means the entry was already gone — someone else unlinked it
+/// between classification and here. That is the state this call wanted, so it
+/// is not a failure; reporting it as one would make the command claim a
+/// half-removed language while the filesystem is exactly as asked.
+fn remove_parser_entry(path: &Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            let still_a_symlink = std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink());
+            if !still_a_symlink {
+                return Err(error);
+            }
+            match std::fs::remove_dir(path) {
+                Ok(()) => Ok(true),
+                // Vanished between the two attempts. Same answer as the
+                // `remove_file` case above and for the same reason: the entry
+                // is gone, so surfacing the first error would report a
+                // half-removed language over a filesystem that is as asked.
+                Err(second) if second.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(_) => Err(error),
+            }
+        }
+    }
+}
+
+/// The language an entry in `queries/` installs, for uninstall's purposes.
+///
+/// The queries counterpart of [`parser_entry_kind`], and separate from
+/// [`installed_query_language_name_checked`] for the same reason: `status` asks
+/// what is USABLE and must not describe an installation it could not observe,
+/// while uninstall asks what is THERE and must be able to take it. A dangling
+/// `queries/lua` is unusable but perfectly removable, so calling it an I/O
+/// error — as the shared helper does, correctly, for `status` — would leave
+/// `uninstall --all` failing on it forever while `uninstall lua` cleared it.
+fn query_entry_language_name(path: &Path) -> std::io::Result<Option<String>> {
+    let Some(name) = safe_query_entry_name(path) else {
+        return Ok(None);
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            Ok((file_type.is_dir() || file_type.is_symlink()).then(|| name.to_string()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The entry name, when it is one this CLI may manage. Shared so `status` and
+/// uninstall cannot disagree about which NAMES count.
+fn safe_query_entry_name(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?;
+    let name = file_name.to_string_lossy();
+    if name.starts_with('.') || !queries::is_safe_language_name(&name) {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// What to tell someone whose `--output` path is already taken. A regular
@@ -1472,7 +1810,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn installed_query_language_name_filters_unsafe_dirs() {
+    fn installed_query_language_name_checked_filters_unsafe_dirs() {
         let temp = tempfile::TempDir::new().unwrap();
         let safe = temp.path().join("lua");
         let unsafe_name = temp.path().join("foo.bar");
@@ -1482,11 +1820,78 @@ mod tests {
         std::fs::create_dir_all(&hidden).unwrap();
 
         assert_eq!(
-            installed_query_language_name(&safe),
+            installed_query_language_name_checked(&safe).unwrap(),
             Some("lua".to_string())
         );
-        assert_eq!(installed_query_language_name(&unsafe_name), None);
-        assert_eq!(installed_query_language_name(&hidden), None);
+        assert_eq!(
+            installed_query_language_name_checked(&unsafe_name).unwrap(),
+            None
+        );
+        assert_eq!(
+            installed_query_language_name_checked(&hidden).unwrap(),
+            None
+        );
+    }
+
+    /// A dangling parser entry is what uninstall must be able to remove, and
+    /// `is_file()` — which follows the link — is what hid it. `Ok(None)` here
+    /// would put the entry back out of reach of every CLI path.
+    #[test]
+    #[cfg(unix)]
+    fn find_parser_entry_sees_a_dangling_symlink() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ext = std::env::consts::DLL_EXTENSION;
+        let path = temp.path().join(format!("dangling.{ext}"));
+        std::os::unix::fs::symlink(temp.path().join("missing"), &path).unwrap();
+
+        assert_eq!(
+            find_parser_entry(temp.path(), "dangling").unwrap(),
+            Some((path, ParserEntry::Removable { is_symlink: true }))
+        );
+        // The loadability question has the opposite answer, which is why the
+        // two helpers exist separately.
+        assert_eq!(find_parser_file(temp.path(), "dangling"), None);
+    }
+
+    /// A parser-shaped directory is not an entry `remove_file` can take (#828).
+    #[test]
+    fn find_parser_entry_reports_a_directory_as_the_wrong_shape() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ext = std::env::consts::DLL_EXTENSION;
+        std::fs::create_dir_all(temp.path().join(format!("fakeparser.{ext}"))).unwrap();
+
+        let (path, entry) = find_parser_entry(temp.path(), "fakeparser")
+            .unwrap()
+            .expect("a directory is present, not absent");
+        assert_eq!(path, temp.path().join(format!("fakeparser.{ext}")));
+        // Not `None`: "there is a directory here I cannot remove" and "there is
+        // nothing here" lead to opposite actions one step before removal.
+        assert_eq!(entry, ParserEntry::WrongShape);
+    }
+
+    /// Removing and finding-already-gone are different answers. A parser that
+    /// another actor unlinked between classification and removal leaves the
+    /// filesystem in exactly the asked-for state, so it must not be reported as
+    /// a failed removal — nor as work this run did.
+    #[test]
+    fn remove_parser_entry_distinguishes_removing_from_already_gone() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let present = temp.path().join("present");
+        std::fs::write(&present, "parser").unwrap();
+
+        assert_eq!(remove_parser_entry(&present).unwrap(), true);
+        assert!(!present.exists());
+        // The same call again: the entry is gone, which is success, but not a
+        // removal this run performed.
+        assert_eq!(remove_parser_entry(&present).unwrap(), false);
+    }
+
+    /// "Nothing here" and "could not tell" must stay distinguishable: the gate
+    /// they feed is one step before `fs::remove_file`.
+    #[test]
+    fn find_parser_entry_reports_absence_but_not_failure() {
+        let temp = tempfile::TempDir::new().unwrap();
+        assert_eq!(find_parser_entry(temp.path(), "absent").unwrap(), None);
     }
 
     /// `Path::exists()` follows symlinks, so the old precheck read a dangling
