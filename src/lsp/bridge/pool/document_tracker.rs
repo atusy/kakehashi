@@ -841,18 +841,18 @@ impl DocumentTracker {
             .get(uri)
             .map(|keys| keys.clone())
             .unwrap_or_default();
-        let host_to_virtual = self.host_to_virtual.lock().await;
-        for document in host_to_virtual
-            .iter()
-            .filter(|(host_uri, _)| host_uri.as_str() == uri)
-            .flat_map(|(_, documents)| documents)
-        {
-            if self.is_virtual_doc_open_on_connection(
-                &document.virtual_uri.to_uri_string(),
-                &document.connection_key,
-            ) && !connections.contains(&document.connection_key)
-            {
-                connections.push(document.connection_key.clone());
+        if let Ok(host_uri) = Url::parse(uri) {
+            let host_to_virtual = self.host_to_virtual.lock().await;
+            if let Some(documents) = host_to_virtual.get(&host_uri) {
+                for document in documents {
+                    if self.is_virtual_doc_open_on_connection(
+                        &document.virtual_uri.to_uri_string(),
+                        &document.connection_key,
+                    ) && !connections.contains(&document.connection_key)
+                    {
+                        connections.push(document.connection_key.clone());
+                    }
+                }
             }
         }
         connections
