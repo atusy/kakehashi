@@ -389,6 +389,24 @@ impl ResponseRouter {
         removed
     }
 
+    /// Retire a peer request on outer cancellation and report whether its
+    /// downstream write had started, requiring an exact `$/cancelRequest`.
+    pub(crate) fn cancel_and_remove(&self, id: RequestId) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::cancel_and_remove");
+        let should_notify = state.pending.get(&id).is_some_and(|pending| {
+            matches!(
+                pending.delivery,
+                RequestDelivery::Writing | RequestDelivery::Sent
+            )
+        });
+        state.pending.remove(&id);
+        Self::remove_cancel_mapping_inner(&mut state, id);
+        should_notify
+    }
+
     /// Fail a single pending request with an error response.
     ///
     /// Called when a write fails or the connection is closing (ls-bridge-message-ordering). Uses
@@ -601,6 +619,20 @@ mod tests {
         let rx2 = router.register(id);
         assert!(rx2.is_none(), "duplicate ID should return None");
         assert_eq!(router.pending_count(), 1, "count should not increase");
+    }
+
+    #[test]
+    fn cancel_and_remove_notifies_only_after_downstream_write_starts() {
+        let router = ResponseRouter::new();
+        let queued = RequestId::new(1);
+        let writing = RequestId::new(2);
+        let _queued_rx = router.register(queued).unwrap();
+        let _writing_rx = router.register(writing).unwrap();
+        assert!(router.claim_for_write(writing));
+
+        assert!(!router.cancel_and_remove(queued));
+        assert!(router.cancel_and_remove(writing));
+        assert_eq!(router.pending_count(), 0);
     }
 
     #[tokio::test]
