@@ -596,7 +596,7 @@ unaffected because only decisions serialize, not process I/O.
 
 The `Ready`-state LSP handshake, the writer handoff with its queue drain,
 the SIGTERM → SIGKILL escalation, and parallel teardown are implemented.
-Four parts of this decision run ahead of the code, which is the ordinary
+Five parts of this decision run ahead of the code, which is the ordinary
 state of an ADR here:
 
 - **The lifecycle actor does not exist yet.** Teardown today is a pool-wide
@@ -618,6 +618,14 @@ state of an ADR here:
   and LSP ordering forbid. This
   is the one gap here that is a live conformance defect rather than a missing
   refinement.
+- **The `Failed → Closed` bypass performs no cleanup.** The decision says
+  that path skips the LSP handshake but still terminates and reaps the
+  process. Today a `Failed` handle is marked `Closed` and excluded from both
+  the shutdown pass and the force-kill pass — a state change and nothing
+  else. `Failed` is reached by writer-task failure and router shutdown as
+  well as by process death, so a still-running child can be dropped here
+  unterminated and unreaped, which is the one thing § Invariants says must
+  never happen.
 - **The escalation reserve does not exist.** The ceiling bounds the graceful
   phase *only*; force-kill then runs after it with its own additive
   per-connection budget, which itself contains a SIGTERM grace period. A
