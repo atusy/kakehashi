@@ -151,6 +151,19 @@ Global Shutdown overrides all (highest priority)
   filesystem call is already running keeps its permit until the call
   returns, its result discarded
 
+**Per-Downstream Response Cap** (**not a tier** — an implementation-state
+bound this hierarchy did not previously register):
+- **Duration**: 30s fixed
+- **Scope**: every downstream response wait, one request at a time. It is
+  not Tier 1, which engages only for a multi-server fan-out and is still
+  Phase 3; and it is not Tier 2, which resets on any decoded server message
+  and so bounds *silence* rather than a request
+- **On expiry**: that request alone fails; the connection is not faulted
+- **Precedence**: connection closure and the shutdown deadline both cut it
+  short, so it never extends a teardown
+- **Status**: shipped, and the reason the absence of Tier 1 is not currently
+  observable as an unbounded request
+
 **Writer-Idle Timeout** (within the applicable shutdown deadline):
 - **Duration**: 2s fixed (**target state** — no per-connection bound exists
   today; see ls-bridge-graceful-shutdown § Decision–Implementation Gap)
@@ -168,7 +181,7 @@ Global Shutdown overrides all (highest priority)
 
 ### Negative
 
-- **Multiple concepts**: Three timeout *tiers* in Phase 1 (four in Phase 3), plus the tier-exempt deadlines registered here (per-slot control shutdown, routing decision, binding-reuse validation, writer-idle)
+- **Multiple concepts**: Three timeout *tiers* in Phase 1 (four in Phase 3), plus the tier-exempt deadlines registered here (per-slot control shutdown, routing decision, binding-reuse validation, writer-idle, per-downstream response cap)
 - **Tuning required**: Implementation-defined values need careful selection
 
 ### Neutral

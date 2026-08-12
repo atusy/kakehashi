@@ -395,8 +395,7 @@ fallback. That was rejected in practice: the signals are per-server
 unreliable (many servers publish no diagnostics for valid code), and a
 readiness gate built on them delays every first request by a timeout
 whenever the guess is wrong. Requests instead go out as soon as the
-handshake completes and are bounded by the timeout tiers of
-ls-bridge-timeout-hierarchy.
+handshake completes, bounded as described below.
 
 ### Async Communication and Error Handling
 
