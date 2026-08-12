@@ -370,24 +370,28 @@ Implementation uses a multi-signal approach:
 
 ### Async Communication and Error Handling
 
-Every downstream request is bounded by a per-request timeout, and **both
-failure shapes degrade rather than propagate**: a server error and an
-expired timeout each log a warning and yield no result, so the host request
+A bridged request never waits on a downstream server indefinitely, and
+**both failure shapes degrade rather than propagate**: a server error and an
+expired wait each log a warning and yield no result, so the host request
 answers with whatever the other layers produced. A hung server costs one
-timeout, never a stalled handler.
+timeout, never a stalled handler. (Which bound applies — the Tier-1
+per-request timeout, which is Phase 3 and only engages for a multi-server
+fan-out, the Tier-2 liveness timeout otherwise — is
+ls-bridge-timeout-hierarchy's subject, along with the requests deliberately
+exempt from both. The lifecycle handshake is exempt in the other direction:
+the `shutdown` request's response wait is bounded by the shutdown deadline,
+not by any request timeout.)
 
 Communication is **pure async** — no blocking stdio, and no OS thread per
 connection. ls-bridge-async-connection carries that decision, its reader and
-writer task patterns, and the timeout tiers this bound sits in; an earlier
-revision of this section sketched a blocking-pool call, which that decision
-explicitly rejected.
+writer task patterns, and the timeout tiers this bound sits in.
 
 #### Error Handling Strategy
 
 | Error Type | Detection | Recovery |
 |------------|-----------|----------|
 | Server crash | Broken pipe on read/write | Mark connection dead, respawn immediately |
-| Request timeout | `tokio::time::timeout` | Return `None`, log warning |
+| Request timeout | Response wait expires | Return `None`, log warning |
 | Malformed response | JSON parse error | Return `None`, log error |
 | Server busy | No response within timeout | Return `None`, consider increasing timeout |
 
