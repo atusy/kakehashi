@@ -161,6 +161,14 @@ fn build_baseline_capabilities(
             position_encodings: Some(vec![PositionEncodingKind::UTF16]),
             ..Default::default()
         }),
+        // The routing protocol is negotiated independently of the
+        // process-wide experimental feature gate.  Downstream servers opt in
+        // by returning the matching advertisement in their capabilities.
+        experimental: Some(serde_json::json!({
+            "kakehashi": {
+                "bridgeRouting": true,
+            },
+        })),
         ..Default::default()
     }
 }
@@ -1059,5 +1067,20 @@ mod tests {
             None,
             "no settings to serve → capability withheld",
         );
+    }
+
+    #[test]
+    fn bridge_routing_capability_is_always_advertised() {
+        for experimental in [false, true] {
+            let capabilities = build_bridge_client_capabilities(None, false, experimental);
+            assert_eq!(
+                capabilities
+                    .experimental
+                    .as_ref()
+                    .and_then(|value| value.get("kakehashi"))
+                    .and_then(|value| value.get("bridgeRouting")),
+                Some(&serde_json::Value::Bool(true)),
+            );
+        }
     }
 }
