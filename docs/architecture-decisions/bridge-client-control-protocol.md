@@ -653,8 +653,10 @@ not a storm.
   must be unable to send it once `Closing` has won, and the abort must be
   unable to release one it had already prepared. What may follow `Closing` depends
   on which path reached it, and ls-bridge-graceful-shutdown governs both:
-  `Ready → Closing` drains the accepted queue and sends `shutdown`/`exit`;
-  `Initializing → Closing` drains nothing and sends no LSP message at all.
+  `Ready → Closing` *attempts* the bounded drain and handshake, falling back
+  to forced termination when the deadline expires or exclusive stdin is
+  never acquired; `Initializing → Closing` always drains nothing and sends no
+  LSP message at all.
 - **Until the server has answered `initialize`, LSP forbids the client every
   further request *and* notification** — `exit` included. The only
   conformant abort in that window is direct process termination.

@@ -110,7 +110,6 @@ until a reload or an explicit restart — accepted: such a peer is
 indistinguishable from a runaway one at the framing layer.
 
 **Writer Pattern:**
-- Write requests to server stdin using async mutex-protected writer
 - Single writer task ensures no byte-level corruption
 
 **Pending Request Cleanup:**

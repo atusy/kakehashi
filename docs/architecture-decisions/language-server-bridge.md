@@ -17,7 +17,7 @@ record this file is.
 
 ## Context
 
-Markdown code blocks and other injection regions (e.g., JavaScript inside HTML `<script>` tags, SQL in string literals) currently only receive Tree-sitter-based features from kakehashi. While Tree-sitter provides excellent syntax highlighting via semantic tokens, injection regions lack access to full LSP capabilities such as:
+*Framing, as of when this decision was taken.* Markdown code blocks and other injection regions (e.g., JavaScript inside HTML `<script>` tags, SQL in string literals) received only Tree-sitter-based features from kakehashi. While Tree-sitter provides excellent syntax highlighting via semantic tokens, injection regions lacked access to full LSP capabilities such as:
 
 - Go-to-definition with cross-file resolution
 - Completion with type information
@@ -261,6 +261,12 @@ This separation allows:
 
 ### Temporary File Management
 
+> **Superseded, non-normative — retained as history.** This whole section
+> describes a design that never shipped. Injection content is not written to
+> disk: the bridge mints virtual document URIs and sends in-memory content
+> (§ Provisioning Flow, language-server-bridge-virtual-document-model).
+> Nothing below is a current requirement.
+
 Injection content must be written to disk for servers that require real files.
 
 #### File Naming Strategy
@@ -358,15 +364,17 @@ Both halves of this record's original provisioning design were **superseded
 before they shipped**, and the sections above still describe the world they
 assumed — see § Decision–Implementation Gap.
 
-1. Mint a **virtual document URI** for the injection region and send its
+1. Initialize the server with user-provided `initializationOptions`.
+2. Complete the **LSP handshake** — the initialize response processed and
+   `initialized` sent — and only then treat the connection as ready. No
+   document notification may precede this (ls-bridge-message-ordering), and
+   there is no indexing detector beyond it.
+3. Mint a **virtual document URI** for the injection region and send its
    current in-memory content in `didOpen`. Regions are not written to
    temporary files, and there is nothing to clean up on close beyond the
    `didClose`. language-server-bridge-virtual-document-model carries this
    decision; the servers that genuinely need a real path on disk are its
    subject, not this one's.
-2. Initialize the server with user-provided `initializationOptions`.
-3. Treat the connection as ready at the **LSP handshake** — the initialize
-   response processed and `initialized` sent. There is no indexing detector.
 
 #### Ready Detection
 
@@ -475,8 +483,13 @@ Translation is straightforward for positions within a single injection. See lang
 
 ### Phase 1: Infrastructure (Complete)
 
+> **Historical ledger, not a status report.** It records what was done at the
+> time of writing, including the temporary-file approach later superseded by
+> virtual documents, and it predates the pooling and crash recovery that have
+> since shipped. See § Decision–Implementation Gap.
+
 - [x] Basic LSP client implementation
-- [x] Temporary source file creation
+- [x] Temporary source file creation (superseded by virtual documents)
 - [x] Offset translation
 - [x] Go-to-definition working
 - [x] `languageServers` configuration at root level (PBI-119)
