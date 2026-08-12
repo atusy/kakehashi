@@ -186,24 +186,28 @@ pub(super) async fn sync_host_document<S: MessageSender>(
         .map(|(_, version)| *version)
         .or(doc.revision.map(|revision| revision.content_version));
 
-    if let Entry::Vacant(uri_entry) = docs.entry(uri_string.clone()) {
-        let notification = JsonRpcNotification::new(
+    let did_open = || {
+        JsonRpcNotification::new(
             "textDocument/didOpen",
             DidOpenTextDocumentParams {
                 text_document: TextDocumentItem::new(
-                    uri_lsp,
+                    uri_lsp.clone(),
                     doc.language_id.to_string(),
                     1,
                     text.to_string(),
                 ),
             },
-        );
-        sender.send_notification(notification).await?;
+        )
+    };
+
+    if let Entry::Vacant(uri_entry) = docs.entry(uri_string.clone()) {
+        sender.send_notification(did_open()).await?;
         uri_entry.insert(std::collections::HashMap::from([(
             connection_key.clone(),
             HostDocSyncState {
                 version: 1,
                 fingerprint: fp,
+                content_version,
             },
         )]));
         return Ok(());
@@ -215,18 +219,7 @@ pub(super) async fn sync_host_document<S: MessageSender>(
         .entry(connection_key.clone())
     {
         Entry::Vacant(entry) => {
-            let notification = JsonRpcNotification::new(
-                "textDocument/didOpen",
-                DidOpenTextDocumentParams {
-                    text_document: TextDocumentItem::new(
-                        uri_lsp,
-                        doc.language_id.to_string(),
-                        1,
-                        text.to_string(),
-                    ),
-                },
-            );
-            sender.send_notification(notification).await?;
+            sender.send_notification(did_open()).await?;
             entry.insert(HostDocSyncState {
                 version: 1,
                 fingerprint: fp,
