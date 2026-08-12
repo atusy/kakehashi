@@ -155,8 +155,8 @@ pub(in crate::lsp::bridge) fn handle(
         return;
     }
 
+    let deadline = tokio::time::Instant::now() + super::super::pool::REQUEST_TIMEOUT;
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + super::super::pool::REQUEST_TIMEOUT;
         let body = tokio::select! {
             response = peer.wait_for_response_until(downstream_id, response_rx, deadline) => {
                 router_guard.disarm();

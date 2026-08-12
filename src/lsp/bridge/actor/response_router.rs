@@ -502,9 +502,12 @@ impl ResponseRouter {
         let entries = state.pending.drain().collect::<Vec<_>>();
         for (request_id, _) in &entries {
             if state.failure_tracked.remove(request_id) {
-                state
-                    .failures
-                    .insert(*request_id, BridgeFailure::RequestTimeout);
+                let failure = if *request_id == id {
+                    BridgeFailure::RequestTimeout
+                } else {
+                    BridgeFailure::ConnectionLost
+                };
+                state.failures.insert(*request_id, failure);
             }
         }
         state.upstream_to_downstream.clear();
@@ -512,12 +515,17 @@ impl ResponseRouter {
         drop(state);
         self.terminal.notify_waiters();
         for (request_id, pending) in entries {
+            let (code, message) = if pending.delivery == RequestDelivery::CancelledQueued {
+                (-32800, "bridge: request cancelled before downstream write")
+            } else {
+                (-32603, "bridge: cancelled peer write timed out")
+            };
             let response = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": request_id.as_i64(),
                 "error": {
-                    "code": -32603,
-                    "message": "bridge: cancelled peer write timed out"
+                    "code": code,
+                    "message": message
                 }
             });
             if pending.response_tx.send(response).is_err() {
