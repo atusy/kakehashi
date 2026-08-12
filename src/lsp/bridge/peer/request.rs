@@ -23,7 +23,20 @@ struct PeerRequestParams {
     id: String,
     method: String,
     #[serde(default)]
-    params: Option<serde_json::Value>,
+    params: OptionalParams,
+}
+
+#[derive(Default)]
+enum OptionalParams {
+    #[default]
+    Missing,
+    Present(serde_json::Value),
+}
+
+impl<'de> Deserialize<'de> for OptionalParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        serde_json::Value::deserialize(deserializer).map(Self::Present)
+    }
 }
 
 fn request_failed(reason: &'static str, message: impl Into<String>) -> jsonrpc::Error {
@@ -47,11 +60,10 @@ fn validate_params(params: &PeerRequestParams) -> jsonrpc::Result<()> {
             ),
         ));
     }
-    if params
-        .params
-        .as_ref()
-        .is_some_and(|value| !value.is_object() && !value.is_array())
-    {
+    if matches!(
+        &params.params,
+        OptionalParams::Present(value) if !value.is_object() && !value.is_array()
+    ) {
         return Err(jsonrpc::Error::invalid_params(
             "inner params must be an object, array, or omitted",
         ));
@@ -127,7 +139,11 @@ pub(in crate::lsp::bridge) fn handle(
     let connection_id = deps.progress_connection_id;
     let registry = deps.inbound_request_registry.clone();
     let (cancel, generation) = registry.register(connection_id, id.clone());
-    if let Err(error) = peer.send_request_value(params.method, params.params, downstream_id) {
+    let inner_params = match params.params {
+        OptionalParams::Missing => None,
+        OptionalParams::Present(value) => Some(value),
+    };
+    if let Err(error) = peer.send_request_value(params.method, inner_params, downstream_id) {
         registry.unregister(connection_id, &id, generation);
         tokio::spawn(async move {
             let response = jsonrpc::Response::from_error(
@@ -238,7 +254,7 @@ mod tests {
         let params = PeerRequestParams {
             id: "denols".to_string(),
             method: "shutdown".to_string(),
-            params: None,
+            params: OptionalParams::Missing,
         };
         let error = validate_params(&params).unwrap_err();
         assert_eq!(error.code, jsonrpc::ErrorCode::ServerError(-32803));
@@ -246,6 +262,25 @@ mod tests {
             error.data,
             Some(serde_json::json!({ "reason": "methodDenied" }))
         );
+    }
+
+    #[test]
+    fn explicit_null_params_are_invalid_but_omission_is_allowed() {
+        let omitted = PeerRequestParams::deserialize(&serde_json::json!({
+            "id": "peer",
+            "method": "custom/request"
+        }))
+        .unwrap();
+        validate_params(&omitted).unwrap();
+
+        let explicit_null = PeerRequestParams::deserialize(&serde_json::json!({
+            "id": "peer",
+            "method": "custom/request",
+            "params": null
+        }))
+        .unwrap();
+        let error = validate_params(&explicit_null).unwrap_err();
+        assert_eq!(error.code, jsonrpc::ErrorCode::InvalidParams);
     }
 
     #[test]
