@@ -55,12 +55,13 @@ CARGO="${CARGO:-cargo}"
 
 # A `timeout` command (GNU coreutils, or gtimeout via Homebrew) caps the run so
 # one stuck test can't stall CI or a scripted gate. Optional — skipped if
-# absent or disabled. (No bash array: macOS ships bash 3.2, where an empty
-# array expansion trips `set -u`.)
-TIMEOUT_BIN=""
-if [ "$RUN_TIMEOUT" -gt 0 ]; then
-  TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
-fi
+# absent. (No bash array: macOS ships bash 3.2, where an empty array expansion
+# trips `set -u`.)
+#
+# Discovered unconditionally: E2E_TIMEOUT and E2E_RETRY_TIMEOUT are documented
+# as independent knobs, so gating discovery on the whole-run one would make
+# E2E_TIMEOUT=0 silently disable the retry cap too.
+TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 
 # On exit OR interrupt, kill any of THIS repo's test binaries still running
 # (Ctrl-C otherwise leaves the harness's spawned servers as orphans). Scoped to
@@ -106,13 +107,15 @@ if [ ! -f "$INSTALL_MARKER" ]; then
   [ -f "$INSTALL_MARKER" ] || echo "    warning: install marker still absent; the parallel run may briefly race to populate it"
 fi
 
-echo "==> Running integration + e2e  (--test-threads=$THREADS on ${CORES} cores${TIMEOUT_BIN:+, ${RUN_TIMEOUT}s cap})"
+RUN_CAP=""
+[ -n "$TIMEOUT_BIN" ] && [ "$RUN_TIMEOUT" -gt 0 ] && RUN_CAP="yes"
+echo "==> Running integration + e2e  (--test-threads=$THREADS on ${CORES} cores${RUN_CAP:+, ${RUN_TIMEOUT}s cap})"
 LOG="$(mktemp)"
 # An empty LOG would make `tee ''` fail and leave the audit below with nothing
 # to read -- fail loudly instead of running an unverifiable suite.
 [ -n "$LOG" ] || { echo "error: mktemp failed; refusing to run without a log"; exit 1; }
 SECONDS=0
-if [ -n "$TIMEOUT_BIN" ]; then
+if [ -n "$RUN_CAP" ]; then
   "$TIMEOUT_BIN" "$RUN_TIMEOUT" "$CARGO" test --features e2e --no-fail-fast \
     --test integration --test e2e -- --test-threads="$THREADS" 2>&1 | tee "$LOG"
 else
@@ -191,7 +194,7 @@ fi
 # the whole-run cap has already been spent by the time we get here.
 RETRY_TIMEOUT="${E2E_RETRY_TIMEOUT:-300}"
 run_retry() {
-  if [ -n "$TIMEOUT_BIN" ]; then
+  if [ -n "$TIMEOUT_BIN" ] && [ "$RETRY_TIMEOUT" -gt 0 ]; then
     "$TIMEOUT_BIN" "$RETRY_TIMEOUT" "$CARGO" test --features e2e --no-fail-fast \
       --test integration --test e2e -- --exact "$1" --test-threads=1 2>&1
   else
