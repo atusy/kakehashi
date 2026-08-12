@@ -48,6 +48,17 @@ impl Kakehashi {
             return;
         }
 
+        // The change above recycles client-fallback connections, which is
+        // exactly where a `forceStart` warm-up lives — it has no document, so
+        // no marker root, so no other key. Re-assert it here rather than
+        // relying on the settings application below: two paths return before
+        // reaching it, and a warm-up that nothing re-acquires (a policy server
+        // with `languages = []` has no document to trigger one) would
+        // otherwise stay dead for the session. Idempotent per key, so the
+        // later application re-asserting it costs nothing.
+        self.bridge
+            .force_start_servers(&self.settings_manager.load_settings());
+
         // An emptied folder list does not leave the session rootless when the
         // client named another root: the rungs below `workspaceFolders` answer,
         // as they did at initialize. A client that named none gets no project

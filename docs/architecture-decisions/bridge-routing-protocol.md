@@ -1162,7 +1162,15 @@ configured. Two pieces close most of the gap:
   layers accumulate (configuration-merging-strategy), `forceStart = true`
   persists until an explicit `false`, and a reload flipping it to `false`
   never stops an already-running server — within a session the flag is
-  effectively one-way; `stop` is the lever that stops.
+  effectively one-way; `stop` is the lever that stops. It also starts a
+  server rather than supervising one: every recovery path in the pool is
+  request-triggered, and a `languages = []` provider has no request, so a
+  warm-up that dies stays dead until the next configuration application
+  re-asserts the flag. A folder change re-asserts it too, since that
+  recycles exactly the client-fallback connections a warm-up occupies.
+  Supervising the provider — the connection routing decisions would
+  actually depend on — is the routing decision's problem, not the
+  warm-up's.
 - **Bounded initialization wait**: a provider whose advertisement is
   known, that is explicitly named in `priorities`, or that carries
   `forceStart` (the filter above), and that is still `Initializing` at

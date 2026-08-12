@@ -476,6 +476,12 @@ pub struct BridgeServerConfig {
     /// Within a session the flag is effectively one-way: a reload that flips
     /// it to `false` never stops an already-running server.
     ///
+    /// It starts a server; it does not supervise one. Every recovery path in
+    /// the pool is request-triggered, so a warm-up that dies — and a server no
+    /// document routes to has no request to notice — stays dead until the next
+    /// configuration application re-asserts the flag. Applying configuration
+    /// is therefore also the way to restart one.
+    ///
     /// `None` = inherit (built-in default `false` = spawn lazily). Like
     /// `prefer_shared_instance`, a concrete server's explicit value overrides
     /// the wildcard.
