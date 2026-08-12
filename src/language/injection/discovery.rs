@@ -2718,6 +2718,204 @@ mod tests {
         );
     }
 
+    /// One `string_literal` region carrying `#offset! 0 1 0 -1` — the shape
+    /// the bundled rust `injections.scm` uses to trim the quotes off an
+    /// embedded regex. Returns `(injections, raw_start, raw_end)`.
+    fn quote_trimmed_injection<'t>(
+        tree: &'t Tree,
+        text: &str,
+        offset: InjectionOffset,
+    ) -> (Vec<InjectionRegionInfo<'t>>, usize, usize) {
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, "(string_literal) @str").expect("valid query");
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+        let node = matches
+            .next()
+            .expect("fixture has a string literal")
+            .captures[0]
+            .node;
+        (
+            vec![InjectionRegionInfo {
+                language: "regex".to_string(),
+                content_node: node,
+                pattern_index: 0,
+                include_children: false,
+                offset: Some(offset),
+                combined: false,
+                identity_slot: 0,
+            }],
+            node.start_byte(),
+            node.end_byte(),
+        )
+    }
+
+    /// `#offset!` trims the quotes, so the closing quote is host punctuation —
+    /// not injected content. Half-open lookup (the point-shaped methods:
+    /// hover, definition, …) must therefore keep it outside, even though it is
+    /// inside the raw `content_node`.
+    #[test]
+    fn offset_trimmed_region_excludes_the_raw_tail_from_half_open() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let s = "git co"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let trim_quotes = InjectionOffset {
+            start_row: 0,
+            start_column: 1,
+            end_row: 0,
+            end_column: -1,
+        };
+        let (injections, raw_start, raw_end) = quote_trimmed_injection(&tree, text, trim_quotes);
+
+        assert!(
+            find_injection_at_position(&injections, raw_end - 1, text, RegionBoundary::HalfOpen)
+                .is_none(),
+            "the closing quote is outside the effective content"
+        );
+        assert!(
+            find_injection_at_position(&injections, raw_start, text, RegionBoundary::HalfOpen)
+                .is_none(),
+            "the opening quote is outside the effective content"
+        );
+        assert!(
+            find_injection_at_position(&injections, raw_start + 1, text, RegionBoundary::HalfOpen)
+                .is_some(),
+            "the first content byte is still inside"
+        );
+    }
+
+    /// The caret fallback anchors on the *effective* end too: it fires at the
+    /// trimmed end (the closing quote's byte) and no longer at the raw end.
+    #[test]
+    fn offset_trimmed_region_moves_the_caret_fallback_to_the_effective_end() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let s = "git co"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let trim_quotes = InjectionOffset {
+            start_row: 0,
+            start_column: 1,
+            end_row: 0,
+            end_column: -1,
+        };
+        let (injections, _raw_start, raw_end) = quote_trimmed_injection(&tree, text, trim_quotes);
+
+        let (_, region) = find_injection_at_position(
+            &injections,
+            raw_end - 1,
+            text,
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("the caret after the last injected byte resolves the region");
+        assert_eq!(region.language, "regex");
+
+        assert!(
+            find_injection_at_position(
+                &injections,
+                raw_end,
+                text,
+                RegionBoundary::CaretEndFallback,
+            )
+            .is_none(),
+            "the raw end is a full character past the injected content"
+        );
+    }
+
+    /// The inverse gap: an `#offset!` that *extends* the end leaves bytes past
+    /// the raw node genuinely injected, and they must be reachable.
+    #[test]
+    fn offset_extended_region_reaches_bytes_past_the_raw_node() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let s = "git co"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let extend_end = InjectionOffset {
+            start_row: 0,
+            start_column: 0,
+            end_row: 0,
+            end_column: 1,
+        };
+        let (injections, _raw_start, raw_end) = quote_trimmed_injection(&tree, text, extend_end);
+
+        let (_, region) =
+            find_injection_at_position(&injections, raw_end, text, RegionBoundary::HalfOpen)
+                .expect("the byte the offset added is inside the effective content");
+        assert_eq!(region.language, "regex");
+    }
+
+    /// An `#offset!` that collapses the range must not match anywhere — half-open
+    /// containment is vacuous for an empty span, and the fallback must not
+    /// resurrect it by matching its end byte.
+    #[test]
+    fn offset_collapsed_region_never_matches() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let s = "git co"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let collapse = InjectionOffset {
+            start_row: 0,
+            start_column: 100,
+            end_row: 0,
+            end_column: 0,
+        };
+        let (injections, raw_start, raw_end) = quote_trimmed_injection(&tree, text, collapse);
+
+        for byte in raw_start..=raw_end {
+            for boundary in [RegionBoundary::HalfOpen, RegionBoundary::CaretEndFallback] {
+                assert!(
+                    find_injection_at_position(&injections, byte, text, boundary).is_none(),
+                    "collapsed region must not match at byte {byte} under {boundary:?}"
+                );
+            }
+        }
+    }
+
+    /// The motivating real-world shape (#996 item 1): markdown YAML frontmatter
+    /// with `#offset! @injection.content 1 0 -1 0`. The closing `---` sits
+    /// inside the raw `minus_metadata` node but outside the injected YAML, so
+    /// no boundary rule may route a request there — while the trimmed body
+    /// still resolves. Unlike the synthetic cases above this goes through
+    /// `collect_all_injections`, so it also pins that the row-shaped directive
+    /// is actually plumbed onto the region.
+    #[test]
+    fn frontmatter_closing_fence_is_outside_the_yaml_region() {
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "---\ntitle: awesome\n---\n\n# heading\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+
+        let query = Query::new(
+            &md_language,
+            r#"
+            ((minus_metadata) @injection.content
+              (#set! injection.language "yaml")
+              (#offset! @injection.content 1 0 -1 0))
+            "#,
+        )
+        .expect("valid frontmatter injection query");
+
+        let injections = collect_all_injections(&tree.root_node(), text, Some(&query))
+            .expect("frontmatter injection is found");
+        assert_eq!(injections.len(), 1);
+        assert!(
+            injections[0].offset.is_some(),
+            "the row offset must reach the region"
+        );
+
+        let body_start = text.find("title").expect("fixture has a body line");
+        let fence_start = text.rfind("---\n").expect("fixture has a closing fence");
+
+        let (_, region) =
+            find_injection_at_position(&injections, body_start, text, RegionBoundary::HalfOpen)
+                .expect("the frontmatter body resolves");
+        assert_eq!(region.language, "yaml");
+
+        for boundary in [RegionBoundary::HalfOpen, RegionBoundary::CaretEndFallback] {
+            assert!(
+                find_injection_at_position(&injections, fence_start, text, boundary).is_none(),
+                "the closing fence must stay outside the YAML region under {boundary:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_collect_all_injections_respects_lua_match_predicate() {
         // Regression test: #lua-match? is a general predicate (not built-in to tree-sitter).
