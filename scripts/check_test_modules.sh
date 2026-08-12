@@ -32,6 +32,14 @@ check_dir() {
     found=$((found + 1))
     grep -q "^mod ${stem};" "$main" || missing="${missing}  ${f}"$'\n'
   done
+  # Directory-backed modules (<name>/mod.rs) too, or they would be invisible in
+  # this direction while the reverse check below happily accepts them.
+  for f in "$dir"/*/mod.rs; do
+    [ -f "$f" ] || continue
+    stem="$(basename "$(dirname "$f")")"
+    found=$((found + 1))
+    grep -q "^mod ${stem};" "$main" || missing="${missing}  ${f}"$'\n'
+  done
   # A suite of nothing but main.rs would satisfy every check above vacuously,
   # and CI's plain `cargo test` would happily accept the resulting zero-test
   # binary. A guard that passes when there is nothing to guard is worse than
