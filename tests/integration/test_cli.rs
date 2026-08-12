@@ -382,6 +382,12 @@ fn test_config_init_includes_prefer_shared_instance() {
         "Should document the per-root-instance default. Got: {}",
         stdout
     );
+    assert!(
+        stdout.contains("forceStart = false"),
+        "Should document the lazy-spawn default, which is otherwise the one \
+         server knob a user cannot discover from the template. Got: {}",
+        stdout
+    );
 }
 
 /// Test that config init --output creates a configuration file

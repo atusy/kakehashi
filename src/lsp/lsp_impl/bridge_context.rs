@@ -647,6 +647,73 @@ pub(crate) fn unspawnable_language_servers(settings: &WorkspaceSettings) -> Vec<
     names
 }
 
+/// Names of `forceStart` servers whose warm-up most documents will bypass.
+///
+/// A document-less acquire has no marker root to walk, so a `forceStart`
+/// connection lands on the client-root fallback. A server that resolves
+/// *marker* roots therefore serves its documents from different connections
+/// entirely, and the warmed process sits idle for the session — paying a
+/// process, a reader task, and a writer task for nothing
+/// (bridge-routing-protocol records the same limit).
+///
+/// Three shapes are deliberately NOT warned about, because the warm-up is
+/// exactly what they are for: a `preferSharedInstance` server (every document
+/// joins the one shared connection), a server with no `languages` (the policy
+/// server, which no document routes to by design), and a server whose marker
+/// search is disabled with `workspaceMarkers = []` (its documents fall back to
+/// the same client root the warm-up used).
+pub(crate) fn bypassed_force_start_servers(settings: &WorkspaceSettings) -> Vec<String> {
+    let servers = &settings.language_servers;
+    let wildcard = servers.get(crate::config::WILDCARD_KEY);
+    let mut names: Vec<String> = servers
+        .iter()
+        .filter(|(name, _)| name.as_str() != crate::config::WILDCARD_KEY)
+        // Gate on the cheap fields first; only a force-started server is worth
+        // resolving a whole config for.
+        .filter(|(_, config)| {
+            config.forces_start_with_wildcard(wildcard)
+                && config.is_spawnable_with_wildcard(wildcard)
+        })
+        .filter(|(name, _)| {
+            crate::config::resolve_with_wildcard(
+                servers,
+                name,
+                crate::config::merge_bridge_server_configs,
+            )
+            .is_some_and(|resolved| {
+                !resolved.prefers_shared_instance()
+                    && !resolved.languages().is_empty()
+                    && !resolved
+                        .workspace_markers
+                        .as_ref()
+                        .is_some_and(Vec::is_empty)
+            })
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Render the single aggregated client-facing warning for `forceStart` servers
+/// whose warm-up most documents will bypass. `None` when there is nothing to
+/// warn about.
+pub(crate) fn format_bypassed_force_start_warning(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "languageServers with 'forceStart' that most documents will not use: \
+         {}. With no document to walk markers from, the warm-up connects at \
+         the client root, while documents under a marker root get their own \
+         connection — so this pre-spawns a process they bypass. It pays off \
+         for 'preferSharedInstance' servers, for marker-less workspaces \
+         ('workspaceMarkers = []'), and for a server no document routes to \
+         ('languages = []').",
+        names.join(", ")
+    ))
+}
+
 /// Render the single aggregated client-facing warning for unspawnable
 /// `languageServers` entries (empty resolved `cmd`). `None` when there is
 /// nothing to warn about.
@@ -1827,6 +1894,91 @@ mod tests {
             enabled: None,
             settings: None,
         }
+    }
+
+    /// A `forceStart` warm-up connects at the client root, because with no
+    /// document there is no marker to walk. A server that resolves marker
+    /// roots therefore serves its documents from other connections entirely,
+    /// and the warmed process is pure cost — worth saying at config load,
+    /// since nothing later will make it visible.
+    #[test]
+    fn bypassed_force_start_flags_only_the_warm_ups_documents_will_not_use() {
+        let warmed = |mutate: fn(&mut crate::config::settings::BridgeServerConfig)| {
+            let mut config = server(&["lua-language-server"]);
+            config.force_start = Some(true);
+            mutate(&mut config);
+            config
+        };
+
+        let mut settings = settings_with(HashMap::new());
+        settings.language_servers = HashMap::from([
+            // Marker-rooted, serves a language: documents bypass the warm-up.
+            ("bypassed".to_string(), warmed(|_| {})),
+            // Every document joins the one shared connection.
+            (
+                "shared".to_string(),
+                warmed(|c| c.prefer_shared_instance = Some(true)),
+            ),
+            // No document routes to it at all — the policy-server pattern,
+            // which is the whole point of the flag.
+            (
+                "policy".to_string(),
+                warmed(|c| c.languages = Some(Vec::new())),
+            ),
+            // Marker search disabled: its documents fall back to the same
+            // client root the warm-up used, so they DO reuse the connection.
+            (
+                "marker-less".to_string(),
+                warmed(|c| c.workspace_markers = Some(Vec::new())),
+            ),
+            // Not warmed at all.
+            ("lazy".to_string(), server(&["lua-language-server"])),
+            // Warmed but unspawnable: already covered by its own warning, and
+            // naming it twice would just be noise.
+            (
+                "disabled".to_string(),
+                warmed(|c| c.enabled = Some(false)),
+            ),
+        ]);
+
+        assert_eq!(
+            bypassed_force_start_servers(&settings),
+            vec!["bypassed".to_string()]
+        );
+        let message = format_bypassed_force_start_warning(&bypassed_force_start_servers(&settings))
+            .expect("a flagged server produces a warning");
+        assert!(message.contains("bypassed"), "{message}");
+        assert!(
+            format_bypassed_force_start_warning(&[]).is_none(),
+            "nothing to say means no notification at all"
+        );
+    }
+
+    /// The flag inherits from the wildcard like every other field, so the
+    /// advisory has to resolve it the same way — a blanket
+    /// `languageServers._.forceStart` is exactly the shape that warms a fleet
+    /// of processes most documents bypass.
+    #[test]
+    fn bypassed_force_start_resolves_the_wildcard() {
+        let mut settings = settings_with(HashMap::new());
+        let mut opted_out = server(&["lua-language-server"]);
+        opted_out.force_start = Some(false);
+        settings.language_servers = HashMap::from([
+            ("_".to_string(), {
+                let mut wildcard = cmd_unspecified();
+                wildcard.force_start = Some(true);
+                wildcard
+            }),
+            ("inheritor".to_string(), server(&["lua-language-server"])),
+            ("opted-out".to_string(), opted_out),
+        ]);
+
+        assert_eq!(
+            bypassed_force_start_servers(&settings),
+            vec!["inheritor".to_string()],
+            "the wildcard opt-in reaches a server that said nothing, and an \
+             explicit false still outranks it"
+        );
     }
 
     #[test]
