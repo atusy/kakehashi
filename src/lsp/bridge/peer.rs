@@ -58,6 +58,7 @@ impl PeerDirectory {
     }
 
     pub(in crate::lsp::bridge) fn register(&self, handle: &Arc<ConnectionHandle>) {
+        self.prune_dead();
         self.handles
             .insert(handle.key().clone(), Arc::downgrade(handle));
     }
@@ -366,7 +367,14 @@ mod tests {
         directory.register(&peer);
         drop(peer);
 
-        assert!(directory.list(&origin_key, None, None).await.is_empty());
-        assert!(directory.handles.is_empty());
+        let replacement = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::new("denols", Some("file:///new-root".to_string())),
+        )
+        .await;
+        directory.register(&replacement);
+        assert_eq!(directory.handles.len(), 1);
+
+        assert_eq!(directory.list(&origin_key, None, None).await.len(), 1);
     }
 }
