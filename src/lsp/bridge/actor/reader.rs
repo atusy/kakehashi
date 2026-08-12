@@ -2067,6 +2067,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_message_forwards_peer_request_and_wraps_its_response() {
+        let router = ResponseRouter::new();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        let peer = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("oxfmt"),
+        )
+        .await;
+        let peer_id = peer.key().peer_id();
+        deps.peer_directory.register(&peer);
+
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "kakehashi/bridge/peer/request",
+                "params": {
+                    "id": peer_id,
+                    "method": "textDocument/formatting",
+                    "params": { "textDocument": { "uri": "file:///repo/main.ts" } }
+                }
+            }),
+            &router,
+            "[tsudoi] ",
+            &deps,
+        )
+        .await;
+
+        for _ in 0..100 {
+            if peer.router().pending_count() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(peer.router().pending_count(), 1);
+        let downstream_id = peer.router().pending_ids()[0];
+        assert_ne!(downstream_id.as_i64(), 41);
+        assert_eq!(
+            peer.router().route(json!({
+                "jsonrpc": "2.0",
+                "id": downstream_id.as_i64(),
+                "result": [{ "newText": "formatted" }]
+            })),
+            RouteResult::Delivered
+        );
+
+        let OutboundMessage::Untracked(response) = response_rx.recv().await.unwrap() else {
+            panic!("server-request responses are untracked")
+        };
+        assert_eq!(response["id"], 41);
+        assert_eq!(
+            response["result"],
+            json!({ "result": [{ "newText": "formatted" }] })
+        );
+        assert_eq!(peer.router().pending_count(), 0);
+        assert!(
+            !deps
+                .inbound_request_registry
+                .is_registered(deps.progress_connection_id, &jsonrpc::Id::Number(41))
+        );
+    }
+
+    #[tokio::test]
     async fn handle_message_unregister_capability_updates_registry() {
         let router = ResponseRouter::new();
         let (response_tx, mut response_rx) = mpsc::channel(16);
