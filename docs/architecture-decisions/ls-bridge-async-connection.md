@@ -80,14 +80,10 @@ Three critical requirements drive this decision:
   - Timeout detection
 - Route responses to pending request handlers via shared map
 
-**Cancel-safety of the read branch:** because the read is a `select!` branch,
-any other branch completing drops the read future mid-frame. The framing parser
-must therefore hold its partial-frame progress in the reader
-(`BridgeReader::frame`), not in the read future's locals, and must await only
-cancel-safe primitives. A parser built on `read_line`/`read_exact` silently
-loses a consumed header on every liveness tick and then resyncs onto the
-message body, reporting a framing error against a well-framed stream and
-killing the connection.
+**Cancel-safety of the read branch:** multiplexing means any other branch
+completing drops the read mid-frame, so the framing parser must be
+cancel-safe (§ Invariants). `BridgeReader::frame` is where that partial-frame
+progress lives.
 
 **Framing size ceilings** (amended with bridge-routing-protocol; **target
 state** — today's `BridgeReader` enforces none of these bounds and
@@ -124,39 +120,22 @@ When the reader task exits abnormally (EOF, read error, timeout, or shutdown), a
 - Log failures for observability
 
 **Cleanup Timeout Bounds:**
-The cleanup operation itself must complete within a bounded time (recommended: 100ms) to prevent cleanup hangs from blocking state transitions:
-- If cleanup exceeds timeout, force state transition anyway
-- Log cleanup timeout as a warning (indicates potential channel saturation)
-- Remaining pending entries will be dropped when the pending map is dropped
-
-**Note on Dropped Channels:** When a `oneshot::Sender` is dropped without sending (due to cleanup timeout), the receiver's `.await` returns `RecvError`. This is semantically equivalent to receiving `INTERNAL_ERROR` - the client knows the request failed. Callers should handle both explicit error responses and channel errors uniformly.
+Cleanup itself is bounded (duration implementation-defined, in the
+sub-second class), because it must never block a state transition:
+- If cleanup exceeds its bound, the state transition happens anyway
+- Log the overrun as a warning (it indicates potential channel saturation)
+- Any pending entry cleanup did not reach is failed by the loss of its reply
+  path, which callers treat identically to an explicit error — a caller
+  cannot, and need not, distinguish the two
 
 **Race Prevention (Request Registration vs Reader Exit):**
 
-A critical race condition exists between request registration and reader task cleanup. The **check-insert-check pattern** prevents orphaned requests:
-
-```rust
-async fn send_request(&self, request: Request) -> Result<Response> {
-    // FIRST CHECK: Fail fast if connection not ready
-    if self.connection_state.load() != ConnectionState::Ready {
-        return Err(Error::ConnectionNotReady);
-    }
-
-    let request_id = request.id;  // LSP spec: integer | string
-    let (response_tx, response_rx) = oneshot::channel();
-    self.pending.insert(request_id, response_tx);
-
-    // SECOND CHECK: Detect race with cleanup
-    if self.connection_state.load() != ConnectionState::Ready {
-        self.pending.remove(&request_id);
-        return Err(Error::ConnectionNotReady);
-    }
-
-    // Safe: cleanup either hasn't started or will include our entry
-    self.write_request(request_id, request).await?;
-    response_rx.await
-}
-```
+Registration and reader-task cleanup race, and the request that registers in
+the window between cleanup's sweep and its state transition is the one that
+waits forever. Registration therefore commits atomically with respect to
+cleanup: a request either registers before the sweep — and is failed by it —
+or is refused with `Error::ConnectionNotReady`. It may never land after the
+sweep and survive.
 
 **Error Code Mapping**: `Error::ConnectionNotReady` maps to `REQUEST_FAILED` (-32803) with state-specific messages. See ls-bridge-message-ordering § Operation Gating for the complete mapping.
 
@@ -169,23 +148,23 @@ The system uses two distinct timeout mechanisms with different purposes:
 - **Purpose**: Detect zombie servers (process alive but unresponsive to pending requests)
 - **Scope**: Connection-level health monitoring
 - **State-Based Gating**:
-  - **Disabled** during: Initializing, Closing, Failed, Closed states, or Ready with liveness-classified pending = 0
-  - **Enabled** during: Ready state with liveness-classified managed pending requests > 0
-  - The 0→1 start/epoch-advance and →0 stop transitions count only
-    liveness-classified managed entries; pass-through requests are
-    excluded from the count entirely. **Target state**: the per-entry
-    classification is an implementation precondition recorded in
+  - **Disabled** during: Initializing, Closing, Failed, Closed states, or Ready with no liveness-classified request outstanding
+  - **Enabled** during: Ready state with at least one liveness-classified managed request outstanding
+  - **Pass-through requests are excluded from liveness accounting
+    entirely** — they carry no bridge-imposed timeout, so a slow one must
+    never drive a healthy connection to `Failed`. **Target state**: the
+    per-entry classification is an implementation precondition recorded in
     bridge-client-control-protocol — today's router counts every
     non-cancelled pending entry, and this rule lands with that protocol
 - **Timer Lifecycle**:
-  - **Start**: First request sent when pending count transitions 0→1
-  - **Keep running**: Additional requests sent (pending count increases)
+  - **Start**: When the first liveness-classified request becomes outstanding
+  - **Keep running**: While any remains outstanding
   - **Reset**: Each framed and JSON-decoded downstream message while active
     (the reset happens before the message is classified, so server-initiated
     requests count too). Not raw stdout activity: a downstream that dribbles
     out a partial frame resets nothing and is still caught, which is what makes
     the timer the backstop for a server that stalls mid-frame.
-  - **Stop**: Last response received (pending count returns to 0)
+  - **Stop**: When the last one is answered
 - **Behavior on Timeout**: Connection transitions to Failed state
 
 **2. Initialization Timeout (Startup Bound)**
@@ -202,6 +181,43 @@ The system uses two distinct timeout mechanisms with different purposes:
 **Independence**: The two timeouts serve different purposes and never overlap (liveness disabled during Initializing; initialization timeout disabled once Ready).
 
 **Coordination with Other Timeouts**: See ls-bridge-timeout-hierarchy for precedence rules when shutdown timeout is active.
+
+## Invariants
+
+> The invariants below are normative; the mechanisms that satisfy them are
+> deliberately unspecified.
+
+Every one of these has a failure mode that presents as the *peer's* fault,
+which is what makes them worth recording.
+
+- **The frame reader must be cancel-safe.** Its partial-frame progress lives
+  with the reader, not in the read future's locals, and it awaits only
+  cancel-safe primitives. A parser built on read-a-line/read-exact loses a
+  consumed header every time another branch wins, resyncs onto the message
+  body, and reports a framing error against a well-framed stream — killing a
+  healthy connection and blaming the server.
+- **An oversized body is never drained.** Draining an attacker-sized body
+  hangs the reader, which is the same denial the size ceiling exists to
+  prevent.
+- **Size ceilings are enforced as bytes accumulate**, never checked after an
+  unbounded buffer has already grown to hold the thing being rejected.
+- **Registration of a pending request is atomic with respect to cleanup.** A
+  request either registers before cleanup's sweep — and is failed by it — or
+  is refused. One that lands after the sweep waits forever, and nothing later
+  will notice it.
+- **Cleanup can never block a state transition.** A connection that cannot
+  finish failing its pending requests must still be able to reach its
+  terminal state.
+- **The loss of a reply path means failure, not silence.** A caller must
+  never need to distinguish an explicit error response from a dropped reply;
+  both say the request failed.
+- **Liveness must not be armed by requests it does not govern.** A
+  pass-through carries no bridge-imposed timeout by contract, so counting one
+  toward liveness lets a slow — but legitimate — request kill a healthy
+  connection.
+- **Liveness resets on decoded messages, not on raw stdout activity.** A
+  downstream dribbling out a partial frame must not be able to keep itself
+  alive; that stall is precisely what the timer is the backstop for.
 
 ## Consequences
 
@@ -301,3 +317,4 @@ Use standard library's `std::process` with one blocking OS thread per server rea
 - **2026-01-06**: Merged Amendment 002 - Added state-based liveness timeout gating and separate initialization timeout mechanism to prevent liveness timeout from firing during slow initialization
 - **2026-08-10**: Amendment — reader framing must be cancel-safe across `select!` wake-ups; partial-frame state moved into `BridgeReader`
 - **2026-08-12**: Amendment (with bridge-routing-protocol) — framing size ceilings: incrementally enforced header-line, header-block, and `Content-Length` bounds, each a fatal framing error; see § Framing size ceilings
+- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - replaced the check-insert-check sketch and the pending-count arithmetic with the atomicity and exclusion rules they implement, and collected this ADR's traps (cancel-safe framing, never drain an oversized body, cleanup must not block a transition, liveness must not be armed by pass-through) into an Invariants section
