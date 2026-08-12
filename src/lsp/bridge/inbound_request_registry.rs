@@ -129,9 +129,8 @@ impl InboundRequestRegistry {
         }
     }
 
-    /// Cancel and drop every in-flight request for a connection — used when a
-    /// downstream connection's reader exits, so its forwarded requests don't
-    /// linger as open editor dialogs.
+    /// Cancel and drop every in-flight request for a connection when its reader
+    /// exits, dismissing editor interactions and retiring peer forwarding.
     pub(crate) fn cancel_connection(&self, connection_id: ProgressConnectionId) {
         if let Some(requests) = self
             .inner
