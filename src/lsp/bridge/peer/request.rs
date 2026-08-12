@@ -156,8 +156,9 @@ pub(in crate::lsp::bridge) fn handle(
     }
 
     tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + super::super::pool::REQUEST_TIMEOUT;
         let body = tokio::select! {
-            response = peer.wait_for_response(downstream_id, response_rx) => {
+            response = peer.wait_for_response_until(downstream_id, response_rx, deadline) => {
                 router_guard.disarm();
                 match response {
                     Ok(response) => normalize_response(response),
@@ -189,12 +190,9 @@ pub(in crate::lsp::bridge) fn handle(
                     let router = peer.router().clone();
                     let peer = peer.clone();
                     tokio::spawn(async move {
-                        tokio::time::sleep(super::super::pool::REQUEST_TIMEOUT).await;
-                        if router.peer_cancel_is_writing(downstream_id) {
-                            peer.set_state(super::super::pool::ConnectionState::Failed);
-                            router.fail_all("bridge: cancelled peer write timed out");
-                        } else {
-                            router.remove(downstream_id);
+                        tokio::time::sleep_until(deadline).await;
+                        if router.expire_peer_cancel(downstream_id) {
+                            peer.fail_if_ready();
                         }
                     });
                 }
