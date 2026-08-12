@@ -1898,6 +1898,38 @@ fn test_language_uninstall_all_leaves_unmanaged_artifacts_and_says_so() {
     );
 }
 
+/// Whether restrictive directory modes actually deny access to this process.
+///
+/// A privileged runner — root, or a container holding `CAP_DAC_OVERRIDE` —
+/// ignores the mode bits, so the fixtures the permission tests are built on
+/// silently do not hold and the assertions fail as if the product regressed.
+///
+/// This probes the PROPERTY rather than the uid: it seals a throwaway directory
+/// and checks whether the seal bites. That cannot mask a real regression, since
+/// it only reports when the fixture itself failed to take effect, and it needs
+/// no privilege-querying dependency.
+#[cfg(unix)]
+fn restrictive_modes_are_enforced() -> bool {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let probe = tempfile::tempdir().expect("Failed to create probe dir");
+    let sealed = probe.path().join("sealed");
+    fs::create_dir(&sealed).expect("Failed to create probe subdir");
+    let mut permissions = fs::metadata(&sealed)
+        .expect("Failed to read probe permissions")
+        .permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&sealed, permissions).expect("Failed to seal probe dir");
+    let enforced = fs::read_dir(&sealed).is_err();
+    let mut permissions = fs::metadata(&sealed)
+        .expect("Failed to read probe permissions")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&sealed, permissions).expect("Failed to unseal probe dir");
+    enforced
+}
+
 /// A directory-level scan failure means uninstall never observed the
 /// installation, so it must abort before removing anything. The bug this pins:
 /// an unreadable `parser/` beside a readable `queries/` used to remove the
@@ -1905,6 +1937,11 @@ fn test_language_uninstall_all_leaves_unmanaged_artifacts_and_says_so() {
 #[test]
 #[cfg(unix)]
 fn test_language_uninstall_all_aborts_when_parser_directory_cannot_be_read() {
+    if !restrictive_modes_are_enforced() {
+        eprintln!("skipping: this environment ignores restrictive directory modes");
+        return;
+    }
+
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1979,6 +2016,11 @@ fn test_language_uninstall_all_aborts_when_parser_directory_cannot_be_read() {
 #[test]
 #[cfg(unix)]
 fn test_language_uninstall_all_reports_and_skips_an_unreadable_parser_entry() {
+    if !restrictive_modes_are_enforced() {
+        eprintln!("skipping: this environment ignores restrictive directory modes");
+        return;
+    }
+
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -2084,6 +2126,11 @@ fn test_language_uninstall_all_removes_a_dangling_query_entry() {
 #[test]
 #[cfg(unix)]
 fn test_language_uninstall_all_leaves_a_language_whole_when_its_parser_is_unreadable() {
+    if !restrictive_modes_are_enforced() {
+        eprintln!("skipping: this environment ignores restrictive directory modes");
+        return;
+    }
+
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -2144,6 +2191,11 @@ fn test_language_uninstall_all_leaves_a_language_whole_when_its_parser_is_unread
 #[test]
 #[cfg(unix)]
 fn test_language_uninstall_all_still_reports_leftovers_when_a_removal_fails() {
+    if !restrictive_modes_are_enforced() {
+        eprintln!("skipping: this environment ignores restrictive directory modes");
+        return;
+    }
+
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -2250,6 +2302,11 @@ fn test_language_uninstall_all_removes_a_dangling_parser_entry() {
 #[test]
 #[cfg(unix)]
 fn test_language_uninstall_all_aborts_when_query_directory_cannot_be_read() {
+    if !restrictive_modes_are_enforced() {
+        eprintln!("skipping: this environment ignores restrictive directory modes");
+        return;
+    }
+
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -2319,6 +2376,11 @@ fn test_language_uninstall_all_aborts_when_query_directory_cannot_be_read() {
 #[test]
 #[cfg(unix)]
 fn test_language_uninstall_does_not_call_a_language_absent_after_failing_to_inspect_it() {
+    if !restrictive_modes_are_enforced() {
+        eprintln!("skipping: this environment ignores restrictive directory modes");
+        return;
+    }
+
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -2392,6 +2454,11 @@ fn test_language_uninstall_does_not_call_a_language_absent_after_failing_to_insp
 #[test]
 #[cfg(unix)]
 fn test_language_uninstall_all_keeps_failing_when_a_declined_prompt_follows_a_bad_entry() {
+    if !restrictive_modes_are_enforced() {
+        eprintln!("skipping: this environment ignores restrictive directory modes");
+        return;
+    }
+
     use std::fs;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -2515,6 +2582,11 @@ fn test_language_uninstall_leaves_a_language_whole_when_its_parser_is_the_wrong_
 #[test]
 #[cfg(unix)]
 fn test_language_uninstall_names_the_half_removed_state_when_the_parser_cannot_be_taken() {
+    if !restrictive_modes_are_enforced() {
+        eprintln!("skipping: this environment ignores restrictive directory modes");
+        return;
+    }
+
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 

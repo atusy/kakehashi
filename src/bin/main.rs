@@ -881,7 +881,7 @@ fn run_language_uninstall(
         // and the other languages are still removed.
         let parser_entry = match find_parser_entry(&parser_dir, lang) {
             Ok(None) => None,
-            Ok(Some((path, ParserEntry::Removable { is_symlink }))) => Some((path, is_symlink)),
+            Ok(Some((path, ParserEntry::Removable { .. }))) => Some(path),
             // A shape removal cannot take is not "no parser here" — but #828
             // settled that such an entry does not count as an installed parser,
             // and that answer stands when there is nothing else to lose. What
@@ -890,7 +890,22 @@ fn run_language_uninstall(
             // (which has no leftovers summary), report it as a clean uninstall.
             // So the refusal is scoped to exactly that case.
             Ok(Some((path, ParserEntry::WrongShape))) => {
-                if std::fs::symlink_metadata(queries_dir.join(lang)).is_ok() {
+                // Only a confirmed absence permits going on. Reading any other
+                // error as "no queries here" would hand back the half-removal
+                // this branch exists to prevent, decided on a guess.
+                let queries_present = match std::fs::symlink_metadata(queries_dir.join(lang)) {
+                    Ok(_) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => {
+                        eprintln!(
+                            "✗ Leaving '{}' untouched: {:?} is not a shape this CLI can remove, and whether it has queries could not be determined: {}",
+                            lang, path, e
+                        );
+                        any_failed = true;
+                        continue;
+                    }
+                };
+                if queries_present {
                     eprintln!(
                         "✗ Leaving '{}' untouched: {:?} is not a shape this CLI can remove, and taking its queries alone would half-remove it.",
                         lang, path
@@ -957,8 +972,8 @@ fn run_language_uninstall(
         }
 
         // Remove the parser entry probed above, still under the same lock.
-        if let Some((parser_path, is_symlink)) = parser_entry {
-            match remove_parser_entry(&parser_path, is_symlink) {
+        if let Some(parser_path) = parser_entry {
+            match remove_parser_entry(&parser_path) {
                 Ok(()) => {
                     eprintln!("✓ Removed parser: {}", parser_path.display());
                     removed_something = true;
@@ -1112,14 +1127,21 @@ fn parser_entry_kind(path: &Path) -> std::io::Result<Option<ParserEntry>> {
 /// loses the link and whatever it pointed at survives. Windows is the exception
 /// worth naming: a directory symlink or junction is a reparse point that
 /// `DeleteFileW` refuses, and `RemoveDirectoryW` is what removes the link there
-/// — also without touching the target. The retry is gated on the entry being a
-/// symlink, and on Unix it simply fails (a symlink is not a directory), so the
-/// fallback cannot reach a real directory on either platform.
-fn remove_parser_entry(path: &Path, is_symlink: bool) -> std::io::Result<()> {
+/// — also without touching the target.
+///
+/// The symlink test is re-taken here rather than carried from discovery. A flag
+/// decided earlier is a statement about what the path WAS, and `remove_dir`
+/// acting on a stale one could take a real directory that replaced the link in
+/// between — the one thing this function must never do. The re-check narrows
+/// that to the window between it and the call, which is the same irreducible
+/// race any unlink runs; closing it fully would need `openat`/`O_NOFOLLOW`.
+fn remove_parser_entry(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) => {
-            if is_symlink && std::fs::remove_dir(path).is_ok() {
+            let still_a_symlink = std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink());
+            if still_a_symlink && std::fs::remove_dir(path).is_ok() {
                 Ok(())
             } else {
                 Err(error)
