@@ -10,8 +10,10 @@
 # stays green while the coverage is gone.
 #
 # The per-binary runner this replaced refused to run when the binary count did
-# not match the file count. This is that guard, moved to `make check` so CI and
-# the pre-commit hook both enforce it.
+# not match the file count. This is that guard. It is wired into BOTH `make
+# check` (local + pre-commit hook) and the CI `check` job directly, because CI
+# invokes the cargo commands itself rather than going through `make check` —
+# wiring it only into the Makefile would leave CI unguarded.
 
 set -uo pipefail
 
