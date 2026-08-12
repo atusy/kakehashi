@@ -830,8 +830,8 @@ namespace.
 ## Decision–Implementation Gap
 
 None of this protocol is implemented yet; § Implementation Notes below is the
-build list. One point of the *decision* is also unresolved rather than merely
-unbuilt:
+build list. One implementation prerequisite is also unsettled — not the
+decision it serves, which stands:
 
 - **The complete set of routing inputs that must survive a handle's death is
   not settled.** The contract is exact resolution — acquires resolve to the

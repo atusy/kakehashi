@@ -69,7 +69,7 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 
 ### Precedence Rules
 
-**Global shutdown overrides all other timeout tiers**, and subsumes the per-slot control shutdown deadline. Non-tier bounds already running are not cancelled by it.
+**Global shutdown overrides all other timeout tiers**, and subsumes the per-slot control shutdown deadline. A per-downstream response cap already counting is not cancelled; routing decisions and queued validation work, by contrast, are resolved and removed at teardown (see their sections below).
 
 | Scenario | Active Timeouts | Behavior |
 |----------|----------------|----------|
