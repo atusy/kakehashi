@@ -31,6 +31,7 @@ pub(crate) use connection_action::BridgeError;
 use connection_action::{ConnectionAction, decide_connection_action};
 use handshake::perform_lsp_handshake;
 
+pub(in crate::lsp::bridge) use connection_handle::REQUEST_TIMEOUT;
 pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
