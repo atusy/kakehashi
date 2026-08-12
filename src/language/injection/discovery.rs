@@ -568,6 +568,15 @@ fn extract_content_and_language<'a>(
 /// end-boundary rule: half-open containment, optionally falling back to a
 /// region whose trailing edge the offset sits on (see [`RegionBoundary`]).
 ///
+/// Containment is judged on each region's **effective** span — the raw
+/// `@injection.content` node after its `#offset!` directive
+/// ([`effective_content_range`]) — which is the same span the resolved region
+/// and every coordinate translation downstream are built from. Judging it on
+/// the raw node instead would let a caret on bytes the directive trimmed
+/// (a frontmatter `---` fence, a string's quotes) select a region that does
+/// not actually contain it, and would leave bytes a directive *added* past
+/// the raw node unreachable (#996 item 1).
+///
 /// Regions are sorted by query pattern index, so same-range alternate
 /// languages use explicit query-order priority for single-result bridge APIs.
 /// Whole-document and hierarchy discovery still retain every language layer.
@@ -582,9 +591,8 @@ fn find_injection_at_position<'a>(
 ) -> Option<(usize, &'a InjectionRegionInfo<'a>)> {
     let doc_len = text.len();
     let half_open = injections.iter().enumerate().find(|(_, inj)| {
-        let start = inj.content_node.start_byte();
-        let end = inj.content_node.end_byte();
-        byte_offset >= start && byte_offset < end
+        let range = effective_content_range(inj, text);
+        byte_offset >= range.start && byte_offset < range.end
     });
     match boundary {
         RegionBoundary::HalfOpen => half_open,
@@ -597,17 +605,31 @@ fn find_injection_at_position<'a>(
             // nested regions ending at the same byte keep the established
             // first-match (outermost) tie-break. The second scan runs only on
             // the miss path, over the handful of regions a document has — not
-            // worth fusing into one pass. Known divergence: the column is a
-            // tree-sitter byte column counted from the last `\n`, so a region
-            // ending right after a LONE `\r` (an LSP line break, not a
-            // tree-sitter one) reads as mid-line here — the translation
-            // pipeline shares that lone-CR divergence; tracked in #996.
+            // worth fusing into one pass.
             injections.iter().enumerate().find(|(_, inj)| {
-                inj.content_node.end_byte() == byte_offset
-                    && (inj.content_node.end_position().column > 0 || byte_offset == doc_len)
+                let range = effective_content_range(inj, text);
+                // A collapsed effective range has no trailing edge to sit on;
+                // half-open rejects it implicitly, the fallback must say so.
+                range.start < range.end
+                    && range.end == byte_offset
+                    && (ends_mid_line(text, range.end) || byte_offset == doc_len)
             })
         }),
     }
+}
+
+/// Whether the byte offset `end` sits mid-line — i.e. tree-sitter would report
+/// a non-zero column there.
+///
+/// Deliberately byte-for-byte the tree-sitter rule (a column counted from the
+/// last `\n`) rather than the LSP one, so it stays consistent with the
+/// coordinate-translation pipeline, which shares the same convention. The
+/// divergence that follows from it — a region ending right after a LONE `\r`,
+/// an LSP line break but not a tree-sitter one, reads as mid-line — is
+/// preserved on purpose and tracked as #996 item 4; fixing it here alone would
+/// only split the lookup from translation.
+fn ends_mid_line(text: &str, end: usize) -> bool {
+    end > 0 && text.as_bytes().get(end - 1).is_some_and(|&b| b != b'\n')
 }
 
 /// How [`InjectionResolver::resolve_at_byte_offset`] treats a region's end
