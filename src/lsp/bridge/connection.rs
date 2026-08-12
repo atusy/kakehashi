@@ -225,19 +225,20 @@ impl FrameParseState {
     /// A ceiling violation, quoting whatever of the peer's header block is
     /// still readable.
     ///
-    /// Prefers the remembered stray line, which is the evidence
-    /// [`Self::missing_length`] would have quoted. A line that never completed
-    /// has none — it is still sitting in `line`, unterminated — so that buffer
-    /// is the fallback, and it is exactly the case the line ceiling catches.
+    /// A rejected line gets priority over the remembered stray line: the
+    /// rejected bytes are the most useful evidence for a line ceiling. The
+    /// remembered stray line remains the fallback for a block ceiling, while
+    /// an unterminated line falls back to the bytes already in `line`.
     fn oversized(&self, reason: String, rejected: &[u8]) -> io::Error {
-        let quote = self.stray_line.clone().unwrap_or_else(|| {
-            if !rejected.is_empty() {
-                let head = &rejected[..rejected.len().min(STRAY_LINE_MAX_QUOTE_BYTES)];
-                return render_capped_line(head, rejected.len() > STRAY_LINE_MAX_QUOTE_BYTES);
-            }
-            let head = &self.line[..self.line.len().min(STRAY_LINE_MAX_QUOTE_BYTES)];
-            render_capped_line(head, self.line.len() > STRAY_LINE_MAX_QUOTE_BYTES)
-        });
+        let quote = if !rejected.is_empty() {
+            let head = &rejected[..rejected.len().min(STRAY_LINE_MAX_QUOTE_BYTES)];
+            render_capped_line(head, rejected.len() > STRAY_LINE_MAX_QUOTE_BYTES)
+        } else {
+            self.stray_line.clone().unwrap_or_else(|| {
+                let head = &self.line[..self.line.len().min(STRAY_LINE_MAX_QUOTE_BYTES)];
+                render_capped_line(head, self.line.len() > STRAY_LINE_MAX_QUOTE_BYTES)
+            })
+        };
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{reason} (stray stdout line: {quote:?})"),
@@ -1654,6 +1655,30 @@ mod tests {
             .absorb(&vec![b'x'; MAX_HEADER_LINE_BYTES])
             .1
             .expect("a line exactly at the ceiling is not past it");
+    }
+
+    #[test]
+    fn an_oversized_line_quotes_it_over_an_earlier_stray_header() {
+        let mut frame = FrameParseState::default();
+        frame
+            .absorb(b"Content-Type: earlier-marker\r\n")
+            .1
+            .expect("the preceding header is individually valid");
+
+        let oversized = vec![b'O'; MAX_HEADER_LINE_BYTES + 1];
+        let error = frame
+            .absorb(&oversized)
+            .1
+            .expect_err("the newline-free line must exceed the ceiling");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains('O'),
+            "the line-ceiling error must quote the rejected line: {rendered}"
+        );
+        assert!(
+            !rendered.contains("earlier-marker"),
+            "the earlier stray header must not hide the rejected line: {rendered}"
+        );
     }
 
     /// Bounding each line is not enough: a peer can send unboundedly many
