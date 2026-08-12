@@ -55,8 +55,14 @@ pub(crate) struct ResolvedServerConfig {
     pub(crate) config: Arc<BridgeServerConfig>,
 }
 
-/// Whether an acquire error means another acquire for the same key is already
-/// in flight (or the pool is closing), rather than that the server failed.
+/// Whether an acquire error means the warm-up was overtaken rather than that
+/// the server failed to start.
+///
+/// Three shapes qualify, and none of them is worth telling a user about: an
+/// acquire for the same key already shaking hands, a slot on its way down, and
+/// the pool refusing new spawns — which covers both shutdown and a warm-up
+/// this pass superseded. What is left is a server that genuinely could not
+/// start, which is exactly what the user needs to hear.
 fn is_concurrent_acquire(error: &std::io::Error) -> bool {
     if error.kind() == std::io::ErrorKind::Interrupted {
         return true;
@@ -65,7 +71,7 @@ fn is_concurrent_acquire(error: &std::io::Error) -> bool {
     error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<BridgeError>())
-        .is_some_and(BridgeError::is_initializing)
+        .is_some_and(|inner| inner.is_initializing() || inner.is_closing())
 }
 
 fn resolve_reload_server_config(
@@ -417,24 +423,21 @@ impl BridgeCoordinator {
                 // of this pass. If a later application has already run, that
                 // snapshot is history: spawning from it would start a server
                 // configuration no longer names, and — worse — the pool reads
-                // a differing launch config as a change, so a stale task can
+                // a differing launch config as a change, so a stale task would
                 // tear down the correctly-configured connection and replace it
                 // with the old command. The newer pass re-asserts every flag,
                 // so standing down costs nothing.
                 //
-                // Checked as late as possible, but the acquire takes the pool
-                // lock after it, so a pass landing in that gap still wins. It
-                // closes the window that matters — one whole settings
-                // application wide — not every window.
-                if current_generation.load(Ordering::Relaxed) != generation {
-                    log::debug!(
-                        target: "kakehashi::bridge",
-                        "forceStart for '{name}' stood down: a newer configuration \
-                         has been applied"
-                    );
-                    return;
-                }
-                let Err(error) = pool.get_or_create_connection(&name, &config, None).await else {
+                // The check is handed to the pool rather than made here,
+                // because here is too early: the acquire takes the pool lock
+                // afterwards, and whoever holds it may be the very pass that
+                // supersedes this one. Evaluated inside that lock, it lands
+                // ahead of the launch-config comparison it exists to prevent.
+                let admit = || current_generation.load(Ordering::Relaxed) == generation;
+                let Err(error) = pool
+                    .get_or_create_connection_admitted(&name, &config, None, &admit)
+                    .await
+                else {
                     return;
                 };
                 // Two errors mean "someone else is already doing this", not
@@ -1731,6 +1734,10 @@ mod tests {
         use crate::lsp::bridge::pool::BridgeError;
 
         assert!(is_concurrent_acquire(&BridgeError::Initializing.into()));
+        assert!(
+            is_concurrent_acquire(&BridgeError::Closing.into()),
+            "a slot on its way down is a lifecycle transition, not a start failure"
+        );
         assert!(is_concurrent_acquire(&std::io::Error::new(
             std::io::ErrorKind::Interrupted,
             "bridge pool is shutting down; rejecting new connection spawn",
@@ -1757,18 +1764,43 @@ mod tests {
     /// configured connection and replace it with the old command.
     #[tokio::test]
     async fn force_start_stands_down_when_a_newer_configuration_arrives() {
+        let evidence = tempfile::tempdir().expect("a temp dir for the marker file");
+        let stale_ran = evidence.path().join("stale-command-ran");
+
+        // The two passes differ in the one way that matters: only the stale
+        // one's command leaves a trace. Counting connections cannot tell these
+        // apart — both target the same key, so a stale task that DID reach the
+        // pool would produce one connection either way, just the wrong one.
+        let staged = |marker: Option<&std::path::Path>| {
+            let script = match marker {
+                Some(path) => format!("touch {}; cat > /dev/null", path.display()),
+                None => "cat > /dev/null".to_string(),
+            };
+            force_start_settings(&[(
+                "policy-server",
+                BridgeServerConfig {
+                    cmd: Some(vec!["sh".to_string(), "-c".to_string(), script]),
+                    ..idle_server(true, vec![])
+                },
+            )])
+        };
+
         let coordinator = BridgeCoordinator::new();
-        let settings = force_start_settings(&[("policy-server", idle_server(true, vec![]))]);
+        // The generation is claimed synchronously, so by the time the first
+        // pass's task body runs, the second pass has already superseded it —
+        // which is exactly the ordering a rapid second settings application
+        // produces.
+        assert_eq!(
+            coordinator.force_start_servers(&staged(Some(&stale_ran))),
+            1
+        );
+        assert_eq!(coordinator.force_start_servers(&staged(None)), 1);
 
-        // Claim a generation and drop the tasks on the floor before they run,
-        // which is what a settings application landing first amounts to.
-        assert_eq!(coordinator.force_start_servers(&settings), 1);
-        assert_eq!(coordinator.force_start_servers(&settings), 1);
-
-        // Exactly one connection: the superseded task stands down rather than
-        // racing the current one. (Both target the same key, so a failure here
-        // shows up as the assertion in `started_servers`, not as two entries.)
         assert_eq!(started_servers(&coordinator, 1).await, ["policy-server"]);
+        assert!(
+            !stale_ran.exists(),
+            "the superseded task reached the pool and spawned its command"
+        );
     }
 
     /// Spawnability outranks the flag: `forceStart` asks *when* a configured

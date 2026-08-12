@@ -660,8 +660,16 @@ pub(crate) fn unspawnable_language_servers(settings: &WorkspaceSettings) -> Vec<
 /// exactly what they are for: a `preferSharedInstance` server (every document
 /// joins the one shared connection), a server with no `languages` (the policy
 /// server, which no document routes to by design), and a server whose marker
-/// search is disabled with `workspaceMarkers = []` (its documents fall back to
-/// the same client root the warm-up used).
+/// search names nothing (its documents fall back to the same client root the
+/// warm-up used).
+///
+/// The `preferSharedInstance` exemption is a *preference*, and a downstream
+/// that turns out not to support workspace-folder changes is downgraded to
+/// per-root at handshake time — at which point its warm-up is bypassed after
+/// all. Not warned about anyway: this runs at configuration load, where no
+/// server has handshaken and the capability is unknowable, and warning every
+/// shared-instance warm-up on the chance that one is incapable would be wrong
+/// for the capable majority. The downgrade already logs once on its own.
 pub(crate) fn bypassed_force_start_servers(settings: &WorkspaceSettings) -> Vec<String> {
     let servers = &settings.language_servers;
     let wildcard = servers.get(crate::config::WILDCARD_KEY);
@@ -683,10 +691,17 @@ pub(crate) fn bypassed_force_start_servers(settings: &WorkspaceSettings) -> Vec<
             .is_some_and(|resolved| {
                 !resolved.prefers_shared_instance()
                     && !resolved.languages().is_empty()
-                    && !resolved
-                        .workspace_markers
-                        .as_ref()
-                        .is_some_and(Vec::is_empty)
+                    && resolved.workspace_markers.as_ref().is_none_or(|markers| {
+                        // A list that names nothing cannot resolve a root, so
+                        // documents fall back to the same client root the
+                        // warm-up used — `[]`, but also `[[]]` and any shape
+                        // whose entries are all empty, which look configured
+                        // and are not.
+                        markers
+                            .iter()
+                            .flat_map(crate::config::settings::RootMarker::names)
+                            .any(|name| !name.is_empty())
+                    })
             })
         })
         .map(|(name, _)| name.clone())
@@ -1930,6 +1945,15 @@ mod tests {
             (
                 "marker-less".to_string(),
                 warmed(|c| c.workspace_markers = Some(Vec::new())),
+            ),
+            // Configured-looking but equally rootless: an empty group names
+            // nothing to search for, so it resolves no root either.
+            (
+                "empty-group".to_string(),
+                warmed(|c| {
+                    c.workspace_markers =
+                        Some(vec![crate::config::settings::RootMarker::Group(Vec::new())])
+                }),
             ),
             // Not warmed at all.
             ("lazy".to_string(), server(&["lua-language-server"])),
