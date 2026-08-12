@@ -59,10 +59,14 @@ only subtract servers or redirect roots (see Trust Model).
 
 One **decision** — one logical fan-out, carrying one JSON-RPC request per
 selected provider — is issued per **bridged document**: the host document
-for the host layer, and **each virtual document** (each injection region)
-for the injection layer. Per-region granularity is the point of the
-protocol: a provider can suppress one code block or root one region
-differently, which no per-language decision could express. The volume
+for the host layer, and **each virtual document** for the injection
+layer — one region, or one combined group of regions under
+`injection.combined`, per
+language-server-bridge-virtual-document-model; the decision unit is
+the virtual document, so combined regions share one decision exactly
+as they share one `didOpen`. Per-document granularity is the point of
+the protocol: a provider can suppress one code block or root one
+region differently, which no per-language decision could express. The volume
 that granularity implies is deliberate and **user-controllable**: the
 shipped markdown injection query emits hundreds of `markdown_inline`
 regions for an ordinary prose document, and a workspace that bridges such
@@ -598,7 +602,8 @@ Two structural rules keep the protocol from consuming itself:
 
 Kakehashi queries at the **first routing decision** for each bridged
 document: the host `didOpen` (when host bridging is enabled) and each
-virtual document's creation. Two
+virtual document's creation (a combined document decides once for its
+whole group). Two
 structures with different lifetimes carry the outcome:
 
 - The **decision cache** holds pre-application answers, keyed
@@ -786,8 +791,9 @@ Decision-cache lifecycle:
 
 - **Evicted on the decided document's close** — the host's `didClose`
   evicts the host-layer entry and, through the virtual documents it
-  closes, every region's entry; a single virtual document's close (its
-  region leaving, by the existing virtual-document lifecycle's own
+  closes, every virtual document's entry; a single virtual document's
+  close (its region — for a combined document, its last combined
+  capture — leaving, by the existing virtual-document lifecycle's own
   rules — whatever authority or debouncing governs those closes governs
   this eviction) evicts that document's entry and binding and retires
   its pending flight through the same cleanup path, so a flight whose

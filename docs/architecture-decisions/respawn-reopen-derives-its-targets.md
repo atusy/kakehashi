@@ -56,7 +56,7 @@ and opens the ones that do.
 No captured re-open *target list* is remembered, so no such list can go
 stale. (Per-document route bindings — bridge-routing-protocol — *are*
 remembered for each binding's lifetime — the decided document's close;
-a region's removal closes its virtual document — and are consulted by the
+a virtual document closes when its last region leaves — and are consulted by the
 belongs-here question below; their staleness is that decision's recorded
 trade-off, not a captured-list resurrection.)
 
@@ -246,8 +246,8 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
   binding record — a terminally deleted entry falls through to marker
   resolution even while sibling entries stay bound: a bound entry
   (bridge-routing-protocol) keeps its key for the binding's lifetime —
-  the decided document's close (a region's removal closes its virtual
-  document) — and is not re-rooted by live marker changes while it
+  the decided document's close (a virtual document closes when its
+  last region leaves) — and is not re-rooted by live marker changes while it
   lives.
 - The re-open considers every open document rather than a pre-narrowed set. The
   configuration question is answered first and from a memo, so the cost is a
