@@ -231,8 +231,16 @@ impl FrameParseState {
     /// an unterminated line falls back to the bytes already in `line`.
     fn oversized(&self, reason: String, rejected: &[u8]) -> io::Error {
         let quote = if !rejected.is_empty() {
-            let head = &rejected[..rejected.len().min(STRAY_LINE_MAX_QUOTE_BYTES)];
-            render_capped_line(head, rejected.len() > STRAY_LINE_MAX_QUOTE_BYTES)
+            let total = self.line.len().saturating_add(rejected.len());
+            let mut evidence = Vec::with_capacity(total.min(STRAY_LINE_MAX_QUOTE_BYTES));
+            let line_take = self.line.len().min(STRAY_LINE_MAX_QUOTE_BYTES);
+            evidence.extend_from_slice(&self.line[..line_take]);
+            if evidence.len() < STRAY_LINE_MAX_QUOTE_BYTES {
+                let rejected_take =
+                    (STRAY_LINE_MAX_QUOTE_BYTES - evidence.len()).min(rejected.len());
+                evidence.extend_from_slice(&rejected[..rejected_take]);
+            }
+            render_capped_line(&evidence, total > STRAY_LINE_MAX_QUOTE_BYTES)
         } else {
             self.stray_line.clone().unwrap_or_else(|| {
                 let head = &self.line[..self.line.len().min(STRAY_LINE_MAX_QUOTE_BYTES)];
@@ -1674,6 +1682,39 @@ mod tests {
         assert!(
             rendered.contains('O'),
             "the line-ceiling error must quote the rejected line: {rendered}"
+        );
+        assert!(
+            !rendered.contains("earlier-marker"),
+            "the earlier stray header must not hide the rejected line: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_split_line_quotes_its_accumulated_prefix() {
+        let mut frame = FrameParseState::default();
+        frame
+            .absorb(b"Content-Type: earlier-marker\r\n")
+            .1
+            .expect("the preceding header is individually valid");
+
+        let marker = b"split-oversized-marker";
+        let first_len = MAX_HEADER_LINE_BYTES / 2;
+        let mut first = marker.to_vec();
+        first.extend(std::iter::repeat_n(b'x', first_len - first.len()));
+        frame
+            .absorb(&first)
+            .1
+            .expect("the first fragment is under the ceiling");
+
+        let second = vec![b'x'; MAX_HEADER_LINE_BYTES - first.len() + 1];
+        let error = frame
+            .absorb(&second)
+            .1
+            .expect_err("the second fragment must cross the line ceiling");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("split-oversized-marker"),
+            "the error must retain the accumulated line prefix: {rendered}"
         );
         assert!(
             !rendered.contains("earlier-marker"),
