@@ -187,20 +187,18 @@ The system uses two distinct timeout mechanisms with different purposes:
 > The invariants below are normative; the mechanisms that satisfy them are
 > deliberately unspecified.
 
-Every one of these has a failure mode that presents as the *peer's* fault,
-which is what makes them worth recording.
-
-- **The frame reader must be cancel-safe.** Its partial-frame progress lives
-  with the reader, not in the read future's locals, and it awaits only
-  cancel-safe primitives. A parser built on read-a-line/read-exact loses a
-  consumed header every time another branch wins, resyncs onto the message
-  body, and reports a framing error against a well-framed stream — killing a
-  healthy connection and blaming the server.
+- **A read dropped mid-frame must lose no frame progress.** Multiplexing
+  means any other branch completing drops the read, and a parser that keeps
+  its progress in that dropped future loses a consumed header every time —
+  then resyncs onto the message body and reports a framing error against a
+  well-framed stream, killing a healthy connection and blaming the server.
 - **An oversized body is never drained.** Draining an attacker-sized body
   hangs the reader, which is the same denial the size ceiling exists to
-  prevent.
-- **Size ceilings are enforced as bytes accumulate**, never checked after an
-  unbounded buffer has already grown to hold the thing being rejected.
+  prevent. (This and the bullet below are **target state** — today's
+  `BridgeReader` enforces no ceilings at all; see § Framing size ceilings.)
+- **Size ceilings are enforced as bytes accumulate.** A ceiling checked only
+  after the fact has already let a hostile or broken peer make the
+  allocation it exists to prevent.
 - **Registration of a pending request is atomic with respect to cleanup.** A
   request either registers before cleanup's sweep — and is failed by it — or
   is refused. One that lands after the sweep waits forever, and nothing later
@@ -215,9 +213,6 @@ which is what makes them worth recording.
   pass-through carries no bridge-imposed timeout by contract, so counting one
   toward liveness lets a slow — but legitimate — request kill a healthy
   connection.
-- **Liveness resets on decoded messages, not on raw stdout activity.** A
-  downstream dribbling out a partial frame must not be able to keep itself
-  alive; that stall is precisely what the timer is the backstop for.
 
 ## Consequences
 

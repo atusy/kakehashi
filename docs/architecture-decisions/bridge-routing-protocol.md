@@ -530,7 +530,7 @@ candidates at all likewise queries nothing.
   launch **concurrently** onto the pool — concurrency removes serial
   dependency between entries; capacity can still gate them, per the
   caveat below. Admission is an online **priority queue**, not
-  arrival-order FIFO: among jobs simultaneously awaiting a permit, the
+  arrival-order FIFO: among jobs simultaneously awaiting capacity, the
   canonical key (the answering provider's priority-walk position, then
   server name, then provider name as the total tie-breaker within a
   `"*"` group) decides who is admitted next — a later-arriving
@@ -556,7 +556,7 @@ candidates at all likewise queries nothing.
   entry-by-entry — and the non-starvation
   claim is scoped honestly: concurrency removes *serial* dependency
   between entries, while pool *capacity* can still gate them (a hung
-  validation retains its permit), in which case entries denied
+  validation still holds its capacity), in which case entries denied
   capacity within budget drop per the capacity rule. Within
   normalization, whole-answer discard is reserved for an answer that
   never arrived, never deserialized, or failed the structural bounds
@@ -1005,8 +1005,8 @@ decision's settlement — a hung losing provider can never pin an entry
 indefinitely, and a late answer always finds its entry gone. The same
 terminal outcomes also **remove the decision's queued validation jobs**
 and discard their waiters and eventual results; only an
-uninterruptible filesystem call already running stays detached, with
-its permit, until it returns. The
+uninterruptible filesystem call already running stays detached, still holding
+its capacity, until it returns. The
 driver and the per-server open tasks are additionally covered by a
 **pool-owned completion guard** of the same class the control protocol
 requires for its detached operations, with the two roles split. An
@@ -1190,9 +1190,8 @@ channel is unaffected (document-independent traffic, above).
 > deliberately unspecified.
 
 Routing lets an outside party influence where a document is analyzed, under
-a deadline, against state that keeps moving underneath. Almost every trap
-here is a variant of one question: *is the thing I validated still the
-thing I am about to act on?*
+a deadline, against state that keeps moving underneath. Almost every trap here is a variant of one question: *is the thing I
+validated still the thing I am about to act on?*
 
 **Identity across a re-open**
 
@@ -1200,13 +1199,15 @@ thing I am about to act on?*
   thing.** Identity comparisons in this protocol therefore cannot rest on
   value equality — an old claimant, waiter, or resolve envelope must be
   unable to act on a successor that merely looks the same.
-- **Every commit is conditional on the exact pending decision it settles.**
-  A task outlived by a close, a re-open, or an eviction writes nothing, and
-  a waiter released by a superseded outcome revalidates before acting.
-- **A stale resolve must fail soft, not resolve through a successor.** A
-  `…/resolve` envelope carries the decided document's identity *and* its
-  open incarnation, because after a close/re-open the same URI holds a new
-  binding and an unstamped item would silently route through it.
+- **A task outlived by a close, a re-open, or an eviction must write
+  nothing**, and a waiter released by a superseded outcome must revalidate
+  before acting. Neither can tell from the value alone that the world moved
+  under it.
+- **A stale resolve must fail soft, not resolve through a successor.** After
+  a close/re-open the same URI holds a *new* binding, so an item carrying no
+  more than its URI would silently resolve through it — reaching a process
+  that never produced the item. (What the envelope carries to prevent that is
+  contract; see § The Query Point.)
 
 **Validate and act, atomically**
 
@@ -1218,10 +1219,10 @@ thing I am about to act on?*
 - **Enqueue registration and a document's close are mutually exclusive**,
   or a task that validated just before a cleanup can register a ghost open
   against a closed document.
-- **A `didOpen` payload is read at the enqueue commit, never captured
-  before the routing wait.** A deadline may delay an open; it must never
-  cause a downstream to analyze text an intervening `didChange` has already
-  replaced.
+- **A delayed open must not carry stale text.** The routing wait can hold an
+  open for as long as its deadline allows, and a payload captured before that
+  wait leaves the downstream analyzing text an intervening `didChange` has
+  already replaced.
 
 **Nobody waits forever, and nobody waits on themselves**
 
@@ -1241,9 +1242,9 @@ thing I am about to act on?*
   start in its place.** The call outlives the waiter, so treating the
   waiter's departure as free capacity simply adds a second uncancellable
   call, and the bound stops bounding anything. Enforcing this has an
-  accepted cost — hung calls can exhaust the pool for unrelated providers —
-  which is contract, with its per-caller effects spelled out above rather
-  than a blanket fail-open.
+  accepted cost: hung calls can exhaust the pool for unrelated providers. The
+  per-caller effects of that exhaustion are specified above, and are
+  deliberately not a blanket fail-open.
 - **Bounded bookkeeping defaults to the safe answer when it runs out.** A
   flight whose epoch-cause provenance is no longer retained discards; it
   never re-anchors on an assumption.
@@ -1542,7 +1543,7 @@ a slot a routing provider left in play.
   servers: handshake completion, replacement insertion, stop, failure,
   and `-32601` advertisement clearing. Each is already a pool-lock commit
   point; the flush is O(1) under the lock — the map is *taken* (swapped
-  for an empty one) with the epoch bump and cause-ring append, and the
+  for an empty one) with the epoch bump and the epoch-cause provenance append, and the
   taken map is dropped outside the critical section, so provider churn
   never stalls pool operations on entry-drop cost.
 - The frame reader currently allocates the declared `Content-Length`

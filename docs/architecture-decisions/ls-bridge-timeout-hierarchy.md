@@ -152,7 +152,8 @@ Global Shutdown overrides all (highest priority)
   returns, its result discarded
 
 **Writer-Idle Timeout** (within the applicable shutdown deadline):
-- **Duration**: 2s fixed
+- **Duration**: 2s fixed (**target state** — no per-connection bound exists
+  today; see ls-bridge-graceful-shutdown § Decision–Implementation Gap)
 - **Purpose**: Wait for writer loop to finish current operation before taking exclusive stdin access
 - **Scope**: Counts against the applicable shutdown budget — per-slot `stop` or global teardown — not additional time
 - **See**: ls-bridge-graceful-shutdown § Writer Loop Shutdown Synchronization
