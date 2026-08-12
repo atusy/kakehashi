@@ -85,13 +85,17 @@ type RoutingParams = {
   // The document being routed, as the downstream sees it: the real URI
   // for the host-layer decision, the region's VIRTUAL URI for an
   // injection decision — paired with that document's languageId.
-  textDocument: { uri: string; languageId: string };
-  // Present exactly for injection decisions: the real URI of the host
-  // document the region lives in — the identity a provider's
-  // project/path-based routing reasons about, since the virtual URI is
-  // opaque and the editor-facing correlation methods are not
-  // registered on downstream connections.
-  hostUri?: string;
+  // `host` is present exactly for injection decisions: the real URI
+  // and languageId of the host document the region lives in — the
+  // identity a provider's project/path-based routing reasons about
+  // (the virtual URI is opaque, and the editor-facing correlation
+  // methods are not registered on downstream connections). Absent
+  // host = this document IS the host.
+  textDocument: {
+    uri: string;
+    languageId: string;
+    host?: { uri: string; languageId: string };
+  };
   // Which decision this is. The host-layer and injection-layer decisions
   // are distinct even when languageId coincides (lua-in-lua,
   // markdown-in-markdown): they read different aggregation entries, sit
@@ -135,11 +139,13 @@ type RoutingResult = null | {
   A virtual URI is **contractually opaque** to providers, exactly as that
   protocol's client ids are to editors: treat it as an identity token,
   never parse its rendering, which may change between kakehashi versions.
-  `hostUri` is what makes an injection decision *decidable*: the
+  The nested `host` is what makes an injection decision *decidable*: the
   editor-facing control methods are not registered on downstream
   connections (per-side dispatch, below), so a provider has no other way
-  to associate an opaque region with its host, and project/path-based
-  routing reasons from the host's real URI.
+  to associate an opaque region with its host — project/path-based
+  routing reasons from the host's real URI, and the host's `languageId`
+  lets a provider distinguish, say, a fish region inside markdown from
+  one inside a lua string.
 - `languageServers` is a **projection**, not the configuration. Only
   `languages`, `workspaceMarkers`, and `preferSharedInstance` are sent —
   the fields a routing decision can use (`preferSharedInstance` is what
@@ -1248,10 +1254,10 @@ motivated it are answered differently: per-region volume is
 user-controllable (disable the noisy bridge entry, or set the language's
 routing `priorities = []`), and virtual-URI identity churn rides the
 existing virtual-document lifecycle rather than needing its own
-machinery. The opacity cost is answered by the request itself: `hostUri`
-rides every injection decision (per-side dispatch makes the
-editor-facing correlation methods unreachable from downstream, so the
-host identity has to be in the params).
+machinery. The opacity cost is answered by the request itself: the
+nested `textDocument.host` rides every injection decision (per-side
+dispatch makes the editor-facing correlation methods unreachable from
+downstream, so the host identity has to be in the params).
 
 ### Open the document on every `workspaceFolders` element's connection
 
@@ -1483,7 +1489,7 @@ a slot a routing provider left in play.
 |---|---|
 | **Method** | `kakehashi/bridge/routing`, kakehashi→downstream request; dispatch strictly per side |
 | **Decision unit** | one query per bridged document (host, and each virtual document); `textDocument = { uri: as the downstream sees it, languageId }` + `layer`; per-region volume user-controllable via bridge `enabled = false` / routing `priorities = []` |
-| **Params** | `textDocument` + `layer` + `hostUri` (injection decisions) + `languageServers` projection `{languages, workspaceMarkers, preferSharedInstance}` of spawnable, language-matching servers (`_` excluded) |
+| **Params** | `textDocument` (with nested `host?` on injection decisions) + `layer` + `languageServers` projection `{languages, workspaceMarkers, preferSharedInstance}` of spawnable, language-matching servers (`_` excluded) |
 | **Answer** | `null`/missing entry/absent `enabled` = kakehashi decides; `enabled: false` = per-document `didOpen` suppression at the routing gate; non-empty `workspaceFolders` = root override; `[]` = rootless route to the server's `#shared` connection |
 | **Precedence** | membership: stopped set > configuration > answer (subtract only); root: answer overrides marker resolution, both resolved keys checked against the stopped set |
 | **Trust** | providers are trusted-by-configuration; folder overrides bounded to canonicalized `file:` URIs at-or-below client workspace folders or the config-resolved root, count-capped |
