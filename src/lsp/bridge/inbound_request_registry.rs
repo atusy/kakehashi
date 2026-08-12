@@ -41,13 +41,28 @@ use crate::error::LockResultExt;
 struct Entry {
     generation: u64,
     token: CancellationToken,
-    kind: EntryKind,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum EntryKind {
-    Editor,
-    Peer,
+/// Per-generation capacity held until target router state and cleanup work are
+/// both gone. It is deliberately independent of the outer request-id registry:
+/// cancellation settles the outer request before a written target request can
+/// be safely retired.
+pub(crate) struct PeerRequestPermit {
+    counts: Arc<Mutex<HashMap<ProgressConnectionId, usize>>>,
+    connection_id: ProgressConnectionId,
+}
+
+impl Drop for PeerRequestPermit {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().recover_poison("PeerRequestPermit::drop");
+        let Some(count) = counts.get_mut(&self.connection_id) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&self.connection_id);
+        }
+    }
 }
 
 pub(crate) const MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION: usize = 64;
@@ -60,6 +75,7 @@ pub(crate) const MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION: usize = 64;
 pub(crate) struct InboundRequestRegistry {
     inner: Arc<Mutex<HashMap<ProgressConnectionId, HashMap<jsonrpc::Id, Entry>>>>,
     next_generation: Arc<AtomicU64>,
+    peer_request_counts: Arc<Mutex<HashMap<ProgressConnectionId, usize>>>,
 }
 
 impl InboundRequestRegistry {
@@ -72,8 +88,7 @@ impl InboundRequestRegistry {
         connection_id: ProgressConnectionId,
         request_id: jsonrpc::Id,
     ) -> (CancellationToken, u64) {
-        self.register_kind(connection_id, request_id, EntryKind::Editor)
-            .expect("editor forwarding is not subject to the peer request limit")
+        self.register_inner(connection_id, request_id)
     }
 
     /// Register peer forwarding while bounding the tasks and router state a
@@ -82,44 +97,51 @@ impl InboundRequestRegistry {
         &self,
         connection_id: ProgressConnectionId,
         request_id: jsonrpc::Id,
-    ) -> Option<(CancellationToken, u64)> {
-        self.register_kind(connection_id, request_id, EntryKind::Peer)
+    ) -> Option<(CancellationToken, u64, PeerRequestPermit)> {
+        let permit = self.try_acquire_peer_permit(connection_id)?;
+        let (token, generation) = self.register_inner(connection_id, request_id);
+        Some((token, generation, permit))
     }
 
-    fn register_kind(
+    fn try_acquire_peer_permit(
+        &self,
+        connection_id: ProgressConnectionId,
+    ) -> Option<PeerRequestPermit> {
+        let mut counts = self
+            .peer_request_counts
+            .lock()
+            .recover_poison("InboundRequestRegistry::try_acquire_peer_permit");
+        let count = counts.entry(connection_id).or_default();
+        if *count >= MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION {
+            return None;
+        }
+        *count += 1;
+        Some(PeerRequestPermit {
+            counts: self.peer_request_counts.clone(),
+            connection_id,
+        })
+    }
+
+    fn register_inner(
         &self,
         connection_id: ProgressConnectionId,
         request_id: jsonrpc::Id,
-        kind: EntryKind,
-    ) -> Option<(CancellationToken, u64)> {
+    ) -> (CancellationToken, u64) {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let token = CancellationToken::new();
-        let mut inner = self
+        let replaced = self
             .inner
             .lock()
-            .recover_poison("InboundRequestRegistry::register_kind");
-        let requests = inner.entry(connection_id).or_default();
-        let replaces_peer = requests
-            .get(&request_id)
-            .is_some_and(|entry| entry.kind == EntryKind::Peer);
-        if kind == EntryKind::Peer
-            && !replaces_peer
-            && requests
-                .values()
-                .filter(|entry| entry.kind == EntryKind::Peer)
-                .count()
-                >= MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION
-        {
-            return None;
-        }
-        let replaced = requests.insert(
-            request_id,
-            Entry {
-                generation,
-                token: token.clone(),
-                kind,
-            },
-        );
+            .recover_poison("InboundRequestRegistry::register_inner")
+            .entry(connection_id)
+            .or_default()
+            .insert(
+                request_id,
+                Entry {
+                    generation,
+                    token: token.clone(),
+                },
+            );
         // A well-behaved downstream never reuses a request id while one is in
         // flight, but if it does, cancel the orphaned forwarding operation so
         // it does not dangle unreachable (including any editor dialog). The orphan's
@@ -127,7 +149,7 @@ impl InboundRequestRegistry {
         if let Some(old) = replaced {
             old.token.cancel();
         }
-        Some((token, generation))
+        (token, generation)
     }
 
     /// Cancel a specific in-flight request (a downstream `$/cancelRequest`). The
@@ -304,8 +326,35 @@ mod tests {
         assert!(
             registry
                 .try_register_peer(conn(1), jsonrpc::Id::Number(1000))
+                .is_none(),
+            "outer settlement alone does not release target-side capacity"
+        );
+        registrations.remove(0);
+        assert!(
+            registry
+                .try_register_peer(conn(1), jsonrpc::Id::Number(1000))
                 .is_some(),
             "settlement releases capacity"
         );
+    }
+
+    #[test]
+    fn reused_outer_id_counts_each_live_peer_generation() {
+        let registry = InboundRequestRegistry::default();
+        let mut registrations = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION {
+            registrations.push(
+                registry
+                    .try_register_peer(conn(1), jsonrpc::Id::Number(7))
+                    .expect("each generation owns independent capacity"),
+            );
+        }
+        assert!(
+            registry
+                .try_register_peer(conn(1), jsonrpc::Id::Number(7))
+                .is_none(),
+            "reusing one outer id cannot bypass the generation limit"
+        );
+        drop(registrations);
     }
 }

@@ -122,7 +122,8 @@ pub(in crate::lsp::bridge) fn handle(
 
     let connection_id = deps.progress_connection_id;
     let registry = deps.inbound_request_registry.clone();
-    let Some((cancel, generation)) = registry.try_register_peer(connection_id, id.clone()) else {
+    let Some((cancel, generation, permit)) = registry.try_register_peer(connection_id, id.clone())
+    else {
         tokio::spawn(async move {
             let response = jsonrpc::Response::from_error(
                 id,
@@ -171,6 +172,7 @@ pub(in crate::lsp::bridge) fn handle(
 
     let deadline = tokio::time::Instant::now() + super::super::pool::REQUEST_TIMEOUT;
     tokio::spawn(async move {
+        let mut permit = Some(permit);
         let body = tokio::select! {
             response = peer.wait_for_response_until(downstream_id, response_rx, deadline) => {
                 router_guard.disarm();
@@ -203,11 +205,13 @@ pub(in crate::lsp::bridge) fn handle(
                     }
                     let router = peer.router().clone();
                     let peer = peer.clone();
+                    let permit = permit.take();
                     tokio::spawn(async move {
                         tokio::time::sleep_until(deadline).await;
                         if router.expire_peer_cancel(downstream_id) {
                             peer.fail_if_ready();
                         }
+                        drop(permit);
                     });
                 }
                 Err(jsonrpc::Error::request_cancelled())

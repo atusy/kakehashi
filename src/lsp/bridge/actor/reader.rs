@@ -2142,14 +2142,17 @@ mod tests {
         .await;
         let peer_id = peer.key().peer_id();
         deps.peer_directory.register(&peer);
+        let mut permits = Vec::new();
         for n in 0..crate::lsp::bridge::inbound_request_registry::MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION
         {
-            deps.inbound_request_registry
-                .try_register_peer(
+            permits.push(
+                deps.inbound_request_registry
+                    .try_register_peer(
                     deps.progress_connection_id,
                     jsonrpc::Id::Number(n as i64),
                 )
-                .expect("fill the per-origin allowance");
+                    .expect("fill the per-origin allowance"),
+            );
         }
 
         handle_message(
