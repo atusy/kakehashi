@@ -164,15 +164,16 @@ Client (editor)          kakehashi           Downstream Server
 
 ### Routing (Phase 1)
 
-In Phase 1, routing resolves `languageId` → `server_name` via configuration, then looks up the connection by `server_name`:
-
-The connection is keyed by **server name**, not by language. That is the key
+In Phase 1, routing resolves `languageId` → `server_name` via
+configuration, then looks up the connection by `server_name`. The connection
+is therefore keyed by **server name**, not by language — that is the key
 difference from pure language-based routing: several languages sharing one
 `server_name` share one process — `typescript` and `typescriptreact` both
 resolve to `tsgo` and get the same connection.
 
 (The full `ConnectionKey` is richer than a bare name — per-root pooling and
-the shared-instance opt-in are above, under § Phase 1. The name is the part
+the shared-instance opt-in are above, under § Phase 1: Connection-Key
+Routing. The name is the part
 this comparison turns on.)
 
 **Phase 3 Extension**: Multi-LS routing strategies — see Future Extensions.
@@ -337,16 +338,12 @@ are owned by cross-layer-aggregation and aggregation-priorities-wildcard —
 that is where the shipped names and semantics live. This section adds only
 the *stability* rules a multi-server fan-out needs on top of them.
 
-(An earlier revision sketched a `FirstWins`/`MergeAll`/`Ranked` enum here.
-It never matched what shipped, and a strategy catalog in two places is a
-catalog that disagrees with itself.)
-
 **Aggregation Stability Rules:**
 - **Per-request timeout conditions**: the timeout applies **only when n ≥ 2
-  downstream servers participate**, whatever strategy selected them. A
-  single participant needs no aggregation bound — nothing is being waited
-  *together* — and the liveness timeout already protects it (default: 5s
-  explicit, 2s incremental)
+  downstream servers participate** (default: 5s explicit, 2s incremental),
+  whatever strategy selected them. A single participant needs no aggregation
+  bound — nothing is being waited *together* — and the liveness timeout
+  already protects it
 - **Per-request timeout behavior**: On timeout, return whatever results available **without sending $/cancelRequest**
   - Downstream servers continue processing and send responses
   - Late responses **discarded** by router but **reset liveness timeout** (heartbeat for connection health)
@@ -364,34 +361,31 @@ catalog that disagrees with itself.)
 
 ### Phase 3: Configuration Example
 
-```yaml
-# Phase 3: Multiple servers per language with aggregation
-languages:
-  markdown:
-    bridges:
-      python:
-        # Multiple servers for Python
-        priority: ["ruff", "pyright"]  # Prioritize ruff when capability overlaps
+```toml
+# Phase 3: several servers for one injected language, with per-method
+# aggregation. `priorities` is an ordered allowlist; a server absent from
+# the list does not run (aggregation-priorities-wildcard).
+[languages.markdown.bridge.python.aggregation._]
+priorities = ["ruff", "pyright"]   # ruff first where capabilities overlap
 
-        # Per-method aggregation config:
-        aggregations:
-          textDocument/completion:
-            strategy: concatenated   # Safe: candidates, user selects one
-            dedup_key: label
-          textDocument/codeAction:
-            strategy: concatenated   # Safe: proposals, user executes one
-          # hover, definition: use default (single_by_capability)
-          # rename: MUST use single_by_capability (overlapping WorkspaceEdits)
-          # formatting: see concatenated-formatting-pipeline (planned sequential
-          #   pipeline; user-issued textDocument/rangeFormatting requests unaffected)
+[languages.markdown.bridge.python.aggregation."textDocument/completion"]
+strategy = "concatenated"          # safe: candidates, the user selects one
 
-languageServers:
-  pyright:
-    cmd: [pyright-langserver, --stdio]
-    languages: [python]
-  ruff:
-    cmd: [ruff, server]
-    languages: [python]  # Same language as pyright
+[languages.markdown.bridge.python.aggregation."textDocument/codeAction"]
+strategy = "concatenated"          # safe: proposals, the user executes one
+
+# hover, definition, rename: left to the default `preferred` dispatch — one
+#   server answers, so overlapping WorkspaceEdits cannot arise.
+# formatting: see concatenated-formatting-pipeline (planned sequential
+#   pipeline; user-issued textDocument/rangeFormatting requests unaffected)
+
+[languageServers.pyright]
+cmd = ["pyright-langserver", "--stdio"]
+languages = ["python"]
+
+[languageServers.ruff]
+cmd = ["ruff", "server"]
+languages = ["python"]             # same language as pyright — this is the fan-out
 ```
 
 ## Consequences
@@ -579,4 +573,4 @@ languageServers:
 - **2026-01-24**: Changed from language-based to server-name-based pool keying to enable process sharing for related languages (e.g., ts/tsx sharing tsgo). Connection pool is now keyed by `server_name` instead of `languageId`, with configuration resolving `language` → `server_name`.
 - **2026-01-07**: Merged Amendment 002 - Simplified ID namespace by using upstream request IDs directly (no transformation), replaced `pending_correlations` with `pending_responses`
 - **2026-01-06**: Merged Amendment 001 - Updated partial results to use LSP-native fields (isIncomplete), clarified $/cancelRequest semantics, added response guarantees for cancelled requests
-- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - retired two drifted sketches that read as guarantees: the `FirstWins`/`MergeAll`/`Ranked` strategy enum (the shipped strategies are `Preferred`/`Concatenated`, owned by cross-layer-aggregation and aggregation-priorities-wildcard) and the Phase 1 `route_request` snippet; the Phase 3 stability rules now turn on participant count rather than the never-shipped `SingleByCapability`/`FanOut` names
+- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - retired two drifted sketches that read as guarantees: the `FirstWins`/`MergeAll`/`Ranked` strategy enum (the shipped strategies are `Preferred`/`Concatenated`, owned by cross-layer-aggregation and aggregation-priorities-wildcard) and the Phase 1 `route_request` snippet; the Phase 3 stability rules now turn on participant count rather than the never-shipped `SingleByCapability`/`FanOut` names; the Phase 3 configuration example was rewritten against the shipped TOML schema (`bridge.<lang>.aggregation`, `priorities`, `strategy`), having drifted to a YAML shape with `priority`/`dedup_key`/`single_by_capability` that never existed
