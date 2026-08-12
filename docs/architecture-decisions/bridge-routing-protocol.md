@@ -379,8 +379,10 @@ A downstream server advertises support in its initialize **result**:
 the downstream-facing side, the convention bridge-client-control-protocol
 set on the client-facing side, and like `serverInfo` there, the flag is
 parsed from the initialize result and retained per connection handle.
-Kakehashi in turn declares `experimental.kakehashi.bridgeRouting: true` in
-the **client capabilities** it sends at `initialize`, unconditionally — a
+Kakehashi in turn declares
+`capabilities.experimental.kakehashi.bridgeRouting: true` in the **client
+capabilities** it sends at `initialize` (the same relative path, under
+`InitializeParams.capabilities`), unconditionally — a
 configuration reload can enable routing mid-session without reinitializing
 existing connections, so the declaration must not encode current config —
 letting a provider skip building routing state only under clients that
