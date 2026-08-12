@@ -69,6 +69,12 @@ require_uint E2E_RETRY_TIMEOUT "$RETRY_TIMEOUT"
 
 # Honor the Makefile's `CARGO` override (toolchain selector / cargo wrapper),
 # the way the other targets do — `make test_e2e` passes it through.
+#
+# Expanded UNQUOTED at every call site below, because the Makefile's other
+# targets are `$(CARGO) test ...` and a command-style override is the normal
+# way to use it: `make CARGO='cargo +stable' test` works, so
+# `make CARGO='cargo +stable' test_e2e` must too. Quoting would look for one
+# executable literally named "cargo +stable" and fail before running anything.
 CARGO="${CARGO:-cargo}"
 
 # A `timeout` command (GNU coreutils, or gtimeout via Homebrew) caps the run so
@@ -90,20 +96,28 @@ case "$TARGET_DIR" in /*) ;; *) TARGET_DIR="$(pwd)/$TARGET_DIR" ;; esac
 # Escape every ERE metacharacter so `pkill -f` matches the path literally.
 TARGET_RE="$(printf '%s' "$TARGET_DIR" | sed 's/[][(){}.^$*+?|\\]/\\&/g')"
 LOG=""
-cleanup() {
+# The harness kill is pattern-based, so it cannot distinguish THIS run's test
+# binaries from a concurrent run's. Reserve it for the paths where cargo did not
+# get to reap its own children -- Ctrl-C, SIGTERM, and the timeout -- so that a
+# second `make test_e2e` (or the pre-commit hook running alongside a manual run)
+# is not shot down by the first one to finish normally. On a normal exit there
+# is nothing to sweep: cargo has already waited on the test binaries.
+kill_orphans() {
   pkill -TERM -f "$TARGET_RE/.*/deps/(e2e|integration)-" 2>/dev/null
   if pgrep -f "$TARGET_RE/.*/deps/(e2e|integration)-" >/dev/null 2>&1; then
     sleep 1
     pkill -KILL -f "$TARGET_RE/.*/deps/(e2e|integration)-" 2>/dev/null
   fi
+}
+cleanup_log() {
   [ -n "$LOG" ] && rm -f "$LOG"
 }
-trap 'cleanup' EXIT
-trap 'trap - EXIT; cleanup; exit 130' INT
-trap 'trap - EXIT; cleanup; exit 143' TERM
+trap 'cleanup_log' EXIT
+trap 'trap - EXIT; kill_orphans; cleanup_log; exit 130' INT
+trap 'trap - EXIT; kill_orphans; cleanup_log; exit 143' TERM
 
 echo "==> Building test binaries ($CARGO test --no-run)"
-"$CARGO" test --features e2e --no-run || exit 1
+$CARGO test --features e2e --no-run || exit 1
 
 # Fresh checkout: the shared parser/query install (deps/test/kakehashi) does not
 # exist yet; the tests populate it lazily on first server spawn. The install
@@ -121,7 +135,7 @@ echo "==> Building test binaries ($CARGO test --no-run)"
 INSTALL_MARKER="deps/test/kakehashi/.installed"
 if [ ! -f "$INSTALL_MARKER" ]; then
   echo "==> First run: seeding shared parser/query install (one module, serial)…"
-  "$CARGO" test --features e2e --test e2e -- --test-threads=1 e2e_lsp_protocol:: >/dev/null 2>&1 || true
+  $CARGO test --features e2e --test e2e -- --test-threads=1 e2e_lsp_protocol:: >/dev/null 2>&1 || true
   [ -f "$INSTALL_MARKER" ] || echo "    warning: install marker still absent; the parallel run may briefly race to populate it"
 fi
 
@@ -134,16 +148,18 @@ LOG="$(mktemp)"
 [ -n "$LOG" ] || { echo "error: mktemp failed; refusing to run without a log"; exit 1; }
 SECONDS=0
 if [ -n "$RUN_CAP" ]; then
-  "$TIMEOUT_BIN" "$RUN_TIMEOUT" "$CARGO" test --features e2e --no-fail-fast \
+  "$TIMEOUT_BIN" "$RUN_TIMEOUT" $CARGO test --features e2e --no-fail-fast \
     --test integration --test e2e -- --test-threads="$THREADS" 2>&1 | tee "$LOG"
 else
-  "$CARGO" test --features e2e --no-fail-fast \
+  $CARGO test --features e2e --no-fail-fast \
     --test integration --test e2e -- --test-threads="$THREADS" 2>&1 | tee "$LOG"
 fi
 ec=${PIPESTATUS[0]}
 WALL=$SECONDS
 
 if [ "$ec" -eq 124 ]; then
+  # timeout killed cargo mid-run, so its test binaries are orphaned here.
+  kill_orphans
   echo "error: run exceeded the ${RUN_TIMEOUT}s timeout (E2E_TIMEOUT to raise)"
   exit 124
 fi
@@ -228,10 +244,10 @@ fi
 # the whole-run cap has already been spent by the time we get here.
 run_retry() {
   if [ -n "$TIMEOUT_BIN" ] && [ "$RETRY_TIMEOUT" -gt 0 ]; then
-    "$TIMEOUT_BIN" "$RETRY_TIMEOUT" "$CARGO" test --features e2e --no-fail-fast \
+    "$TIMEOUT_BIN" "$RETRY_TIMEOUT" $CARGO test --features e2e --no-fail-fast \
       --test integration --test e2e -- --exact "$1" --test-threads=1 2>&1
   else
-    "$CARGO" test --features e2e --no-fail-fast \
+    $CARGO test --features e2e --no-fail-fast \
       --test integration --test e2e -- --exact "$1" --test-threads=1 2>&1
   fi
 }
