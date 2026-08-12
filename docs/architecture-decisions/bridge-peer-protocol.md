@@ -74,8 +74,9 @@ target's downstream-facing document identities and protocol state correctly.
 `params`, when present, must be an object or array as required by JSON-RPC.
 `initialize`, `initialized`, `shutdown`, `exit`, and `$/cancelRequest` are denied
 because they would take over the target connection's lifecycle. Cancellation is
-instead expressed by cancelling the outer request; kakehashi cancels the inner
-request and answers the caller with `RequestCancelled` (`-32800`). Peer requests
+instead expressed by cancelling the outer request; kakehashi retires the inner
+request, best-effort queues `$/cancelRequest` when its write already started,
+and answers the caller with `RequestCancelled` (`-32800`). Peer requests
 inherit the ordinary managed downstream-request deadline (currently 30 seconds)
 and Tier-2 liveness accounting.
 
