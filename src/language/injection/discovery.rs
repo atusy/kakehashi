@@ -123,6 +123,56 @@ fn position_of_byte(
     (row as u32, column)
 }
 
+/// The effective (post-`#offset!`) byte span of `info`'s content node within
+/// `text`, snapped to in-bounds UTF-8 char boundaries.
+///
+/// `#offset!` narrows (or widens) the raw `@injection.content` span to the
+/// bytes the injection parser actually sees — trimming frontmatter `---`
+/// fences, string quotes, and the like. Every consumer that reasons about
+/// *where the injected content is* must agree on this span, so region lookup
+/// ([`find_injection_at_position`]) and region resolution
+/// ([`CacheableInjectionRegion::from_region_info`]) share this one helper
+/// rather than each deriving it.
+///
+/// Scope: this applies `#offset!` only. Child-exclusion gaps (blockquote `> `
+/// prefixes, excluded named children) are *not* subtracted here, because the
+/// bridge's coordinate translation models a region as one contiguous
+/// `byte_range` plus per-line column offsets — a lookup that rejected gap
+/// bytes while translation still mapped them would only trade an
+/// over-permissive class for a mistranslating one. Gap membership is tracked
+/// separately in #996 item 6, together with the translation model it needs.
+/// (`kakehashi/node`'s `injection_stack` does subtract gaps, because it parses
+/// with real `included_ranges` and has no such flat mapping.)
+///
+/// Cheap enough for the per-keystroke lookup path: the offset branch is skipped
+/// entirely when the pattern has no directive, and the boundary snaps iterate
+/// at most three bytes.
+fn effective_content_range(info: &InjectionRegionInfo<'_>, text: &str) -> Range<usize> {
+    let node = &info.content_node;
+    let (start, end) = match info.offset {
+        Some(offset) => {
+            use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
+            // calculate_effective_range clamps, snaps inward to char
+            // boundaries, and normalizes start <= end, so callers slicing with
+            // the result cannot panic.
+            let effective = calculate_effective_range(
+                text,
+                ByteRange::new(node.start_byte(), node.end_byte()),
+                offset,
+            );
+            (effective.start, effective.end)
+        }
+        None => (node.start_byte(), node.end_byte()),
+    };
+
+    // Snap to valid in-bounds char boundaries (ceil start / floor end) so the
+    // range is always safe to slice — a stale node can't leave an
+    // out-of-bounds range for downstream consumers.
+    let start = ceil_char_boundary(text, start);
+    let end = floor_char_boundary(text, end).max(start);
+    start..end
+}
+
 /// Compute clean virtual content and per-line column offsets for an injection region.
 ///
 /// This combines `compute_included_ranges`, `extract_clean_content`, and
@@ -185,31 +235,14 @@ impl CacheableInjectionRegion {
         // (e.g. trimming `---` frontmatter delimiters). The bridge consumes
         // byte_range / line_range / start_column for virtual-document content
         // extraction and coordinate translation, so all of them must reflect
-        // the effective range, mirroring the semantic path (#183).
-        let (start_byte, end_byte) = match info.offset {
-            Some(offset) => {
-                use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
-                // calculate_effective_range clamps, snaps inward to char
-                // boundaries, and normalizes start <= end, so slicing below
-                // cannot panic.
-                let effective = calculate_effective_range(
-                    text,
-                    ByteRange::new(node.start_byte(), node.end_byte()),
-                    offset,
-                );
-                (effective.start, effective.end)
-            }
-            None => (node.start_byte(), node.end_byte()),
-        };
-
-        // Snap the range to valid in-bounds char boundaries (ceil start / floor
-        // end) so the `byte_range` stored below is always safe to slice — a stale
-        // node can't leave an out-of-bounds range for downstream consumers, and
-        // the direct `content` slice here can't panic. Valid ranges are
-        // unchanged; a stale node also stops matching `node.start_byte()` below,
-        // routing through the safe `position_of_byte` path.
-        let start_byte = ceil_char_boundary(text, start_byte);
-        let end_byte = floor_char_boundary(text, end_byte).max(start_byte);
+        // the effective range, mirroring the semantic path (#183). The shared
+        // helper also boundary-snaps, so the `content` slice below can't panic
+        // on a stale node; a stale node then stops matching `node.start_byte()`
+        // and routes through the safe `position_of_byte` path.
+        let Range {
+            start: start_byte,
+            end: end_byte,
+        } = effective_content_range(info, text);
         let content = &text[start_byte..end_byte];
 
         // Convert tree-sitter byte column to UTF-16 code units for LSP compatibility.
@@ -544,9 +577,10 @@ fn extract_content_and_language<'a>(
 fn find_injection_at_position<'a>(
     injections: &'a [InjectionRegionInfo<'a>],
     byte_offset: usize,
-    doc_len: usize,
+    text: &str,
     boundary: RegionBoundary,
 ) -> Option<(usize, &'a InjectionRegionInfo<'a>)> {
+    let doc_len = text.len();
     let half_open = injections.iter().enumerate().find(|(_, inj)| {
         let start = inj.content_node.start_byte();
         let end = inj.content_node.end_byte();
@@ -652,7 +686,7 @@ impl InjectionResolver {
     ) -> Option<ResolvedInjection> {
         let injections = collect_all_injections(&tree.root_node(), text, Some(injection_query))?;
         let (_region_index, region) =
-            find_injection_at_position(&injections, byte_offset, text.len(), boundary)?;
+            find_injection_at_position(&injections, byte_offset, text, boundary)?;
         if region.combined {
             let group: Vec<_> = injections
                 .iter()
@@ -2391,12 +2425,8 @@ mod tests {
 
         // Test finding position inside first Lua block
         let lua1_byte = nodes[0].start_byte() + 1; // Inside first string
-        let result = find_injection_at_position(
-            &injections,
-            lua1_byte,
-            text.len(),
-            RegionBoundary::HalfOpen,
-        );
+        let result =
+            find_injection_at_position(&injections, lua1_byte, text, RegionBoundary::HalfOpen);
         assert!(result.is_some(), "Should find injection at lua1 position");
         let (idx, region) = result.unwrap();
         assert_eq!(idx, 0, "Should be at index 0");
@@ -2405,7 +2435,7 @@ mod tests {
         // Test finding position inside Python block
         let py_byte = nodes[1].start_byte() + 1;
         let result =
-            find_injection_at_position(&injections, py_byte, text.len(), RegionBoundary::HalfOpen);
+            find_injection_at_position(&injections, py_byte, text, RegionBoundary::HalfOpen);
         assert!(result.is_some(), "Should find injection at python position");
         let (idx, region) = result.unwrap();
         assert_eq!(idx, 1, "Should be at index 1");
@@ -2413,12 +2443,8 @@ mod tests {
 
         // Test finding position inside second Lua block
         let lua2_byte = nodes[2].start_byte() + 1;
-        let result = find_injection_at_position(
-            &injections,
-            lua2_byte,
-            text.len(),
-            RegionBoundary::HalfOpen,
-        );
+        let result =
+            find_injection_at_position(&injections, lua2_byte, text, RegionBoundary::HalfOpen);
         assert!(result.is_some(), "Should find injection at lua2 position");
         let (idx, region) = result.unwrap();
         assert_eq!(idx, 2, "Should be at index 2");
@@ -2426,12 +2452,8 @@ mod tests {
 
         // Test position outside all injections
         let outside_byte = 5; // Position before any string
-        let result = find_injection_at_position(
-            &injections,
-            outside_byte,
-            text.len(),
-            RegionBoundary::HalfOpen,
-        );
+        let result =
+            find_injection_at_position(&injections, outside_byte, text, RegionBoundary::HalfOpen);
         assert!(
             result.is_none(),
             "Should not find injection outside regions"
@@ -2631,23 +2653,15 @@ mod tests {
         ];
 
         // byte 5 == end(A) == start(B): containment in B wins, not A's end.
-        let (_, region) = find_injection_at_position(
-            &injections,
-            5,
-            text.len(),
-            RegionBoundary::CaretEndFallback,
-        )
-        .expect("B contains byte 5");
+        let (_, region) =
+            find_injection_at_position(&injections, 5, text, RegionBoundary::CaretEndFallback)
+                .expect("B contains byte 5");
         assert_eq!(region.language, "python");
 
         // byte 6 == end(B), mid-line, contained nowhere: the fallback fires.
-        let (_, region) = find_injection_at_position(
-            &injections,
-            6,
-            text.len(),
-            RegionBoundary::CaretEndFallback,
-        )
-        .expect("caret fallback at the trailing edge of B");
+        let (_, region) =
+            find_injection_at_position(&injections, 6, text, RegionBoundary::CaretEndFallback)
+                .expect("caret fallback at the trailing edge of B");
         assert_eq!(region.language, "python");
     }
 
@@ -2695,13 +2709,9 @@ mod tests {
             },
         ];
 
-        let (_, region) = find_injection_at_position(
-            &injections,
-            6,
-            text.len(),
-            RegionBoundary::CaretEndFallback,
-        )
-        .expect("shared trailing edge resolves");
+        let (_, region) =
+            find_injection_at_position(&injections, 6, text, RegionBoundary::CaretEndFallback)
+                .expect("shared trailing edge resolves");
         assert_eq!(
             region.language, "lua",
             "the outermost of the regions sharing the end byte must win"
