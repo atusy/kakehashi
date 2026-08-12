@@ -70,9 +70,10 @@ const MAX_HEADER_BLOCK_BYTES: usize = 32 * 1024;
 
 /// Largest `Content-Length` accepted from a downstream server.
 ///
-/// This one is not a memory *policy* — it is what stands between a hostile or
-/// runaway header and `Vec::with_capacity` aborting the process, which no
-/// `io::Error` can report. It is therefore set far above anything a working
+/// This refuses an absurd declaration early and cheaply, before anything
+/// tries to satisfy it; a declaration that merely turns out to be too large
+/// for the heap is the allocation's problem, and it reserves fallibly. So the
+/// value is set far above anything a working
 /// server sends rather than at a defensible working-set size: real payloads
 /// (whole-document semantic tokens, a workspace diagnostics burst, a large
 /// completion list) reach into the megabytes, so this leaves roughly two
@@ -274,10 +275,9 @@ impl FrameParseState {
             let length: usize = value.and_then(|v| v.parse().ok()).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length value")
             })?;
-            // Refuse the declaration, not the allocation: the empty line below
-            // hands this number straight to `Vec::with_capacity`, and an
-            // allocation failure aborts the process rather than surfacing as an
-            // error anyone can report. Nothing may reach that point unchecked.
+            // Refuse the declaration here rather than at the empty line below
+            // that acts on it: a number no honest peer would send should cost
+            // nothing to reject, and the frame is already unusable.
             if length > MAX_CONTENT_LENGTH_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1579,11 +1579,10 @@ mod tests {
     }
 
     /// A declared body size beyond the ceiling must be refused while it is
-    /// still just a number in a header. One line later the parser calls
-    /// `Vec::with_capacity(length)`, and an allocation failure aborts the
-    /// process instead of returning an `io::Error` there is any chance to
-    /// report — so the check has to leave `content_length` unset, not merely
-    /// fail somewhere downstream of it.
+    /// still just a number in a header, and must leave `content_length` unset
+    /// — the empty line that follows acts on that field, so a check that
+    /// failed anywhere downstream of it would already have committed the
+    /// frame to a size no peer should be able to name.
     #[test]
     fn a_content_length_beyond_the_ceiling_never_reaches_the_allocation() {
         let mut frame = FrameParseState::default();
