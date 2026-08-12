@@ -394,7 +394,7 @@ mod tests {
             peer.clone(),
             request_id,
             settled_rx,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            tokio::time::Instant::now() + crate::lsp::bridge::pool::REQUEST_TIMEOUT,
             Arc::clone(&permit),
         ));
         drop(response_rx);
