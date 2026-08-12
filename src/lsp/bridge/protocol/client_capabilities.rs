@@ -469,7 +469,10 @@ mod tests {
         assert_eq!(
             capabilities.experimental,
             Some(serde_json::json!({
-                "kakehashi": { "bridgePeer": true }
+                "kakehashi": {
+                    "bridgePeer": true,
+                    "bridgeRouting": true
+                }
             }))
         );
     }

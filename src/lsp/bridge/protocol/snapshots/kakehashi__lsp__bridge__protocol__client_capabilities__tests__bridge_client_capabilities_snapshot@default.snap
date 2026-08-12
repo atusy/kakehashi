@@ -99,7 +99,8 @@ expression: capabilities
   },
   "experimental": {
     "kakehashi": {
-      "bridgeRouting": true
+      "bridgeRouting": true,
+      "bridgePeer": true
     }
   }
 }
