@@ -629,12 +629,17 @@ fn find_injection_at_position<'a>(
             injections.iter().enumerate().find(|(_, inj)| {
                 let range = effective_content_range(inj, text);
                 // No `start < end` condition: a region an `#offset!` collapses
-                // to zero width is still routable at the byte it collapses to.
-                // That position IS the whole (empty) injection — the first
-                // keystroke inside a block the user just opened — and the
-                // resolved virtual document is empty, so the caret maps to a
-                // valid (0, 0). Half-open declines it by arithmetic alone,
-                // which is the right answer there: no character to hover.
+                // to zero width is routable at the byte it collapses to, on
+                // the same terms as any other region — that position IS the
+                // whole (empty) injection, and its virtual document is empty,
+                // so the caret maps to a valid (0, 0). Half-open declines it
+                // by arithmetic alone, which is right: no character to hover.
+                //
+                // Zero width buys no exemption from the column-0 rule below.
+                // A collapse onto a line start is the closing-fence shape (an
+                // EMPTY frontmatter collapses exactly there) and stays
+                // outside; a collapse mid-line — `html!{}` under the bundled
+                // rust `0 1 0 -1` — routes.
                 range.end == byte_offset
                     && (ends_mid_line(text, range.end) || byte_offset == doc_len)
             })
@@ -699,8 +704,10 @@ pub(crate) enum RegionBoundary {
     /// end-of-document exception (`b == L && e == L`).
     ///
     /// A region an `#offset!` collapses to zero width has no interior for
-    /// half-open to match, but the caret still routes at the byte it collapses
-    /// to: that position is the whole (empty) injection.
+    /// half-open to match, but the caret routes at the byte it collapses to —
+    /// that position is the whole (empty) injection — subject to the same
+    /// mid-line-or-EOF condition as everything else. A collapse onto a line
+    /// start is the closing-fence shape and stays outside.
     CaretEndFallback,
 }
 
@@ -2905,6 +2912,48 @@ mod tests {
                 (index, region.language.as_str()),
                 (1, "python"),
                 "the trimmed region must not shadow its neighbour under {boundary:?}"
+            );
+        }
+    }
+
+    /// A zero-width region is not a licence to ignore the column-0 rule. An
+    /// EMPTY frontmatter collapses to the start of the closing fence line, so
+    /// the one caret position it could offer sits on the fence itself — the
+    /// canonical "outside" case. It declines, exactly as a non-collapsed
+    /// region ending at column 0 does.
+    ///
+    /// This is a deliberate behavior change from `origin/main`, which routed
+    /// the byte through raw containment. It is the same change as the fence
+    /// exclusion everywhere else, not a special case for zero width.
+    #[test]
+    fn a_collapse_onto_a_line_start_is_the_closing_fence_and_stays_outside() {
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "---\n---\nrest\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &md_language,
+            r#"
+            ((minus_metadata) @injection.content
+              (#set! injection.language "yaml")
+              (#offset! @injection.content 1 0 -1 0))
+            "#,
+        )
+        .expect("valid frontmatter injection query");
+
+        let injections = collect_all_injections(&tree.root_node(), text, Some(&query))
+            .expect("empty frontmatter is still an injection");
+        assert_eq!(
+            effective_content_range(&injections[0], text),
+            4..4,
+            "fixture: an empty frontmatter collapses onto the closing fence"
+        );
+
+        for boundary in [RegionBoundary::HalfOpen, RegionBoundary::CaretEndFallback] {
+            assert!(
+                find_injection_at_position(&injections, 4, text, boundary).is_none(),
+                "a collapse at column 0 is the closing fence: outside under {boundary:?}"
             );
         }
     }
