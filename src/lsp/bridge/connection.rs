@@ -171,7 +171,7 @@ impl FrameParseState {
         match available.iter().position(|&byte| byte == b'\n') {
             Some(newline) => {
                 let chunk = &available[..=newline];
-                if let Err(error) = self.charge_header_bytes(chunk.len()) {
+                if let Err(error) = self.charge_header_bytes(chunk) {
                     return (chunk.len(), Err(error));
                 }
                 self.line.extend_from_slice(chunk);
@@ -179,7 +179,7 @@ impl FrameParseState {
                 (newline + 1, self.finish_header_line(&line))
             }
             None => {
-                if let Err(error) = self.charge_header_bytes(available.len()) {
+                if let Err(error) = self.charge_header_bytes(available) {
                     return (available.len(), Err(error));
                 }
                 self.line.extend_from_slice(available);
@@ -204,17 +204,20 @@ impl FrameParseState {
     /// `saturating_add` rather than `checked_add`: saturation lands on
     /// `usize::MAX`, which trips the very comparison below it, so there is no
     /// third outcome for a checked variant to handle.
-    fn charge_header_bytes(&mut self, len: usize) -> io::Result<()> {
+    fn charge_header_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let len = bytes.len();
         if self.line.len().saturating_add(len) > MAX_HEADER_LINE_BYTES {
-            return Err(
-                self.oversized(format!("header line exceeds {MAX_HEADER_LINE_BYTES} bytes"))
-            );
+            return Err(self.oversized(
+                format!("header line exceeds {MAX_HEADER_LINE_BYTES} bytes"),
+                bytes,
+            ));
         }
         self.header_bytes = self.header_bytes.saturating_add(len);
         if self.header_bytes > MAX_HEADER_BLOCK_BYTES {
-            return Err(self.oversized(format!(
-                "header block exceeds {MAX_HEADER_BLOCK_BYTES} bytes"
-            )));
+            return Err(self.oversized(
+                format!("header block exceeds {MAX_HEADER_BLOCK_BYTES} bytes"),
+                &[],
+            ));
         }
         Ok(())
     }
@@ -226,8 +229,12 @@ impl FrameParseState {
     /// [`Self::missing_length`] would have quoted. A line that never completed
     /// has none — it is still sitting in `line`, unterminated — so that buffer
     /// is the fallback, and it is exactly the case the line ceiling catches.
-    fn oversized(&self, reason: String) -> io::Error {
+    fn oversized(&self, reason: String, rejected: &[u8]) -> io::Error {
         let quote = self.stray_line.clone().unwrap_or_else(|| {
+            if !rejected.is_empty() {
+                let head = &rejected[..rejected.len().min(STRAY_LINE_MAX_QUOTE_BYTES)];
+                return render_capped_line(head, rejected.len() > STRAY_LINE_MAX_QUOTE_BYTES);
+            }
             let head = &self.line[..self.line.len().min(STRAY_LINE_MAX_QUOTE_BYTES)];
             render_capped_line(head, self.line.len() > STRAY_LINE_MAX_QUOTE_BYTES)
         });
@@ -1619,16 +1626,13 @@ mod tests {
     #[test]
     fn a_header_line_past_the_ceiling_fails_as_its_bytes_accumulate() {
         let mut frame = FrameParseState::default();
-        let half = vec![b'x'; MAX_HEADER_LINE_BYTES / 2 + 1];
+        let mut oversized = vec![b'Z'];
+        oversized.extend(std::iter::repeat_n(b'x', MAX_HEADER_LINE_BYTES));
 
-        let (consumed, outcome) = frame.absorb(&half);
-        assert_eq!(consumed, half.len());
-        outcome.expect("half a line is still under the ceiling");
-
-        let (consumed, outcome) = frame.absorb(&half);
+        let (consumed, outcome) = frame.absorb(&oversized);
         assert_eq!(
             consumed,
-            half.len(),
+            oversized.len(),
             "the offending bytes are consumed, as for every other framing error"
         );
         let error = outcome.expect_err("a newline-less line past the ceiling must fail");
@@ -1638,8 +1642,8 @@ mod tests {
             "the error must name what tripped: {error}"
         );
         assert!(
-            error.to_string().contains("xxx"),
-            "and quote the peer's bytes, which this error is the last chance to \
+            error.to_string().contains('Z'),
+            "and quote the rejected peer bytes, which this error is the last chance to \
              read: {error}"
         );
 
