@@ -1230,9 +1230,11 @@ validated still the thing I am about to act on?*
   Waiters exist for suppressions, retentions, and rejections alike, and
   each must be released — a pending entry that can persist is a hung
   request.
-- **Awaiting a decision never makes the awaiter the one to drive it.**
-  Otherwise the sweep's query-free guarantee breaks merely by the sweep
-  observing a pending binding.
+- **The re-open sweep must never initiate provider I/O, including by
+  awaiting a decision someone else is deciding.** Its query-free guarantee is
+  what a restart's document restoration rests on, and an arrangement where
+  observing a pending binding can promote the observer into its driver breaks
+  that guarantee without any call site looking wrong.
 - **A joiner inherits the remaining deadline, never a fresh one**, or
   single-flight dedup silently becomes a way to extend a bound.
 

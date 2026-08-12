@@ -363,10 +363,13 @@ I/O, so the O(1) wall-clock property below is unaffected.
   as confirmation will report success over a live straggler or accumulate
   zombies. A `wait` that keeps failing must keep retrying visibly and
   boundedly — never a silent promotion to closed, never a hot loop.
-- **Terminating a child is not the same as ceasing to own it.** Ownership
-  ends when the process is reaped, or when kakehashi's own imminent exit
-  reparents the child to init — never merely because a deadline passed
-  (§ Unconfirmed Termination).
+- **Terminating a child is not the same as ceasing to own it.** A deadline
+  passing does not end ownership; only a reap does, or kakehashi's own exit,
+  which ends its *ability* to own rather than proving anything about the
+  child. Abandonment on the process-exit path is therefore a bounded loss
+  accepted knowingly, not a guarantee of cleanup — the OS may or may not
+  reap the straggler, and on platforms without Unix reparenting there is no
+  backstop at all (§ Unconfirmed Termination).
 - **The stopped-check and the spawn-decision must be atomic.** Split them
   and an acquire spawns a connection beside a tombstone a concurrent `stop`
   just committed, resurrecting a server the user asked to stay down.

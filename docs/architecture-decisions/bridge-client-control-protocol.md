@@ -675,9 +675,10 @@ not a storm.
   operation answers `unknownClient` and reads as deleted. Whatever owns the
   key at any instant — handle, record, or in-flight operation — must keep
   resolving it.
-- **A routing decision that reads from a live handle needs a source that
-  survives that handle's death.** The shared slot's workspace-folder
-  capability verdict is the case in hand: without retaining it, non-seed
+- **Every input a routing decision reads from a live handle needs a source
+  that survives that handle's death** — the trap is general, and the set of
+  such inputs is whatever routing actually consults, not a closed list. The
+  recorded case is the shared slot's workspace-folder capability verdict: without retaining it, non-seed
   roots of an *incapable* shared server resolve optimistically to the
   stopped shared key and hit its fence, blacking out per-root clients that
   other roots are already using.

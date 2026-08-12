@@ -397,11 +397,17 @@ ls-bridge-timeout-hierarchy.
 
 ### Async Communication and Error Handling
 
-A bridged request never waits on a downstream server indefinitely, and
-**both failure shapes degrade rather than propagate**: a server error and an
-expired wait each log a warning and yield no result, so the host request
-answers with whatever the other layers produced. A hung server costs one
-timeout, never a stalled handler. (Which bound applies — the Tier-1
+A bridged request never waits on a downstream server indefinitely: a server
+error and an expired wait each log a warning and yield no result *from that
+server*, so a hung server costs one timeout, never a stalled handler.
+
+Whether that becomes a failed host request depends on the aggregation
+strategy, and is cross-layer-aggregation's and
+ls-bridge-server-pool-coordination's subject rather than this one's. In
+outline: a `preferred` fan-in falls through to the next candidate and only
+surfaces an error when nothing answered; a `concatenated` aggregation fails
+if a layer it required fails; and a fan-out whose downstreams all fail
+answers `REQUEST_FAILED`. Degradation is per-server, not per-request. (Which bound applies — the Tier-1
 per-request timeout, which is Phase 3 and only engages for a multi-server
 fan-out, the Tier-2 liveness timeout otherwise — is
 ls-bridge-timeout-hierarchy's subject, along with the requests deliberately

@@ -330,7 +330,13 @@ Result: State divergence (recoverable via next didChange)
 
 ### Phase 3: Response Aggregation Strategies
 
-> **Note**: This section describes Phase 3 multi-LS-per-language features. Phase 1 uses single-server routing.
+> **Note**: The multi-server aggregation this section introduced as "Phase 3"
+> has since **shipped** — dispatch fans out to every selected server, and the
+> strategies and allowlist are owned by cross-layer-aggregation and
+> aggregation-priorities-wildcard. What remains unimplemented is the
+> per-request timeout tier the stability rules below assume
+> (ls-bridge-timeout-hierarchy places Tier 1 in Phase 3). Read the rules as
+> target state and the capability as current.
 
 For fan-out **requests** (with `id`), aggregation is configured per method.
 The strategies and the priority-ordered allowlist that selects participants
@@ -417,8 +423,9 @@ languages = ["python"]             # same language as pyright — this is the fa
 
 ### Negative
 
-**Single Server Limitation (Phase 1):**
-- Cannot use multiple servers for same language (e.g., pyright + ruff) until Phase 3
+**Single Server Limitation (Phase 1)** — *historical; multi-server fan-out
+has since shipped:*
+- Could not use multiple servers for the same language (e.g. pyright + ruff) until Phase 3
 
 **Coordination Complexity:**
 - Per-downstream document state tracking required
