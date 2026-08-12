@@ -1109,6 +1109,14 @@ impl ConnectionHandle {
         self.register_request_with_upstream(None)
     }
 
+    pub(in crate::lsp::bridge) fn register_peer_request(
+        &self,
+    ) -> io::Result<(RequestId, tokio::sync::oneshot::Receiver<serde_json::Value>)> {
+        let (request_id, response_rx) = self.register_request()?;
+        self.router.track_failure(request_id);
+        Ok((request_id, response_rx))
+    }
+
     /// Like `register_request()`, but also records the upstream→downstream ID
     /// mapping in the router's cancel_map so `$/cancelRequest` can be translated
     /// and forwarded (`None` for internal requests).
@@ -1146,6 +1154,19 @@ impl ConnectionHandle {
 
         match timeout(REQUEST_TIMEOUT, response_rx).await {
             Ok(Ok(response)) => {
+                if let Some(failure) = self.router.take_failure(request_id) {
+                    let (kind, message) = match failure {
+                        super::super::actor::BridgeFailure::ConnectionLost => (
+                            io::ErrorKind::BrokenPipe,
+                            "bridge: downstream connection lost",
+                        ),
+                        super::super::actor::BridgeFailure::RequestTimeout => (
+                            io::ErrorKind::TimedOut,
+                            "bridge: downstream request timed out",
+                        ),
+                    };
+                    return Err(io::Error::new(kind, message));
+                }
                 // Check if this was an error response from liveness timeout
                 // If so, transition to Failed state (ls-bridge-async-connection Phase 3)
                 if self.reader_handle.check_liveness_failed() {
