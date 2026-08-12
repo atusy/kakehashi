@@ -847,7 +847,11 @@ impl DocumentTracker {
             .filter(|(host_uri, _)| host_uri.as_str() == uri)
             .flat_map(|(_, documents)| documents)
         {
-            if !connections.contains(&document.connection_key) {
+            if self.is_virtual_doc_open_on_connection(
+                &document.virtual_uri.to_uri_string(),
+                &document.connection_key,
+            ) && !connections.contains(&document.connection_key)
+            {
                 connections.push(document.connection_key.clone());
             }
         }
@@ -966,6 +970,24 @@ mod tests {
                 .connections_serving_uri(&virtual_uri.to_uri_string())
                 .await,
             vec![connection]
+        );
+    }
+
+    #[tokio::test]
+    async fn connections_serving_uri_ignores_pending_document_open() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "typescript", "ts-0");
+        let connection = ConnectionKey::for_server("denols");
+        tracker
+            .register_pending_document(&host_uri, &virtual_uri, &connection)
+            .await;
+
+        assert!(
+            tracker
+                .connections_serving_uri(host_uri.as_str())
+                .await
+                .is_empty()
         );
     }
 
