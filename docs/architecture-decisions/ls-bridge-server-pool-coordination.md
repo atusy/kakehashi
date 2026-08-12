@@ -51,10 +51,13 @@ The `ConnectionKey` is stored on each connection handle, so the request,
 no `textDocument`, so the originating host URI is stashed in their routing
 envelopes (`KakehashiEnvelope` / `CodeActionEnvelope` / `CodeLensEnvelope`)
 and used to re-resolve the same `(server, root)` connection that produced the
-item. (A legacy envelope without that field falls back to the client-root
-connection — the pre-#382 rule, and still the shipped behavior today; the
-fail-soft rule below is target state that lands with
-bridge-routing-protocol's implementation.) Amended with
+item. (A legacy **completion** envelope without that field falls back to
+the client-root connection — the pre-#382 rule, and still the shipped
+behavior today, via the field's serde default; the code-action and
+code-lens envelopes *require* the field, so a stamp-less one fails to
+deserialize and the item is returned unresolved. The fail-soft rule
+below is target state that lands with bridge-routing-protocol's
+implementation.) Amended with
 bridge-routing-protocol:
 this re-resolution — like every site that derives a connection from the host
 URI — consults the active route binding first, matched by the envelope's
