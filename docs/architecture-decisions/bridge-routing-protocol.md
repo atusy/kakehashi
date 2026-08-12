@@ -47,8 +47,8 @@ the transport: absence or failure of providers reproduces today's
 one recorded difference in what happens afterwards: the decision settles
 into the document's route binding either way, so even a fallback route is
 frozen for the **binding's lifetime** (the decided document's close —
-for a virtual document, its region leaving through the existing
-virtual-document lifecycle — with the one abnormal-finalization
+for a virtual document, its own close — its last region leaving —
+through the existing virtual-document lifecycle — with the one abnormal-finalization
 exception the Caching section records), where today a restart's re-open
 re-resolves live markers (respawn-reopen-derives-its-targets records the
 same freeze from its side). A *successful* answer, by design, can
@@ -902,7 +902,8 @@ Decision-cache lifecycle:
     constant; a flight whose gap has overflowed the ring — or whose
     provenance is missing for any reason — discards, never re-anchors;
   - an **incarnation** move (`didClose`, or close/re-open — for a
-    virtual document, its own close when its region leaves) **aborts**
+    virtual document, its own close when its last region leaves)
+    **aborts**
     the waiting tasks outright — no `didOpen` is sent at all, and the
     open's enqueue commit re-checks the decided document's incarnation
     (each virtual document carries its own, so one region's removal
@@ -1503,6 +1504,6 @@ a slot a routing provider left in play.
 | **Folders↔Key** | shared instance: union-only join; per-root: first element, rest warned+ignored; at most one connection per server name per document |
 | **Providers** | all spawnable configured servers ∩ advertising ∩ `Ready` (Initializing awaited only when the advertisement is known, the server is named, or it carries `forceStart`), ordered by routing `priorities` (no `"_"` method-wildcard inheritance); concurrent fan-out, `preferred` fan-in, operative-entry rule |
 | **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy, plus a separate binding-reuse validation budget); expiry is partial-result (cancel unanswered, drop unfinished entries, fan-in over what normalized; whole fallback only when no operative normalized result remains); exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
-| **Caching** | decision cache per (document URI, derived layer, languageId, config generation) — the decided document's own URI, virtual for regions; single-flight; evicted on the decided document's close (a region leaving closes its virtual document), flushed on reload / `Ready`-provider-set / workspace-folder-set change; (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until that document closes; never retroactive |
+| **Caching** | decision cache per (document URI, derived layer, languageId, config generation) — the decided document's own URI, virtual for regions; single-flight; evicted on the decided document's close (a virtual document closes when its last region leaves), flushed on reload / `Ready`-provider-set / workspace-folder-set change; (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until that document closes; never retroactive |
 | **Cold start** | `forceStart` (publication-fenced get-or-create — the `Initializing` slot registers before the config becomes observable to `didOpen`; `#shared` + primary-root seed for `preferSharedInstance` servers, the marker-less fallback shape otherwise; warm-up scope limited to shared/marker-less/policy servers; wait-eligible for the initialization wait) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
 | **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; the sweep reads each exact server entry's binding where one exists, marker resolution where none does, and never spawns |
