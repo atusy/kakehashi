@@ -162,7 +162,7 @@ Global Shutdown overrides all (highest priority)
 ### Positive
 
 - **Deterministic behavior**: Clear precedence when multiple timeouts could fire
-- **Bounded shutdown**: Global timeout bounds the termination attempt; a child unconfirmed at the deadline is retained or abandoned per ls-bridge-graceful-shutdown § Unconfirmed termination
+- **Bounded shutdown**: Global timeout bounds the termination attempt; a child unconfirmed at the deadline is retained or abandoned per ls-bridge-graceful-shutdown § Unconfirmed Termination
 - **Hung server detection**: Liveness timeout catches unresponsive servers
 
 ### Negative

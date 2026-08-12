@@ -40,7 +40,7 @@ Failed → Closed          (skip shutdown handshake, cleanup only)
 returned `Ok` — an unconfirmed termination converts to a
 termination-pending record (`stopping`) and settles
 `stopFailed`/`restartFailed` instead. Only global teardown may take the
-bookkeeping-only `Closed` (§ Unconfirmed termination).
+bookkeeping-only `Closed` (§ Unconfirmed Termination).
 
 **Operation Gating in Closing State:**
 - New operations: Reject with `REQUEST_FAILED` ("bridge: connection closing")
@@ -85,6 +85,8 @@ Failed → Closed (skip LSP handshake)
 ├─ Send SIGTERM immediately
 └─ Wait for process exit, then SIGKILL if needed
 ```
+
+#### Unconfirmed Termination
 
 **Unconfirmed termination at the global deadline**: the connection still
 transitions to `Closed` for bookkeeping. What happens to the child
@@ -136,102 +138,37 @@ abandoned, and its tracked requests fail exactly like pending responses.
 
 ### Writer Loop Shutdown Synchronization
 
-**Problem**: Writer loop and shutdown sequence both write to stdin. Concurrent writes corrupt protocol stream.
+**Problem**: The writer loop and the shutdown sequence both write to the
+server's stdin. Concurrent writes corrupt the protocol stream.
 
-**Solution**: Three-phase shutdown coordination.
+**Decision**: The shutdown sequence takes **exclusive** access to stdin from
+the writer before it sends `shutdown`, and waits only a bounded time to get
+it. Failing to acquire it, the sequence skips the LSP handshake entirely and
+force terminates.
 
-> **Target design.** The sketches in this section (and § Lifecycle Actor /
-> § Multi-Connection Shutdown below) record the protocol adopted
-> alongside bridge-client-control-protocol. The current implementation
-> differs — a stop oneshot with `try_recv` drain, a separate writer
-> return channel, no per-connection handoff timeout — and converges as
-> that protocol lands (adrs-are-aspirational is the repo's standing
-> convention: ADRs run ahead of code).
-
-**Phase 1: Signal Stop**
-```rust
-// Shutdown sequence
-async fn graceful_shutdown(&self) {
-    // 1. Transition to Closing state (new operations rejected)
-    self.state.set(Closing);
-
-    // 2. Atomically close queue admission: the close() is the seal —
-    //    after it, no enqueue can succeed, even from a caller holding a
-    //    stale Ready view of the handle. Everything accepted before the
-    //    close is still in the queue and will be drained.
-    self.order_queue.close();
-
-    // Phase 2: Wait for writer to become idle...
-}
-
-// Writer loop — owns its state by value (incl. stdin); ownership is what
-// makes the handoff transfer real (target design — see note above)
-async fn writer_loop(mut self) {
-    // recv() on a closed queue yields the remaining accepted items in
-    // FIFO order, then None — so the loop drains everything accepted
-    // before the seal and only then exits (§ Operation Disposal Policy).
-    while let Some(operation) = self.order_queue.recv().await {
-        // Write operation... (never aborted mid-write)
-    }
-
-    // Hand stdin back: idle signal AND ownership transfer in one send
-    let _ = self.writer_idle_tx.send(self.stdin);
-}
+**Sequence:**
+```
+1. Transition to Closing state (new operations rejected)
+2. Close queue admission — accepted operations still drain
+3. Writer drains the accepted queue in FIFO order, then yields stdin
+4. Shutdown sequence writes `shutdown` / `exit` over the yielded stdin
+   ── or, if step 3 did not complete within its bound, skips to ──
+5. Force terminate (SIGTERM → SIGKILL)
 ```
 
-**Phase 2: Wait for Idle**
-```rust
-// Shutdown sequence continues
-async fn graceful_shutdown(&self) {
-    // Wait for the writer to hand stdin back (or timeout). Idle alone
-    // is not enough: Phase 3 needs the returned stdin handle for
-    // exclusive access, and a CLOSED channel means the writer died
-    // without handing off — treat it exactly like a timeout.
-    let stdin = match tokio::time::timeout(
-        Duration::from_secs(2),
-        self.writer_idle_rx.recv()
-    ).await {
-        Ok(Some(stdin)) => stdin, // handoff complete
-        Ok(None) | Err(_) => {
-            // The writer may still own stdin or sit mid-write; writing
-            // the shutdown request now could interleave with a partial
-            // frame. Skip the LSP handshake entirely and force
-            // terminate (SIGTERM → SIGKILL) — exclusive access was
-            // never acquired, so no LSP goodbye is possible.
-            log::warn!("Writer loop timeout; skipping LSP handshake");
-            return self.force_terminate().await;
-        }
-    };
-
-    // Phase 3: Exclusive stdin access via the handed-back `stdin`...
-}
-```
-
-**Phase 3: Exclusive Access**
-```rust
-// Shutdown sequence continues
-async fn graceful_shutdown(&self) {
-    // NOW safe: `stdin` is the handle Phase 2 received from the writer —
-    // ownership, not just quiescence
-    self.send_shutdown_request(&mut stdin).await?;
-
-    // Wait for shutdown response...
-    // Send exit notification...
-    // Kill process...
-}
-```
+Draining before the handshake is what makes `shutdown` unable to overtake a
+message the bridge already committed to send (§ Operation Disposal Policy).
+The bound on step 3 is the writer-idle timeout of
+ls-bridge-timeout-hierarchy, which counts against the applicable shutdown
+budget — per-slot `stop` or global teardown — rather than adding to it.
 
 **Guarantees (graceful path — a forced termination forfeits the queue
 drain and current-write completion; the bounded wait is what enforces
 it):**
 - ✅ Writer loop stops dequeuing **before** shutdown writes to stdin
 - ✅ No concurrent writes to stdin (sequential: writer → shutdown)
-- ✅ Bounded wait (2s timeout prevents indefinite hang)
+- ✅ Bounded wait (no indefinite hang)
 - ✅ Current write completes (no mid-write abortion)
-
-**Why 2-second timeout**: Writer loop writes typically <100ms. 2s allows for slow disk I/O without indefinite hang.
-
-**Note**: This 2s timeout is per-connection and runs inside `graceful_shutdown()`, which itself runs under the applicable shutdown deadline (per-slot `stop` or global teardown). The 2s counts against that budget.
 
 ### Shutdown Timeout Policy
 
@@ -251,8 +188,12 @@ All connections shut down in parallel under a single global ceiling. This is int
 - Fast servers don't wait for slow servers to time out
 - Simplicity: No complex budget-splitting logic
 
-**Timeout Application**: see § Lifecycle Actor below — the deadline and the
-escalation reserve are owned by the actor's teardown state machine.
+**Timeout Application**: the ceiling is one absolute deadline split between
+the graceful phase and an escalation reserve
+(ls-bridge-timeout-hierarchy § Global Shutdown Design). It is owned by the
+teardown transition (§ Lifecycle Actor below), which is also what makes it
+un-extendable: the deadline is captured at shutdown initiation, so every
+later step spends the budget rather than adding to it.
 
 ### Lifecycle Actor: All Lifecycle Transitions Serialize
 
@@ -274,249 +215,75 @@ section specified (see Alternative 4): instead of *handling* the races
 between stop, restart, teardown, reload, and acquire with dedicated
 machinery, serialization **removes** them by construction.
 
-**The actor loop never blocks.** Long operations — the LSP shutdown
-handshake, SIGTERM/SIGKILL escalation, `Child::wait` — run as spawned
-sub-tasks. **Authoritative lifecycle resources never travel** (borrowed
-working material — an `Arc` of a handle, lent I/O endpoints — does): the
-authoritative process handle,
-the reply sender, and every record live in the actor's state entry for
-the key; a sub-task borrows what it needs (a shared `Arc` of the process
-handle, the I/O endpoints a handshake transition lends it) and carries
-only its job parameters, so a panicked, aborted, or stale sub-task can
-lose nothing — its completion is a *report* referencing the key and
-generation, not a container of resources. Each completion comes back to
-the actor as a message. A
-multi-step operation (`restart` = stop phase → respawn → verify) is a
-small per-key state machine advanced by those messages, so every state
-mutation is atomic at message granularity and there is no lock to hold,
-tear, or lease.
+**Decisions serialize; I/O does not.** The LSP shutdown handshake,
+SIGTERM/SIGKILL escalation, and waiting on a child all run outside the
+serialization point, reporting back as further messages. So the actor
+never blocks on a server, and per-connection shutdowns still proceed in
+parallel. A multi-step operation (`restart` = stop phase → respawn →
+verify) is a per-key state machine advanced by those reports, which is
+what makes every lifecycle state change atomic with respect to every
+other one.
+
+**Two shutdown modes**, which the teardown contracts below discriminate
+on:
+
+- `ProcessExit` — kakehashi itself is ending (exit notification, signal).
+- `ServerRemains` — the LSP `shutdown` request path: the server answers,
+  then stays alive awaiting `exit`, possibly indefinitely.
 
 What the previous machinery bought, the actor gives structurally:
 
-- **Single-flight per key** — two control calls for one key are two queued
-  messages; the second is answered from the key's current state
-  (`clientRestarting`, `clientNotReady`, …). No registry, no guard to
-  release, no half-mutated slot for a dropped handler to leave behind.
-- **No lease-owner map** — the actor is the sole lifecycle
-  **authority**: every spawn, signal, and wait happens either inside one
-  of its transitions or in exactly one tracked sub-task acting on its
-  delegation, and because the spawn *intent* commits as a non-suspending
-  transition, no child can come into existence behind an escalation
-  scan. Sub-tasks the actor spawns are the delegation, tracked in its
-  `JoinSet`; a "revoked claim" is just the actor ignoring a stale
-  completion message — safe to ignore outright, because completions
-  carry reports, never resources (those stay in the state entry).
+- **Single-flight per key** — two control calls for one key serialize;
+  the second is answered from the key's current state
+  (`clientRestarting`, `clientNotReady`, …). No registry of in-flight
+  operations, and no half-mutated slot for a dropped handler to leave
+  behind.
+- **One lifecycle authority** — every spawn, signal, and wait happens
+  under the actor's ownership, so there is nothing to lease, revoke, or
+  reclaim, and no child can come into existence behind an escalation
+  scan.
 - **Spawn commit is an actor transition** — the acquire path may use an
-  existing `Ready` connection lock-free, but *creating* one goes through
-  the actor, which checks the stopped set, termination-pending records,
-  in-flight operations, and teardown sealing in-queue. An acquire can
-  never race a committing `stop` into spawning beside a tombstone.
-- **Teardown is a message** — `Teardown` carries the mode and the
-  **caller-captured absolute deadline** (anchored at shutdown initiation,
-  so mailbox delay spends the budget rather than extending it), seals
-  admission, and drives the parallel per-connection shutdowns as
-  sub-tasks. Sealing means the
-  actor *answers differently*, not that it stops reading its queue: a
-  post-seal spawn commit fails the acquire, and a post-seal
-  `Stop`/`Restart` answers `clientNotReady` with
-  `data.status: "stopping"`. The budget is one absolute deadline with an
-  escalation reserve (~20%, ls-bridge-timeout-hierarchy): the graceful
-  phase runs to `deadline − reserve`, escalation gets the remainder, and
-  each `DeadlineExpired` token carries the operation generation it was
-  armed for — a token whose generation no longer matches is stale and
-  dropped. The mailbox token is an optimization, not the record: the
-  **absolute deadline itself persists on the entry**, and an incarnation
-  recheck at startup settles any entry already past its deadline — so an
-  expiry consumed by a pre-commit panic can never leave an operation
-  beyond its ceiling. The same reconciliation — after
-  first processing any pending-settlement markers — launches **exactly
-  one producer for each active, unclaimed `Spawning` intent that has
-  none** in the `JoinSet`: producer existence is derived from the
-  intent, never remembered, so an incarnation dying between commit and
-  launch cannot orphan an accepted intent. Claimed or settling entries
-  and cleanup records never relaunch a producer. A second `Teardown` upgrades the mode monotonically
-  (`ProcessExit` dominates) but can never extend the ceiling — an active
-  run retains the **earliest** deadline it has been offered. The actor
-  owns the single completion watch, hands every caller a receiver, and
-  publishes the run's **success-or-failure** only after cleanup — with
-  the single final-deadline exception below, where completion publishes
-  as failed while an unjoined producer's record stays authoritative;
+  existing `Ready` connection without consulting the actor, but
+  *creating* one may not: the stopped set, termination-pending records,
+  and teardown sealing are all checked in the same transition that
+  commits the spawn. An acquire can never race a committing `stop` into
+  spawning beside a tombstone.
+- **Teardown is a transition, not a scan** — teardown carries the mode
+  and an absolute deadline captured at shutdown initiation, seals
+  admission, and drives the per-connection shutdowns. Sealing changes
+  the *answers*, not the actor's availability: after the seal a spawn
+  commit fails its acquire, and a `Stop`/`Restart` answers
+  `clientNotReady` with `data.status: "stopping"`. A second teardown
+  upgrades the mode monotonically (`ProcessExit` dominates) and never
+  extends the ceiling — the earliest deadline offered wins. Completion
+  publishes the run's **success-or-failure** only after cleanup, so
   callers surface or log a failed teardown rather than mistaking it for
-  success. A
-  `Teardown(ProcessExit)` arriving **after** a completed `ServerRemains`
-  run is a new transition, not a lost upgrade: it adopts the retained
-  termination-pending records **and spawn-cleanup records**, disposes
-  them per this section (abort-join-abandon for open intents,
-  log-abandon for known children — § Unconfirmed termination), and
-  publishes its own completion.
-- **Abnormal outcomes settle in one place** — the actor polls its
-  sub-task `JoinSet` alongside the mailbox, so a sub-task that panics
-  (and therefore never sends its completion) still surfaces as a
-  `join_next` result; the actor applies the ownership-at-completion rules
-  (bridge-client-control-protocol) to its own state entry: settle the
-  tombstone/ARM/replacement records, answer the outer request
-  (`stopFailed`/`restartFailed`), keep or convert the termination-pending
-  record.
+  success. A `Teardown(ProcessExit)` arriving **after** a completed
+  `ServerRemains` run is a new transition, not a lost upgrade: it adopts
+  the retained records and disposes them by mode
+  (§ Unconfirmed Termination).
+- **Abnormal outcomes settle in one place** — a spawn, handshake, or
+  wait that ends abnormally settles through the same transition path as
+  a normal one: it answers the outer request
+  (`stopFailed`/`restartFailed`) and disposes the tombstone, ARM,
+  replacement, and termination-pending records per
+  bridge-client-control-protocol's ownership-at-completion rules.
 
-**The actor's state outlives the actor task.** `LifecycleState` and the
-sub-task `JoinSet` live in pool-owned storage handed to each incarnation,
-never in task locals — a panicking incarnation can drop neither the
-stopped set (which is precisely the record of keys *not* in the pool and
-so cannot be re-derived from it), nor termination-pending kill handles,
-nor in-flight `Child::wait`s. The pool's supervisor restarts the actor;
-the new incarnation resumes from that storage plus its mailbox, and
-re-derives only what pool state can supply (connection states) — the same
-derive-don't-remember posture as respawn-reopen-derives-its-targets.
-Transitions themselves are **unwind-contained**: a transition stages its
-mutations on a scratch copy of its **write set** — one keyed entry for a
-control transition; the entry plus its pool-map insertion for a spawn
-commit; the global sections a `Reload` or `Teardown` touches (mode,
-sealing, tombstone sweeps) — and its final act is the single
-**commit-and-reply swap**, so a panic anywhere before that pair leaves
-every affected value unchanged with the message merely consumed.
-External effects are not staged, because an OS child cannot be rolled
-back: a spawn first **commits a `Spawning` intent** whose entry carries
-an actor-owned **escrow slot**; the tracked sub-task creates the child
-**under a kill-on-drop guard**, and its first act on a successful spawn —
-atomically with observing it, before any suspension point — is to store
-the child's handle into that slot, disarming the guard. A panic in the
-create-to-store window therefore drops the guard and kills the child:
-no process can exist outside actor records even across an unwind. At every instant,
-therefore, either no child exists or its handle is in actor-owned state;
-the completion stays a pure report, and a panic at any point settles
-from the entry (kill-and-reap whatever the escrow holds), never by
-pretending the child away. **Escrow closes by claim, not by time**: a
-transition that settles a `Spawning` intent out from under its sub-task
-(teardown, reload deletion, same-name configuration invalidation,
-`stop`) marks the entry *settling* but
-retains it — slot still writable — until the sub-task's termination
-surfaces through the `JoinSet`; a handle landing in that window is
-killed-and-reaped by the final settlement, so no child can slip in
-behind an escalation scan, and teardown publishes completion only after
-its adopted `Spawning` entries have settled this way (or, at the final
-deadline, publishes as failed per the disposition below). **Operations waiting for claim closure are deadline-bounded**; claim
-closure itself may outlive a reload. The deadline belongs to whoever is
-waiting. `stop`/`restart` wait under the per-slot
-deadline and teardown under its absolute one; a **reload** claim has no
-waiter of its own — the reload reply commits with the claim, an
-acquisition deadline terminates only its acquire waiter, and the
-reload-origin cleanup record stays authoritative and fenced until its
-producer terminates or teardown adopts it. A spawn sub-task that has not terminated by its waiter's deadline fails
-that waiter — a per-slot `stop`/`restart` answers
-`stopFailed`/`restartFailed`; teardown publishes its failed completion
-and disposes the record by mode as below — and converts the entry to a
-fenced cleanup record; an **acquire** timeout, by contrast, only drops its own
-subscription and leaves the entry — reload-origin cleanup included —
-unchanged. The converted record keeps the escrow open, and any eventual
-child is still killed and reaped on arrival — while teardown disposes that record by
-mode instead of waiting indefinitely: `ServerRemains` retains it, and
-`ProcessExit` **aborts the producer first** — an open-escrow intent's
-claim stays authoritative until its producer is closed, because unlike
-an already-escalated child, an unaborted spawn task could create a
-fresh child with no retained record to kill — joins the abort through
-the `JoinSet`, then log-abandons whatever the escrow holds. A producer
-still unjoined at the final deadline gets a coherent terminal
-disposition, not just a log line: teardown **publishes its completion
-as failed** — naming the guarantee it can no longer honor — while the
-record stays authoritative until actual process exit ends ownership;
-the log names the potential straggler. The pairing applies to the
-**terminal, caller-visible transition** of an operation: a multi-step
-`stop`/`restart` commits its initial and intermediate transitions
-state-only, the entry retaining the live reply sender for terminal
-settlement. A transition with no live reply — the caller released by
-`RequestCancelled`, or a reply-less message (`DeadlineExpired`, internal
-settlement) — likewise commits state-only. For the terminal transition
-of a live request, reply and commit are one act, so a caller whose
-receiver closes (an incarnation died before the pair) learns
-`RequestFailed` (`stopFailed`/`restartFailed`) and that reading is
-always truthful: *terminal outcome not committed*, never a committed
-success misreported as failure. Settlement is at-most-once and no caller
-is ever left pending.
-
-**Sketch** (illustrative, target design):
-
-```rust
-enum ShutdownMode {
-    ProcessExit,   // exit notification / signal path: kakehashi is ending
-    ServerRemains, // LSP shutdown request: server stays alive awaiting exit
-}
-
-enum LifecycleMsg {
-    Stop { key: ConnectionKey, reply: Reply },
-    Restart { key: ConnectionKey, reply: Reply },
-    CommitSpawn { key: ConnectionKey, reply: Reply },
-    // ^ the reply is the ACCEPTANCE acknowledgment (intent committed),
-    //   not the terminal spawn result — and it carries a
-    //   GENERATION-BOUND RECEIVER, subscribed inside the accepting
-    //   transition itself, so no later notification can precede the
-    //   subscription. That receiver ALWAYS terminates: a handle landing
-    //   resolves it; a pre-handle SPAWN FAILURE resolves it with the
-    //   original spawn error while the failed intent dissolves (no
-    //   retained state — the ordinary acquire path also surfaces spawn
-    //   errors and simply retries later); a claim by
-    //   stop/restart/teardown publishes the key's terminal state in
-    //   the snapshot, resolving the wait to that state's ordinary
-    //   acquire error; a reload that KEEPS the server but changes its
-    //   spawn-time configuration claims the superseded intent the same
-    //   way — producer settled per claim closure, the stale handle
-    //   never published — and resolves the receiver with the
-    //   superseded-configuration acquire error only AFTER the claim
-    //   commits — the settling entry already fences spawn commits, so
-    //   the re-acquire cannot spawn beside the superseded producer
-    //   (the reload-origin record then dissolves per the origin rule).
-    //   The re-acquire re-resolves current configuration, spends the
-    //   REMAINING budget of the original acquisition deadline (reload
-    //   churn cannot reset the timeout), and — finding the settling
-    //   fence still up — subscribes to the same (key, generation')
-    //   notify path everything else uses: cleanup dissolution wakes it
-    //   to spawn under the new generation, deletion wakes it with the
-    //   deleted-server error, teardown with the sealed error, and the
-    //   deadline expiring first fails it like any timed-out acquire.
-    //   Reload DELETION is its own case: it removes the row, and the
-    //   removal itself notifies waiters of that (key, generation) with
-    //   the deleted-server acquire error — the notification carries the
-    //   terminal answer, so no row needs to remain. No pending reply
-    //   exists to error.
-    Reload { generation: ConfigGeneration, reply: Reply },
-    Teardown { mode: ShutdownMode, deadline: Instant, reply: Reply<WatchRx> },
-    // ^ deadline captured by the caller at initiation; actor owns the one watch
-    DeadlineExpired { token: DeadlineToken },           // generation-stamped
-}
-
-async fn lifecycle_actor(pool: Arc<ConnectionPool>) {
-    // State and JoinSet are POOL-OWNED, handed to each incarnation —
-    // a panicking incarnation drops neither records nor in-flight waits.
-    let (mut rx, state, tasks) = pool.lifecycle_storage();
-    loop {
-        select! {
-            Some(msg) = rx.recv() => state.step(msg, &pool, tasks),
-            Some(done) = tasks.join_next() => {
-                // The join outcome is recorded on the entry as a
-                // non-fallible first act (a pending-settlement marker),
-                // THEN the settlement transition runs: join_next removed
-                // the only terminal event, so if settlement panics the
-                // marker survives and a restarted incarnation re-runs
-                // settlement from markers at startup — no caller is
-                // left pending.
-                state.record_outcome(&done);
-                state.settle(done, &pool);
-            }
-            // Every arm is non-suspending state mutation plus sub-task
-            // spawns; long I/O never runs inside the loop. A panicked
-            // sub-task never sends a completion message — join_next is
-            // how it still surfaces.
-        }
-    }
-}
-```
+**An acquire waiting on an in-flight spawn always terminates** — with the
+connection, with the spawn's own error, or with the ordinary acquire
+error for whatever terminal state the key reached: stopped, deleted by a
+configuration reload, superseded by a reload that changed spawn-time
+configuration, or sealed by teardown. It spends the *remaining* budget of
+its original acquisition deadline, because internal churn must not reset a
+caller's timeout, and an acquire that does time out drops only its own
+wait — it disturbs no lifecycle record.
 
 **Latency**: control and teardown events are rare and human-initiated;
 the automatic transitions (spawn commits, respawn decisions, reload
-purges) cost one message round trip each — the per-spawn round trip
-already recorded in bridge-client-control-protocol's consequences.
-Serializing them costs nothing else observable. The per-connection shutdown
-handshakes themselves still run in parallel as sub-tasks — the actor
-serializes *decisions*, not process I/O.
+purges) cost one round trip each — the per-spawn round trip already
+recorded in bridge-client-control-protocol's consequences. Serializing
+them costs nothing else observable, because only decisions serialize,
+not process I/O.
 
 ### Initialization Shutdown: Abort Immediately, No LSP Message
 
@@ -548,45 +315,102 @@ Shutdown signal arrives
 
 **Decision**: Shut down all connections in parallel with single global timeout.
 
-**Coordination Strategy:**
+**Coordination Strategy**, in order:
 
-```rust
-async fn shutdown_router(mode: ShutdownMode) {
-    // 0. Capture the absolute deadline FIRST: every later step — router
-    //    gating, mailbox delay, the actor's transitions — spends this
-    //    budget rather than extending it
-    let deadline = Instant::now() + GLOBAL_TIMEOUT;
+1. **Capture the absolute deadline**, before anything else — every later
+   step spends this budget rather than extending it.
+2. **Gate the router**: stop accepting new requests, which also gates
+   ordinary acquires.
+3. **Fail all pending routing decisions.**
+4. **Hand the mode and deadline to the lifecycle actor's teardown
+   transition** (§ Lifecycle Actor) and await its completion. Mode
+   upgrade, sealing, the parallel per-connection shutdowns, escalation
+   under the deadline, survivor disposition, and cleanup all belong to
+   that transition. Router-specific resource cleanup runs before
+   completion is published, so no caller can resume around it. A
+   teardown that publishes as failed is surfaced or logged, never read
+   as success.
 
-    // 1. Stop accepting new requests (also gates ordinary acquires via
-    //    the pool-wide shutting_down flag)
-    mark_router_shutting_down();
-
-    // 2. Fail all pending routing decisions
-    fail_pending_routes();
-
-    // 3. Send Teardown to the lifecycle actor (§ Lifecycle Actor) and
-    //    await the shared completion watch. Mode upgrade (earliest
-    //    deadline retained), sealing, the parallel per-connection
-    //    shutdown sub-tasks, escalation under the deadline, survivor
-    //    disposition, and cleanup are all the actor's teardown state
-    //    machine; router-specific resource cleanup runs inside its
-    //    cleanup step, BEFORE completion is published, so no caller can
-    //    resume around it.
-    if let Err(failure) = pool.lifecycle().teardown(mode, deadline).await {
-        log::error!("bridge teardown completed as failed: {failure}");
-    }
-}
-```
-
-The per-connection shutdowns themselves run in parallel as actor
-sub-tasks — the actor serializes the teardown *decisions* (mode, sealing,
-disposition), not the process I/O, so the O(1) wall-clock property below
-is unaffected.
+The per-connection shutdowns still run in parallel — the actor serializes
+the teardown *decisions* (mode, sealing, disposition), not the process
+I/O, so the O(1) wall-clock property below is unaffected.
 
 **Why Parallel:**
 - **Bounded total time**: N servers shut down in O(1) time, not O(N)
 - **Independent failures**: Hung server doesn't block others
 - **User experience**: 3 servers × 5s sequential = 15s vs 5s parallel
+
+## Invariants
+
+> The invariants below are normative; the mechanisms that satisfy them are
+> deliberately unspecified.
+
+These are the traps adversarial review found in this decision — the reasons
+the design has the shape it has. An implementation may satisfy each one
+however it likes; it may not violate one.
+
+**Process ownership**
+
+- **A child process must never exist outside owned records.** The window is
+  between creating the process and committing the record of it: an unwind,
+  panic, or abandoned task there strands a child that nothing will ever
+  signal or reap.
+- **Delivering SIGTERM or SIGKILL is not termination.** Only a reaped
+  `wait` confirms a process is gone. Anything that treats signal delivery
+  as confirmation will report success over a live straggler or accumulate
+  zombies.
+- **Terminating a child is not the same as ceasing to own it.** Ownership
+  ends when the process is reaped, or when kakehashi's own imminent exit
+  reparents the child to init — never merely because a deadline passed
+  (§ Unconfirmed Termination).
+- **The stopped-check and the spawn-decision must be atomic.** Split them
+  and an acquire spawns a connection beside a tombstone a concurrent `stop`
+  just committed, resurrecting a server the user asked to stay down.
+- **Accepted work must always have exactly one worker, and that fact must
+  be derivable from the record.** Remembering it separately lets a crash
+  between accepting work and starting it strand the record with nobody
+  acting on it — the derive-don't-remember posture of
+  respawn-reopen-derives-its-targets.
+- **Lifecycle records that cannot be re-derived must outlive the component
+  that owns them.** The stopped set is precisely the record of keys *not*
+  in the pool, so losing it cannot be repaired by reading the pool;
+  in-flight waits and termination-pending records are the same. Only state
+  the pool can supply may be re-derived after a failure.
+
+**Protocol integrity**
+
+- **Until the server has answered `initialize`, LSP forbids the client every
+  further request *and* notification** — `exit` included. The only
+  conformant abort in that window is process termination with no LSP
+  message at all.
+- **The shutdown handshake requires exclusive access to stdin, and
+  quiescence observed from outside is not exclusivity.** A writer that
+  merely looks idle may be mid-frame; interleaving a `shutdown` request
+  with a partial frame corrupts the JSON-RPC stream unrecoverably. Failing
+  to acquire exclusivity, the correct action is to skip the handshake, not
+  to write anyway.
+- **Closing admission must be atomic against a stale view.** A caller
+  holding a `Ready` view of a connection that has since begun closing must
+  not be able to enqueue; otherwise an operation is accepted after the
+  bridge has promised to accept none.
+- **A blocked writer plus a downstream that has stopped reading is a
+  full-duplex pipe deadlock.** Draining the accepted queue is bounded in
+  *work*, not in *time* — so every drain must run under a deadline and be
+  able to end in forced termination.
+
+**Answering callers**
+
+- **No caller is left pending, and settlement is at-most-once.** Every
+  control operation ends in exactly one answer, including when the work
+  behind it ends abnormally rather than reporting.
+- **A failure answer must be truthful.** A caller told
+  `stopFailed`/`restartFailed` must be able to read it as *the terminal
+  outcome was not committed* — a committed success must never be reported
+  as a failure.
+- **A deadline is a ceiling, not a budget that internal events refill.**
+  Queueing delay, retries, and configuration churn spend it; nothing
+  extends it, and no operation may outlive its ceiling because the expiry
+  signal itself was lost.
 
 ## Consequences
 
@@ -617,7 +441,7 @@ is unaffected.
 - SIGTERM → SIGKILL sequence terminates processes in the ordinary case;
   a child unconfirmed at the deadline is retained via its
   termination-pending record (or logged and abandoned on the
-  process-exit path — see § Unconfirmed termination)
+  process-exit path — see § Unconfirmed Termination)
 - No zombie processes or leaked file descriptors while kakehashi lives
   (pending `wait`s are driven to completion)
 - Lock files and caches properly released
@@ -746,6 +570,23 @@ queue. The actor and its supervisor are new code too — but one
 well-worn shape instead of five bespoke mechanisms — and latency is
 unaffected because only decisions serialize, not process I/O.
 
+## Decision–Implementation Gap
+
+The LSP handshake, the writer handoff with its queue drain, the
+SIGTERM → SIGKILL escalation, and parallel teardown under one global ceiling
+are implemented. Two parts of this decision run ahead of the code
+(adrs-are-aspirational is the repo's standing convention):
+
+- **The lifecycle actor does not exist yet.** Teardown today is a pool-wide
+  shutting-down flag checked under the connections lock — enough to make the
+  stopped-check/spawn-decision atomic for teardown, but there is no per-slot
+  `stop`/`restart`, so most of the serialization this section describes has
+  nothing yet to serialize. It converges as bridge-client-control-protocol
+  lands.
+- **The wait for the writer handoff is unbounded per connection.** Only the
+  enclosing global teardown ceiling bounds it, so one wedged writer can spend
+  the whole budget instead of its own writer-idle share.
+
 ## Related Decisions
 
 - **[ls-bridge-async-connection](ls-bridge-async-connection.md)**: Async Bridge Connection
@@ -777,4 +618,5 @@ unaffected because only decisions serialize, not process I/O.
 - **2026-01-06**: Merged Amendment 001 - Added three-phase writer loop shutdown synchronization to prevent stdin corruption during concurrent shutdown writes
 - **2026-08-11**: Corrected Initialization Shutdown - the abort path sends no LSP message at all (the earlier revision sent `exit` before the initialize response, which LSP ordering forbids); adopted alongside bridge-client-control-protocol, whose per-slot `stop` shares the path
 - **2026-08-11**: Reconciled the Operation Disposal Policy with the Closing-state gating and the writer's actual behavior - the accepted order queue drains ahead of `shutdown` (the earlier table said queued operations are never sent, contradicting § Operation Gating and the FIFO writer)
+- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - deleted the lifecycle-actor and writer-handoff implementation mechanics (escrow slots, kill-on-drop guards, scratch-copy staging, commit-and-reply swaps, generation-bound receivers, settlement markers, the message-enum and coordination sketches, the writer-idle constant), added an Invariants section recording the traps that machinery closed, and moved the aspirational-design note into a Decision–Implementation Gap section; no contract changed
 - **2026-08-12**: Replaced the lock-based concurrent lifecycle-control design with the Lifecycle Actor - all lifecycle transitions (stop/restart/teardown/spawn-commit) serialize through one pool-owned actor, dissolving the single-flight registry, lease-owner map, supervisor-owned transactional teardown state, and durable-record finalizer machinery the earlier revision had accreted (now recorded as rejected Alternative 4); observable contracts in bridge-client-control-protocol are unchanged

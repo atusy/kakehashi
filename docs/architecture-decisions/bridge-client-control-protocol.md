@@ -563,7 +563,7 @@ never-`Closed`-while-unconfirmed rule is a **steady-state** invariant;
 global teardown's final deadline disposes by mode instead — the
 process-exit path logs and abandons the child to the OS, while a
 shutdown-request teardown that leaves the server alive keeps the records
-and their waits (ls-bridge-graceful-shutdown § Unconfirmed termination).
+and their waits (ls-bridge-graceful-shutdown § Unconfirmed Termination).
 
 - **Process-level configuration applies.** `command`, `args`,
   `initializationOptions`, settings — whatever the config says *now* is what
