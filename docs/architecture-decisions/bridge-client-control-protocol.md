@@ -648,10 +648,13 @@ not a storm.
   overwrite it** — not `Ready`, and not `Failed` from error, timeout, or
   task failure. A handshake that finishes afterwards has lost, and a lost
   handshake that still writes brings a slot the user stopped back to life.
-- **No LSP message may go out on behalf of a connection already being torn
-  down.** `initialized` is the one at risk: a handshake that lost the race
-  must be unable to send it afterwards, and an abort must be unable to
-  release one it had already prepared.
+- **A handshake that lost `Initializing → Closing` may send nothing
+  afterwards.** `initialized` is the message at risk: the losing handshake
+  must be unable to send it once `Closing` has won, and the abort must be
+  unable to release one it had already prepared. This constrains the *losing
+  handshake* only — the accepted-queue drain and teardown's own
+  `shutdown`/`exit` are ls-bridge-graceful-shutdown's to govern, and both
+  legitimately follow `Closing`.
 - **Until the server has answered `initialize`, LSP forbids the client every
   further request *and* notification** — `exit` included. The only
   conformant abort in that window is direct process termination.

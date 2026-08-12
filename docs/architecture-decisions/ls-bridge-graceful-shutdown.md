@@ -581,10 +581,10 @@ unaffected because only decisions serialize, not process I/O.
 
 ## Decision–Implementation Gap
 
-The LSP handshake, the writer handoff with its queue drain, the
-SIGTERM → SIGKILL escalation, and parallel teardown are implemented. Three
-parts of this decision run ahead of the code, which is the ordinary state of
-an ADR here:
+The `Ready`-state LSP handshake, the writer handoff with its queue drain,
+the SIGTERM → SIGKILL escalation, and parallel teardown are implemented.
+Four parts of this decision run ahead of the code, which is the ordinary
+state of an ADR here:
 
 - **The lifecycle actor does not exist yet.** Teardown today is a pool-wide
   shutting-down flag checked under the connections lock — enough to make the
@@ -597,6 +597,13 @@ an ADR here:
   the graceful ceiling, or the force-kill bound if escalation reaches it. So
   one wedged writer can spend the whole graceful budget instead of its own
   writer-idle share.
+- **Initialization shutdown does not take the direct-termination path.**
+  Teardown sends `Initializing` handles through the same graceful sequence as
+  `Ready` ones, which writes `shutdown` and then `exit` unconditionally — so
+  a connection still awaiting its initialize response receives both, which
+  § Initialization Shutdown forbids and LSP ordering forbids outright. This
+  is the one gap here that is a live conformance defect rather than a missing
+  refinement.
 - **The escalation reserve does not exist.** The ceiling bounds the graceful
   phase *only*; force-kill then runs after it with its own additive
   per-connection budget, which itself contains a SIGTERM grace period. A

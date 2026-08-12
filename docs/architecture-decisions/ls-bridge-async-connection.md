@@ -119,9 +119,10 @@ When the reader task exits abnormally (EOF, read error, timeout, or shutdown), a
 - Clear the pending map to prevent memory leaks
 - Log failures for observability
 
-**Cleanup Timeout Bounds:**
-Cleanup itself is bounded (duration implementation-defined, in the
-sub-second class), because it must never block a state transition:
+**Cleanup Timeout Bounds** (**target state** — today's cleanup drains every
+pending entry synchronously, with no deadline and no overrun warning):
+Cleanup is bounded (duration implementation-defined, in the sub-second
+class), because it must never block a state transition:
 - If cleanup exceeds its bound, the state transition happens anyway
 - Log the overrun as a warning (it indicates potential channel saturation)
 - Any pending entry cleanup did not reach is failed by the loss of its reply

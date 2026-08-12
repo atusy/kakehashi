@@ -340,8 +340,11 @@ the *stability* rules a multi-server fan-out needs on top of them.
 
 **Aggregation Stability Rules:**
 - **Per-request timeout conditions**: the timeout applies **only when n ≥ 2
-  downstream servers participate** (default: 5s explicit, 2s incremental),
-  whatever strategy selected them. A single participant needs no aggregation
+  downstream servers participate** in aggregating one document request
+  (default: 5s explicit, 2s incremental), whatever strategy selected them.
+  A routing-provider fan-out is not such an aggregation: it stays exempt,
+  bounded solely by its own routing deadline (bridge-routing-protocol,
+  ls-bridge-timeout-hierarchy). A single participant needs no aggregation
   bound — nothing is being waited *together* — and the liveness timeout
   already protects it
 - **Per-request timeout behavior**: On timeout, return whatever results available **without sending $/cancelRequest**
