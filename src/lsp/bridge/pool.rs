@@ -856,6 +856,13 @@ impl LanguageServerPool {
         &self.cancel_metrics
     }
 
+    /// How many connections the pool holds, for tests outside this module
+    /// that need to observe a spawn without reaching into the map.
+    #[cfg(test)]
+    pub(crate) async fn connection_count(&self) -> usize {
+        self.connections.lock().await.len()
+    }
+
     /// Get access to the connections map.
     ///
     /// Used by text_document submodules that need to access connections.
@@ -8523,11 +8530,39 @@ mod tests {
         let inherited = crate::config::settings::BridgeServerConfig::default();
         let explicit = crate::config::settings::BridgeServerConfig {
             prefer_shared_instance: Some(false),
-            force_start: None,
             enabled: Some(true),
             ..Default::default()
         };
         assert!(same_launch_config(&inherited, &explicit));
+    }
+
+    /// `forceStart` is deliberately not a launch input: it decides whether a
+    /// connection is created before a document asks for one, never how the
+    /// process is launched. Comparing it would restart a running server on a
+    /// flip, for no observable difference — and the flag is one-way within a
+    /// session anyway.
+    #[test]
+    fn launch_config_ignores_force_start() {
+        let warm = crate::config::settings::BridgeServerConfig {
+            force_start: Some(true),
+            ..Default::default()
+        };
+        let lazy = crate::config::settings::BridgeServerConfig {
+            force_start: Some(false),
+            ..Default::default()
+        };
+        assert!(same_launch_config(&warm, &lazy));
+        assert!(same_launch_config(
+            &warm,
+            &crate::config::settings::BridgeServerConfig::default()
+        ));
+
+        // Guard the guard: a field that IS a launch input still invalidates.
+        let renamed = crate::config::settings::BridgeServerConfig {
+            cmd: Some(vec!["other".to_string()]),
+            ..warm.clone()
+        };
+        assert!(!same_launch_config(&warm, &renamed));
     }
 
     #[tokio::test]

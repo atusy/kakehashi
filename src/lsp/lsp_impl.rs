@@ -636,6 +636,10 @@ impl Kakehashi {
         if let Some(msg) = bridge_context::format_unspawnable_servers_warning(&unspawnable) {
             warnings.push(msg);
         }
+        let bypassed = bridge_context::bypassed_force_start_servers(settings);
+        if let Some(msg) = bridge_context::format_bypassed_force_start_warning(&bypassed) {
+            warnings.push(msg);
+        }
         warnings
     }
 
@@ -1046,6 +1050,54 @@ mod tests {
 
     // Note: Wildcard config resolution tests are in src/config.rs
     // Note: apply_content_changes_with_edits tests are in src/lsp/text_sync.rs
+
+    /// Applying settings is what starts a `forceStart` server — there is no
+    /// other trigger for one, and a server with `languages = []` has no
+    /// document path that could stand in.
+    ///
+    /// Worth a test at this level rather than only on the coordinator: the
+    /// coordinator's own tests call `force_start_servers` directly, so
+    /// deleting the call from the reload transaction leaves every one of them
+    /// green while the feature stops working entirely.
+    #[tokio::test]
+    async fn applying_settings_starts_a_force_start_server() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "policy-server".to_string(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "cat > /dev/null".to_string(),
+                ]),
+                languages: Some(Vec::new()),
+                force_start: Some(true),
+                ..Default::default()
+            },
+        );
+
+        server
+            .apply_raw_settings(RawWorkspaceSettings::default(), settings)
+            .await;
+
+        // The acquire is detached and inserts its handle before the handshake
+        // this server never answers, so the observable event is the insertion.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let started = server.bridge.pool().connection_count().await;
+            if started > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "the settings application never started the forceStart server"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 
     #[tokio::test]
     async fn settings_reload_discards_available_document_parsers() {

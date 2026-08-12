@@ -35,34 +35,8 @@ pub(crate) const LANGUAGES_WILDCARD: &str = "*";
 ///
 /// The first non-LSP method name in that key space, and the only key exempt
 /// from the map's `"_"` method wildcard — see
-/// [`resolve_aggregation_in_map`].
+/// [`crate::config::merge::resolve_aggregation_for_method`].
 pub(crate) const BRIDGE_ROUTING_METHOD: &str = "kakehashi/bridge/routing";
-
-/// Resolve one method's aggregation entry out of an `aggregation` map,
-/// applying the map's `"_"` method wildcard — except for
-/// [`BRIDGE_ROUTING_METHOD`], which reads its own key or nothing.
-///
-/// The exemption is deliberate (bridge-routing-protocol). Every
-/// `aggregation."_"` entry written before routing existed is an LSP fan-out
-/// allowlist naming *language servers*; inheriting one at the routing key
-/// would exclude every dedicated routing provider from routing for that
-/// language, turning the protocol off with no signal. The inverse is the
-/// recorded cost: a deliberate global allowlist or kill switch at
-/// `aggregation."_"` does not gate routing either.
-///
-/// Both the runtime lookup and the config round-trip's inherited-value
-/// stripping resolve through here — a routing entry that merely *equals* the
-/// `"_"` entry would otherwise be stripped as redundant on serialization and
-/// come back meaning something else.
-pub(crate) fn resolve_aggregation_in_map(
-    map: &HashMap<String, AggregationConfig>,
-    method: &str,
-) -> Option<AggregationConfig> {
-    if method == BRIDGE_ROUTING_METHOD {
-        return map.get(method).cloned();
-    }
-    crate::config::resolve_with_wildcard(map, method, crate::config::merge_aggregation_configs)
-}
 
 /// The resolved default for an absent `priorities`: `["*"]`, i.e. fan out to
 /// every configured server with no ranking (first-win).
@@ -327,9 +301,10 @@ impl BridgeLanguageConfig {
     ///
     /// A method-specific entry inherits any unset fields from the `_` wildcard
     /// entry (wildcard-config-inheritance) — except at
-    /// [`BRIDGE_ROUTING_METHOD`]; see [`resolve_aggregation_in_map`].
+    /// [`BRIDGE_ROUTING_METHOD`]; see
+    /// [`crate::config::merge::resolve_aggregation_for_method`].
     fn resolve_aggregation_entry(&self, method: &str) -> Option<AggregationConfig> {
-        resolve_aggregation_in_map(self.aggregation.as_ref()?, method)
+        crate::config::merge::resolve_aggregation_for_method(self.aggregation.as_ref()?, method)
     }
 
     /// Resolve all aggregation settings for a specific LSP method in a single call.
@@ -521,10 +496,20 @@ impl BridgeServerConfig {
         self.prefer_shared_instance.unwrap_or(false)
     }
 
-    /// Effective `force_start` preference, resolving the inherit (`None`) case
-    /// to the built-in default `false` (spawn lazily).
-    pub(crate) fn forces_start(&self) -> bool {
-        self.force_start.unwrap_or(false)
+    /// Effective `force_start` preference — resolving `_` inheritance against
+    /// an already-looked-up `wildcard`, and the inherit (`None`) case to the
+    /// built-in default `false` (spawn lazily).
+    ///
+    /// Only the wildcard-resolving form exists, unlike
+    /// [`Self::prefers_shared_instance`]: the one caller reads this field
+    /// while looping over the whole fleet, which is exactly the shape
+    /// [`Self::is_spawnable_with_wildcard`] exists for — resolving a whole
+    /// config to answer a boolean costs a clone and a deep JSON merge per
+    /// server. Pass `None` for an already-merged config.
+    pub(crate) fn forces_start_with_wildcard(&self, wildcard: Option<&Self>) -> bool {
+        self.force_start
+            .or_else(|| wildcard.and_then(|w| w.force_start))
+            .unwrap_or(false)
     }
 
     /// Effective `enabled` state, resolving the inherit (`None`) case to the
@@ -2041,7 +2026,21 @@ mod tests {
             servers["pyright"].force_start, None,
             "absent forceStart parses as None (inherit -> lazy spawn)"
         );
-        assert!(!servers["pyright"].forces_start());
+        assert!(!servers["pyright"].forces_start_with_wildcard(None));
+        // A wildcard opt-in reaches a server that said nothing, and an
+        // explicit `false` still outranks it.
+        let wildcard = BridgeServerConfig {
+            force_start: Some(true),
+            ..Default::default()
+        };
+        assert!(servers["pyright"].forces_start_with_wildcard(Some(&wildcard)));
+        assert!(
+            !BridgeServerConfig {
+                force_start: Some(false),
+                ..Default::default()
+            }
+            .forces_start_with_wildcard(Some(&wildcard))
+        );
     }
 
     #[test]
@@ -3144,6 +3143,60 @@ kind = "locals""#;
         assert_eq!(
             agg.max_fan_out, None,
             "no field of the wildcard entry reaches the routing key"
+        );
+    }
+
+    /// The exempt key is protocol surface, so its spelling is part of the
+    /// contract. Every other test here reaches it through the constant, which
+    /// would let a rename pass unnoticed while providers stop being ordered.
+    #[test]
+    fn the_routing_method_key_is_spelled_as_the_protocol_names_it() {
+        assert_eq!(BRIDGE_ROUTING_METHOD, "kakehashi/bridge/routing");
+
+        let config: BridgeLanguageConfig = serde_json::from_value(serde_json::json!({
+            "aggregation": {
+                "_": { "priorities": ["lua_ls"] },
+                "kakehashi/bridge/routing": { "priorities": ["policy-server"] },
+            }
+        }))
+        .expect("the routing key parses as an ordinary aggregation method key");
+
+        assert_eq!(
+            config
+                .resolve_aggregation("kakehashi/bridge/routing")
+                .priorities,
+            &["policy-server".to_string()],
+        );
+    }
+
+    /// The exemption is on the method axis only: a routing entry written at
+    /// `bridge._` still reaches `bridge.<lang>` like any other method's.
+    #[test]
+    fn the_routing_key_still_inherits_along_the_language_axis() {
+        let routing_entry = HashMap::from([(
+            BRIDGE_ROUTING_METHOD.to_string(),
+            AggregationConfig {
+                priorities: Some(vec!["policy-server".to_string()]),
+                ..Default::default()
+            },
+        )]);
+        let wildcard_language = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(routing_entry),
+        };
+        let concrete_language = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: None,
+        };
+
+        let resolved = crate::config::merge_bridge_language_configs(
+            &wildcard_language,
+            &concrete_language,
+        );
+        assert_eq!(
+            resolved.resolve_aggregation(BRIDGE_ROUTING_METHOD).priorities,
+            &["policy-server".to_string()],
+            "bridge._ supplies the routing key to a language that names none"
         );
     }
 

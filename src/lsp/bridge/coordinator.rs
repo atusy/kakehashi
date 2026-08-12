@@ -55,6 +55,19 @@ pub(crate) struct ResolvedServerConfig {
     pub(crate) config: Arc<BridgeServerConfig>,
 }
 
+/// Whether an acquire error means another acquire for the same key is already
+/// in flight (or the pool is closing), rather than that the server failed.
+fn is_concurrent_acquire(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::Interrupted {
+        return true;
+    }
+    use crate::lsp::bridge::pool::BridgeError;
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<BridgeError>())
+        .is_some_and(BridgeError::is_initializing)
+}
+
 fn resolve_reload_server_config(
     settings: &WorkspaceSettings,
     server_name: &str,
@@ -298,7 +311,9 @@ impl BridgeCoordinator {
     }
 
     /// Spawn every configured server that asks to start without waiting for a
-    /// document (`forceStart`), returning how many now hold a connection.
+    /// document (`forceStart`), returning how many warm-up acquires were
+    /// launched — attempts, not connections: each one is detached, so none of
+    /// them has resolved a key or started a process by the time this returns.
     ///
     /// Runs at each settings application, so a reload that adds the flag —  or
     /// adds the server — starts it then, and one that removes the flag simply
@@ -322,7 +337,13 @@ impl BridgeCoordinator {
     /// for a heavy server's whole startup, let alone for a fleet of them.
     /// Failures are logged there and never propagated here.
     ///
-    /// Returns how many acquires were launched. bridge-routing-protocol
+    /// The acquires are also **untracked**, unlike the eager-open tasks this
+    /// coordinator registers abort handles for. They need no abort path: the
+    /// pool refuses new spawns once shutdown begins, and it checks that inside
+    /// the same `connections` lock `shutdown_all` takes to snapshot, so a
+    /// racing warm-up is either rejected or already in the snapshot.
+    ///
+    /// bridge-routing-protocol
     /// additionally asks that a `forceStart` slot be *registered* before the
     /// configuration mandating it becomes observable to `didOpen`, so that a
     /// racing first open cannot enumerate an empty provider set. Nothing here
@@ -333,8 +354,10 @@ impl BridgeCoordinator {
     /// third acquire variant with no caller to justify it.
     pub(crate) fn force_start_servers(&self, settings: &WorkspaceSettings) -> usize {
         let servers = &settings.language_servers;
-        // Deterministic order so a fleet's processes are launched the same way
-        // every session — the config map's iteration order is not.
+        let wildcard = servers.get(crate::config::WILDCARD_KEY);
+        // Deterministic order, so the log reads the same way every session
+        // where the config map's iteration order would not. It orders the
+        // launches only — the acquires themselves are detached and race.
         let mut names: Vec<&String> = servers
             .keys()
             .filter(|name| name.as_str() != crate::config::WILDCARD_KEY)
@@ -343,24 +366,58 @@ impl BridgeCoordinator {
 
         let mut launched = 0;
         for name in names {
-            let Some(config) = resolve_reload_server_config(settings, name) else {
+            // Gate on the two fields alone before merging anything. Resolving
+            // a whole config clones every field and deep-merges the wildcard's
+            // `settings` and `initializationOptions` JSON, and this runs for
+            // every configured server on every settings application — so the
+            // merge belongs on the servers that actually force-start, not on
+            // the fleet. (The same reason `is_spawnable_with_wildcard` exists.)
+            let Some(config) = servers.get(name) else {
                 continue;
             };
             // Spawnability outranks the flag: `forceStart` says when a
             // configured server starts, not whether a disabled or
             // command-less one may.
-            if !config.forces_start() || !config.is_spawnable() {
+            if !config.forces_start_with_wildcard(wildcard)
+                || !config.is_spawnable_with_wildcard(wildcard)
+            {
                 continue;
             }
+            let Some(config) = resolve_reload_server_config(settings, name) else {
+                continue;
+            };
+
             let pool = Arc::clone(&self.pool);
             let name = name.clone();
             tokio::spawn(async move {
-                if let Err(error) = pool.get_or_create_connection(&name, &config, None).await {
-                    log::warn!(
+                let Err(error) = pool.get_or_create_connection(&name, &config, None).await else {
+                    return;
+                };
+                // Two errors mean "someone else is already doing this", not
+                // failure: a previous application's acquire is still shaking
+                // hands, or the pool is shutting down. Both are ordinary — a
+                // client that pushes configuration right after `initialized`
+                // hits the first one every session — and reporting them as
+                // failures would train the user to ignore the message.
+                if is_concurrent_acquire(&error) {
+                    log::debug!(
                         target: "kakehashi::bridge",
-                        "forceStart could not start language server '{name}': {error}"
+                        "forceStart for '{name}' deferred to an acquire already in flight: {error}"
                     );
+                    return;
                 }
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "forceStart could not start language server '{name}': {error}"
+                );
+                // The editor has to hear this one. A warm-up failure is
+                // otherwise invisible by construction: with an unset
+                // `RUST_LOG` the line above is filtered out, and a server
+                // nothing routes to has no request whose failure would
+                // surface it either.
+                pool.warn_to_editor(format!(
+                    "forceStart could not start language server '{name}': {error}"
+                ));
             });
             launched += 1;
         }
@@ -1476,6 +1533,7 @@ mod tests {
     use crate::config::LanguageSettings;
     use crate::config::settings::{BridgeLanguageConfig, LANGUAGES_WILDCARD};
     use crate::lsp::bridge::ConnectionKey;
+    use crate::lsp::bridge::pool::ConnectionState;
 
     #[test]
     fn reload_resolution_does_not_resurrect_deleted_server_from_wildcard() {
@@ -1516,27 +1574,46 @@ mod tests {
         }
     }
 
-    /// The connection keys once `expected` acquires have reached the pool.
+    /// The connection keys once `expected` acquires have reached the pool, and
+    /// nothing more has since.
     ///
     /// `force_start_servers` detaches each acquire, and an acquire inserts its
     /// `Initializing` handle before running the handshake — which these idle
     /// servers never answer. So the assertion point is the insertion, reached
     /// by polling rather than by awaiting a readiness that will not come.
+    ///
+    /// The settle after the count is reached is what lets a caller assert that
+    /// a server did *not* start: returning the instant `expected` appears
+    /// would never observe a spurious connection landing a moment later.
+    /// Timing out panics rather than returning a short list, so a loaded
+    /// machine reports a timeout instead of an inscrutable wrong-value diff.
     async fn started_servers(coordinator: &BridgeCoordinator, expected: usize) -> Vec<String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let connections = coordinator.pool().connections().await;
-            if connections.len() >= expected || std::time::Instant::now() > deadline {
-                let mut names: Vec<String> = connections
-                    .keys()
-                    .map(|key| key.server().to_string())
-                    .collect();
-                names.sort();
-                return names;
+            let reached = coordinator.pool().connections().await.len() >= expected;
+            assert!(
+                reached || std::time::Instant::now() <= deadline,
+                "timed out waiting for {expected} warm-up connection(s)"
+            );
+            if reached {
+                break;
             }
-            drop(connections);
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let connections = coordinator.pool().connections().await;
+        let mut names: Vec<String> = connections
+            .keys()
+            .map(|key| key.server().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names.len(),
+            expected,
+            "a server outside the expected set started: {names:?}"
+        );
+        names
     }
 
     /// `forceStart` exists for servers nothing else would ever start: with
@@ -1556,9 +1633,15 @@ mod tests {
         assert_eq!(started_servers(&coordinator, 1).await, ["policy-server"]);
     }
 
-    /// Idempotent per key: a reload re-runs the pass, and a server already
-    /// running under the key it resolves to is left alone rather than
-    /// double-spawned.
+    /// A reload re-runs the pass, and a server whose first acquire has not
+    /// finished is left alone rather than double-spawned.
+    ///
+    /// This pins the *concurrent* case specifically: these idle servers never
+    /// answer `initialize`, so the connection is still `Initializing` when the
+    /// second pass arrives and the pool refuses the acquire outright. That is
+    /// the branch a client which pushes configuration right after
+    /// `initialized` takes every session, and the one whose error must not be
+    /// reported to the user as a failure.
     #[tokio::test]
     async fn force_start_is_idempotent_across_reloads() {
         let coordinator = BridgeCoordinator::new();
@@ -1575,18 +1658,50 @@ mod tests {
             .map(Arc::clone)
             .expect("the first pass spawned a connection");
 
+        assert_eq!(
+            first.state(),
+            ConnectionState::Initializing,
+            "the case under test is a second pass arriving mid-handshake"
+        );
+
         assert_eq!(coordinator.force_start_servers(&settings), 1);
         // Two acquires for one key serialize on the pool lock; the second must
-        // find the first's handle rather than spawn a second process. Give it
-        // room to do the wrong thing before asserting it didn't.
+        // leave the first's handle alone rather than spawn a second process.
+        // Give it room to do the wrong thing before asserting it didn't.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let connections = coordinator.pool().connections().await;
         assert_eq!(connections.len(), 1, "no second process for the same key");
         assert!(
             Arc::ptr_eq(&first, connections.values().next().unwrap()),
-            "the running connection is reused, not replaced"
+            "the running connection survives, rather than being replaced"
         );
         drop(connections);
+    }
+
+    /// The refusal a second pass gets while the first is still shaking hands
+    /// is not a failure, and must not be reported to the user as one — a
+    /// client that pushes configuration right after `initialized` would
+    /// otherwise produce a spurious warning every session.
+    #[test]
+    fn a_concurrent_acquire_is_not_a_forced_start_failure() {
+        use crate::lsp::bridge::pool::BridgeError;
+
+        assert!(is_concurrent_acquire(&BridgeError::Initializing.into()));
+        assert!(is_concurrent_acquire(&std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "bridge pool is shutting down; rejecting new connection spawn",
+        )));
+        assert!(
+            !is_concurrent_acquire(&std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory (os error 2)",
+            )),
+            "a missing command is exactly what the user has to be told about"
+        );
+        assert!(
+            !is_concurrent_acquire(&BridgeError::Disabled.into()),
+            "a server disabled after repeated handshake failures is a failure"
+        );
     }
 
     /// Spawnability outranks the flag: `forceStart` asks *when* a configured
