@@ -153,10 +153,14 @@ force terminates.
 ```
 1. Transition to Closing state (new operations rejected)
 2. Close queue admission — accepted operations still drain
-3. Writer drains the accepted queue in FIFO order, then yields stdin
-4. Shutdown sequence writes `shutdown` / `exit` over the yielded stdin
-   ── or, if step 3 did not complete within its bound, skips to ──
+3. Everything already accepted goes out, in FIFO order
+4. `shutdown` / `exit` follow it
+   ── or, if step 3 did not complete within its bound, skip to ──
 5. Force terminate (SIGTERM → SIGKILL)
+
+This is the order the *server* observes. How the shutdown sequence comes to
+be the only writer is unspecified; that it must be, before step 4, is
+§ Invariants.
 ```
 
 Draining before the handshake is what makes `shutdown` unable to overtake a
@@ -649,5 +653,5 @@ state of an ADR here:
 - **2026-01-06**: Merged Amendment 001 - Added three-phase writer loop shutdown synchronization to prevent stdin corruption during concurrent shutdown writes
 - **2026-08-11**: Corrected Initialization Shutdown - the abort path sends no LSP message at all (the earlier revision sent `exit` before the initialize response, which LSP ordering forbids); adopted alongside bridge-client-control-protocol, whose per-slot `stop` shares the path
 - **2026-08-11**: Reconciled the Operation Disposal Policy with the Closing-state gating and the writer's actual behavior - the accepted order queue drains ahead of `shutdown` (the earlier table said queued operations are never sent, contradicting § Operation Gating and the FIFO writer)
-- **2026-08-12**: Replaced the lock-based concurrent lifecycle-control design with the Lifecycle Actor - all lifecycle transitions (stop/restart/teardown/spawn-commit) serialize through one pool-owned actor, dissolving the single-flight registry, lease-owner map, supervisor-owned transactional teardown state, and durable-record finalizer machinery the earlier revision had accreted (now recorded as rejected Alternative 4); observable contracts in bridge-client-control-protocol are unchanged
+- **2026-08-12**: Replaced the lock-based concurrent lifecycle-control design with the Lifecycle Actor as the **target design** (implementation pending — see § Decision–Implementation Gap) - all lifecycle transitions (stop/restart/teardown/spawn-commit) serialize through one pool-owned actor, dissolving the single-flight registry, lease-owner map, supervisor-owned transactional teardown state, and durable-record finalizer machinery the earlier revision had accreted (now recorded as rejected Alternative 4); observable contracts in bridge-client-control-protocol are unchanged
 - **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - deleted the lifecycle-actor and writer-handoff implementation mechanics (escrow slots, kill-on-drop guards, scratch-copy staging, commit-and-reply swaps, generation-bound receivers, settlement markers, the message-enum and coordination sketches, the writer-idle constant), and added an Invariants section recording the traps that machinery closed. Replaced the aspirational-design note with a Decision–Implementation Gap section, dropping its stop-oneshot and writer-return-channel divergences as no longer load-bearing and adding the lifecycle-actor and escalation-reserve gaps. No contract changed.

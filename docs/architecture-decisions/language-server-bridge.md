@@ -83,7 +83,10 @@ These constraints mean bridging is not simply "forward request, return response"
 
 - Servers must be listed in user configuration with explicit `cmd` field
 - No shell expansion or command interpolation in server commands
-- Temp files contain only extracted source code, never executable content
+- Injection content reaches servers as in-memory virtual documents, never as
+  files written to disk, so this decision adds no data-at-rest surface
+  (§ Provisioning Flow; the temp-file design it replaced is retained as
+  history under § Temporary File Management)
 
 ### Server Connection Pool
 

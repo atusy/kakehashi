@@ -966,8 +966,8 @@ ordinary marker resolution an override entry needs to construct its
 trust anchor and its configuration-resolved stopped key (marker walks
 make synchronous metadata calls that a network or automounted path can
 stall) — runs off the async executor on a **globally bounded validation
-pool** (bounded concurrency with a
-bounded queue), charged against the caller's remaining budget; at the
+pool** with a bounded
+backlog, charged against the caller's remaining budget; at the
 deadline the affected entry drops (per-entry, as normalization defines)
 and the orphaned blocking call's result
 is discarded — the *decision's* latency stays bounded even where an OS
