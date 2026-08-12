@@ -30,6 +30,7 @@ mod client_progress;
 mod connection;
 pub(crate) mod coordinator;
 mod inbound_request_registry;
+mod peer;
 mod pool;
 mod progress_registry;
 mod protocol;
