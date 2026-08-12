@@ -92,6 +92,7 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
             // generated template documents the opt-in and the knob is
             // discoverable (#391). Concrete servers inherit it via the wildcard.
             prefer_shared_instance: Some(false),
+            force_start: None,
             settings: None,
             // Spell out the built-in default (every server enabled) so the
             // template documents the opt-out knob: setting this to `false`

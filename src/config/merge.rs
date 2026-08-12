@@ -127,6 +127,8 @@ pub(crate) fn merge_bridge_server_configs(
         prefer_shared_instance: overlay
             .prefer_shared_instance
             .or(base.prefer_shared_instance),
+        // Overlay-wins-when-present, mirroring `prefer_shared_instance`.
+        force_start: overlay.force_start.or(base.force_start),
         // Overlay-wins-when-present, mirroring `prefer_shared_instance`: a
         // concrete server's explicit `enabled` overrides the wildcard, so
         // `_.enabled: false` can be opted back into per server.
@@ -723,6 +725,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        force_start: None,
                         enabled: None,
                         settings: None,
                     },
@@ -736,6 +739,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        force_start: None,
                         enabled: None,
                         settings: None,
                     },
@@ -806,6 +810,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        force_start: None,
                         enabled: None,
                         settings: None,
                     },
@@ -823,6 +828,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        force_start: None,
                         enabled: None,
                         settings: None,
                     },
@@ -888,6 +894,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    force_start: None,
                     enabled: None,
                     settings: None,
                 },
@@ -1279,6 +1286,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1297,6 +1305,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1316,6 +1325,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    force_start: None,
                     enabled: None,
                     settings: None,
                 },
@@ -1329,6 +1339,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    force_start: None,
                     enabled: None,
                     settings: None,
                 },
@@ -1360,6 +1371,7 @@ mod tests {
             workspace_markers: Some(vec![RootMarker::Single(".git".to_string())]),
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -1372,6 +1384,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -1417,6 +1430,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: prefer,
+            force_start: None,
             settings: None,
             enabled: None,
         };
@@ -1444,6 +1458,42 @@ mod tests {
         );
     }
 
+    /// `force_start` merges overlay-wins-when-present like its siblings, so a
+    /// blanket `languageServers._.forceStart: true` can be opted out of per
+    /// server (bridge-routing-protocol).
+    #[test]
+    fn test_merge_bridge_server_configs_force_start() {
+        use settings::BridgeServerConfig;
+
+        let server = |force: Option<bool>| BridgeServerConfig {
+            cmd: None,
+            languages: None,
+            initialization_options: None,
+            workspace_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+            force_start: force,
+            settings: None,
+            enabled: None,
+        };
+
+        let base = server(Some(true));
+        assert_eq!(
+            merge_bridge_server_configs(&base, &server(None)).force_start,
+            Some(true),
+            "unset overlay inherits the wildcard opt-in"
+        );
+        assert_eq!(
+            merge_bridge_server_configs(&base, &server(Some(false))).force_start,
+            Some(false),
+            "explicit false opts a server out of the wildcard opt-in"
+        );
+        assert_eq!(
+            merge_bridge_server_configs(&server(None), &server(Some(true))).force_start,
+            Some(true),
+        );
+    }
+
     /// `enabled` merges overlay-wins-when-present, exactly like
     /// `prefer_shared_instance`, so a `languageServers._.enabled: false` can
     /// disable every server by default while a concrete server opts back in
@@ -1459,6 +1509,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             settings: None,
             enabled,
         };
@@ -1508,6 +1559,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -1522,6 +1574,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -1612,6 +1665,7 @@ mod tests {
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -1765,6 +1819,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    force_start: None,
                     enabled: None,
                     settings: None,
                 },
@@ -1779,6 +1834,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    force_start: None,
                     enabled: None,
                     settings: None,
                 },
@@ -1820,6 +1876,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    force_start: None,
                     enabled: None,
                     settings: None,
                 },
@@ -1834,6 +1891,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    force_start: None,
                     enabled: None,
                     settings: None,
                 },
@@ -2178,6 +2236,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled,
             settings: None,
         };

@@ -1097,10 +1097,25 @@ configured. Two pieces close most of the gap:
 - **`languageServers.<name>.forceStart`** (new config; `None` = inherit
   from the wildcard, built-in default `false`, matching the
   `enabled`/`preferSharedInstance` inheritance shape): spawn this server
-  eagerly, with no triggering document. The spawn fires **after the first
-  effective configuration is published** (spawning at `initialize` would
-  use a configuration the client's first settings push routinely
-  replaces, evicting the fresh connection as pure churn), and rides the
+  eagerly, with no triggering document. The spawn fires **at each
+  effective configuration application**, the earliest of which is
+  `initialize`'s own. An earlier draft deferred it past that first
+  application, on the grounds that the client's first settings push
+  routinely replaces the configuration and would evict the fresh
+  connection as pure churn. As shipped it fires on every application
+  including the first, because deferring makes the flag unreachable for a
+  client that neither pushes settings nor supports the
+  `workspace/configuration` pull — exactly the policy-server pattern's
+  client. The churn accepted in exchange is narrow: an eviction needs the
+  first configuration to already carry a spawnable `forceStart` server
+  *and* the later push to change that server's launch config, since
+  propagation evicts only on a launch-config change — and each later
+  application re-asserts the flag, so an evicted warm-up comes back. It
+  runs **after** propagation within an application, so a reload cannot
+  evict the warm-up it just started. Each acquire is **detached**: an
+  acquire runs the handshake to completion before returning, and no
+  warm-up may hold settings publication for a heavy server's startup.
+  The spawn rides the
   ordinary acquire path as a **get-or-create inside the acquire critical
   section** — with no document there is no marker walk, so it resolves
   the same marker-less fallback shape a document-less acquire produces
@@ -1116,14 +1131,18 @@ configured. Two pieces close most of the gap:
   server simply serves nothing new, per the existing fallback. It
   observes the stopped set and control registry exactly as a lazy
   acquire does, colliding rather than double-spawning when one races
-  it. Its `Initializing` handle is registered **before the
+  it. (**Target state**, landing with the routing decision it exists
+  for — today's warm-up detaches its acquire, so the handle appears when
+  that task runs.) Its `Initializing` handle is registered **before the
   configuration that mandates it becomes observable to `didOpen`
-  processing** — the insertion rides the same publication fence that
-  already serializes settings with acquires, so no first `didOpen` can
+  processing**, so no first `didOpen` can
   slip between the config publishing and its `forceStart` slots
   existing, enumerate an empty provider set, and commit a fallback
   binding that the freeze would then retain past the provider's
-  arrival. That fallback shape is also the
+  arrival. No such fence exists in the code today — nothing spans the
+  settings snapshot's publication and an acquire — and the gap is
+  unobservable until routing bindings exist, so buying it is that
+  decision's work, not the warm-up's. That fallback shape is also the
   honest scope of the warm-up: documents under marker roots resolve
   *marker* keys and will not reuse the warmed connection, so `forceStart`
   warms a usable connection only for shared-instance servers, marker-less

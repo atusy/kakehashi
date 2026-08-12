@@ -1,6 +1,5 @@
 ---
 source: src/config/merge.rs
-assertion_line: 871
 expression: result
 ---
 {
@@ -86,6 +85,7 @@ expression: result
       "workspaceMarkers": null,
       "onTypeFormattingTriggers": null,
       "preferSharedInstance": null,
+      "forceStart": null,
       "enabled": null
     },
     "pyright": {
@@ -100,6 +100,7 @@ expression: result
       "workspaceMarkers": null,
       "onTypeFormattingTriggers": null,
       "preferSharedInstance": null,
+      "forceStart": null,
       "enabled": null
     },
     "rust-analyzer": {
@@ -118,6 +119,7 @@ expression: result
       "workspaceMarkers": null,
       "onTypeFormattingTriggers": null,
       "preferSharedInstance": null,
+      "forceStart": null,
       "enabled": null
     }
   }

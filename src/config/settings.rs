@@ -485,6 +485,26 @@ pub struct BridgeServerConfig {
     /// wildcard, so `_.preferSharedInstance: true` can be opted out of
     /// per server with `preferSharedInstance: false`.
     pub prefer_shared_instance: Option<bool>,
+    /// Spawn this server as soon as configuration is published, instead of
+    /// waiting for a document that routes to it (bridge-routing-protocol).
+    ///
+    /// With no triggering document there is no marker root to walk, so the
+    /// connection is keyed the way any document-less acquire is: the shared
+    /// key for a `preferSharedInstance` server, the client-fallback root
+    /// otherwise (rootless in a workspace-less session). That is also the
+    /// honest scope of the warm-up — documents under marker roots resolve
+    /// *marker* keys and will not reuse this connection, so setting it on an
+    /// ordinary per-root server pre-spawns a process most documents bypass.
+    /// It earns its keep for shared-instance servers, marker-less workspaces,
+    /// and a server that no document would ever start (`languages = []`).
+    ///
+    /// Within a session the flag is effectively one-way: a reload that flips
+    /// it to `false` never stops an already-running server.
+    ///
+    /// `None` = inherit (built-in default `false` = spawn lazily). Like
+    /// `prefer_shared_instance`, a concrete server's explicit value overrides
+    /// the wildcard.
+    pub force_start: Option<bool>,
     /// Whether this server is eligible to be spawned/used at all.
     ///
     /// `None` = inherit (built-in default `true`). Like `root_markers` and
@@ -499,6 +519,12 @@ impl BridgeServerConfig {
     /// (`None`) case to the built-in default `false` (per-root instances).
     pub(crate) fn prefers_shared_instance(&self) -> bool {
         self.prefer_shared_instance.unwrap_or(false)
+    }
+
+    /// Effective `force_start` preference, resolving the inherit (`None`) case
+    /// to the built-in default `false` (spawn lazily).
+    pub(crate) fn forces_start(&self) -> bool {
+        self.force_start.unwrap_or(false)
     }
 
     /// Effective `enabled` state, resolving the inherit (`None`) case to the
@@ -1930,6 +1956,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled,
             settings: None,
         };
@@ -1985,6 +2012,36 @@ mod tests {
             servers["pyright"].prefer_shared_instance, None,
             "absent preferSharedInstance parses as None (inherit -> per-root)"
         );
+    }
+
+    #[test]
+    fn should_parse_force_start() {
+        let config_json = r#"{
+            "languageServers": {
+                "policy-server": {
+                    "cmd": ["my-policy-server"],
+                    "languages": [],
+                    "forceStart": true
+                },
+                "pyright": {
+                    "cmd": ["pyright-langserver", "--stdio"],
+                    "languages": ["python"]
+                }
+            }
+        }"#;
+
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
+        let servers = settings.language_servers.expect("languageServers parses");
+        assert_eq!(
+            servers["policy-server"].force_start,
+            Some(true),
+            "explicit forceStart is preserved"
+        );
+        assert_eq!(
+            servers["pyright"].force_start, None,
+            "absent forceStart parses as None (inherit -> lazy spawn)"
+        );
+        assert!(!servers["pyright"].forces_start());
     }
 
     #[test]
@@ -2055,6 +2112,7 @@ mod tests {
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -2094,6 +2152,7 @@ mod tests {
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
+            force_start: None,
             enabled,
             settings: None,
         };
@@ -2178,6 +2237,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: Some(vec![";".to_string()]),
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2201,6 +2261,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: Some(vec![String::new()]),
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2379,6 +2440,7 @@ mod tests {
             ]),
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };

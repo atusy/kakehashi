@@ -233,6 +233,18 @@ pub(super) async fn apply_shared_settings_locked(
     // At initialize time there are no connections yet, so it is a clean no-op
     // (downstream-settings-propagation).
     let pushed = bridge.propagate_settings(&settings).await;
+    // After propagation, not before: propagation evicts connections whose
+    // launch config changed, and a warm-up started ahead of it would be
+    // spawned only to be torn down by the same reload. Every settings
+    // application re-asserts the flag, so a server that gains `forceStart` on
+    // reload starts then (bridge-routing-protocol).
+    let force_started = bridge.force_start_servers(&settings);
+    if force_started > 0 {
+        log::debug!(
+            target: "kakehashi::bridge",
+            "Starting {force_started} language server(s) eagerly (forceStart)"
+        );
+    }
     if pushed > 0 {
         log::debug!(
             target: "kakehashi::bridge",

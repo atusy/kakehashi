@@ -74,6 +74,12 @@ fn same_launch_config(
         workspace_markers: old_workspace_markers,
         on_type_formatting_triggers: old_on_type_formatting_triggers,
         prefer_shared_instance: _,
+        // Not a launch input: `force_start` decides whether a connection is
+        // spawned before any document asks for one, never how the process is
+        // launched. Tearing a live connection down over a flip would restart a
+        // server for no observable difference — and the flag is one-way within
+        // a session anyway (bridge-routing-protocol).
+        force_start: _,
         enabled: _,
     } = old;
     let BridgeServerConfig {
@@ -84,6 +90,7 @@ fn same_launch_config(
         workspace_markers: new_workspace_markers,
         on_type_formatting_triggers: new_on_type_formatting_triggers,
         prefer_shared_instance: _,
+        force_start: _,
         enabled: _,
     } = new;
     old_cmd == new_cmd
@@ -3850,6 +3857,7 @@ mod tests {
     fn shared_config() -> crate::config::settings::BridgeServerConfig {
         crate::config::settings::BridgeServerConfig {
             prefer_shared_instance: Some(true),
+            force_start: None,
             settings: None,
             ..devnull_config()
         }
@@ -4983,6 +4991,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -8514,6 +8523,7 @@ mod tests {
         let inherited = crate::config::settings::BridgeServerConfig::default();
         let explicit = crate::config::settings::BridgeServerConfig {
             prefer_shared_instance: Some(false),
+            force_start: None,
             enabled: Some(true),
             ..Default::default()
         };

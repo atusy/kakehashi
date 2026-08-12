@@ -43,6 +43,7 @@ pub(crate) const KNOWN_BRIDGE_LANGUAGE_SETTING_KEYS: &[&str] = &["aggregation", 
 pub(crate) const KNOWN_BRIDGE_SERVER_SETTING_KEYS: &[&str] = &[
     "cmd",
     "enabled",
+    "forceStart",
     "initializationOptions",
     "languages",
     "onTypeFormattingTriggers",

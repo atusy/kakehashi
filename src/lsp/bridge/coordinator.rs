@@ -297,6 +297,76 @@ impl BridgeCoordinator {
             .await
     }
 
+    /// Spawn every configured server that asks to start without waiting for a
+    /// document (`forceStart`), returning how many now hold a connection.
+    ///
+    /// Runs at each settings application, so a reload that adds the flag —  or
+    /// adds the server — starts it then, and one that removes the flag simply
+    /// stops re-asserting it: within a session the flag is one-way, since
+    /// nothing here stops a running server (bridge-routing-protocol).
+    ///
+    /// Ordinary get-or-create, so a server already running under the key it
+    /// resolves to is reused rather than double-spawned, and one racing a
+    /// document's lazy acquire collides with it on the same key instead of
+    /// forking a second process. With no document there is no marker walk, so
+    /// the key is whatever a document-less acquire produces — the shared key
+    /// for a `preferSharedInstance` server, the client-fallback root
+    /// otherwise. Documents under marker roots resolve *marker* keys and so
+    /// will not reuse this connection; that limit is recorded on the config
+    /// field itself.
+    ///
+    /// Each acquire is **detached**, and that is the whole reason this
+    /// function does not await: an acquire runs the LSP handshake to
+    /// completion before it returns, up to the initialization timeout, and a
+    /// warm-up must never hold settings publication — or the reload lock —
+    /// for a heavy server's whole startup, let alone for a fleet of them.
+    /// Failures are logged there and never propagated here.
+    ///
+    /// Returns how many acquires were launched. bridge-routing-protocol
+    /// additionally asks that a `forceStart` slot be *registered* before the
+    /// configuration mandating it becomes observable to `didOpen`, so that a
+    /// racing first open cannot enumerate an empty provider set. Nothing here
+    /// provides that fence: the insertion happens inside the detached
+    /// acquire. It is deferred deliberately — the guarantee is only
+    /// observable once routing decisions and their bindings exist, and buying
+    /// it now would mean either blocking publication on process startup or a
+    /// third acquire variant with no caller to justify it.
+    pub(crate) fn force_start_servers(&self, settings: &WorkspaceSettings) -> usize {
+        let servers = &settings.language_servers;
+        // Deterministic order so a fleet's processes are launched the same way
+        // every session — the config map's iteration order is not.
+        let mut names: Vec<&String> = servers
+            .keys()
+            .filter(|name| name.as_str() != crate::config::WILDCARD_KEY)
+            .collect();
+        names.sort();
+
+        let mut launched = 0;
+        for name in names {
+            let Some(config) = resolve_reload_server_config(settings, name) else {
+                continue;
+            };
+            // Spawnability outranks the flag: `forceStart` says when a
+            // configured server starts, not whether a disabled or
+            // command-less one may.
+            if !config.forces_start() || !config.is_spawnable() {
+                continue;
+            }
+            let pool = Arc::clone(&self.pool);
+            let name = name.clone();
+            tokio::spawn(async move {
+                if let Err(error) = pool.get_or_create_connection(&name, &config, None).await {
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "forceStart could not start language server '{name}': {error}"
+                    );
+                }
+            });
+            launched += 1;
+        }
+        launched
+    }
+
     /// Access the cancel forwarder.
     ///
     /// Used by:
@@ -1405,6 +1475,7 @@ mod tests {
     use super::*;
     use crate::config::LanguageSettings;
     use crate::config::settings::{BridgeLanguageConfig, LANGUAGES_WILDCARD};
+    use crate::lsp::bridge::ConnectionKey;
 
     #[test]
     fn reload_resolution_does_not_resurrect_deleted_server_from_wildcard() {
@@ -1418,6 +1489,185 @@ mod tests {
         );
 
         assert!(resolve_reload_server_config(&settings, "deleted").is_none());
+    }
+
+    /// A server config whose command runs harmlessly forever: enough to
+    /// occupy a connection slot without answering an LSP handshake.
+    fn force_start_settings(entries: &[(&str, BridgeServerConfig)]) -> WorkspaceSettings {
+        let mut settings = WorkspaceSettings::default();
+        for (name, config) in entries {
+            settings
+                .language_servers
+                .insert((*name).to_string(), config.clone());
+        }
+        settings
+    }
+
+    fn idle_server(force_start: bool, languages: Vec<String>) -> BridgeServerConfig {
+        BridgeServerConfig {
+            cmd: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "cat > /dev/null".to_string(),
+            ]),
+            languages: Some(languages),
+            force_start: force_start.then_some(true),
+            ..Default::default()
+        }
+    }
+
+    /// The connection keys once `expected` acquires have reached the pool.
+    ///
+    /// `force_start_servers` detaches each acquire, and an acquire inserts its
+    /// `Initializing` handle before running the handshake — which these idle
+    /// servers never answer. So the assertion point is the insertion, reached
+    /// by polling rather than by awaiting a readiness that will not come.
+    async fn started_servers(coordinator: &BridgeCoordinator, expected: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let connections = coordinator.pool().connections().await;
+            if connections.len() >= expected || std::time::Instant::now() > deadline {
+                let mut names: Vec<String> = connections
+                    .keys()
+                    .map(|key| key.server().to_string())
+                    .collect();
+                names.sort();
+                return names;
+            }
+            drop(connections);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// `forceStart` exists for servers nothing else would ever start: with
+    /// `languages = []` the server is in no document's candidate set, so no
+    /// lazy acquire can fire for it (bridge-routing-protocol's policy-server
+    /// pattern). Without the flag the same entry stays unspawned.
+    #[tokio::test]
+    async fn force_start_spawns_a_server_no_document_would() {
+        let coordinator = BridgeCoordinator::new();
+        let settings = force_start_settings(&[
+            ("policy-server", idle_server(true, vec![])),
+            ("lazy-server", idle_server(false, vec!["lua".to_string()])),
+        ]);
+
+        assert_eq!(coordinator.force_start_servers(&settings), 1);
+
+        assert_eq!(started_servers(&coordinator, 1).await, ["policy-server"]);
+    }
+
+    /// Idempotent per key: a reload re-runs the pass, and a server already
+    /// running under the key it resolves to is left alone rather than
+    /// double-spawned.
+    #[tokio::test]
+    async fn force_start_is_idempotent_across_reloads() {
+        let coordinator = BridgeCoordinator::new();
+        let settings = force_start_settings(&[("policy-server", idle_server(true, vec![]))]);
+
+        assert_eq!(coordinator.force_start_servers(&settings), 1);
+        started_servers(&coordinator, 1).await;
+        let first = coordinator
+            .pool()
+            .connections()
+            .await
+            .values()
+            .next()
+            .map(Arc::clone)
+            .expect("the first pass spawned a connection");
+
+        assert_eq!(coordinator.force_start_servers(&settings), 1);
+        // Two acquires for one key serialize on the pool lock; the second must
+        // find the first's handle rather than spawn a second process. Give it
+        // room to do the wrong thing before asserting it didn't.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let connections = coordinator.pool().connections().await;
+        assert_eq!(connections.len(), 1, "no second process for the same key");
+        assert!(
+            Arc::ptr_eq(&first, connections.values().next().unwrap()),
+            "the running connection is reused, not replaced"
+        );
+        drop(connections);
+    }
+
+    /// Spawnability outranks the flag: `forceStart` asks *when* a configured
+    /// server starts, never whether a disabled or command-less one may.
+    #[tokio::test]
+    async fn force_start_never_starts_an_unspawnable_server() {
+        let coordinator = BridgeCoordinator::new();
+        let disabled = BridgeServerConfig {
+            enabled: Some(false),
+            ..idle_server(true, vec![])
+        };
+        let no_cmd = BridgeServerConfig {
+            cmd: None,
+            ..idle_server(true, vec![])
+        };
+        let settings = force_start_settings(&[("disabled", disabled), ("no-cmd", no_cmd)]);
+
+        assert_eq!(coordinator.force_start_servers(&settings), 0);
+        assert!(coordinator.pool().connections().await.is_empty());
+    }
+
+    /// The wildcard supplies the flag like any other field, and — as with
+    /// `preferSharedInstance` — a concrete server can opt out of a blanket
+    /// opt-in. The wildcard entry itself is a template, never a server.
+    #[tokio::test]
+    async fn force_start_inherits_the_wildcard_and_can_be_opted_out_of() {
+        let coordinator = BridgeCoordinator::new();
+        let mut settings = force_start_settings(&[
+            ("inheritor", idle_server(false, vec!["lua".to_string()])),
+            (
+                "opted-out",
+                BridgeServerConfig {
+                    force_start: Some(false),
+                    ..idle_server(false, vec!["lua".to_string()])
+                },
+            ),
+        ]);
+        settings.language_servers.insert(
+            crate::config::WILDCARD_KEY.to_string(),
+            BridgeServerConfig {
+                force_start: Some(true),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(coordinator.force_start_servers(&settings), 1);
+        assert_eq!(started_servers(&coordinator, 1).await, ["inheritor"]);
+    }
+
+    /// With no document there is no marker to walk, so the connection lands on
+    /// the same key any document-less acquire produces: the shared key for a
+    /// `preferSharedInstance` server, the client-fallback root otherwise. That
+    /// is the honest scope of the warm-up, and the key is what a later
+    /// document has to match to reuse the process.
+    #[tokio::test]
+    async fn force_start_lands_on_the_document_less_key() {
+        let coordinator = BridgeCoordinator::new();
+        let settings = force_start_settings(&[
+            ("per-root", idle_server(true, vec![])),
+            (
+                "shared",
+                BridgeServerConfig {
+                    prefer_shared_instance: Some(true),
+                    ..idle_server(true, vec![])
+                },
+            ),
+        ]);
+
+        assert_eq!(coordinator.force_start_servers(&settings), 2);
+        started_servers(&coordinator, 2).await;
+
+        let connections = coordinator.pool().connections().await;
+        let mut keys: Vec<&ConnectionKey> = connections.keys().collect();
+        assert_eq!(keys.len(), 2, "both warm-ups must have reached the pool");
+        keys.sort_by_key(|key| key.server().to_string());
+        assert!(
+            keys[0].is_client_fallback(),
+            "a per-root server with no document has no marker root to key on"
+        );
+        assert_eq!(keys[1], &ConnectionKey::shared("shared"));
+        drop(connections);
     }
 
     /// Shutdown's `abort_all_eager_open` must drain the host-layer eager-open
@@ -1528,6 +1778,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1560,6 +1811,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -1611,6 +1863,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1625,6 +1878,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1683,6 +1937,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1731,6 +1986,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -1896,6 +2152,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1938,6 +2195,7 @@ mod tests {
                 )]),
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1951,6 +2209,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2011,6 +2270,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: Some(false),
                 settings: None,
             },
@@ -2024,6 +2284,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2081,6 +2342,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: Some(false),
                 settings: None,
             },
@@ -2094,6 +2356,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: Some(true),
                 settings: None,
             },
@@ -2131,6 +2394,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2144,6 +2408,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2519,6 +2784,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2557,6 +2823,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2676,6 +2943,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2902,6 +3170,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
