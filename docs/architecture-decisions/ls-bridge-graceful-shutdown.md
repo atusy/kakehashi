@@ -599,9 +599,10 @@ state of an ADR here:
   writer-idle share.
 - **Initialization shutdown does not take the direct-termination path.**
   Teardown sends `Initializing` handles through the same graceful sequence as
-  `Ready` ones, which writes `shutdown` and then `exit` unconditionally — so
-  a connection still awaiting its initialize response receives both, which
-  § Initialization Shutdown forbids and LSP ordering forbids outright. This
+  `Ready` ones, so a connection still awaiting its initialize response is
+  always sent `shutdown` — and then `exit` too, if that response wait
+  resolves. The `shutdown` alone is already what § Initialization Shutdown
+  and LSP ordering forbid. This
   is the one gap here that is a live conformance defect rather than a missing
   refinement.
 - **The escalation reserve does not exist.** The ceiling bounds the graceful

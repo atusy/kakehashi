@@ -114,8 +114,10 @@ indistinguishable from a runaway one at the framing layer.
 - Single writer task ensures no byte-level corruption
 
 **Pending Request Cleanup:**
-When the reader task exits abnormally (EOF, read error, timeout, or shutdown), all pending requests must receive error responses:
-- Fail all pending requests with `INTERNAL_ERROR` (-32603)
+When the reader task exits abnormally (EOF, read error, timeout, or shutdown), every pending request must receive a terminal error response:
+- Normally `INTERNAL_ERROR` (-32603) — but a request already cancelled while
+  still queued keeps `REQUEST_CANCELLED` (-32800), so the caller learns why
+  it actually ended
 - Clear the pending map to prevent memory leaks
 - Log failures for observability
 

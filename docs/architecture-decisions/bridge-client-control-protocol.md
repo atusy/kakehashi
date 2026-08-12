@@ -651,10 +651,10 @@ not a storm.
 - **A handshake that lost `Initializing → Closing` may send nothing
   afterwards.** `initialized` is the message at risk: the losing handshake
   must be unable to send it once `Closing` has won, and the abort must be
-  unable to release one it had already prepared. This constrains the *losing
-  handshake* only — the accepted-queue drain and teardown's own
-  `shutdown`/`exit` are ls-bridge-graceful-shutdown's to govern, and both
-  legitimately follow `Closing`.
+  unable to release one it had already prepared. What may follow `Closing` depends
+  on which path reached it, and ls-bridge-graceful-shutdown governs both:
+  `Ready → Closing` drains the accepted queue and sends `shutdown`/`exit`;
+  `Initializing → Closing` drains nothing and sends no LSP message at all.
 - **Until the server has answered `initialize`, LSP forbids the client every
   further request *and* notification** — `exit` included. The only
   conformant abort in that window is direct process termination.

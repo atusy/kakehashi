@@ -6,6 +6,15 @@ As recorded, only Phase 1 (bridge infrastructure with working go-to-definition)
 was complete. Per-method coverage has since expanded well beyond this; see
 [docs/README.md](../README.md) for the current list of bridge-backed requests.
 
+Two of this record's original mechanisms never shipped, and the architecture
+diagram, the eager-spawn diagram, and the Phase 1 checklist below still show
+them. Injection content goes to **virtual document URIs**, not temporary
+files on disk (language-server-bridge-virtual-document-model), so the
+`TempFileManager` those diagrams name does not exist; and readiness is the
+**LSP handshake**, not a multi-signal indexing detector. § Provisioning Flow
+and § Ready Detection are corrected; the diagrams are left as the historical
+record this file is.
+
 ## Context
 
 Markdown code blocks and other injection regions (e.g., JavaScript inside HTML `<script>` tags, SQL in string literals) currently only receive Tree-sitter-based features from kakehashi. While Tree-sitter provides excellent syntax highlighting via semantic tokens, injection regions lack access to full LSP capabilities such as:
@@ -147,7 +156,7 @@ Spawning can piggyback on these existing code paths.
 
 - **Spawn on injection detection**: Background spawn when new language injection is found
 - **Reuse**: All subsequent requests use warm connection
-- **Crash recovery**: Detect dead servers (broken pipe, exit code) and respawn immediately
+- **Crash recovery**: Detect dead servers (broken pipe, exit code) and mark the connection `Failed`; the next acquire respawns it (not a timer — bridge-client-control-protocol)
 
 ### Server Registry and Configuration
 
@@ -345,28 +354,31 @@ kakehashi configuration points rust-analyzer to this file:
 
 #### Provisioning Flow
 
-1. Create temporary file with injection content using deterministic path
-2. Initialize server with user-provided `initializationOptions`
-3. Send `didOpen` notification
-4. Wait for ready signal (see below)
-5. Clean up temp files on document close or shutdown
+Both halves of this record's original provisioning design were **superseded
+before they shipped**, and the sections above still describe the world they
+assumed — see § Decision–Implementation Gap.
+
+1. Mint a **virtual document URI** for the injection region and send its
+   current in-memory content in `didOpen`. Regions are not written to
+   temporary files, and there is nothing to clean up on close beyond the
+   `didClose`. language-server-bridge-virtual-document-model carries this
+   decision; the servers that genuinely need a real path on disk are its
+   subject, not this one's.
+2. Initialize the server with user-provided `initializationOptions`.
+3. Treat the connection as ready at the **LSP handshake** — the initialize
+   response processed and `initialized` sent. There is no indexing detector.
 
 #### Ready Detection
 
-Detecting when a server has finished indexing and is ready for queries:
-
-| Method | Reliability | Timeout |
-|--------|-------------|---------|
-| `publishDiagnostics` received | Medium (some servers don't send for valid code) | 5s |
-| `window/workDoneProgress` completion | High (when supported) | 10s |
-| Configurable delay | Low (guessing) | N/A |
-| Timeout fallback | Always | 5s default |
-
-Implementation uses a multi-signal approach:
-1. Start timeout timer (configurable, default 5s)
-2. Listen for `publishDiagnostics` or `workDoneProgress/end`
-3. Mark ready on first signal OR timeout expiration
-4. Log warning if timeout was hit (suggests misconfiguration)
+A server is ready when its handshake completes, and not by any later signal.
+The original design instead tried to detect *indexing* completion by waiting
+on `publishDiagnostics`, `window/workDoneProgress` end, or a timeout
+fallback. That was rejected in practice: the signals are per-server
+unreliable (many servers publish no diagnostics for valid code), and a
+readiness gate built on them delays every first request by a timeout
+whenever the guess is wrong. Requests instead go out as soon as the
+handshake completes and are bounded by the timeout tiers of
+ls-bridge-timeout-hierarchy.
 
 ### Async Communication and Error Handling
 
@@ -390,7 +402,7 @@ writer task patterns, and the timeout tiers this bound sits in.
 
 | Error Type | Detection | Recovery |
 |------------|-----------|----------|
-| Server crash | Broken pipe on read/write | Mark connection dead, respawn immediately |
+| Server crash | Broken pipe on read/write | Mark connection `Failed`; the next acquire respawns |
 | Request timeout | Response wait expires | Return `None`, log warning |
 | Malformed response | JSON parse error | Return `None`, log error |
 | Server busy | No response within timeout | Return `None`, consider increasing timeout |
