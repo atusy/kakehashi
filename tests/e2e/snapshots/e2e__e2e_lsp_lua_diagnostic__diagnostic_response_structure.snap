@@ -1,5 +1,5 @@
 ---
-source: tests/e2e_lsp_lua_diagnostic.rs
+source: tests/e2e/e2e_lsp_lua_diagnostic.rs
 expression: result
 ---
 {

@@ -1,5 +1,5 @@
 ---
-source: tests/e2e_lsp_protocol.rs
+source: tests/e2e/e2e_lsp_protocol.rs
 expression: capabilities
 ---
 {

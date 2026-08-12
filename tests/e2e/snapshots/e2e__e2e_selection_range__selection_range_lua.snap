@@ -1,5 +1,5 @@
 ---
-source: tests/e2e_selection_range.rs
+source: tests/e2e/e2e_selection_range.rs
 expression: sanitized
 ---
 [

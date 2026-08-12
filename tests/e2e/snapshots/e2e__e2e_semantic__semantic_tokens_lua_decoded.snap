@@ -1,5 +1,5 @@
 ---
-source: tests/e2e_semantic.rs
+source: tests/e2e/e2e_semantic.rs
 expression: snapshot_tokens
 ---
 [

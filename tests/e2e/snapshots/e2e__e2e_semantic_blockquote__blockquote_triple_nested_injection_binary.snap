@@ -1,5 +1,5 @@
 ---
-source: tests/e2e_semantic_blockquote.rs
+source: tests/e2e/e2e_semantic_blockquote.rs
 expression: data
 ---
 [
