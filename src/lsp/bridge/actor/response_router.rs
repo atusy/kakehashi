@@ -360,6 +360,17 @@ impl ResponseRouter {
         state.pending.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_ids(&self) -> Vec<RequestId> {
+        self.state
+            .lock()
+            .recover_poison("ResponseRouter::pending_ids")
+            .pending
+            .keys()
+            .copied()
+            .collect()
+    }
+
     /// Requests that can still make downstream progress. Cancelled queued
     /// entries remain only until the FIFO writer discards them.
     pub(crate) fn awaiting_downstream_count(&self) -> usize {
