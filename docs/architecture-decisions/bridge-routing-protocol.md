@@ -914,7 +914,14 @@ Decision-cache lifecycle:
     lifecycle critical section** — an old task cannot validate, lose the lock to
     a cleanup that evicts and closes everything, and then register a
     ghost open. So a stale task can never open a closed document or a
-    removed region. A
+    removed region. The `didOpen` **payload** is likewise re-read at
+    the enqueue commit: the task sends the document's *current* text,
+    never a snapshot captured before the routing await — the deadline
+    may delay an open, but a `didChange` landing during the wait can
+    never make a downstream analyze stale text (today's open tasks
+    carry the didOpen-time snapshot, which the await would otherwise
+    turn into a staleness window; requiring the re-read is part of
+    this protocol's contract). A
     re-opened document never receives the previous open's answer:
     the anchors are part of the flight's identity, so a caller arriving
     after a flush or re-open never joins the stale flight — it starts a
