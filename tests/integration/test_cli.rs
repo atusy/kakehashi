@@ -2457,6 +2457,162 @@ fn test_language_uninstall_all_keeps_failing_when_a_declined_prompt_follows_a_ba
     );
 }
 
+/// A parser entry of the wrong SHAPE is not "no parser here". Going on would
+/// remove the queries, step over the parser, and — on the named path, which has
+/// no leftovers summary — report a clean uninstall over a half-removed language.
+#[test]
+fn test_language_uninstall_leaves_a_language_whole_when_its_parser_is_the_wrong_shape() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    let shaped_dir = test_dir.path().join(format!("parser/lua.{ext}"));
+    fs::create_dir_all(&shaped_dir).expect("Failed to create parser-shaped directory");
+    let queries_lua = test_dir.path().join("queries/lua");
+    fs::create_dir_all(&queries_lua).expect("Failed to create queries dir");
+    fs::write(queries_lua.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write queries");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "lua",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a language that cannot be fully removed must fail the run: {combined}"
+    );
+    assert!(
+        !combined.contains("Uninstalled 'lua'."),
+        "a half-removal must never be reported as a clean uninstall: {combined}"
+    );
+    assert!(
+        queries_lua.is_dir(),
+        "the queries must not be taken while the parser cannot be: {combined}"
+    );
+    assert!(
+        shaped_dir.is_dir(),
+        "the entry must be left alone: {combined}"
+    );
+}
+
+/// A removal that FAILS is a different case from one that could not be
+/// classified: the queries are already gone, so the language really is
+/// half-removed. It must say which half, and must not go on to call the
+/// language absent — that claim rides on the mere absence of a success.
+#[test]
+#[cfg(unix)]
+fn test_language_uninstall_names_the_half_removed_state_when_the_parser_cannot_be_taken() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    let parser_dir = test_dir.path().join("parser");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    let parser_file = parser_dir.join(format!("lua.{ext}"));
+    fs::write(&parser_file, "parser").expect("Failed to write parser");
+    let queries_lua = test_dir.path().join("queries/lua");
+    fs::create_dir_all(&queries_lua).expect("Failed to create queries dir");
+    fs::write(queries_lua.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write queries");
+    // 0500: readable and searchable, so the entry classifies fine and the run
+    // reaches the removal — which then fails for want of write permission.
+    let mut permissions = fs::metadata(&parser_dir)
+        .expect("Failed to read permissions")
+        .permissions();
+    permissions.set_mode(0o500);
+    fs::set_permissions(&parser_dir, permissions).expect("Failed to seal parser dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "lua",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut permissions = fs::metadata(&parser_dir)
+        .expect("Failed to read permissions")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&parser_dir, permissions).expect("Failed to unseal parser dir");
+
+    assert!(!output.status.success(), "the run must fail: {combined}");
+    // Discriminates against the removal never being attempted.
+    assert!(
+        combined.contains("Failed to remove parser"),
+        "the run must reach the removal and fail there: {combined}"
+    );
+    assert!(
+        !combined.contains("is not installed"),
+        "a language whose parser removal just failed must not be called absent: {combined}"
+    );
+    assert!(
+        combined.contains("half-removed"),
+        "the state it actually left must be named: {combined}"
+    );
+}
+
+/// A data directory that is a dangling symlink makes `read_dir` report its
+/// children as absent, so surveying it would find nothing and call the
+/// installation empty — the completeness claim over a directory never reached.
+#[test]
+#[cfg(unix)]
+fn test_language_uninstall_all_fails_for_a_dangling_data_directory() {
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let data_dir = test_dir.path().join("data");
+    std::os::unix::fs::symlink(test_dir.path().join("missing-target"), &data_dir)
+        .expect("Failed to create dangling symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--force",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "an unreachable data directory must fail the command: {combined}"
+    );
+    assert!(
+        !combined.contains("No languages installed to uninstall"),
+        "a directory it never reached must not be reported as empty: {combined}"
+    );
+}
+
 /// The issue's other half: a dangling entry needs SOME way to be removed.
 /// Naming it used to answer "is not installed" and exit 0, because the gate
 /// asked `is_file()`, which follows the link.
