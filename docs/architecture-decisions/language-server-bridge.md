@@ -6,10 +6,15 @@ As recorded, only Phase 1 (bridge infrastructure with working go-to-definition)
 was complete. Per-method coverage has since expanded well beyond this; see
 [docs/README.md](../README.md) for the current list of bridge-backed requests.
 
-Two of this record's original mechanisms shipped in the legacy redirection
-implementation (`src/lsp/redirection.rs`) and were superseded later; the
-architecture diagram, the eager-spawn diagram, and the Phase 1 checklist
-below still show them. Injection content goes to **virtual document URIs**, not temporary
+Two of this record's original mechanisms are obsolete, in different ways.
+The **temporary workspace** shipped in the legacy redirection implementation
+(`src/lsp/redirection.rs`) and was superseded by virtual documents. The
+**multi-signal readiness detector** never shipped as designed: that
+implementation waited on `publishDiagnostics` alone, bounded by a message
+count rather than a timeout, and never treated progress completion as
+readiness — and the current bridge dropped even that in favour of the
+handshake. The architecture diagram, the eager-spawn diagram, and the
+Phase 1 checklist below still show both. Injection content goes to **virtual document URIs**, not temporary
 files on disk (language-server-bridge-virtual-document-model), so the
 `TempFileManager` those diagrams name does not exist; and readiness is the
 **LSP handshake**, not a multi-signal indexing detector. § Provisioning Flow
@@ -277,8 +282,8 @@ This separation allows:
 ### Temporary File Management
 
 > **Superseded, non-normative — retained as history.** This whole section
-> describes a design that shipped in the legacy redirection implementation
-> and was later replaced. Injection content is not written to
+> describes the temporary-workspace design, which shipped in the legacy
+> redirection implementation and was later replaced by virtual documents. Injection content is not written to
 > disk: the bridge mints virtual document URIs and sends in-memory content
 > (§ Provisioning Flow, language-server-bridge-virtual-document-model).
 > Nothing below is a current requirement.
@@ -383,10 +388,10 @@ kakehashi configuration points rust-analyzer to this file:
 
 #### Provisioning Flow
 
-Both halves of this record's original provisioning design shipped once, in
-the legacy redirection implementation, and were **superseded** by the
-current bridge; the sections above still describe the world they assumed —
-see § Decision–Implementation Gap.
+This record's original provisioning design is obsolete: its temp-file half
+shipped once and was superseded, and its multi-signal readiness half never
+shipped as designed. The sections above still describe the world they
+assumed — see § Decision–Implementation Gap.
 
 1. Initialize the server with user-provided `initializationOptions`.
 2. Complete the **LSP handshake** — the initialize response processed and
@@ -405,7 +410,9 @@ see § Decision–Implementation Gap.
 A server is ready when its handshake completes, and not by any later signal.
 The original design instead tried to detect *indexing* completion by waiting
 on `publishDiagnostics`, `window/workDoneProgress` end, or a timeout
-fallback. That was rejected in practice: the signals are per-server
+fallback. Only the first ever shipped, in the legacy redirection
+implementation and bounded by a message count rather than a clock; the rest
+was rejected in practice: the signals are per-server
 unreliable (many servers publish no diagnostics for valid code), and a
 readiness gate built on them delays every first request by a timeout
 whenever the guess is wrong. Requests instead go out as soon as the
