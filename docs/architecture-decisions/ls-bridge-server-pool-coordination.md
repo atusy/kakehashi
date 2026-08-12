@@ -385,8 +385,8 @@ strategy = "concatenated"          # safe: proposals, the user executes one
 
 # hover, definition, rename: left to the default `preferred` dispatch — one
 #   server answers, so overlapping WorkspaceEdits cannot arise.
-# formatting: see concatenated-formatting-pipeline (planned sequential
-#   pipeline; user-issued textDocument/rangeFormatting requests unaffected)
+# formatting: see concatenated-formatting-pipeline (sequential pipeline,
+#   implemented; user-issued textDocument/rangeFormatting unaffected)
 
 [languageServers.pyright]
 cmd = ["pyright-langserver", "--stdio"]

@@ -410,13 +410,15 @@ ls-bridge-server-pool-coordination's subject rather than this one's. In
 outline: a `preferred` fan-in falls through to the next candidate and only
 surfaces an error when nothing answered; a `concatenated` aggregation fails
 if a layer it required fails; and a fan-out whose downstreams all fail
-answers `REQUEST_FAILED`. Degradation is per-server, not per-request. (Which bound applies — the Tier-1
-per-request timeout, which is Phase 3 and only engages for a multi-server
-fan-out, the Tier-2 liveness timeout otherwise — is
-ls-bridge-timeout-hierarchy's subject, along with the requests deliberately
-exempt from both. The lifecycle handshake is exempt in the other direction:
+answers `REQUEST_FAILED`. Degradation is per-server, not per-request. What bounds the wait, today, is a fixed 30-second cap on every downstream
+response wait. It is not either of the named tiers: Tier 1 — the per-request
+aggregation timeout that engages only for a multi-server fan-out — is still
+Phase 3, and Tier 2 is a connection-*health* monitor that resets on any
+decoded server message, so it bounds silence rather than any one request.
+ls-bridge-timeout-hierarchy owns those tiers and the requests deliberately
+exempt from them. The lifecycle handshake is exempt in the other direction:
 the `shutdown` request's response wait is bounded by the shutdown deadline,
-not by any request timeout.)
+not by any request timeout.
 
 Communication is **pure async** — no blocking stdio, and no OS thread per
 connection. ls-bridge-async-connection carries that decision, its reader and

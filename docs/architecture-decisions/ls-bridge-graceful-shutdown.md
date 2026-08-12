@@ -419,9 +419,11 @@ I/O, so the O(1) wall-clock property below is unaffected.
   control operation ends in exactly one answer, including when the work
   behind it ends abnormally rather than reporting.
 - **A failure answer must be truthful.** A caller told
-  `stopFailed`/`restartFailed` must be able to read it as *the terminal
-  outcome was not committed* — a committed success must never be reported
-  as a failure.
+  `stopFailed`/`restartFailed` must be able to read it as *the requested
+  successful outcome was not committed* — a verified `Closed` for `stop`, an
+  owned verified-`Ready` replacement for `restart`. The failure is itself a
+  committed terminal answer; what it denies is the success, and a committed
+  success must never be reported as one of these.
 - **A deadline is a ceiling, not a budget that internal events refill.**
   Queueing delay, retries, and configuration churn spend it; nothing
   extends it, and no operation may outlive its ceiling because the expiry
