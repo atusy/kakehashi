@@ -206,9 +206,9 @@ impl FrameParseState {
     /// third outcome for a checked variant to handle.
     fn charge_header_bytes(&mut self, len: usize) -> io::Result<()> {
         if self.line.len().saturating_add(len) > MAX_HEADER_LINE_BYTES {
-            return Err(self.oversized(format!(
-                "header line exceeds {MAX_HEADER_LINE_BYTES} bytes"
-            )));
+            return Err(
+                self.oversized(format!("header line exceeds {MAX_HEADER_LINE_BYTES} bytes"))
+            );
         }
         self.header_bytes = self.header_bytes.saturating_add(len);
         if self.header_bytes > MAX_HEADER_BLOCK_BYTES {
@@ -281,9 +281,7 @@ impl FrameParseState {
             if length > MAX_CONTENT_LENGTH_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "Content-Length {length} exceeds {MAX_CONTENT_LENGTH_BYTES} bytes"
-                    ),
+                    format!("Content-Length {length} exceeds {MAX_CONTENT_LENGTH_BYTES} bytes"),
                 ));
             }
             self.content_length = Some(length);
@@ -1608,7 +1606,9 @@ mod tests {
         // The boundary itself is legitimate traffic.
         let mut frame = FrameParseState::default();
         frame
-            .finish_header_line(format!("Content-Length: {MAX_CONTENT_LENGTH_BYTES}\r\n").as_bytes())
+            .finish_header_line(
+                format!("Content-Length: {MAX_CONTENT_LENGTH_BYTES}\r\n").as_bytes(),
+            )
             .expect("the ceiling is inclusive");
         assert_eq!(frame.content_length, Some(MAX_CONTENT_LENGTH_BYTES));
     }

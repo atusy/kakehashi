@@ -130,6 +130,20 @@ pub(crate) struct BridgeCoordinator {
     /// DashMap's internal locks provide memory synchronization for the
     /// stored generation values.
     eager_open_generation: std::sync::atomic::AtomicU64,
+    /// Monotonic generation counter for `forceStart` warm-up passes.
+    ///
+    /// Each pass claims the next value; its detached acquires re-read this
+    /// before touching the pool and stand down if a newer pass has claimed
+    /// one, so a task carrying a superseded configuration cannot spawn — or
+    /// worse, replace a correctly-configured connection with a stale launch
+    /// config, which the pool would do on seeing what it reads as a config
+    /// change. The newer pass re-asserts every flag anyway, so standing down
+    /// loses nothing.
+    ///
+    /// `Arc` because the check happens inside the detached task. Ordering is
+    /// `Relaxed` for the same reason the counter above is: monotonicity is
+    /// the whole requirement, and the pool's own lock orders the effects.
+    force_start_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Eager-open task batches, keyed by host document URI.
     ///
     /// Each batch contains a generation counter and abort handles. When a new
@@ -212,6 +226,7 @@ impl BridgeCoordinator {
             node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
+            force_start_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eager_open_tasks: DashMap::new(),
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
@@ -235,6 +250,7 @@ impl BridgeCoordinator {
             node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
+            force_start_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eager_open_tasks: DashMap::new(),
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
@@ -353,8 +369,14 @@ impl BridgeCoordinator {
     /// it now would mean either blocking publication on process startup or a
     /// third acquire variant with no caller to justify it.
     pub(crate) fn force_start_servers(&self, settings: &WorkspaceSettings) -> usize {
+        use std::sync::atomic::Ordering;
+
         let servers = &settings.language_servers;
         let wildcard = servers.get(crate::config::WILDCARD_KEY);
+        // Claim this pass's generation before launching anything, so every
+        // task it spawns can tell whether it still speaks for the current
+        // configuration by the time it reaches the pool.
+        let generation = self.force_start_generation.fetch_add(1, Ordering::Relaxed) + 1;
         // Deterministic order, so the log reads the same way every session
         // where the config map's iteration order would not. It orders the
         // launches only — the acquires themselves are detached and race.
@@ -389,7 +411,29 @@ impl BridgeCoordinator {
 
             let pool = Arc::clone(&self.pool);
             let name = name.clone();
+            let current_generation = Arc::clone(&self.force_start_generation);
             tokio::spawn(async move {
+                // The config in hand was resolved from the settings snapshot
+                // of this pass. If a later application has already run, that
+                // snapshot is history: spawning from it would start a server
+                // configuration no longer names, and — worse — the pool reads
+                // a differing launch config as a change, so a stale task can
+                // tear down the correctly-configured connection and replace it
+                // with the old command. The newer pass re-asserts every flag,
+                // so standing down costs nothing.
+                //
+                // Checked as late as possible, but the acquire takes the pool
+                // lock after it, so a pass landing in that gap still wins. It
+                // closes the window that matters — one whole settings
+                // application wide — not every window.
+                if current_generation.load(Ordering::Relaxed) != generation {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "forceStart for '{name}' stood down: a newer configuration \
+                         has been applied"
+                    );
+                    return;
+                }
                 let Err(error) = pool.get_or_create_connection(&name, &config, None).await else {
                     return;
                 };
@@ -1702,6 +1746,29 @@ mod tests {
             !is_concurrent_acquire(&BridgeError::Disabled.into()),
             "a server disabled after repeated handshake failures is a failure"
         );
+    }
+
+    /// A task carrying a superseded configuration must not reach the pool.
+    ///
+    /// The acquires are detached, so one launched by application N can arrive
+    /// after N+1 has been applied. Spawning from a snapshot configuration no
+    /// longer names is bad enough; worse, the pool reads a differing launch
+    /// config as a change, so the stale task would tear down N+1's correctly
+    /// configured connection and replace it with the old command.
+    #[tokio::test]
+    async fn force_start_stands_down_when_a_newer_configuration_arrives() {
+        let coordinator = BridgeCoordinator::new();
+        let settings = force_start_settings(&[("policy-server", idle_server(true, vec![]))]);
+
+        // Claim a generation and drop the tasks on the floor before they run,
+        // which is what a settings application landing first amounts to.
+        assert_eq!(coordinator.force_start_servers(&settings), 1);
+        assert_eq!(coordinator.force_start_servers(&settings), 1);
+
+        // Exactly one connection: the superseded task stands down rather than
+        // racing the current one. (Both target the same key, so a failure here
+        // shows up as the assertion in `started_servers`, not as two entries.)
+        assert_eq!(started_servers(&coordinator, 1).await, ["policy-server"]);
     }
 
     /// Spawnability outranks the flag: `forceStart` asks *when* a configured

@@ -14,9 +14,8 @@ pub(crate) mod user;
 
 pub use expand::{set_config_file_override, set_data_dir_override};
 pub(crate) use merge::{
-    is_server_spawnable, merge_bridge_language_configs,
-    merge_bridge_server_configs, merge_layer_aggregation_configs, merge_workspace_settings,
-    resolve_with_wildcard,
+    is_server_spawnable, merge_bridge_language_configs, merge_bridge_server_configs,
+    merge_layer_aggregation_configs, merge_workspace_settings, resolve_with_wildcard,
 };
 pub(crate) use settings::{CaptureMapping, CaptureMappings, DEFAULT_DEBOUNCE_MS};
 // Raw and effective settings share this type, so converting between them no

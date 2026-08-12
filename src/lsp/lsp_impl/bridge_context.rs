@@ -1935,10 +1935,7 @@ mod tests {
             ("lazy".to_string(), server(&["lua-language-server"])),
             // Warmed but unspawnable: already covered by its own warning, and
             // naming it twice would just be noise.
-            (
-                "disabled".to_string(),
-                warmed(|c| c.enabled = Some(false)),
-            ),
+            ("disabled".to_string(), warmed(|c| c.enabled = Some(false))),
         ]);
 
         assert_eq!(

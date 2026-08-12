@@ -3195,12 +3195,12 @@ kind = "locals""#;
             aggregation: None,
         };
 
-        let resolved = crate::config::merge_bridge_language_configs(
-            &wildcard_language,
-            &concrete_language,
-        );
+        let resolved =
+            crate::config::merge_bridge_language_configs(&wildcard_language, &concrete_language);
         assert_eq!(
-            resolved.resolve_aggregation(BRIDGE_ROUTING_METHOD).priorities,
+            resolved
+                .resolve_aggregation(BRIDGE_ROUTING_METHOD)
+                .priorities,
             &["policy-server".to_string()],
             "bridge._ supplies the routing key to a language that names none"
         );
