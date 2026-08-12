@@ -78,8 +78,8 @@ impl InboundRequestRegistry {
                 },
             );
         // A well-behaved downstream never reuses a request id while one is in
-        // flight, but if it does, cancel the orphaned request so its forwarded
-        // editor request (and dialog) doesn't dangle unreachable. The orphan's
+        // flight, but if it does, cancel the orphaned forwarding operation so
+        // it does not dangle unreachable (including any editor dialog). The orphan's
         // later unregister is a no-op — its generation no longer matches.
         if let Some(old) = replaced {
             old.token.cancel();

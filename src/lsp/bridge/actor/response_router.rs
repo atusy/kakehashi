@@ -148,6 +148,22 @@ impl ResponseRouter {
         downstream_id: RequestId,
         upstream_id: Option<UpstreamId>,
     ) -> Option<(oneshot::Receiver<serde_json::Value>, Option<u64>)> {
+        self.register_with_upstream_liveness_mode(downstream_id, upstream_id, false)
+    }
+
+    pub(crate) fn register_peer(
+        &self,
+        downstream_id: RequestId,
+    ) -> Option<(oneshot::Receiver<serde_json::Value>, Option<u64>)> {
+        self.register_with_upstream_liveness_mode(downstream_id, None, true)
+    }
+
+    fn register_with_upstream_liveness_mode(
+        &self,
+        downstream_id: RequestId,
+        upstream_id: Option<UpstreamId>,
+        track_failure: bool,
+    ) -> Option<(oneshot::Receiver<serde_json::Value>, Option<u64>)> {
         let (tx, rx) = oneshot::channel();
         let mut state = self
             .state
@@ -174,6 +190,9 @@ impl ResponseRouter {
                 delivery: RequestDelivery::Queued,
             },
         );
+        if track_failure {
+            state.failure_tracked.insert(downstream_id);
+        }
 
         // Store bidirectional mapping if upstream_id is provided. Appending
         // (not inserting) keeps every concurrent downstream request for this
@@ -446,14 +465,6 @@ impl ResponseRouter {
         state.failures.remove(&id)
     }
 
-    pub(crate) fn track_failure(&self, id: RequestId) {
-        self.state
-            .lock()
-            .recover_poison("ResponseRouter::track_failure")
-            .failure_tracked
-            .insert(id);
-    }
-
     /// Fail a single pending request with an error response.
     ///
     /// Called when a write fails or the connection is closing (ls-bridge-message-ordering). Uses
@@ -470,6 +481,10 @@ impl ResponseRouter {
             .recover_poison("ResponseRouter::fail_request");
 
         let pending = state.pending.remove(&id);
+        let tracked = state.failure_tracked.remove(&id);
+        if tracked {
+            state.failures.insert(id, BridgeFailure::ConnectionLost);
+        }
 
         // Clean up bidirectional cancel map entries in O(1)
         Self::remove_cancel_mapping_inner(&mut state, id);
@@ -487,19 +502,6 @@ impl ResponseRouter {
                         "message": format!("bridge: {}", reason)
                     }
                 });
-                let tracked = self
-                    .state
-                    .lock()
-                    .recover_poison("ResponseRouter::fail_request provenance")
-                    .failure_tracked
-                    .contains(&id);
-                if tracked {
-                    self.state
-                        .lock()
-                        .recover_poison("ResponseRouter::fail_request provenance")
-                        .failures
-                        .insert(id, BridgeFailure::ConnectionLost);
-                }
                 if pending.response_tx.send(error_response).is_err() {
                     self.take_failure(id);
                 }
@@ -521,6 +523,11 @@ impl ResponseRouter {
         let mut state = self.state.lock().recover_poison("ResponseRouter::fail_all");
         state.accepting = false;
         let entries: Vec<_> = state.pending.drain().collect();
+        for (id, _) in &entries {
+            if state.failure_tracked.remove(id) {
+                state.failures.insert(*id, BridgeFailure::ConnectionLost);
+            }
+        }
 
         // Clear both cancel map directions
         state.upstream_to_downstream.clear();
@@ -544,14 +551,6 @@ impl ResponseRouter {
                     "message": message
                 }
             });
-            let mut state = self
-                .state
-                .lock()
-                .recover_poison("ResponseRouter::fail_all provenance");
-            if state.failure_tracked.contains(&id) {
-                state.failures.insert(id, BridgeFailure::ConnectionLost);
-            }
-            drop(state);
             if pending.response_tx.send(error_response).is_err() {
                 self.take_failure(id);
             }
@@ -589,6 +588,11 @@ impl ResponseRouter {
         // Publish the connection failure before waking any drained waiter.
         state.accepting = false;
         let entries: Vec<_> = state.pending.drain().collect();
+        for (id, _) in &entries {
+            if state.failure_tracked.remove(id) {
+                state.failures.insert(*id, BridgeFailure::RequestTimeout);
+            }
+        }
         state.upstream_to_downstream.clear();
         state.downstream_to_upstream.clear();
         drop(state);
@@ -609,14 +613,6 @@ impl ResponseRouter {
                     "message": message
                 }
             });
-            let mut state = self
-                .state
-                .lock()
-                .recover_poison("ResponseRouter::liveness provenance");
-            if state.failure_tracked.contains(&id) {
-                state.failures.insert(id, BridgeFailure::RequestTimeout);
-            }
-            drop(state);
             if pending.response_tx.send(error_response).is_err() {
                 self.take_failure(id);
             }
