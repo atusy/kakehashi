@@ -8,8 +8,9 @@
 //! exposes no cancel API for an outgoing request, so the forwarding loop instead
 //! sends the request with an id it minted (see `send_editor_request`) and, on
 //! cancel, sends a correlated `$/cancelRequest` to the editor. Peer forwarding
-//! similarly retires its target router entry and cancels a write that started. (A locally
-//! answered request — the capability-gated applyEdit — is unregistered before
+//! similarly retires its target router entry and requests downstream
+//! cancellation when writing has started. (A locally answered request — the
+//! capability-gated applyEdit — is unregistered before
 //! its token is ever awaited, so cancellation has nothing to do there.)
 //!
 //! This registry connects the two halves: the per-connection reader (which sees
