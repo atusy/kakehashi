@@ -342,6 +342,8 @@ pub struct LanguageServerPool {
     /// workspace root (issue #382); documents sharing a root (or the
     /// client-root fallback) still share one process.
     connections: Mutex<HashMap<ConnectionKey, Arc<ConnectionHandle>>>,
+    /// Weak directory exposed to downstream `kakehashi/bridge/peer*` requests.
+    peer_directory: Arc<super::peer::PeerDirectory>,
     /// Gate that rejects **new** connection spawns once shutdown has begun.
     ///
     /// `shutdown_all` snapshots the live connections and tears them down, but a
@@ -522,6 +524,7 @@ impl LanguageServerPool {
         let (upstream_request_tx, upstream_request_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             connections: Mutex::new(HashMap::new()),
+            peer_directory: Arc::new(super::peer::PeerDirectory::default()),
             shutting_down: AtomicBool::new(false),
             document_tracker: Arc::new(DocumentTracker::new()),
             open_transition_locks: Arc::new(DashMap::new()),
@@ -3163,6 +3166,7 @@ impl LanguageServerPool {
                 // The applyEdit version validation scopes downstream-supplied
                 // versions to this connection's version space (PR-L).
                 connection_key: connection_key.clone(),
+                peer_directory: Arc::clone(&self.peer_directory),
                 response_tx: tx.clone(),
                 dynamic_capabilities: Arc::clone(&dynamic_capabilities),
                 upstream_tx: self.upstream_tx.clone(),
@@ -3206,6 +3210,7 @@ impl LanguageServerPool {
 
         // Insert into pool immediately so concurrent requests see Initializing state
         connections.insert(connection_key.clone(), Arc::clone(&handle));
+        self.peer_directory.register(&handle);
 
         // Release lock before spawning handshake task
         drop(connections);
