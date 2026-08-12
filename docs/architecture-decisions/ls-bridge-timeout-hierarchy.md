@@ -94,10 +94,15 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 | **Global Shutdown** | 5-15s | Balance clean exit vs user wait time |
 | **Per-Request** *(Phase 3)* | 2-5s | User-facing latency bound for aggregation |
 
-**Relationships:**
+**Relationships:** these do not overlap and are configured independently, so
+their precedence comes from **state gating, not duration ordering** —
+initialization applies only while `Initializing`, liveness only while
+`Ready`, per-request only to an in-flight aggregation. (An earlier revision
+stated this as `Initialization (60s) > Liveness (30-120s) > Per-request
+(5s)`, an inequality that is false wherever liveness is configured above
+60s — which this file's own table permits.)
 ```
-Initialization → Liveness → Per-request   (state-gated, not duration-ordered)
-Global Shutdown overrides all
+Initializing → Initialization | Ready → Liveness | in-flight → Per-request
 Global Shutdown overrides all (highest priority)
 ```
 
