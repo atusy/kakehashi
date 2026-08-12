@@ -152,15 +152,18 @@ The bridge tracks pending requests for response correlation only:
 
 The order queue is bounded and admission never blocks, so a slow or
 initializing server cannot deadlock a producer. **Admission threshold: 4096**
-— raised from the original 256, which caused routine fan-out loss. The
-queue's memory bound is testable and covers responses as well as outbound
-traffic.
+— raised from the original 256, which caused routine fan-out loss. Held and
+reserved traffic count toward that depth, so **while the combined depth sits
+above the threshold, admission stays closed until the writer drains below
+it** — the threshold governs when a producer is refused, not merely how much
+is allocated. The queue's memory bound is testable and covers responses as
+well as outbound traffic.
 
 Responses to **downstream-initiated** requests are the delicate case, because
 the response router deliberately does not track them. So an inbound server
 request is either admitted with room for its answer already accounted for, or
-**refused up front** with `RequestFailed` — never accepted and then dropped
-for want of room. A refusal serializes inbound admission behind its own
+**answered up front with `RequestFailed`** rather than accepted — never
+accepted and then dropped for want of room. A refusal serializes inbound admission behind its own
 sending, and that wait is **bounded and shutdown-aware**: the deadline is the
 existing 5-second-class response-send bound, capped by the earliest active
 lifecycle deadline. On expiry the connection fails via **conditional
@@ -298,7 +301,11 @@ Operations are gated at two levels: **server lifecycle** and **document lifecycl
 
     Held notifications release in arrival order when the connection
     becomes `Ready`, and that release can neither be refused nor fail
-    (§ Invariants). What may legally enter the hold is narrow.
+    (§ Invariants). The hold introduces **no observable state**: a
+    connection reads `Initializing` until it reads `Ready`, with nothing
+    between, so no `flushing`-like status ever appears in the
+    ConnectionState enum or in the client enumeration
+    (bridge-client-control-protocol). What may legally enter the hold is narrow.
     **Document lifecycle notifications keep their Ready-only gating and
     are never held**: they arrive via the post-Ready derived open paths,
     and releasing a held `didChange` ahead of the derived `didOpen`
@@ -423,19 +430,12 @@ awaits only cancel-safe primitives.
 > The invariants below are normative; the mechanisms that satisfy them are
 > deliberately unspecified.
 
-Ordering is the whole subject of this decision, so most of these are traps
-where two correct-looking local choices produce a wrong global order.
-
 **The wire**
 
-- **At most one task ever writes a connection's wire.** Interleaved frames
+- **At most one task writes a connection's wire at any instant.** Interleaved frames
   corrupt the JSON-RPC stream unrecoverably, and a corrupted stream is not
   something a peer can resynchronize from — this is why a panicked writer
   respawns the connection instead of being restarted (Alternative 3).
-- **A frame reader must be cancel-safe.** Losing a consumed header to a
-  dropped read future makes the reader resync onto the next message body and
-  report a framing error against a perfectly well-framed stream — a bug that
-  reads as the peer's fault.
 - **A paused reader plus a writer blocked on the server's stdin is a
   full-duplex pipe deadlock.** Anything that stops the reader — including
   waiting for a refusal to be sent — must therefore be bounded and
@@ -445,9 +445,10 @@ where two correct-looking local choices produce a wrong global order.
 
 - **Admission control must never lose a message the bridge already committed
   to send.** For downstream-initiated requests that means one of two things
-  happens and there is no third: the request is refused before acceptance, or
-  it is answerable after it. Accepting and then discovering there is no room
-  for the answer leaves the server waiting forever.
+  happens and there is no third: the request is answered with `RequestFailed`
+  instead of being accepted, or it is accepted and remains answerable.
+  Accepting and then discovering there is no room for the answer leaves the
+  server waiting forever.
 - **Releasing held traffic cannot be refusable.** Its capacity is accounted
   when it is held, not when it is released; a release that can fail turns a
   bounded queue into silent notification loss at the one moment the
@@ -471,10 +472,10 @@ where two correct-looking local choices produce a wrong global order.
 
 **Documents**
 
-- **`didOpen` precedes every document-specific operation on a downstream, and
-  carries the current snapshot.** Ordering alone is not enough: a `didOpen`
-  built from stale content desynchronizes the document for as long as it
-  stays open.
+- **Ordering `didOpen` first is not enough; it must also carry the current
+  snapshot.** The ordering itself is contract (§ Document Lifecycle Gating);
+  the trap is that a correctly-ordered `didOpen` built from content captured
+  earlier desynchronizes the document for as long as it stays open.
 
 ## Consequences
 
@@ -642,4 +643,4 @@ The current design rejects requests with `REQUEST_FAILED` during initialization.
 
 - **2026-01-06**: Merged Amendment 001 - Completed state machine with all transitions, panic handler implementation requirements, and error code corrections
 - **2026-01-06**: Merged Amendment 002 - Added comprehensive notification drop telemetry and state re-synchronization metadata to prevent silent data loss
-- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - deleted the allocation arithmetic, the inbound response-slot reservation pool, and the lock-private `Flushing` phase, and added an Invariants section recording the ordering traps they closed; the admission threshold, the pre-ready hold's admissibility rules, and every wire-visible behavior are unchanged
+- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - deleted the allocation arithmetic, the inbound response-slot reservation pool, and the lock-private `Flushing` phase, and added an Invariants section recording the ordering traps they closed. The admission threshold and the pre-ready hold's admissibility rules are unchanged. Two wire-visible rules were lost in that first pass and restored on review: that admission stays closed while the combined depth sits above the threshold, and that the flush phase is not an observable connection state
