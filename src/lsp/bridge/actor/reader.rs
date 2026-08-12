@@ -1066,7 +1066,7 @@ async fn handle_server_request(
             workspace::configuration::handle(&message, server_prefix, deps)
         }
         "kakehashi/bridge/peer" => {
-            peer::list_result(&deps.peer_directory, &deps.connection_key, &message)
+            peer::list_result(&deps.peer_directory, &deps.connection_key, &message).await
         }
         _ => {
             debug!(

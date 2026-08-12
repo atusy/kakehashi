@@ -7,10 +7,13 @@
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::{Arc, Weak};
-use tower_lsp_server::ls_types::WorkspaceFolder;
+use tower_lsp_server::ls_types::{TextDocumentIdentifier, WorkspaceFolder};
 
-use super::pool::{ConnectionHandle, ConnectionKey, ConnectionState};
+use super::pool::{
+    ConnectionHandle, ConnectionKey, ConnectionState, DocumentTracker, HostDocuments,
+};
 
 pub(in crate::lsp::bridge) mod request;
 
@@ -27,27 +30,58 @@ pub(in crate::lsp::bridge) struct Peer {
 ///
 /// Weak handles avoid a pool -> handle -> reader -> directory -> handle cycle.
 /// Re-inserting the same key on respawn replaces the old generation.
-#[derive(Default)]
 pub(in crate::lsp::bridge) struct PeerDirectory {
     handles: DashMap<ConnectionKey, Weak<ConnectionHandle>>,
+    document_tracker: Arc<DocumentTracker>,
+    host_documents: Arc<HostDocuments>,
+}
+
+impl Default for PeerDirectory {
+    fn default() -> Self {
+        Self::new(
+            Arc::new(DocumentTracker::new()),
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        )
+    }
 }
 
 impl PeerDirectory {
+    pub(in crate::lsp::bridge) fn new(
+        document_tracker: Arc<DocumentTracker>,
+        host_documents: Arc<HostDocuments>,
+    ) -> Self {
+        Self {
+            handles: DashMap::new(),
+            document_tracker,
+            host_documents,
+        }
+    }
+
     pub(in crate::lsp::bridge) fn register(&self, handle: &Arc<ConnectionHandle>) {
         self.handles
             .insert(handle.key().clone(), Arc::downgrade(handle));
     }
 
-    pub(in crate::lsp::bridge) fn list(
+    pub(in crate::lsp::bridge) async fn list(
         &self,
         origin: &ConnectionKey,
         name: Option<&str>,
+        text_document: Option<&TextDocumentIdentifier>,
     ) -> Vec<Peer> {
+        let serving_connections = match text_document {
+            Some(text_document) => Some(self.serving_connections(text_document.uri.as_str()).await),
+            None => None,
+        };
         let mut peers = self
             .handles
             .iter()
             .filter(|entry| entry.key() != origin)
             .filter(|entry| name.is_none_or(|name| entry.key().server() == name))
+            .filter(|entry| {
+                serving_connections
+                    .as_ref()
+                    .is_none_or(|connections| connections.contains(entry.key()))
+            })
             .filter_map(|entry| entry.value().upgrade())
             .filter(|handle| handle.state() == ConnectionState::Ready)
             .map(|handle| Peer {
@@ -58,6 +92,24 @@ impl PeerDirectory {
             .collect::<Vec<_>>();
         peers.sort_unstable_by(|left, right| left.id.cmp(&right.id));
         peers
+    }
+
+    async fn serving_connections(&self, uri: &str) -> HashSet<ConnectionKey> {
+        let mut connections = self
+            .document_tracker
+            .connections_serving_uri(uri)
+            .await
+            .into_iter()
+            .collect::<HashSet<_>>();
+        connections.extend(
+            self.host_documents
+                .lock()
+                .await
+                .keys()
+                .filter(|(document_uri, _)| document_uri == uri)
+                .map(|(_, connection_key)| connection_key.clone()),
+        );
+        connections
     }
 
     pub(in crate::lsp::bridge) fn resolve(
@@ -77,10 +129,12 @@ impl PeerDirectory {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PeerParams {
     #[serde(default)]
+    text_document: Option<TextDocumentIdentifier>,
+    #[serde(default)]
     name: Option<String>,
 }
 
-pub(in crate::lsp::bridge) fn list_result(
+pub(in crate::lsp::bridge) async fn list_result(
     directory: &PeerDirectory,
     origin: &ConnectionKey,
     message: &serde_json::Value,
@@ -91,8 +145,16 @@ pub(in crate::lsp::bridge) fn list_result(
         .map_err(|error| {
             tower_lsp_server::jsonrpc::Error::invalid_params(format!("Invalid params: {error}"))
         })?;
-    serde_json::to_value(directory.list(origin, params.name.as_deref()))
-        .map_err(|_| tower_lsp_server::jsonrpc::Error::internal_error())
+    serde_json::to_value(
+        directory
+            .list(
+                origin,
+                params.name.as_deref(),
+                params.text_document.as_ref(),
+            )
+            .await,
+    )
+    .map_err(|_| tower_lsp_server::jsonrpc::Error::internal_error())
 }
 
 #[cfg(test)]
@@ -145,7 +207,7 @@ mod tests {
             directory.register(handle);
         }
 
-        let peers = directory.list(&origin_key, None);
+        let peers = directory.list(&origin_key, None, None).await;
         assert_eq!(
             peers
                 .iter()
@@ -176,6 +238,7 @@ mod tests {
             &origin_key,
             &serde_json::json!({ "params": { "name": "oxfmt" } }),
         )
+        .await
         .unwrap();
         assert_eq!(
             result,
@@ -185,6 +248,31 @@ mod tests {
                 "workspaceFolders": []
             }])
         );
+    }
+
+    #[tokio::test]
+    async fn peer_request_filters_out_peers_not_serving_the_text_document() {
+        let directory = PeerDirectory::default();
+        let origin_key = ConnectionKey::for_server("tsudoi");
+        let peer_key = ConnectionKey::for_server("oxfmt");
+        let origin = create_handle_with_key(ConnectionState::Ready, origin_key.clone()).await;
+        let peer = create_handle_with_key(ConnectionState::Ready, peer_key).await;
+        directory.register(&origin);
+        directory.register(&peer);
+
+        let result = list_result(
+            &directory,
+            &origin_key,
+            &serde_json::json!({
+                "params": {
+                    "textDocument": { "uri": "file:///repo/main.ts" }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, serde_json::json!([]));
     }
 
     #[tokio::test]
