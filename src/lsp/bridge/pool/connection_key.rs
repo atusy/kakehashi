@@ -114,6 +114,24 @@ impl ConnectionKey {
             ConnectionRoot::ClientFallback | ConnectionRoot::Shared => None,
         }
     }
+
+    /// Opaque, injective wire identity for downstream peer discovery.
+    ///
+    /// The display form is human-oriented and can collide when a configured
+    /// server name itself contains `@` or `#`. Length-prefixing the unrestricted
+    /// server name and tagging the root variant keeps this identifier unambiguous.
+    pub(in crate::lsp::bridge) fn peer_id(&self) -> String {
+        let root = match &self.root {
+            ConnectionRoot::Marker(root) => format!("marker:{root}"),
+            ConnectionRoot::ClientFallback => "fallback".to_string(),
+            ConnectionRoot::Shared => "shared".to_string(),
+        };
+        format!(
+            "kakehashi-peer:{}:{}:{root}",
+            self.server.len(),
+            self.server
+        )
+    }
 }
 
 impl fmt::Display for ConnectionKey {
@@ -188,5 +206,17 @@ mod tests {
     #[test]
     fn shared_key_display_is_unambiguous() {
         assert_eq!(ConnectionKey::shared("tsgo").to_string(), "tsgo#shared");
+    }
+
+    #[test]
+    fn peer_id_does_not_confuse_server_name_markers_with_root_variants() {
+        assert_ne!(
+            ConnectionKey::for_server("a#shared").peer_id(),
+            ConnectionKey::shared("a").peer_id()
+        );
+        assert_ne!(
+            ConnectionKey::for_server("a@file:///repo").peer_id(),
+            ConnectionKey::new("a", Some("file:///repo".to_string())).peer_id()
+        );
     }
 }
