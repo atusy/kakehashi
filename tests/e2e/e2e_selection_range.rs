@@ -13,11 +13,31 @@
 //! Run with: `cargo test --features e2e --test e2e e2e_selection_range::`
 
 use crate::helpers::lsp_client::LspClient;
+use crate::helpers::lsp_polling::poll_until;
 use crate::helpers::sanitization::sanitize_selection_range_response;
 use crate::helpers::test_fixtures::{
     create_selection_range_lua_fixture, create_selection_range_md_fixture,
 };
 use serde_json::{Value, json};
+
+/// Request `textDocument/selectionRange` once the document's parse has landed.
+///
+/// `didOpen` schedules parsing asynchronously and the server answers `null`
+/// until it completes, so the fixed `sleep(100ms)` these call sites used was a
+/// latent flake: under parallel load the parse routinely takes longer, and the
+/// `result.as_array().unwrap()` that follows then panics on `None` with no
+/// indication of why. Poll for the array instead — correct at any load, and
+/// still instant when the parse is quick.
+fn selection_range_when_parsed(client: &mut LspClient, request: Value) -> Value {
+    poll_until(100, 50, || {
+        let response = client.send_request("textDocument/selectionRange", request.clone());
+        response
+            .get("result")
+            .filter(|r| r.is_array())
+            .map(|_| response.clone())
+    })
+    .unwrap_or_else(|| panic!("textDocument/selectionRange never returned an array for {request}"))
+}
 
 /// Helper function to extract text from a range in content.
 ///
@@ -106,12 +126,9 @@ fn test_selection_range_lua_no_injection() {
         }),
     );
 
-    // Give server time to process
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
     // Request selection range at line 0, col 0 (on "local" keyword)
-    let response = client.send_request(
-        "textDocument/selectionRange",
+    let response = selection_range_when_parsed(
+        &mut client,
         json!({
             "textDocument": {
                 "uri": uri
@@ -191,11 +208,9 @@ fn test_selection_range_parent_chain() {
         }),
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
     // Request selection range
-    let response = client.send_request(
-        "textDocument/selectionRange",
+    let response = selection_range_when_parsed(
+        &mut client,
         json!({
             "textDocument": { "uri": uri },
             "positions": [{ "line": 0, "character": 0 }]
@@ -280,11 +295,9 @@ fn test_selection_range_markdown_with_injections() {
         }),
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
     // Test YAML frontmatter: line 1 (0-indexed), col 0 - "title" keyword
-    let response = client.send_request(
-        "textDocument/selectionRange",
+    let response = selection_range_when_parsed(
+        &mut client,
         json!({
             "textDocument": { "uri": uri },
             "positions": [{ "line": 1, "character": 0 }]
@@ -306,8 +319,8 @@ fn test_selection_range_markdown_with_injections() {
     );
 
     // Test Lua code block: line 6 (0-indexed), col 0 - "local" keyword
-    let response = client.send_request(
-        "textDocument/selectionRange",
+    let response = selection_range_when_parsed(
+        &mut client,
         json!({
             "textDocument": { "uri": uri },
             "positions": [{ "line": 6, "character": 0 }]
@@ -364,11 +377,9 @@ fn test_selection_range_snapshot() {
         }),
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
     // Request selection range
-    let response = client.send_request(
-        "textDocument/selectionRange",
+    let response = selection_range_when_parsed(
+        &mut client,
         json!({
             "textDocument": { "uri": uri },
             "positions": [{ "line": 0, "character": 0 }]
@@ -416,11 +427,9 @@ fn test_selection_range_multiple_positions() {
         }),
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
     // Request selection ranges for multiple positions
-    let response = client.send_request(
-        "textDocument/selectionRange",
+    let response = selection_range_when_parsed(
+        &mut client,
         json!({
             "textDocument": { "uri": uri },
             "positions": [
