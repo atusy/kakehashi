@@ -182,7 +182,12 @@ fi
 # helpers still reports a healthy-looking count. Require each suite's actual
 # test modules to have produced results.
 for want in 'e2e_:E2E' 'test_:integration'; do
-  if ! grep -q "^test ${want%%:*}" "$LOG"; then
+  # Anchored on libtest's complete result-line shape, and on a status that means
+  # the body actually EXECUTED. Two reasons: a failing test's captured stdout is
+  # echoed into this same log, so a loose match could be satisfied by a test
+  # merely PRINTING such a line; and `... ignored` would otherwise let a wholly
+  # #[ignore]d suite satisfy the floor without running anything.
+  if ! grep -qE "^test ${want%%:*}[A-Za-z0-9_:]+ \.\.\. (ok|FAILED)$" "$LOG"; then
     echo "error: no ${want%%:*}* test ran — the ${want##*:} suite was not exercised."
     echo "       Its modules are missing, unregistered, or filtered out."
     exit 1
