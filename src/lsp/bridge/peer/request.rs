@@ -179,6 +179,21 @@ fn normalize_response(response: serde_json::Value) -> jsonrpc::Result<serde_json
             "peer returned a response without jsonrpc: 2.0",
         ));
     }
+    if let Some(reason) = response
+        .pointer("/error/data/kakehashiBridgeFailure")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|reason| match reason {
+            "connectionLost" => Some("connectionLost"),
+            "requestTimeout" => Some("requestTimeout"),
+            _ => None,
+        })
+    {
+        let message = response
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("peer connection failed");
+        return Err(request_failed(reason, message));
+    }
     match (response.get("result"), response.get("error")) {
         (Some(result), None) => Ok(serde_json::json!({ "result": result })),
         (None, Some(error)) => serde_json::from_value::<jsonrpc::Error>(error.clone())
@@ -235,6 +250,24 @@ mod tests {
             error.data,
             Some(serde_json::json!({ "reason": "methodDenied" }))
         );
+    }
+
+    #[test]
+    fn bridge_failures_remain_outer_request_failures() {
+        for reason in ["connectionLost", "requestTimeout"] {
+            let error = normalize_response(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 91,
+                "error": {
+                    "code": -32603,
+                    "message": "bridge transport failed",
+                    "data": { "kakehashiBridgeFailure": reason }
+                }
+            }))
+            .unwrap_err();
+            assert_eq!(error.code, jsonrpc::ErrorCode::ServerError(-32803));
+            assert_eq!(error.data, Some(serde_json::json!({ "reason": reason })));
+        }
     }
 
     #[test]
