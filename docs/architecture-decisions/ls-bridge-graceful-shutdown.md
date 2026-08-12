@@ -159,8 +159,8 @@ force terminates.
 Draining before the handshake is what makes `shutdown` unable to overtake a
 message the bridge already committed to send (§ Operation Disposal Policy).
 The bound on step 3 is the writer-idle timeout of
-ls-bridge-timeout-hierarchy, which counts against the applicable shutdown
-budget — per-slot `stop` or global teardown — rather than adding to it.
+ls-bridge-timeout-hierarchy § Writer-Idle Timeout, which counts against the
+applicable shutdown budget — per-slot `stop` or global teardown — rather than adding to it.
 
 **Guarantees (graceful path — a forced termination forfeits the queue
 drain and current-write completion; the bounded wait is what enforces
@@ -188,8 +188,9 @@ All connections shut down in parallel under a single global ceiling. This is int
 - Fast servers don't wait for slow servers to time out
 - Simplicity: No complex budget-splitting logic
 
-**Timeout Application**: the ceiling is one absolute deadline split between
-the graceful phase and an escalation reserve
+**Timeout Application** (**target state**; see § Decision–Implementation
+Gap): the ceiling is one absolute deadline split between the graceful phase
+and an escalation reserve
 (ls-bridge-timeout-hierarchy § Global Shutdown Design). It is owned by the
 teardown transition (§ Lifecycle Actor below), which is also what makes it
 un-extendable: the deadline is captured at shutdown initiation, so every
@@ -207,7 +208,8 @@ snapshot the actor publishes atomically per transition; nothing else
 mutates lifecycle state. The one deliberate boundary: per-connection
 *handshake* terminal commits (`Initializing → Ready/Failed/Closing`)
 remain the conditional compare-transitions ls-bridge-message-ordering
-§ Connection State Tracking defines — the actor's abort path wins or
+§ Invariants requires and § Connection State Tracking tabulates — the
+actor's abort path wins or
 loses through that same conditional commit, never around it.
 
 This replaces the lock-based concurrent design an earlier revision of this
@@ -245,8 +247,8 @@ What the previous machinery bought, the actor gives structurally:
 - **Spawn commit is an actor transition** — the acquire path may use an
   existing `Ready` connection without consulting the actor, but
   *creating* one may not: the stopped set, termination-pending records,
-  and teardown sealing are all checked in the same transition that
-  commits the spawn. An acquire can never race a committing `stop` into
+  in-flight operations, and teardown sealing are all checked in the same
+  transition that commits the spawn. An acquire can never race a committing `stop` into
   spawning beside a tombstone.
 - **Teardown is a transition, not a scan** — teardown carries the mode
   and an absolute deadline captured at shutdown initiation, seals
@@ -261,7 +263,10 @@ What the previous machinery bought, the actor gives structurally:
   success. A `Teardown(ProcessExit)` arriving **after** a completed
   `ServerRemains` run is a new transition, not a lost upgrade: it adopts
   the retained records and disposes them by mode
-  (§ Unconfirmed Termination).
+  (§ Unconfirmed Termination). A run that reaches its final deadline with a
+  spawn still unfinished publishes as **failed** and names the potential
+  straggler in the log; its record stays authoritative until actual process
+  exit ends ownership.
 - **Abnormal outcomes settle in one place** — a spawn, handshake, or
   wait that ends abnormally settles through the same transition path as
   a normal one: it answers the outer request
@@ -345,20 +350,19 @@ I/O, so the O(1) wall-clock property below is unaffected.
 > The invariants below are normative; the mechanisms that satisfy them are
 > deliberately unspecified.
 
-These are the traps adversarial review found in this decision — the reasons
-the design has the shape it has. An implementation may satisfy each one
-however it likes; it may not violate one.
-
 **Process ownership**
 
 - **A child process must never exist outside owned records.** The window is
   between creating the process and committing the record of it: an unwind,
   panic, or abandoned task there strands a child that nothing will ever
-  signal or reap.
+  signal or reap. It is not the only such window — a record abandoned while
+  its spawn is still live reopens it from the other end
+  (bridge-client-control-protocol).
 - **Delivering SIGTERM or SIGKILL is not termination.** Only a reaped
   `wait` confirms a process is gone. Anything that treats signal delivery
   as confirmation will report success over a live straggler or accumulate
-  zombies.
+  zombies. A `wait` that keeps failing must keep retrying visibly and
+  boundedly — never a silent promotion to closed, never a hot loop.
 - **Terminating a child is not the same as ceasing to own it.** Ownership
   ends when the process is reaped, or when kakehashi's own imminent exit
   reparents the child to init — never merely because a deadline passed
@@ -411,6 +415,11 @@ however it likes; it may not violate one.
   Queueing delay, retries, and configuration churn spend it; nothing
   extends it, and no operation may outlive its ceiling because the expiry
   signal itself was lost.
+- **A completion or an expiry must be attributable to the operation it was
+  armed for**, and one that no longer matches the key's current operation
+  changes nothing. Otherwise a timed-out `stop`'s late expiry settles or
+  kills the `restart` that replaced it, and a superseded spawn's completion
+  answers on behalf of its successor.
 
 ## Consequences
 
@@ -573,9 +582,9 @@ unaffected because only decisions serialize, not process I/O.
 ## Decision–Implementation Gap
 
 The LSP handshake, the writer handoff with its queue drain, the
-SIGTERM → SIGKILL escalation, and parallel teardown under one global ceiling
-are implemented. Two parts of this decision run ahead of the code
-(adrs-are-aspirational is the repo's standing convention):
+SIGTERM → SIGKILL escalation, and parallel teardown are implemented. Three
+parts of this decision run ahead of the code, which is the ordinary state of
+an ADR here:
 
 - **The lifecycle actor does not exist yet.** Teardown today is a pool-wide
   shutting-down flag checked under the connections lock — enough to make the
@@ -583,9 +592,16 @@ are implemented. Two parts of this decision run ahead of the code
   `stop`/`restart`, so most of the serialization this section describes has
   nothing yet to serialize. It converges as bridge-client-control-protocol
   lands.
-- **The wait for the writer handoff is unbounded per connection.** Only the
-  enclosing global teardown ceiling bounds it, so one wedged writer can spend
-  the whole budget instead of its own writer-idle share.
+- **The wait for the writer handoff is unbounded per connection.** Nothing
+  inside the connection bounds it; only the enclosing teardown budget does —
+  the graceful ceiling, or the force-kill bound if escalation reaches it. So
+  one wedged writer can spend the whole graceful budget instead of its own
+  writer-idle share.
+- **The escalation reserve does not exist.** The ceiling bounds the graceful
+  phase *only*; force-kill then runs after it with its own additive
+  per-connection budget, which itself contains a SIGTERM grace period. A
+  teardown can therefore overrun the ceiling it is supposed to be bounded by
+  — with the shipped defaults, by roughly a third.
 
 ## Related Decisions
 
@@ -618,5 +634,5 @@ are implemented. Two parts of this decision run ahead of the code
 - **2026-01-06**: Merged Amendment 001 - Added three-phase writer loop shutdown synchronization to prevent stdin corruption during concurrent shutdown writes
 - **2026-08-11**: Corrected Initialization Shutdown - the abort path sends no LSP message at all (the earlier revision sent `exit` before the initialize response, which LSP ordering forbids); adopted alongside bridge-client-control-protocol, whose per-slot `stop` shares the path
 - **2026-08-11**: Reconciled the Operation Disposal Policy with the Closing-state gating and the writer's actual behavior - the accepted order queue drains ahead of `shutdown` (the earlier table said queued operations are never sent, contradicting § Operation Gating and the FIFO writer)
-- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - deleted the lifecycle-actor and writer-handoff implementation mechanics (escrow slots, kill-on-drop guards, scratch-copy staging, commit-and-reply swaps, generation-bound receivers, settlement markers, the message-enum and coordination sketches, the writer-idle constant), added an Invariants section recording the traps that machinery closed, and moved the aspirational-design note into a Decision–Implementation Gap section; no contract changed
 - **2026-08-12**: Replaced the lock-based concurrent lifecycle-control design with the Lifecycle Actor - all lifecycle transitions (stop/restart/teardown/spawn-commit) serialize through one pool-owned actor, dissolving the single-flight registry, lease-owner map, supervisor-owned transactional teardown state, and durable-record finalizer machinery the earlier revision had accreted (now recorded as rejected Alternative 4); observable contracts in bridge-client-control-protocol are unchanged
+- **2026-08-12**: Applied the contract/invariant/mechanism discipline (template.md) - deleted the lifecycle-actor and writer-handoff implementation mechanics (escrow slots, kill-on-drop guards, scratch-copy staging, commit-and-reply swaps, generation-bound receivers, settlement markers, the message-enum and coordination sketches, the writer-idle constant), and added an Invariants section recording the traps that machinery closed. Replaced the aspirational-design note with a Decision–Implementation Gap section, dropping its stop-oneshot and writer-return-channel divergences as no longer load-bearing and adding the lifecycle-actor and escalation-reserve gaps. No contract changed.
