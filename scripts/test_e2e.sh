@@ -22,15 +22,24 @@
 #   E2E_THREADS=8 E2E_TIMEOUT=900 E2E_RETRIES=0 scripts/test_e2e.sh
 #
 # Env:
-#   E2E_THREADS   test threads for the merged binaries (default: ~1.5x cores)
-#   E2E_RETRIES   serial retry rounds for failed tests   (default: 1, 0=off)
-#   E2E_TIMEOUT   whole-run timeout in seconds           (default: 600, 0=off)
+#   E2E_THREADS        test threads for the merged binaries (default: ~1.5x cores)
+#   E2E_RETRIES        retry failed tests serially once     (default: 1, 0=off)
+#   E2E_TIMEOUT        WHOLE-RUN timeout in seconds         (default: 600, 0=off)
+#   E2E_RETRY_TIMEOUT  per-test timeout for a retry         (default: 300)
 #
-# NOTE: the build step (`cargo test --no-run`) writes to the default `target/`,
-# which rust-analyzer may lock while it (re)compiles after an edit — the
-# "==> Building" line can sit for a while in that case. It is the editor's
-# lock, not a hang.
+# NOTE: E2E_TIMEOUT caps the whole run. The per-binary runner it replaced capped
+# each binary, so its effective budget was ~59x larger; a cold or heavily loaded
+# machine that used to finish can now hit the cap and exit 124. Raise it rather
+# than reading 124 as a hang.
+#
+# NOTE: the build step (`cargo test --no-run`) writes to the cargo target dir
+# (`$CARGO_TARGET_DIR`, else `target/`), which rust-analyzer may lock while it
+# (re)compiles after an edit — the "==> Building" line can sit for a while in
+# that case. It is the editor's lock, not a hang.
 
+# `-e` is deliberately absent: every failure below is inspected explicitly (via
+# PIPESTATUS/$ec) because a failing test run is an expected outcome that must
+# reach the retry and reporting logic, not abort the script.
 set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
@@ -77,12 +86,19 @@ trap 'trap - EXIT; cleanup; exit 143' TERM
 echo "==> Building test binaries ($CARGO test --no-run)"
 "$CARGO" test --features e2e --no-run || exit 1
 
-# Fresh checkout: the shared parser/query install (deps/test/kakehashi) does
-# not exist yet. The tests populate it lazily on first server spawn, so a
-# parallel run would have many tests race to populate one dir — one reading
-# another's half-written parser/query files (corrupt-cache flakiness). Seed it
-# ONCE, serially, with a single module first; the marker then short-circuits
-# every later run.
+# Fresh checkout: the shared parser/query install (deps/test/kakehashi) does not
+# exist yet; the tests populate it lazily on first server spawn. The install
+# itself is safe under concurrency (per-language flock + unique staging paths),
+# but four modules own separate OnceLock initializers for that one dir
+# (helpers::lsp_client, e2e_cli_diagnose, e2e_cli_format,
+# e2e_config_relative_paths), so a cold parallel run has several threads
+# redundantly compiling the same parsers before any of them wins. Seed it ONCE,
+# serially, and the marker short-circuits every later run.
+#
+# The filter names a specific module, so it is a real coupling: rename or delete
+# e2e_lsp_protocol and seeding silently becomes a no-op (the marker check below
+# is what catches that). Seeding is best-effort — `|| true` keeps a seed failure
+# from aborting a run that may well succeed anyway.
 INSTALL_MARKER="deps/test/kakehashi/.installed"
 if [ ! -f "$INSTALL_MARKER" ]; then
   echo "==> First run: seeding shared parser/query install (one module, serial)…"
@@ -107,6 +123,33 @@ if [ "$ec" -eq 124 ]; then
   echo "error: run exceeded the ${RUN_TIMEOUT}s timeout (E2E_TIMEOUT to raise)"
   exit 124
 fi
+
+# Everything below trusts the log to say what ran and what failed, so check the
+# log is COMPLETE before trusting it. Cargo's one-target-per-file layout used to
+# make this free — a missing binary was a missing binary — and the old runner
+# cross-checked the discovered binaries and refused a partial run. Merging to two
+# targets removed both safety nets, leaving three ways for a red run to read
+# green:
+#   * a binary dies by signal (abort, SIGSEGV, stack overflow, OOM-kill) and
+#     never prints a `test result:` line, so its failures are invisible to the
+#     retry parser below and the surviving binary's flake "recovers" the run;
+#   * a binary runs zero tests — e.g. `--features e2e` stops enabling the module
+#     tree, making tests/e2e a `#![cfg]`-emptied harness — and libtest exits 0;
+#   * libtest declares more failures than the parser can name, so the unnamed
+#     ones are never retried and silently disappear.
+# All three are fatal: refuse the run rather than fall through to a retry.
+SUMMARIES=$(grep -c '^test result: ' "$LOG" || true)
+if [ "$SUMMARIES" -ne 2 ]; then
+  echo "error: expected a 'test result:' summary from both binaries, found $SUMMARIES."
+  echo "       A test binary died without reporting (abort/segfault/stack overflow/OOM)."
+  exit 1
+fi
+if grep -q '^running 0 tests' "$LOG"; then
+  echo "error: a test binary ran zero tests — the suite is not being exercised."
+  echo "       Check that --features e2e still enables the tests/e2e module tree."
+  exit 1
+fi
+
 if [ "$ec" -eq 0 ]; then
   echo "All tests passed (${WALL}s)."
   exit 0
@@ -122,14 +165,49 @@ if [ -z "$FAILED" ]; then
   exit "$ec"
 fi
 
+# Every failure libtest declared must be one the parser could name. If the counts
+# disagree, some failure is about to go unretried and therefore unreported — the
+# parser's charset missed a name, or a `failures:` block was truncated. Refuse,
+# rather than retry the subset and call the run green.
+DECLARED=$(awk '/^test result: /{for(i=1;i<=NF;i++) if($(i+1)=="failed;") s+=$i} END{print s+0}' "$LOG")
+PARSED=$(printf '%s\n' "$FAILED" | grep -c .)
+if [ "$DECLARED" -ne "$PARSED" ]; then
+  echo "error: libtest declared $DECLARED failure(s) but only $PARSED could be named for retry."
+  echo "       Refusing to retry a subset — the unnamed failure(s) would vanish."
+  exit "$ec"
+fi
+
+# Bound each retry the way the main run is bounded. Without this a test that
+# hangs only when run alone blocks the gate (and the pre-commit hook) forever:
+# the whole-run cap has already been spent by the time we get here.
+RETRY_TIMEOUT="${E2E_RETRY_TIMEOUT:-300}"
+run_retry() {
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" "$RETRY_TIMEOUT" "$CARGO" test --features e2e --no-fail-fast \
+      --test integration --test e2e -- --exact "$1" --test-threads=1 2>&1
+  else
+    "$CARGO" test --features e2e --no-fail-fast \
+      --test integration --test e2e -- --exact "$1" --test-threads=1 2>&1
+  fi
+}
+
 echo
 echo "==> Retrying $(printf '%s\n' "$FAILED" | wc -l | tr -d ' ') failed tests serially (load-induced flakes recover here):"
 final=0
+# Unquoted on purpose: the parser's charset admits no whitespace or glob
+# characters, so word-splitting $FAILED is exactly the intended per-name split.
 for t in $FAILED; do
   t0=$SECONDS
-  if "$CARGO" test --features e2e --no-fail-fast --test integration --test e2e \
-       -- --exact "$t" --test-threads=1 >/dev/null 2>&1; then
+  out=$(run_retry "$t")
+  rc=$?
+  # A filter that matches nothing makes libtest exit 0, so the exit code alone
+  # cannot tell "passed" from "never ran". Count what actually executed.
+  ran=$(printf '%s\n' "$out" | awk '/^test result: /{for(i=1;i<=NF;i++){if($(i+1)=="passed;")p+=$i; if($(i+1)=="failed;")f+=$i}} END{print p+f+0}')
+  if [ "$rc" -eq 0 ] && [ "$ran" -ge 1 ]; then
     printf '  retry ok   %s  %3ds (was a flake)\n' "$t" "$((SECONDS - t0))"
+  elif [ "$rc" -eq 0 ]; then
+    printf '  retry VOID %s  %3ds (matched no test — name unusable, not a pass)\n' "$t" "$((SECONDS - t0))"
+    final=1
   else
     printf '  retry FAIL %s  %3ds (real failure)\n' "$t" "$((SECONDS - t0))"
     final=1
