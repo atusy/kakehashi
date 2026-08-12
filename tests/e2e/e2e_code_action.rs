@@ -639,7 +639,20 @@ fn open_markdown(client: &mut LspClient) {
 
 /// Issue `textDocument/codeAction` over the lua fence line, retrying while
 /// the result is null (cold downstream still handshaking).
-fn code_action_with_retry(client: &mut LspClient) -> Vec<Value> {
+/// Poll `textDocument/codeAction` until `ready` accepts the action list.
+///
+/// The readiness condition belongs to the caller. A NON-EMPTY menu is not proof
+/// of a COMPLETE one: with two downstream servers, whichever finishes its
+/// handshake and lazy open first can answer on its own, and that partial menu is
+/// a legitimate response, not an error. A test asserting on both servers must
+/// therefore wait for both — otherwise it races the slower server and fails
+/// under load, in whichever direction lost the race.
+fn code_action_until(
+    client: &mut LspClient,
+    expectation: &str,
+    ready: impl Fn(&[Value]) -> bool,
+) -> Vec<Value> {
+    let mut last: Vec<Value> = Vec::new();
     for _ in 0..300 {
         let response = client.send_request(
             "textDocument/codeAction",
@@ -652,14 +665,36 @@ fn code_action_with_retry(client: &mut LspClient) -> Vec<Value> {
                 "context": { "diagnostics": [] }
             }),
         );
-        if let Some(actions) = response["result"].as_array()
-            && !actions.is_empty()
-        {
-            return actions.clone();
+        if let Some(actions) = response["result"].as_array() {
+            if ready(actions) {
+                return actions.clone();
+            }
+            last = actions.clone();
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("textDocument/codeAction never returned actions");
+    panic!("textDocument/codeAction never {expectation}; last saw: {last:?}");
+}
+
+fn code_action_with_retry(client: &mut LspClient) -> Vec<Value> {
+    code_action_until(client, "returned actions", |actions| !actions.is_empty())
+}
+
+/// For the two-server tests: wait until BOTH mocks are represented in the menu.
+fn code_action_from_both_servers(client: &mut LspClient) -> Vec<Value> {
+    code_action_until(
+        client,
+        "returned actions from both mock-a and mock-b",
+        |actions| {
+            let has_suffix = |suffix: &str| {
+                actions
+                    .iter()
+                    .filter_map(|a| a["title"].as_str())
+                    .any(|t| t.ends_with(suffix))
+            };
+            has_suffix("— mock-a") && has_suffix("— mock-b")
+        },
+    )
 }
 
 #[test]
@@ -807,7 +842,10 @@ fn ispreferred_collapse_runs_even_under_crosslayer_preferred() {
     assert_advertised(&init_response);
     open_markdown(&mut client);
 
-    let actions = code_action_with_retry(&mut client);
+    // Both servers must be in the menu before counting: "exactly one preferred"
+    // is trivially true of a single server's actions, so a partial menu would
+    // pass this without exercising the cross-layer collapse at all.
+    let actions = code_action_from_both_servers(&mut client);
     let preferred_count = actions
         .iter()
         .filter(|a| a["isPreferred"] == json!(true))
@@ -831,7 +869,9 @@ fn concatenated_default_merges_actions_from_both_servers() {
     assert_advertised(&init_response);
     open_markdown(&mut client);
 
-    let actions = code_action_with_retry(&mut client);
+    // Wait for both servers: a menu holding only the faster mock is a valid
+    // response, so accepting the first non-empty one would race the slower one.
+    let actions = code_action_from_both_servers(&mut client);
     let titles: Vec<&str> = actions.iter().filter_map(|a| a["title"].as_str()).collect();
 
     assert!(
