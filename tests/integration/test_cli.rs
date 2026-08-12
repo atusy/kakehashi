@@ -1898,6 +1898,50 @@ fn test_language_uninstall_all_leaves_unmanaged_artifacts_and_says_so() {
     );
 }
 
+/// The issue's other half: a dangling entry needs SOME way to be removed.
+/// Naming it used to answer "is not installed" and exit 0, because the gate
+/// asked `is_file()`, which follows the link.
+#[test]
+#[cfg(unix)]
+fn test_language_uninstall_removes_a_dangling_parser_entry_by_name() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    let parser_dir = test_dir.path().join("parser");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    let dangling = parser_dir.join(format!("dangling.{ext}"));
+    std::os::unix::fs::symlink(test_dir.path().join("missing-target"), &dangling)
+        .expect("Failed to create dangling symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "dangling",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "uninstall failed: {combined}");
+    assert!(
+        !combined.contains("is not installed"),
+        "an entry that is plainly on disk must not be called absent: {combined}"
+    );
+    assert!(
+        fs::symlink_metadata(&dangling).is_err(),
+        "the dangling entry must be unlinked: {combined}"
+    );
+}
+
 /// Explicit uninstall must use the same regular-file check as discovery, so a
 /// parser-shaped directory is reported as absent and never passed to removal.
 #[test]

@@ -805,8 +805,8 @@ fn run_language_uninstall(
         }
 
         // Remove parser file
-        if let Some(parser_path) = find_parser_file(&parser_dir, lang) {
-            match fs::remove_file(&parser_path) {
+        match find_parser_entry(&parser_dir, lang) {
+            Ok(Some(parser_path)) => match fs::remove_file(&parser_path) {
                 Ok(()) => {
                     eprintln!("✓ Removed parser: {}", parser_path.display());
                     removed_something = true;
@@ -815,6 +815,19 @@ fn run_language_uninstall(
                     eprintln!("✗ Failed to remove parser {}: {}", parser_path.display(), e);
                     any_failed = true;
                 }
+            },
+            Ok(None) => {}
+            // Failing to look is not the same as finding nothing: reporting
+            // "not installed" here would be the command guessing, having just
+            // removed the language's queries.
+            Err(e) => {
+                eprintln!(
+                    "✗ Failed to inspect the parser for '{}' in {}: {}",
+                    lang,
+                    parser_dir.display(),
+                    e
+                );
+                any_failed = true;
             }
         }
 
@@ -857,10 +870,60 @@ fn run_language_uninstall(
     Ok(())
 }
 
-/// Find the parser file for a language.
+/// Find the LOADABLE parser file for a language.
+///
+/// Used by `status` to fill the parser column, where the question is whether the
+/// language can actually be loaded — so this follows symlinks and a broken one
+/// reads as absent. Uninstall asks a different question and uses
+/// [`find_parser_entry`]; see the note there for why the two must not be merged.
 fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf> {
     let path = parser_dir.join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION));
     if path.is_file() { Some(path) } else { None }
+}
+
+/// The parser entry `unlink` can take for a language, if there is one.
+///
+/// Uninstall's question is not "can this load" but "is there a directory entry
+/// here to remove", and the two differ exactly where it matters: a dangling
+/// symlink does not load, yet `remove_file` unlinks it happily because unlink
+/// acts on the link rather than its target. Asking `is_file()` — which follows
+/// the link — made the entry invisible, so `uninstall <lang>` answered "is not
+/// installed" and exited 0 while it sat on disk with no CLI path to clear it.
+///
+/// `Err` means the entry could not be classified at all. That is deliberately
+/// distinct from `Ok(None)`: "there is nothing here" and "I could not tell"
+/// must not collapse into the same answer one step before a destructive action.
+fn find_parser_entry(parser_dir: &Path, lang: &str) -> std::io::Result<Option<PathBuf>> {
+    let path = parser_dir.join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION));
+    match parser_entry_kind(&path)? {
+        Some(()) => Ok(Some(path)),
+        None => Ok(None),
+    }
+}
+
+/// Whether a path in `parser/` is an entry uninstall may remove.
+///
+/// `symlink_metadata` rather than `metadata`, so a dangling symlink is a normal
+/// answer instead of a `NotFound` error; and rather than `DirEntry::file_type`,
+/// which can be served from `readdir`'s cached `d_type` and so would report
+/// success on some filesystems and fail on others for an unreadable directory.
+///
+/// A regular file or a symlink counts — those are the two shapes an install
+/// produces, and a symlink is how a locally built parser gets pointed at. A
+/// directory does not (see #828: `remove_file` cannot take one). Other special
+/// file types are left out for the same reason a directory is: discovery would
+/// be inventing an install that nothing here created.
+fn parser_entry_kind(path: &Path) -> std::io::Result<Option<()>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            Ok((file_type.is_file() || file_type.is_symlink()).then_some(()))
+        }
+        // Absent is the ordinary "not installed" answer; every other failure
+        // means we could not tell, which must not read as absent.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// What to tell someone whose `--output` path is already taken. A regular
@@ -1487,6 +1550,44 @@ mod tests {
         );
         assert_eq!(installed_query_language_name(&unsafe_name), None);
         assert_eq!(installed_query_language_name(&hidden), None);
+    }
+
+    /// A dangling parser entry is what uninstall must be able to remove, and
+    /// `is_file()` — which follows the link — is what hid it. `Ok(None)` here
+    /// would put the entry back out of reach of every CLI path.
+    #[test]
+    #[cfg(unix)]
+    fn find_parser_entry_sees_a_dangling_symlink() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ext = std::env::consts::DLL_EXTENSION;
+        let path = temp.path().join(format!("dangling.{ext}"));
+        std::os::unix::fs::symlink(temp.path().join("missing"), &path).unwrap();
+
+        assert_eq!(
+            find_parser_entry(temp.path(), "dangling").unwrap(),
+            Some(path)
+        );
+        // The loadability question has the opposite answer, which is why the
+        // two helpers exist separately.
+        assert_eq!(find_parser_file(temp.path(), "dangling"), None);
+    }
+
+    /// A parser-shaped directory is not an entry `remove_file` can take (#828).
+    #[test]
+    fn find_parser_entry_rejects_a_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let ext = std::env::consts::DLL_EXTENSION;
+        std::fs::create_dir_all(temp.path().join(format!("fakeparser.{ext}"))).unwrap();
+
+        assert_eq!(find_parser_entry(temp.path(), "fakeparser").unwrap(), None);
+    }
+
+    /// "Nothing here" and "could not tell" must stay distinguishable: the gate
+    /// they feed is one step before `fs::remove_file`.
+    #[test]
+    fn find_parser_entry_reports_absence_but_not_failure() {
+        let temp = tempfile::TempDir::new().unwrap();
+        assert_eq!(find_parser_entry(temp.path(), "absent").unwrap(), None);
     }
 
     /// `Path::exists()` follows symlinks, so the old precheck read a dangling
