@@ -351,8 +351,9 @@ the *stability* rules a multi-server fan-out needs on top of them.
   A routing-provider fan-out is not such an aggregation: it stays exempt,
   bounded solely by its own routing deadline (bridge-routing-protocol,
   ls-bridge-timeout-hierarchy). A single participant needs no aggregation
-  bound — nothing is being waited *together* — and the liveness timeout
-  already protects it
+  bound — nothing is being waited *together* — and the per-downstream
+  response cap already bounds its individual wait; liveness separately
+  detects connection silence
 - **Per-request timeout behavior**: On timeout, return whatever results available **without sending $/cancelRequest**
   - Downstream servers continue processing and send responses
   - Late responses **discarded** by router but **reset liveness timeout** (heartbeat for connection health)
