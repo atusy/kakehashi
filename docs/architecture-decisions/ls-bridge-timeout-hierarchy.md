@@ -30,6 +30,7 @@ The async bridge architecture defines timeout systems across several decisions:
 6. **Routing Decision Deadline** (bridge-routing-protocol): Bounds one routing decision — provider fan-out, initialization waits, and answer normalization (see the dedicated section below)
 7. **Binding-Reuse Validation Budget** (bridge-routing-protocol): Bounds the *caller's wait* on filesystem revalidation along binding-driven reuse paths — capped by the sweep's remaining budget on re-open sweeps, a dedicated implementation-defined budget on lazy-open/retry paths, and the global shutdown ceiling always. It does not bound the underlying OS call or its worker capacity, which may outlive every deadline (capacity returns only when the call does)
 8. **Per-Downstream Response Cap** (language-server-bridge): A flat 30s bound on each bridge-managed downstream request — excluding control-protocol pass-through and the lifecycle handshake; shipped, and not a tier (see the dedicated section below)
+9. **Writer-Idle Timeout** (ls-bridge-graceful-shutdown): Bounds the wait for exclusive stdin access during shutdown, inside the applicable shutdown deadline rather than in addition to it (see the dedicated section below)
 
 ### The Problem
 

@@ -6,14 +6,26 @@ As recorded, only Phase 1 (bridge infrastructure with working go-to-definition)
 was complete. Per-method coverage has since expanded well beyond this; see
 [docs/README.md](../README.md) for the current list of bridge-backed requests.
 
-Two of this record's original mechanisms never shipped, and the architecture
-diagram, the eager-spawn diagram, and the Phase 1 checklist below still show
-them. Injection content goes to **virtual document URIs**, not temporary
+Two of this record's original mechanisms shipped in the legacy redirection
+implementation (`src/lsp/redirection.rs`) and were superseded later; the
+architecture diagram, the eager-spawn diagram, and the Phase 1 checklist
+below still show them. Injection content goes to **virtual document URIs**, not temporary
 files on disk (language-server-bridge-virtual-document-model), so the
 `TempFileManager` those diagrams name does not exist; and readiness is the
 **LSP handshake**, not a multi-signal indexing detector. § Provisioning Flow
 and § Ready Detection are corrected; the diagrams are left as the historical
 record this file is.
+
+**Crash recovery diverges, and two ADRs disagree about it.** This record
+decides immediate respawn on detecting a dead server. The code instead marks
+the connection `Failed` and respawns on the next acquire, and
+bridge-client-control-protocol states acquire-driven recovery as *its*
+decision — so this is not merely code lagging a decision, it is two
+decisions in conflict. The observable difference is real: a server nothing
+re-acquires (a `forceStart`-only policy server with `languages = []`) stays
+down under acquire-driven recovery until a reload or an explicit `restart`.
+Settling it changes behavior, so it is recorded here rather than decided
+while reorganizing this record.
 
 ## Context
 
@@ -159,14 +171,7 @@ Spawning can piggyback on these existing code paths.
 
 - **Spawn on injection detection**: Background spawn when new language injection is found
 - **Reuse**: All subsequent requests use warm connection
-- **Crash recovery**: Detect dead servers (broken pipe, exit code) and mark
-  the connection `Failed`; the next acquire respawns it. **This corrects the
-  original promise of immediate respawn**, which neither the code nor
-  bridge-client-control-protocol has ever implemented — recovery is
-  acquire-driven, not timer-driven. The consequence is real and recorded
-  elsewhere: a server nothing re-acquires (a `forceStart`-only policy server
-  with `languages = []`) stays down until a reload or an explicit `restart`
-  (bridge-routing-protocol)
+- **Crash recovery**: Detect dead servers (broken pipe, exit code) and respawn immediately (see § Decision–Implementation Gap — recovery is acquire-driven today, and bridge-client-control-protocol decides otherwise)
 
 ### Server Registry and Configuration
 
@@ -272,7 +277,8 @@ This separation allows:
 ### Temporary File Management
 
 > **Superseded, non-normative — retained as history.** This whole section
-> describes a design that never shipped. Injection content is not written to
+> describes a design that shipped in the legacy redirection implementation
+> and was later replaced. Injection content is not written to
 > disk: the bridge mints virtual document URIs and sends in-memory content
 > (§ Provisioning Flow, language-server-bridge-virtual-document-model).
 > Nothing below is a current requirement.
@@ -377,9 +383,10 @@ kakehashi configuration points rust-analyzer to this file:
 
 #### Provisioning Flow
 
-Both halves of this record's original provisioning design were **superseded
-before they shipped**, and the sections above still describe the world they
-assumed — see § Decision–Implementation Gap.
+Both halves of this record's original provisioning design shipped once, in
+the legacy redirection implementation, and were **superseded** by the
+current bridge; the sections above still describe the world they assumed —
+see § Decision–Implementation Gap.
 
 1. Initialize the server with user-provided `initializationOptions`.
 2. Complete the **LSP handshake** — the initialize response processed and
@@ -435,7 +442,7 @@ writer task patterns, and the timeout tiers this bound sits in.
 
 | Error Type | Detection | Recovery |
 |------------|-----------|----------|
-| Server crash | Broken pipe on read/write | Mark connection `Failed`; the next acquire respawns |
+| Server crash | Broken pipe on read/write | Mark connection dead, respawn immediately (see § Decision–Implementation Gap) |
 | Request timeout | Response wait expires | Return `None`, log warning |
 | Malformed response | JSON decode failure on the wire | Connection-fatal: every pending request fails and the connection reports `Failed` |
 | Server busy | No response within timeout | Return `None`, consider increasing timeout |
