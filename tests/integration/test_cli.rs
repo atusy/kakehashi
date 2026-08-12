@@ -2326,9 +2326,16 @@ fn test_language_uninstall_does_not_call_a_language_absent_after_failing_to_insp
     let ext = std::env::consts::DLL_EXTENSION;
     let parser_dir = test_dir.path().join("parser");
     fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
-    fs::write(parser_dir.join(format!("lua.{ext}")), "parser").expect("Failed to write parser");
-    // `queries/` stays writable — the language lock lives there and is taken
-    // first, so sealing it would fail the run earlier than the parser lookup.
+    let parser_file = parser_dir.join(format!("lua.{ext}"));
+    fs::write(&parser_file, "parser").expect("Failed to write parser");
+    // Queries must be present for this to reach the removal at all — and they
+    // are what proves the run left the language WHOLE rather than half-taken.
+    // `queries/` itself stays writable: the language lock lives there and is
+    // taken first, so sealing it would fail the run before the parser lookup.
+    let queries_lua = test_dir.path().join("queries/lua");
+    fs::create_dir_all(&queries_lua).expect("Failed to create queries dir");
+    fs::write(queries_lua.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write queries");
     let mut permissions = fs::metadata(&parser_dir)
         .expect("Failed to read permissions")
         .permissions();
@@ -2367,6 +2374,16 @@ fn test_language_uninstall_does_not_call_a_language_absent_after_failing_to_insp
     assert!(
         combined.contains(&format!("lua.{ext}")),
         "the failure must name the entry it could not inspect: {combined}"
+    );
+    // The probe happens before the queries are taken, so an unreadable parser
+    // leaves the language whole instead of manufacturing the parser-only state.
+    assert!(
+        queries_lua.is_dir(),
+        "the queries must survive an undecidable parser: {combined}"
+    );
+    assert!(
+        parser_file.is_file(),
+        "nothing about the language may be taken: {combined}"
     );
 }
 

@@ -613,16 +613,9 @@ fn safe_parser_language_name(stem: &str) -> Option<String> {
 }
 
 fn installed_query_language_name_checked(path: &Path) -> std::io::Result<Option<String>> {
-    let Some(file_name) = path.file_name() else {
+    let Some(name) = safe_query_entry_name(path) else {
         return Ok(None);
     };
-    let name = file_name.to_string_lossy();
-    if name.starts_with('.') {
-        return Ok(None);
-    }
-    if !queries::is_safe_language_name(&name) {
-        return Ok(None);
-    }
     let is_dir = match std::fs::metadata(path) {
         Ok(metadata) => metadata.is_dir(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -638,7 +631,7 @@ fn installed_query_language_name_checked(path: &Path) -> std::io::Result<Option<
     if !is_dir {
         return Ok(None);
     }
-    Ok(Some(name.to_string()))
+    Ok(Some(name))
 }
 
 /// Say what discovery deliberately left on disk, and why.
@@ -690,12 +683,6 @@ fn run_language_uninstall(
     // command does not know the shape of, so it cannot know what it left.
     let mut unreadable = false;
 
-    // Languages whose own parser entry could not be read. Removing their
-    // queries would leave exactly the parser-only state this command exists to
-    // avoid — and unlike a removal that fails, this one is known BEFORE
-    // anything is taken, so the language can simply be left whole.
-    let mut undecidable: BTreeSet<String> = BTreeSet::new();
-
     // Determine which languages to uninstall
     let languages_to_uninstall: Vec<String> = if all {
         // Collect all installed languages
@@ -746,13 +733,6 @@ fn run_language_uninstall(
                     // could smuggle ANSI escapes into this line.
                     eprintln!("✗ Failed to inspect {:?}: {}", path, error);
                     unreadable = true;
-                    // The stem is legible even when the entry is not, and it is
-                    // what says which language must now be left alone.
-                    if let Some(stem) = path.file_stem()
-                        && let Some(language) = safe_parser_language_name(&stem.to_string_lossy())
-                    {
-                        undecidable.insert(language);
-                    }
                 }
             }
             Ok(())
@@ -776,9 +756,6 @@ fn run_language_uninstall(
                 Err(error) => {
                     eprintln!("✗ Failed to inspect {:?}: {}", path, error);
                     unreadable = true;
-                    if let Some(name) = safe_query_entry_name(&path) {
-                        undecidable.insert(name);
-                    }
                 }
             }
             Ok(())
@@ -857,20 +834,6 @@ fn run_language_uninstall(
             continue;
         }
 
-        // Discovery could not read this language's own parser entry. Taking its
-        // queries would leave the parser-only state the lock below exists to
-        // prevent, and unlike a removal that fails, this is known before
-        // anything is taken — so leave the language whole and say so. The run
-        // still fails; the neighbours still get removed.
-        if undecidable.contains(lang) {
-            eprintln!(
-                "✗ Leaving '{}' untouched: its parser entry could not be inspected.",
-                lang
-            );
-            any_failed = true;
-            continue;
-        }
-
         let mut removed_something = false;
         // Whether anything about THIS language went wrong. "Not installed" is a
         // claim about the filesystem, and a run that just failed to read or
@@ -885,6 +848,30 @@ fn run_language_uninstall(
             Ok(lock) => lock,
             Err(e) => {
                 eprintln!("✗ Failed to lock '{}' for uninstall: {}", lang, e);
+                any_failed = true;
+                continue;
+            }
+        };
+
+        // Look at the parser BEFORE taking the queries, under the same lock
+        // that will still be held when it is removed.
+        //
+        // Order matters for one reason: if we cannot tell what is at the parser
+        // path, removing the queries first would manufacture the parser-only
+        // state this whole transaction exists to avoid — #953's headline shape,
+        // reached through the per-entry door instead of the directory-level
+        // one. Unlike a removal that FAILS, this is knowable before anything is
+        // taken, so the language can simply be left whole. The run still fails,
+        // and the other languages are still removed.
+        let parser_entry = match find_parser_entry(&parser_dir, lang) {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!(
+                    "✗ Leaving '{}' untouched: failed to inspect its parser entry at {:?}: {}",
+                    lang,
+                    parser_entry_path(&parser_dir, lang),
+                    e
+                );
                 any_failed = true;
                 continue;
             }
@@ -934,39 +921,18 @@ fn run_language_uninstall(
             }
         }
 
-        // Remove parser file
-        match find_parser_entry(&parser_dir, lang) {
-            Ok(Some((parser_path, is_symlink))) => {
-                match remove_parser_entry(&parser_path, is_symlink) {
-                    Ok(()) => {
-                        eprintln!("✓ Removed parser: {}", parser_path.display());
-                        removed_something = true;
-                    }
-                    Err(e) => {
-                        eprintln!("✗ Failed to remove parser {}: {}", parser_path.display(), e);
-                        any_failed = true;
-                        lang_failed = true;
-                    }
+        // Remove the parser entry probed above, still under the same lock.
+        if let Some((parser_path, is_symlink)) = parser_entry {
+            match remove_parser_entry(&parser_path, is_symlink) {
+                Ok(()) => {
+                    eprintln!("✓ Removed parser: {}", parser_path.display());
+                    removed_something = true;
                 }
-            }
-            Ok(None) => {}
-            // Failing to look is not the same as finding nothing: reporting
-            // "not installed" here would be the command guessing, having just
-            // removed the language's queries.
-            //
-            // Naming the candidate entry rather than the directory, because
-            // "failed to inspect …/parser: No such file or directory" about a
-            // directory that plainly exists is precisely the message #953
-            // called out as unactionable.
-            Err(e) => {
-                eprintln!(
-                    "✗ Failed to inspect the parser for '{}' at {}: {}",
-                    lang,
-                    parser_entry_path(&parser_dir, lang).display(),
-                    e
-                );
-                any_failed = true;
-                lang_failed = true;
+                Err(e) => {
+                    eprintln!("✗ Failed to remove parser {}: {}", parser_path.display(), e);
+                    any_failed = true;
+                    lang_failed = true;
+                }
             }
         }
 
