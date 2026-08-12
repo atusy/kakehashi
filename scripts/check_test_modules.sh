@@ -21,15 +21,17 @@ cd "$(git rev-parse --show-toplevel)"
 
 status=0
 
-# $1: directory holding the modules, $2: the main.rs declaring them
+# $1: directory holding the modules, $2: the main.rs declaring them,
+# $3: filename prefix that marks a real test module (vs a support module like
+#     helpers/), used for the non-emptiness check
 check_dir() {
-  local dir="$1" main="$2" stem missing found
+  local dir="$1" main="$2" prefix="$3" stem missing found
   missing=""
   found=0
   for f in "$dir"/*.rs; do
     stem="$(basename "$f" .rs)"
     [ "$stem" = "main" ] && continue
-    found=$((found + 1))
+    case "$stem" in "$prefix"*) found=$((found + 1)) ;; esac
     grep -q "^mod ${stem};" "$main" || missing="${missing}  ${f}"$'\n'
   done
   # Directory-backed modules (<name>/mod.rs) too, or they would be invisible in
@@ -37,17 +39,22 @@ check_dir() {
   for f in "$dir"/*/mod.rs; do
     [ -f "$f" ] || continue
     stem="$(basename "$(dirname "$f")")"
-    found=$((found + 1))
+    case "$stem" in "$prefix"*) found=$((found + 1)) ;; esac
     grep -q "^mod ${stem};" "$main" || missing="${missing}  ${f}"$'\n'
   done
   # A suite of nothing but main.rs would satisfy every check above vacuously,
   # and CI's plain `cargo test` would happily accept the resulting zero-test
   # binary. A guard that passes when there is nothing to guard is worse than
   # no guard, so require the suite to be non-empty.
+  #
+  # Only `$prefix`-named modules count. Support modules must not: tests/e2e's
+  # helpers carry 25 #[test] fns of their own, so counting them would let every
+  # e2e_*.rs be deleted while the suite still looked non-empty here AND still
+  # reported a non-zero test count to the runner.
   # (A missing directory needs no separate case: bash leaves the unmatched glob
   # literal, so the "*" stem finds no `mod` line and is reported as missing.)
   if [ "$found" -eq 0 ]; then
-    echo "error: ${dir} declares no test modules at all — the suite would be empty." >&2
+    echo "error: ${dir} declares no ${prefix}* test modules — the suite would be empty." >&2
     status=1
     return
   fi
@@ -75,7 +82,7 @@ check_dir() {
   done
 }
 
-check_dir tests/e2e tests/e2e/main.rs
-check_dir tests/integration tests/integration/main.rs
+check_dir tests/e2e tests/e2e/main.rs e2e_
+check_dir tests/integration tests/integration/main.rs test_
 
 exit "$status"

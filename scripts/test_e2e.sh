@@ -177,6 +177,17 @@ if grep -q '^running 0 tests' "$LOG"; then
   echo "       Check that --features e2e still enables the tests/e2e module tree."
   exit 1
 fi
+# "more than zero tests" is not the same as "the suite ran". tests/e2e/helpers
+# contributes 25 #[test] fns of its own, so an e2e binary containing nothing but
+# helpers still reports a healthy-looking count. Require each suite's actual
+# test modules to have produced results.
+for want in 'e2e_:E2E' 'test_:integration'; do
+  if ! grep -q "^test ${want%%:*}" "$LOG"; then
+    echo "error: no ${want%%:*}* test ran — the ${want##*:} suite was not exercised."
+    echo "       Its modules are missing, unregistered, or filtered out."
+    exit 1
+  fi
+done
 
 if [ "$ec" -eq 0 ]; then
   echo "All tests passed (${WALL}s)."
