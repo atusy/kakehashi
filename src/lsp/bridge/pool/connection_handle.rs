@@ -1101,8 +1101,16 @@ impl ConnectionHandle {
     pub(in crate::lsp::bridge) fn register_peer_request(
         &self,
     ) -> io::Result<(RequestId, tokio::sync::oneshot::Receiver<serde_json::Value>)> {
-        let (request_id, response_rx) = self.register_request()?;
-        self.router.track_failure(request_id);
+        let request_id = RequestId::new(self.next_request_id());
+        let (response_rx, liveness_epoch) = self
+            .router()
+            .register_peer(request_id)
+            .ok_or_else(|| io::Error::other("bridge: duplicate request ID"))?;
+        if let Some(epoch) = liveness_epoch
+            && self.state() == ConnectionState::Ready
+        {
+            self.reader_handle.notify_liveness_start(epoch);
+        }
         Ok((request_id, response_rx))
     }
 
