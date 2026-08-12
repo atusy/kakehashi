@@ -17,9 +17,11 @@ implementation waited on `publishDiagnostics` alone, bounded by a message
 count rather than a timeout, and never treated progress completion as
 readiness — and the current bridge dropped even that in favour of the
 handshake. The architecture diagram, the eager-spawn diagram, and the
-Phase 1 checklist below still show both. Injection content goes to **virtual document URIs**, not temporary
-files on disk (language-server-bridge-virtual-document-model), so the
-`TempFileManager` those diagrams name does not exist; and readiness is the
+Phase 1 checklist below still show both. Injection content goes to **virtual document URIs** on the ordinary path
+rather than unconditionally to temporary files
+(language-server-bridge-virtual-document-model, which keeps materialization
+for servers that need a real path), so the `TempFileManager` those diagrams
+name does not exist; and readiness is the
 **LSP handshake**, not a multi-signal indexing detector. § Provisioning Flow
 and § Ready Detection are corrected; the diagrams are left as the historical
 record this file is.
@@ -261,7 +263,10 @@ The bridge filtering happens at request time: when a request targets an injectio
 
 #### Multiple Servers Per Language
 
-When multiple servers are configured for the same language (e.g., `pyright` + `ruff` for Python), requests are only routed to servers with the required capability. The routing strategy among capable servers is **implementation-defined**:
+When multiple servers are configured for the same language (e.g., `pyright` + `ruff` for Python), requests are only routed to servers with the required capability. The routing strategy among capable servers is decided by
+cross-layer-aggregation and aggregation-priorities-wildcard — `preferred`
+and `concatenated`, selected by a priority-ordered allowlist. The options
+weighed when this record was written, retained for their trade-offs:
 
 | Strategy | Description | Trade-off |
 |----------|-------------|-----------|
@@ -396,8 +401,9 @@ kakehashi configuration points rust-analyzer to this file:
 
 #### Provisioning Flow
 
-This record's original provisioning design is obsolete: its temp-file half
-shipped once and was superseded, and its multi-signal readiness half never
+This record's original provisioning design is obsolete: its
+unconditional temp-file half shipped once and was superseded by conditional
+materialization, and its multi-signal readiness half never
 shipped as designed. The sections above still describe the world they
 assumed — see § Decision–Implementation Gap.
 
@@ -441,7 +447,8 @@ surfaces an error when nothing answered; a `concatenated` aggregation fails
 if a layer it required fails; and a fan-out whose downstreams all fail
 answers `REQUEST_FAILED`. Degradation is per-server, not per-request. What bounds the wait, today, is a fixed 30-second cap on each
 bridge-managed downstream request — not on control-protocol pass-through,
-which by contract carries no bridge-imposed timeout. It is not either of the named tiers: Tier 1 — the per-request
+which by contract carries no bridge-imposed timeout, and not on
+routing-provider requests, whose routing deadline is their sole bound. It is not either of the named tiers: Tier 1 — the per-request
 aggregation timeout that engages only for a multi-server fan-out — is still
 Phase 3, and Tier 2 is a connection-*health* monitor that resets on any
 decoded server message, so it bounds silence rather than any one request.
