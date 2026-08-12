@@ -1862,6 +1862,23 @@ mod tests {
         assert_eq!(entry, ParserEntry::WrongShape);
     }
 
+    /// Removing and finding-already-gone are different answers. A parser that
+    /// another actor unlinked between classification and removal leaves the
+    /// filesystem in exactly the asked-for state, so it must not be reported as
+    /// a failed removal — nor as work this run did.
+    #[test]
+    fn remove_parser_entry_distinguishes_removing_from_already_gone() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let present = temp.path().join("present");
+        std::fs::write(&present, "parser").unwrap();
+
+        assert_eq!(remove_parser_entry(&present).unwrap(), true);
+        assert!(!present.exists());
+        // The same call again: the entry is gone, which is success, but not a
+        // removal this run performed.
+        assert_eq!(remove_parser_entry(&present).unwrap(), false);
+    }
+
     /// "Nothing here" and "could not tell" must stay distinguishable: the gate
     /// they feed is one step before `fs::remove_file`.
     #[test]
