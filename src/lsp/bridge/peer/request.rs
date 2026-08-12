@@ -1,12 +1,15 @@
 //! `kakehashi/bridge/peer/request`: downstream → kakehashi → peer request.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use serde::Deserialize;
 use tower_lsp_server::jsonrpc;
 
 use crate::lsp::bridge::actor::{RouterCleanupGuard, ServerRequestDeps, send_server_response};
+use crate::lsp::bridge::inbound_request_registry::PeerRequestPermit;
+use crate::lsp::bridge::pool::ConnectionHandle;
 use crate::lsp::bridge::protocol::JsonRpcNotification;
+use crate::lsp::bridge::protocol::RequestId;
 
 const METHOD: &str = "kakehashi/bridge/peer/request";
 const DENIED_METHODS: &[&str] = &[
@@ -71,9 +74,26 @@ fn validate_params(params: &PeerRequestParams) -> jsonrpc::Result<()> {
     Ok(())
 }
 
+async fn cleanup_cancelled_peer(
+    peer: Arc<ConnectionHandle>,
+    downstream_id: RequestId,
+    settled_rx: tokio::sync::oneshot::Receiver<()>,
+    deadline: tokio::time::Instant,
+    _permit: PeerRequestPermit,
+) {
+    tokio::select! {
+        _ = settled_rx => {}
+        _ = tokio::time::sleep_until(deadline) => {
+            if peer.router().expire_peer_cancel(downstream_id) {
+                peer.fail_if_ready();
+            }
+        }
+    }
+}
+
 /// Start an arbitrary request against one discovered peer without blocking the
 /// originating connection's reader loop.
-pub(in crate::lsp::bridge) fn handle(
+pub(in crate::lsp::bridge) async fn handle(
     message: &serde_json::Value,
     id: jsonrpc::Id,
     server_prefix: &str,
@@ -84,22 +104,18 @@ pub(in crate::lsp::bridge) fn handle(
     let params = match PeerRequestParams::deserialize(&message["params"]) {
         Ok(params) => params,
         Err(error) => {
-            tokio::spawn(async move {
-                let response = jsonrpc::Response::from_error(
-                    id,
-                    jsonrpc::Error::invalid_params(format!("Invalid params: {error}")),
-                );
-                send_server_response(&response_tx, response, &server_prefix, METHOD).await;
-            });
+            let response = jsonrpc::Response::from_error(
+                id,
+                jsonrpc::Error::invalid_params(format!("Invalid params: {error}")),
+            );
+            send_server_response(&response_tx, response, &server_prefix, METHOD).await;
             return;
         }
     };
 
     if let Err(error) = validate_params(&params) {
-        tokio::spawn(async move {
-            let response = jsonrpc::Response::from_error(id, error);
-            send_server_response(&response_tx, response, &server_prefix, METHOD).await;
-        });
+        let response = jsonrpc::Response::from_error(id, error);
+        send_server_response(&response_tx, response, &server_prefix, METHOD).await;
         return;
     }
 
@@ -107,16 +123,14 @@ pub(in crate::lsp::bridge) fn handle(
         .peer_directory
         .resolve(&deps.connection_key, &params.id)
     else {
-        tokio::spawn(async move {
-            let response = jsonrpc::Response::from_error(
-                id,
-                request_failed(
-                    "unknownPeer",
-                    "peer is absent, is the caller, or is not running",
-                ),
-            );
-            send_server_response(&response_tx, response, &server_prefix, METHOD).await;
-        });
+        let response = jsonrpc::Response::from_error(
+            id,
+            request_failed(
+                "unknownPeer",
+                "peer is absent, is the caller, or is not running",
+            ),
+        );
+        send_server_response(&response_tx, response, &server_prefix, METHOD).await;
         return;
     };
 
@@ -124,30 +138,27 @@ pub(in crate::lsp::bridge) fn handle(
     let registry = deps.inbound_request_registry.clone();
     let Some((cancel, generation, permit)) = registry.try_register_peer(connection_id, id.clone())
     else {
-        tokio::spawn(async move {
-            let response = jsonrpc::Response::from_error(
-                id,
-                request_failed(
-                    "tooManyRequests",
-                    "too many peer requests are awaiting responses",
-                ),
-            );
-            send_server_response(&response_tx, response, &server_prefix, METHOD).await;
-        });
+        let response = jsonrpc::Response::from_error(
+            id,
+            request_failed(
+                "tooManyRequests",
+                "too many peer requests are awaiting responses",
+            ),
+        );
+        send_server_response(&response_tx, response, &server_prefix, METHOD).await;
         return;
     };
 
-    let (downstream_id, response_rx) = match peer.register_peer_request() {
+    let (downstream_id, response_rx, settled_rx) = match peer.register_peer_request() {
         Ok(registered) => registered,
         Err(error) => {
             registry.unregister(connection_id, &id, generation);
-            tokio::spawn(async move {
-                let response = jsonrpc::Response::from_error(
-                    id,
-                    request_failed("forwardFailed", error.to_string()),
-                );
-                send_server_response(&response_tx, response, &server_prefix, METHOD).await;
-            });
+            drop(permit);
+            let response = jsonrpc::Response::from_error(
+                id,
+                request_failed("forwardFailed", error.to_string()),
+            );
+            send_server_response(&response_tx, response, &server_prefix, METHOD).await;
             return;
         }
     };
@@ -160,13 +171,11 @@ pub(in crate::lsp::bridge) fn handle(
     };
     if let Err(error) = peer.send_request_value(params.method, inner_params, downstream_id) {
         registry.unregister(connection_id, &id, generation);
-        tokio::spawn(async move {
-            let response = jsonrpc::Response::from_error(
-                id,
-                request_failed("forwardFailed", error.to_string()),
-            );
-            send_server_response(&response_tx, response, &server_prefix, METHOD).await;
-        });
+        drop(router_guard);
+        drop(permit);
+        let response =
+            jsonrpc::Response::from_error(id, request_failed("forwardFailed", error.to_string()));
+        send_server_response(&response_tx, response, &server_prefix, METHOD).await;
         return;
     }
 
@@ -203,16 +212,14 @@ pub(in crate::lsp::bridge) fn handle(
                             outcome
                         );
                     }
-                    let router = peer.router().clone();
-                    let peer = peer.clone();
                     let permit = permit.take();
-                    tokio::spawn(async move {
-                        tokio::time::sleep_until(deadline).await;
-                        if router.expire_peer_cancel(downstream_id) {
-                            peer.fail_if_ready();
-                        }
-                        drop(permit);
-                    });
+                    tokio::spawn(cleanup_cancelled_peer(
+                        peer.clone(),
+                        downstream_id,
+                        settled_rx,
+                        deadline,
+                        permit.expect("an admitted request owns its capacity permit"),
+                    ));
                 }
                 Err(jsonrpc::Error::request_cancelled())
             }
@@ -254,6 +261,10 @@ fn normalize_response(response: serde_json::Value) -> jsonrpc::Result<serde_json
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::bridge::ProgressConnectionId;
+    use crate::lsp::bridge::inbound_request_registry::{
+        InboundRequestRegistry, MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION,
+    };
     use crate::lsp::bridge::pool::{
         ConnectionKey, ConnectionState, test_helpers::create_handle_with_key,
     };
@@ -341,7 +352,7 @@ mod tests {
         let peer =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("oxfmt"))
                 .await;
-        let (request_id, response_rx) = peer.register_peer_request().unwrap();
+        let (request_id, response_rx, _settled_rx) = peer.register_peer_request().unwrap();
         assert!(peer.router().fail_request(request_id, "write error"));
 
         let error = peer
@@ -349,6 +360,64 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn target_response_releases_cancelled_peer_capacity_immediately() {
+        let registry = InboundRequestRegistry::default();
+        let origin = ProgressConnectionId::for_test(1);
+        let (_cancel, _generation, permit) = registry
+            .try_register_peer(origin, jsonrpc::Id::Number(1))
+            .unwrap();
+        let mut remaining = Vec::new();
+        for n in 1..MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION {
+            remaining.push(
+                registry
+                    .try_register_peer(origin, jsonrpc::Id::Number(n as i64 + 1))
+                    .unwrap(),
+            );
+        }
+        assert!(
+            registry
+                .try_register_peer(origin, jsonrpc::Id::Number(1000))
+                .is_none()
+        );
+
+        let peer =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("oxfmt"))
+                .await;
+        let (request_id, response_rx, settled_rx) = peer.register_peer_request().unwrap();
+        assert!(peer.router().claim_for_write(request_id));
+        peer.router().mark_sent(request_id);
+        assert_eq!(peer.router().cancel_peer(request_id), Some(true));
+        let cleanup = tokio::spawn(cleanup_cancelled_peer(
+            peer.clone(),
+            request_id,
+            settled_rx,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            permit,
+        ));
+        drop(response_rx);
+
+        assert_eq!(
+            peer.router().route(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request_id.as_i64(),
+                "result": null
+            })),
+            crate::lsp::bridge::actor::RouteResult::ReceiverDropped
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), cleanup)
+            .await
+            .expect("settlement wakes cleanup before the request deadline")
+            .unwrap();
+        assert!(
+            registry
+                .try_register_peer(origin, jsonrpc::Id::Number(1000))
+                .is_some(),
+            "target settlement releases the cancelled generation's capacity"
+        );
+        drop(remaining);
     }
 
     #[test]
