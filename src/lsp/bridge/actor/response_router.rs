@@ -4,7 +4,7 @@
 //! oneshot channels (ls-bridge-message-ordering). A requester registers before sending, then awaits
 //! the receiver without holding any Mutex; the Reader Task calls `route()` on arrival.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::oneshot;
@@ -49,6 +49,11 @@ struct ResponseRouterState {
     liveness_epoch: u64,
     /// Pending requests waiting for responses.
     pending: HashMap<RequestId, PendingRequest>,
+    /// Out-of-band provenance for responses synthesized by bridge failures.
+    failures: HashMap<RequestId, BridgeFailure>,
+    /// Requests whose callers distinguish bridge transport failure from a
+    /// genuine downstream JSON-RPC error.
+    failure_tracked: HashSet<RequestId>,
     /// Maps upstream request ID (from client) to downstream request IDs (to LS).
     ///
     /// Used for $/cancelRequest forwarding: when the client cancels request 42,
@@ -89,7 +94,11 @@ pub(crate) enum LivenessExpiry {
     Failed { pending_count: usize },
 }
 
-const BRIDGE_FAILURE_DATA_KEY: &str = "kakehashiBridgeFailure";
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BridgeFailure {
+    ConnectionLost,
+    RequestTimeout,
+}
 
 impl ResponseRouter {
     /// Create a new empty ResponseRouter.
@@ -99,6 +108,8 @@ impl ResponseRouter {
                 accepting: true,
                 liveness_epoch: 0,
                 pending: HashMap::new(),
+                failures: HashMap::new(),
+                failure_tracked: HashSet::new(),
                 upstream_to_downstream: HashMap::new(),
                 downstream_to_upstream: HashMap::new(),
             }),
@@ -276,6 +287,7 @@ impl ResponseRouter {
         }
 
         let pending = state.pending.remove(&id);
+        state.failure_tracked.remove(&id);
         Self::remove_cancel_mapping_inner(&mut state, id);
         drop(state);
         if let Some(pending) = pending {
@@ -314,6 +326,7 @@ impl ResponseRouter {
 
         let mut state = self.state.lock().recover_poison("ResponseRouter::route");
         let pending = state.pending.remove(&id);
+        state.failure_tracked.remove(&id);
 
         // Clean up bidirectional cancel map entries in O(1)
         Self::remove_cancel_mapping_inner(&mut state, id);
@@ -394,6 +407,8 @@ impl ResponseRouter {
     pub(crate) fn remove(&self, id: RequestId) -> bool {
         let mut state = self.state.lock().recover_poison("ResponseRouter::remove");
         let removed = state.pending.remove(&id).is_some();
+        state.failures.remove(&id);
+        state.failure_tracked.remove(&id);
 
         if removed {
             Self::remove_cancel_mapping_inner(&mut state, id);
@@ -416,8 +431,27 @@ impl ResponseRouter {
             )
         });
         state.pending.remove(&id);
+        state.failures.remove(&id);
+        state.failure_tracked.remove(&id);
         Self::remove_cancel_mapping_inner(&mut state, id);
         should_notify
+    }
+
+    pub(crate) fn take_failure(&self, id: RequestId) -> Option<BridgeFailure> {
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("ResponseRouter::take_failure");
+        state.failure_tracked.remove(&id);
+        state.failures.remove(&id)
+    }
+
+    pub(crate) fn track_failure(&self, id: RequestId) {
+        self.state
+            .lock()
+            .recover_poison("ResponseRouter::track_failure")
+            .failure_tracked
+            .insert(id);
     }
 
     /// Fail a single pending request with an error response.
@@ -450,11 +484,25 @@ impl ResponseRouter {
                     "id": id.as_i64(),
                     "error": {
                         "code": -32803, // REQUEST_FAILED per LSP spec
-                        "message": format!("bridge: {}", reason),
-                        "data": { (BRIDGE_FAILURE_DATA_KEY): "connectionLost" }
+                        "message": format!("bridge: {}", reason)
                     }
                 });
-                let _ = pending.response_tx.send(error_response);
+                let tracked = self
+                    .state
+                    .lock()
+                    .recover_poison("ResponseRouter::fail_request provenance")
+                    .failure_tracked
+                    .contains(&id);
+                if tracked {
+                    self.state
+                        .lock()
+                        .recover_poison("ResponseRouter::fail_request provenance")
+                        .failures
+                        .insert(id, BridgeFailure::ConnectionLost);
+                }
+                if pending.response_tx.send(error_response).is_err() {
+                    self.take_failure(id);
+                }
                 true
             }
             None => false,
@@ -493,11 +541,20 @@ impl ResponseRouter {
                 "id": id.as_i64(),
                 "error": {
                     "code": code,
-                    "message": message,
-                    "data": { (BRIDGE_FAILURE_DATA_KEY): "connectionLost" }
+                    "message": message
                 }
             });
-            let _ = pending.response_tx.send(error_response);
+            let mut state = self
+                .state
+                .lock()
+                .recover_poison("ResponseRouter::fail_all provenance");
+            if state.failure_tracked.contains(&id) {
+                state.failures.insert(id, BridgeFailure::ConnectionLost);
+            }
+            drop(state);
+            if pending.response_tx.send(error_response).is_err() {
+                self.take_failure(id);
+            }
         }
     }
 
@@ -549,11 +606,20 @@ impl ResponseRouter {
                 "id": id.as_i64(),
                 "error": {
                     "code": code,
-                    "message": message,
-                    "data": { (BRIDGE_FAILURE_DATA_KEY): "requestTimeout" }
+                    "message": message
                 }
             });
-            let _ = pending.response_tx.send(error_response);
+            let mut state = self
+                .state
+                .lock()
+                .recover_poison("ResponseRouter::liveness provenance");
+            if state.failure_tracked.contains(&id) {
+                state.failures.insert(id, BridgeFailure::RequestTimeout);
+            }
+            drop(state);
+            if pending.response_tx.send(error_response).is_err() {
+                self.take_failure(id);
+            }
         }
         LivenessExpiry::Failed {
             pending_count: awaiting,
