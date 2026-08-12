@@ -65,11 +65,15 @@ const MAX_HEADER_BLOCK_BYTES: usize = 32 * 1024;
 ///
 /// This one is not a memory *policy* — it is what stands between a hostile or
 /// runaway header and `Vec::with_capacity` aborting the process, which no
-/// `io::Error` can report. So it is set deliberately generous: the largest
-/// legitimate downstream payload observed to date is a ~75 MB diagnostics
-/// burst (see the diagnostic wire-flood work), and this leaves that room to
-/// triple before tripping. A configuration knob can follow if a real
-/// deployment ever meets it.
+/// `io::Error` can report. It is therefore set far above anything a working
+/// server sends rather than at a defensible working-set size: real payloads
+/// (whole-document semantic tokens, a workspace diagnostics burst, a large
+/// completion list) reach into the megabytes, so this leaves roughly two
+/// orders of magnitude of headroom and trips only on a peer that is already
+/// malfunctioning. Deliberately not tuned to observed traffic — tightening
+/// it toward real payload sizes would turn a runaway-peer guard into a
+/// working-set limit that a legitimately large workspace could meet. A
+/// configuration knob can follow if one ever does.
 const MAX_CONTENT_LENGTH_BYTES: usize = 256 * 1024 * 1024;
 
 /// A body remainder large enough to read straight from the source.
