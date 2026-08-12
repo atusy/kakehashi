@@ -11,6 +11,7 @@ kakehashi is a bridge (架け橋) across your editors, your languages, and the l
 ```mermaid
 flowchart TB
     subgraph K[" "]
+        direction TB
         T["🌉 kakehashi"] ~~~ B["Builtin smart features"]
     end
 
