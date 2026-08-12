@@ -55,8 +55,8 @@ and opens the ones that do.
 
 No captured re-open *target list* is remembered, so no such list can go
 stale. (Per-document route bindings — bridge-routing-protocol — *are*
-remembered for each binding's lifetime — the host's close, or an
-injection tuple's last-region disappearance — and are consulted by the
+remembered for each binding's lifetime — the decided document's close;
+a region's removal closes its virtual document — and are consulted by the
 belongs-here question below; their staleness is that decision's recorded
 trade-off, not a captured-list resurrection.)
 
@@ -114,14 +114,12 @@ with the work that belongs to the connection.
    marker walk — a suppressed server is "not applicable", a bound key must
    match this connection's — and an entry-less server (this exact (host,
    layer, language, server) entry has no record, whatever the tuple's
-   other servers settled) falls through to the marker rule above. Bindings are keyed per (host, layer, language),
-   so stages 2-3 evaluate each layer/language binding **independently**:
-   the injection units are the resolved injections stage 2 already
-   produces, and the host layer is its own unit — screened by
-   `_self`/host-language candidacy rather than injections — with each
-   unit routed to its own opens — an injection unit carries **all** of its
-   language's current regions and enqueues every one of their virtual
-   `didOpen`s, the host unit enqueues the host `didOpen`; any
+   other servers settled) falls through to the marker rule above. Bindings
+   are keyed per decided document (the host, and each virtual document),
+   so stages 2-3 evaluate each unit **independently**: every current
+   virtual document is its own unit with its own binding, the host layer
+   is a unit screened by `_self`/host-language candidacy rather than
+   injections, and each unit enqueues its own `didOpen`; any
    required-open failure fails the applicable host, while a host with
    zero applicable units reads NotApplicable. One host can suppress a
    server for one injection language while another language — or the
@@ -244,12 +242,12 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
   marker resolution walks the live filesystem uncached, so creating a marker
   (`git init` in a subdirectory, a submodule checkout, scaffolding a nested
   project) re-roots a host with settings untouched. Both apply only to
-  (host, layer, language, server) entries *without* an active route
+  (document, server) entries *without* an active route
   binding record — a terminally deleted entry falls through to marker
   resolution even while sibling entries stay bound: a bound entry
   (bridge-routing-protocol) keeps its key for the binding's lifetime —
-  the host's close, or an injection tuple's authoritative last-region
-  disappearance — and is not re-rooted by live marker changes while it
+  the decided document's close (a region's removal closes its virtual
+  document) — and is not re-rooted by live marker changes while it
   lives.
 - The re-open considers every open document rather than a pre-narrowed set. The
   configuration question is answered first and from a memo, so the cost is a
@@ -260,7 +258,7 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
   respawned connection failing soft on a large workspace.
 - Marker resolution now runs during the re-open for the server entries that
   lack a route binding record; bound entries answer from the binding
-  instead (per exact (host, layer, language, server) entry — a tuple can
+  instead (per exact (document, server) entry — one host's units can
   hold both kinds at once). The pre-existing eager path already resolves markers
   per open, so this is not a new kind of work, but it is work the
   captured-list design skipped.

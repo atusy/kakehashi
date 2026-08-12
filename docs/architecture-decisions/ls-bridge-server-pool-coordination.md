@@ -58,7 +58,8 @@ bridge-routing-protocol's implementation.) Amended with
 bridge-routing-protocol:
 this re-resolution — like every site that derives a connection from the host
 URI — consults the active route binding first, matched by the envelope's
-layer/language, open-incarnation, and binding-generation stamp; a
+stamp of the decided document's URI (virtual for virt items) and its
+open incarnation; a
 missing, legacy, evicted, or mismatched stamp **fails soft** rather than falling back to marker or
 client-root resolution, which under a root override would reach the
 config-root process instead of the one that produced the item.

@@ -47,8 +47,9 @@ the transport: absence or failure of providers reproduces today's
 *initial* routing decision, at worst one decision deadline later — with
 one recorded difference in what happens afterwards: the decision settles
 into the document's route binding either way, so even a fallback route is
-frozen for the **binding's lifetime** (the host's close; an injection
-tuple's last-region disappearance — with the one abnormal-finalization
+frozen for the **binding's lifetime** (the decided document's close —
+for a virtual document, its region leaving through the existing
+virtual-document lifecycle — with the one abnormal-finalization
 exception the Caching section records), where today a restart's re-open
 re-resolves live markers (respawn-reopen-derives-its-targets records the
 same freeze from its side). A *successful* answer, by design, can
@@ -57,20 +58,29 @@ only subtract servers or redirect roots (see Trust Model).
 ### The Request
 
 One **decision** — one logical fan-out, carrying one JSON-RPC request per
-selected provider — is issued per **(host document, layer, language)**,
-not per injection region. All injection regions of one language in one host document
-route to the same connections, so the decision is genuinely per language;
-querying per region would multiply one decision by the region count (the
-shipped markdown injection query emits hundreds of `markdown_inline` regions
-for an ordinary prose document) and key it to virtual URIs whose identity is
-deliberately unstable across edits
-(language-server-bridge-virtual-document-model).
+selected provider — is issued per **bridged document**: the host document
+for the host layer, and **each virtual document** (each injection region)
+for the injection layer. Per-region granularity is the point of the
+protocol: a provider can suppress one code block or root one region
+differently, which no per-language decision could express. The volume
+that granularity implies is deliberate and **user-controllable**: the
+shipped markdown injection query emits hundreds of `markdown_inline`
+regions for an ordinary prose document, and a workspace that bridges such
+a language *and* runs a provider pays a decision per region — the levers
+are disabling that bridge entry
+(`[languages.markdown.bridge.markdown_inline] enabled = false`) or
+disabling routing fan-out for the language
+(`aggregation."kakehashi/bridge/routing".priorities = []`), on top of the
+advertisement gate that makes provider-less fleets pay nothing. Virtual
+URI identity rides the existing virtual-document lifecycle
+(language-server-bridge-virtual-document-model): a region's close or
+re-mint is a close/re-open of its decision, no more.
 
 ```typescript
 type RoutingParams = {
-  // The document being routed: always the HOST document's real URI, paired
-  // with the language under decision — the host's own languageId for the
-  // host-layer decision, an injection languageId for injection decisions.
+  // The document being routed, as the downstream sees it: the real URI
+  // for the host-layer decision, the region's VIRTUAL URI for an
+  // injection decision — paired with that document's languageId.
   textDocument: { uri: string; languageId: string };
   // Which decision this is. The host-layer and injection-layer decisions
   // are distinct even when languageId coincides (lua-in-lua,
@@ -97,8 +107,8 @@ type RoutingResult = null | {
   routing: Record<string, {
     // Workspace folder URIs for this server. Absent or null = kakehashi
     // resolves the root as usual; non-empty = root-resolution override
-    // (see below). An empty array is invalid in v1 (no rootless
-    // ConnectionKey exists in a rooted session) and the entry is dropped.
+    // (see below); [] = route to the server's `#shared` connection with
+    // no folder joined (the rootless answer — see below).
     workspaceFolders?: string[] | null;
     // false = this document's didOpen is not forwarded to this server.
     // Absent = kakehashi decides; true = an explicit no-op affirmation.
@@ -112,6 +122,13 @@ type RoutingResult = null | {
   needs the effective `languageId`, which for injections is not derivable
   from the URI. The two-field shape mirrors the `uri` + `languageId`
   pairing of bridge-client-control-protocol's `OpenDocument` result type.
+  A virtual URI is **contractually opaque** to providers, exactly as that
+  protocol's client ids are to editors: treat it as an identity token,
+  never parse its rendering, which may change between kakehashi versions
+  — a provider that needs the host document behind a virtual URI
+  correlates through `kakehashi/bridge/client/documents`, whose
+  `OpenDocument` rows carry `uri` + `hostUri`. (A `hostUri` field on this
+  request stays deferred, additively.)
 - `languageServers` is a **projection**, not the configuration. Only
   `languages`, `workspaceMarkers`, and `preferSharedInstance` are sent —
   the fields a routing decision can use (`preferSharedInstance` is what
@@ -143,10 +160,9 @@ The result layers a "kakehashi decides" default at every granularity:
   any `didOpen` — the eager per-server open tasks, the lazy per-request
   open (the `ensure_document_opened` call on the request-execute path),
   and the derived re-open sweep alike. The applied decision is recorded
-  as an **active route binding** that lives for the binding's lifetime
-  — until the host's `didClose` for the host layer; until `didClose` or
-  the language's last region disappearing for an injection tuple (see
-  Caching below) — so no later request can open the document there
+  as an **active route binding** that lives until the decided document
+  closes — the host's `didClose`, or a virtual document's close when its
+  region leaves (see Caching below) — so no later request can open the document there
   through a side door while the binding lives (the gate's placement
   is specified under the deadline section). This is **per-document forwarding
   suppression**, not slot control: the connection (if any) is untouched
@@ -312,10 +328,14 @@ ls-bridge-server-pool-coordination's model as follows:
   runtime capability fallback can still downgrade a shared-preferring
   server to per-root, in which case the same first-element truncation
   applies, with a warning.
-- An empty array is **invalid in v1**: the rootless connection shape
-  exists only in workspace-less sessions, and no rootless `ConnectionKey`
-  variant exists in a rooted session's pool model. The entry is dropped
-  with a warning (a rootless override is deferred — below).
+- An **empty array** routes the document to the server's `#shared`
+  connection with **no folder joined**: `ConnectionKey::shared` carries
+  no root, so it is the natural home for a rootless answer. An existing
+  shared connection serves as-is (its folder set untouched — nothing is
+  announced); a fresh spawn triggered by a `[]` answer seeds **rootless**
+  (the workspace-less shape), unlike ordinary shared spawns' primary-root
+  seed, because rootlessness is exactly what the answer asked for. The
+  stopped-set double check covers the shared key as for any override.
 
 Folder strings are workspace folder URIs. Canonicalization is identity,
 not merely a validation step: each element must resolve to an existing
@@ -546,7 +566,7 @@ Two structural rules keep the protocol from consuming itself:
   connections are routed by kakehashi's own rules — the bootstrap base
   case. The derived re-open sweep after a restart **issues no routing
   query and never spawns as a routing side effect** — it reads each
-  exact (host, layer, language, server) entry's binding record where
+  exact (document, server) entry's binding record where
   one exists and falls through to read-only marker resolution where
   that entry is absent (below) — preserving
   respawn-reopen-derives-its-targets' read-only, never-spawns stage
@@ -558,13 +578,14 @@ Two structural rules keep the protocol from consuming itself:
 
 ### The Query Point, the Decision Cache, and the Route Binding
 
-Kakehashi queries at the **first routing decision** for a (host document,
-layer, language) tuple: the host `didOpen` (when host bridging is enabled)
-and the first virtual-document creation per injection language. Two
+Kakehashi queries at the **first routing decision** for each bridged
+document: the host `didOpen` (when host bridging is enabled) and each
+virtual document's creation. Two
 structures with different lifetimes carry the outcome:
 
 - The **decision cache** holds pre-application answers, keyed
-  `(host URI, layer, languageId, config generation)` with **single-flight**
+  `(document URI, layer, languageId, config generation)` — the decided
+  document's own URI, virtual for regions — with **single-flight**
   dedup — concurrent decision points for the same key await one in-flight
   query rather than racing their own (no existing lock covers this: the
   per-URI `edit_lock` is released before the bridge's open fan-out
@@ -573,7 +594,7 @@ structures with different lifetimes carry the outcome:
   one. The cache is policy, and policy is invalidatable — flushed and
   evicted by the rules below.
 - The **active route binding** records the decision's applied outcome:
-  per (host document, layer, language), which servers were suppressed,
+  per decided document (host or virtual), which servers were suppressed,
   which `ConnectionKey` each open landed on, and — for **every** shared
   routed/retained entry, override-driven or not — the effective
   folder(s) **selected for the route and persisted before the acquire
@@ -593,7 +614,7 @@ structures with different lifetimes carry the outcome:
   representable. Retaining the folder for
   non-override shared routes too is what gives a restarted shared
   replacement a folder source for every bound document; live resolution
-  serves only a (host, layer, language, server) entry with no record —
+  serves only a (document, server) entry with no record —
   a terminally deleted entry falls through even while sibling entries
   stay settled. The pending binding record is
   installed **synchronously in the `didOpen` handler (respectively the
@@ -713,8 +734,7 @@ structures with different lifetimes carry the outcome:
   unannounced folders nor silently re-roots to a per-root key; the
   document's features on that server stay dark until close/re-open runs
   a fresh decision under the new capability reality. It is evicted only
-  at the end of its lifetime — the host's `didClose`, or an injection
-  tuple's last-region disappearance — never by a flush — this is what makes
+  by the decided document's close — never by a flush — this is what makes
   invalidation non-retroactive without opening side doors: a flushed
   *cache* cannot lift a suppression or re-root an open document onto a
   second same-name connection, because those sites read the *binding*.
@@ -722,7 +742,7 @@ structures with different lifetimes carry the outcome:
   an override admitted under an earlier workspace-folder set keeps
   driving re-opens for the binding's lifetime (the trust guarantee is
   scoped to admission time; revoking an open document's route is
-  close/re-open — or the tuple's language leaving — or `stop`). Only a server with no binding record at all
+  close/re-open — for a region, an edit that removes it — or `stop`). Only a server with no binding record at all
   (one that became a candidate after the open, say via reload) falls
   through to kakehashi's ordinary resolution. The binding governs
   **every** site that derives a connection from the host URI — the
@@ -732,46 +752,30 @@ structures with different lifetimes carry the outcome:
   config-root process instead of the one that produced the item
   (ls-bridge-server-pool-coordination is amended accordingly). The
   envelope must carry enough identity to *hit the right binding*: the
-  layer/language pair, the open incarnation, and the tuple's **binding
-  generation** — drawn from one **session-global** monotonic 64-bit
-  counter that is never reset and never reused (no per-host or
-  per-tuple allocator state exists at all, so nothing survives or
-  resets across `didClose`; monotonicity rules out collision and a
-  64-bit space cannot wrap in practice), stamped anew each time a
-  tuple's binding is created, because an injection language can leave
-  and re-enter the document without the host incarnation moving —
-  matched exactly: after
-  a close/re-open or a tuple re-creation the same URI holds a *new*
-  binding, and an unstamped stale item would silently resolve through
-  it. A resolve whose stamp no longer matches — the
+  **decided document's URI** (the virtual URI for a virt-layer item)
+  **and its open incarnation**, matched exactly — a region leaving and
+  re-entering closes and re-mints its virtual document, so the
+  incarnation moves and no separate binding-generation counter is
+  needed; after a close/re-open the same URI holds a *new* binding, and
+  an unstamped stale item would silently resolve through it. A resolve whose stamp no longer matches — the
   binding evicted, or a newer incarnation in its place — fails soft as
   an unroutable envelope does today.
 
 Decision-cache lifecycle:
 
-- **Evicted on the host document's `didClose`** — all its layers' and
-  languages' entries, and its binding, at once — **and per injection
-  language when its last region disappears**: a parse supersession that
-  removes an injection language from the document evicts that (host,
-  injection, language) tuple's cache entry and binding and retires its
-  pending flight through the same cleanup path a `didClose` uses, so a
-  flight whose subscribers vanished with their regions still reaches a
-  terminal state, and a document that churns through language ids does
-  not accumulate tuples for its whole open lifetime. "Disappears" means
-  an **authoritative parse result without the language** — transient
-  tree-less states (a reload-invalidation placeholder, a parse failure,
-  a missing parser) preserve bindings, and the parse-state
-  discriminator that distinction requires, which the re-open decision
-  records as not existing today, is an implementation prerequisite of
-  this eviction rule. The eviction commits as a **non-inserting
-  compare-and-set** against the exact incarnation/content version the
-  parse result speaks for and the tuple's current binding generation —
-  a lagging parse of older text can never evict a language the newest
-  text retains or has reintroduced. A configuration reload
+- **Evicted on the decided document's close** — the host's `didClose`
+  evicts the host-layer entry and, through the virtual documents it
+  closes, every region's entry; a single virtual document's close (its
+  region leaving, by the existing virtual-document lifecycle's own
+  rules — whatever authority or debouncing governs those closes governs
+  this eviction) evicts that document's entry and binding and retires
+  its pending flight through the same cleanup path, so a flight whose
+  subscriber vanished with its region still reaches a terminal state
+  and region churn cannot accumulate entries. A configuration reload
   flushes the whole cache: superseded-generation entries are unreadable
   under the new generation and would otherwise sit resident until their
   document closes. Cache and binding are each bounded in top-level keys
-  by open documents × layers × languages; entries in **both** carry
+  by the open bridged documents (host and virtual); entries in **both** carry
   per-candidate-server payloads (a normalized answer's routing map, a
   binding's settlements) and capped folder lists, so the byte bound
   multiplies by the candidate-server count and the folder cap. The
@@ -857,16 +861,14 @@ Decision-cache lifecycle:
     flights. The ring's capacity is an implementation-defined small
     constant; a flight whose gap has overflowed the ring — or whose
     provenance is missing for any reason — discards, never re-anchors;
-  - an **incarnation** move (`didClose`, or close/re-open) **aborts**
+  - an **incarnation** move (`didClose`, or close/re-open — for a
+    virtual document, its own close when its region leaves) **aborts**
     the waiting tasks outright — no `didOpen` is sent at all, and the
-    open's enqueue commit re-checks the incarnation **and, for a
-    virtual open, the tuple's current binding generation and the exact
-    current region/virtual-document identity** (the incarnation alone
-    does not move when an injection language leaves and re-enters, and
-    the tuple generation alone does not move when one region of a
-    language is removed while another remains). The enqueue
-    registration and the tuple's eviction/close share **one lifecycle
-    critical section** — an old task cannot validate, lose the lock to
+    open's enqueue commit re-checks the decided document's incarnation
+    (each virtual document carries its own, so one region's removal
+    moves exactly its own decision's fence). The enqueue
+    registration and the document's eviction/close share **one
+    lifecycle critical section** — an old task cannot validate, lose the lock to
     a cleanup that evicts and closes everything, and then register a
     ghost open. So a stale task can never open a closed document or a
     removed region. A
@@ -1209,16 +1211,20 @@ provider, none of it routing signal. The three-field projection is
 additive-evolvable and leaks nothing beyond server names and marker chains
 (Trust Model).
 
-### Per-region queries with virtual-URI `textDocument`
+### One decision per (host document, layer, language)
 
-An earlier draft queried per injection region, sending the region's virtual
-URI. Rejected: all regions of one language in one host route identically,
-so per-region queries multiply one decision by the region count — hundreds
-for the shipped markdown injections — and virtual-URI identity is neither
-stable across edits nor parseable by providers (it is contractually
-opaque). The host URI is the identity project-side tooling can actually
-reason about. A `hostUri` field is therefore also moot: the host URI *is*
-the identity sent.
+An intermediate draft coalesced all regions of one language into a single
+per-host decision, sending the host URI. Rejected: it cannot express
+per-region control — suppressing one code block, or rooting one region
+differently — which is half the protocol's point. The costs that
+motivated it are answered differently: per-region volume is
+user-controllable (disable the noisy bridge entry, or set the language's
+routing `priorities = []`), and virtual-URI identity churn rides the
+existing virtual-document lifecycle rather than needing its own
+machinery. The opacity cost stands and is accepted: a provider
+correlates a virtual URI to its host through
+`kakehashi/bridge/client/documents`; a `hostUri` field on the request
+itself stays deferred, additively.
 
 ### Open the document on every `workspaceFolders` element's connection
 
@@ -1237,13 +1243,14 @@ the "no spawn beyond `forceStart`" rule, and needs its own
 generation/stopped-set race analysis — all for a speculative warm-up.
 Ignoring the elements with a warning loses nothing correct.
 
-### A rootless (`[]`) override
+### A dedicated rootless `ConnectionKey` for `[]`
 
-An earlier draft defined `[]` as "no workspace folders". Deferred: the
-rootless connection shape exists only in workspace-less sessions; a rooted
-session's pool has no rootless `ConnectionKey` variant, and inventing one
-(with its `Display` rendering, enumeration row, and stopped-set identity)
-is not worth it before a concrete need exists.
+`[]` could have minted a new rootless key variant. Rejected:
+`ConnectionKey::shared` already carries no root, has a `Display`
+rendering, an enumeration row, and a stopped-set identity — routing the
+rootless answer there costs nothing new, at the price of sharing the
+slot with ordinary shared routing (accepted: both mean "one connection,
+not per-root").
 
 ### Provider-initiated invalidation
 
@@ -1376,9 +1383,9 @@ a slot a routing provider left in play.
   store's open tracker already mints), the decision cache, and the
   active route binding are new state beside the pool's per-connection
   maps; the binding rides the per-document lifecycle the
-  open-incarnation tracker maintains, with the injection-tuple
-  last-region eviction layered on top (the binding-generation counter
-  is session-global, not per-document state).
+  open-incarnation tracker maintains, uniformly for host and virtual
+  documents (a region's close is its virtual document's close — no
+  separate eviction machinery, no binding-generation counter).
 - Fan-out/fan-in reuse `fan_out` + the `preferred` collector over the
   expanded priority walk, with the routing-specific provider universe
   (all spawnable configured servers, advertisement-filtered) and the
@@ -1448,7 +1455,7 @@ a slot a routing provider left in play.
 | Aspect | Decision |
 |---|---|
 | **Method** | `kakehashi/bridge/routing`, kakehashi→downstream request; dispatch strictly per side |
-| **Decision unit** | one query per (host document, layer, language); `textDocument = { uri: host URI, languageId }` + `layer` |
+| **Decision unit** | one query per bridged document (host, and each virtual document); `textDocument = { uri: as the downstream sees it, languageId }` + `layer`; per-region volume user-controllable via bridge `enabled = false` / routing `priorities = []` |
 | **Params** | `textDocument` + `layer` + `languageServers` projection `{languages, workspaceMarkers, preferSharedInstance}` of spawnable, language-matching servers (`_` excluded) |
 | **Answer** | `null`/missing entry/absent `enabled` = kakehashi decides; `enabled: false` = per-document `didOpen` suppression at the routing gate; non-empty `workspaceFolders` = root override; `[]` invalid in v1 |
 | **Precedence** | membership: stopped set > configuration > answer (subtract only); root: answer overrides marker resolution, both resolved keys checked against the stopped set |
@@ -1456,6 +1463,6 @@ a slot a routing provider left in play.
 | **Folders↔Key** | shared instance: union-only join; per-root: first element, rest warned+ignored; at most one connection per server name per document |
 | **Providers** | all spawnable configured servers ∩ advertising ∩ `Ready` (Initializing awaited only when the advertisement is known, the server is named, or it carries `forceStart`), ordered by routing `priorities` (no `"_"` method-wildcard inheritance); concurrent fan-out, `preferred` fan-in, operative-entry rule |
 | **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy, plus a separate binding-reuse validation budget); expiry is partial-result (cancel unanswered, drop unfinished entries, fan-in over what normalized; whole fallback only when no operative normalized result remains); exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
-| **Caching** | decision cache per (host URI, layer, languageId, config generation), single-flight, evicted on `didClose` and on an injection tuple's authoritative last-region disappearance, flushed on reload / `Ready`-provider-set / workspace-folder-set change, (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until `didClose` (injection tuples: also last-region disappearance); never retroactive |
+| **Caching** | decision cache per (document URI, layer, languageId, config generation) — the decided document's own URI, virtual for regions; single-flight; evicted on the decided document's close (a region leaving closes its virtual document), flushed on reload / `Ready`-provider-set / workspace-folder-set change; (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until that document closes; never retroactive |
 | **Cold start** | `forceStart` (publication-fenced get-or-create — the `Initializing` slot registers before the config becomes observable to `didOpen`; `#shared` + primary-root seed for `preferSharedInstance` servers, the marker-less fallback shape otherwise; warm-up scope limited to shared/marker-less/policy servers; wait-eligible for the initialization wait) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
 | **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; the sweep reads each exact server entry's binding where one exists, marker resolution where none does, and never spawns |
