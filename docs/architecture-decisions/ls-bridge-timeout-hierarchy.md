@@ -57,7 +57,10 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 
 ### Phase 3 Addition: Per-Request Timeout (Tier 1)
 
-> **Note**: Only needed for multi-server aggregation. In Phase 1, liveness timeout provides sufficient protection.
+> **Note**: Tier 1 is needed only to bound multi-server *aggregation*. An
+> individual downstream wait is already bounded by the per-downstream
+> response cap — not by liveness, which bounds connection silence and can
+> reset indefinitely on unrelated messages.
 
 | Tier | Timeout | Duration | Trigger | Action |
 |------|---------|----------|---------|--------|
@@ -70,7 +73,7 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 | Scenario | Active Timeouts | Behavior |
 |----------|----------------|----------|
 | Normal operation (Phase 1) | Liveness, per-downstream response cap | Liveness resets on activity, `Ready` → `Failed` on timeout; the cap fails one request without faulting the connection |
-| Normal operation (Phase 3) | Liveness, Per-request | Per-request bounds aggregation; Liveness detects hung servers |
+| Normal operation (Phase 3) | Liveness, per-downstream response cap, Per-request (only when n ≥ 2) | Per-request bounds aggregation; the cap still bounds each individual wait, including single-participant requests Tier 1 never engages for; Liveness detects hung servers |
 | Shutdown (any state) | Global only | All other timeouts (Init/Liveness/Per-request) STOP; an in-flight per-slot control shutdown is subsumed by the `Teardown` transition, its deadline superseded by the global one; global bounds the termination attempt |
 | Late response during shutdown | Global | ACCEPT until the connection closes or the deadline expires |
 
