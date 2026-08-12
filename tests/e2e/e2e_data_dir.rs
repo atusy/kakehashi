@@ -1,0 +1,103 @@
+//! End-to-end tests for --data-dir and KAKEHASHI_DATA_DIR resolution.
+//!
+//! Verifies that the effective `searchPaths` in the LSP configuration
+//! correctly reflects the --data-dir CLI flag and KAKEHASHI_DATA_DIR
+//! environment variable, including their interaction and precedence.
+//!
+//! Run with: `cargo test --features e2e --test e2e e2e_data_dir::`
+
+use crate::helpers::lsp_client::{LspClient, LspClientBuilder};
+use serde_json::json;
+use tempfile::TempDir;
+
+/// Create an `LspClientBuilder` that ignores the developer's user config.
+///
+/// The two assertions in this file pin the *default* raw `searchPaths`
+/// (`["${KAKEHASHI_DATA_DIR}"]`), so any non-default user config at
+/// `~/.config/kakehashi/kakehashi.toml` would silently corrupt these tests.
+/// Passing `--config-file <empty-toml>` short-circuits user config discovery
+/// and pins the binary to its built-in defaults.
+fn isolated_builder(tmp: &TempDir) -> LspClientBuilder {
+    let path = tmp.path().join("empty.toml");
+    std::fs::write(&path, "").expect("write empty config");
+    LspClient::builder()
+        .arg("--config-file")
+        .arg(path.to_str().expect("temp path is utf-8"))
+}
+
+/// Helper: initialize the LSP client and return the effective searchPaths.
+fn get_effective_search_paths(client: &mut LspClient) -> Vec<String> {
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let response = client.send_request("kakehashi/internal/effectiveConfiguration", json!({}));
+
+    let result = response
+        .get("result")
+        .expect("effectiveConfiguration should return a result");
+    let settings = result
+        .get("settings")
+        .expect("result should contain settings");
+    let search_paths = settings
+        .get("searchPaths")
+        .expect("settings should contain searchPaths");
+
+    search_paths
+        .as_array()
+        .expect("searchPaths should be an array")
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .expect("searchPath should be a string")
+                .to_string()
+        })
+        .collect()
+}
+
+/// effectiveConfiguration returns pre-expansion settings, so with no
+/// `KAKEHASHI_DATA_DIR` env var and no `--data-dir` flag the raw searchPaths
+/// still contains the `${KAKEHASHI_DATA_DIR}` template.
+///
+/// Path anchoring runs before this point but cannot touch the template: a
+/// `$`-led value carries its own base. That is what keeps this assertion the
+/// guard for anchoring staying syntactic rather than expanding per layer.
+#[test]
+fn test_search_paths_returns_raw_template() {
+    let tmp = TempDir::new().unwrap();
+    let mut client = isolated_builder(&tmp)
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let paths = get_effective_search_paths(&mut client);
+
+    assert_eq!(
+        paths,
+        vec!["${KAKEHASHI_DATA_DIR}"],
+        "raw searchPaths should preserve the template variable"
+    );
+}
+
+/// When KAKEHASHI_DATA_DIR env var is set, effectiveConfiguration still shows
+/// the raw template — expansion happens internally, not in the raw config.
+#[test]
+fn test_env_var_does_not_affect_raw_search_paths() {
+    let tmp = TempDir::new().unwrap();
+    let mut client = isolated_builder(&tmp)
+        .env("KAKEHASHI_DATA_DIR", "/tmp/kakehashi_test_data")
+        .build();
+
+    let paths = get_effective_search_paths(&mut client);
+
+    assert_eq!(
+        paths,
+        vec!["${KAKEHASHI_DATA_DIR}"],
+        "raw searchPaths should still show template even with env var set"
+    );
+}

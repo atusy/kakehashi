@@ -13,7 +13,7 @@ name = "kakehashi"
 path = "src/bin/main.rs"
 
 # Mock downstream LSP formatter driven by the concatenated-formatting E2E
-# tests (tests/e2e_concatenated_formatting.rs) via CARGO_BIN_EXE_mock-lsp-formatter.
+# tests (tests/e2e/e2e_concatenated_formatting.rs) via CARGO_BIN_EXE_mock-lsp-formatter.
 # Gated on the e2e feature so normal builds don't ship it.
 [[bin]]
 name = "mock-lsp-formatter"

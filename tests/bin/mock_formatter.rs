@@ -1,5 +1,5 @@
 //! Minimal mock LSP formatter for E2E tests of the concatenated formatting
-//! pipeline (`tests/e2e_concatenated_formatting.rs`).
+//! pipeline (`tests/e2e/e2e_concatenated_formatting.rs`).
 //!
 //! Speaks just enough LSP over stdio to participate in the bridge: it answers
 //! `initialize` with formatting capabilities, tracks document text via
@@ -20,7 +20,7 @@
 //! - `definition` — advertises `definitionProvider` + `hoverProvider`;
 //!   answers definition with a fixed Location that **echoes the requested
 //!   URI** (and hover with the URI in the contents), but only for documents
-//!   it received via `didOpen`. Used by `tests/e2e_host_bridge.rs` to prove
+//!   it received via `didOpen`. Used by `tests/e2e/e2e_host_bridge.rs` to prove
 //!   the host bridge forwards the real client URI and returns the response
 //!   verbatim (host-document-bridge).
 //! - `options-echo` — advertises `documentFormattingProvider`; replaces the
@@ -40,7 +40,7 @@
 //! - `code-lens` — advertises `codeLensProvider` with `resolveProvider`;
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
-//!   Used by `tests/e2e_code_lens_resolve.rs` (#355).
+//!   Used by `tests/e2e/e2e_code_lens_resolve.rs` (#355).
 //! - `document-link` — advertises `documentLinkProvider`; answers
 //!   `textDocument/documentLink` with one link whose tooltip identifies the
 //!   requested URI.
@@ -59,12 +59,12 @@
 //!   request failure (exit 2), not read it as "no diagnostics".
 //! - `diagnostics-push` — spontaneously **pushes** `textDocument/publishDiagnostics`
 //!   on `didOpen` (one diagnostic on virtual line 0, no pull) and an empty list on
-//!   `didChange`. Used by `tests/e2e_push_diagnostics.rs` to prove a downstream's
+//!   `didChange`. Used by `tests/e2e/e2e_push_diagnostics.rs` to prove a downstream's
 //!   spontaneous push reaches the editor in host coordinates and that an empty push
 //!   clears it (#427).
 //! - `diagnostics-push-pullcap` — advertises `diagnosticProvider` (pull-driven)
 //!   AND spontaneously pushes one diagnostic on `didOpen`. Used by
-//!   `tests/e2e_push_diagnostics.rs` to prove `pullFallback = false` still
+//!   `tests/e2e/e2e_push_diagnostics.rs` to prove `pullFallback = false` still
 //!   publishes a pull-driven server's spontaneous push (#425).
 //! - `diagnostics-push-crash` — pushes the same diagnostic on `didOpen`, then exits
 //!   the process on the next `didChange` to simulate a downstream crash while the
@@ -90,7 +90,7 @@
 //! - `on-type` — advertises `documentOnTypeFormattingProvider` with `}` and
 //!   `;` as triggers; answers `textDocument/onTypeFormatting` with the
 //!   uppercasing whole-document edit for ANY typed character (bridge-side
-//!   trigger filtering is what `tests/e2e_on_type_formatting.rs` proves).
+//!   trigger filtering is what `tests/e2e/e2e_on_type_formatting.rs` proves).
 //! - `will-save` — advertises `hoverProvider` + a `textDocumentSync` Options
 //!   block with `willSave`, `willSaveWaitUntil`, and `save` true. Records every
 //!   `textDocument/willSave` (count + last reason + last URI) and
@@ -100,7 +100,7 @@
 //!   the recorded state as a JSON string (`{will,reason,willUri,did,didUri}`),
 //!   so a test can prove the notifications reached this server carrying the URI
 //!   it knows — the host URI for a host server, the *virtual* URI for a virt
-//!   server. Used by `tests/e2e_host_bridge.rs` to prove host- AND virt-bridge
+//!   server. Used by `tests/e2e/e2e_host_bridge.rs` to prove host- AND virt-bridge
 //!   willSave/didSave forwarding (#357).
 //! - `will-save-slow` — like `will-save`, but sleeps 8s before answering
 //!   `willSaveWaitUntil`, past kakehashi's 5s save budget. Lets the test prove
@@ -111,7 +111,7 @@
 //!   per-server capability gate must skip it and its counts stay zero (#357).
 //! - `notify` — right after answering `initialize`, emits a
 //!   `window/showMessage` followed by a `window/logMessage` notification.
-//!   Used by `tests/e2e_window_notifications.rs` to prove the bridge forwards
+//!   Used by `tests/e2e/e2e_window_notifications.rs` to prove the bridge forwards
 //!   both window/* notifications unconditionally (#378). showMessage is sent
 //!   FIRST, and the bridge preserves order, so the test asserts showMessage
 //!   arrives ahead of logMessage.
@@ -122,7 +122,7 @@
 //!   URIs it currently knows (not gated on `didOpen` — the folder set is the
 //!   subject under test, populated by initialize + didChangeWorkspaceFolders).
 //!   Used by
-//!   `tests/e2e_shared_instance.rs` (#391) to prove the shared-instance opt-in
+//!   `tests/e2e/e2e_shared_instance.rs` (#391) to prove the shared-instance opt-in
 //!   grows one downstream process's folder set across roots.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
