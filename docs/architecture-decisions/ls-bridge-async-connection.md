@@ -85,24 +85,28 @@ completing drops the read mid-frame, so the framing parser must be
 cancel-safe (§ Invariants). `BridgeReader::frame` is where that partial-frame
 progress lives.
 
-**Framing size ceilings** (amended with bridge-routing-protocol; **target
-state** — today's `BridgeReader` enforces none of these bounds and
-allocates the declared `Content-Length` unchecked, which is exactly the
-exposure this amendment closes; the ceilings land with that protocol's
-implementation): the reader
+**Framing size ceilings** (amended with bridge-routing-protocol): the reader
 enforces three incrementally checked bounds — a maximum header-line length, a
 maximum total header-block size, and a maximum declared `Content-Length` —
 each violation being a framing error with the same fatal disposition as every
 other framing violation: the connection fails; an oversized body is never
 drained (draining an attacker-sized body can hang the reader), and the
 header-line bound is enforced as bytes accumulate, never after an unbounded
-buffer already grew. The body ceiling's default is implementation-defined and
+buffer already grew. The `Content-Length` bound is checked where the header is
+*parsed*, not where the body is allocated: `Vec::with_capacity` on a hostile
+declaration aborts the process, which no framing error could report.
+The body ceiling's default is implementation-defined and
 deliberately generous — well above the largest legitimate payloads observed
 (multi-megabyte diagnostics bursts are real) — so it trips on runaway or
 adversarial peers, not on big workspaces; a configuration knob can follow if a
 legitimate deployment ever meets it. The header-line and header-block
 ceilings are likewise implementation-defined, in the small-kilobytes class —
-LSP headers are few and tiny, so any legitimate margin is enormous. A peer
+LSP headers are few and tiny, so any legitimate margin is enormous. As
+shipped: 8 KiB per header line, 32 KiB per header block (the client-facing
+`wire_repair` reader's bound is 64 KiB; downstream traffic is kakehashi's own
+protocol surface rather than an arbitrary editor's, so it takes the tighter
+half), and 256 MiB of body — roughly triple the largest burst yet observed.
+A peer
 whose honest traffic exceeds a ceiling fails repeatedly through
 acquire-driven respawn — or, for a connection nothing re-acquires (a
 `forceStart`-only policy server with `languages = []`), stays unavailable

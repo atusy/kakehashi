@@ -1548,12 +1548,13 @@ a slot a routing provider left in play.
   for an empty one) with the epoch bump and the epoch-cause provenance append, and the
   taken map is dropped outside the critical section, so provider churn
   never stalls pool operations on entry-drop cost.
-- The frame reader currently allocates the declared `Content-Length`
-  before parsing anything, so the answer-size bound needs a
-  **framing-level ceiling on downstream message size** — a transport
-  hardening recorded here as an implementation prerequisite of this
-  protocol's allocation bound, not a routing-handler check (which
-  would run too late). Its disposition is chosen, not deferred: a
+- The answer-size bound rests on a **framing-level ceiling on downstream
+  message size**, not a routing-handler check (which would run too late:
+  the frame is fully read before method dispatch). That ceiling is a
+  transport hardening this protocol depends on rather than owns, and it
+  **shipped ahead of the protocol** — the frame reader used to allocate
+  the declared `Content-Length` unchecked. Its disposition is chosen, not
+  deferred: a
   header declaring more than the ceiling is a **framing error and
   fails the downstream connection**, never a drain (draining an
   attacker-sized body can hang the reader) — the same fatal posture
