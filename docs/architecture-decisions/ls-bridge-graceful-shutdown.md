@@ -596,7 +596,7 @@ unaffected because only decisions serialize, not process I/O.
 
 The `Ready`-state LSP handshake, the writer handoff with its queue drain,
 the SIGTERM → SIGKILL escalation, and parallel teardown are implemented.
-Five parts of this decision run ahead of the code, which is the ordinary
+Six parts of this decision run ahead of the code, which is the ordinary
 state of an ADR here:
 
 - **The lifecycle actor does not exist yet.** Teardown today is a pool-wide
@@ -618,6 +618,14 @@ state of an ADR here:
   and LSP ordering forbid. This
   is the one gap here that is a live conformance defect rather than a missing
   refinement.
+- **Admission is never sealed.** The enqueue paths do not consult the
+  connection's state, so a `Closing` connection still accepts operations
+  instead of rejecting them with `REQUEST_FAILED`; and because the drain
+  stops when the queue is momentarily empty rather than at a seal, an
+  operation enqueued in that window is reported as queued to its caller and
+  then silently dropped. Both halves contradict § Operation Disposal Policy,
+  and the second is the § Invariants case of admission that is not atomic
+  against a stale view.
 - **The `Failed → Closed` bypass performs no cleanup.** The decision says
   that path skips the LSP handshake but still terminates and reaps the
   process. Today a `Failed` handle is marked `Closed` and excluded from both

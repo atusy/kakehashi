@@ -26,9 +26,13 @@ decides immediate respawn on detecting a dead server. The code instead marks
 the connection `Failed` and respawns on the next acquire, and
 bridge-client-control-protocol states acquire-driven recovery as *its*
 decision — so this is not merely code lagging a decision, it is two
-decisions in conflict. The observable difference is real: a server nothing
-re-acquires (a `forceStart`-only policy server with `languages = []`) stays
-down under acquire-driven recovery until a reload or an explicit `restart`.
+decisions in conflict. The observable difference bites once the protocols that create
+un-reacquired servers land: a `forceStart`-only policy server with
+`languages = []` (bridge-routing-protocol) would stay down under
+acquire-driven recovery until a reload or an explicit `restart`
+(bridge-client-control-protocol). Neither exists in the code yet, so today
+the divergence is latent — every live connection is reachable by some
+acquire.
 Settling it changes behavior, so it is recorded here rather than decided
 while reorganizing this record.
 

@@ -29,7 +29,7 @@ The async bridge architecture defines timeout systems across several decisions:
 5. **Per-Slot Control Shutdown Timeout** (bridge-client-control-protocol): Bounds a single-slot `stop`/`restart` (see the dedicated section below)
 6. **Routing Decision Deadline** (bridge-routing-protocol): Bounds one routing decision — provider fan-out, initialization waits, and answer normalization (see the dedicated section below)
 7. **Binding-Reuse Validation Budget** (bridge-routing-protocol): Bounds the *caller's wait* on filesystem revalidation along binding-driven reuse paths — capped by the sweep's remaining budget on re-open sweeps, a dedicated implementation-defined budget on lazy-open/retry paths, and the global shutdown ceiling always. It does not bound the underlying OS call or its worker capacity, which may outlive every deadline (capacity returns only when the call does)
-8. **Per-Downstream Response Cap** (language-server-bridge): A flat 30s bound on each bridge-managed downstream request — excluding control-protocol pass-through and the lifecycle handshake; shipped, and not a tier (see the dedicated section below)
+8. **Per-Downstream Response Cap** (language-server-bridge): A flat 30s bound on each bridge-managed downstream request — excluding control-protocol pass-through, the lifecycle handshake, and routing-provider requests; shipped, and not a tier (see the dedicated section below)
 9. **Writer-Idle Timeout** (ls-bridge-graceful-shutdown): Bounds the wait for exclusive stdin access during shutdown, inside the applicable shutdown deadline rather than in addition to it (see the dedicated section below)
 
 ### The Problem
@@ -161,8 +161,10 @@ bound this hierarchy did not previously register):
 - **Duration**: 30s fixed
 - **Scope**: bridge-managed downstream requests, one wait at a time —
   **not** control-protocol pass-through, which carries no bridge-imposed
-  timeout by contract (bridge-client-control-protocol), and not the
-  lifecycle handshake, which the shutdown deadline bounds. It is also
+  timeout by contract (bridge-client-control-protocol); not the lifecycle
+  handshake, which the shutdown deadline bounds; and not routing-provider
+  requests, whose routing deadline is their sole bound
+  (bridge-routing-protocol) and is shorter besides. It is also
   neither tier: Tier 1 engages only for a multi-server fan-out and is still
   Phase 3, and Tier 2 resets on any decoded server message, so it bounds
   *silence* rather than a request
