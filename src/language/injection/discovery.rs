@@ -2740,13 +2740,22 @@ mod tests {
         );
     }
 
-    /// One `string_literal` region carrying `#offset! 0 1 0 -1` — the shape
-    /// the bundled rust `injections.scm` uses to trim the quotes off an
-    /// embedded regex. Returns `(injections, raw_start, raw_end)`.
-    fn quote_trimmed_injection<'t>(
+    /// One `string_literal` region carrying the caller's `#offset!` — the shape
+    /// the bundled rust `injections.scm` wraps an embedded regex in, where the
+    /// directive is `0 1 0 -1` to trim the quotes. Reused here with trimming,
+    /// extending, and collapsing directives, so the offset is a parameter.
+    ///
+    /// `include_children` matters whenever a test follows the region past the
+    /// lookup: a rust `string_literal` has a named `string_content` child, so
+    /// with `false` the extracted content is only the quotes and the gap math
+    /// (not the offset) would dominate the outcome.
+    ///
+    /// Returns `(injections, raw_start, raw_end)`.
+    fn string_literal_injection_with_offset<'t>(
         tree: &'t Tree,
         text: &str,
         offset: InjectionOffset,
+        include_children: bool,
     ) -> (Vec<InjectionRegionInfo<'t>>, usize, usize) {
         let language = tree_sitter_rust::LANGUAGE.into();
         let query = Query::new(&language, "(string_literal) @str").expect("valid query");
@@ -2762,7 +2771,7 @@ mod tests {
                 language: "regex".to_string(),
                 content_node: node,
                 pattern_index: 0,
-                include_children: false,
+                include_children,
                 offset: Some(offset),
                 combined: false,
                 identity_slot: 0,
@@ -2787,7 +2796,8 @@ mod tests {
             end_row: 0,
             end_column: -1,
         };
-        let (injections, raw_start, raw_end) = quote_trimmed_injection(&tree, text, trim_quotes);
+        let (injections, raw_start, raw_end) =
+            string_literal_injection_with_offset(&tree, text, trim_quotes, false);
 
         assert!(
             find_injection_at_position(&injections, raw_end - 1, text, RegionBoundary::HalfOpen)
@@ -2819,7 +2829,8 @@ mod tests {
             end_row: 0,
             end_column: -1,
         };
-        let (injections, _raw_start, raw_end) = quote_trimmed_injection(&tree, text, trim_quotes);
+        let (injections, _raw_start, raw_end) =
+            string_literal_injection_with_offset(&tree, text, trim_quotes, false);
 
         let (_, region) = find_injection_at_position(
             &injections,
@@ -2855,7 +2866,8 @@ mod tests {
             end_row: 0,
             end_column: 1,
         };
-        let (injections, _raw_start, raw_end) = quote_trimmed_injection(&tree, text, extend_end);
+        let (injections, _raw_start, raw_end) =
+            string_literal_injection_with_offset(&tree, text, extend_end, true);
 
         let (_, region) =
             find_injection_at_position(&injections, raw_end, text, RegionBoundary::HalfOpen)
@@ -2863,30 +2875,86 @@ mod tests {
         assert_eq!(region.language, "regex");
     }
 
-    /// An `#offset!` that collapses the range must not match anywhere — half-open
-    /// containment is vacuous for an empty span, and the fallback must not
-    /// resurrect it by matching its end byte.
+    /// An `#offset!` whose bounds cross collapses the effective span to zero
+    /// width. Half-open containment is then vacuous by arithmetic — there is no
+    /// character to hover — but the caret rule still routes at the collapse
+    /// byte: that position IS the whole (empty) injection, which is the first
+    /// keystroke inside an embedded block the user just opened. `origin/main`
+    /// routed it through raw containment, and nothing downstream objects — an
+    /// empty virtual document maps the caret to a valid `(0, 0)`.
     #[test]
-    fn offset_collapsed_region_never_matches() {
+    fn offset_collapsed_region_routes_only_the_caret_at_its_collapse_byte() {
         let mut parser = create_rust_parser();
         let text = r#"fn main() { let s = "git co"; }"#;
         let tree = parse_rust_code(&mut parser, text);
-        let collapse = InjectionOffset {
+        // The string_literal spans [20, 28). Crossing bounds (start 25 > end 23)
+        // exercise `calculate_effective_range`'s normalization directly, rather
+        // than collapsing by out-of-range clamping.
+        let crossing = InjectionOffset {
             start_row: 0,
-            start_column: 100,
+            start_column: 5,
             end_row: 0,
-            end_column: 0,
+            end_column: -5,
         };
-        let (injections, raw_start, raw_end) = quote_trimmed_injection(&tree, text, collapse);
+        let (injections, raw_start, raw_end) =
+            string_literal_injection_with_offset(&tree, text, crossing, false);
+        let collapse_byte = raw_start + 3;
 
         for byte in raw_start..=raw_end {
-            for boundary in [RegionBoundary::HalfOpen, RegionBoundary::CaretEndFallback] {
-                assert!(
-                    find_injection_at_position(&injections, byte, text, boundary).is_none(),
-                    "collapsed region must not match at byte {byte} under {boundary:?}"
-                );
-            }
+            assert!(
+                find_injection_at_position(&injections, byte, text, RegionBoundary::HalfOpen)
+                    .is_none(),
+                "half-open containment is vacuous for a zero-width span (byte {byte})"
+            );
         }
+
+        let (_, region) = find_injection_at_position(
+            &injections,
+            collapse_byte,
+            text,
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("the caret sitting exactly at the zero-width injection routes into it");
+        assert_eq!(region.language, "regex");
+
+        for byte in (raw_start..=raw_end).filter(|byte| *byte != collapse_byte) {
+            assert!(
+                find_injection_at_position(
+                    &injections,
+                    byte,
+                    text,
+                    RegionBoundary::CaretEndFallback
+                )
+                .is_none(),
+                "only the collapse byte routes under the caret rule (byte {byte})"
+            );
+        }
+
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("collapsed_region");
+        let resolved = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &Query::new(
+                &tree_sitter_rust::LANGUAGE.into(),
+                r#"((string_literal) @injection.content
+                     (#set! injection.language "regex")
+                     (#offset! @injection.content 0 5 0 -5))"#,
+            )
+            .expect("valid collapsing injection query"),
+            collapse_byte,
+            0,
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("a zero-width injection still resolves, to an empty virtual document");
+        assert_eq!(
+            resolved.virtual_content, "",
+            "the virtual document of a collapsed region is empty, not the raw span"
+        );
     }
 
     /// The motivating real-world shape (#996 item 1): markdown YAML frontmatter
