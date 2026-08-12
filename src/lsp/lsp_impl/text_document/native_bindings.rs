@@ -775,6 +775,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offset_narrowed_region_owns_the_effectively_innermost_cursor() {
+        // The document capture is raw-outermost, but its offset narrows the
+        // effective span to the `print(v)` line inside the Lua fence. At that
+        // cursor it is therefore the innermost containing injection and must
+        // own the position. Offset regions stay silent in the native path.
+        let text = "# t\n\n```lua\nlocal v = 1\nprint(v)\n```\n";
+        let (service, uri) = server_with_markdown_doc(text);
+        let server = service.inner();
+        let nested_query = Query::new(
+            &tree_sitter_md::LANGUAGE.into(),
+            r#"
+            ((document) @injection.content
+             (#set! injection.language "yaml")
+             (#set! injection.include-children)
+             (#offset! @injection.content 4 0 -1 0))
+            (fenced_code_block
+              (info_string (language) @injection.language)
+              (code_fence_content) @injection.content)
+            "#,
+        )
+        .unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(nested_query));
+
+        let links = server
+            .native_bindings_answer(&uri, Position::new(4, 6), |ctx| {
+                native_definition(ctx, &uri)
+            })
+            .await
+            .unwrap();
+        assert!(
+            links.is_none(),
+            "the narrower effective offset region must own the cursor and stay silent"
+        );
+    }
+
+    #[tokio::test]
     async fn native_definition_resolves_inside_an_injected_layer() {
         // line 3: `local v = 1`; line 4: `print(v)`.
         let text = "# t\n\n```lua\nlocal v = 1\nprint(v)\n```\n";
