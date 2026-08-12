@@ -119,7 +119,7 @@ pub(super) async fn sync_host_document<S: MessageSender>(
     connection_key: &ConnectionKey,
 ) -> io::Result<()> {
     let uri_lsp = host_url_to_lsp_uri(doc.uri)?;
-    let connections = docs.entry(doc.uri.to_string()).or_default();
+    let uri_string = doc.uri.to_string();
     // With a live reader, read the document's CURRENT text under this lock so a
     // late-unparking eager re-sync sends the latest text, not the snapshot it was
     // spawned with (#422); a `None` read (closed mid-sync) falls back to the
@@ -129,7 +129,34 @@ pub(super) async fn sync_host_document<S: MessageSender>(
     let text: &str = live.as_deref().unwrap_or(doc.text);
     let fp = fingerprint(text);
 
-    match connections.entry(connection_key.clone()) {
+    if let Entry::Vacant(uri_entry) = docs.entry(uri_string.clone()) {
+        let notification = JsonRpcNotification::new(
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem::new(
+                    uri_lsp,
+                    doc.language_id.to_string(),
+                    1,
+                    text.to_string(),
+                ),
+            },
+        );
+        sender.send_notification(notification).await?;
+        uri_entry.insert(std::collections::HashMap::from([(
+            connection_key.clone(),
+            HostDocSyncState {
+                version: 1,
+                fingerprint: fp,
+            },
+        )]));
+        return Ok(());
+    }
+
+    match docs
+        .get_mut(&uri_string)
+        .expect("host URI presence checked above")
+        .entry(connection_key.clone())
+    {
         Entry::Vacant(entry) => {
             let notification = JsonRpcNotification::new(
                 "textDocument/didOpen",
