@@ -154,5 +154,10 @@ expression: merged
     "positionEncodings": [
       "utf-16"
     ]
+  },
+  "experimental": {
+    "kakehashi": {
+      "bridgeRouting": true
+    }
   }
 }

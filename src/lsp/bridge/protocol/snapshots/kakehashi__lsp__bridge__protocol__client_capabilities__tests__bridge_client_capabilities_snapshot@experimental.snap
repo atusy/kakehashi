@@ -99,5 +99,10 @@ expression: capabilities
     "positionEncodings": [
       "utf-16"
     ]
+  },
+  "experimental": {
+    "kakehashi": {
+      "bridgeRouting": true
+    }
   }
 }
