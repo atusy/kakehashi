@@ -607,6 +607,17 @@ impl ConnectionHandle {
         self.state_watch.send_replace(new_state);
     }
 
+    pub(in crate::lsp::bridge) fn fail_if_ready(&self) {
+        let mut state = self
+            .state
+            .write()
+            .recover_poison("ConnectionHandle::fail_if_ready");
+        if *state == ConnectionState::Ready {
+            *state = ConnectionState::Failed;
+            self.state_watch.send_replace(ConnectionState::Failed);
+        }
+    }
+
     /// Complete initialization only while this handle still belongs to its
     /// original lifecycle. A reload or global shutdown may move an
     /// initializing handle to `Closing`; the handshake task must not resurrect
@@ -1147,9 +1158,23 @@ impl ConnectionHandle {
         request_id: RequestId,
         response_rx: tokio::sync::oneshot::Receiver<serde_json::Value>,
     ) -> io::Result<serde_json::Value> {
-        use tokio::time::timeout;
+        self.wait_for_response_until(
+            request_id,
+            response_rx,
+            tokio::time::Instant::now() + REQUEST_TIMEOUT,
+        )
+        .await
+    }
 
-        match timeout(REQUEST_TIMEOUT, response_rx).await {
+    pub(in crate::lsp::bridge) async fn wait_for_response_until(
+        &self,
+        request_id: RequestId,
+        response_rx: tokio::sync::oneshot::Receiver<serde_json::Value>,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<serde_json::Value> {
+        use tokio::time::timeout_at;
+
+        match timeout_at(deadline, response_rx).await {
             Ok(Ok(response)) => {
                 if let Some(failure) = self.router.take_failure(request_id) {
                     let (kind, message) = match failure {
