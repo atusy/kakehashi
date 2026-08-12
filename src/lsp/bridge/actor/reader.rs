@@ -25,7 +25,7 @@ use tower_lsp_server::jsonrpc;
 use tower_lsp_server::ls_types::MessageType;
 
 use super::super::connection::BridgeReader;
-use super::super::{client, telemetry, text_document, window};
+use super::super::{client, peer, telemetry, text_document, window};
 use super::OutboundMessage;
 use super::ResponseRouter;
 use super::response_router::{LivenessExpiry, RouteResult};
@@ -288,6 +288,8 @@ pub(crate) struct ServerRequestDeps {
     /// downstream-supplied `TextDocumentEdit.version`s against the version the
     /// bridge tracks for the virtual document on THIS connection.
     pub(crate) connection_key: ConnectionKey,
+    /// Live downstream slots available to `kakehashi/bridge/peer*` handlers.
+    pub(crate) peer_directory: Arc<peer::PeerDirectory>,
     pub(crate) response_tx: mpsc::Sender<OutboundMessage>,
     pub(crate) dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
     /// Loss-intolerant notifications (`DiagnosticRefresh` and work-done
@@ -594,6 +596,7 @@ pub(crate) fn spawn_reader_task_with_liveness(
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -686,6 +689,7 @@ async fn reader_loop(
         settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         server_name: None,
         connection_key: ConnectionKey::for_server("test"),
+        peer_directory: Arc::new(peer::PeerDirectory::default()),
         response_tx,
         dynamic_capabilities,
         upstream_tx,
@@ -1037,6 +1041,10 @@ async fn handle_server_request(
             workspace::apply_edit::handle(&message, id, server_prefix, deps);
             return;
         }
+        "kakehashi/bridge/peer/request" => {
+            peer::request::handle(&message, id, server_prefix, deps);
+            return;
+        }
         _ => {}
     }
 
@@ -1056,6 +1064,9 @@ async fn handle_server_request(
         "workspace/workspaceFolders" => workspace::workspace_folders::handle(server_prefix, deps),
         "workspace/configuration" => {
             workspace::configuration::handle(&message, server_prefix, deps)
+        }
+        "kakehashi/bridge/peer" => {
+            peer::list_result(&deps.peer_directory, &deps.connection_key, &message)
         }
         _ => {
             debug!(
@@ -1133,6 +1144,7 @@ pub(in crate::lsp::bridge) async fn send_server_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::bridge::ConnectionState;
     use crate::lsp::bridge::connection::AsyncBridgeConnection;
     use serde_json::json;
 
@@ -1306,6 +1318,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: server_name.map(String::from),
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
@@ -1443,6 +1456,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("mock-ls".to_string()),
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
@@ -1521,6 +1535,7 @@ mod tests {
                 settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 server_name: None,
                 connection_key: ConnectionKey::for_server("test"),
+                peer_directory: Arc::new(peer::PeerDirectory::default()),
                 response_tx,
                 dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
                 upstream_tx,
@@ -1976,6 +1991,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -2020,6 +2036,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_message_answers_peer_discovery_from_downstream_only() {
+        let router = ResponseRouter::new();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        let peer = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("oxfmt"),
+        )
+        .await;
+        deps.peer_directory.register(&peer);
+
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "kakehashi/bridge/peer",
+                "params": {}
+            }),
+            &router,
+            "[tsudoi] ",
+            &deps,
+        )
+        .await;
+
+        let OutboundMessage::Untracked(response) = response_rx.recv().await.unwrap() else {
+            panic!("server-request responses are untracked")
+        };
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["result"][0]["name"], "oxfmt");
+    }
+
+    #[tokio::test]
     async fn handle_message_unregister_capability_updates_registry() {
         let router = ResponseRouter::new();
         let (response_tx, mut response_rx) = mpsc::channel(16);
@@ -2039,6 +2087,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -2102,6 +2151,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2192,6 +2242,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2253,6 +2304,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2312,6 +2364,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2372,6 +2425,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2441,6 +2495,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2528,6 +2583,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2586,6 +2642,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2672,6 +2729,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2713,6 +2771,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2770,6 +2829,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2816,6 +2876,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2862,6 +2923,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2914,6 +2976,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("luals".to_string()),
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
             upstream_tx,
@@ -2974,6 +3037,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("lua_ls".to_string()),
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
             upstream_tx,
@@ -3027,6 +3091,7 @@ mod tests {
                 settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 server_name: Some("luals".to_string()),
                 connection_key: ConnectionKey::for_server("test"),
+                peer_directory: Arc::new(peer::PeerDirectory::default()),
                 response_tx,
                 dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
                 upstream_tx,
@@ -3110,6 +3175,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -3152,6 +3218,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -3209,6 +3276,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -3277,6 +3345,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx: response_tx.clone(),
             dynamic_capabilities,
             upstream_tx,
@@ -3340,6 +3409,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -3814,6 +3884,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("mock-ls".to_string()),
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
             upstream_tx,
@@ -4266,6 +4337,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
