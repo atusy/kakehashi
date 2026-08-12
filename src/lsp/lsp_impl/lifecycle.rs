@@ -688,11 +688,6 @@ impl Kakehashi {
                     },
                 )),
                 workspace: Some(workspace_server_capabilities()),
-                experimental: Some(serde_json::json!({
-                    "kakehashi": {
-                        "wrappedDidChangeConfigurationSettings": true,
-                    },
-                })),
                 ..ServerCapabilities::default()
             },
         })
