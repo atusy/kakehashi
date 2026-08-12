@@ -79,7 +79,7 @@ async fn cleanup_cancelled_peer(
     downstream_id: RequestId,
     settled_rx: tokio::sync::oneshot::Receiver<()>,
     deadline: tokio::time::Instant,
-    _permit: PeerRequestPermit,
+    _permit: Arc<PeerRequestPermit>,
 ) {
     tokio::select! {
         _ = settled_rx => {}
@@ -180,8 +180,8 @@ pub(in crate::lsp::bridge) async fn handle(
     }
 
     let deadline = tokio::time::Instant::now() + super::super::pool::REQUEST_TIMEOUT;
+    let permit = Arc::new(permit);
     tokio::spawn(async move {
-        let mut permit = Some(permit);
         let body = tokio::select! {
             response = peer.wait_for_response_until(downstream_id, response_rx, deadline) => {
                 router_guard.disarm();
@@ -212,13 +212,12 @@ pub(in crate::lsp::bridge) async fn handle(
                             outcome
                         );
                     }
-                    let permit = permit.take();
                     tokio::spawn(cleanup_cancelled_peer(
                         peer.clone(),
                         downstream_id,
                         settled_rx,
                         deadline,
-                        permit.expect("an admitted request owns its capacity permit"),
+                        Arc::clone(&permit),
                     ));
                 }
                 Err(jsonrpc::Error::request_cancelled())
@@ -363,7 +362,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn target_response_releases_cancelled_peer_capacity_immediately() {
+    async fn cancelled_peer_capacity_waits_for_target_and_outer_settlement() {
         let registry = InboundRequestRegistry::default();
         let origin = ProgressConnectionId::for_test(1);
         let (_cancel, _generation, permit) = registry
@@ -390,12 +389,13 @@ mod tests {
         assert!(peer.router().claim_for_write(request_id));
         peer.router().mark_sent(request_id);
         assert_eq!(peer.router().cancel_peer(request_id), Some(true));
+        let permit = Arc::new(permit);
         let cleanup = tokio::spawn(cleanup_cancelled_peer(
             peer.clone(),
             request_id,
             settled_rx,
             tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-            permit,
+            Arc::clone(&permit),
         ));
         drop(response_rx);
 
@@ -414,8 +414,15 @@ mod tests {
         assert!(
             registry
                 .try_register_peer(origin, jsonrpc::Id::Number(1000))
+                .is_none(),
+            "outer response delivery still owns the generation's capacity"
+        );
+        drop(permit);
+        assert!(
+            registry
+                .try_register_peer(origin, jsonrpc::Id::Number(1000))
                 .is_some(),
-            "target settlement releases the cancelled generation's capacity"
+            "capacity returns only after target cleanup and outer delivery settle"
         );
         drop(remaining);
     }
