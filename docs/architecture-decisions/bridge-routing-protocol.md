@@ -266,12 +266,21 @@ A provider **cannot**:
 - resurrect a stopped slot (precedence above);
 - see `cmd`, `initializationOptions`, or `settings` (projection);
 - point a server at an arbitrary filesystem location. Each
-  `workspaceFolders` element **that the mapping below will use** — all
-  of them for a shared instance, the first for a per-root server (the
-  ignored trailing elements are skipped unvalidated: they produce no
-  effect to validate, and validating them would spend filesystem work
-  on discarded data) — must be a `file:`-scheme URI, and after
-  canonicalization (symlinks resolved, on both sides) it must lie **at or
+  `workspaceFolders` element **that the mapping below may use** — all
+  of them when the server's effective `preferSharedInstance` is true,
+  the first otherwise (the ignored trailing elements are skipped
+  unvalidated: they produce no effect to validate, and validating them
+  would spend filesystem work on discarded data) — must be a
+  `file:`-scheme URI. The use/skip split follows the **configured
+  preference**, not the runtime capability — which for a
+  not-yet-spawned server is unknown at normalization time: a
+  shared-preferring server validates every element, and if the later
+  handshake's capability fallback downgrades it to per-root, the
+  first-element truncation applies at apply time with the extra
+  elements validated-but-unused — over-validation in the safe
+  direction, never an unvalidated folder reaching a capable server.
+  After
+  canonicalization (symlinks resolved, on both sides) each used element must lie **at or
   below** one of: a client-announced workspace folder, or the root
   kakehashi's own resolution produces for that (document, server) — the
   marker walk's result or the client fallback root. Containment is
@@ -738,11 +747,14 @@ structures with different lifetimes carry the outcome:
   binding's folders before the `didOpen` (a `#shared` key carries no
   folders and a restart loses the old set, so the binding is the only
   place the override survives). If the replacement no longer supports
-  workspace folders — the capability fallback downgraded it — the bound
-  shared route is **not applicable**: the sweep neither opens with
-  unannounced folders nor silently re-roots to a per-root key; the
-  document's features on that server stay dark until close/re-open runs
-  a fresh decision under the new capability reality. It is evicted only
+  workspace folders — the capability fallback downgraded it — a bound
+  shared route **with retained folders** is **not applicable**: the
+  sweep neither opens with unannounced folders nor silently re-roots to
+  a per-root key, and the document's features on that server stay dark
+  until close/re-open runs a fresh decision under the new capability
+  reality. A rootless `[]` binding retains no folders and needs no
+  announcement, so it survives the downgrade and reopens on `#shared`
+  untouched. It is evicted only
   by the decided document's close — never by a flush — this is what makes
   invalidation non-retroactive without opening side doors: a flushed
   *cache* cannot lift a suppression or re-root an open document onto a
@@ -1230,10 +1242,10 @@ motivated it are answered differently: per-region volume is
 user-controllable (disable the noisy bridge entry, or set the language's
 routing `priorities = []`), and virtual-URI identity churn rides the
 existing virtual-document lifecycle rather than needing its own
-machinery. The opacity cost stands and is accepted: a provider
-correlates a virtual URI to its host through
-`kakehashi/bridge/client/documents`; a `hostUri` field on the request
-itself stays deferred, additively.
+machinery. The opacity cost is answered by the request itself: `hostUri`
+rides every injection decision (per-side dispatch makes the
+editor-facing correlation methods unreachable from downstream, so the
+host identity has to be in the params).
 
 ### Open the document on every `workspaceFolders` element's connection
 
