@@ -116,7 +116,9 @@ indistinguishable from a runaway one at the framing layer.
 When the reader task exits abnormally (EOF, read error, timeout, or shutdown), every pending request must receive a terminal error response:
 - Normally `INTERNAL_ERROR` (-32603) — but a request already cancelled while
   still queued keeps `REQUEST_CANCELLED` (-32800), so the caller learns why
-  it actually ended
+  it actually ended. This narrows the older all-`INTERNAL_ERROR` rule to
+  preserve the outcome ls-bridge-message-ordering § Cancellation Forwarding
+  decided later.
 - Clear the pending map to prevent memory leaks
 - Log failures for observability
 

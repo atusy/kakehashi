@@ -7,8 +7,11 @@ was complete. Per-method coverage has since expanded well beyond this; see
 [docs/README.md](../README.md) for the current list of bridge-backed requests.
 
 Two of this record's original mechanisms are obsolete, in different ways.
-The **temporary workspace** shipped in the legacy redirection implementation
-(`src/lsp/redirection.rs`) and was superseded by virtual documents. The
+The **unconditional temporary workspace** — every injection written to disk
+— shipped in the legacy redirection implementation
+(`src/lsp/redirection.rs`) and was superseded by the virtual-document model,
+under which materialization is conditional on a server needing a real file
+and the ordinary path is in-memory. The
 **multi-signal readiness detector** never shipped as designed: that
 implementation waited on `publishDiagnostics` alone, bounded by a message
 count rather than a timeout, and never treated progress completion as
@@ -104,10 +107,11 @@ These constraints mean bridging is not simply "forward request, return response"
 
 - Servers must be listed in user configuration with explicit `cmd` field
 - No shell expansion or command interpolation in server commands
-- Injection content reaches servers as in-memory virtual documents, never as
-  files written to disk, so this decision adds no data-at-rest surface
-  (§ Provisioning Flow; the temp-file design it replaced is retained as
-  history under § Temporary File Management)
+- Injection content reaches servers as in-memory virtual documents on the
+  ordinary path, so no data-at-rest surface is created for it. A server that
+  requires a real file is served by **materialization**, which
+  language-server-bridge-virtual-document-model decides and scopes; where it
+  applies, the temp-file handling below is the reference
 
 ### Server Connection Pool
 
@@ -285,12 +289,12 @@ This separation allows:
 
 ### Temporary File Management
 
-> **Superseded, non-normative — retained as history.** This whole section
-> describes the temporary-workspace design, which shipped in the legacy
-> redirection implementation and was later replaced by virtual documents. Injection content is not written to
-> disk: the bridge mints virtual document URIs and sends in-memory content
-> (§ Provisioning Flow, language-server-bridge-virtual-document-model).
-> Nothing below is a current requirement.
+> **No longer the default path, and no longer unconditional.** Injection
+> content is not written to disk on the ordinary path; virtual documents are
+> logical. This section remains the reference for **materialized**
+> documents, which language-server-bridge-virtual-document-model still
+> provides for and refers back to here — so read it as scoped to that case,
+> not as a requirement for every injection.
 
 Injection content must be written to disk for servers that require real files.
 
@@ -329,12 +333,12 @@ Startup cleanup handles crash recovery: scan `{temp_dir}/kakehashi/` and remove 
 
 ### Workspace Provisioning
 
-> **Superseded in its mechanism, non-normative — retained as history.** The
-> *problem* is real and still shapes the design: servers differ in what
-> project context they need. The *solution* recorded below routes through
-> temp files kakehashi no longer writes (§ Provisioning Flow). Treat the
-> per-server requirements as accurate and the temp-path instructions as
-> historical.
+> **Scoped to materialized documents.** The *problem* is real and still
+> shapes the design: servers differ in what project context they need. The
+> temp-path handling below applies where
+> language-server-bridge-virtual-document-model calls for materialization —
+> it cites this section for exactly that — and not to the ordinary in-memory
+> path.
 
 Different language servers have different project structure requirements:
 
@@ -403,11 +407,12 @@ assumed — see § Decision–Implementation Gap.
    document notification may precede this (ls-bridge-message-ordering), and
    there is no indexing detector beyond it.
 3. Mint a **virtual document URI** for the injection region and send its
-   current in-memory content in `didOpen`. Regions are not written to
-   temporary files, and there is nothing to clean up on close beyond the
-   `didClose`. language-server-bridge-virtual-document-model carries this
-   decision; the servers that genuinely need a real path on disk are its
-   subject, not this one's.
+   current in-memory content in `didOpen`. On this path nothing is written to
+   disk and nothing needs cleaning up beyond the `didClose`.
+   language-server-bridge-virtual-document-model carries the decision, and
+   also decides when a server needing a real path on disk gets a
+   **materialized** document instead — that case routes through
+   § Temporary File Management and § Workspace Provisioning below.
 
 #### Ready Detection
 
