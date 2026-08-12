@@ -59,8 +59,11 @@ bridge-routing-protocol:
 this re-resolution — like every site that derives a connection from the host
 URI — consults the active route binding first, matched by the envelope's
 stamp of the decided document's URI (virtual for virt items) and its
-open incarnation; a
-missing, legacy, evicted, or mismatched stamp **fails soft** rather than falling back to marker or
+open incarnation; a missing, evicted, or mismatched **binding stamp**
+fails soft under that target-state rule (distinct from the *legacy
+envelope* above — an envelope missing the host-URI field entirely,
+whose shipped client-root fallback predates bindings altogether) rather
+than falling back to marker or
 client-root resolution, which under a root override would reach the
 config-root process instead of the one that produced the item.
 

@@ -135,11 +135,14 @@ type RoutingResult = null | {
   A virtual URI is **contractually opaque** to providers, exactly as that
   protocol's client ids are to editors: treat it as an identity token,
   never parse its rendering, which may change between kakehashi versions.
-  `host`'s presence is also the layer discriminator — no separate
-  `layer` field exists, because an injection decision is exactly one
-  whose `textDocument` carries a `host`, and the decided documents'
-  URIs never collide across layers (a virtual URI is never a real one),
-  so even lua-in-lua or markdown-in-markdown decisions stay distinct.
+  `host`'s presence is also the wire's layer discriminator — no
+  separate `layer` field exists, because an injection decision is
+  exactly one whose `textDocument` carries a `host`, so even lua-in-lua
+  or markdown-in-markdown decisions stay distinct on the wire. (URIs
+  alone would not suffice: a materialized injection's downstream URI is
+  a real temporary-file URI — virtual-document-model — which a host
+  document could share; kakehashi's internal keys keep a derived layer
+  bit for exactly that case, below.)
   The nested `host` is what makes an injection decision *decidable*: the
   editor-facing control methods are not registered on downstream
   connections (per-side dispatch, below), so a provider has no other way
@@ -614,9 +617,11 @@ whole group). Two
 structures with different lifetimes carry the outcome:
 
 - The **decision cache** holds pre-application answers, keyed
-  `(document URI, languageId, config generation)` — the decided
-  document's own URI, virtual for regions, distinct across layers by
-  construction — with **single-flight**
+  `(document URI, layer, languageId, config generation)` — the decided
+  document's own URI plus a **derived** layer bit (an injection
+  decision is one with a `host`; no wire field), kept in the key
+  because a materialized injection's downstream URI is a real
+  temporary-file URI a host document could share — with **single-flight**
   dedup — concurrent decision points for the same key await one in-flight
   query rather than racing their own (no existing lock covers this: the
   per-URI `edit_lock` is released before the bridge's open fan-out
@@ -1498,6 +1503,6 @@ a slot a routing provider left in play.
 | **Folders↔Key** | shared instance: union-only join; per-root: first element, rest warned+ignored; at most one connection per server name per document |
 | **Providers** | all spawnable configured servers ∩ advertising ∩ `Ready` (Initializing awaited only when the advertisement is known, the server is named, or it carries `forceStart`), ordered by routing `priorities` (no `"_"` method-wildcard inheritance); concurrent fan-out, `preferred` fan-in, operative-entry rule |
 | **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy, plus a separate binding-reuse validation budget); expiry is partial-result (cancel unanswered, drop unfinished entries, fan-in over what normalized; whole fallback only when no operative normalized result remains); exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
-| **Caching** | decision cache per (document URI, languageId, config generation) — the decided document's own URI, virtual for regions; single-flight; evicted on the decided document's close (a region leaving closes its virtual document), flushed on reload / `Ready`-provider-set / workspace-folder-set change; (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until that document closes; never retroactive |
+| **Caching** | decision cache per (document URI, derived layer, languageId, config generation) — the decided document's own URI, virtual for regions; single-flight; evicted on the decided document's close (a region leaving closes its virtual document), flushed on reload / `Ready`-provider-set / workspace-folder-set change; (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until that document closes; never retroactive |
 | **Cold start** | `forceStart` (publication-fenced get-or-create — the `Initializing` slot registers before the config becomes observable to `didOpen`; `#shared` + primary-root seed for `preferSharedInstance` servers, the marker-less fallback shape otherwise; warm-up scope limited to shared/marker-less/policy servers; wait-eligible for the initialization wait) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
 | **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; the sweep reads each exact server entry's binding where one exists, marker resolution where none does, and never spawns |
