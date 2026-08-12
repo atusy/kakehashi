@@ -94,13 +94,15 @@ Without clear precedence rules, timeout interactions are non-deterministic:
 | **Global Shutdown** | 5-15s | Balance clean exit vs user wait time |
 | **Per-Request** *(Phase 3)* | 2-5s | User-facing latency bound for aggregation |
 
-**Relationships:** these do not overlap and are configured independently, so
-their precedence comes from **state gating, not duration ordering** —
-initialization applies only while `Initializing`, liveness only while
-`Ready`, per-request only to an in-flight aggregation. (An earlier revision
-stated this as `Initialization (60s) > Liveness (30-120s) > Per-request
-(5s)`, an inequality that is false wherever liveness is configured above
-60s — which this file's own table permits.)
+**Relationships:** precedence comes from **state gating, not duration
+ordering**. Initialization and liveness are mutually exclusive — one applies
+while `Initializing`, the other while `Ready`. Per-request is not exclusive
+with liveness: it bounds an in-flight aggregation on a `Ready` connection, so
+both run at once and each fails what it governs. Global shutdown can begin
+during any of them and overrides all. (An earlier revision stated this as
+`Initialization (60s) > Liveness (30-120s) > Per-request (5s)`, an inequality
+that is false wherever liveness is configured above 60s — which this file's
+own table permits — and duration was never what made the tiers safe.)
 ```
 Initializing → Initialization | Ready → Liveness | in-flight → Per-request
 Global Shutdown overrides all (highest priority)
@@ -182,8 +184,9 @@ bound this hierarchy did not previously register):
   observable as an unbounded request
 
 **Writer-Idle Timeout** (within the applicable shutdown deadline):
-- **Duration**: 2s fixed (**target state** — no per-connection bound exists
-  today; see ls-bridge-graceful-shutdown § Decision–Implementation Gap)
+- **Duration**: implementation-defined, small relative to the enclosing
+  shutdown deadline (**target state** — no per-connection bound exists today;
+  see ls-bridge-graceful-shutdown § Decision–Implementation Gap)
 - **Purpose**: Wait for writer loop to finish current operation before taking exclusive stdin access
 - **Scope**: Counts against the applicable shutdown budget — per-slot `stop` or global teardown — not additional time
 - **See**: ls-bridge-graceful-shutdown § Writer Loop Shutdown Synchronization
