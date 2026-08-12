@@ -677,10 +677,12 @@ not a storm.
   operation answers `unknownClient` and reads as deleted. Whatever owns the
   key at any instant — handle, record, or in-flight operation — must keep
   resolving it.
-- **Every input a routing decision reads from a live handle needs a source
-  that survives that handle's death** — the trap is general, and the set of
-  such inputs is whatever routing actually consults, not a closed list. The
-  recorded case is the shared slot's workspace-folder capability verdict: without retaining it, non-seed
+- **A routing input read from a live handle is lost when that handle dies,
+  and the decision still has to be made.** The decided case is the shared
+  slot's workspace-folder capability verdict, which is retained for exactly
+  this reason; whether other inputs need the same treatment is open (see
+  § Decision–Implementation Gap) — this invariant names the hazard, not the
+  complete set: without retaining it, non-seed
   roots of an *incapable* shared server resolve optimistically to the
   stopped shared key and hit its fence, blacking out per-root clients that
   other roots are already using.

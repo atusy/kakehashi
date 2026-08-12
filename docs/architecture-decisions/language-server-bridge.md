@@ -159,7 +159,14 @@ Spawning can piggyback on these existing code paths.
 
 - **Spawn on injection detection**: Background spawn when new language injection is found
 - **Reuse**: All subsequent requests use warm connection
-- **Crash recovery**: Detect dead servers (broken pipe, exit code) and mark the connection `Failed`; the next acquire respawns it (not a timer — bridge-client-control-protocol)
+- **Crash recovery**: Detect dead servers (broken pipe, exit code) and mark
+  the connection `Failed`; the next acquire respawns it. **This corrects the
+  original promise of immediate respawn**, which neither the code nor
+  bridge-client-control-protocol has ever implemented — recovery is
+  acquire-driven, not timer-driven. The consequence is real and recorded
+  elsewhere: a server nothing re-acquires (a `forceStart`-only policy server
+  with `languages = []`) stays down until a reload or an explicit `restart`
+  (bridge-routing-protocol)
 
 ### Server Registry and Configuration
 
@@ -409,8 +416,9 @@ ls-bridge-server-pool-coordination's subject rather than this one's. In
 outline: a `preferred` fan-in falls through to the next candidate and only
 surfaces an error when nothing answered; a `concatenated` aggregation fails
 if a layer it required fails; and a fan-out whose downstreams all fail
-answers `REQUEST_FAILED`. Degradation is per-server, not per-request. What bounds the wait, today, is a fixed 30-second cap on every downstream
-response wait. It is not either of the named tiers: Tier 1 — the per-request
+answers `REQUEST_FAILED`. Degradation is per-server, not per-request. What bounds the wait, today, is a fixed 30-second cap on each
+bridge-managed downstream request — not on control-protocol pass-through,
+which by contract carries no bridge-imposed timeout. It is not either of the named tiers: Tier 1 — the per-request
 aggregation timeout that engages only for a multi-server fan-out — is still
 Phase 3, and Tier 2 is a connection-*health* monitor that resets on any
 decoded server message, so it bounds silence rather than any one request.
@@ -429,7 +437,7 @@ writer task patterns, and the timeout tiers this bound sits in.
 |------------|-----------|----------|
 | Server crash | Broken pipe on read/write | Mark connection `Failed`; the next acquire respawns |
 | Request timeout | Response wait expires | Return `None`, log warning |
-| Malformed response | JSON parse error | Return `None`, log error |
+| Malformed response | JSON decode failure on the wire | Connection-fatal: every pending request fails and the connection reports `Failed` |
 | Server busy | No response within timeout | Return `None`, consider increasing timeout |
 
 Cancellation: When the user moves the cursor before a response arrives, the LSP client typically sends a new request. kakehashi should:

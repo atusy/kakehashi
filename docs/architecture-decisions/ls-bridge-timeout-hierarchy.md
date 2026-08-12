@@ -158,10 +158,13 @@ Global Shutdown overrides all (highest priority)
 **Per-Downstream Response Cap** (**not a tier** — an implementation-state
 bound this hierarchy did not previously register):
 - **Duration**: 30s fixed
-- **Scope**: every downstream response wait, one request at a time. It is
-  not Tier 1, which engages only for a multi-server fan-out and is still
-  Phase 3; and it is not Tier 2, which resets on any decoded server message
-  and so bounds *silence* rather than a request
+- **Scope**: bridge-managed downstream requests, one wait at a time —
+  **not** control-protocol pass-through, which carries no bridge-imposed
+  timeout by contract (bridge-client-control-protocol), and not the
+  lifecycle handshake, which the shutdown deadline bounds. It is also
+  neither tier: Tier 1 engages only for a multi-server fan-out and is still
+  Phase 3, and Tier 2 resets on any decoded server message, so it bounds
+  *silence* rather than a request
 - **On expiry**: that request alone fails; the connection is not faulted
 - **Precedence**: connection closure and the shutdown deadline both cut it
   short, so it never extends a teardown
