@@ -528,8 +528,10 @@ impl ResponseRouter {
         for (request_id, pending) in entries {
             let (code, message) = if pending.delivery == RequestDelivery::CancelledQueued {
                 (-32800, "bridge: request cancelled before downstream write")
-            } else {
+            } else if request_id == id {
                 (-32603, "bridge: cancelled peer write timed out")
+            } else {
+                (-32603, "bridge: connection failed after peer write timeout")
             };
             let response = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -1065,6 +1067,29 @@ mod tests {
             router.take_failure(RequestId::new(2)),
             Some(BridgeFailure::ConnectionLost),
             "a later peer request is a victim of connection-wide liveness failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_write_expiry_distinguishes_connection_failure_victims() {
+        let router = ResponseRouter::new();
+        let peer_id = RequestId::new(1);
+        let (peer_rx, _epoch, _settled_rx) = router.register_peer(peer_id).unwrap();
+        assert!(router.claim_for_write(peer_id));
+        assert_eq!(router.cancel_peer(peer_id), Some(true));
+        let victim_id = RequestId::new(2);
+        let victim_rx = router.register(victim_id).unwrap();
+
+        assert!(router.expire_peer_cancel(peer_id));
+        let peer_error = peer_rx.await.unwrap();
+        let victim_error = victim_rx.await.unwrap();
+        assert_eq!(
+            peer_error["error"]["message"],
+            "bridge: cancelled peer write timed out"
+        );
+        assert_eq!(
+            victim_error["error"]["message"],
+            "bridge: connection failed after peer write timeout"
         );
     }
 
