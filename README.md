@@ -12,7 +12,7 @@ kakehashi is a bridge (架け橋) across your editors, your languages, and the l
 ---
 config:
   flowchart:
-    rankSpacing: 30
+    rankSpacing: 5
 ---
 flowchart TB
     subgraph K[" "]
@@ -20,8 +20,8 @@ flowchart TB
         T["🌉 kakehashi"] ~~~ B["Builtin smart features"]
     end
 
-    K <-->|Highlighting, selection, and more — everywhere| E["Your editor (any LSP client)"]
-    K <-.->|The additional smarts of real language servers| LS["pyright, rust-analyzer, and friends"]
+    K <--->|Highlighting, selection, and more — everywhere| E["Your editor (any LSP client)"]
+    K <-..->|The additional smarts of real language servers| LS["pyright, rust-analyzer, and friends"]
 
     style K fill:#e6f7f1,stroke:#5aa88b,stroke-width:2px
     style T fill:transparent,stroke:transparent,font-size:20px,font-weight:bold
