@@ -830,6 +830,30 @@ impl DocumentTracker {
             .is_some_and(|entry| entry.value().contains(connection_key))
     }
 
+    /// Connections that currently serve `uri` either as that exact downstream
+    /// document or as an injection belonging to that host document.
+    pub(in crate::lsp::bridge) async fn connections_serving_uri(
+        &self,
+        uri: &str,
+    ) -> Vec<ConnectionKey> {
+        let mut connections = self
+            .virtual_to_servers
+            .get(uri)
+            .map(|keys| keys.clone())
+            .unwrap_or_default();
+        let host_to_virtual = self.host_to_virtual.lock().await;
+        for document in host_to_virtual
+            .iter()
+            .filter(|(host_uri, _)| host_uri.as_str() == uri)
+            .flat_map(|(_, documents)| documents)
+        {
+            if !connections.contains(&document.connection_key) {
+                connections.push(document.connection_key.clone());
+            }
+        }
+        connections
+    }
+
     /// Resolve a virtual-document URI string back to its `(host_url, region_id)`.
     ///
     /// Used by the inbound `window/showDocument` translation to recover which

@@ -34,7 +34,7 @@ use handshake::perform_lsp_handshake;
 pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
-use document_tracker::DocumentTracker;
+pub(in crate::lsp::bridge) use document_tracker::DocumentTracker;
 pub(crate) use document_tracker::OpenedVirtualDoc;
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
@@ -276,6 +276,9 @@ pub(super) struct HostDocSyncState {
     pub(super) fingerprint: u64,
 }
 
+pub(in crate::lsp::bridge) type HostDocuments =
+    Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>;
+
 /// Cancellation-safe rollback for the pre-send virtual-document claim.
 /// Eager-open tasks are deliberately aborted when a newer parse supersedes
 /// them; dropping the handler between claim and FIFO enqueue must not leave a
@@ -386,7 +389,7 @@ pub struct LanguageServerPool {
     /// (host-document-bridge): the real-URI documents opened on downstream
     /// servers via `bridge._self`, with their version and content
     /// fingerprint for lazy full-text re-sync.
-    host_documents: Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>,
+    host_documents: Arc<HostDocuments>,
     /// Host documents explicitly suppressed by a downstream routing answer.
     host_routing_suppressed: DashMap<(String, ConnectionKey), ()>,
     /// Host/server pairs for which routing has already been decided, including
@@ -536,15 +539,20 @@ impl LanguageServerPool {
         let (window_tx, window_rx) =
             tokio::sync::mpsc::channel(super::actor::WINDOW_NOTIFICATION_QUEUE_CAPACITY);
         let (upstream_request_tx, upstream_request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let document_tracker = Arc::new(DocumentTracker::new());
+        let host_documents = Arc::new(Mutex::new(HashMap::new()));
         Self {
             connections: Mutex::new(HashMap::new()),
-            peer_directory: Arc::new(super::peer::PeerDirectory::default()),
+            peer_directory: Arc::new(super::peer::PeerDirectory::new(
+                Arc::clone(&document_tracker),
+                Arc::clone(&host_documents),
+            )),
             shutting_down: AtomicBool::new(false),
-            document_tracker: Arc::new(DocumentTracker::new()),
+            document_tracker,
             open_transition_locks: Arc::new(DashMap::new()),
             host_lifecycle_locks: DashMap::new(),
             latest_virtual_contents: DashMap::new(),
-            host_documents: Mutex::new(HashMap::new()),
+            host_documents,
             host_routing_suppressed: DashMap::new(),
             host_routing_decided: DashMap::new(),
             host_routing_by_server: DashMap::new(),
