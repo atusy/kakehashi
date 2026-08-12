@@ -152,10 +152,14 @@ pub(in crate::lsp::bridge) fn handle(
                 }
             }
             _ = cancel.cancelled() => {
-                peer.send_notification(JsonRpcNotification::new(
-                    "$/cancelRequest",
-                    serde_json::json!({ "id": downstream_id.as_i64() }),
-                ));
+                let should_notify = peer.router().cancel_and_remove(downstream_id);
+                router_guard.disarm();
+                if should_notify {
+                    peer.send_notification(JsonRpcNotification::new(
+                        "$/cancelRequest",
+                        serde_json::json!({ "id": downstream_id.as_i64() }),
+                    ));
+                }
                 Err(jsonrpc::Error::request_cancelled())
             }
         };
