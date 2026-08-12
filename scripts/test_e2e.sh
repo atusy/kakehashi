@@ -108,6 +108,9 @@ fi
 
 echo "==> Running integration + e2e  (--test-threads=$THREADS on ${CORES} cores${TIMEOUT_BIN:+, ${RUN_TIMEOUT}s cap})"
 LOG="$(mktemp)"
+# An empty LOG would make `tee ''` fail and leave the audit below with nothing
+# to read -- fail loudly instead of running an unverifiable suite.
+[ -n "$LOG" ] || { echo "error: mktemp failed; refusing to run without a log"; exit 1; }
 SECONDS=0
 if [ -n "$TIMEOUT_BIN" ]; then
   "$TIMEOUT_BIN" "$RUN_TIMEOUT" "$CARGO" test --features e2e --no-fail-fast \
@@ -138,7 +141,11 @@ fi
 #   * libtest declares more failures than the parser can name, so the unnamed
 #     ones are never retried and silently disappear.
 # All three are fatal: refuse the run rather than fall through to a retry.
-SUMMARIES=$(grep -c '^test result: ' "$LOG" || true)
+# Default to 0 rather than empty: `[ "" -ne 2 ]` is an error, and with `-e`
+# absent the `if` reads that error as FALSE and skips the very check below —
+# an unreadable log would silently disable the audit instead of tripping it.
+SUMMARIES=$(grep -c '^test result: ' "$LOG" 2>/dev/null)
+SUMMARIES=${SUMMARIES:-0}
 if [ "$SUMMARIES" -ne 2 ]; then
   echo "error: expected a 'test result:' summary from both binaries, found $SUMMARIES."
   echo "       A test binary died without reporting (abort/segfault/stack overflow/OOM)."
@@ -171,6 +178,8 @@ fi
 # rather than retry the subset and call the run green.
 DECLARED=$(awk '/^test result: /{for(i=1;i<=NF;i++) if($(i+1)=="failed;") s+=$i} END{print s+0}' "$LOG")
 PARSED=$(printf '%s\n' "$FAILED" | grep -c .)
+DECLARED=${DECLARED:-0}
+PARSED=${PARSED:-0}
 if [ "$DECLARED" -ne "$PARSED" ]; then
   echo "error: libtest declared $DECLARED failure(s) but only $PARSED could be named for retry."
   echo "       Refusing to retry a subset — the unnamed failure(s) would vanish."
