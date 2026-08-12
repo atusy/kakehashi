@@ -236,11 +236,12 @@ impl Kakehashi {
         // region without a directive the two spans are identical.
         let region = regions
             .iter()
-            .filter(|r| {
+            .filter_map(|r| {
                 let range = effective_content_range(r, text);
-                range.start <= byte && byte < range.end
+                (range.start <= byte && byte < range.end).then_some((r, range))
             })
-            .min_by_key(|r| r.content_node.end_byte() - r.content_node.start_byte())?;
+            .min_by_key(|(_, range)| range.end - range.start)
+            .map(|(r, _)| r)?;
 
         // From here on the cursor IS in a region: every bail is silence.
         if region.offset.is_some() {
