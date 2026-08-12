@@ -476,6 +476,43 @@ impl ConnectionHandle {
         parse_routing_response(&response)
     }
 
+    /// Queue an arbitrary JSON-RPC request for the downstream peer escape hatch.
+    ///
+    /// Unlike [`Self::send_request`], `method` is runtime data and `params` may
+    /// be omitted. The request is still tracked by the same response router and
+    /// single-writer queue as bridge-managed requests.
+    pub(crate) fn send_request_value(
+        &self,
+        method: String,
+        params: Option<serde_json::Value>,
+        request_id: RequestId,
+    ) -> Result<(), BridgeError> {
+        let mut payload = serde_json::Map::with_capacity(4);
+        payload.insert(
+            "jsonrpc".to_string(),
+            serde_json::Value::String("2.0".to_string()),
+        );
+        payload.insert("id".to_string(), serde_json::json!(request_id.as_i64()));
+        payload.insert("method".to_string(), serde_json::Value::String(method));
+        if let Some(params) = params {
+            payload.insert("params".to_string(), params);
+        }
+        match self.tx.try_send(OutboundMessage::Tracked {
+            payload: serde_json::Value::Object(payload),
+            request_id,
+        }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.router.remove(request_id);
+                Err(BridgeError::QueueFull)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.router.remove(request_id);
+                Err(BridgeError::ChannelClosed)
+            }
+        }
+    }
+
     /// Send a raw payload for echo-server tests.
     ///
     /// Echo-server tests need to send a message that, when echoed back, is
