@@ -124,8 +124,10 @@ When the reader task exits abnormally (EOF, read error, timeout, or shutdown), e
 
 **Cleanup Timeout Bounds** (**target state** — today's cleanup drains every
 pending entry synchronously, with no deadline and no overrun warning):
-Cleanup is bounded (duration implementation-defined, in the sub-second
-class), because it must never block a state transition:
+Cleanup must never block a state transition, so it cannot wait
+indefinitely. How that is bounded is unspecified — it is internal
+apportionment no peer can observe, and so is deliberately not registered as
+one of ls-bridge-timeout-hierarchy's deadlines:
 - If cleanup exceeds its bound, the state transition happens anyway
 - Log the overrun as a warning (it indicates potential channel saturation)
 - Any pending entry cleanup did not reach is failed by the loss of its reply
@@ -175,7 +177,7 @@ The system uses two distinct timeout mechanisms with different purposes:
 
 - **Purpose**: Bound initialization time to prevent indefinite hangs during server startup
 - **Scope**: Single operation during connection startup
-- **Duration**: Longer than liveness timeout (typically 30-60 seconds)
+- **Duration**: 30-60s. It is not ordered against the liveness timeout — the two are state-gated and configured independently (ls-bridge-timeout-hierarchy § Relationships), so a liveness value above this one is legal and harmless
 - **Timer Management**:
   - **Start**: When initialize request sent (Connection state: Initializing)
   - **Stop**: When initialize response received (transition to Ready)

@@ -301,8 +301,10 @@ no coordinate translation. They reuse the `UpstreamNotification` decoupling
 carrying `workspace/diagnostic/refresh`: a log-flooding downstream server must
 not grow memory without bound, and the forwarding loop's biased select drains
 the refresh channel first so a `window/*` burst cannot starve diagnostics.
-FIFO order is preserved within each channel. Still not forwarded: `$/progress`
-(#379) and push-based `textDocument/publishDiagnostics` (#380).
+FIFO order is preserved within each channel. `$/progress` (#379) and
+push-based `textDocument/publishDiagnostics` (#380) are forwarded too — the
+latter into the diagnostics cache per push-propagation-diagnostic-forwarding
+rather than passed straight through.
 
 ### Cancellation Propagation
 
