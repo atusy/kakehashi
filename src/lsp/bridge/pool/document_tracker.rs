@@ -947,6 +947,28 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn connections_serving_uri_matches_virtual_uri_and_its_host() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "typescript", "ts-0");
+        let connection = ConnectionKey::for_server("denols");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &connection)
+            .await;
+
+        assert_eq!(
+            tracker.connections_serving_uri(host_uri.as_str()).await,
+            vec![connection.clone()]
+        );
+        assert_eq!(
+            tracker
+                .connections_serving_uri(&virtual_uri.to_uri_string())
+                .await,
+            vec![connection]
+        );
+    }
+
     /// Test that register_opened_document records multiple virtual docs for same host.
     #[tokio::test]
     async fn register_opened_document_records_multiple_virtual_docs() {
