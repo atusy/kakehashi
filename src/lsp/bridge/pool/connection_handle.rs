@@ -1113,9 +1113,13 @@ impl ConnectionHandle {
 
     pub(in crate::lsp::bridge) fn register_peer_request(
         &self,
-    ) -> io::Result<(RequestId, tokio::sync::oneshot::Receiver<serde_json::Value>)> {
+    ) -> io::Result<(
+        RequestId,
+        tokio::sync::oneshot::Receiver<serde_json::Value>,
+        tokio::sync::oneshot::Receiver<()>,
+    )> {
         let request_id = RequestId::new(self.next_request_id());
-        let (response_rx, liveness_epoch) = self
+        let (response_rx, liveness_epoch, settled_rx) = self
             .router()
             .register_peer(request_id)
             .ok_or_else(|| io::Error::other("bridge: duplicate request ID"))?;
@@ -1124,7 +1128,7 @@ impl ConnectionHandle {
         {
             self.reader_handle.notify_liveness_start(epoch);
         }
-        Ok((request_id, response_rx))
+        Ok((request_id, response_rx, settled_rx))
     }
 
     /// Like `register_request()`, but also records the upstream→downstream ID
