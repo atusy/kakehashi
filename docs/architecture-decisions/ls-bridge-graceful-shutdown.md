@@ -92,10 +92,13 @@ Failed → Closed (skip LSP handshake)
 transitions to `Closed` for bookkeeping. What happens to the child
 depends on whether the kakehashi process is actually exiting:
 log-and-abandon applies **only on the process-exit path** (the `exit`
-notification, or teardown that ends the process) — and it is safe there
-for exactly one reason: the parent's imminent exit reparents the child
-to init, which reaps it, so neither a live straggler nor a zombie can
-persist. A teardown after which kakehashi keeps running is by
+notification, or teardown that ends the process), and it is tolerable there
+for one reason only: kakehashi is about to lose the ability to own anything,
+so retaining a record would be retaining it in a process that will not
+exist. It is not a cleanup guarantee. On Unix the child reparents to init,
+which reaps it *once it exits* — that disposes of the zombie, not of a live
+straggler, whose lifetime is its own; on platforms without that model there
+is no backstop at all. A teardown after which kakehashi keeps running is by
 definition `ServerRemains` and retains its records; delivery of SIGTERM
 or SIGKILL never substitutes for the reaped `wait`. When a `Teardown(ServerRemains)`
 runs while the server stays alive — the LSP `shutdown` request is
@@ -366,8 +369,9 @@ I/O, so the O(1) wall-clock property below is unaffected.
 - **Terminating a child is not the same as ceasing to own it.** A deadline
   passing does not end ownership; only a reap does, or kakehashi's own exit,
   which ends its *ability* to own rather than proving anything about the
-  child. Abandonment on the process-exit path is therefore a bounded loss
-  accepted knowingly, not a guarantee of cleanup — the OS may or may not
+  child. Abandonment on the process-exit path is therefore a knowingly
+  accepted loss — unbounded in the straggler's lifetime — not a guarantee of
+  cleanup — the OS may or may not
   reap the straggler, and on platforms without Unix reparenting there is no
   backstop at all (§ Unconfirmed Termination).
 - **The stopped-check and the spawn-decision must be atomic.** Split them

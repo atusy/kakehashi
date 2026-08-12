@@ -613,17 +613,19 @@ and their waits (ls-bridge-graceful-shutdown § Unconfirmed Termination).
   replacement no longer advertises workspace-folder change support,
   pool-coordination's existing capability fallback applies: subsequent
   acquires degrade to per-root connections and the restarted shared slot
-  simply serves nothing new. One piece of routing metadata **is**
-  retained across the stopped, termination-pending, and
+  simply serves nothing new. One **known required** piece of routing
+  metadata is retained across the stopped, termination-pending, and
   in-flight-operation records:
   the shared slot's workspace-folder **capability verdict**, which that
   fallback consults. The live decision reads it from the `Ready` handle,
   and the handle dies with a stop — without the retained verdict,
   non-seed roots of an *incapable* shared server would resolve
   optimistically to the shared key while it is stopped and hit its
-  fence, blacking out per-root clients other roots already use. With
-  it, their acquires keep resolving to per-root keys exactly as when
-  the handle was live.
+  fence, blacking out per-root clients other roots already use.
+  Retaining it removes that blackout. Whether it is *sufficient* — whether
+  the spawn root and the initialize-time folder set must also survive for
+  every initialize-listed non-seed root to resolve as it did while the
+  handle was live — is **unresolved**; see § Decision–Implementation Gap.
 
 During the restart window, `request` fails with `clientRestarting` and
 `notify` is silently dropped. `restart` on a `stopped` slot is simply a
@@ -824,6 +826,22 @@ namespace.
   undiscoverable until someone backfills them.
 - Server-name validation (`@`/`#` rejected) constrains configuration slightly;
   no known real-world server name uses either character.
+
+## Decision–Implementation Gap
+
+None of this protocol is implemented yet; § Implementation Notes below is the
+build list. One point of the *decision* is also unresolved rather than merely
+unbuilt:
+
+- **The complete set of routing inputs that must survive a handle's death is
+  not settled.** The shared slot's workspace-folder capability verdict is
+  recorded as retained and is known to be required. Live routing also
+  consults the spawn root and, where initial workspace folders are supported,
+  the initialize-time folder set — so an initialize-listed non-seed root may
+  resolve differently after a `stop` even with the verdict retained.
+  Resolving this widens what the stopped, termination-pending, and
+  in-flight-operation records carry, which is a behavioral change and so was
+  deliberately not decided while reorganizing this record.
 
 ## Implementation Notes
 

@@ -418,7 +418,7 @@ languages = ["python"]             # same language as pyright — this is the fa
 - Users can diagnose configuration issues immediately
 
 **Extensible Foundation:**
-- Phase 1 architecture supports future multi-LS extension (Phase 3)
+- The Phase 1 architecture was built to admit multi-LS extension, which has since shipped
 - Single-server configurations continue to work unchanged
 
 ### Negative
