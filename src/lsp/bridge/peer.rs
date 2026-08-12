@@ -62,12 +62,17 @@ impl PeerDirectory {
             .insert(handle.key().clone(), Arc::downgrade(handle));
     }
 
+    fn prune_dead(&self) {
+        self.handles.retain(|_, handle| handle.strong_count() != 0);
+    }
+
     pub(in crate::lsp::bridge) async fn list(
         &self,
         origin: &ConnectionKey,
         name: Option<&str>,
         text_document: Option<&TextDocumentIdentifier>,
     ) -> Vec<Peer> {
+        self.prune_dead();
         let serving_connections = match text_document {
             Some(text_document) => Some(self.serving_connections(text_document.uri.as_str()).await),
             None => None,
@@ -117,6 +122,7 @@ impl PeerDirectory {
         origin: &ConnectionKey,
         id: &str,
     ) -> Option<Arc<ConnectionHandle>> {
+        self.prune_dead();
         self.handles
             .iter()
             .find(|entry| entry.key() != origin && entry.key().peer_id() == id)
@@ -346,5 +352,21 @@ mod tests {
                 .resolve(&origin_key, "kakehashi-peer:6:tsudoi:fallback")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn peer_lookup_prunes_connections_after_their_handles_drop() {
+        let directory = PeerDirectory::default();
+        let origin_key = ConnectionKey::for_server("tsudoi");
+        let peer = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::new("denols", Some("file:///old-root".to_string())),
+        )
+        .await;
+        directory.register(&peer);
+        drop(peer);
+
+        assert!(directory.list(&origin_key, None, None).await.is_empty());
+        assert!(directory.handles.is_empty());
     }
 }
