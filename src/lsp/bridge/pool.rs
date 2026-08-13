@@ -1398,8 +1398,18 @@ impl LanguageServerPool {
             return Ok(());
         }
         for folder in folders {
-            let Some(folder_uri) = Url::parse(&folder).ok() else {
-                continue;
+            let folder_uri = match Url::parse(&folder) {
+                Ok(uri) => uri,
+                Err(error) => {
+                    log::debug!(
+                        target: "kakehashi::bridge::routing",
+                        "Ignoring invalid routing workspace folder {} for {}: {}",
+                        folder,
+                        server_name,
+                        error
+                    );
+                    continue;
+                }
             };
             let Some(marker) = super::root_markers::workspace_at_root(folder_uri) else {
                 continue;
