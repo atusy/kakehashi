@@ -11,23 +11,28 @@ kakehashi is a bridge (架け橋) across your editors, your languages, and the l
 ```mermaid
 ---
 config:
+  themeVariables:
+    fontSize: 20px
   flowchart:
     padding: 1
     rankSpacing: 1
+    subGraphTitleMargin:
+      top: 0
+      bottom: 12
 ---
 flowchart TB
-    subgraph K[" "]
-        direction TB
-        T["🌉 kakehashi"] ~~~ B["Builtin smart features"]
+    subgraph K["`**🌉 kakehashi**`"]
+        B["Builtin smart features"]
     end
 
     K <--->|Highlighting, selection, and more — everywhere| E["Your editor (any LSP client)"]
     K <-..->|The additional smarts of real language servers| LS["pyright, rust-analyzer, and friends"]
 
     style K fill:#e6f7f1,stroke:#5aa88b,stroke-width:2px
-    style T fill:transparent,stroke:transparent,font-size:20px,font-weight:bold
     style B fill:transparent,stroke:#aaa,stroke-dasharray:3 3,color:#666,font-size:12px
-    linkStyle 1,2 font-size:13px
+    style E font-size:16px
+    style LS font-size:16px
+    linkStyle 0,1 font-size:13px
 ```
 
 ## 🎨 Highlighting & smart selection, for any language
