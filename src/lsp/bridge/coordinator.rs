@@ -629,7 +629,14 @@ impl BridgeCoordinator {
             return OpenOutcome::NotOpened;
         };
         let routed = self
-            .route_virtual_injections(settings, host_language, host_uri, &host_uri_lsp, injections)
+            .route_virtual_injections(
+                settings,
+                host_language,
+                host_uri,
+                &host_uri_lsp,
+                injections,
+                Some(server_name),
+            )
             .await;
         let mut config = None;
         let for_server = routed
@@ -1088,6 +1095,7 @@ impl BridgeCoordinator {
         host_uri: &Url,
         host_uri_lsp: &tower_lsp_server::ls_types::Uri,
         injections: Vec<BridgeInjection>,
+        target_server: Option<&str>,
     ) -> Vec<(BridgeInjection, Vec<ResolvedServerConfig>)> {
         let mut configs_by_lang: HashMap<String, Vec<ResolvedServerConfig>> = HashMap::new();
         let mut routed = Vec::with_capacity(injections.len());
@@ -1106,6 +1114,13 @@ impl BridgeCoordinator {
                     self.get_all_configs_for_language(settings, host_language, &injection.language)
                 })
                 .clone();
+            let configs = match target_server {
+                Some(target) => configs
+                    .into_iter()
+                    .filter(|config| config.server_name == target)
+                    .collect(),
+                None => configs,
+            };
             if configs.is_empty() {
                 continue;
             }
@@ -1239,7 +1254,14 @@ impl BridgeCoordinator {
         // Empty means current settings resolve no server for any injection —
         // the batch belongs to removed configuration and must stop.
         let routed = self
-            .route_virtual_injections(settings, host_language, host_uri, &host_uri_lsp, injections)
+            .route_virtual_injections(
+                settings,
+                host_language,
+                host_uri,
+                &host_uri_lsp,
+                injections,
+                None,
+            )
             .await;
         let resolved_groups = Self::eager_open_groups_for_configs(routed);
         if resolved_groups.is_empty() {
