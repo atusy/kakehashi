@@ -1488,6 +1488,15 @@ impl BridgeCoordinator {
                     .and_then(|answer| answer.routing.get(&config.server_name))
                     .and_then(|entry| entry.workspace_folders.clone()),
             );
+            pool.set_host_routing_rootless(
+                document_uri,
+                &config.server_name,
+                answer
+                    .as_ref()
+                    .and_then(|answer| answer.routing.get(&config.server_name))
+                    .and_then(|entry| entry.workspace_folders.as_ref())
+                    .is_some_and(Vec::is_empty),
+            );
             let Some((_, handle)) = handles.iter().find(|(name, _)| name == &config.server_name)
             else {
                 if enabled {
