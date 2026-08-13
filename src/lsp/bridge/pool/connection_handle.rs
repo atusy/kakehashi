@@ -25,11 +25,14 @@ use super::dynamic_capability_registry::DynamicCapabilityRegistry;
 use super::{ConnectionState, UpstreamId};
 use crate::error::LockResultExt;
 use crate::lsp::bridge::actor::{
-    OUTBOUND_QUEUE_CAPACITY, OutboundMessage, ReaderTaskHandle, ResponseRouter, WriterTaskHandle,
+    OUTBOUND_QUEUE_CAPACITY, OutboundMessage, ReaderTaskHandle, ResponseRouter, RouterCleanupGuard,
+    WriterTaskHandle,
 };
 use crate::lsp::bridge::connection::SplitConnectionWriter;
 use crate::lsp::bridge::protocol::{
-    JsonRpcNotification, JsonRpcRequest, RequestId, build_exit_notification, build_shutdown_request,
+    JsonRpcNotification, JsonRpcRequest, ROUTING_METHOD, ROUTING_TIMEOUT, RequestId, RoutingAnswer,
+    RoutingParams, build_exit_notification, build_shutdown_request, jsonrpc_error_code,
+    parse_routing_response,
 };
 use crate::lsp::bridge::workspace::WorkspaceFolderSet;
 
@@ -415,6 +418,62 @@ impl ConnectionHandle {
                 Err(BridgeError::ChannelClosed)
             }
         }
+    }
+
+    /// Ask an advertising downstream server for its routing refinement.
+    ///
+    /// The request is deliberately scoped to the connection: provider
+    /// selection and decision caching belong to the pool/document layer, while
+    /// this method owns only the negotiated wire contract and response
+    /// lifetime. A `MethodNotFound` response permanently disables routing for
+    /// this connection until its next initialize handshake.
+    pub(crate) async fn request_routing(
+        &self,
+        params: RoutingParams,
+    ) -> io::Result<Option<RoutingAnswer>> {
+        if !self.supports_bridge_routing() {
+            return Ok(None);
+        }
+
+        // Routing is control traffic, not user request traffic: keep it out of
+        // the connection-wide liveness timer. Its own deadline below sends a
+        // cancellation and retires the router entry.
+        let request_id = RequestId::new(self.next_request_id());
+        let response_rx = self
+            .router()
+            .register(request_id)
+            .ok_or_else(|| io::Error::other("bridge: duplicate routing request ID"))?;
+        let mut cleanup = RouterCleanupGuard::new(Arc::clone(self.router()), request_id);
+        let request = JsonRpcRequest::new(request_id.as_i64(), ROUTING_METHOD, params);
+        self.send_request(request, request_id)
+            .map_err(io::Error::other)?;
+        let mut response_rx = response_rx;
+        let response = match tokio::time::timeout(ROUTING_TIMEOUT, &mut response_rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => return Err(io::Error::other("bridge: routing response channel closed")),
+            Err(_) => {
+                let cancel = JsonRpcNotification::new(
+                    "$/cancelRequest",
+                    serde_json::json!({"id": request_id.as_i64()}),
+                );
+                if self.send_notification(cancel) != NotificationSendResult::Queued {
+                    log::warn!(
+                        target: "kakehashi::bridge::routing",
+                        "Routing request {} timed out and its cancellation was not queued",
+                        request_id.as_i64()
+                    );
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "bridge: routing request timeout",
+                ));
+            }
+        };
+        cleanup.disarm();
+        if jsonrpc_error_code(&response) == Some(-32601) {
+            self.set_bridge_routing(false);
+        }
+        parse_routing_response(&response)
     }
 
     /// Send a raw payload for echo-server tests.

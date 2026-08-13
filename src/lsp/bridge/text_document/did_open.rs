@@ -4,6 +4,7 @@
 //! language servers when injection regions are detected during `did_open`
 //! or `did_change` processing.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use super::super::pool::{
     ConnectionHandleSender, ConnectionKey, INIT_TIMEOUT_SECS, LanguageServerPool,
 };
 use super::super::protocol::VirtualDocumentUri;
+use super::super::protocol::{RoutingLanguageServer, RoutingParams, RoutingTextDocument};
 
 /// What the caller requires to STILL hold by the time an eager open actually
 /// runs. Both fields are preconditions checked inside the open, not inputs to
@@ -299,6 +301,62 @@ impl LanguageServerPool {
         // Borrow the key (no clone) — both `connections.get` and `sync_host_document`
         // take it by reference, like `execute_host_request`.
         let connection_key = handle.key();
+        // The host-layer eager open is the first live consumer of the
+        // downstream routing protocol. The provider-selection and decision
+        // cache layers will widen this projection; this initial slice already
+        // makes an advertised server able to suppress its own document open.
+        let workspace_markers = server_config
+            .workspace_markers
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|marker| serde_json::to_value(marker).expect("RootMarker is serializable"))
+            .collect();
+        let routing_params = RoutingParams {
+            text_document: RoutingTextDocument {
+                uri: host_uri.to_string(),
+                language_id: language_id.to_string(),
+                host: None,
+            },
+            language_servers: BTreeMap::from([(
+                server_name.to_string(),
+                RoutingLanguageServer {
+                    languages: server_config.languages.clone().unwrap_or_default(),
+                    workspace_markers,
+                    prefer_shared_instance: server_config.prefer_shared_instance.unwrap_or(false),
+                },
+            )]),
+        };
+        let already_open = self.is_host_document_opened(host_uri, server_name).await;
+        if !already_open {
+            match handle.request_routing(routing_params).await {
+                Ok(Some(answer))
+                    if answer
+                        .routing
+                        .get(server_name)
+                        .and_then(|entry| entry.enabled)
+                        == Some(false) =>
+                {
+                    log::debug!(
+                        target: "kakehashi::bridge::routing",
+                        "Routing provider suppressed host document {} on {}",
+                        host_uri,
+                        server_name
+                    );
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    log::debug!(
+                        target: "kakehashi::bridge::routing",
+                        "Routing query failed for {} on {}: {}",
+                        host_uri,
+                        server_name,
+                        error
+                    );
+                }
+            }
+        }
         // Sync (sends didOpen) under the `connections` + `host_documents` locks in
         // that order, with the live-handle `Arc::ptr_eq` check — identical to
         // `execute_host_request`, so a concurrent respawn purge cannot interleave

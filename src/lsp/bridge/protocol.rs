@@ -23,6 +23,7 @@ mod lifecycle;
 mod request;
 mod request_id;
 mod response;
+mod routing;
 mod translation;
 mod virtual_uri;
 mod workspace_edit;
@@ -36,6 +37,7 @@ pub(crate) use lifecycle::*;
 pub(crate) use request::*;
 pub(crate) use request_id::RequestId;
 pub(crate) use response::*;
+pub(crate) use routing::*;
 pub(crate) use translation::*;
 pub(crate) use virtual_uri::VirtualDocumentUri;
 pub(crate) use workspace_edit::{
