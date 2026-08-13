@@ -387,6 +387,7 @@ pub struct LanguageServerPool {
     /// means the routing provider supplied the field; an inner `None` is the
     /// explicit JSON `null` value.
     host_routing_workspace_folders: DashMap<(String, String), Option<Vec<String>>>,
+    host_routing_rootless: DashMap<(String, String), ()>,
     /// Host URIs whose routing decision is currently being resolved.
     host_routing_pending: DashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>,
     /// Connections whose replacement still owes a virtual-document re-open, and
@@ -527,6 +528,7 @@ impl LanguageServerPool {
             host_routing_decided: DashMap::new(),
             host_routing_by_server: DashMap::new(),
             host_routing_workspace_folders: DashMap::new(),
+            host_routing_rootless: DashMap::new(),
             host_routing_pending: DashMap::new(),
             pending_reopen: Arc::new(PendingReopenRegistry::default()),
             diagnostic_pull_baselines: DashMap::new(),
@@ -1358,6 +1360,25 @@ impl LanguageServerPool {
         }
     }
 
+    pub(crate) fn set_host_routing_rootless(
+        &self,
+        host_uri: &Url,
+        server_name: &str,
+        rootless: bool,
+    ) {
+        let key = (host_uri.to_string(), server_name.to_string());
+        if rootless {
+            self.host_routing_rootless.insert(key, ());
+        } else {
+            self.host_routing_rootless.remove(&key);
+        }
+    }
+
+    pub(crate) fn host_routing_rootless(&self, host_uri: &Url, server_name: &str) -> bool {
+        self.host_routing_rootless
+            .contains_key(&(host_uri.to_string(), server_name.to_string()))
+    }
+
     pub(crate) fn host_routing_workspace_folders(
         &self,
         host_uri: &Url,
@@ -1381,20 +1402,19 @@ impl LanguageServerPool {
         let Some(folders) = self.host_routing_workspace_folders(host_uri, server_name) else {
             return Ok(());
         };
-        let Some(folders) = folders else {
+        let folders = folders.unwrap_or_else(|| {
             log::debug!(
                 target: "kakehashi::bridge::routing",
-                "Routing provider supplied workspaceFolders=null for {}; keeping the connection's existing folders",
+                "Routing provider supplied workspaceFolders=null for {}; using kakehashi's client workspace",
                 server_name
             );
-            return Ok(());
-        };
+            self.workspace_folders()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|folder| folder.uri.to_string())
+                .collect()
+        });
         if folders.is_empty() {
-            log::debug!(
-                target: "kakehashi::bridge::routing",
-                "Routing provider supplied an empty workspaceFolders list for {}; keeping the connection's existing folders",
-                server_name
-            );
             return Ok(());
         }
         for folder in folders {
@@ -1492,6 +1512,8 @@ impl LanguageServerPool {
         self.host_routing_by_server
             .retain(|(doc_uri, _), _| doc_uri != &uri);
         self.host_routing_workspace_folders
+            .retain(|(doc_uri, _), _| doc_uri != &uri);
+        self.host_routing_rootless
             .retain(|(doc_uri, _), _| doc_uri != &uri);
         self.finish_all_host_routing(host_uri);
     }
@@ -1768,6 +1790,9 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         document_uri: &Url,
     ) -> ConnectionKey {
+        if self.host_routing_rootless(document_uri, server_name) {
+            return ConnectionKey::new(server_name, None);
+        }
         self.resolve_acquire(server_name, server_config, Some(document_uri))
             .await
             .1
@@ -2197,9 +2222,13 @@ impl LanguageServerPool {
         let start = std::time::Instant::now();
         // Resolve the marker workspace + key ONCE (one filesystem walk, plus the
         // shared-instance capability probe).
-        let (marker, connection_key) = self
+        let (mut marker, mut connection_key) = self
             .resolve_acquire(server_name, server_config, document_uri)
             .await;
+        if document_uri.is_some_and(|uri| self.host_routing_rootless(uri, server_name)) {
+            marker = None;
+            connection_key = ConnectionKey::new(server_name, None);
+        }
 
         // Acquire and wait through initialization for the resolved key.
         let handle = self
