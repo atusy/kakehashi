@@ -779,6 +779,7 @@ impl LanguageServerPool {
                 .lock()
                 .await
                 .retain(|(_, connection_key), _| connection_key != &key);
+            self.clear_host_routing_for_connection(&key);
             self.document_tracker.purge_connection(&key).await;
             // Arm before the replacement can claim: what this connection held
             // is irrelevant, only that it owes a re-open. A connection dropped
@@ -936,6 +937,7 @@ impl LanguageServerPool {
                 .lock()
                 .await
                 .retain(|(_, connection_key), _| connection_key != &key);
+            self.clear_host_routing_for_connection(&key);
             self.document_tracker.purge_connection(&key).await;
             // Arm before the replacement can claim: what this connection held
             // is irrelevant, only that it owes a re-open.
@@ -1334,6 +1336,13 @@ impl LanguageServerPool {
             .retain(|(doc_uri, _), _| doc_uri != &uri);
         self.host_routing_decided
             .retain(|(doc_uri, _), _| doc_uri != &uri);
+    }
+
+    pub(crate) fn clear_host_routing_for_connection(&self, connection_key: &ConnectionKey) {
+        self.host_routing_suppressed
+            .retain(|(_, key), _| key != connection_key);
+        self.host_routing_decided
+            .retain(|(_, key), _| key != connection_key);
     }
 
     /// The current sync version of the host document at `host_uri` on `server_name`,
@@ -2723,6 +2732,7 @@ impl LanguageServerPool {
                         .lock()
                         .await
                         .retain(|(_, key), _| key != &connection_key);
+                    self.clear_host_routing_for_connection(&connection_key);
                     self.document_tracker
                         .purge_connection(&connection_key)
                         .await;
