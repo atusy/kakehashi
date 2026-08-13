@@ -1121,31 +1121,31 @@ impl Kakehashi {
         // become transport errors in the aggregation layer. The execution
         // guard remains as a defense against a stale decision or a race with
         // routing cleanup.
-        if let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(&preamble.uri) {
-            if let Ok(virtual_uri) = url::Url::parse(
+        if let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(&preamble.uri)
+            && let Ok(virtual_uri) = url::Url::parse(
                 &crate::lsp::bridge::VirtualDocumentUri::new(
                     &host_uri_lsp,
                     &preamble.resolved.injection_language,
                     &preamble.resolved.region.region_id,
                 )
                 .to_uri_string(),
-            ) {
-                let pool = self.bridge.pool_arc();
-                configs.retain(|config| {
-                    let suppressed = pool
-                        .host_routing_by_server(&virtual_uri, &config.server_name)
-                        .is_some_and(|enabled| !enabled);
-                    if suppressed {
-                        log::debug!(
-                            "{}: routing suppressed server '{}' for virtual document {}",
-                            method_name,
-                            config.server_name,
-                            virtual_uri
-                        );
-                    }
-                    !suppressed
-                });
-            }
+            )
+        {
+            let pool = self.bridge.pool_arc();
+            configs.retain(|config| {
+                let suppressed = pool
+                    .host_routing_by_server(&virtual_uri, &config.server_name)
+                    .is_some_and(|enabled| !enabled);
+                if suppressed {
+                    log::debug!(
+                        "{}: routing suppressed server '{}' for virtual document {}",
+                        method_name,
+                        config.server_name,
+                        virtual_uri
+                    );
+                }
+                !suppressed
+            });
         }
         if configs.is_empty() {
             return None;
