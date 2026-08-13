@@ -74,6 +74,12 @@ fn same_launch_config(
         workspace_markers: old_workspace_markers,
         on_type_formatting_triggers: old_on_type_formatting_triggers,
         prefer_shared_instance: _,
+        // Not a launch input: `force_start` decides whether a connection is
+        // spawned before any document asks for one, never how the process is
+        // launched. Tearing a live connection down over a flip would restart a
+        // server for no observable difference — and the flag is one-way within
+        // a session anyway (bridge-routing-protocol).
+        force_start: _,
         enabled: _,
     } = old;
     let BridgeServerConfig {
@@ -84,6 +90,7 @@ fn same_launch_config(
         workspace_markers: new_workspace_markers,
         on_type_formatting_triggers: new_on_type_formatting_triggers,
         prefer_shared_instance: _,
+        force_start: _,
         enabled: _,
     } = new;
     old_cmd == new_cmd
@@ -847,6 +854,13 @@ impl LanguageServerPool {
     #[cfg(test)]
     pub(crate) fn cancel_metrics(&self) -> &CancelForwardingMetrics {
         &self.cancel_metrics
+    }
+
+    /// How many connections the pool holds, for tests outside this module
+    /// that need to observe a spawn without reaching into the map.
+    #[cfg(test)]
+    pub(crate) async fn connection_count(&self) -> usize {
+        self.connections.lock().await.len()
     }
 
     /// Get access to the connections map.
@@ -1883,6 +1897,34 @@ impl LanguageServerPool {
             server_config,
             document_uri,
             Duration::from_secs(INIT_TIMEOUT_SECS),
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::get_or_create_connection`], with a caller-supplied `admit`
+    /// predicate evaluated **inside the acquire's critical section**.
+    ///
+    /// For a caller whose right to act can expire while it waits: checking
+    /// before the call is not enough, because the pool lock is taken after the
+    /// check and whoever holds it may be the very thing that expires the
+    /// caller. Returning `false` refuses the acquire with `Interrupted`,
+    /// exactly as the shutdown gate does — and, critically, refuses it before
+    /// the launch-config comparison that would otherwise let a stale caller
+    /// replace a live connection with the configuration it was carrying.
+    pub(super) async fn get_or_create_connection_admitted(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<Arc<ConnectionHandle>> {
+        self.get_or_create_connection_with_timeout(
+            server_name,
+            server_config,
+            document_uri,
+            Duration::from_secs(INIT_TIMEOUT_SECS),
+            Some(admit),
         )
         .await
     }
@@ -1906,6 +1948,7 @@ impl LanguageServerPool {
                 server_config,
                 None,
                 Duration::from_secs(INIT_TIMEOUT_SECS),
+                None,
             )
             .await;
     }
@@ -2021,6 +2064,7 @@ impl LanguageServerPool {
                 // incapable-shared divert, which passes its REMAINING budget)
                 // stays within `timeout` overall.
                 timeout,
+                None,
             )
             .await
         {
@@ -2481,6 +2525,7 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         document_uri: Option<&Url>,
         timeout: Duration,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         let (marker, connection_key) = self
             .resolve_acquire(server_name, server_config, document_uri)
@@ -2491,6 +2536,7 @@ impl LanguageServerPool {
             connection_key,
             marker,
             timeout,
+            admit,
         )
         .await
     }
@@ -2509,8 +2555,22 @@ impl LanguageServerPool {
         connection_key: ConnectionKey,
         marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         timeout: Duration,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         let mut connections = self.connections.lock().await;
+
+        // A caller whose right to act can expire says so here, under the same
+        // lock that guards every decision below — including the launch-config
+        // comparison, which would otherwise let a caller carrying superseded
+        // configuration tear down a live connection and respawn it stale.
+        // Checked beside the shutdown gate because it is the same kind of
+        // gate: the acquire is refused, not failed.
+        if admit.is_some_and(|admit| !admit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!("bridge: acquire for {connection_key} was superseded before admission"),
+            ));
+        }
 
         // Reject new spawns once shutdown has begun. Checked here, INSIDE the
         // `connections` lock that `shutdown_all` also takes to snapshot: if shutdown
@@ -3850,6 +3910,7 @@ mod tests {
     fn shared_config() -> crate::config::settings::BridgeServerConfig {
         crate::config::settings::BridgeServerConfig {
             prefer_shared_instance: Some(true),
+            force_start: None,
             settings: None,
             ..devnull_config()
         }
@@ -4534,6 +4595,7 @@ mod tests {
                 &config,
                 Some(&doc_a),
                 Duration::from_millis(150),
+                None,
             )
             .await;
         let _ = pool
@@ -4542,6 +4604,7 @@ mod tests {
                 &config,
                 Some(&doc_b),
                 Duration::from_millis(150),
+                None,
             )
             .await;
 
@@ -4818,6 +4881,7 @@ mod tests {
                 &config,
                 None,
                 Duration::from_millis(100),
+                None,
             )
             .await;
 
@@ -4868,6 +4932,7 @@ mod tests {
                 &config,
                 None,
                 Duration::from_millis(100),
+                None,
             )
             .await;
 
@@ -4922,7 +4987,13 @@ mod tests {
         let config = lua_ls_config();
 
         let result = pool
-            .get_or_create_connection_with_timeout("lua", &config, None, Duration::from_secs(30))
+            .get_or_create_connection_with_timeout(
+                "lua",
+                &config,
+                None,
+                Duration::from_secs(30),
+                None,
+            )
             .await;
 
         // Should succeed with a new Ready connection
@@ -4983,6 +5054,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -4993,6 +5065,7 @@ mod tests {
                 &unresponsive_config,
                 None,
                 Duration::from_millis(100),
+                None,
             )
             .await;
         assert!(result.is_err(), "First attempt should timeout");
@@ -5024,6 +5097,7 @@ mod tests {
                 &working_config,
                 None,
                 Duration::from_secs(30),
+                None,
             )
             .await;
 
@@ -6415,7 +6489,13 @@ mod tests {
         pool.shutdown_all().await;
 
         let err = pool
-            .get_or_create_connection_with_timeout("test", &config, None, Duration::from_secs(5))
+            .get_or_create_connection_with_timeout(
+                "test",
+                &config,
+                None,
+                Duration::from_secs(5),
+                None,
+            )
             .await
             .map(|_| ()) // ConnectionHandle isn't Debug; discard it for expect_err
             .expect_err("a spawn after shutdown must be rejected");
@@ -7535,7 +7615,13 @@ mod tests {
 
         // Spawn server (ignoring errors like ensure_server_ready does)
         let _ = pool
-            .get_or_create_connection_with_timeout("test-server", &config, None, short_timeout)
+            .get_or_create_connection_with_timeout(
+                "test-server",
+                &config,
+                None,
+                short_timeout,
+                None,
+            )
             .await;
 
         // After: connection entry exists (state may be Initializing or Failed)
@@ -7567,10 +7653,22 @@ mod tests {
 
         // Call twice (ignoring errors like ensure_server_ready does)
         let _ = pool
-            .get_or_create_connection_with_timeout("test-server", &config, None, short_timeout)
+            .get_or_create_connection_with_timeout(
+                "test-server",
+                &config,
+                None,
+                short_timeout,
+                None,
+            )
             .await;
         let _ = pool
-            .get_or_create_connection_with_timeout("test-server", &config, None, short_timeout)
+            .get_or_create_connection_with_timeout(
+                "test-server",
+                &config,
+                None,
+                short_timeout,
+                None,
+            )
             .await;
 
         // Should still have exactly one connection
@@ -8518,6 +8616,35 @@ mod tests {
             ..Default::default()
         };
         assert!(same_launch_config(&inherited, &explicit));
+    }
+
+    /// `forceStart` is deliberately not a launch input: it decides whether a
+    /// connection is created before a document asks for one, never how the
+    /// process is launched. Comparing it would restart a running server on a
+    /// flip, for no observable difference — and the flag is one-way within a
+    /// session anyway.
+    #[test]
+    fn launch_config_ignores_force_start() {
+        let warm = crate::config::settings::BridgeServerConfig {
+            force_start: Some(true),
+            ..Default::default()
+        };
+        let lazy = crate::config::settings::BridgeServerConfig {
+            force_start: Some(false),
+            ..Default::default()
+        };
+        assert!(same_launch_config(&warm, &lazy));
+        assert!(same_launch_config(
+            &warm,
+            &crate::config::settings::BridgeServerConfig::default()
+        ));
+
+        // Guard the guard: a field that IS a launch input still invalidates.
+        let renamed = crate::config::settings::BridgeServerConfig {
+            cmd: Some(vec!["other".to_string()]),
+            ..warm.clone()
+        };
+        assert!(!same_launch_config(&warm, &renamed));
     }
 
     #[tokio::test]

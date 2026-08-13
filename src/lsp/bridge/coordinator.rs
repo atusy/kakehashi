@@ -55,6 +55,25 @@ pub(crate) struct ResolvedServerConfig {
     pub(crate) config: Arc<BridgeServerConfig>,
 }
 
+/// Whether an acquire error means the warm-up was overtaken rather than that
+/// the server failed to start.
+///
+/// Three shapes qualify, and none of them is worth telling a user about: an
+/// acquire for the same key already shaking hands, a slot on its way down, and
+/// the pool refusing new spawns — which covers both shutdown and a warm-up
+/// this pass superseded. What is left is a server that genuinely could not
+/// start, which is exactly what the user needs to hear.
+fn is_concurrent_acquire(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::Interrupted {
+        return true;
+    }
+    use crate::lsp::bridge::pool::BridgeError;
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<BridgeError>())
+        .is_some_and(|inner| inner.is_initializing() || inner.is_closing())
+}
+
 fn resolve_reload_server_config(
     settings: &WorkspaceSettings,
     server_name: &str,
@@ -93,6 +112,16 @@ struct EagerOpenBatch {
     cancel: CancellationToken,
 }
 
+#[cfg(test)]
+pub(crate) struct ForceStartTestControl {
+    pub(crate) before_admission: Arc<tokio::sync::Notify>,
+    pub(crate) release_admission: Arc<tokio::sync::Notify>,
+    pub(crate) admission_finished: Arc<tokio::sync::Notify>,
+    pub(crate) pause_propagation: std::sync::atomic::AtomicBool,
+    pub(crate) after_propagation: Arc<tokio::sync::Notify>,
+    pub(crate) release_propagation: Arc<tokio::sync::Notify>,
+}
+
 /// Bundles `LanguageServerPool` and `NodeTracker` so LSP handlers see one field.
 /// The pool is `Arc`'d so the cancel-forwarding middleware can share it.
 ///
@@ -117,6 +146,22 @@ pub(crate) struct BridgeCoordinator {
     /// DashMap's internal locks provide memory synchronization for the
     /// stored generation values.
     eager_open_generation: std::sync::atomic::AtomicU64,
+    /// Monotonic generation counter for `forceStart` warm-up passes.
+    ///
+    /// Each pass claims the next value; its detached acquires re-read this
+    /// before touching the pool and stand down if a newer pass has claimed
+    /// one, so a task carrying a superseded configuration cannot spawn — or
+    /// worse, replace a correctly-configured connection with a stale launch
+    /// config, which the pool would do on seeing what it reads as a config
+    /// change. The newer pass re-asserts every flag anyway, so standing down
+    /// loses nothing.
+    ///
+    /// `Arc` because the check happens inside the detached task. Ordering is
+    /// `Relaxed` for the same reason the counter above is: monotonicity is
+    /// the whole requirement, and the pool's own lock orders the effects.
+    force_start_generation: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    force_start_test_control: arc_swap::ArcSwapOption<ForceStartTestControl>,
     /// Eager-open task batches, keyed by host document URI.
     ///
     /// Each batch contains a generation counter and abort handles. When a new
@@ -199,6 +244,9 @@ impl BridgeCoordinator {
             node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
+            force_start_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            force_start_test_control: arc_swap::ArcSwapOption::empty(),
             eager_open_tasks: DashMap::new(),
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
@@ -222,6 +270,9 @@ impl BridgeCoordinator {
             node_tracker: Arc::new(NodeTracker::new()),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
+            force_start_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            force_start_test_control: arc_swap::ArcSwapOption::empty(),
             eager_open_tasks: DashMap::new(),
             host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
@@ -292,9 +343,190 @@ impl BridgeCoordinator {
     /// next use spawns from the new config. Returns the number of settings
     /// notifications pushed (evictions are not counted).
     pub(crate) async fn propagate_settings(&self, settings: &WorkspaceSettings) -> usize {
-        self.pool
+        let pushed = self
+            .pool
             .propagate_settings(|server_name| resolve_reload_server_config(settings, server_name))
-            .await
+            .await;
+        #[cfg(test)]
+        if let Some(control) = self.force_start_test_control.load_full()
+            && control
+                .pause_propagation
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            control.after_propagation.notify_one();
+            control.release_propagation.notified().await;
+        }
+        pushed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_force_start_test_control(&self, control: Arc<ForceStartTestControl>) {
+        self.force_start_test_control.store(Some(control));
+    }
+
+    /// Retire every in-flight warm-up acquire, without launching new ones.
+    ///
+    /// Call this at the *start* of a settings application, before anything
+    /// that walks the connection map. An acquire is admitted for as long as
+    /// its generation is current, so retiring them only when the new warm-ups
+    /// launch would leave a window — after propagation, before the pass — in
+    /// which a stale acquire can still install a connection propagation has
+    /// already walked past.
+    pub(crate) fn supersede_force_start(&self) {
+        self.force_start_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Spawn every configured server that asks to start without waiting for a
+    /// document (`forceStart`), returning how many warm-up acquires were
+    /// launched — attempts, not connections: each one is detached, so none of
+    /// them has resolved a key or started a process by the time this returns.
+    ///
+    /// Runs at each settings application, so a reload that adds the flag —  or
+    /// adds the server — starts it then, and one that removes the flag simply
+    /// stops re-asserting it: within a session the flag is one-way, since
+    /// nothing here stops a running server (bridge-routing-protocol).
+    ///
+    /// Ordinary get-or-create, so a server already running under the key it
+    /// resolves to is reused rather than double-spawned, and one racing a
+    /// document's lazy acquire collides with it on the same key instead of
+    /// forking a second process. With no document there is no marker walk, so
+    /// the key is whatever a document-less acquire produces — the shared key
+    /// for a `preferSharedInstance` server, the client-fallback root
+    /// otherwise. Documents under marker roots resolve *marker* keys and so
+    /// will not reuse this connection; that limit is recorded on the config
+    /// field itself.
+    ///
+    /// Each acquire is **detached**, and that is the whole reason this
+    /// function does not await: an acquire runs the LSP handshake to
+    /// completion before it returns, up to the initialization timeout, and a
+    /// warm-up must never hold settings publication — or the reload lock —
+    /// for a heavy server's whole startup, let alone for a fleet of them.
+    /// Failures are logged there and never propagated here.
+    ///
+    /// The acquires are also **untracked**, unlike the eager-open tasks this
+    /// coordinator registers abort handles for. They need no abort path: the
+    /// pool refuses new spawns once shutdown begins, and it checks that inside
+    /// the same `connections` lock `shutdown_all` takes to snapshot, so a
+    /// racing warm-up is either rejected or already in the snapshot.
+    ///
+    /// bridge-routing-protocol
+    /// additionally asks that a `forceStart` slot be *registered* before the
+    /// configuration mandating it becomes observable to `didOpen`, so that a
+    /// racing first open cannot enumerate an empty provider set. Nothing here
+    /// provides that fence: the insertion happens inside the detached
+    /// acquire. It is deferred deliberately — the guarantee is only
+    /// observable once routing decisions and their bindings exist, and buying
+    /// it now would mean either blocking publication on process startup or a
+    /// third acquire variant with no caller to justify it.
+    pub(crate) fn force_start_servers(&self, settings: &WorkspaceSettings) -> usize {
+        use std::sync::atomic::Ordering;
+
+        let servers = &settings.language_servers;
+        let wildcard = servers.get(crate::config::WILDCARD_KEY);
+        // Claim this pass's generation before launching anything, so every
+        // task it spawns can tell whether it still speaks for the current
+        // configuration by the time it reaches the pool. A caller that
+        // superseded earlier in the same transaction claims again here, which
+        // is harmless: only the newest value admits anything.
+        let generation = self.force_start_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        // Deterministic order, so the log reads the same way every session
+        // where the config map's iteration order would not. It orders the
+        // launches only — the acquires themselves are detached and race.
+        let mut names: Vec<&String> = servers
+            .keys()
+            .filter(|name| name.as_str() != crate::config::WILDCARD_KEY)
+            .collect();
+        names.sort();
+
+        let mut launched = 0;
+        for name in names {
+            // Gate on the two fields alone before merging anything. Resolving
+            // a whole config clones every field and deep-merges the wildcard's
+            // `settings` and `initializationOptions` JSON, and this runs for
+            // every configured server on every settings application — so the
+            // merge belongs on the servers that actually force-start, not on
+            // the fleet. (The same reason `is_spawnable_with_wildcard` exists.)
+            let Some(config) = servers.get(name) else {
+                continue;
+            };
+            // Spawnability outranks the flag: `forceStart` says when a
+            // configured server starts, not whether a disabled or
+            // command-less one may.
+            if !config.forces_start_with_wildcard(wildcard)
+                || !config.is_spawnable_with_wildcard(wildcard)
+            {
+                continue;
+            }
+            let Some(config) = resolve_reload_server_config(settings, name) else {
+                continue;
+            };
+
+            let pool = Arc::clone(&self.pool);
+            let name = name.clone();
+            let current_generation = Arc::clone(&self.force_start_generation);
+            #[cfg(test)]
+            let test_control = self.force_start_test_control.load_full();
+            tokio::spawn(async move {
+                #[cfg(test)]
+                if let Some(control) = &test_control {
+                    control.before_admission.notify_one();
+                    control.release_admission.notified().await;
+                }
+                // The config in hand was resolved from the settings snapshot
+                // of this pass. If a later application has already run, that
+                // snapshot is history: spawning from it would start a server
+                // configuration no longer names, and — worse — the pool reads
+                // a differing launch config as a change, so a stale task would
+                // tear down the correctly-configured connection and replace it
+                // with the old command. The newer pass re-asserts every flag,
+                // so standing down costs nothing.
+                //
+                // The check is handed to the pool rather than made here,
+                // because here is too early: the acquire takes the pool lock
+                // afterwards, and whoever holds it may be the very pass that
+                // supersedes this one. Evaluated inside that lock, it lands
+                // ahead of the launch-config comparison it exists to prevent.
+                let admit = || current_generation.load(Ordering::Relaxed) == generation;
+                let result = pool
+                    .get_or_create_connection_admitted(&name, &config, None, &admit)
+                    .await;
+                #[cfg(test)]
+                if let Some(control) = &test_control {
+                    control.admission_finished.notify_one();
+                }
+                let Err(error) = result else {
+                    return;
+                };
+                // Two errors mean "someone else is already doing this", not
+                // failure: a previous application's acquire is still shaking
+                // hands, or the pool is shutting down. Both are ordinary — a
+                // client that pushes configuration right after `initialized`
+                // hits the first one every session — and reporting them as
+                // failures would train the user to ignore the message.
+                if is_concurrent_acquire(&error) {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "forceStart for '{name}' deferred to an acquire already in flight: {error}"
+                    );
+                    return;
+                }
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "forceStart could not start language server '{name}': {error}"
+                );
+                // The editor has to hear this one. A warm-up failure is
+                // otherwise invisible by construction: with an unset
+                // `RUST_LOG` the line above is filtered out, and a server
+                // nothing routes to has no request whose failure would
+                // surface it either.
+                pool.warn_to_editor(format!(
+                    "forceStart could not start language server '{name}': {error}"
+                ));
+            });
+            launched += 1;
+        }
+        launched
     }
 
     /// Access the cancel forwarder.
@@ -1405,6 +1637,8 @@ mod tests {
     use super::*;
     use crate::config::LanguageSettings;
     use crate::config::settings::{BridgeLanguageConfig, LANGUAGES_WILDCARD};
+    use crate::lsp::bridge::ConnectionKey;
+    use crate::lsp::bridge::pool::ConnectionState;
 
     #[test]
     fn reload_resolution_does_not_resurrect_deleted_server_from_wildcard() {
@@ -1418,6 +1652,294 @@ mod tests {
         );
 
         assert!(resolve_reload_server_config(&settings, "deleted").is_none());
+    }
+
+    /// A server config whose command runs harmlessly forever: enough to
+    /// occupy a connection slot without answering an LSP handshake.
+    fn force_start_settings(entries: &[(&str, BridgeServerConfig)]) -> WorkspaceSettings {
+        let mut settings = WorkspaceSettings::default();
+        for (name, config) in entries {
+            settings
+                .language_servers
+                .insert((*name).to_string(), config.clone());
+        }
+        settings
+    }
+
+    fn idle_server(force_start: bool, languages: Vec<String>) -> BridgeServerConfig {
+        BridgeServerConfig {
+            cmd: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "cat > /dev/null".to_string(),
+            ]),
+            languages: Some(languages),
+            force_start: force_start.then_some(true),
+            ..Default::default()
+        }
+    }
+
+    /// The connection keys once `expected` acquires have reached the pool, and
+    /// nothing more has since.
+    ///
+    /// `force_start_servers` detaches each acquire, and an acquire inserts its
+    /// `Initializing` handle before running the handshake — which these idle
+    /// servers never answer. So the assertion point is the insertion, reached
+    /// by polling rather than by awaiting a readiness that will not come.
+    ///
+    /// The settle after the count is reached is what lets a caller assert that
+    /// a server did *not* start: returning the instant `expected` appears
+    /// would never observe a spurious connection landing a moment later.
+    /// Timing out panics rather than returning a short list, so a loaded
+    /// machine reports a timeout instead of an inscrutable wrong-value diff.
+    async fn started_servers(coordinator: &BridgeCoordinator, expected: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let reached = coordinator.pool().connections().await.len() >= expected;
+            assert!(
+                reached || std::time::Instant::now() <= deadline,
+                "timed out waiting for {expected} warm-up connection(s)"
+            );
+            if reached {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let connections = coordinator.pool().connections().await;
+        let mut names: Vec<String> = connections
+            .keys()
+            .map(|key| key.server().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names.len(),
+            expected,
+            "a server outside the expected set started: {names:?}"
+        );
+        names
+    }
+
+    /// `forceStart` exists for servers nothing else would ever start: with
+    /// `languages = []` the server is in no document's candidate set, so no
+    /// lazy acquire can fire for it (bridge-routing-protocol's policy-server
+    /// pattern). Without the flag the same entry stays unspawned.
+    #[tokio::test]
+    async fn force_start_spawns_a_server_no_document_would() {
+        let coordinator = BridgeCoordinator::new();
+        let settings = force_start_settings(&[
+            ("policy-server", idle_server(true, vec![])),
+            ("lazy-server", idle_server(false, vec!["lua".to_string()])),
+        ]);
+
+        assert_eq!(coordinator.force_start_servers(&settings), 1);
+
+        assert_eq!(started_servers(&coordinator, 1).await, ["policy-server"]);
+    }
+
+    /// A reload re-runs the pass, and a server whose first acquire has not
+    /// finished is left alone rather than double-spawned.
+    ///
+    /// This pins the *concurrent* case specifically: these idle servers never
+    /// answer `initialize`, so the connection is still `Initializing` when the
+    /// second pass arrives and the pool refuses the acquire outright. That is
+    /// the branch a client which pushes configuration right after
+    /// `initialized` takes every session, and the one whose error must not be
+    /// reported to the user as a failure.
+    #[tokio::test]
+    async fn force_start_is_idempotent_across_reloads() {
+        let coordinator = BridgeCoordinator::new();
+        let settings = force_start_settings(&[("policy-server", idle_server(true, vec![]))]);
+
+        assert_eq!(coordinator.force_start_servers(&settings), 1);
+        started_servers(&coordinator, 1).await;
+        let first = coordinator
+            .pool()
+            .connections()
+            .await
+            .values()
+            .next()
+            .map(Arc::clone)
+            .expect("the first pass spawned a connection");
+
+        assert_eq!(
+            first.state(),
+            ConnectionState::Initializing,
+            "the case under test is a second pass arriving mid-handshake"
+        );
+
+        assert_eq!(coordinator.force_start_servers(&settings), 1);
+        // Two acquires for one key serialize on the pool lock; the second must
+        // leave the first's handle alone rather than spawn a second process.
+        // Give it room to do the wrong thing before asserting it didn't.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let connections = coordinator.pool().connections().await;
+        assert_eq!(connections.len(), 1, "no second process for the same key");
+        assert!(
+            Arc::ptr_eq(&first, connections.values().next().unwrap()),
+            "the running connection survives, rather than being replaced"
+        );
+        drop(connections);
+    }
+
+    /// The refusal a second pass gets while the first is still shaking hands
+    /// is not a failure, and must not be reported to the user as one — a
+    /// client that pushes configuration right after `initialized` would
+    /// otherwise produce a spurious warning every session.
+    #[test]
+    fn a_concurrent_acquire_is_not_a_forced_start_failure() {
+        use crate::lsp::bridge::pool::BridgeError;
+
+        assert!(is_concurrent_acquire(&BridgeError::Initializing.into()));
+        assert!(
+            is_concurrent_acquire(&BridgeError::Closing.into()),
+            "a slot on its way down is a lifecycle transition, not a start failure"
+        );
+        assert!(is_concurrent_acquire(&std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "bridge pool is shutting down; rejecting new connection spawn",
+        )));
+        assert!(
+            !is_concurrent_acquire(&std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No such file or directory (os error 2)",
+            )),
+            "a missing command is exactly what the user has to be told about"
+        );
+        assert!(
+            !is_concurrent_acquire(&BridgeError::Disabled.into()),
+            "a server disabled after repeated handshake failures is a failure"
+        );
+    }
+
+    /// A task carrying a superseded configuration must not reach the pool.
+    ///
+    /// The acquires are detached, so one launched by application N can arrive
+    /// after N+1 has been applied. Spawning from a snapshot configuration no
+    /// longer names is bad enough; worse, the pool reads a differing launch
+    /// config as a change, so the stale task would tear down N+1's correctly
+    /// configured connection and replace it with the old command.
+    #[tokio::test]
+    async fn force_start_stands_down_when_a_newer_configuration_arrives() {
+        let evidence = tempfile::tempdir().expect("a temp dir for the marker file");
+        let stale_ran = evidence.path().join("stale-command-ran");
+
+        // The two passes differ in the one way that matters: only the stale
+        // one's command leaves a trace. Counting connections cannot tell these
+        // apart — both target the same key, so a stale task that DID reach the
+        // pool would produce one connection either way, just the wrong one.
+        let staged = |marker: Option<&std::path::Path>| {
+            let script = match marker {
+                Some(path) => format!("touch {}; cat > /dev/null", path.display()),
+                None => "cat > /dev/null".to_string(),
+            };
+            force_start_settings(&[(
+                "policy-server",
+                BridgeServerConfig {
+                    cmd: Some(vec!["sh".to_string(), "-c".to_string(), script]),
+                    ..idle_server(true, vec![])
+                },
+            )])
+        };
+
+        let coordinator = BridgeCoordinator::new();
+        // The generation is claimed synchronously, so by the time the first
+        // pass's task body runs, the second pass has already superseded it —
+        // which is exactly the ordering a rapid second settings application
+        // produces.
+        assert_eq!(
+            coordinator.force_start_servers(&staged(Some(&stale_ran))),
+            1
+        );
+        assert_eq!(coordinator.force_start_servers(&staged(None)), 1);
+
+        assert_eq!(started_servers(&coordinator, 1).await, ["policy-server"]);
+        assert!(
+            !stale_ran.exists(),
+            "the superseded task reached the pool and spawned its command"
+        );
+    }
+
+    /// Spawnability outranks the flag: `forceStart` asks *when* a configured
+    /// server starts, never whether a disabled or command-less one may.
+    #[tokio::test]
+    async fn force_start_never_starts_an_unspawnable_server() {
+        let coordinator = BridgeCoordinator::new();
+        let disabled = BridgeServerConfig {
+            enabled: Some(false),
+            ..idle_server(true, vec![])
+        };
+        let no_cmd = BridgeServerConfig {
+            cmd: None,
+            ..idle_server(true, vec![])
+        };
+        let settings = force_start_settings(&[("disabled", disabled), ("no-cmd", no_cmd)]);
+
+        assert_eq!(coordinator.force_start_servers(&settings), 0);
+        assert!(coordinator.pool().connections().await.is_empty());
+    }
+
+    /// The wildcard supplies the flag like any other field, and — as with
+    /// `preferSharedInstance` — a concrete server can opt out of a blanket
+    /// opt-in. The wildcard entry itself is a template, never a server.
+    #[tokio::test]
+    async fn force_start_inherits_the_wildcard_and_can_be_opted_out_of() {
+        let coordinator = BridgeCoordinator::new();
+        let mut settings = force_start_settings(&[
+            ("inheritor", idle_server(false, vec!["lua".to_string()])),
+            (
+                "opted-out",
+                BridgeServerConfig {
+                    force_start: Some(false),
+                    ..idle_server(false, vec!["lua".to_string()])
+                },
+            ),
+        ]);
+        settings.language_servers.insert(
+            crate::config::WILDCARD_KEY.to_string(),
+            BridgeServerConfig {
+                force_start: Some(true),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(coordinator.force_start_servers(&settings), 1);
+        assert_eq!(started_servers(&coordinator, 1).await, ["inheritor"]);
+    }
+
+    /// With no document there is no marker to walk, so the connection lands on
+    /// the same key any document-less acquire produces: the shared key for a
+    /// `preferSharedInstance` server, the client-fallback root otherwise. That
+    /// is the honest scope of the warm-up, and the key is what a later
+    /// document has to match to reuse the process.
+    #[tokio::test]
+    async fn force_start_lands_on_the_document_less_key() {
+        let coordinator = BridgeCoordinator::new();
+        let settings = force_start_settings(&[
+            ("per-root", idle_server(true, vec![])),
+            (
+                "shared",
+                BridgeServerConfig {
+                    prefer_shared_instance: Some(true),
+                    ..idle_server(true, vec![])
+                },
+            ),
+        ]);
+
+        assert_eq!(coordinator.force_start_servers(&settings), 2);
+        started_servers(&coordinator, 2).await;
+
+        let connections = coordinator.pool().connections().await;
+        let mut keys: Vec<&ConnectionKey> = connections.keys().collect();
+        assert_eq!(keys.len(), 2, "both warm-ups must have reached the pool");
+        keys.sort_by_key(|key| key.server().to_string());
+        assert!(
+            keys[0].is_client_fallback(),
+            "a per-root server with no document has no marker root to key on"
+        );
+        assert_eq!(keys[1], &ConnectionKey::shared("shared"));
+        drop(connections);
     }
 
     /// Shutdown's `abort_all_eager_open` must drain the host-layer eager-open
@@ -1528,6 +2050,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1560,6 +2083,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -1611,6 +2135,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1625,6 +2150,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1683,6 +2209,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1731,6 +2258,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -1896,6 +2424,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1938,6 +2467,7 @@ mod tests {
                 )]),
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -1951,6 +2481,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2011,6 +2542,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: Some(false),
                 settings: None,
             },
@@ -2024,6 +2556,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2081,6 +2614,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: Some(false),
                 settings: None,
             },
@@ -2094,6 +2628,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: Some(true),
                 settings: None,
             },
@@ -2131,6 +2666,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2144,6 +2680,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2519,6 +3056,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2557,6 +3095,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2676,6 +3215,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2902,6 +3442,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },

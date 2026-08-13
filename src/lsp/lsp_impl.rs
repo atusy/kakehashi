@@ -227,12 +227,33 @@ pub(super) async fn apply_shared_settings_locked(
         .pool()
         .set_log_message_level(settings.features.window_log_message)
         .await;
+    // Supersede in-flight warm-ups BEFORE propagation, not with the pass that
+    // launches the new ones. An acquire carrying the previous application's
+    // configuration is admitted for as long as its generation is current, so
+    // one holding the pool lock in the gap between propagation and the warm-up
+    // pass would install a connection propagation has already walked past —
+    // and if this application removed that server, nothing would evict it
+    // until some later application ran. Claiming the generation up front makes
+    // the whole of this application a no-admittance window for stale acquires.
+    bridge.supersede_force_start();
     // Path c: apply downstream config at this single reload choke point
     // (initialize, didChangeConfiguration, auto-install reload): push runtime
     // settings in place and recycle connections whose launch config changed.
     // At initialize time there are no connections yet, so it is a clean no-op
     // (downstream-settings-propagation).
     let pushed = bridge.propagate_settings(&settings).await;
+    // After propagation, not before: propagation evicts connections whose
+    // launch config changed, and a warm-up started ahead of it would be
+    // spawned only to be torn down by the same reload. Every settings
+    // application re-asserts the flag, so a server that gains `forceStart` on
+    // reload starts then (bridge-routing-protocol).
+    let force_started = bridge.force_start_servers(&settings);
+    if force_started > 0 {
+        log::debug!(
+            target: "kakehashi::bridge",
+            "Starting {force_started} language server(s) eagerly (forceStart)"
+        );
+    }
     if pushed > 0 {
         log::debug!(
             target: "kakehashi::bridge",
@@ -622,6 +643,10 @@ impl Kakehashi {
         }
         let unspawnable = bridge_context::unspawnable_language_servers(settings);
         if let Some(msg) = bridge_context::format_unspawnable_servers_warning(&unspawnable) {
+            warnings.push(msg);
+        }
+        let bypassed = bridge_context::bypassed_force_start_servers(settings);
+        if let Some(msg) = bridge_context::format_bypassed_force_start_warning(&bypassed) {
             warnings.push(msg);
         }
         warnings
@@ -1034,6 +1059,114 @@ mod tests {
 
     // Note: Wildcard config resolution tests are in src/config.rs
     // Note: apply_content_changes_with_edits tests are in src/lsp/text_sync.rs
+
+    /// Applying settings is what starts a `forceStart` server — there is no
+    /// other trigger for one, and a server with `languages = []` has no
+    /// document path that could stand in.
+    ///
+    /// Worth a test at this level rather than only on the coordinator: the
+    /// coordinator's own tests call `force_start_servers` directly, so
+    /// deleting the call from the reload transaction leaves every one of them
+    /// green while the feature stops working entirely.
+    #[tokio::test]
+    async fn applying_settings_starts_a_force_start_server() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "policy-server".to_string(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "cat > /dev/null".to_string(),
+                ]),
+                languages: Some(Vec::new()),
+                force_start: Some(true),
+                ..Default::default()
+            },
+        );
+
+        server
+            .apply_raw_settings(RawWorkspaceSettings::default(), settings)
+            .await;
+
+        // The acquire is detached and inserts its handle before the handshake
+        // this server never answers, so the observable event is the insertion.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let started = server.bridge.pool().connection_count().await;
+            if started > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "the settings application never started the forceStart server"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A reload retires an old detached warm-up before propagation walks the
+    /// pool. If the retirement moved after propagation, the paused old acquire
+    /// would be admitted in that gap and resurrect a server removed by the
+    /// reload.
+    #[tokio::test]
+    async fn settings_reload_supersedes_warmups_before_propagation() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let control = std::sync::Arc::new(crate::lsp::bridge::coordinator::ForceStartTestControl {
+            before_admission: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release_admission: std::sync::Arc::new(tokio::sync::Notify::new()),
+            admission_finished: std::sync::Arc::new(tokio::sync::Notify::new()),
+            pause_propagation: std::sync::atomic::AtomicBool::new(false),
+            after_propagation: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release_propagation: std::sync::Arc::new(tokio::sync::Notify::new()),
+        });
+        server
+            .bridge
+            .set_force_start_test_control(std::sync::Arc::clone(&control));
+
+        let mut old_settings = WorkspaceSettings::default();
+        old_settings.language_servers.insert(
+            "policy-server".to_string(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "cat > /dev/null".to_string(),
+                ]),
+                languages: Some(Vec::new()),
+                force_start: Some(true),
+                ..Default::default()
+            },
+        );
+        server
+            .apply_raw_settings(RawWorkspaceSettings::default(), old_settings)
+            .await;
+        control.before_admission.notified().await;
+
+        control
+            .pause_propagation
+            .store(true, std::sync::atomic::Ordering::Release);
+        let reload = server.apply_raw_settings(
+            RawWorkspaceSettings::default(),
+            WorkspaceSettings::default(),
+        );
+        tokio::pin!(reload);
+        tokio::select! {
+            _ = control.after_propagation.notified() => {}
+            _ = &mut reload => panic!("reload reached forceStart before propagation was released"),
+        }
+
+        control.release_admission.notify_one();
+        control.admission_finished.notified().await;
+        assert_eq!(server.bridge.pool().connection_count().await, 0);
+
+        control.release_propagation.notify_one();
+        reload.await;
+    }
 
     #[tokio::test]
     async fn settings_reload_discards_available_document_parsers() {

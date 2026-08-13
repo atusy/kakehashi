@@ -15,6 +15,7 @@ expression: settings.language_servers
     "workspaceMarkers": null,
     "onTypeFormattingTriggers": null,
     "preferSharedInstance": null,
+    "forceStart": null,
     "enabled": null
   },
   "rust-analyzer": {
@@ -28,6 +29,7 @@ expression: settings.language_servers
     "workspaceMarkers": null,
     "onTypeFormattingTriggers": null,
     "preferSharedInstance": null,
+    "forceStart": null,
     "enabled": null
   }
 }

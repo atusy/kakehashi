@@ -158,8 +158,12 @@ pub(crate) struct ConnectionHandle {
     settings: Arc<arc_swap::ArcSwapOption<serde_json::Value>>,
     /// Resolved server configuration that created this process.
     ///
-    /// `settings` is ignored when comparing this snapshot on reload because it
-    /// can be propagated at runtime; every other field is spawn-time state.
+    /// Two fields are dropped rather than snapshotted, because neither is
+    /// spawn-time state: `settings` can be propagated at runtime, and
+    /// `force_start` only decides whether a connection is created before a
+    /// document asks for one — never how the process is launched. Everything
+    /// else here is what the process was started with, and a change to any of
+    /// it invalidates the connection.
     launch_config: OnceLock<crate::config::settings::BridgeServerConfig>,
     /// The workspace root this connection's `initialize` was rooted at (the
     /// marker root, or the client root for a marker-less/fallback spawn).
@@ -255,6 +259,10 @@ impl ConnectionHandle {
             workspace_markers: config.workspace_markers.clone(),
             on_type_formatting_triggers: config.on_type_formatting_triggers.clone(),
             prefer_shared_instance: config.prefer_shared_instance,
+            // Dropped like `settings`, and for the same kind of reason — see
+            // the field doc. Snapshotting it would make a `forceStart` flip
+            // read as a launch-config change and tear the process down.
+            force_start: None,
             enabled: config.enabled,
         };
         let _ = self.launch_config.set(snapshot);

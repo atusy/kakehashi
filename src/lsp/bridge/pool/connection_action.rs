@@ -55,6 +55,12 @@ impl BridgeError {
         matches!(self, BridgeError::Initializing)
     }
 
+    /// Whether this is a slot on its way down — a lifecycle transition a
+    /// caller races rather than a failure it caused.
+    pub(crate) fn is_closing(&self) -> bool {
+        matches!(self, BridgeError::Closing)
+    }
+
     /// Get the LSP error code for this error.
     ///
     /// All bridge errors map to REQUEST_FAILED (-32803) per LSP spec,

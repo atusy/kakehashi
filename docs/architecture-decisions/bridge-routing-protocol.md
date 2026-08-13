@@ -503,6 +503,9 @@ candidates at all likewise queries nothing.
   any language level, wildcards included. Kakehashi warns once at config
   load when a `"_"` entry carries an explicit `priorities` list while the
   routing key is unset — the shape where intent and effect diverge.
+  (**Target state.** The exemption itself has shipped; the advisory lands
+  with the routing decision, because a warning that a config does not gate
+  a protocol which does not yet run would mislead more than it helps.)
   `bridge.<lang>` vs `bridge._` inheritance (the language axis) applies
   to the routing key exactly as to any other.
 - The method consumes only `priorities`. `strategy`, `maxFanOut`,
@@ -1097,33 +1100,56 @@ configured. Two pieces close most of the gap:
 - **`languageServers.<name>.forceStart`** (new config; `None` = inherit
   from the wildcard, built-in default `false`, matching the
   `enabled`/`preferSharedInstance` inheritance shape): spawn this server
-  eagerly, with no triggering document. The spawn fires **after the first
-  effective configuration is published** (spawning at `initialize` would
-  use a configuration the client's first settings push routinely
-  replaces, evicting the fresh connection as pure churn), and rides the
+  eagerly, with no triggering document. The spawn fires **at each
+  effective configuration application**, the earliest of which is
+  `initialize`'s own. An earlier draft deferred it past that first
+  application, on the grounds that the client's first settings push
+  routinely replaces the configuration and would evict the fresh
+  connection as pure churn. As shipped it fires on every application
+  including the first, because deferring makes the flag unreachable for a
+  client that neither pushes settings nor supports the
+  `workspace/configuration` pull — exactly the policy-server pattern's
+  client. The churn accepted in exchange is narrow: an eviction needs the
+  first configuration to already carry a spawnable `forceStart` server
+  *and* the later push to change that server's launch config, since
+  propagation evicts only on a launch-config change — and each later
+  application re-asserts the flag, so an evicted warm-up comes back. It
+  runs **after** propagation within an application, so a reload cannot
+  evict the warm-up it just started. Each acquire is **detached**: an
+  acquire runs the handshake to completion before returning, and no
+  warm-up may hold settings publication for a heavy server's startup.
+  The spawn rides the
   ordinary acquire path as a **get-or-create inside the acquire critical
   section** — with no document there is no marker walk, so it resolves
   the same marker-less fallback shape a document-less acquire produces
   (`root_markers::workspace_from_marker`: the client-supplied `rootUri`
   and the client's workspace-folder snapshot; rootless in a
-  workspace-less session) — **except** for a `preferSharedInstance`
-  server, where it resolves the `#shared` key directly, seeded with the
-  client's primary root exactly as the control protocol's shared
-  re-seed is (the document-less acquire's ordinary answer would be the
-  client-fallback key, which marker-rooted documents bypass — the
-  warm-up would warm a process nothing uses); the capability verdict
+  workspace-less session). For a `preferSharedInstance` server that
+  same ordinary answer is already the `#shared` key — the acquire routes
+  any shared-preferring server there whether or not a document triggered
+  it — so the warm-up needs no special case of its own; an earlier draft
+  wrote one, on the mistaken premise that a document-less acquire would
+  land on the client-fallback key. The shared spawn is seeded the way
+  every marker-less spawn is: the client's `rootUri` together with its
+  workspace-folder snapshot. The capability verdict
   lands at the handshake as for any shared spawn, and an incapable
   server simply serves nothing new, per the existing fallback. It
   observes the stopped set and control registry exactly as a lazy
   acquire does, colliding rather than double-spawning when one races
-  it. Its `Initializing` handle is registered **before the
+  it — insofar as either exists: no stopped set or control registry is
+  implemented yet, so today only the collision half is real.
+  (**Target state**, landing with the routing decision it exists
+  for — today's warm-up detaches its acquire, so the handle appears when
+  that task runs.) Its `Initializing` handle is registered **before the
   configuration that mandates it becomes observable to `didOpen`
-  processing** — the insertion rides the same publication fence that
-  already serializes settings with acquires, so no first `didOpen` can
+  processing**, so no first `didOpen` can
   slip between the config publishing and its `forceStart` slots
   existing, enumerate an empty provider set, and commit a fallback
   binding that the freeze would then retain past the provider's
-  arrival. That fallback shape is also the
+  arrival. No such fence exists in the code today — nothing spans the
+  settings snapshot's publication and an acquire — and the gap is
+  unobservable until routing bindings exist, so buying it is that
+  decision's work, not the warm-up's. That fallback shape is also the
   honest scope of the warm-up: documents under marker roots resolve
   *marker* keys and will not reuse the warmed connection, so `forceStart`
   warms a usable connection only for shared-instance servers, marker-less
@@ -1136,7 +1162,15 @@ configured. Two pieces close most of the gap:
   layers accumulate (configuration-merging-strategy), `forceStart = true`
   persists until an explicit `false`, and a reload flipping it to `false`
   never stops an already-running server — within a session the flag is
-  effectively one-way; `stop` is the lever that stops.
+  effectively one-way; `stop` is the lever that stops. It also starts a
+  server rather than supervising one: every recovery path in the pool is
+  request-triggered, and a `languages = []` provider has no request, so a
+  warm-up that dies stays dead until the next configuration application
+  re-asserts the flag. A folder change re-asserts it too, since that
+  recycles exactly the client-fallback connections a warm-up occupies.
+  Supervising the provider — the connection routing decisions would
+  actually depend on — is the routing decision's problem, not the
+  warm-up's.
 - **Bounded initialization wait**: a provider whose advertisement is
   known, that is explicitly named in `priorities`, or that carries
   `forceStart` (the filter above), and that is still `Initializing` at
@@ -1533,14 +1567,19 @@ a slot a routing provider left in play.
   control protocol introduces for pass-through; routing entries carry the
   same non-liveness class.
 - `forceStart` joins `KNOWN_BRIDGE_SERVER_SETTING_KEYS` (unknown-key
-  allowlist) with a `forces_start()` accessor mirroring
-  `prefers_shared_instance()`; its doc comment is user-facing config-schema
-  hover output.
-- Two config-load advisories ship with the feature: a `"_"` aggregation
-  entry carrying an explicit `priorities` list while the routing key is
-  unset (restriction the user likely believes covers routing), and
+  allowlist) with a wildcard-resolving `forces_start_with_wildcard`
+  accessor — only that form, since its one caller reads the field while
+  looping over the fleet, which is what `is_spawnable_with_wildcard`
+  exists for; its doc comment is user-facing config-schema hover output.
+- Two config-load advisories, each landing with the behavior it describes.
   `forceStart = true` on a per-root marker server with non-empty
-  `languages` (a warm-up most documents will bypass).
+  `languages` (a warm-up most documents will bypass) **ships with
+  `forceStart`**, joining the existing settings-apply advisories. A `"_"`
+  aggregation entry carrying an explicit `priorities` list while the
+  routing key is unset (a restriction the user likely believes covers
+  routing) is **target state**, landing with the routing decision: the
+  exemption it warns about has shipped, but warning that a config does not
+  gate a protocol which does not yet run would mislead more than it helps.
 - The cache flush hook fires on `Ready`-set transitions of advertising
   servers: handshake completion, replacement insertion, stop, failure,
   and `-32601` advertisement clearing. Each is already a pool-lock commit
@@ -1548,12 +1587,13 @@ a slot a routing provider left in play.
   for an empty one) with the epoch bump and the epoch-cause provenance append, and the
   taken map is dropped outside the critical section, so provider churn
   never stalls pool operations on entry-drop cost.
-- The frame reader currently allocates the declared `Content-Length`
-  before parsing anything, so the answer-size bound needs a
-  **framing-level ceiling on downstream message size** — a transport
-  hardening recorded here as an implementation prerequisite of this
-  protocol's allocation bound, not a routing-handler check (which
-  would run too late). Its disposition is chosen, not deferred: a
+- The answer-size bound rests on a **framing-level ceiling on downstream
+  message size**, not a routing-handler check (which would run too late:
+  the frame is fully read before method dispatch). That ceiling is a
+  transport hardening this protocol depends on rather than owns, and it
+  **shipped ahead of the protocol** — the frame reader used to allocate
+  the declared `Content-Length` unchecked. Its disposition is chosen, not
+  deferred: a
   header declaring more than the ceiling is a **framing error and
   fails the downstream connection**, never a drain (draining an
   attacker-sized body can hang the reader) — the same fatal posture
@@ -1583,5 +1623,5 @@ a slot a routing provider left in play.
 | **Providers** | all spawnable configured servers ∩ advertising ∩ `Ready` (Initializing awaited only when the advertisement is known, the server is named, or it carries `forceStart`), ordered by routing `priorities` (no `"_"` method-wildcard inheritance); concurrent fan-out, `preferred` fan-in, operative-entry rule |
 | **Deadline** | one routing timeout per decision (low-seconds class, registered in ls-bridge-timeout-hierarchy, plus a separate binding-reuse validation budget); expiry is partial-result (cancel unanswered, drop unfinished entries, fan-in over what normalized; whole fallback only when no operative normalized result remains); exempt from Tier-1 and Tier-2 accounting; awaited in the open tasks, never under the ingress ticket |
 | **Caching** | decision cache per (document URI, derived layer, languageId, config generation) — the decided document's own URI, virtual for regions; single-flight; evicted on the decided document's close (a virtual document closes when its last region leaves), flushed on reload / `Ready`-provider-set / workspace-folder-set change; (generation, flush-epoch, open-incarnation)-anchored; applied outcomes live in a per-document **route binding** until that document closes; never retroactive |
-| **Cold start** | `forceStart` (publication-fenced get-or-create — the `Initializing` slot registers before the config becomes observable to `didOpen`; `#shared` + primary-root seed for `preferSharedInstance` servers, the marker-less fallback shape otherwise; warm-up scope limited to shared/marker-less/policy servers; wait-eligible for the initialization wait) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
+| **Cold start** | `forceStart` (get-or-create at each configuration application, detached, keyed as any document-less acquire is — `#shared` for a `preferSharedInstance` server, the marker-less fallback otherwise; warm-up scope limited to shared/marker-less/policy servers, advised at config load; publication fence and wait-eligibility are target state) + bounded initialization wait inside the decision deadline, woken by any handshake exit |
 | **Recursion** | provider connections, queries, and the re-open sweep never trigger routing queries; the sweep reads each exact server entry's binding where one exists, marker resolution where none does, and never spawns |

@@ -506,6 +506,7 @@ Configure language servers for bridging LSP requests in injection regions.
 | `initializationOptions` | Optional initialization options forwarded during the downstream server's `initialize` request |
 | `workspaceMarkers` | Marker files/directories locating the workspace root the server is initialized with, following Neovim's `vim.fs.root` `(string\|string[])[]` shape. (The pre-rename key `rootMarkers` is still accepted as a deprecated alias.) Entries are tried **in list order** (earlier = higher priority): each entry is searched up the triggering document's ancestors nearest-first before the next entry is tried, so a higher-priority marker in a far ancestor outranks a lower-priority one sitting next to the document. A **nested array** is one equal-priority group where the nearest ancestor containing any of its names wins — e.g. `[["stylua.toml", ".luarc.json"], ".git"]` means "nearest of stylua.toml/.luarc.json, otherwise .git". The first matching entry's directory becomes the server's `rootUri` and sole workspace folder. Default: `[".git"]`. No marker hit falls back to the client-supplied root; an explicit `[]` disables the search. The connection pool is keyed by `(server, resolved root)`, so in a multi-root monorepo documents under different marker roots get their own downstream process, each rooted correctly; documents sharing a root (or the no-marker fallback) share one process. Trade-off: process count grows with the number of distinct roots opened, and there is currently no idle-eviction — a long session touching many roots keeps one process per root alive until shutdown. Servers that operate purely on `workspaceFolders` can opt out of this growth with `preferSharedInstance` (below). |
 | `onTypeFormattingTriggers` | Trigger characters for bridged `textDocument/onTypeFormatting` (e.g. `["}", ";"]`). kakehashi advertises the sorted union across all servers at initialize and forwards a request to a downstream server only when that server's own capabilities declare the typed character. Unset everywhere (default) → the capability is not advertised. |
+| `forceStart` | Start this server as soon as configuration is applied, instead of waiting for a document that routes to it. Default `false`. With no triggering document there is no marker root to walk, so the connection is keyed the way any document-less acquire is — the shared connection for a `preferSharedInstance` server, the client-root fallback otherwise. That is also the honest scope of the warm-up: documents under marker roots resolve *marker* keys and will not reuse it, so setting this on an ordinary per-root server pre-spawns a process most documents bypass. It earns its keep for `preferSharedInstance` servers, marker-less workspaces, and a server that no document would ever start (`languages = []`). Within a session the flag is one-way: a reload that flips it to `false` never stops an already-running server, and deleting the entry is what stops one. It also starts a server rather than supervising it — a warm-up that crashes stays down until configuration is applied again, since a server no document routes to has no request that would notice. |
 | `preferSharedInstance` | Prefer reusing **one** downstream process across every workspace root for this server instead of the default one-process-per-marker-root (above). Default `false`. It is a *preference*, honored only when the downstream server advertises `workspace.workspaceFolders.{supported, changeNotifications}`: when it does, kakehashi routes all roots to a single connection and announces each new root with `workspace/didChangeWorkspaceFolders`; when it does not, kakehashi logs once and silently falls back to the per-root-instance model for marker-rooted documents (marker-less documents — e.g. non-file URIs like an editor's `untitled:` scratch buffers — stay on the shared connection: they bring no marker root, so the missing capability never blocks them; on capable servers the client workspace is announced on their behalf). Because that fallback is universal, a blanket `languageServers._.preferSharedInstance = true` is safe across a mixed set of servers. Use it to bound process count and get cross-root navigation for servers that key purely off `workspaceFolders`; leave it `false` for servers needing per-root isolation (per-root virtualenv, conflicting tool/package versions) or that key behavior off the immutable `rootUri`. Note: removal/idle-eviction of folders is not modeled yet — the set only grows. |
 
 > **Migration note**: `workspaceMarkers` was previously named `rootMarkers`
@@ -598,7 +599,7 @@ Each entry in the `bridge` map configures bridging for one injection language:
 | Field | Description |
 |-------|-------------|
 | `enabled` | Whether bridging is enabled (`true`/`false`). Omit to inherit from the `_` wildcard (defaults to `true`). |
-| `aggregation` | Per-method aggregation config. Key = LSP method name (e.g., `textDocument/completion`) or `_` for default. |
+| `aggregation` | Per-method aggregation config. Key = LSP method name (e.g., `textDocument/completion`) or `_` for default. One key is exempt from `_`: see the note under the aggregation fields below. |
 
 **Host bridging (`bridge._self`):**
 
@@ -644,6 +645,14 @@ When multiple language servers can handle the same injection language, `aggregat
 > servers still participated as fallback. It is now an allowlist: `["pyright"]`
 > runs *only* pyright. Append `"*"` (`["pyright", "*"]`) to keep the old
 > fallback behavior.
+
+> **One key does not inherit from `_`**: `kakehashi/bridge/routing`, the
+> method key that will order routing providers. Every `aggregation._` entry
+> written so far is an allowlist of *language servers*, and inheriting one
+> would exclude every dedicated routing provider — so that key reads its own
+> entry or nothing. The cost is symmetric and worth knowing: a deliberate
+> global restriction at `aggregation._` does not reach routing either. To
+> control routing, write the key itself, at any language level.
 
 Example with per-method priorities, strategy, and maxFanOut:
 

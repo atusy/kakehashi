@@ -75,7 +75,7 @@ pub fn config_init_settings() -> RawWorkspaceSettings {
 
 /// Returns the default languageServers map: a defaults-only `_` wildcard
 /// entry documenting the built-in `workspaceMarkers`, `preferSharedInstance`,
-/// and `enabled` defaults that every concrete server inherits
+/// `forceStart`, and `enabled` defaults that every concrete server inherits
 /// (wildcard-config-inheritance). Not spawnable itself — lookups skip the
 /// wildcard key and any server that isn't [`BridgeServerConfig::is_spawnable`]
 /// (empty resolved cmd, or resolved `enabled: false`).
@@ -92,6 +92,11 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
             // generated template documents the opt-in and the knob is
             // discoverable (#391). Concrete servers inherit it via the wildcard.
             prefer_shared_instance: Some(false),
+            // Spelled out for the same reason as its neighbours: the template
+            // is where a knob becomes discoverable, and this one is otherwise
+            // invisible. `Some(false)` and `None` are indistinguishable at
+            // every consumer, so writing it costs nothing.
+            force_start: Some(false),
             settings: None,
             // Spell out the built-in default (every server enabled) so the
             // template documents the opt-out knob: setting this to `false`

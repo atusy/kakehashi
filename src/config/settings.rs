@@ -30,6 +30,14 @@ pub(crate) const PRIORITIES_WILDCARD: &str = "*";
 /// [`PRIORITIES_WILDCARD`].
 pub(crate) const LANGUAGES_WILDCARD: &str = "*";
 
+/// The kakehashi→downstream routing request (bridge-routing-protocol), which
+/// takes its provider order from the `aggregation` map under this key.
+///
+/// The first non-LSP method name in that key space, and the only key exempt
+/// from the map's `"_"` method wildcard — see
+/// [`crate::config::merge::resolve_aggregation_for_method`].
+pub(crate) const BRIDGE_ROUTING_METHOD: &str = "kakehashi/bridge/routing";
+
 /// The resolved default for an absent `priorities`: `["*"]`, i.e. fan out to
 /// every configured server with no ranking (first-win).
 fn default_priorities() -> Vec<String> {
@@ -291,11 +299,12 @@ fn default_layer_strategy_for_method(method: &str) -> AggregationStrategy {
 impl BridgeLanguageConfig {
     /// Look up the aggregation entry for a method with field-level wildcard merge.
     ///
-    /// Uses [`crate::config::resolve_with_wildcard`] so that a method-specific entry
-    /// inherits any unset fields from the `_` wildcard entry (wildcard-config-inheritance).
+    /// A method-specific entry inherits any unset fields from the `_` wildcard
+    /// entry (wildcard-config-inheritance) — except at
+    /// [`BRIDGE_ROUTING_METHOD`]; see
+    /// [`crate::config::merge::resolve_aggregation_for_method`].
     fn resolve_aggregation_entry(&self, method: &str) -> Option<AggregationConfig> {
-        let map = self.aggregation.as_ref()?;
-        crate::config::resolve_with_wildcard(map, method, crate::config::merge_aggregation_configs)
+        crate::config::merge::resolve_aggregation_for_method(self.aggregation.as_ref()?, method)
     }
 
     /// Resolve all aggregation settings for a specific LSP method in a single call.
@@ -451,6 +460,32 @@ pub struct BridgeServerConfig {
     /// wildcard, so `_.preferSharedInstance: true` can be opted out of
     /// per server with `preferSharedInstance: false`.
     pub prefer_shared_instance: Option<bool>,
+    /// Spawn this server as soon as configuration is published, instead of
+    /// waiting for a document that routes to it (bridge-routing-protocol).
+    ///
+    /// With no triggering document there is no marker root to walk, so the
+    /// connection is keyed the way any document-less acquire is: the shared
+    /// key for a `preferSharedInstance` server, the client-fallback root
+    /// otherwise (rootless in a workspace-less session). That is also the
+    /// honest scope of the warm-up — documents under marker roots resolve
+    /// *marker* keys and will not reuse this connection, so setting it on an
+    /// ordinary per-root server pre-spawns a process most documents bypass.
+    /// It earns its keep for shared-instance servers, marker-less workspaces,
+    /// and a server that no document would ever start (`languages = []`).
+    ///
+    /// Within a session the flag is effectively one-way: a reload that flips
+    /// it to `false` never stops an already-running server.
+    ///
+    /// It starts a server; it does not supervise one. Every recovery path in
+    /// the pool is request-triggered, so a warm-up that dies — and a server no
+    /// document routes to has no request to notice — stays dead until the next
+    /// configuration application re-asserts the flag. Applying configuration
+    /// is therefore also the way to restart one.
+    ///
+    /// `None` = inherit (built-in default `false` = spawn lazily). Like
+    /// `prefer_shared_instance`, a concrete server's explicit value overrides
+    /// the wildcard.
+    pub force_start: Option<bool>,
     /// Whether this server is eligible to be spawned/used at all.
     ///
     /// `None` = inherit (built-in default `true`). Like `root_markers` and
@@ -465,6 +500,22 @@ impl BridgeServerConfig {
     /// (`None`) case to the built-in default `false` (per-root instances).
     pub(crate) fn prefers_shared_instance(&self) -> bool {
         self.prefer_shared_instance.unwrap_or(false)
+    }
+
+    /// Effective `force_start` preference — resolving `_` inheritance against
+    /// an already-looked-up `wildcard`, and the inherit (`None`) case to the
+    /// built-in default `false` (spawn lazily).
+    ///
+    /// Only the wildcard-resolving form exists, unlike
+    /// [`Self::prefers_shared_instance`]: the one caller reads this field
+    /// while looping over the whole fleet, which is exactly the shape
+    /// [`Self::is_spawnable_with_wildcard`] exists for — resolving a whole
+    /// config to answer a boolean costs a clone and a deep JSON merge per
+    /// server. Pass `None` for an already-merged config.
+    pub(crate) fn forces_start_with_wildcard(&self, wildcard: Option<&Self>) -> bool {
+        self.force_start
+            .or_else(|| wildcard.and_then(|w| w.force_start))
+            .unwrap_or(false)
     }
 
     /// Effective `enabled` state, resolving the inherit (`None`) case to the
@@ -1896,6 +1947,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled,
             settings: None,
         };
@@ -1950,6 +2002,50 @@ mod tests {
         assert_eq!(
             servers["pyright"].prefer_shared_instance, None,
             "absent preferSharedInstance parses as None (inherit -> per-root)"
+        );
+    }
+
+    #[test]
+    fn should_parse_force_start() {
+        let config_json = r#"{
+            "languageServers": {
+                "policy-server": {
+                    "cmd": ["my-policy-server"],
+                    "languages": [],
+                    "forceStart": true
+                },
+                "pyright": {
+                    "cmd": ["pyright-langserver", "--stdio"],
+                    "languages": ["python"]
+                }
+            }
+        }"#;
+
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
+        let servers = settings.language_servers.expect("languageServers parses");
+        assert_eq!(
+            servers["policy-server"].force_start,
+            Some(true),
+            "explicit forceStart is preserved"
+        );
+        assert_eq!(
+            servers["pyright"].force_start, None,
+            "absent forceStart parses as None (inherit -> lazy spawn)"
+        );
+        assert!(!servers["pyright"].forces_start_with_wildcard(None));
+        // A wildcard opt-in reaches a server that said nothing, and an
+        // explicit `false` still outranks it.
+        let wildcard = BridgeServerConfig {
+            force_start: Some(true),
+            ..Default::default()
+        };
+        assert!(servers["pyright"].forces_start_with_wildcard(Some(&wildcard)));
+        assert!(
+            !BridgeServerConfig {
+                force_start: Some(false),
+                ..Default::default()
+            }
+            .forces_start_with_wildcard(Some(&wildcard))
         );
     }
 
@@ -2021,6 +2117,7 @@ mod tests {
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -2060,6 +2157,7 @@ mod tests {
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
+            force_start: None,
             enabled,
             settings: None,
         };
@@ -2144,6 +2242,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: Some(vec![";".to_string()]),
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2167,6 +2266,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: Some(vec![String::new()]),
                 prefer_shared_instance: None,
+                force_start: None,
                 enabled: None,
                 settings: None,
             },
@@ -2345,6 +2445,7 @@ mod tests {
             ]),
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            force_start: None,
             enabled: None,
             settings: None,
         };
@@ -2983,6 +3084,148 @@ kind = "locals""#;
         };
         let agg = config.resolve_aggregation("textDocument/hover");
         assert_eq!(agg.priorities, &["server_b".to_string()]);
+    }
+
+    /// Existing `aggregation."_"` entries were written as LSP fan-out
+    /// allowlists naming *language servers*. Folding one into the routing key
+    /// would exclude every dedicated routing provider from routing for that
+    /// language — a common config shape silently turning the protocol off. So
+    /// the routing key alone does not inherit the method wildcard
+    /// (bridge-routing-protocol). The language axis is untouched: this is an
+    /// exception to the `aggregation` map's `"_"` merge, nothing else.
+    #[test]
+    fn routing_priorities_do_not_inherit_the_method_wildcard() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    priorities: Some(vec!["lua_ls".to_string()]),
+                    max_fan_out: Some(1),
+                    ..Default::default()
+                },
+            )])),
+        };
+
+        assert_eq!(
+            config.resolve_aggregation("textDocument/hover").priorities,
+            &["lua_ls".to_string()],
+            "every other method still inherits the wildcard"
+        );
+        assert_eq!(
+            config.resolve_aggregation(BRIDGE_ROUTING_METHOD).priorities,
+            vec![PRIORITIES_WILDCARD.to_string()],
+            "routing falls to its own default, not the LSP allowlist"
+        );
+    }
+
+    /// The exemption is only about inheritance: an entry written *at* the
+    /// routing key is what governs routing, at any language level.
+    #[test]
+    fn routing_priorities_come_from_the_routing_key_itself() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    AggregationConfig {
+                        priorities: Some(vec!["lua_ls".to_string()]),
+                        max_fan_out: Some(1),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    BRIDGE_ROUTING_METHOD.to_string(),
+                    AggregationConfig {
+                        priorities: Some(vec!["policy-server".to_string()]),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+        };
+
+        let agg = config.resolve_aggregation(BRIDGE_ROUTING_METHOD);
+        assert_eq!(agg.priorities, &["policy-server".to_string()]);
+        assert_eq!(
+            agg.max_fan_out, None,
+            "no field of the wildcard entry reaches the routing key"
+        );
+    }
+
+    /// The exempt key is protocol surface, so its spelling is part of the
+    /// contract. Every other test here reaches it through the constant, which
+    /// would let a rename pass unnoticed while providers stop being ordered.
+    #[test]
+    fn the_routing_method_key_is_spelled_as_the_protocol_names_it() {
+        assert_eq!(BRIDGE_ROUTING_METHOD, "kakehashi/bridge/routing");
+
+        let config: BridgeLanguageConfig = serde_json::from_value(serde_json::json!({
+            "aggregation": {
+                "_": { "priorities": ["lua_ls"] },
+                "kakehashi/bridge/routing": { "priorities": ["policy-server"] },
+            }
+        }))
+        .expect("the routing key parses as an ordinary aggregation method key");
+
+        assert_eq!(
+            config
+                .resolve_aggregation("kakehashi/bridge/routing")
+                .priorities,
+            &["policy-server".to_string()],
+        );
+    }
+
+    /// The exemption is on the method axis only: a routing entry written at
+    /// `bridge._` still reaches `bridge.<lang>` like any other method's.
+    #[test]
+    fn the_routing_key_still_inherits_along_the_language_axis() {
+        let routing_entry = HashMap::from([(
+            BRIDGE_ROUTING_METHOD.to_string(),
+            AggregationConfig {
+                priorities: Some(vec!["policy-server".to_string()]),
+                ..Default::default()
+            },
+        )]);
+        let wildcard_language = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(routing_entry),
+        };
+        let concrete_language = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: None,
+        };
+
+        let resolved =
+            crate::config::merge_bridge_language_configs(&wildcard_language, &concrete_language);
+        assert_eq!(
+            resolved
+                .resolve_aggregation(BRIDGE_ROUTING_METHOD)
+                .priorities,
+            &["policy-server".to_string()],
+            "bridge._ supplies the routing key to a language that names none"
+        );
+    }
+
+    /// `[]` at the routing key is the documented per-language kill switch, and
+    /// must survive resolution as itself.
+    #[test]
+    fn routing_priorities_preserve_the_explicit_kill_switch() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                BRIDGE_ROUTING_METHOD.to_string(),
+                AggregationConfig {
+                    priorities: Some(vec![]),
+                    ..Default::default()
+                },
+            )])),
+        };
+        assert!(
+            config
+                .resolve_aggregation(BRIDGE_ROUTING_METHOD)
+                .priorities
+                .is_empty()
+        );
     }
 
     #[test]

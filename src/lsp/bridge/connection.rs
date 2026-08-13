@@ -42,6 +42,48 @@ const STRAY_LINE_MAX_QUOTE_BYTES: usize = 300;
 /// body remainder directly beats staging it through that buffer.
 const BUF_READER_CAPACITY: usize = 8 * 1024;
 
+/// Longest single header line accepted from a downstream server.
+///
+/// LSP headers are `Content-Length: <digits>` and `Content-Type: <mime>`, so
+/// anything past a few dozen bytes is already slack; kilobytes is pure margin.
+/// The bound exists because the line buffer is the one place a peer can grow
+/// memory without ever completing a frame — it is charged as bytes arrive, not
+/// once a newline finally does.
+const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+
+/// Longest header block (all lines of one frame together) accepted from a
+/// downstream server.
+///
+/// What this bounds is progress, not memory: a completed line is taken out of
+/// the buffer, so unboundedly many well-formed short lines cost nothing to
+/// hold — they simply never end the block, and the read loop spins forever
+/// without ever yielding a message. The liveness timer cannot rescue it,
+/// since that only runs while requests are pending, so an idle connection
+/// would hang indefinitely.
+///
+/// The client-facing reader trips its own header scan at 64 KiB
+/// (`wire_repair::MAX_HEADER_BYTES`, checked after a read that appends up to
+/// a 64 KiB chunk, so its effective ceiling is about twice that). Downstream
+/// traffic is kakehashi's own protocol surface rather than an arbitrary
+/// editor's, so it can afford to be stricter.
+const MAX_HEADER_BLOCK_BYTES: usize = 32 * 1024;
+
+/// Largest `Content-Length` accepted from a downstream server.
+///
+/// This refuses an absurd declaration early and cheaply, before anything
+/// tries to satisfy it; a declaration that merely turns out to be too large
+/// for the heap is the allocation's problem, and it reserves fallibly. So the
+/// value is set far above anything a working
+/// server sends rather than at a defensible working-set size: real payloads
+/// (whole-document semantic tokens, a workspace diagnostics burst, a large
+/// completion list) reach into the megabytes, so this leaves roughly two
+/// orders of magnitude of headroom and trips only on a peer that is already
+/// malfunctioning. Deliberately not tuned to observed traffic — tightening
+/// it toward real payload sizes would turn a runaway-peer guard into a
+/// working-set limit that a legitimately large workspace could meet. A
+/// configuration knob can follow if one ever does.
+const MAX_CONTENT_LENGTH_BYTES: usize = 256 * 1024 * 1024;
+
 /// A body remainder large enough to read straight from the source.
 struct LargeBodyRead<'a> {
     /// Bytes this frame still owes — the cap that keeps the read inside it.
@@ -61,6 +103,9 @@ struct LargeBodyRead<'a> {
 struct FrameParseState {
     /// Header line accumulated so far, still waiting for its newline.
     line: Vec<u8>,
+    /// Every header byte of this frame, across lines. `line` is emptied as each
+    /// line completes, so it cannot carry the block's running total itself.
+    header_bytes: usize,
     content_length: Option<usize>,
     /// First non-`Content-Length` header line, quoted as evidence if the block
     /// turns out to have no `Content-Length` at all — when a downstream prints
@@ -125,15 +170,87 @@ impl FrameParseState {
         // truncated frame instead of a header block without Content-Length.
         match available.iter().position(|&byte| byte == b'\n') {
             Some(newline) => {
-                self.line.extend_from_slice(&available[..=newline]);
+                let chunk = &available[..=newline];
+                if let Err(error) = self.charge_header_bytes(chunk) {
+                    return (chunk.len(), Err(error));
+                }
+                self.line.extend_from_slice(chunk);
                 let line = std::mem::take(&mut self.line);
                 (newline + 1, self.finish_header_line(&line))
             }
             None => {
+                if let Err(error) = self.charge_header_bytes(available) {
+                    return (available.len(), Err(error));
+                }
                 self.line.extend_from_slice(available);
                 (available.len(), Ok(()))
             }
         }
+    }
+
+    /// Account for header bytes about to be buffered, refusing the frame once
+    /// either ceiling is passed.
+    ///
+    /// Charged *before* the bytes land: the line buffer is the one place a
+    /// peer can grow kakehashi's memory without ever completing a frame, and a
+    /// caller that let it grow first and checked afterwards would have already
+    /// paid whatever arrived in one chunk.
+    ///
+    /// Both errors quote the offending input for the same reason
+    /// `missing_length` does — a downstream that writes a crash to stdout
+    /// makes the frame that trips over it the only place that reason is still
+    /// readable, and this error tears the connection down.
+    ///
+    /// `saturating_add` rather than `checked_add`: saturation lands on
+    /// `usize::MAX`, which trips the very comparison below it, so there is no
+    /// third outcome for a checked variant to handle.
+    fn charge_header_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let len = bytes.len();
+        if self.line.len().saturating_add(len) > MAX_HEADER_LINE_BYTES {
+            return Err(self.oversized(
+                format!("header line exceeds {MAX_HEADER_LINE_BYTES} bytes"),
+                bytes,
+            ));
+        }
+        self.header_bytes = self.header_bytes.saturating_add(len);
+        if self.header_bytes > MAX_HEADER_BLOCK_BYTES {
+            return Err(self.oversized(
+                format!("header block exceeds {MAX_HEADER_BLOCK_BYTES} bytes"),
+                &[],
+            ));
+        }
+        Ok(())
+    }
+
+    /// A ceiling violation, quoting whatever of the peer's header block is
+    /// still readable.
+    ///
+    /// A rejected line gets priority over the remembered stray line: the
+    /// rejected bytes are the most useful evidence for a line ceiling. The
+    /// remembered stray line remains the fallback for a block ceiling, while
+    /// an unterminated line falls back to the bytes already in `line`.
+    fn oversized(&self, reason: String, rejected: &[u8]) -> io::Error {
+        let quote = if !rejected.is_empty() {
+            let total = self.line.len().saturating_add(rejected.len());
+            let mut evidence = Vec::with_capacity(total.min(STRAY_LINE_MAX_QUOTE_BYTES));
+            let line_take = self.line.len().min(STRAY_LINE_MAX_QUOTE_BYTES);
+            evidence.extend_from_slice(&self.line[..line_take]);
+            if evidence.len() < STRAY_LINE_MAX_QUOTE_BYTES {
+                let rejected_take =
+                    (STRAY_LINE_MAX_QUOTE_BYTES - evidence.len()).min(rejected.len());
+                evidence.extend_from_slice(&rejected[..rejected_take]);
+            }
+            render_capped_line(&evidence, total > STRAY_LINE_MAX_QUOTE_BYTES)
+        } else {
+            self.stray_line.clone().unwrap_or_else(|| {
+                let head = &self.line[..self.line.len().min(STRAY_LINE_MAX_QUOTE_BYTES)];
+                render_capped_line(head, self.line.len() > STRAY_LINE_MAX_QUOTE_BYTES)
+            })
+        };
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{reason} (stray stdout line: {quote:?})"),
+        )
     }
 
     /// Handle one complete header line (newline included). An empty line ends
@@ -149,15 +266,40 @@ impl FrameParseState {
 
         if trimmed.is_empty() {
             let length = self.content_length.ok_or_else(|| self.missing_length())?;
-            self.body = Some(Vec::with_capacity(length));
+            // `try_reserve`, not `with_capacity`: an infallible allocation of a
+            // peer-chosen size aborts the whole process when it fails, and no
+            // ceiling can prevent that — even an accepted length is a single
+            // contiguous request that a loaded or fragmented heap can refuse.
+            // Reserving fallibly turns that into one failed connection.
+            //
+            // The exact-fit capacity still matters: the large-body read path
+            // appends through `BufMut`, which grows a full `Vec` in 64-byte
+            // steps, so under-reserving would shred that read into syscalls.
+            let mut body = Vec::new();
+            body.try_reserve(length).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    format!("cannot allocate a {length}-byte message body"),
+                )
+            })?;
+            self.body = Some(body);
             return Ok(());
         }
 
         if let Some(value) = trimmed.strip_prefix(b"Content-Length: ") {
             let value = std::str::from_utf8(value).ok().map(str::trim);
-            let length = value.and_then(|v| v.parse().ok()).ok_or_else(|| {
+            let length: usize = value.and_then(|v| v.parse().ok()).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length value")
             })?;
+            // Refuse the declaration here rather than at the empty line below
+            // that acts on it: a number no honest peer would send should cost
+            // nothing to reject, and the frame is already unusable.
+            if length > MAX_CONTENT_LENGTH_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Content-Length {length} exceeds {MAX_CONTENT_LENGTH_BYTES} bytes"),
+                ));
+            }
             self.content_length = Some(length);
         } else if self.stray_line.is_none() {
             // Remember the first non-Content-Length line for the framing
@@ -1448,6 +1590,211 @@ mod tests {
         assert!(error.to_string().contains("missing Content-Length header"));
 
         assert_eq!(reader.read_message_bytes().await.unwrap(), PROGRESS);
+    }
+
+    /// A declared body size beyond the ceiling must be refused while it is
+    /// still just a number in a header, and must leave `content_length` unset
+    /// — the empty line that follows acts on that field, so a check that
+    /// failed anywhere downstream of it would already have committed the
+    /// frame to a size no peer should be able to name.
+    #[test]
+    fn a_content_length_beyond_the_ceiling_never_reaches_the_allocation() {
+        let mut frame = FrameParseState::default();
+
+        // The ceiling itself plus one, not an absurd number: an absurd one
+        // fails at `parse::<usize>()` on a narrow target and would pass this
+        // test for the wrong reason.
+        let error = frame
+            .finish_header_line(
+                format!("Content-Length: {}\r\n", MAX_CONTENT_LENGTH_BYTES + 1).as_bytes(),
+            )
+            .expect_err("a body size past the ceiling must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("Content-Length"),
+            "the error must name what tripped: {error}"
+        );
+        assert!(
+            frame.content_length.is_none(),
+            "an accepted length would be allocated at the end of the header block"
+        );
+
+        // The boundary itself is legitimate traffic.
+        let mut frame = FrameParseState::default();
+        frame
+            .finish_header_line(
+                format!("Content-Length: {MAX_CONTENT_LENGTH_BYTES}\r\n").as_bytes(),
+            )
+            .expect("the ceiling is inclusive");
+        assert_eq!(frame.content_length, Some(MAX_CONTENT_LENGTH_BYTES));
+    }
+
+    /// The header line is the one buffer a peer can grow without ever sending a
+    /// newline, so its bound is checked as the bytes accumulate rather than
+    /// once the line completes — by which point the buffer has already grown.
+    #[test]
+    fn a_header_line_past_the_ceiling_fails_as_its_bytes_accumulate() {
+        let mut frame = FrameParseState::default();
+        let mut oversized = vec![b'Z'];
+        oversized.extend(std::iter::repeat_n(b'x', MAX_HEADER_LINE_BYTES));
+
+        let (consumed, outcome) = frame.absorb(&oversized);
+        assert_eq!(
+            consumed,
+            oversized.len(),
+            "the offending bytes are consumed, as for every other framing error"
+        );
+        let error = outcome.expect_err("a newline-less line past the ceiling must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("header line"),
+            "the error must name what tripped: {error}"
+        );
+        assert!(
+            error.to_string().contains('Z'),
+            "and quote the rejected peer bytes, which this error is the last chance to \
+             read: {error}"
+        );
+
+        // The ceiling itself is legal. Without this, tightening `>` to `>=`
+        // would pass every other assertion here.
+        let mut frame = FrameParseState::default();
+        frame
+            .absorb(&vec![b'x'; MAX_HEADER_LINE_BYTES])
+            .1
+            .expect("a line exactly at the ceiling is not past it");
+    }
+
+    #[test]
+    fn an_oversized_line_quotes_it_over_an_earlier_stray_header() {
+        let mut frame = FrameParseState::default();
+        frame
+            .absorb(b"Content-Type: earlier-marker\r\n")
+            .1
+            .expect("the preceding header is individually valid");
+
+        let oversized = vec![b'O'; MAX_HEADER_LINE_BYTES + 1];
+        let error = frame
+            .absorb(&oversized)
+            .1
+            .expect_err("the newline-free line must exceed the ceiling");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains('O'),
+            "the line-ceiling error must quote the rejected line: {rendered}"
+        );
+        assert!(
+            !rendered.contains("earlier-marker"),
+            "the earlier stray header must not hide the rejected line: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_oversized_split_line_quotes_its_accumulated_prefix() {
+        let mut frame = FrameParseState::default();
+        frame
+            .absorb(b"Content-Type: earlier-marker\r\n")
+            .1
+            .expect("the preceding header is individually valid");
+
+        let marker = b"split-oversized-marker";
+        let first_len = MAX_HEADER_LINE_BYTES / 2;
+        let mut first = marker.to_vec();
+        first.extend(std::iter::repeat_n(b'x', first_len - first.len()));
+        frame
+            .absorb(&first)
+            .1
+            .expect("the first fragment is under the ceiling");
+
+        let second = vec![b'x'; MAX_HEADER_LINE_BYTES - first.len() + 1];
+        let error = frame
+            .absorb(&second)
+            .1
+            .expect_err("the second fragment must cross the line ceiling");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("split-oversized-marker"),
+            "the error must retain the accumulated line prefix: {rendered}"
+        );
+        assert!(
+            !rendered.contains("earlier-marker"),
+            "the earlier stray header must not hide the rejected line: {rendered}"
+        );
+    }
+
+    /// Bounding each line is not enough: a peer can send unboundedly many
+    /// well-formed short lines and never terminate the block. The running
+    /// total is charged across lines, and reset with the frame.
+    #[test]
+    fn header_lines_summing_past_the_block_ceiling_fail_the_frame() {
+        let line = format!("X-Padding: {}\r\n", "p".repeat(1000));
+        assert!(
+            line.len() < MAX_HEADER_LINE_BYTES,
+            "each line must be individually legal, or this would test the line bound"
+        );
+
+        let mut frame = FrameParseState::default();
+        let mut error = None;
+        for _ in 0..(MAX_HEADER_BLOCK_BYTES / line.len() + 2) {
+            let (consumed, outcome) = frame.absorb(line.as_bytes());
+            assert_eq!(consumed, line.len());
+            if let Err(e) = outcome {
+                error = Some(e);
+                break;
+            }
+        }
+
+        let error = error.expect("an unterminated header block must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("header block"),
+            "the error must name what tripped: {error}"
+        );
+
+        // The ceiling itself is legal, so a `>` tightened to `>=` fails here
+        // rather than passing everything above.
+        let mut frame = FrameParseState::default();
+        let filler = format!("X-Padding: {}\r\n", "p".repeat(1000));
+        let mut charged = 0;
+        while charged + filler.len() <= MAX_HEADER_BLOCK_BYTES {
+            frame.absorb(filler.as_bytes()).1.unwrap();
+            charged += filler.len();
+        }
+        let exact = vec![b'p'; MAX_HEADER_BLOCK_BYTES - charged];
+        frame
+            .absorb(&exact)
+            .1
+            .expect("a block summing exactly to the ceiling is not past it");
+
+        // A completed frame starts the next one's budget from zero, so a busy
+        // connection cannot accumulate its way into a false positive.
+        let mut frame = FrameParseState::default();
+        for _ in 0..3 {
+            frame.absorb(line.as_bytes()).1.unwrap();
+        }
+        frame.absorb(b"Content-Length: 0\r\n").1.unwrap();
+        frame.absorb(b"\r\n").1.unwrap();
+        assert_eq!(frame.take_completed_frame(), Some(Vec::new()));
+        assert_eq!(frame.header_bytes, 0);
+    }
+
+    /// End to end: the ceiling reaches the reader, and the connection fails
+    /// rather than draining a body the peer never has to send.
+    #[tokio::test]
+    async fn an_oversized_declared_body_fails_the_read() {
+        let (mut tx, mut reader) = duplex_reader();
+        tx.write_all(
+            format!("Content-Length: {}\r\n\r\n", MAX_CONTENT_LENGTH_BYTES + 1).as_bytes(),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        let error = reader
+            .read_message_bytes()
+            .await
+            .expect_err("a hostile Content-Length must fail the frame");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     /// Repeated cancellation must not desync the stream: the reader loop
