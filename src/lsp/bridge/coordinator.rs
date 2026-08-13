@@ -1372,6 +1372,14 @@ impl BridgeCoordinator {
                 .and_then(|entry| entry.enabled)
                 != Some(false);
             pool.set_host_routing_by_server(host_uri, &config.server_name, enabled);
+            pool.set_host_routing_workspace_folders(
+                host_uri,
+                &config.server_name,
+                answer
+                    .as_ref()
+                    .and_then(|answer| answer.routing.get(&config.server_name))
+                    .and_then(|entry| entry.workspace_folders.clone()),
+            );
             let Some((_, handle)) = handles.iter().find(|(name, _)| name == &config.server_name)
             else {
                 if enabled {

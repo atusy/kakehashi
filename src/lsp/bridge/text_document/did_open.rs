@@ -311,6 +311,19 @@ impl LanguageServerPool {
                 return;
             }
         }
+        if let Err(error) = self
+            .apply_host_routing_workspace_folders(host_uri, server_name, &handle)
+            .await
+        {
+            log::debug!(
+                target: "kakehashi::bridge::routing",
+                "Failed to apply routing workspace folders for {} on {}: {}",
+                host_uri,
+                server_name,
+                error
+            );
+            return;
+        }
         // Serialize the routing decision with lazy host sync. A request that
         // arrives while routing is in flight must not open the document before
         // the eager path can honor a suppressing answer.

@@ -383,6 +383,10 @@ pub struct LanguageServerPool {
     /// Host/server-name routing decisions, retained even before a concrete
     /// connection can be acquired.
     host_routing_by_server: DashMap<(String, String), bool>,
+    /// Routing-selected workspace folders per host/server. An outer `Some`
+    /// means the routing provider supplied the field; an inner `None` is the
+    /// explicit JSON `null` value.
+    host_routing_workspace_folders: DashMap<(String, String), Option<Vec<String>>>,
     /// Host URIs whose routing decision is currently being resolved.
     host_routing_pending: DashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>,
     /// Connections whose replacement still owes a virtual-document re-open, and
@@ -522,6 +526,7 @@ impl LanguageServerPool {
             host_routing_suppressed: DashMap::new(),
             host_routing_decided: DashMap::new(),
             host_routing_by_server: DashMap::new(),
+            host_routing_workspace_folders: DashMap::new(),
             host_routing_pending: DashMap::new(),
             pending_reopen: Arc::new(PendingReopenRegistry::default()),
             diagnostic_pull_baselines: DashMap::new(),
@@ -1336,6 +1341,62 @@ impl LanguageServerPool {
             .map(|entry| *entry)
     }
 
+    pub(crate) fn set_host_routing_workspace_folders(
+        &self,
+        host_uri: &Url,
+        server_name: &str,
+        folders: Option<Option<Vec<String>>>,
+    ) {
+        let key = (host_uri.to_string(), server_name.to_string());
+        match folders {
+            Some(folders) => {
+                self.host_routing_workspace_folders.insert(key, folders);
+            }
+            None => {
+                self.host_routing_workspace_folders.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) fn host_routing_workspace_folders(
+        &self,
+        host_uri: &Url,
+        server_name: &str,
+    ) -> Option<Option<Vec<String>>> {
+        self.host_routing_workspace_folders
+            .get(&(host_uri.to_string(), server_name.to_string()))
+            .map(|entry| entry.clone())
+    }
+
+    /// Apply a routing-selected folder to a shared connection before its
+    /// document is opened. Routing answers currently use one folder for the
+    /// TypeScript providers; the existing shared-root announcement machinery
+    /// keeps the notification and folder-set update atomic with respect to the
+    /// following `didOpen`.
+    pub(crate) async fn apply_host_routing_workspace_folders(
+        &self,
+        host_uri: &Url,
+        server_name: &str,
+        handle: &Arc<ConnectionHandle>,
+    ) -> io::Result<()> {
+        let Some(Some(folders)) = self.host_routing_workspace_folders(host_uri, server_name) else {
+            return Ok(());
+        };
+        let Some(folder_uri) = folders.first().and_then(|uri| Url::parse(uri).ok()) else {
+            return Ok(());
+        };
+        let Some(marker) = super::root_markers::workspace_at_root(folder_uri.clone()) else {
+            log::debug!(
+                target: "kakehashi::bridge::routing",
+                "Ignoring invalid routing workspace folder {} for {}",
+                folder_uri,
+                server_name
+            );
+            return Ok(());
+        };
+        self.announce_shared_root(handle, &Some(marker)).await
+    }
+
     pub(crate) fn begin_host_routing(
         &self,
         host_uri: &Url,
@@ -1407,6 +1468,8 @@ impl LanguageServerPool {
         self.host_routing_decided
             .retain(|(doc_uri, _), _| doc_uri != &uri);
         self.host_routing_by_server
+            .retain(|(doc_uri, _), _| doc_uri != &uri);
+        self.host_routing_workspace_folders
             .retain(|(doc_uri, _), _| doc_uri != &uri);
         self.finish_all_host_routing(host_uri);
     }
