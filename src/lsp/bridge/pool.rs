@@ -1368,10 +1368,9 @@ impl LanguageServerPool {
             .map(|entry| entry.clone())
     }
 
-    /// Apply a routing-selected folder to a shared connection before its
-    /// document is opened. Routing answers currently use one folder for the
-    /// TypeScript providers; the existing shared-root announcement machinery
-    /// keeps the notification and folder-set update atomic with respect to the
+    /// Apply routing-selected folders to a shared connection before its
+    /// document is opened. The existing shared-root announcement machinery
+    /// keeps each notification and folder-set update ordered before the
     /// following `didOpen`.
     pub(crate) async fn apply_host_routing_workspace_folders(
         &self,
@@ -1382,19 +1381,22 @@ impl LanguageServerPool {
         let Some(Some(folders)) = self.host_routing_workspace_folders(host_uri, server_name) else {
             return Ok(());
         };
-        let Some(folder_uri) = folders.first().and_then(|uri| Url::parse(uri).ok()) else {
-            return Ok(());
-        };
-        let Some(marker) = super::root_markers::workspace_at_root(folder_uri.clone()) else {
-            log::debug!(
-                target: "kakehashi::bridge::routing",
-                "Ignoring invalid routing workspace folder {} for {}",
-                folder_uri,
-                server_name
-            );
-            return Ok(());
-        };
-        self.announce_shared_root(handle, &Some(marker)).await
+        for folder in folders {
+            let Some(folder_uri) = Url::parse(&folder).ok() else {
+                log::debug!(
+                    target: "kakehashi::bridge::routing",
+                    "Ignoring invalid routing workspace folder {} for {}",
+                    folder,
+                    server_name
+                );
+                continue;
+            };
+            let Some(marker) = super::root_markers::workspace_at_root(folder_uri) else {
+                continue;
+            };
+            self.announce_shared_root(handle, &Some(marker)).await?;
+        }
+        Ok(())
     }
 
     pub(crate) fn begin_host_routing(
