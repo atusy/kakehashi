@@ -494,6 +494,16 @@ impl LanguageServerPool {
                 format!("host document routing disabled on {connection_key}"),
             ));
         }
+        if let Err(error) = self
+            .apply_host_routing_workspace_folders(doc.uri, connection_key.server(), &handle)
+            .await
+        {
+            let kind = error.kind();
+            return Err(io::Error::new(
+                kind,
+                format!("failed to apply host routing workspace folders: {error}"),
+            ));
+        }
         if let Some(ref id) = upstream_request_id {
             self.register_upstream_request(id.clone(), connection_key);
         }
