@@ -625,8 +625,23 @@ impl BridgeCoordinator {
         server_name: &str,
     ) -> super::text_document::OpenOutcome {
         use super::text_document::OpenOutcome;
-        let (for_server, config) =
-            self.injections_for_server(settings, host_language, injections, server_name);
+        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return OpenOutcome::NotOpened;
+        };
+        let routed = self
+            .route_virtual_injections(settings, host_language, host_uri, &host_uri_lsp, injections)
+            .await;
+        let mut config = None;
+        let for_server = routed
+            .into_iter()
+            .filter_map(|(injection, configs)| {
+                let resolved = configs
+                    .into_iter()
+                    .find(|resolved| resolved.server_name == server_name)?;
+                config.get_or_insert(Arc::clone(&resolved.config));
+                Some(injection)
+            })
+            .collect::<Vec<_>>();
         let Some(config) = config else {
             // No injected region on this host bridges to `server_name`, so this
             // host supplies nothing for that server on any connection. Pure
@@ -634,9 +649,6 @@ impl BridgeCoordinator {
             // walk, so the hosts that bridge nowhere near this server cost
             // nothing to reject.
             return OpenOutcome::NotApplicable;
-        };
-        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
-            return OpenOutcome::NotOpened;
         };
         self.pool
             .eager_open_virtual_documents(
@@ -673,6 +685,7 @@ impl BridgeCoordinator {
     /// single first pick would miss the origin when e.g. both ruff and pyright
     /// bridge python and the command came from ruff. Pure; the async open is
     /// separate so it is unit-testable.
+    #[cfg(test)]
     fn injections_for_server(
         &self,
         settings: &Arc<WorkspaceSettings>,
@@ -1068,6 +1081,74 @@ impl BridgeCoordinator {
     // Eager spawn + open (warmup with document content)
     // ========================================
 
+    async fn route_virtual_injections(
+        &self,
+        settings: &WorkspaceSettings,
+        host_language: &str,
+        host_uri: &Url,
+        host_uri_lsp: &tower_lsp_server::ls_types::Uri,
+        injections: Vec<BridgeInjection>,
+    ) -> Vec<(BridgeInjection, Vec<ResolvedServerConfig>)> {
+        let mut configs_by_lang: HashMap<String, Vec<ResolvedServerConfig>> = HashMap::new();
+        let mut routed = Vec::with_capacity(injections.len());
+        for injection in injections {
+            let virtual_uri = super::protocol::VirtualDocumentUri::new(
+                host_uri_lsp,
+                &injection.language,
+                &injection.region_id,
+            );
+            let Ok(document_uri) = Url::parse(&virtual_uri.to_uri_string()) else {
+                continue;
+            };
+            let configs = configs_by_lang
+                .entry(injection.language.clone())
+                .or_insert_with(|| {
+                    self.get_all_configs_for_language(settings, host_language, &injection.language)
+                })
+                .clone();
+            if configs.is_empty() {
+                continue;
+            }
+            let selected = Self::resolve_document_routing(
+                &self.pool,
+                &document_uri,
+                &injection.language,
+                Some(super::protocol::RoutingHostDocument {
+                    uri: host_uri.to_string(),
+                    language_id: host_language.to_string(),
+                }),
+                configs,
+            )
+            .await;
+            routed.push((injection, selected));
+        }
+        routed
+    }
+
+    fn eager_open_groups_for_configs(
+        routed: Vec<(BridgeInjection, Vec<ResolvedServerConfig>)>,
+    ) -> BTreeMap<String, ServerGroup> {
+        let mut groups: BTreeMap<String, ServerGroup> = BTreeMap::new();
+        for (injection, configs) in routed {
+            let Some((last, rest)) = configs.split_last() else {
+                continue;
+            };
+            for config in rest {
+                groups
+                    .entry(config.server_name.clone())
+                    .or_insert_with(|| (config.config.clone(), Vec::new()))
+                    .1
+                    .push(injection.clone());
+            }
+            groups
+                .entry(last.server_name.clone())
+                .or_insert_with(|| (last.config.clone(), Vec::new()))
+                .1
+                .push(injection);
+        }
+        groups
+    }
+
     /// Which servers should receive an eager `didOpen`, and for which
     /// injections. Grouped by server name, since several languages can share
     /// one server (e.g. ts/tsx → tsgo).
@@ -1089,6 +1170,7 @@ impl BridgeCoordinator {
     ///
     /// Pure, so the selection is unit-testable; resolving connection keys and
     /// skipping already-open regions needs `await` and stays in the caller.
+    #[cfg(test)]
     fn eager_open_groups(
         &self,
         settings: &WorkspaceSettings,
@@ -1156,7 +1238,10 @@ impl BridgeCoordinator {
 
         // Empty means current settings resolve no server for any injection —
         // the batch belongs to removed configuration and must stop.
-        let resolved_groups = self.eager_open_groups(settings, host_language, injections);
+        let routed = self
+            .route_virtual_injections(settings, host_language, host_uri, &host_uri_lsp, injections)
+            .await;
+        let resolved_groups = Self::eager_open_groups_for_configs(routed);
         if resolved_groups.is_empty() {
             self.cancel_eager_open(host_uri);
             return;
@@ -1263,20 +1348,21 @@ impl BridgeCoordinator {
     /// before any host `didOpen` is sent. This is deliberately one orchestration
     /// step: asking each server about a projection containing only itself cannot
     /// let a provider such as tsudoi suppress a sibling provider such as tsgo.
-    async fn resolve_host_routing(
+    async fn resolve_document_routing(
         pool: &LanguageServerPool,
-        host_uri: &Url,
+        document_uri: &Url,
         language_id: &str,
+        host: Option<super::protocol::RoutingHostDocument>,
         configs: Vec<ResolvedServerConfig>,
     ) -> Vec<ResolvedServerConfig> {
         if configs.iter().all(|config| {
-            pool.host_routing_by_server(host_uri, &config.server_name)
+            pool.host_routing_by_server(document_uri, &config.server_name)
                 .is_some()
         }) {
             return configs
                 .into_iter()
                 .filter(|config| {
-                    pool.host_routing_by_server(host_uri, &config.server_name)
+                    pool.host_routing_by_server(document_uri, &config.server_name)
                         .unwrap_or(true)
                 })
                 .collect();
@@ -1307,9 +1393,9 @@ impl BridgeCoordinator {
             .collect::<BTreeMap<_, _>>();
         let params = RoutingParams {
             text_document: RoutingTextDocument {
-                uri: host_uri.to_string(),
+                uri: document_uri.to_string(),
                 language_id: language_id.to_string(),
-                host: None,
+                host,
             },
             language_servers,
         };
@@ -1318,13 +1404,13 @@ impl BridgeCoordinator {
         for config in &configs {
             let server_name = config.server_name.clone();
             let server_config = Arc::clone(&config.config);
-            let host_uri = host_uri.clone();
+            let document_uri = document_uri.clone();
             candidates.push(async move {
                 let result = pool
                     .get_or_create_connection_wait_ready(
                         &server_name,
                         &server_config,
-                        Some(&host_uri),
+                        Some(&document_uri),
                         std::time::Duration::from_secs(INIT_TIMEOUT_SECS),
                     )
                     .await;
@@ -1342,7 +1428,7 @@ impl BridgeCoordinator {
                         target: "kakehashi::bridge::routing",
                         "Routing candidate {} was not ready for {}: {}",
                         server_name,
-                        host_uri,
+                        document_uri,
                         error
                     );
                     continue;
@@ -1356,7 +1442,7 @@ impl BridgeCoordinator {
                         target: "kakehashi::bridge::routing",
                         "Routing provider {} failed for {}: {}",
                         server_name,
-                        host_uri,
+                        document_uri,
                         error
                     ),
                 }
@@ -1371,9 +1457,9 @@ impl BridgeCoordinator {
                 .and_then(|answer| answer.routing.get(&config.server_name))
                 .and_then(|entry| entry.enabled)
                 != Some(false);
-            pool.set_host_routing_by_server(host_uri, &config.server_name, enabled);
+            pool.set_host_routing_by_server(document_uri, &config.server_name, enabled);
             pool.set_host_routing_workspace_folders(
-                host_uri,
+                document_uri,
                 &config.server_name,
                 answer
                     .as_ref()
@@ -1387,9 +1473,9 @@ impl BridgeCoordinator {
                 }
                 continue;
             };
-            pool.set_host_routing_decided(host_uri, handle.key());
+            pool.set_host_routing_decided(document_uri, handle.key());
             if !enabled {
-                pool.set_host_routing_suppressed(host_uri, handle.key());
+                pool.set_host_routing_suppressed(document_uri, handle.key());
                 continue;
             }
             selected.push(config);
@@ -1466,10 +1552,11 @@ impl BridgeCoordinator {
                 configs = async {
                     let lifecycle = pool.host_lifecycle_lock(&host_uri_owned);
                     let _guard = lifecycle.lock().await;
-                    Self::resolve_host_routing(
+                    Self::resolve_document_routing(
                         &pool,
                         &host_uri_owned,
                         &language_id,
+                        None,
                         configs_for_routing,
                     ).await
                 } => configs,

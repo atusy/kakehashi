@@ -154,6 +154,9 @@ impl LanguageServerPool {
     /// and `close_invalidated_docs`. Errors are logged but do not prevent
     /// cleanup of the document_versions tracking.
     pub(crate) async fn close_single_virtual_doc(&self, doc: &OpenedVirtualDoc) {
+        if let Ok(uri) = url::Url::parse(&doc.virtual_uri.to_uri_string()) {
+            self.clear_host_routing_suppression(&uri);
+        }
         let handle = self.connection_for_didclose(&doc.connection_key).await;
         let transition = self.open_transition_lock(&doc.virtual_uri, &doc.connection_key);
         let transition_guard = transition.lock().await;

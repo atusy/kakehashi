@@ -143,6 +143,19 @@ impl LanguageServerPool {
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
 
         let host_lifecycle = self.request_host_lifecycle(host_uri).await?;
+        let routing_uri = url::Url::parse(&virtual_uri.to_uri_string())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        if self
+            .host_routing_by_server(&routing_uri, connection_key.server())
+            .is_some_and(|enabled| !enabled)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("virtual document routing disabled on {connection_key}"),
+            ));
+        }
+        self.apply_host_routing_workspace_folders(&routing_uri, connection_key.server(), &handle)
+            .await?;
 
         // Register in the upstream request registry before downstream router
         // registration for cancel lookup. This relative order matters: if a
