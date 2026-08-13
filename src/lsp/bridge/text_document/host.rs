@@ -498,8 +498,9 @@ impl LanguageServerPool {
             .apply_host_routing_workspace_folders(doc.uri, connection_key.server(), &handle)
             .await
         {
+            let kind = error.kind();
             return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
+                kind,
                 format!("failed to apply host routing workspace folders: {error}"),
             ));
         }
