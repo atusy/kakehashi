@@ -187,6 +187,9 @@ impl LanguageServerPool {
     /// Mirrors the virt path's `close_host_document`; called from the
     /// upstream `didClose` handler.
     pub(crate) async fn close_host_bridge_document(&self, uri: &Url) {
+        self.finish_all_host_routing(uri);
+        let lifecycle = self.host_lifecycle_lock(uri);
+        let _lifecycle_guard = lifecycle.lock().await;
         self.invalidate_diagnostic_host(uri);
         let Ok(uri_lsp) = host_url_to_lsp_uri(uri) else {
             return;
@@ -223,6 +226,7 @@ impl LanguageServerPool {
             .map(|(doc_uri, connection_key)| (connection_key, doc_uri))
             .collect::<Vec<_>>();
         docs.retain(|(doc_uri, _), _| *doc_uri != uri_string);
+        self.clear_host_routing_suppression(uri);
         for key in closed_keys {
             self.invalidate_diagnostic_document(&key);
         }
@@ -481,6 +485,15 @@ impl LanguageServerPool {
     ) -> io::Result<T> {
         // Route per-connection state by this handle's pool key (#382).
         let connection_key = handle.key();
+        self.wait_for_host_routing(doc.uri).await;
+        let lifecycle = self.host_lifecycle_lock(doc.uri);
+        let _lifecycle_guard = lifecycle.lock().await;
+        if self.is_host_routing_suppressed(doc.uri, connection_key) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("host document routing disabled on {connection_key}"),
+            ));
+        }
         if let Some(ref id) = upstream_request_id {
             self.register_upstream_request(id.clone(), connection_key);
         }

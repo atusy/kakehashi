@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 use url::Url;
@@ -18,6 +19,8 @@ use crate::language::node_tracker::{EditInfo, NodeTracker};
 use crate::lsp::request_id::CancelForwarder;
 
 use super::LanguageServerPool;
+use super::pool::INIT_TIMEOUT_SECS;
+use super::protocol::{RoutingAnswer, RoutingLanguageServer, RoutingParams, RoutingTextDocument};
 
 /// A resolved bridge virtual-document payload from a host document.
 ///
@@ -1255,6 +1258,137 @@ impl BridgeCoordinator {
         );
     }
 
+    /// Ask one advertising host bridge for a routing decision over the full
+    /// candidate set, then mark every candidate connection with that decision
+    /// before any host `didOpen` is sent. This is deliberately one orchestration
+    /// step: asking each server about a projection containing only itself cannot
+    /// let a provider such as tsudoi suppress a sibling provider such as tsgo.
+    async fn resolve_host_routing(
+        pool: &LanguageServerPool,
+        host_uri: &Url,
+        language_id: &str,
+        configs: Vec<ResolvedServerConfig>,
+    ) -> Vec<ResolvedServerConfig> {
+        if configs.iter().all(|config| {
+            pool.host_routing_by_server(host_uri, &config.server_name)
+                .is_some()
+        }) {
+            return configs
+                .into_iter()
+                .filter(|config| {
+                    pool.host_routing_by_server(host_uri, &config.server_name)
+                        .unwrap_or(true)
+                })
+                .collect();
+        }
+        let language_servers = configs
+            .iter()
+            .map(|config| {
+                let workspace_markers = config
+                    .config
+                    .workspace_markers
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|marker| serde_json::to_value(marker).expect("RootMarker is serializable"))
+                    .collect();
+                (
+                    config.server_name.clone(),
+                    RoutingLanguageServer {
+                        languages: config.config.languages.clone().unwrap_or_default(),
+                        workspace_markers,
+                        prefer_shared_instance: config
+                            .config
+                            .prefer_shared_instance
+                            .unwrap_or(false),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let params = RoutingParams {
+            text_document: RoutingTextDocument {
+                uri: host_uri.to_string(),
+                language_id: language_id.to_string(),
+                host: None,
+            },
+            language_servers,
+        };
+
+        let mut candidates = futures::stream::FuturesUnordered::new();
+        for config in &configs {
+            let server_name = config.server_name.clone();
+            let server_config = Arc::clone(&config.config);
+            let host_uri = host_uri.clone();
+            candidates.push(async move {
+                let result = pool
+                    .get_or_create_connection_wait_ready(
+                        &server_name,
+                        &server_config,
+                        Some(&host_uri),
+                        std::time::Duration::from_secs(INIT_TIMEOUT_SECS),
+                    )
+                    .await;
+                (server_name, result)
+            });
+        }
+
+        let mut handles = Vec::with_capacity(configs.len());
+        let mut answer: Option<RoutingAnswer> = None;
+        while let Some((server_name, result)) = candidates.next().await {
+            let handle = match result {
+                Ok(handle) => handle,
+                Err(error) => {
+                    log::debug!(
+                        target: "kakehashi::bridge::routing",
+                        "Routing candidate {} was not ready for {}: {}",
+                        server_name,
+                        host_uri,
+                        error
+                    );
+                    continue;
+                }
+            };
+            if answer.is_none() && handle.supports_bridge_routing() {
+                match handle.request_routing(params.clone()).await {
+                    Ok(Some(candidate_answer)) => answer = Some(candidate_answer),
+                    Ok(None) => {}
+                    Err(error) => log::debug!(
+                        target: "kakehashi::bridge::routing",
+                        "Routing provider {} failed for {}: {}",
+                        server_name,
+                        host_uri,
+                        error
+                    ),
+                }
+            }
+            handles.push((server_name, handle));
+        }
+
+        let mut selected = Vec::new();
+        for config in configs {
+            let enabled = answer
+                .as_ref()
+                .and_then(|answer| answer.routing.get(&config.server_name))
+                .and_then(|entry| entry.enabled)
+                != Some(false);
+            pool.set_host_routing_by_server(host_uri, &config.server_name, enabled);
+            let Some((_, handle)) = handles.iter().find(|(name, _)| name == &config.server_name)
+            else {
+                if enabled {
+                    selected.push(config);
+                }
+                continue;
+            };
+            pool.set_host_routing_decided(host_uri, handle.key());
+            if !enabled {
+                pool.set_host_routing_suppressed(host_uri, handle.key());
+                continue;
+            }
+            selected.push(config);
+        }
+        selected
+    }
+
     /// Sync the real host document to a resolved set of `_self` host servers
     /// (host-document-bridge). `sync_host_document` sends `didOpen` the first time
     /// and a versioned `didChange` when the text changed, so this is used both for
@@ -1311,36 +1445,57 @@ impl BridgeCoordinator {
         // `text` already arrives as `Arc<str>` (the debounce path hands over its
         // `HostRequestContext.text` without copying).
         let language_id: Arc<str> = Arc::from(language_id);
-        for config in configs {
-            let pool = self.pool_arc();
-            let host_uri_owned = host_uri.clone();
-            let language_id = Arc::clone(&language_id);
-            let text = Arc::clone(&text);
-            let server_name = config.server_name.clone();
-            let server_config = config.config.clone();
-            let cancel = cancel.clone();
-            // Each task shares the same live reader (cheap `Arc` clone) — it is
-            // evaluated inside `sync_host_document`'s lock, so the last task to sync
-            // sends the latest text regardless of which snapshot it was spawned with.
-            let live_text_reader = live_text_reader.clone();
-            let task = tokio::spawn(async move {
-                tokio::select! {
-                    biased;
-                    // Cancelled during the spawn→register window (or later) —
-                    // bail before the side effect (#435).
-                    _ = cancel.cancelled() => {}
-                    _ = pool.eager_open_host_document(
-                        &server_name,
-                        &server_config,
+        let pool = self.pool_arc();
+        let host_uri_owned = host_uri.clone();
+        let configs_for_routing = configs;
+        let routing_sender = pool.begin_host_routing(host_uri);
+        let task = tokio::spawn(async move {
+            let configs = tokio::select! {
+                _ = cancel.cancelled() => {
+                    pool.finish_host_routing(&host_uri_owned, &routing_sender);
+                    return;
+                }
+                configs = async {
+                    let lifecycle = pool.host_lifecycle_lock(&host_uri_owned);
+                    let _guard = lifecycle.lock().await;
+                    Self::resolve_host_routing(
+                        &pool,
                         &host_uri_owned,
                         &language_id,
-                        &text,
-                        live_text_reader.as_deref(),
-                    ) => {}
-                }
-            });
-            self.push_or_abort_host_eager_open_handle(host_uri, task.abort_handle(), generation);
-        }
+                        configs_for_routing,
+                    ).await
+                } => configs,
+            };
+            pool.finish_host_routing(&host_uri_owned, &routing_sender);
+            let mut opens = Vec::new();
+            for config in configs {
+                let pool = Arc::clone(&pool);
+                let host_uri = host_uri_owned.clone();
+                let language_id = Arc::clone(&language_id);
+                let text = Arc::clone(&text);
+                let cancel = cancel.clone();
+                let live_text_reader = live_text_reader.clone();
+                opens.push(tokio::spawn(async move {
+                    let server_name = config.server_name;
+                    let server_config = config.config;
+                    tokio::select! {
+                        _ = cancel.cancelled() => {}
+                        _ = pool.eager_open_host_document(
+                            &server_name,
+                            &server_config,
+                            &host_uri,
+                            &language_id,
+                            &text,
+                            live_text_reader.as_deref(),
+                        ) => {}
+                    }
+                }));
+            }
+            for open in opens {
+                let _ = open.await;
+            }
+        });
+        self.push_or_abort_host_eager_open_handle(host_uri, task.abort_handle(), generation);
     }
 
     /// Supersede the host eager-open batch for `uri` (abort old handles + cancel the

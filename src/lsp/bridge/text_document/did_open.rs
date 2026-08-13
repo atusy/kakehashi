@@ -276,6 +276,8 @@ impl LanguageServerPool {
         text: &str,
         live_text_reader: Option<&(dyn Fn() -> Option<Arc<str>> + Send + Sync)>,
     ) {
+        let lifecycle = self.host_lifecycle_lock(host_uri);
+        let _lifecycle_guard = lifecycle.lock().await;
         let handle = match self
             .get_or_create_connection_wait_ready(
                 server_name,
@@ -301,6 +303,17 @@ impl LanguageServerPool {
         // Borrow the key (no clone) — both `connections.get` and `sync_host_document`
         // take it by reference, like `execute_host_request`.
         let connection_key = handle.key();
+        if let Some(enabled) = self.host_routing_by_server(host_uri, server_name) {
+            if enabled {
+                self.set_host_routing_decided(host_uri, connection_key);
+            } else {
+                self.set_host_routing_suppressed(host_uri, connection_key);
+                return;
+            }
+        }
+        // Serialize the routing decision with lazy host sync. A request that
+        // arrives while routing is in flight must not open the document before
+        // the eager path can honor a suppressing answer.
         // The host-layer eager open is the first live consumer of the
         // downstream routing protocol. The provider-selection and decision
         // cache layers will widen this projection; this initial slice already
@@ -327,26 +340,42 @@ impl LanguageServerPool {
                 },
             )]),
         };
-        let already_open = self.is_host_document_opened(host_uri, server_name).await;
-        if !already_open {
+        let already_open = self
+            .is_host_document_opened_on_connection(host_uri, connection_key)
+            .await;
+        if !already_open && !self.is_host_routing_decided(host_uri, connection_key) {
             match handle.request_routing(routing_params).await {
-                Ok(Some(answer))
+                Ok(Some(answer)) => {
+                    let connections = self.connections().await;
+                    if !connections
+                        .get(connection_key)
+                        .is_some_and(|current| Arc::ptr_eq(current, &handle))
+                    {
+                        return;
+                    }
                     if answer
                         .routing
                         .get(server_name)
                         .and_then(|entry| entry.enabled)
-                        == Some(false) =>
-                {
-                    log::debug!(
-                        target: "kakehashi::bridge::routing",
-                        "Routing provider suppressed host document {} on {}",
-                        host_uri,
-                        server_name
-                    );
-                    return;
+                        != Some(false)
+                    {
+                        // The current connection remains eligible to receive
+                        // the normal eager open below.
+                        self.set_host_routing_decided(host_uri, connection_key);
+                    } else {
+                        self.set_host_routing_suppressed(host_uri, connection_key);
+                        log::debug!(
+                            target: "kakehashi::bridge::routing",
+                            "Routing provider suppressed host document {} on {}",
+                            host_uri,
+                            server_name
+                        );
+                        return;
+                    }
                 }
-                Ok(_) => {}
+                Ok(_) => self.set_host_routing_decided(host_uri, connection_key),
                 Err(error) => {
+                    self.set_host_routing_decided(host_uri, connection_key);
                     log::debug!(
                         target: "kakehashi::bridge::routing",
                         "Routing query failed for {} on {}: {}",
