@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 use url::Url;
@@ -1313,24 +1314,34 @@ impl BridgeCoordinator {
             language_servers,
         };
 
+        let mut candidates = futures::stream::FuturesUnordered::new();
+        for config in &configs {
+            let server_name = config.server_name.clone();
+            let server_config = Arc::clone(&config.config);
+            let host_uri = host_uri.clone();
+            candidates.push(async move {
+                let result = pool
+                    .get_or_create_connection_wait_ready(
+                        &server_name,
+                        &server_config,
+                        Some(&host_uri),
+                        std::time::Duration::from_secs(INIT_TIMEOUT_SECS),
+                    )
+                    .await;
+                (server_name, result)
+            });
+        }
+
         let mut handles = Vec::with_capacity(configs.len());
         let mut answer: Option<RoutingAnswer> = None;
-        for config in &configs {
-            let handle = match pool
-                .get_or_create_connection_wait_ready(
-                    &config.server_name,
-                    &config.config,
-                    Some(host_uri),
-                    std::time::Duration::from_secs(INIT_TIMEOUT_SECS),
-                )
-                .await
-            {
+        while let Some((server_name, result)) = candidates.next().await {
+            let handle = match result {
                 Ok(handle) => handle,
                 Err(error) => {
                     log::debug!(
                         target: "kakehashi::bridge::routing",
                         "Routing candidate {} was not ready for {}: {}",
-                        config.server_name,
+                        server_name,
                         host_uri,
                         error
                     );
@@ -1344,13 +1355,13 @@ impl BridgeCoordinator {
                     Err(error) => log::debug!(
                         target: "kakehashi::bridge::routing",
                         "Routing provider {} failed for {}: {}",
-                        config.server_name,
+                        server_name,
                         host_uri,
                         error
                     ),
                 }
             }
-            handles.push((config.server_name.clone(), handle));
+            handles.push((server_name, handle));
         }
 
         let mut selected = Vec::new();
