@@ -29,7 +29,8 @@ use crate::lsp::bridge::actor::{
 };
 use crate::lsp::bridge::connection::SplitConnectionWriter;
 use crate::lsp::bridge::protocol::{
-    JsonRpcNotification, JsonRpcRequest, RequestId, build_exit_notification, build_shutdown_request,
+    JsonRpcNotification, JsonRpcRequest, ROUTING_METHOD, RequestId, RoutingAnswer, RoutingParams,
+    build_exit_notification, build_shutdown_request, jsonrpc_error_code, parse_routing_response,
 };
 use crate::lsp::bridge::workspace::WorkspaceFolderSet;
 
@@ -415,6 +416,32 @@ impl ConnectionHandle {
                 Err(BridgeError::ChannelClosed)
             }
         }
+    }
+
+    /// Ask an advertising downstream server for its routing refinement.
+    ///
+    /// The request is deliberately scoped to the connection: provider
+    /// selection and decision caching belong to the pool/document layer, while
+    /// this method owns only the negotiated wire contract and response
+    /// lifetime. A `MethodNotFound` response permanently disables routing for
+    /// this connection until its next initialize handshake.
+    pub(crate) async fn request_routing(
+        &self,
+        params: RoutingParams,
+    ) -> io::Result<Option<RoutingAnswer>> {
+        if !self.supports_bridge_routing() {
+            return Ok(None);
+        }
+
+        let (request_id, response_rx) = self.register_request()?;
+        let request = JsonRpcRequest::new(request_id.as_i64(), ROUTING_METHOD, params);
+        self.send_request(request, request_id)
+            .map_err(io::Error::other)?;
+        let response = self.wait_for_response(request_id, response_rx).await?;
+        if jsonrpc_error_code(&response) == Some(-32601) {
+            self.set_bridge_routing(false);
+        }
+        parse_routing_response(&response)
     }
 
     /// Send a raw payload for echo-server tests.
