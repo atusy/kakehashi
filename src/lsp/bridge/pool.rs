@@ -380,6 +380,11 @@ pub struct LanguageServerPool {
     /// Host/server pairs for which routing has already been decided, including
     /// the fail-open case where no provider answered.
     host_routing_decided: DashMap<(String, ConnectionKey), ()>,
+    /// Host/server-name routing decisions, retained even before a concrete
+    /// connection can be acquired.
+    host_routing_by_server: DashMap<(String, String), bool>,
+    /// Host URIs whose routing decision is currently being resolved.
+    host_routing_pending: DashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>,
     /// Connections whose replacement still owes a virtual-document re-open, and
     /// the barrier requests wait on (respawn-reopen-derives-its-targets).
     /// `Arc` because the claim runs inside the spawned handshake task.
@@ -516,6 +521,8 @@ impl LanguageServerPool {
             host_documents: Mutex::new(HashMap::new()),
             host_routing_suppressed: DashMap::new(),
             host_routing_decided: DashMap::new(),
+            host_routing_by_server: DashMap::new(),
+            host_routing_pending: DashMap::new(),
             pending_reopen: Arc::new(PendingReopenRegistry::default()),
             diagnostic_pull_baselines: DashMap::new(),
             diagnostic_document_generations: DashMap::new(),
@@ -1308,8 +1315,71 @@ impl LanguageServerPool {
     }
 
     pub(crate) fn set_host_routing_decided(&self, host_uri: &Url, connection_key: &ConnectionKey) {
-        self.host_routing_decided
-            .insert((host_uri.to_string(), connection_key.clone()), ());
+        let key = (host_uri.to_string(), connection_key.clone());
+        self.host_routing_suppressed.remove(&key);
+        self.host_routing_decided.insert(key, ());
+    }
+
+    pub(crate) fn set_host_routing_by_server(
+        &self,
+        host_uri: &Url,
+        server_name: &str,
+        enabled: bool,
+    ) {
+        self.host_routing_by_server
+            .insert((host_uri.to_string(), server_name.to_string()), enabled);
+    }
+
+    pub(crate) fn host_routing_by_server(&self, host_uri: &Url, server_name: &str) -> Option<bool> {
+        self.host_routing_by_server
+            .get(&(host_uri.to_string(), server_name.to_string()))
+            .map(|entry| *entry)
+    }
+
+    pub(crate) fn begin_host_routing(
+        &self,
+        host_uri: &Url,
+    ) -> Arc<tokio::sync::watch::Sender<bool>> {
+        let sender = Arc::new(tokio::sync::watch::channel(false).0);
+        self.host_routing_pending
+            .insert(host_uri.clone(), Arc::clone(&sender));
+        sender
+    }
+
+    pub(crate) async fn wait_for_host_routing(&self, host_uri: &Url) {
+        let Some(sender) = self
+            .host_routing_pending
+            .get(host_uri)
+            .map(|entry| Arc::clone(entry.value()))
+        else {
+            return;
+        };
+        let mut receiver = sender.subscribe();
+        while !*receiver.borrow() {
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn finish_host_routing(
+        &self,
+        host_uri: &Url,
+        sender: &Arc<tokio::sync::watch::Sender<bool>>,
+    ) {
+        if self
+            .host_routing_pending
+            .remove_if(host_uri, |_, current| Arc::ptr_eq(current, sender))
+            .is_some()
+        {
+            let _ = sender.send(true);
+        }
+    }
+
+    pub(crate) fn finish_all_host_routing(&self, host_uri: &Url) {
+        if let Some((_, sender)) = self.host_routing_pending.remove(host_uri) {
+            let _ = sender.send(true);
+        }
     }
 
     pub(crate) fn is_host_routing_decided(
@@ -1336,6 +1406,9 @@ impl LanguageServerPool {
             .retain(|(doc_uri, _), _| doc_uri != &uri);
         self.host_routing_decided
             .retain(|(doc_uri, _), _| doc_uri != &uri);
+        self.host_routing_by_server
+            .retain(|(doc_uri, _), _| doc_uri != &uri);
+        self.finish_all_host_routing(host_uri);
     }
 
     pub(crate) fn clear_host_routing_for_connection(&self, connection_key: &ConnectionKey) {

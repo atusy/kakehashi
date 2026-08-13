@@ -303,6 +303,14 @@ impl LanguageServerPool {
         // Borrow the key (no clone) — both `connections.get` and `sync_host_document`
         // take it by reference, like `execute_host_request`.
         let connection_key = handle.key();
+        if let Some(enabled) = self.host_routing_by_server(host_uri, server_name) {
+            if enabled {
+                self.set_host_routing_decided(host_uri, connection_key);
+            } else {
+                self.set_host_routing_suppressed(host_uri, connection_key);
+                return;
+            }
+        }
         // Serialize the routing decision with lazy host sync. A request that
         // arrives while routing is in flight must not open the document before
         // the eager path can honor a suppressing answer.

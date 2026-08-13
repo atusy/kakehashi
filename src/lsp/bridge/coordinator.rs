@@ -1268,6 +1268,18 @@ impl BridgeCoordinator {
         language_id: &str,
         configs: Vec<ResolvedServerConfig>,
     ) -> Vec<ResolvedServerConfig> {
+        if configs.iter().all(|config| {
+            pool.host_routing_by_server(host_uri, &config.server_name)
+                .is_some()
+        }) {
+            return configs
+                .into_iter()
+                .filter(|config| {
+                    pool.host_routing_by_server(host_uri, &config.server_name)
+                        .unwrap_or(true)
+                })
+                .collect();
+        }
         let language_servers = configs
             .iter()
             .map(|config| {
@@ -1343,16 +1355,19 @@ impl BridgeCoordinator {
 
         let mut selected = Vec::new();
         for config in configs {
-            let Some((_, handle)) = handles.iter().find(|(name, _)| name == &config.server_name)
-            else {
-                selected.push(config);
-                continue;
-            };
             let enabled = answer
                 .as_ref()
                 .and_then(|answer| answer.routing.get(&config.server_name))
                 .and_then(|entry| entry.enabled)
                 != Some(false);
+            pool.set_host_routing_by_server(host_uri, &config.server_name, enabled);
+            let Some((_, handle)) = handles.iter().find(|(name, _)| name == &config.server_name)
+            else {
+                if enabled {
+                    selected.push(config);
+                }
+                continue;
+            };
             pool.set_host_routing_decided(host_uri, handle.key());
             if !enabled {
                 pool.set_host_routing_suppressed(host_uri, handle.key());
@@ -1422,29 +1437,51 @@ impl BridgeCoordinator {
         let pool = self.pool_arc();
         let host_uri_owned = host_uri.clone();
         let configs_for_routing = configs;
+        let routing_sender = pool.begin_host_routing(host_uri);
         let task = tokio::spawn(async move {
-            let configs = Self::resolve_host_routing(
-                &pool,
-                &host_uri_owned,
-                &language_id,
-                configs_for_routing,
-            )
-            .await;
-            for config in configs {
-                let server_name = config.server_name.clone();
-                let server_config = config.config.clone();
-                if cancel.is_cancelled() {
-                    break;
+            let configs = tokio::select! {
+                _ = cancel.cancelled() => {
+                    pool.finish_host_routing(&host_uri_owned, &routing_sender);
+                    return;
                 }
-                pool.eager_open_host_document(
-                    &server_name,
-                    &server_config,
-                    &host_uri_owned,
-                    &language_id,
-                    &text,
-                    live_text_reader.as_deref(),
-                )
-                .await;
+                configs = async {
+                    let lifecycle = pool.host_lifecycle_lock(&host_uri_owned);
+                    let _guard = lifecycle.lock().await;
+                    Self::resolve_host_routing(
+                        &pool,
+                        &host_uri_owned,
+                        &language_id,
+                        configs_for_routing,
+                    ).await
+                } => configs,
+            };
+            pool.finish_host_routing(&host_uri_owned, &routing_sender);
+            let mut opens = Vec::new();
+            for config in configs {
+                let pool = Arc::clone(&pool);
+                let host_uri = host_uri_owned.clone();
+                let language_id = Arc::clone(&language_id);
+                let text = Arc::clone(&text);
+                let cancel = cancel.clone();
+                let live_text_reader = live_text_reader.clone();
+                opens.push(tokio::spawn(async move {
+                    let server_name = config.server_name;
+                    let server_config = config.config;
+                    tokio::select! {
+                        _ = cancel.cancelled() => {}
+                        _ = pool.eager_open_host_document(
+                            &server_name,
+                            &server_config,
+                            &host_uri,
+                            &language_id,
+                            &text,
+                            live_text_reader.as_deref(),
+                        ) => {}
+                    }
+                }));
+            }
+            for open in opens {
+                let _ = open.await;
             }
         });
         self.push_or_abort_host_eager_open_handle(host_uri, task.abort_handle(), generation);
