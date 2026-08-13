@@ -1378,17 +1378,27 @@ impl LanguageServerPool {
         server_name: &str,
         handle: &Arc<ConnectionHandle>,
     ) -> io::Result<()> {
-        let Some(Some(folders)) = self.host_routing_workspace_folders(host_uri, server_name) else {
+        let Some(folders) = self.host_routing_workspace_folders(host_uri, server_name) else {
             return Ok(());
         };
+        let Some(folders) = folders else {
+            log::debug!(
+                target: "kakehashi::bridge::routing",
+                "Routing provider supplied workspaceFolders=null for {}; keeping the connection's existing folders",
+                server_name
+            );
+            return Ok(());
+        };
+        if folders.is_empty() {
+            log::debug!(
+                target: "kakehashi::bridge::routing",
+                "Routing provider supplied an empty workspaceFolders list for {}; keeping the connection's existing folders",
+                server_name
+            );
+            return Ok(());
+        }
         for folder in folders {
             let Some(folder_uri) = Url::parse(&folder).ok() else {
-                log::debug!(
-                    target: "kakehashi::bridge::routing",
-                    "Ignoring invalid routing workspace folder {} for {}",
-                    folder,
-                    server_name
-                );
                 continue;
             };
             let Some(marker) = super::root_markers::workspace_at_root(folder_uri) else {
