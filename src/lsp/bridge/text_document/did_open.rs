@@ -327,31 +327,34 @@ impl LanguageServerPool {
                 },
             )]),
         };
-        match handle.request_routing(routing_params).await {
-            Ok(Some(answer))
-                if answer
-                    .routing
-                    .get(server_name)
-                    .and_then(|entry| entry.enabled)
-                    == Some(false) =>
-            {
-                log::debug!(
-                    target: "kakehashi::bridge::routing",
-                    "Routing provider suppressed host document {} on {}",
-                    host_uri,
-                    server_name
-                );
-                return;
-            }
-            Ok(_) => {}
-            Err(error) => {
-                log::debug!(
-                    target: "kakehashi::bridge::routing",
-                    "Routing query failed for {} on {}: {}",
-                    host_uri,
-                    server_name,
-                    error
-                );
+        let already_open = self.is_host_document_opened(host_uri, server_name).await;
+        if !already_open {
+            match handle.request_routing(routing_params).await {
+                Ok(Some(answer))
+                    if answer
+                        .routing
+                        .get(server_name)
+                        .and_then(|entry| entry.enabled)
+                        == Some(false) =>
+                {
+                    log::debug!(
+                        target: "kakehashi::bridge::routing",
+                        "Routing provider suppressed host document {} on {}",
+                        host_uri,
+                        server_name
+                    );
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    log::debug!(
+                        target: "kakehashi::bridge::routing",
+                        "Routing query failed for {} on {}: {}",
+                        host_uri,
+                        server_name,
+                        error
+                    );
+                }
             }
         }
         // Sync (sends didOpen) under the `connections` + `host_documents` locks in

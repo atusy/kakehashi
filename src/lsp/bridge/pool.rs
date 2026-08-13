@@ -1264,7 +1264,6 @@ impl LanguageServerPool {
     /// Whether the host document at `host_uri` has been synced (didOpen sent) to a
     /// `_self` host server named `server_name` — i.e. a `host_documents` sync-state
     /// entry exists for that `(uri, server)`. Used to verify host-layer eager open.
-    #[cfg(test)]
     pub(crate) async fn is_host_document_opened(&self, host_uri: &Url, server_name: &str) -> bool {
         // Key exactly as `sync_host_document` does (`doc.uri.to_string()`) so the
         // lookup can never diverge from the map's key construction.
