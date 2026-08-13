@@ -199,6 +199,33 @@ impl LanguageServerPool {
             }
             let virtual_uri =
                 VirtualDocumentUri::new(host_uri_lsp, &injection.language, &injection.region_id);
+            let Ok(routing_uri) = url::Url::parse(&virtual_uri.to_uri_string()) else {
+                enqueued_all = false;
+                drop(lifecycle_guard);
+                continue;
+            };
+            if self
+                .host_routing_by_server(&routing_uri, server_name)
+                .is_some_and(|enabled| !enabled)
+            {
+                drop(lifecycle_guard);
+                continue;
+            }
+            if let Err(error) = self
+                .apply_host_routing_workspace_folders(&routing_uri, server_name, &handle)
+                .await
+            {
+                log::debug!(
+                    target: "kakehashi::bridge::routing",
+                    "Failed to apply virtual routing workspace folders for {} on {}: {}",
+                    routing_uri,
+                    server_name,
+                    error
+                );
+                enqueued_all = false;
+                drop(lifecycle_guard);
+                continue;
+            }
 
             // Verify `handle` is still the pool's LIVE connection for its key and
             // claim + didOpen this ONE injection under the `connections` lock,

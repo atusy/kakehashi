@@ -293,8 +293,17 @@ impl InjectionCoordinator {
         };
         tokio::spawn(install_task);
 
-        self.eager_spawn_bridge_servers(uri, incarnation, &host_language, injections)
-            .await;
+        // Routing may need to wait for a downstream provider to become ready.
+        // Keep that wait out of the lifecycle pass: the pass must release its
+        // per-document lock promptly, while the detached task still observes
+        // the same incarnation and is cancelled by the next close/rebuild.
+        let coordinator = self.clone();
+        let uri = uri.clone();
+        tokio::spawn(async move {
+            coordinator
+                .eager_spawn_bridge_servers(&uri, incarnation, &host_language, injections)
+                .await;
+        });
         true
     }
 
