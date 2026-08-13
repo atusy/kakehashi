@@ -37,6 +37,11 @@ enum ConnectionRoot {
     /// a per-root fallback after a capability miss) do not collide with the
     /// shared instance.
     Shared,
+    /// One shared connection whose initialize explicitly advertises no
+    /// workspace folders (`workspaceFolders: []`). Kept distinct from the
+    /// ordinary shared instance so a routed rootless session never reuses a
+    /// connection initialized with the client workspace.
+    RootlessShared,
 }
 
 /// Identity of one pooled downstream connection: `(server_name, root)`.
@@ -78,9 +83,23 @@ impl ConnectionKey {
         }
     }
 
+    pub(crate) fn rootless_shared(server: impl Into<String>) -> Self {
+        Self {
+            server: server.into(),
+            root: ConnectionRoot::RootlessShared,
+        }
+    }
+
     /// Whether this is a shared-instance key (#391).
     pub(crate) fn is_shared(&self) -> bool {
-        matches!(self.root, ConnectionRoot::Shared)
+        matches!(
+            self.root,
+            ConnectionRoot::Shared | ConnectionRoot::RootlessShared
+        )
+    }
+
+    pub(crate) fn is_rootless_shared(&self) -> bool {
+        matches!(self.root, ConnectionRoot::RootlessShared)
     }
 
     /// Whether this key is the client-root fallback (no resolved marker root).
@@ -115,7 +134,9 @@ impl ConnectionKey {
     pub(crate) fn marker_root(&self) -> Option<&str> {
         match &self.root {
             ConnectionRoot::Marker(root) => Some(root),
-            ConnectionRoot::ClientFallback | ConnectionRoot::Shared => None,
+            ConnectionRoot::ClientFallback
+            | ConnectionRoot::Shared
+            | ConnectionRoot::RootlessShared => None,
         }
     }
 }
@@ -126,6 +147,7 @@ impl fmt::Display for ConnectionKey {
             ConnectionRoot::Marker(root) => write!(f, "{}@{}", self.server, root),
             ConnectionRoot::ClientFallback => write!(f, "{}", self.server),
             ConnectionRoot::Shared => write!(f, "{}#shared", self.server),
+            ConnectionRoot::RootlessShared => write!(f, "{}#rootless-shared", self.server),
         }
     }
 }

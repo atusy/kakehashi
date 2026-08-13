@@ -1402,18 +1402,12 @@ impl LanguageServerPool {
         let Some(folders) = self.host_routing_workspace_folders(host_uri, server_name) else {
             return Ok(());
         };
-        let folders = folders.unwrap_or_else(|| {
-            log::debug!(
-                target: "kakehashi::bridge::routing",
-                "Routing provider supplied workspaceFolders=null for {}; using kakehashi's client workspace",
-                server_name
-            );
-            self.workspace_folders()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|folder| folder.uri.to_string())
-                .collect()
-        });
+        let Some(folders) = folders else {
+            // `null` means that routing has no opinion. Let the ordinary
+            // kakehashi marker/client workspace resolution decide instead of
+            // replaying the client folders as routing announcements.
+            return Ok(());
+        };
         if folders.is_empty() {
             return Ok(());
         }
@@ -1791,7 +1785,11 @@ impl LanguageServerPool {
         document_uri: &Url,
     ) -> ConnectionKey {
         if self.host_routing_rootless(document_uri, server_name) {
-            return ConnectionKey::new(server_name, None);
+            return if server_config.prefers_shared_instance() {
+                ConnectionKey::rootless_shared(server_name)
+            } else {
+                ConnectionKey::new(server_name, None)
+            };
         }
         self.resolve_acquire(server_name, server_config, Some(document_uri))
             .await
@@ -2225,9 +2223,14 @@ impl LanguageServerPool {
         let (mut marker, mut connection_key) = self
             .resolve_acquire(server_name, server_config, document_uri)
             .await;
-        if document_uri.is_some_and(|uri| self.host_routing_rootless(uri, server_name)) {
+        let rootless = document_uri.is_some_and(|uri| self.host_routing_rootless(uri, server_name));
+        if rootless {
             marker = None;
-            connection_key = ConnectionKey::new(server_name, None);
+            connection_key = if server_config.prefers_shared_instance() {
+                ConnectionKey::rootless_shared(server_name)
+            } else {
+                ConnectionKey::new(server_name, None)
+            };
         }
 
         // Acquire and wait through initialization for the resolved key.
@@ -2294,7 +2297,9 @@ impl LanguageServerPool {
         // path already announced; on the initializing-retry path it is the only
         // announce. Propagates a queue-full failure so the caller retries rather
         // than open a document for an unannounced root.
-        self.announce_shared_root(&handle, &marker).await?;
+        if !rootless {
+            self.announce_shared_root(&handle, &marker).await?;
+        }
         Ok(handle)
     }
 
@@ -2656,6 +2661,9 @@ impl LanguageServerPool {
         let folders: Vec<tower_lsp_server::ls_types::WorkspaceFolder> = match marker {
             Some((_root, folder)) => vec![folder.clone()],
             None => {
+                if handle.key().is_rootless_shared() {
+                    return Ok(());
+                }
                 let snapshot = self.workspace_folders().unwrap_or_default();
                 if !snapshot.is_empty() {
                     snapshot
@@ -2784,9 +2792,18 @@ impl LanguageServerPool {
         timeout: Duration,
         admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> io::Result<Arc<ConnectionHandle>> {
-        let (marker, connection_key) = self
+        let (marker, mut connection_key) = self
             .resolve_acquire(server_name, server_config, document_uri)
             .await;
+        let rootless = document_uri.is_some_and(|uri| self.host_routing_rootless(uri, server_name));
+        let marker = if rootless { None } else { marker };
+        if rootless {
+            connection_key = if server_config.prefers_shared_instance() {
+                ConnectionKey::rootless_shared(server_name)
+            } else {
+                ConnectionKey::new(server_name, None)
+            };
+        }
         self.get_or_create_connection_resolved(
             server_name,
             server_config,
@@ -2983,9 +3000,13 @@ impl LanguageServerPool {
         // matches `connection_key`.
         // Resolved before the reader task spawns because the reader answers
         // downstream `workspace/workspaceFolders` queries with these folders.
-        let (root_uri, init_folders) = super::root_markers::workspace_from_marker(marker, || {
-            (self.root_uri(), self.workspace_folders())
-        });
+        let (root_uri, init_folders) = if connection_key.is_rootless_shared() {
+            (None, Some(Vec::new()))
+        } else {
+            super::root_markers::workspace_from_marker(marker, || {
+                (self.root_uri(), self.workspace_folders())
+            })
+        };
         log::debug!(
             target: "kakehashi::bridge::init",
             "[{}] workspace root for spawn: {:?}",
