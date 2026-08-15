@@ -1272,19 +1272,42 @@ impl BridgeCoordinator {
         // Drop the regions already open on each server's connection. The key
         // is per SERVER (`(server, root)`), so it is resolved once per group
         // rather than once per region.
-        let mut server_groups: BTreeMap<String, ServerGroup> = BTreeMap::new();
+        // A single server can receive different routing answers for different
+        // virtual documents. In particular, rootless and rooted injections
+        // must not share one representative URI merely because their server
+        // names match.
+        let mut server_groups: BTreeMap<(String, bool), ServerGroup> = BTreeMap::new();
         for (server_name, (config, group_injections)) in resolved_groups {
-            let routing_uri = group_injections
-                .first()
-                .and_then(|injection| {
-                    let virtual_uri = super::protocol::VirtualDocumentUri::new(
-                        &host_uri_lsp,
-                        &injection.language,
-                        &injection.region_id,
-                    );
-                    Url::parse(&virtual_uri.to_uri_string()).ok()
-                })
-                .unwrap_or_else(|| host_uri.clone());
+            for injection in group_injections {
+                let routing_uri = super::protocol::VirtualDocumentUri::new(
+                    &host_uri_lsp,
+                    &injection.language,
+                    &injection.region_id,
+                );
+                let Ok(routing_uri) = Url::parse(&routing_uri.to_uri_string()) else {
+                    continue;
+                };
+                let rootless = self.pool.host_routing_rootless(&routing_uri, &server_name);
+                let entry = server_groups
+                    .entry((server_name.clone(), rootless))
+                    .or_insert_with(|| (Arc::clone(&config), Vec::new()));
+                entry.1.push(injection);
+            }
+        }
+
+        let mut pending_groups: BTreeMap<(String, bool), ServerGroup> = BTreeMap::new();
+        for ((server_name, rootless), (config, group_injections)) in server_groups {
+            let Some(first) = group_injections.first() else {
+                continue;
+            };
+            let routing_uri = super::protocol::VirtualDocumentUri::new(
+                &host_uri_lsp,
+                &first.language,
+                &first.region_id,
+            );
+            let Ok(routing_uri) = Url::parse(&routing_uri.to_uri_string()) else {
+                continue;
+            };
             let connection_key = self
                 .pool
                 .resolved_connection_key(&server_name, &config, &routing_uri)
@@ -1296,9 +1319,10 @@ impl BridgeCoordinator {
                 })
                 .collect();
             if !pending.is_empty() {
-                server_groups.insert(server_name, (config, pending));
+                pending_groups.insert((server_name, rootless), (config, pending));
             }
         }
+        let server_groups = pending_groups;
 
         // Every resolved injection is already sent/open — preserve the batch.
         if server_groups.is_empty() {
@@ -1312,7 +1336,7 @@ impl BridgeCoordinator {
         let (generation, cancel) = self.supersede_eager_open_tasks(host_uri);
 
         // Spawn one task per server group, registering each handle immediately
-        for (server_name, (config, group_injections)) in server_groups {
+        for ((server_name, _rootless), (config, group_injections)) in server_groups {
             log::debug!(
                 target: "kakehashi::bridge",
                 "Eager open: spawning {} with {} injections",
