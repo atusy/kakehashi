@@ -97,6 +97,20 @@ impl LanguageServerPool {
             incarnation: expected_incarnation,
             connection: expected_key,
         } = expect;
+        // Routing decisions for injected documents are cached by virtual URI.
+        // Use one of those URIs for connection acquisition; resolving from the
+        // host URI would miss an explicit `workspaceFolders: []` answer.
+        let routing_uri = injections
+            .first()
+            .and_then(|injection| {
+                let virtual_uri = VirtualDocumentUri::new(
+                    host_uri_lsp,
+                    &injection.language,
+                    &injection.region_id,
+                );
+                url::Url::parse(&virtual_uri.to_uri_string()).ok()
+            })
+            .unwrap_or_else(|| host_uri.clone());
         // A caller repairing a NAMED connection is acquired BY KEY. Resolving
         // from `host_uri` would find whatever that host routes to *now*, which
         // after a re-rooting config change is a different connection — and then
@@ -115,7 +129,7 @@ impl LanguageServerPool {
                 // spawns, so asking about a host that belongs to some other
                 // root cannot bring that root's server up.
                 let (_marker, routes_to) = self
-                    .resolve_acquire(server_name, server_config, Some(host_uri))
+                    .resolve_acquire(server_name, server_config, Some(&routing_uri))
                     .await;
                 if &routes_to != key {
                     log::debug!(
@@ -146,7 +160,7 @@ impl LanguageServerPool {
                 .get_or_create_connection_wait_ready(
                     server_name,
                     server_config,
-                    Some(host_uri),
+                    Some(&routing_uri),
                     Duration::from_secs(INIT_TIMEOUT_SECS),
                 )
                 .await

@@ -1274,9 +1274,20 @@ impl BridgeCoordinator {
         // rather than once per region.
         let mut server_groups: BTreeMap<String, ServerGroup> = BTreeMap::new();
         for (server_name, (config, group_injections)) in resolved_groups {
+            let routing_uri = group_injections
+                .first()
+                .and_then(|injection| {
+                    let virtual_uri = super::protocol::VirtualDocumentUri::new(
+                        &host_uri_lsp,
+                        &injection.language,
+                        &injection.region_id,
+                    );
+                    Url::parse(&virtual_uri.to_uri_string()).ok()
+                })
+                .unwrap_or_else(|| host_uri.clone());
             let connection_key = self
                 .pool
-                .resolved_connection_key(&server_name, &config, host_uri)
+                .resolved_connection_key(&server_name, &config, &routing_uri)
                 .await;
             let pending: Vec<BridgeInjection> = group_injections
                 .into_iter()
@@ -1417,7 +1428,7 @@ impl BridgeCoordinator {
             text_document: RoutingTextDocument {
                 uri: document_uri.to_string(),
                 language_id: language_id.to_string(),
-                host: host.clone(),
+                host,
             },
             language_servers,
         };
@@ -1494,13 +1505,6 @@ impl BridgeCoordinator {
                 .and_then(|entry| entry.workspace_folders.as_ref())
                 .is_some_and(|folders| folders.as_ref().is_some_and(Vec::is_empty));
             pool.set_host_routing_rootless(document_uri, &config.server_name, rootless);
-            // Eager acquisition and host diagnostics start from the real host
-            // URI, while routing is requested for each virtual injection URI.
-            // Carry the explicit rootless decision to that host-level lookup;
-            // otherwise the virtual route is lost before the first didOpen.
-            if let Some(host_uri) = host.as_ref().and_then(|host| Url::parse(&host.uri).ok()) {
-                pool.set_host_routing_rootless(&host_uri, &config.server_name, rootless);
-            }
             let Some((_, handle)) = handles.iter().find(|(name, _)| name == &config.server_name)
             else {
                 if enabled {

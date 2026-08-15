@@ -51,12 +51,17 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Vec<Diagnostic>> {
         let (host_generation, request_sequence) = self.begin_diagnostic_pull(host_uri);
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
+        let routing_uri = Url::parse(&virtual_uri.to_uri_string())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         // Pre-work: wait for server to become Ready (unlike other handlers that fail fast).
         let handle = self
             .get_or_create_connection_wait_ready(
                 server_name,
                 server_config,
-                Some(host_uri),
+                Some(&routing_uri),
                 Duration::from_secs(INIT_TIMEOUT_SECS),
             )
             .await?;
@@ -75,9 +80,6 @@ impl LanguageServerPool {
         // Server is Ready and supports diagnostics — proceed with standard lifecycle.
         // Use execute_bridge_request_with_handle to reuse the pre-fetched handle,
         // avoiding a redundant HashMap lookup.
-        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-        let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
         let cache_key = (handle.key().clone(), virtual_uri.to_uri_string());
         let snapshot = self.diagnostic_pull_snapshot(
             &cache_key,
