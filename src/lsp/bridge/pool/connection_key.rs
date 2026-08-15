@@ -9,13 +9,10 @@
 //! one.
 //!
 //! `root` is the resolved root URI string from the `root_markers` walk, or
-//! `None` when no marker root applies (no document hint, non-file URI, no
-//! marker found, or the `[]` kill switch) — such a document falls back to the
-//! single client-rooted connection, matching the pre-#382 behavior, unless the
-//! server opted into `preferSharedInstance` (#391), in which case it joins the
-//! shared instance (on capable connections the complete client workspace —
-//! folder snapshot, or the bare rootUri when the client sent no folders — is
-//! announced on its behalf; admission itself needs no root).
+//! `None` when no marker root applies (no document hint, non-file URI, or no
+//! marker found). The routing provider's explicit `workspaceFolders: []` case
+//! uses the separate `RootlessShared` discriminator so it cannot inherit a
+//! client-rooted initialization.
 
 use std::fmt;
 
@@ -26,9 +23,9 @@ enum ConnectionRoot {
     /// Resolved marker workspace root URI string: documents under distinct
     /// marker roots get distinct connections (per-root pooling, #382).
     Marker(String),
-    /// No marker root applied (no document hint, non-file URI, no marker
-    /// found, or the `[]` kill switch). Every such document collapses onto the
-    /// single client-rooted fallback connection — the pre-#382 behavior.
+    /// No marker root applied (no document hint, non-file URI, or no marker
+    /// found). Such documents use the single client-rooted fallback connection
+    /// unless shared-instance routing applies.
     ClientFallback,
     /// One connection shared across *every* root for a `preferSharedInstance`
     /// server (#391), and — because they have no root to isolate by — every

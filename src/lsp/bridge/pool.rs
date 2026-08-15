@@ -1785,11 +1785,7 @@ impl LanguageServerPool {
         document_uri: &Url,
     ) -> ConnectionKey {
         if self.host_routing_rootless(document_uri, server_name) {
-            return if server_config.prefers_shared_instance() {
-                ConnectionKey::rootless_shared(server_name)
-            } else {
-                ConnectionKey::new(server_name, None)
-            };
+            return ConnectionKey::rootless_shared(server_name);
         }
         self.resolve_acquire(server_name, server_config, Some(document_uri))
             .await
@@ -2226,11 +2222,7 @@ impl LanguageServerPool {
         let rootless = document_uri.is_some_and(|uri| self.host_routing_rootless(uri, server_name));
         if rootless {
             marker = None;
-            connection_key = if server_config.prefers_shared_instance() {
-                ConnectionKey::rootless_shared(server_name)
-            } else {
-                ConnectionKey::new(server_name, None)
-            };
+            connection_key = ConnectionKey::rootless_shared(server_name);
         }
 
         // Acquire and wait through initialization for the resolved key.
@@ -2798,11 +2790,7 @@ impl LanguageServerPool {
         let rootless = document_uri.is_some_and(|uri| self.host_routing_rootless(uri, server_name));
         let marker = if rootless { None } else { marker };
         if rootless {
-            connection_key = if server_config.prefers_shared_instance() {
-                ConnectionKey::rootless_shared(server_name)
-            } else {
-                ConnectionKey::new(server_name, None)
-            };
+            connection_key = ConnectionKey::rootless_shared(server_name);
         }
         self.get_or_create_connection_resolved(
             server_name,
