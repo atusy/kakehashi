@@ -1762,6 +1762,7 @@ impl LanguageServerPool {
                 key.clone(),
                 marker,
                 Duration::from_secs(INIT_TIMEOUT_SECS),
+                false,
             )
             .await
         {
@@ -1785,7 +1786,7 @@ impl LanguageServerPool {
         document_uri: &Url,
     ) -> ConnectionKey {
         if self.host_routing_rootless(document_uri, server_name) {
-            return ConnectionKey::rootless_shared(server_name);
+            return ConnectionKey::shared(server_name);
         }
         self.resolve_acquire(server_name, server_config, Some(document_uri))
             .await
@@ -2222,7 +2223,7 @@ impl LanguageServerPool {
         let rootless = document_uri.is_some_and(|uri| self.host_routing_rootless(uri, server_name));
         if rootless {
             marker = None;
-            connection_key = ConnectionKey::rootless_shared(server_name);
+            connection_key = ConnectionKey::shared(server_name);
         }
 
         // Acquire and wait through initialization for the resolved key.
@@ -2233,6 +2234,7 @@ impl LanguageServerPool {
                 connection_key,
                 marker.clone(),
                 timeout,
+                rootless,
             )
             .await?;
 
@@ -2279,6 +2281,7 @@ impl LanguageServerPool {
                         per_root_key,
                         marker,
                         remaining,
+                        false,
                     )
                     .await;
             }
@@ -2306,6 +2309,7 @@ impl LanguageServerPool {
         connection_key: ConnectionKey,
         marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         timeout: Duration,
+        rootless: bool,
     ) -> io::Result<Arc<ConnectionHandle>> {
         match self
             .get_or_create_connection_resolved(
@@ -2318,6 +2322,7 @@ impl LanguageServerPool {
                 // incapable-shared divert, which passes its REMAINING budget)
                 // stays within `timeout` overall.
                 timeout,
+                rootless,
                 None,
             )
             .await
@@ -2653,9 +2658,6 @@ impl LanguageServerPool {
         let folders: Vec<tower_lsp_server::ls_types::WorkspaceFolder> = match marker {
             Some((_root, folder)) => vec![folder.clone()],
             None => {
-                if handle.key().is_rootless_shared() {
-                    return Ok(());
-                }
                 let snapshot = self.workspace_folders().unwrap_or_default();
                 if !snapshot.is_empty() {
                     snapshot
@@ -2790,7 +2792,7 @@ impl LanguageServerPool {
         let rootless = document_uri.is_some_and(|uri| self.host_routing_rootless(uri, server_name));
         let marker = if rootless { None } else { marker };
         if rootless {
-            connection_key = ConnectionKey::rootless_shared(server_name);
+            connection_key = ConnectionKey::shared(server_name);
         }
         self.get_or_create_connection_resolved(
             server_name,
@@ -2798,6 +2800,7 @@ impl LanguageServerPool {
             connection_key,
             marker,
             timeout,
+            rootless,
             admit,
         )
         .await
@@ -2810,6 +2813,11 @@ impl LanguageServerPool {
     /// `Initializing`, and run the LSP initialize handshake in a background task
     /// that transitions Ready or Failed. Requests against Initializing fail with
     /// REQUEST_FAILED; Failed causes removal and respawn on the next call.
+    // The rootless bit is intentionally separate from `ConnectionKey::shared`:
+    // both ordinary shared acquisitions and routed `[]` acquisitions use the
+    // same key, but only the latter may seed a fresh process without the client
+    // workspace. Keep this explicit at the spawn boundary.
+    #[allow(clippy::too_many_arguments)]
     async fn get_or_create_connection_resolved(
         &self,
         server_name: &str,
@@ -2817,6 +2825,7 @@ impl LanguageServerPool {
         connection_key: ConnectionKey,
         marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         timeout: Duration,
+        rootless: bool,
         admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         let mut connections = self.connections.lock().await;
@@ -2887,7 +2896,9 @@ impl LanguageServerPool {
                 // check, so it must not be held here (the tokio mutex is not
                 // reentrant).
                 drop(connections);
-                self.announce_shared_root(&handle, &marker).await?;
+                if !rootless {
+                    self.announce_shared_root(&handle, &marker).await?;
+                }
                 return Ok(handle);
             }
             ConnectionAction::FailFast(err) => {
@@ -2988,7 +2999,7 @@ impl LanguageServerPool {
         // matches `connection_key`.
         // Resolved before the reader task spawns because the reader answers
         // downstream `workspace/workspaceFolders` queries with these folders.
-        let (root_uri, init_folders) = if connection_key.is_rootless_shared() {
+        let (root_uri, init_folders) = if rootless {
             (None, Some(Vec::new()))
         } else {
             super::root_markers::workspace_from_marker(marker, || {

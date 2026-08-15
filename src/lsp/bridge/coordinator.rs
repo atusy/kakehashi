@@ -1417,7 +1417,7 @@ impl BridgeCoordinator {
             text_document: RoutingTextDocument {
                 uri: document_uri.to_string(),
                 language_id: language_id.to_string(),
-                host,
+                host: host.clone(),
             },
             language_servers,
         };
@@ -1488,15 +1488,19 @@ impl BridgeCoordinator {
                     .and_then(|answer| answer.routing.get(&config.server_name))
                     .and_then(|entry| entry.workspace_folders.clone()),
             );
-            pool.set_host_routing_rootless(
-                document_uri,
-                &config.server_name,
-                answer
-                    .as_ref()
-                    .and_then(|answer| answer.routing.get(&config.server_name))
-                    .and_then(|entry| entry.workspace_folders.as_ref())
-                    .is_some_and(|folders| folders.as_ref().is_some_and(Vec::is_empty)),
-            );
+            let rootless = answer
+                .as_ref()
+                .and_then(|answer| answer.routing.get(&config.server_name))
+                .and_then(|entry| entry.workspace_folders.as_ref())
+                .is_some_and(|folders| folders.as_ref().is_some_and(Vec::is_empty));
+            pool.set_host_routing_rootless(document_uri, &config.server_name, rootless);
+            // Eager acquisition and host diagnostics start from the real host
+            // URI, while routing is requested for each virtual injection URI.
+            // Carry the explicit rootless decision to that host-level lookup;
+            // otherwise the virtual route is lost before the first didOpen.
+            if let Some(host_uri) = host.as_ref().and_then(|host| Url::parse(&host.uri).ok()) {
+                pool.set_host_routing_rootless(&host_uri, &config.server_name, rootless);
+            }
             let Some((_, handle)) = handles.iter().find(|(name, _)| name == &config.server_name)
             else {
                 if enabled {
