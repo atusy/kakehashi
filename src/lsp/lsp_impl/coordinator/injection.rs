@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use url::Url;
 
@@ -299,9 +300,16 @@ impl InjectionCoordinator {
         // the same incarnation and is cancelled by the next close/rebuild.
         let coordinator = self.clone();
         let uri = uri.clone();
+        let routing_sender = self.bridge.begin_virtual_routing(&uri);
         tokio::spawn(async move {
             coordinator
-                .eager_spawn_bridge_servers(&uri, incarnation, &host_language, injections)
+                .eager_spawn_bridge_servers(
+                    &uri,
+                    incarnation,
+                    &host_language,
+                    injections,
+                    routing_sender,
+                )
                 .await;
         });
         true
@@ -450,10 +458,18 @@ impl InjectionCoordinator {
         incarnation: u64,
         host_language: &str,
         injections: Vec<BridgeInjection>,
+        routing_sender: Arc<tokio::sync::watch::Sender<bool>>,
     ) {
         let settings = self.settings_manager.load_settings();
         self.bridge
-            .eager_spawn_and_open_documents(&settings, host_language, uri, incarnation, injections)
+            .eager_spawn_and_open_documents(
+                &settings,
+                host_language,
+                uri,
+                incarnation,
+                injections,
+                routing_sender,
+            )
             .await;
     }
 

@@ -239,6 +239,13 @@ impl ConfigMemo {
 }
 
 impl BridgeCoordinator {
+    pub(crate) fn begin_virtual_routing(
+        &self,
+        host_uri: &Url,
+    ) -> Arc<tokio::sync::watch::Sender<bool>> {
+        self.pool.begin_virtual_routing(host_uri)
+    }
+
     /// Create a new bridge coordinator with fresh pool and tracker.
     pub(crate) fn new() -> Self {
         let pool = Arc::new(LanguageServerPool::new());
@@ -1262,6 +1269,9 @@ impl BridgeCoordinator {
     ///
     /// Sending `didOpen` up front (not just a handshake) lets downstream servers
     /// start analyzing immediately, yielding faster diagnostics.
+    /// The lifecycle coordinator registers `routing_sender` synchronously,
+    /// before detaching this eager task, so interactive requests cannot pass
+    /// through the spawn-to-first-poll window.
     pub(crate) async fn eager_spawn_and_open_documents(
         &self,
         settings: &WorkspaceSettings,
@@ -1269,6 +1279,7 @@ impl BridgeCoordinator {
         host_uri: &Url,
         incarnation: u64,
         injections: Vec<BridgeInjection>,
+        routing_sender: Arc<tokio::sync::watch::Sender<bool>>,
     ) {
         // Convert host_uri to ls_types::Uri for VirtualDocumentUri construction
         let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
@@ -1285,7 +1296,6 @@ impl BridgeCoordinator {
 
         // Empty means current settings resolve no server for any injection —
         // the batch belongs to removed configuration and must stop.
-        let routing_sender = self.pool.begin_virtual_routing(host_uri);
         let routed = self
             .route_virtual_injections(
                 settings,
@@ -3153,6 +3163,7 @@ mod tests {
                 &host_uri,
                 1,
                 vec![injection("rust", "r1")],
+                coordinator.begin_virtual_routing(&host_uri),
             )
             .await;
 
