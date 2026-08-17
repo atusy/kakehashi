@@ -2162,6 +2162,16 @@ impl LanguageServerPool {
         injection_language: &str,
         region_id: &str,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        // Legacy or client-modified resolve envelopes may not carry the
+        // virtual identity. Do not feed an empty component to
+        // `VirtualDocumentUri::new` (debug builds assert, and release builds
+        // would select an unrelated `.txt` route); preserve the pre-routing
+        // host-URI fallback instead.
+        if injection_language.is_empty() || region_id.is_empty() {
+            return self
+                .get_or_create_connection(server_name, server_config, Some(host_uri))
+                .await;
+        }
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         let virtual_uri =
