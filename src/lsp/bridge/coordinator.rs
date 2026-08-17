@@ -653,7 +653,7 @@ impl BridgeCoordinator {
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
             return OpenOutcome::NotOpened;
         };
-        let routed = self
+        let (routed, _) = self
             .route_virtual_injections(
                 settings,
                 host_language,
@@ -1155,9 +1155,10 @@ impl BridgeCoordinator {
         injections: Vec<BridgeInjection>,
         target_server: Option<&str>,
         routing_tokens: Option<&HashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>>,
-    ) -> Vec<(BridgeInjection, Vec<ResolvedServerConfig>)> {
+    ) -> (Vec<(BridgeInjection, Vec<ResolvedServerConfig>)>, bool) {
         let mut configs_by_lang: HashMap<String, Vec<ResolvedServerConfig>> = HashMap::new();
         let mut routed = Vec::with_capacity(injections.len());
+        let mut superseded = false;
         for injection in injections {
             let virtual_uri = super::protocol::VirtualDocumentUri::new(
                 host_uri_lsp,
@@ -1182,6 +1183,12 @@ impl BridgeCoordinator {
             };
             if configs.is_empty() {
                 if let Some(token) = routing_tokens.and_then(|tokens| tokens.get(&document_uri)) {
+                    if !self
+                        .pool
+                        .is_virtual_routing_current(host_uri, &document_uri, token)
+                    {
+                        superseded = true;
+                    }
                     self.pool
                         .finish_virtual_routing(host_uri, &document_uri, token);
                 }
@@ -1203,12 +1210,18 @@ impl BridgeCoordinator {
             )
             .await;
             if let Some(token) = routing_tokens.and_then(|tokens| tokens.get(&document_uri)) {
+                if !self
+                    .pool
+                    .is_virtual_routing_current(host_uri, &document_uri, token)
+                {
+                    superseded = true;
+                }
                 self.pool
                     .finish_virtual_routing(host_uri, &document_uri, token);
             }
             routed.push((injection, selected));
         }
-        routed
+        (routed, superseded)
     }
 
     fn eager_open_groups_for_configs(
@@ -1325,7 +1338,7 @@ impl BridgeCoordinator {
 
         // Empty means current settings resolve no server for any injection —
         // the batch belongs to removed configuration and must stop.
-        let routed = self
+        let (routed, routing_superseded) = self
             .route_virtual_injections(
                 settings,
                 host_language,
@@ -1338,6 +1351,9 @@ impl BridgeCoordinator {
             .await;
         let resolved_groups = Self::eager_open_groups_for_configs(routed);
         if resolved_groups.is_empty() {
+            if routing_superseded {
+                return;
+            }
             self.cancel_eager_open(host_uri);
             return;
         }

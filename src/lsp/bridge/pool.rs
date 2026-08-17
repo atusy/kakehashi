@@ -1476,18 +1476,25 @@ impl LanguageServerPool {
     }
 
     pub(crate) async fn wait_for_virtual_routing(&self, host_uri: &Url, virtual_uri: &Url) {
-        let Some(sender) = self
-            .virtual_routing_pending
-            .get(&(host_uri.clone(), virtual_uri.clone()))
-            .map(|entry| Arc::clone(entry.value()))
-        else {
-            return;
-        };
-        let mut receiver = sender.subscribe();
-        while !*receiver.borrow() {
-            if receiver.changed().await.is_err() {
+        let key = (host_uri.clone(), virtual_uri.clone());
+        loop {
+            let Some(sender) = self
+                .virtual_routing_pending
+                .get(&key)
+                .map(|entry| Arc::clone(entry.value()))
+            else {
                 return;
+            };
+            let mut receiver = sender.subscribe();
+            while !*receiver.borrow() {
+                if receiver.changed().await.is_err() {
+                    break;
+                }
             }
+            // A notification can mean either completion (the entry was
+            // removed) or handoff (the entry was replaced by a newer pass).
+            // Re-read the map so an old pass cannot release a waiter into a
+            // connection acquired before the newest routing answer.
         }
     }
 
@@ -6339,7 +6346,14 @@ mod tests {
             "a virtual request must wait for the routing answer"
         );
 
-        pool.finish_virtual_routing(&host_uri, &virtual_uri, &sender);
+        let replacement = pool.begin_virtual_routing(&host_uri, &virtual_uri);
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "handoff from an old routing pass must keep waiting"
+        );
+        let _ = sender.send(true);
+        pool.finish_virtual_routing(&host_uri, &virtual_uri, &replacement);
         waiter.await.expect("the request proceeds after routing");
     }
 
