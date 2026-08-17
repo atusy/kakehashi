@@ -171,9 +171,25 @@ impl LanguageServerPool {
                 .await
             {
                 Ok(h) => {
+                    let capability_fallback = if let Some(expected) =
+                        expected_connection.as_ref().filter(|expected| {
+                            h.key() != *expected && expected.is_shared() && !h.key().is_shared()
+                        }) {
+                        // A shared connection can legitimately divert to a
+                        // per-root key after it is Ready but lacks
+                        // workspace-folder change support. Confirm that the
+                        // routing decision itself is still the expected
+                        // shared key before accepting that fallback.
+                        self.resolved_connection_key(server_name, server_config, &routing_uri)
+                            .await
+                            == *expected
+                    } else {
+                        false
+                    };
                     if expected_connection
                         .as_ref()
                         .is_some_and(|expected| h.key() != expected)
+                        && !capability_fallback
                     {
                         log::debug!(
                             target: "kakehashi::bridge",
