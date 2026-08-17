@@ -200,6 +200,13 @@ impl LanguageServerPool {
             re_envelope_item(&mut item, &envelope);
             return item;
         };
+        if envelope
+            .incarnation
+            .is_some_and(|expected| self.current_host_incarnation(&host_uri) != Some(expected))
+        {
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        }
         let handle = match self
             .get_or_create_virtual_connection(
                 server_name,
@@ -409,6 +416,7 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
     let ctx = EnvelopeContext {
         server_name: &envelope.origin,
         injection_language: &envelope.injection_language,
+        incarnation: envelope.incarnation,
         host_uri: &envelope.host_uri,
         region_id: &envelope.region_id,
         offset: &RegionOffset::from(&envelope.offset),
@@ -462,6 +470,7 @@ mod tests {
         KakehashiEnvelope {
             origin: "lua-ls".to_string(),
             injection_language: "markdown".to_string(),
+            incarnation: Some(1),
             host_uri: "file:///test/doc.md".to_string(),
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
             inner: Some(json!({"resolve_id": 99})),
@@ -680,6 +689,7 @@ mod tests {
         let envelope = KakehashiEnvelope {
             origin: server.to_string(),
             injection_language: "markdown".to_string(),
+            incarnation: Some(1),
             host_uri: "file:///test/doc.md".to_string(),
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
             inner: Some(json!({"resolve_id": 42})),

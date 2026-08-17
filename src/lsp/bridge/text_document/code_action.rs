@@ -74,6 +74,9 @@ pub(crate) struct CodeActionEnvelope {
     pub(crate) original_title: String,
     /// The downstream server's original `data` value (preserved verbatim).
     pub(crate) inner: Option<Value>,
+    /// Host open incarnation that produced this action. Missing for legacy data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) incarnation: Option<u64>,
     /// Host-layer action (`bridge._self`): its edit/data are already in host
     /// coordinates, so resolve routes to the host server VERBATIM — no virtual
     /// URI, region, or offset translation. `region_id`/`injection_language`/
@@ -106,6 +109,7 @@ pub(crate) struct CodeActionEnvelopeContext<'a> {
     region_id: &'a str,
     injection_language: &'a str,
     offset: &'a RegionOffset,
+    incarnation: Option<u64>,
 }
 
 /// Wrap `action.data` in a Kakehashi envelope for origin tracking, capturing
@@ -120,6 +124,7 @@ fn envelope_action_data(action: &mut CodeAction, ctx: &CodeActionEnvelopeContext
         offset: EnvelopeOffset::from(ctx.offset),
         original_title: action.title.clone(),
         inner,
+        incarnation: ctx.incarnation,
         host_layer: false,
     };
     action.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
@@ -145,6 +150,7 @@ fn envelope_host_action(action: &mut CodeAction, server_name: &str, host_uri: &s
         },
         original_title: action.title.clone(),
         inner,
+        incarnation: None,
         host_layer: true,
     };
     action.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
@@ -187,6 +193,7 @@ fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
             offset: envelope.offset.clone(),
             original_title: envelope.original_title.clone(),
             inner,
+            incarnation: envelope.incarnation,
             host_layer: envelope.host_layer,
         }
     }));
@@ -488,6 +495,7 @@ impl LanguageServerPool {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let virtual_uri_string =
             VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id).to_uri_string();
+        let host_incarnation = self.current_host_incarnation(host_uri);
         let virt = VirtLayerContext {
             request_virtual_uri: &virtual_uri_string,
             host_uri: &host_uri_lsp,
@@ -499,6 +507,7 @@ impl LanguageServerPool {
             injection_language,
             host_uri_string: host_uri.as_str(),
             server_name,
+            incarnation: host_incarnation,
         };
         Ok(Some(bridge_code_actions(
             actions,
@@ -696,6 +705,13 @@ impl LanguageServerPool {
             re_envelope_action(&mut action, &envelope);
             return action;
         };
+        if envelope
+            .incarnation
+            .is_some_and(|expected| self.current_host_incarnation(&host_url) != Some(expected))
+        {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
         let handle = match self
             .get_or_create_connection(server_name, server_config, Some(&host_url))
             .await
@@ -781,6 +797,13 @@ impl LanguageServerPool {
             re_envelope_action(&mut action, &envelope);
             return action;
         };
+        if envelope
+            .incarnation
+            .is_some_and(|expected| self.current_host_incarnation(&host_url) != Some(expected))
+        {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
         let handle = match self
             .get_or_create_virtual_connection(
                 server_name,
@@ -1242,6 +1265,7 @@ pub(crate) struct VirtLayerContext<'a> {
     /// (`host_uri` above is the `Uri` form used for edit re-keying).
     host_uri_string: &'a str,
     server_name: &'a str,
+    incarnation: Option<u64>,
 }
 
 impl VirtLayerContext<'_> {
@@ -1252,6 +1276,7 @@ impl VirtLayerContext<'_> {
             region_id: self.region_id,
             injection_language: self.injection_language,
             offset: self.offset,
+            incarnation: self.incarnation,
         }
     }
 }
@@ -1916,6 +1941,7 @@ mod tests {
             injection_language: "lua",
             host_uri_string: "file:///test.md",
             server_name: "ruff",
+            incarnation: Some(1),
         };
         Some(bridge_code_actions(
             actions,
@@ -2675,6 +2701,7 @@ mod tests {
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             injection_language: "lua",
             offset,
+            incarnation: Some(1),
         }
     }
 

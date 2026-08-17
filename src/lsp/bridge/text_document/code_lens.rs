@@ -61,6 +61,9 @@ pub(crate) struct CodeLensEnvelope {
     /// Injection language needed to reconstruct the routed virtual URI during
     /// a later `codeLens/resolve` request.
     pub(crate) injection_language: String,
+    /// Host open incarnation that produced this lens. Missing for legacy data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) incarnation: Option<u64>,
     /// Region offset snapshot for coordinate translation at resolve time.
     pub(crate) offset: EnvelopeOffset,
     /// The downstream server's original `data` value (preserved verbatim).
@@ -73,6 +76,7 @@ struct CodeLensEnvelopeContext<'a> {
     host_uri: &'a str,
     region_id: &'a str,
     injection_language: &'a str,
+    incarnation: Option<u64>,
     offset: &'a RegionOffset,
 }
 
@@ -84,6 +88,7 @@ fn envelope_lens_data(lens: &mut CodeLens, ctx: &CodeLensEnvelopeContext) {
         host_uri: ctx.host_uri.to_string(),
         region_id: ctx.region_id.to_string(),
         injection_language: ctx.injection_language.to_string(),
+        incarnation: ctx.incarnation,
         offset: EnvelopeOffset::from(ctx.offset),
         inner,
     };
@@ -116,6 +121,7 @@ fn re_envelope_lens(lens: &mut CodeLens, envelope: &CodeLensEnvelope) {
         host_uri: &envelope.host_uri,
         region_id: &envelope.region_id,
         injection_language: &envelope.injection_language,
+        incarnation: envelope.incarnation,
         offset: &RegionOffset::from(&envelope.offset),
     };
     envelope_lens_data(lens, &ctx);
@@ -140,6 +146,7 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
         client_progress_token: Option<NumberOrString>,
     ) -> io::Result<Option<Vec<CodeLens>>> {
+        let host_incarnation = self.current_host_incarnation(host_uri);
         let handle = self
             .get_or_create_virtual_connection(
                 server_name,
@@ -170,6 +177,7 @@ impl LanguageServerPool {
                     host_uri: &host_uri_string,
                     region_id,
                     injection_language,
+                    incarnation: host_incarnation,
                     offset: ctx.offset,
                 };
                 transform_code_lens_response_to_host(response, ctx.offset, &envelope_ctx)
@@ -232,6 +240,13 @@ impl LanguageServerPool {
             re_envelope_lens(&mut lens, &envelope);
             return lens;
         };
+        if envelope
+            .incarnation
+            .is_some_and(|expected| self.current_host_incarnation(&host_uri) != Some(expected))
+        {
+            re_envelope_lens(&mut lens, &envelope);
+            return lens;
+        }
         let handle = match self
             .get_or_create_virtual_connection(
                 server_name,
@@ -438,6 +453,7 @@ mod tests {
             host_uri: "file:///test.md",
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             injection_language: "lua",
+            incarnation: Some(1),
             offset,
         }
     }

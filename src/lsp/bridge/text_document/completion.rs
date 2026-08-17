@@ -49,6 +49,7 @@ impl LanguageServerPool {
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<CompletionList>> {
+        let host_incarnation = self.current_host_incarnation(host_uri);
         let handle = self
             .get_or_create_virtual_connection(
                 server_name,
@@ -84,6 +85,7 @@ impl LanguageServerPool {
                     Some(EnvelopeContext {
                         server_name,
                         injection_language,
+                        incarnation: host_incarnation,
                         host_uri: host_uri.as_str(),
                         region_id,
                         offset: ctx.offset,
@@ -395,6 +397,9 @@ pub(crate) struct KakehashiEnvelope {
     /// Empty for host-layer and legacy envelopes.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub injection_language: String,
+    /// Host open incarnation that produced this item. Missing for legacy data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<u64>,
     /// Host document URI the completion was requested on. Used to re-resolve the
     /// same `(server, root)` connection for `completionItem/resolve` so the
     /// resolve reaches the very process that produced the item (#382) — without
@@ -498,6 +503,7 @@ impl From<&EnvelopeOffset> for RegionOffset {
 pub(crate) struct EnvelopeContext<'a> {
     pub server_name: &'a str,
     pub injection_language: &'a str,
+    pub incarnation: Option<u64>,
     /// Host document URI the completion ran on, stored in the envelope so
     /// `completionItem/resolve` can route back to the originating connection.
     pub host_uri: &'a str,
@@ -521,6 +527,7 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
     let envelope = KakehashiEnvelope {
         origin: ctx.server_name.to_string(),
         injection_language: ctx.injection_language.to_string(),
+        incarnation: ctx.incarnation,
         host_uri: ctx.host_uri.to_string(),
         region_id: ctx.region_id.to_string(),
         inner: None,
@@ -610,6 +617,7 @@ pub(super) fn envelope_host_item(item: &mut CompletionItem, server_name: &str, h
     let envelope = KakehashiEnvelope {
         origin: server_name.to_string(),
         injection_language: String::new(),
+        incarnation: None,
         host_uri: host_uri.to_string(),
         region_id: String::new(),
         inner: None,
@@ -1162,6 +1170,7 @@ mod tests {
         let ctx = EnvelopeContext {
             server_name: "lua-ls",
             injection_language: "markdown",
+            incarnation: Some(1),
             host_uri: "file:///test/doc.md",
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
@@ -1358,6 +1367,7 @@ mod tests {
             &EnvelopeContext {
                 server_name: "lua-ls",
                 injection_language: "markdown",
+                incarnation: Some(1),
                 host_uri: "file:///test/doc.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,
@@ -1381,6 +1391,7 @@ mod tests {
             &EnvelopeContext {
                 server_name: "lua-ls",
                 injection_language: "markdown",
+                incarnation: Some(1),
                 host_uri: "file:///test/doc.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,
@@ -1406,6 +1417,7 @@ mod tests {
         let ctx = EnvelopeContext {
             server_name: "lua-ls",
             injection_language: "markdown",
+            incarnation: Some(1),
             host_uri: "file:///test/doc.md",
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
@@ -1448,6 +1460,7 @@ mod tests {
             &EnvelopeContext {
                 server_name: "lua-ls",
                 injection_language: "markdown",
+                incarnation: Some(1),
                 host_uri: "file:///test/doc.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,
