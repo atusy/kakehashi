@@ -1175,8 +1175,7 @@ impl BridgeCoordinator {
                 None => configs,
             };
             if configs.is_empty() {
-                self.pool
-                    .finish_virtual_routing(host_uri, &document_uri);
+                self.pool.finish_virtual_routing(host_uri, &document_uri);
                 continue;
             }
             let selected = Self::resolve_document_routing(
