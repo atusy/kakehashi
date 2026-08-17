@@ -1439,6 +1439,7 @@ impl BridgeCoordinator {
                             incarnation,
                             // The eager batch opens wherever the host routes now.
                             connection: None,
+                            expected_connection: Some(connection_key.clone()),
                         },
                         group_injections,
                     ) => {}
@@ -2752,6 +2753,7 @@ mod tests {
                 crate::lsp::bridge::OpenExpectation {
                     incarnation: 1,
                     connection: None,
+                    expected_connection: None,
                 },
                 injections,
                 "other-server",

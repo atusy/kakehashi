@@ -61,6 +61,10 @@ pub(crate) struct OpenExpectation<'a> {
     /// `None` opens wherever the host routes now, spawning if needed, which is
     /// what every other caller wants.
     pub(crate) connection: Option<&'a ConnectionKey>,
+    /// Expected key for a normal eager batch. Unlike `connection`, this does
+    /// not force a ready-only repair; it rejects a race that reacquires a
+    /// different key after the group was formed.
+    pub(crate) expected_connection: Option<ConnectionKey>,
 }
 
 struct LifecycleCleanup<'a> {
@@ -96,6 +100,7 @@ impl LanguageServerPool {
         let OpenExpectation {
             incarnation: expected_incarnation,
             connection: expected_key,
+            expected_connection,
         } = expect;
         // Routing decisions for injected documents are cached by virtual URI.
         // Use one of those URIs for connection acquisition; resolving from the
@@ -165,7 +170,21 @@ impl LanguageServerPool {
                 )
                 .await
             {
-                Ok(h) => h,
+                Ok(h) => {
+                    if expected_connection
+                        .as_ref()
+                        .is_some_and(|expected| h.key() != expected)
+                    {
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "Eager open: routing changed from expected {} to {}",
+                            expected_connection.as_ref().unwrap(),
+                            h.key()
+                        );
+                        return OpenOutcome::NotApplicable;
+                    }
+                    h
+                }
                 Err(e) => {
                     log::debug!(
                         target: "kakehashi::bridge",
@@ -532,6 +551,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: None,
+                    expected_connection: None,
                 },
                 injections,
             )
@@ -594,6 +614,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: Some(&claimed),
+                    expected_connection: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -644,6 +665,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: Some(&gone),
+                    expected_connection: None,
                 },
                 injections,
             )
@@ -698,6 +720,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: Some(&elsewhere),
+                    expected_connection: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -744,6 +767,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: Some(&routed_key),
+                    expected_connection: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -800,6 +824,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: None,
+                    expected_connection: None,
                 },
                 injections.clone(),
             )
@@ -822,6 +847,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: None,
+                    expected_connection: None,
                 },
                 injections,
             )

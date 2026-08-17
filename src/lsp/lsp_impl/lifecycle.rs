@@ -1773,6 +1773,7 @@ fn spawn_upstream_request(
                                     // that route here are opened, and they are
                                     // opened HERE.
                                     connection: Some(&key),
+                                    expected_connection: None,
                                 },
                                 injections,
                                 &reopen_server,

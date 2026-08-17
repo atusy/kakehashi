@@ -5959,6 +5959,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: None,
+                    expected_connection: None,
                 },
                 vec![super::super::coordinator::BridgeInjection {
                     language: "lua".to_string(),
@@ -6004,6 +6005,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: None,
+                    expected_connection: None,
                 },
                 vec![super::super::coordinator::BridgeInjection {
                     language: "lua".to_string(),
