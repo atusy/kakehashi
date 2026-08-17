@@ -128,8 +128,8 @@ impl LanguageServerPool {
                 // compare. Read-only — unlike the `None` arm below it never
                 // spawns, so asking about a host that belongs to some other
                 // root cannot bring that root's server up.
-                let (_marker, routes_to) = self
-                    .resolve_acquire(server_name, server_config, Some(&routing_uri))
+                let routes_to = self
+                    .resolved_connection_key(server_name, server_config, &routing_uri)
                     .await;
                 if &routes_to != key {
                     log::debug!(

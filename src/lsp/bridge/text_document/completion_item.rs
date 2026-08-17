@@ -196,9 +196,18 @@ impl LanguageServerPool {
         // The origin
         // is normally already pooled by the completion request that produced the
         // item; only if it died in between does this respawn.
-        let host_uri = Url::parse(&envelope.host_uri).ok();
+        let Ok(host_uri) = Url::parse(&envelope.host_uri) else {
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        };
         let handle = match self
-            .get_or_create_connection(server_name, server_config, host_uri.as_ref())
+            .get_or_create_virtual_connection(
+                server_name,
+                server_config,
+                &host_uri,
+                &envelope.injection_language,
+                &envelope.region_id,
+            )
             .await
         {
             Ok(h) => h,
@@ -399,6 +408,7 @@ fn translate_item_ranges_host_to_virtual(item: &mut CompletionItem, offset: &Reg
 fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
     let ctx = EnvelopeContext {
         server_name: &envelope.origin,
+        injection_language: &envelope.injection_language,
         host_uri: &envelope.host_uri,
         region_id: &envelope.region_id,
         offset: &RegionOffset::from(&envelope.offset),
@@ -451,6 +461,7 @@ mod tests {
     fn test_envelope() -> KakehashiEnvelope {
         KakehashiEnvelope {
             origin: "lua-ls".to_string(),
+            injection_language: "markdown".to_string(),
             host_uri: "file:///test/doc.md".to_string(),
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
             inner: Some(json!({"resolve_id": 99})),
@@ -668,6 +679,7 @@ mod tests {
     fn enveloped_item(server: &str) -> CompletionItem {
         let envelope = KakehashiEnvelope {
             origin: server.to_string(),
+            injection_language: "markdown".to_string(),
             host_uri: "file:///test/doc.md".to_string(),
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
             inner: Some(json!({"resolve_id": 42})),

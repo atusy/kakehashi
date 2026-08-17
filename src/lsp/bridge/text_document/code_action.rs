@@ -782,7 +782,13 @@ impl LanguageServerPool {
             return action;
         };
         let handle = match self
-            .get_or_create_connection(server_name, server_config, Some(&host_url))
+            .get_or_create_virtual_connection(
+                server_name,
+                server_config,
+                &host_url,
+                &envelope.injection_language,
+                &envelope.region_id,
+            )
             .await
         {
             Ok(h) => h,
