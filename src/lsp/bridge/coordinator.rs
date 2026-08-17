@@ -1285,6 +1285,7 @@ impl BridgeCoordinator {
 
         // Empty means current settings resolve no server for any injection —
         // the batch belongs to removed configuration and must stop.
+        let routing_sender = self.pool.begin_virtual_routing(host_uri);
         let routed = self
             .route_virtual_injections(
                 settings,
@@ -1295,6 +1296,7 @@ impl BridgeCoordinator {
                 None,
             )
             .await;
+        self.pool.finish_virtual_routing(host_uri, &routing_sender);
         let resolved_groups = Self::eager_open_groups_for_configs(routed);
         if resolved_groups.is_empty() {
             self.cancel_eager_open(host_uri);
