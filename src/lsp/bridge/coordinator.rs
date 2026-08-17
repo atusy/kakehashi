@@ -1349,11 +1349,11 @@ impl BridgeCoordinator {
                 Some(&routing_tokens),
             )
             .await;
+        if routing_superseded {
+            return;
+        }
         let resolved_groups = Self::eager_open_groups_for_configs(routed);
         if resolved_groups.is_empty() {
-            if routing_superseded {
-                return;
-            }
             self.cancel_eager_open(host_uri);
             return;
         }
