@@ -6324,7 +6324,7 @@ mod tests {
         let host_uri = Url::parse("file:///test/pending-routing.md").unwrap();
         let virtual_uri =
             Url::parse("deno:///test/pending-routing.md?language=lua&region=r0").unwrap();
-        pool.begin_virtual_routing(&host_uri, &virtual_uri);
+        let sender = pool.begin_virtual_routing(&host_uri, &virtual_uri);
         let waiter = {
             let pool = Arc::clone(&pool);
             let host_uri = host_uri.clone();
@@ -6339,7 +6339,7 @@ mod tests {
             "a virtual request must wait for the routing answer"
         );
 
-        pool.finish_virtual_routing(&host_uri, &virtual_uri);
+        pool.finish_virtual_routing(&host_uri, &virtual_uri, &sender);
         waiter.await.expect("the request proceeds after routing");
     }
 
