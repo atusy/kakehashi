@@ -658,6 +658,37 @@ impl BridgeCoordinator {
             // nothing to reject.
             return OpenOutcome::NotApplicable;
         };
+        // A repair is for one concrete connection. The same host can have
+        // injections routed to several keys, so do not pass the whole server
+        // batch to `eager_open_virtual_documents` and let its first injection
+        // represent the rest. The normal eager path is partitioned earlier;
+        // this filters the respawn path to the key being repaired.
+        let for_server = if let Some(expected_key) = expect.connection {
+            let mut matching = Vec::new();
+            for injection in for_server {
+                let virtual_uri = super::protocol::VirtualDocumentUri::new(
+                    &host_uri_lsp,
+                    &injection.language,
+                    &injection.region_id,
+                );
+                let Ok(routing_uri) = Url::parse(&virtual_uri.to_uri_string()) else {
+                    continue;
+                };
+                let routed_key = self
+                    .pool
+                    .resolved_connection_key(server_name, &config, &routing_uri)
+                    .await;
+                if &routed_key == expected_key {
+                    matching.push(injection);
+                }
+            }
+            matching
+        } else {
+            for_server
+        };
+        if for_server.is_empty() {
+            return OpenOutcome::NotApplicable;
+        }
         self.pool
             .eager_open_virtual_documents(
                 server_name,
