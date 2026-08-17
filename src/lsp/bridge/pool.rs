@@ -1448,7 +1448,11 @@ impl LanguageServerPool {
         sender
     }
 
-    pub(crate) fn begin_virtual_routing(&self, host_uri: &Url, virtual_uri: &Url) {
+    pub(crate) fn begin_virtual_routing(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &Url,
+    ) -> Arc<tokio::sync::watch::Sender<bool>> {
         let sender = Arc::new(tokio::sync::watch::channel(false).0);
         let key = (host_uri.clone(), virtual_uri.clone());
         if let Some(previous) = self
@@ -1457,6 +1461,18 @@ impl LanguageServerPool {
         {
             let _ = previous.send(true);
         }
+        sender
+    }
+
+    pub(crate) fn is_virtual_routing_current(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &Url,
+        sender: &Arc<tokio::sync::watch::Sender<bool>>,
+    ) -> bool {
+        self.virtual_routing_pending
+            .get(&(host_uri.clone(), virtual_uri.clone()))
+            .is_some_and(|current| Arc::ptr_eq(current.value(), sender))
     }
 
     pub(crate) async fn wait_for_virtual_routing(&self, host_uri: &Url, virtual_uri: &Url) {
@@ -1475,9 +1491,18 @@ impl LanguageServerPool {
         }
     }
 
-    pub(crate) fn finish_virtual_routing(&self, host_uri: &Url, virtual_uri: &Url) {
+    pub(crate) fn finish_virtual_routing(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &Url,
+        sender: &Arc<tokio::sync::watch::Sender<bool>>,
+    ) {
         let key = (host_uri.clone(), virtual_uri.clone());
-        if let Some((_, sender)) = self.virtual_routing_pending.remove(&key) {
+        if self
+            .virtual_routing_pending
+            .remove_if(&key, |_, current| Arc::ptr_eq(current, sender))
+            .is_some()
+        {
             let _ = sender.send(true);
         }
     }

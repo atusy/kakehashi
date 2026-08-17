@@ -243,9 +243,10 @@ impl BridgeCoordinator {
         &self,
         host_uri: &Url,
         injections: &[BridgeInjection],
-    ) {
+    ) -> HashMap<Url, Arc<tokio::sync::watch::Sender<bool>>> {
+        let mut tokens = HashMap::new();
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
-            return;
+            return tokens;
         };
         for injection in injections {
             let virtual_uri = super::protocol::VirtualDocumentUri::new(
@@ -256,8 +257,10 @@ impl BridgeCoordinator {
             let Ok(virtual_uri) = Url::parse(&virtual_uri.to_uri_string()) else {
                 continue;
             };
-            self.pool.begin_virtual_routing(host_uri, &virtual_uri);
+            let token = self.pool.begin_virtual_routing(host_uri, &virtual_uri);
+            tokens.insert(virtual_uri, token);
         }
+        tokens
     }
 
     /// Create a new bridge coordinator with fresh pool and tracker.
@@ -658,6 +661,7 @@ impl BridgeCoordinator {
                 &host_uri_lsp,
                 injections,
                 Some(server_name),
+                None,
             )
             .await;
         let mut config = None;
@@ -1141,6 +1145,7 @@ impl BridgeCoordinator {
     // Eager spawn + open (warmup with document content)
     // ========================================
 
+    #[allow(clippy::too_many_arguments)]
     async fn route_virtual_injections(
         &self,
         settings: &WorkspaceSettings,
@@ -1149,6 +1154,7 @@ impl BridgeCoordinator {
         host_uri_lsp: &tower_lsp_server::ls_types::Uri,
         injections: Vec<BridgeInjection>,
         target_server: Option<&str>,
+        routing_tokens: Option<&HashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>>,
     ) -> Vec<(BridgeInjection, Vec<ResolvedServerConfig>)> {
         let mut configs_by_lang: HashMap<String, Vec<ResolvedServerConfig>> = HashMap::new();
         let mut routed = Vec::with_capacity(injections.len());
@@ -1175,9 +1181,15 @@ impl BridgeCoordinator {
                 None => configs,
             };
             if configs.is_empty() {
-                self.pool.finish_virtual_routing(host_uri, &document_uri);
+                if let Some(token) = routing_tokens.and_then(|tokens| tokens.get(&document_uri)) {
+                    self.pool
+                        .finish_virtual_routing(host_uri, &document_uri, token);
+                }
                 continue;
             }
+            let routing_guard = routing_tokens
+                .and_then(|tokens| tokens.get(&document_uri))
+                .map(|token| (host_uri, &document_uri, token));
             let selected = Self::resolve_document_routing(
                 &self.pool,
                 &document_uri,
@@ -1187,9 +1199,13 @@ impl BridgeCoordinator {
                     language_id: host_language.to_string(),
                 }),
                 configs,
+                routing_guard,
             )
             .await;
-            self.pool.finish_virtual_routing(host_uri, &document_uri);
+            if let Some(token) = routing_tokens.and_then(|tokens| tokens.get(&document_uri)) {
+                self.pool
+                    .finish_virtual_routing(host_uri, &document_uri, token);
+            }
             routed.push((injection, selected));
         }
         routed
@@ -1292,6 +1308,7 @@ impl BridgeCoordinator {
         host_uri: &Url,
         incarnation: u64,
         injections: Vec<BridgeInjection>,
+        routing_tokens: HashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>,
     ) {
         // Convert host_uri to ls_types::Uri for VirtualDocumentUri construction
         let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
@@ -1316,6 +1333,7 @@ impl BridgeCoordinator {
                 &host_uri_lsp,
                 injections,
                 None,
+                Some(&routing_tokens),
             )
             .await;
         let resolved_groups = Self::eager_open_groups_for_configs(routed);
@@ -1452,7 +1470,13 @@ impl BridgeCoordinator {
         language_id: &str,
         host: Option<super::protocol::RoutingHostDocument>,
         configs: Vec<ResolvedServerConfig>,
+        routing_guard: Option<(&Url, &Url, &Arc<tokio::sync::watch::Sender<bool>>)>,
     ) -> Vec<ResolvedServerConfig> {
+        if routing_guard.is_some_and(|(host_uri, virtual_uri, token)| {
+            !pool.is_virtual_routing_current(host_uri, virtual_uri, token)
+        }) {
+            return Vec::new();
+        }
         if configs.iter().all(|config| {
             pool.host_routing_by_server(document_uri, &config.server_name)
                 .is_some()
@@ -1550,6 +1574,11 @@ impl BridgeCoordinator {
 
         let mut selected = Vec::new();
         for config in configs {
+            if routing_guard.is_some_and(|(host_uri, virtual_uri, token)| {
+                !pool.is_virtual_routing_current(host_uri, virtual_uri, token)
+            }) {
+                return Vec::new();
+            }
             let enabled = answer
                 .as_ref()
                 .and_then(|answer| answer.routing.get(&config.server_name))
@@ -1662,6 +1691,7 @@ impl BridgeCoordinator {
                         &language_id,
                         None,
                         configs_for_routing,
+                        None,
                     ).await
                 } => configs,
             };
@@ -3170,7 +3200,14 @@ mod tests {
         coordinator.begin_virtual_routing_for_injections(&host_uri, &injections);
 
         coordinator
-            .eager_spawn_and_open_documents(&settings, "markdown", &host_uri, 1, injections)
+            .eager_spawn_and_open_documents(
+                &settings,
+                "markdown",
+                &host_uri,
+                1,
+                injections,
+                HashMap::new(),
+            )
             .await;
 
         let handles = coordinator
