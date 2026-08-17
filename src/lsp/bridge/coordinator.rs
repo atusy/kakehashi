@@ -239,11 +239,25 @@ impl ConfigMemo {
 }
 
 impl BridgeCoordinator {
-    pub(crate) fn begin_virtual_routing(
+    pub(crate) fn begin_virtual_routing_for_injections(
         &self,
         host_uri: &Url,
-    ) -> Arc<tokio::sync::watch::Sender<bool>> {
-        self.pool.begin_virtual_routing(host_uri)
+        injections: &[BridgeInjection],
+    ) {
+        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return;
+        };
+        for injection in injections {
+            let virtual_uri = super::protocol::VirtualDocumentUri::new(
+                &host_uri_lsp,
+                &injection.language,
+                &injection.region_id,
+            );
+            let Ok(virtual_uri) = Url::parse(&virtual_uri.to_uri_string()) else {
+                continue;
+            };
+            self.pool.begin_virtual_routing(host_uri, &virtual_uri);
+        }
     }
 
     /// Create a new bridge coordinator with fresh pool and tracker.
@@ -1161,6 +1175,8 @@ impl BridgeCoordinator {
                 None => configs,
             };
             if configs.is_empty() {
+                self.pool
+                    .finish_virtual_routing(host_uri, &document_uri);
                 continue;
             }
             let selected = Self::resolve_document_routing(
@@ -1174,6 +1190,7 @@ impl BridgeCoordinator {
                 configs,
             )
             .await;
+            self.pool.finish_virtual_routing(host_uri, &document_uri);
             routed.push((injection, selected));
         }
         routed
@@ -1269,9 +1286,6 @@ impl BridgeCoordinator {
     ///
     /// Sending `didOpen` up front (not just a handshake) lets downstream servers
     /// start analyzing immediately, yielding faster diagnostics.
-    /// The lifecycle coordinator registers `routing_sender` synchronously,
-    /// before detaching this eager task, so interactive requests cannot pass
-    /// through the spawn-to-first-poll window.
     pub(crate) async fn eager_spawn_and_open_documents(
         &self,
         settings: &WorkspaceSettings,
@@ -1279,7 +1293,6 @@ impl BridgeCoordinator {
         host_uri: &Url,
         incarnation: u64,
         injections: Vec<BridgeInjection>,
-        routing_sender: Arc<tokio::sync::watch::Sender<bool>>,
     ) {
         // Convert host_uri to ls_types::Uri for VirtualDocumentUri construction
         let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
@@ -1306,7 +1319,6 @@ impl BridgeCoordinator {
                 None,
             )
             .await;
-        self.pool.finish_virtual_routing(host_uri, &routing_sender);
         let resolved_groups = Self::eager_open_groups_for_configs(routed);
         if resolved_groups.is_empty() {
             self.cancel_eager_open(host_uri);
@@ -3155,16 +3167,11 @@ mod tests {
             config.cmd = Some(vec!["/nonexistent/kakehashi-test-server".to_string()]);
         }
         let host_uri = Url::parse("file:///test.md").unwrap();
+        let injections = vec![injection("rust", "r1")];
+        coordinator.begin_virtual_routing_for_injections(&host_uri, &injections);
 
         coordinator
-            .eager_spawn_and_open_documents(
-                &settings,
-                "markdown",
-                &host_uri,
-                1,
-                vec![injection("rust", "r1")],
-                coordinator.begin_virtual_routing(&host_uri),
-            )
+            .eager_spawn_and_open_documents(&settings, "markdown", &host_uri, 1, injections)
             .await;
 
         let handles = coordinator

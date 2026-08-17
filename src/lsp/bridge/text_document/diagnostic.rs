@@ -51,12 +51,12 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Vec<Diagnostic>> {
         let (host_generation, request_sequence) = self.begin_diagnostic_pull(host_uri);
-        self.wait_for_virtual_routing(host_uri).await;
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
         let routing_uri = Url::parse(&virtual_uri.to_uri_string())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        self.wait_for_virtual_routing(host_uri, &routing_uri).await;
         // Pre-work: wait for server to become Ready (unlike other handlers that fail fast).
         let handle = self
             .get_or_create_connection_wait_ready(

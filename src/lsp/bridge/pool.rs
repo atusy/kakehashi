@@ -393,7 +393,7 @@ pub struct LanguageServerPool {
     /// Pending per-host virtual-document routing. Interactive requests wait
     /// here while the detached eager-routing pass is asking the provider, so
     /// they cannot acquire a pre-routing marker connection.
-    virtual_routing_pending: DashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>,
+    virtual_routing_pending: DashMap<(Url, Url), Arc<tokio::sync::watch::Sender<bool>>>,
     /// Connections whose replacement still owes a virtual-document re-open, and
     /// the barrier requests wait on (respawn-reopen-derives-its-targets).
     /// `Arc` because the claim runs inside the spawned handshake task.
@@ -1448,24 +1448,21 @@ impl LanguageServerPool {
         sender
     }
 
-    pub(crate) fn begin_virtual_routing(
-        &self,
-        host_uri: &Url,
-    ) -> Arc<tokio::sync::watch::Sender<bool>> {
+    pub(crate) fn begin_virtual_routing(&self, host_uri: &Url, virtual_uri: &Url) {
         let sender = Arc::new(tokio::sync::watch::channel(false).0);
+        let key = (host_uri.clone(), virtual_uri.clone());
         if let Some(previous) = self
             .virtual_routing_pending
-            .insert(host_uri.clone(), Arc::clone(&sender))
+            .insert(key, Arc::clone(&sender))
         {
             let _ = previous.send(true);
         }
-        sender
     }
 
-    pub(crate) async fn wait_for_virtual_routing(&self, host_uri: &Url) {
+    pub(crate) async fn wait_for_virtual_routing(&self, host_uri: &Url, virtual_uri: &Url) {
         let Some(sender) = self
             .virtual_routing_pending
-            .get(host_uri)
+            .get(&(host_uri.clone(), virtual_uri.clone()))
             .map(|entry| Arc::clone(entry.value()))
         else {
             return;
@@ -1478,23 +1475,28 @@ impl LanguageServerPool {
         }
     }
 
-    pub(crate) fn finish_virtual_routing(
-        &self,
-        host_uri: &Url,
-        sender: &Arc<tokio::sync::watch::Sender<bool>>,
-    ) {
-        if self
-            .virtual_routing_pending
-            .remove_if(host_uri, |_, current| Arc::ptr_eq(current, sender))
-            .is_some()
-        {
+    pub(crate) fn finish_virtual_routing(&self, host_uri: &Url, virtual_uri: &Url) {
+        let key = (host_uri.clone(), virtual_uri.clone());
+        if let Some((_, sender)) = self.virtual_routing_pending.remove(&key) {
             let _ = sender.send(true);
         }
     }
 
     pub(crate) fn finish_all_virtual_routing(&self, host_uri: &Url) {
-        if let Some((_, sender)) = self.virtual_routing_pending.remove(host_uri) {
-            let _ = sender.send(true);
+        let pending: Vec<_> = self
+            .virtual_routing_pending
+            .iter()
+            .filter(|entry| entry.key().0 == *host_uri)
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+        for (key, sender) in pending {
+            if self
+                .virtual_routing_pending
+                .remove_if(&key, |_, current| Arc::ptr_eq(current, &sender))
+                .is_some()
+            {
+                let _ = sender.send(true);
+            }
         }
     }
 
@@ -2228,13 +2230,13 @@ impl LanguageServerPool {
                 .get_or_create_connection(server_name, server_config, Some(host_uri))
                 .await;
         }
-        self.wait_for_virtual_routing(host_uri).await;
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         let virtual_uri =
             super::protocol::VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
         let routing_uri = Url::parse(&virtual_uri.to_uri_string())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        self.wait_for_virtual_routing(host_uri, &routing_uri).await;
         self.get_or_create_connection(server_name, server_config, Some(&routing_uri))
             .await
     }
@@ -6295,11 +6297,16 @@ mod tests {
     async fn a_virtual_request_waits_for_pending_routing() {
         let pool = Arc::new(LanguageServerPool::new());
         let host_uri = Url::parse("file:///test/pending-routing.md").unwrap();
-        let sender = pool.begin_virtual_routing(&host_uri);
+        let virtual_uri =
+            Url::parse("deno:///test/pending-routing.md?language=lua&region=r0").unwrap();
+        pool.begin_virtual_routing(&host_uri, &virtual_uri);
         let waiter = {
             let pool = Arc::clone(&pool);
             let host_uri = host_uri.clone();
-            tokio::spawn(async move { pool.wait_for_virtual_routing(&host_uri).await })
+            let virtual_uri = virtual_uri.clone();
+            tokio::spawn(
+                async move { pool.wait_for_virtual_routing(&host_uri, &virtual_uri).await },
+            )
         };
         tokio::task::yield_now().await;
         assert!(
@@ -6307,7 +6314,7 @@ mod tests {
             "a virtual request must wait for the routing answer"
         );
 
-        pool.finish_virtual_routing(&host_uri, &sender);
+        pool.finish_virtual_routing(&host_uri, &virtual_uri);
         waiter.await.expect("the request proceeds after routing");
     }
 
