@@ -2150,6 +2150,28 @@ impl LanguageServerPool {
         .await
     }
 
+    /// Acquire the connection for an injected document using the URI under
+    /// which routing decisions are cached. The request handlers receive the
+    /// host URI for coordinate translation, but routing is decided per virtual
+    /// document and must use that virtual URI for connection selection.
+    pub(super) async fn get_or_create_virtual_connection(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+    ) -> io::Result<Arc<ConnectionHandle>> {
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let virtual_uri =
+            super::protocol::VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
+        let routing_uri = Url::parse(&virtual_uri.to_uri_string())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        self.get_or_create_connection(server_name, server_config, Some(&routing_uri))
+            .await
+    }
+
     /// [`Self::get_or_create_connection`], with a caller-supplied `admit`
     /// predicate evaluated **inside the acquire's critical section**.
     ///

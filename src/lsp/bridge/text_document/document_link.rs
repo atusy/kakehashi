@@ -39,7 +39,13 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<DocumentLink>>> {
         let handle = self
-            .get_or_create_connection(server_name, server_config, Some(host_uri))
+            .get_or_create_virtual_connection(
+                server_name,
+                server_config,
+                host_uri,
+                injection_language,
+                region_id,
+            )
             .await?;
         if !handle.has_capability("textDocument/documentLink") {
             return Ok(None);
