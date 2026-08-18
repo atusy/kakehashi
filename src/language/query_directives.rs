@@ -176,14 +176,12 @@ fn trim_range(
     } else {
         starts[end_index - 1] + lines[end_index - 1].len()
     };
-    if trim_end_columns {
-        if end_index != 0 {
-            let line = lines[end_index - 1];
-            end = starts[end_index - 1]
-                + line
-                    .trim_end_matches(|character: char| character.is_ascii_whitespace())
-                    .len();
-        }
+    if trim_end_columns && end_index != 0 {
+        let line = lines[end_index - 1];
+        end = starts[end_index - 1]
+            + line
+                .trim_end_matches(|character: char| character.is_ascii_whitespace())
+                .len();
     }
 
     if trim_start_lines {
