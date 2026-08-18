@@ -24,8 +24,8 @@ use crate::language::LanguageCoordinator;
 use crate::language::NodeTracker;
 use crate::language::injection::{
     CacheableInjectionRegion, InjectionRegionInfo, MAX_INJECTION_DEPTH, compute_included_ranges,
-    compute_included_ranges_clipped, effective_offset_for_pattern, has_combined_for_pattern,
-    intersect_included_ranges, parse_with_ranges, sub_select_included_ranges,
+    compute_included_ranges_clipped, intersect_included_ranges, parse_with_ranges,
+    sub_select_included_ranges,
 };
 use crate::text::position::byte_to_utf16_col;
 
@@ -501,13 +501,7 @@ fn collect_injection_contexts_sync<'a>(
     let mut combined_groups: indexmap::IndexMap<(String, usize), Vec<InjectionRegionInfo>> =
         indexmap::IndexMap::new();
     for injection in injections {
-        if has_combined_for_pattern(&injection_query, injection.pattern_index)
-            // effective_offset_for_pattern (not the raw directive parser):
-            // an all-zero #offset! is a no-op and must not exile the pattern
-            // to the singles path — the rest of the codebase branches on the
-            // effective offset for the same reason (cf. injection_stack.rs).
-            && effective_offset_for_pattern(&injection_query, injection.pattern_index).is_none()
-        {
+        if injection.combined {
             combined_groups
                 .entry((injection.language.clone(), injection.pattern_index))
                 .or_default()
@@ -999,7 +993,7 @@ pub(crate) fn build_document_discovery(
 pub(crate) fn build_document_discovery_cancellable(
     regions: &[InjectionRegionInfo<'_>],
     prebuilt_cacheable: &[CacheableInjectionRegion],
-    injection_query: &tree_sitter::Query,
+    _injection_query: &tree_sitter::Query,
     text: &str,
     coordinator: &LanguageCoordinator,
     uri: &Url,
@@ -1022,9 +1016,7 @@ pub(crate) fn build_document_discovery_cancellable(
         if crate::cancel::is_cancelled(cancel) {
             return None;
         }
-        if has_combined_for_pattern(injection_query, injection.pattern_index)
-            && effective_offset_for_pattern(injection_query, injection.pattern_index).is_none()
-        {
+        if injection.combined {
             log::debug!(
                 target: "kakehashi::semantic",
                 "discovery stored partial: combined-group region dropped (lang={})",
@@ -3401,7 +3393,7 @@ local b = 2
         let expected_hashes: std::collections::HashSet<u64> = regions
             .iter()
             .zip(prebuilt.iter())
-            .filter(|(r, _)| !has_combined_for_pattern(injection_query.as_ref(), r.pattern_index))
+            .filter(|(region, _)| !region.combined)
             .map(|(_, c)| {
                 crate::analysis::semantic_cache::region_validity_hash(c.content_hash, "lua")
             })
