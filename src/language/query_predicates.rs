@@ -258,8 +258,9 @@ fn lua_replacement_to_regex(replacement: &str) -> Option<String> {
             '%' => match chars.next()? {
                 '%' => converted.push('%'),
                 digit @ '0'..='9' => {
-                    converted.push('$');
+                    converted.push_str("${");
                     converted.push(digit);
+                    converted.push('}');
                 }
                 _ => return None,
             },
@@ -411,6 +412,15 @@ mod tests {
         assert_eq!(
             lua_gsub("%w+", "[%0] %% $", "abc").as_deref(),
             Some("[abc] % $")
+        );
+        assert_eq!(
+            lua_gsub("(%a+)", "%10", "abc").as_deref(),
+            Some("abc0"),
+            "Lua %10 means capture 1 followed by a literal zero"
+        );
+        assert_eq!(
+            lua_gsub("(%a+)", "%1_lang", "abc").as_deref(),
+            Some("abc_lang")
         );
     }
 
