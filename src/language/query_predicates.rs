@@ -280,16 +280,26 @@ pub(crate) fn lua_gsub_bytes(pattern: &str, replacement: &str, text: &[u8]) -> O
     let replacement = lua_replacement_to_regex(replacement, regex.captures_len())?;
     let mut result = Vec::with_capacity(text.len());
     let mut copied_until = 0;
-    let mut previous_nonempty_end = None;
-    for captures in regex.captures_iter(text) {
+    let mut search_from = 0;
+    while search_from <= text.len() {
+        let Some(captures) = regex.captures_at(text, search_from) else {
+            break;
+        };
         let matched = captures.get(0)?;
-        if matched.is_empty() && previous_nonempty_end == Some(matched.start()) {
-            continue;
-        }
         result.extend_from_slice(&text[copied_until..matched.start()]);
         captures.expand(replacement.as_bytes(), &mut result);
         copied_until = matched.end();
-        previous_nonempty_end = (!matched.is_empty()).then_some(matched.end());
+        if matched.is_empty() {
+            if matched.start() == text.len() {
+                break;
+            }
+            search_from = matched.start() + 1;
+        } else {
+            // Unlike Regex::captures_iter, Lua permits one empty match at the
+            // end of a preceding nonempty match (e.g. `("a"):gsub("a*",
+            // "x") == "xx"`). Search from that exact boundary.
+            search_from = matched.end();
+        }
     }
     result.extend_from_slice(&text[copied_until..]);
     Some(result)
@@ -518,7 +528,10 @@ mod tests {
             "Lua patterns operate on bytes rather than Unicode scalars"
         );
         assert_eq!(lua_gsub(".", "x", "a\nb").as_deref(), Some("xxx"));
-        assert_eq!(lua_gsub("a*", "x", "a").as_deref(), Some("x"));
+        assert_eq!(lua_gsub("a*", "x", "a").as_deref(), Some("xx"));
+        assert_eq!(lua_gsub(".*", "x", "abc").as_deref(), Some("xx"));
+        assert_eq!(lua_gsub("a*", "x", "ba").as_deref(), Some("xbxx"));
+        assert_eq!(lua_gsub("^.*$", "x", "abc").as_deref(), Some("x"));
         assert_eq!(lua_gsub("[]()]", "x", "]()").as_deref(), Some("xxx"));
         let intermediate = lua_gsub_bytes("^.", "", "é".as_bytes()).unwrap();
         assert!(std::str::from_utf8(&intermediate).is_err());
