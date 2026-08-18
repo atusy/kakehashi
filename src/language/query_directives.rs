@@ -32,12 +32,7 @@ pub(crate) fn capture_range(
     };
     let mut offset = None;
     let mut trimmed = None;
-    let is_single_capture = match_
-        .captures
-        .iter()
-        .filter(|capture| capture.index == capture_id)
-        .count()
-        == 1;
+    let mut is_single_capture = None;
     for directive in query.general_predicates(match_.pattern_index) {
         if !matches!(
             directive.args.first(),
@@ -46,6 +41,15 @@ pub(crate) fn capture_range(
             continue;
         }
         if directive.operator.as_ref() == "trim!" {
+            let is_single_capture = *is_single_capture.get_or_insert_with(|| {
+                match_
+                    .captures
+                    .iter()
+                    .filter(|capture| capture.index == capture_id)
+                    .take(2)
+                    .count()
+                    == 1
+            });
             let enabled = |index: usize| {
                 matches!(
                     directive.args.get(index),
