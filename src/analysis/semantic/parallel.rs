@@ -646,7 +646,7 @@ fn discover_single_region(
     let end = effective.end;
 
     // Validate bounds
-    if start > end || end > text.len() {
+    if start >= end || end > text.len() {
         return SingleDiscovery::Skip;
     }
 
@@ -1125,21 +1125,25 @@ fn build_combined_context<'a>(
     parent_included_ranges: Option<&[tree_sitter::Range]>,
     exclusion_ranges: &mut Vec<(usize, usize)>,
 ) -> Result<Option<InjectionContext<'a>>, CombinedDiscoveryIncomplete> {
-    // collect_all_injections sorts by start byte, so `first` anchors the group.
-    let Some(first) = regions.first() else {
-        return Ok(None);
-    };
-    let effective_ranges: Vec<_> = regions
+    let effective_regions: Vec<_> = regions
         .iter()
-        .map(|region| effective_content_range(region, text))
+        .map(|region| (region, effective_content_range(region, text)))
+        .filter(|(_, range)| range.start < range.end)
         .collect();
-    let Some(group_start) = effective_ranges.iter().map(|range| range.start).min() else {
+    let Some((first, first_range)) = effective_regions.first() else {
         return Ok(None);
     };
+    let group_start = effective_regions
+        .iter()
+        .map(|(_, range)| range.start)
+        .min()
+        .unwrap_or(first_range.start);
     let group_start_pos = byte_to_point(text, group_start);
-    let Some(group_end) = effective_ranges.iter().map(|range| range.end).max() else {
-        return Ok(None);
-    };
+    let group_end = effective_regions
+        .iter()
+        .map(|(_, range)| range.end)
+        .max()
+        .unwrap_or(first_range.end);
     if group_start >= group_end || group_end > text.len() {
         return Ok(None);
     }
@@ -1147,7 +1151,7 @@ fn build_combined_context<'a>(
     // Resolve the language once from the first block's content — the grouping
     // key guarantees every region shares the raw injection language. A missing
     // language/query is transient (loads later without the content changing).
-    let first_content = &text[effective_ranges[0].clone()];
+    let first_content = &text[first_range.clone()];
     let Some((resolved_lang, _)) =
         coordinator.resolve_injection_language(&first.language, first_content)
     else {
@@ -1170,7 +1174,7 @@ fn build_combined_context<'a>(
     // Each block contributes its directive-adjusted, child-filtered ranges,
     // rebased from host coordinates into the combined content slice.
     let mut group_ranges: Vec<tree_sitter::Range> = Vec::with_capacity(regions.len());
-    for (region, effective) in regions.iter().zip(&effective_ranges) {
+    for (region, effective) in effective_regions {
         let node = &region.content_node;
         if region.offset.is_some() {
             let effective_start_point = byte_to_point_anchored(
