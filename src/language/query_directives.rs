@@ -40,6 +40,18 @@ pub(crate) fn has_offset_directive(query: &Query) -> bool {
     })
 }
 
+/// Whether any pattern carries a runtime directive that can change a capture
+/// range. Range-scoped query execution must evaluate these directives before
+/// deciding which captures intersect the requested viewport.
+pub(crate) fn has_range_directive(query: &Query) -> bool {
+    (0..query.pattern_count()).any(|pattern_index| {
+        query
+            .general_predicates(pattern_index)
+            .iter()
+            .any(|directive| matches!(directive.operator.as_ref(), "offset!" | "trim!"))
+    })
+}
+
 /// Apply Neovim's `#offset!` and `#trim!` range metadata for `capture_id`.
 /// A valid trim range takes precedence over an offset, as in
 /// `vim.treesitter.get_range()`.
