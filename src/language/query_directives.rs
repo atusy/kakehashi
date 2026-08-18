@@ -28,9 +28,14 @@ pub(crate) fn has_offset_directive(query: &Query) -> bool {
                 if directive.operator.as_ref() != "offset!" {
                     return false;
                 }
-                crate::language::injection::parse_offset_args(&directive.args[1..]).is_some_and(
-                    |offset| offset != crate::language::injection::InjectionOffset::default(),
-                )
+                let Some((tree_sitter::QueryPredicateArg::Capture(_), args)) =
+                    directive.args.split_first()
+                else {
+                    return false;
+                };
+                crate::language::injection::parse_offset_args(args).is_some_and(|offset| {
+                    offset != crate::language::injection::InjectionOffset::default()
+                })
             })
     })
 }
@@ -420,5 +425,8 @@ mod tests {
         assert!(has_offset_directive(&query("offset!", "0 1 0 -1")));
         assert!(!has_offset_directive(&query("offset!", "0 0 0 0")));
         assert!(!has_offset_directive(&query("trim!", "1 1 1 1")));
+
+        let malformed = Query::new(&language, "((string_literal) @string (#offset!))").unwrap();
+        assert!(!has_offset_directive(&malformed));
     }
 }
