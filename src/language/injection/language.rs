@@ -213,6 +213,10 @@ mod tests {
             Some("bash")
         );
         assert_eq!(
+            resolve("(#offset! @injection.language 0 3)").as_deref(),
+            Some("bash */")
+        );
+        assert_eq!(
             resolve(
                 "(#offset! @injection.language 0 3 0 -3)\n\
                  (#gsub! @injection.language \"^.*$\" \"%0\")"

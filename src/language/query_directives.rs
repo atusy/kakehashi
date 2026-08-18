@@ -116,29 +116,7 @@ fn capture_range_for_directives(
         if directive.operator.as_ref() != "offset!" {
             continue;
         }
-        let parse = |arg: &tree_sitter::QueryPredicateArg| match arg {
-            tree_sitter::QueryPredicateArg::String(value) => value.parse::<i32>().ok(),
-            tree_sitter::QueryPredicateArg::Capture(_) => None,
-        };
-        let values = directive.args.get(1..5).and_then(|args| {
-            let [start_row, start_column, end_row, end_column] = args else {
-                return None;
-            };
-            Some((
-                parse(start_row)?,
-                parse(start_column)?,
-                parse(end_row)?,
-                parse(end_column)?,
-            ))
-        });
-        if let Some((start_row, start_column, end_row, end_column)) = values {
-            offset = Some(crate::language::injection::InjectionOffset {
-                start_row,
-                start_column,
-                end_row,
-                end_column,
-            });
-        }
+        offset = crate::language::injection::parse_offset_args(&directive.args[1..]);
     }
 
     if let Some(range) = trimmed {

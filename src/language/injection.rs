@@ -27,7 +27,7 @@ pub(crate) use discovery::{
     RegionBoundary, ResolvedInjection, collect_all_injections, collect_all_injections_cancellable,
     detect_injection, effective_content_range,
 };
-pub(crate) use offset::{InjectionOffset, effective_offset_for_pattern};
+pub(crate) use offset::{InjectionOffset, effective_offset_for_pattern, parse_offset_args};
 pub(crate) use ranges::{
     compute_included_ranges, compute_included_ranges_clipped, has_combined_for_pattern,
     has_include_children_for_pattern, intersect_included_ranges, sub_select_included_ranges,
