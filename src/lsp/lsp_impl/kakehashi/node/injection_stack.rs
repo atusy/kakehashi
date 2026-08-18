@@ -725,6 +725,7 @@ pub(crate) fn collect_document_layer_trees(
         host_tree,
         None,
         None,
+        &mut |_| false,
         &mut |language, tree, depth| {
             // The host layer (depth 0) already lives on the snapshot as
             // `ParseSnapshot::tree`; store only the injected layers.
@@ -771,6 +772,7 @@ pub(crate) fn collect_document_layer_trees(
 /// return `null` (the protocol's re-acquire signal). Same depth-as-identity
 /// weakness documented in lazy-node-identity-tracking; disjoint same-depth
 /// regions (the norm) are unaffected.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
     coordinator: &LanguageCoordinator,
     host_language: &str,
@@ -778,6 +780,7 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
     host_tree: &tree_sitter::Tree,
     byte_filter: Option<&std::ops::Range<usize>>,
     cancel: Option<&crate::cancel::CancelToken>,
+    range_can_expand: &mut dyn FnMut(&str) -> bool,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
 ) {
     visit(host_language, host_tree, 0);
@@ -790,6 +793,7 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
         1,
         byte_filter,
         cancel,
+        range_can_expand,
         visit,
     );
 }
@@ -804,6 +808,7 @@ fn walk_child_layers(
     depth: usize,
     byte_filter: Option<&std::ops::Range<usize>>,
     cancel: Option<&crate::cancel::CancelToken>,
+    range_can_expand: &mut dyn FnMut(&str) -> bool,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
 ) {
     // Allows injected depths 1..=MAX_INJECTION_DEPTH — deliberately matching
@@ -826,7 +831,10 @@ fn walk_child_layers(
         parent_tree,
         parent_ranges,
         host_text,
-        byte_filter,
+        // The injected language is resolved below. Defer viewport pruning
+        // until then so the caller can retain a layer whose kind query may
+        // expand captures into the viewport before paying the parse cost.
+        None,
     ) {
         // Per-region checkpoint: each iteration below runs a language
         // resolve + a full injected-region reparse, so on an
@@ -842,6 +850,12 @@ fn walk_child_layers(
         else {
             continue;
         };
+        if let Some(filter) = byte_filter
+            && !ranges_intersect(&absolute_ranges, filter, host_text.len())
+            && !range_can_expand(&resolved_lang)
+        {
+            continue;
+        }
         let Some(language) = coordinator
             .language_registry_for_parallel()
             .get(&resolved_lang)
@@ -861,6 +875,7 @@ fn walk_child_layers(
             depth + 1,
             byte_filter,
             cancel,
+            range_can_expand,
             visit,
         );
     }
@@ -909,6 +924,7 @@ mod tests {
             &tree,
             None,
             None,
+            &mut |_| false,
             &mut |lang, layer_tree, depth| {
                 if depth == 0 {
                     return;

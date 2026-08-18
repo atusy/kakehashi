@@ -1696,16 +1696,27 @@ fn execute_captures_walk(
                 visit(&layer.language, &layer.tree, layer.depth, Some(&layer.span));
             }
         } else {
+            let mut range_can_expand = |layer_language: &str| {
+                matches!(
+                    load_kind_query_cached(
+                        &registry,
+                        &search_paths,
+                        layer_language,
+                        &file_name,
+                        generation,
+                    )
+                    .as_ref(),
+                    KindQueryLoad::Loaded(query) if query.has_expanding_range
+                )
+            };
             walk_document_layers(
                 language,
                 language_id,
                 text,
                 tree,
-                // The layer walker cannot know each visited language's kind
-                // query. Traverse all injection layers and let `visit` prune
-                // those whose query is guaranteed not to expand ranges.
-                None,
+                byte_range.as_ref(),
                 cancel,
+                &mut range_can_expand,
                 &mut |language, tree, depth| visit(language, tree, depth, None),
             );
         }
