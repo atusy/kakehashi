@@ -52,6 +52,33 @@ pub(crate) fn has_range_directive(query: &Query) -> bool {
     })
 }
 
+/// Whether a runtime offset can move a capture boundary outside its raw node.
+/// Trims and inward-only offsets still need result filtering, but may retain
+/// Tree-sitter's viewport pruning because they cannot pull an outside node in.
+pub(crate) fn has_expanding_range_directive(query: &Query) -> bool {
+    (0..query.pattern_count()).any(|pattern_index| {
+        query
+            .general_predicates(pattern_index)
+            .iter()
+            .any(|directive| {
+                if directive.operator.as_ref() != "offset!" {
+                    return false;
+                }
+                let Some((tree_sitter::QueryPredicateArg::Capture(_), args)) =
+                    directive.args.split_first()
+                else {
+                    return false;
+                };
+                crate::language::injection::parse_offset_args(args).is_some_and(|offset| {
+                    offset.start_row < 0
+                        || (offset.start_row == 0 && offset.start_column < 0)
+                        || offset.end_row > 0
+                        || (offset.end_row == 0 && offset.end_column > 0)
+                })
+            })
+    })
+}
+
 /// Apply Neovim's `#offset!` and `#trim!` range metadata for `capture_id`.
 /// A valid trim range takes precedence over an offset, as in
 /// `vim.treesitter.get_range()`.
@@ -476,7 +503,15 @@ mod tests {
         assert!(!has_offset_directive(&query("offset!", "0 0 0 0")));
         assert!(!has_offset_directive(&query("trim!", "1 1 1 1")));
 
+        assert!(has_expanding_range_directive(&query("offset!", "0 -1 0 0")));
+        assert!(has_expanding_range_directive(&query("offset!", "0 0 1 0")));
+        assert!(!has_expanding_range_directive(&query(
+            "offset!", "1 0 -1 0"
+        )));
+        assert!(!has_expanding_range_directive(&query("trim!", "1 1 1 1")));
+
         let malformed = Query::new(&language, "((string_literal) @string (#offset!))").unwrap();
         assert!(!has_offset_directive(&malformed));
+        assert!(!has_expanding_range_directive(&malformed));
     }
 }
