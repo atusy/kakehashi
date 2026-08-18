@@ -79,6 +79,7 @@ fn runtime_offset_for_capture(
 }
 
 /// Checks if a node is within the bounds of another node
+#[cfg(test)]
 fn is_node_within(node: &Node, container: &Node) -> bool {
     node.start_byte() >= container.start_byte() && node.end_byte() <= container.end_byte()
 }
@@ -467,7 +468,7 @@ pub(crate) fn detect_injection<'a>(
     text: &str,
     injection_query: Option<&Query>,
     base_language: &str,
-) -> Option<(Vec<String>, Node<'a>, usize)> {
+) -> Option<(Vec<String>, Node<'a>, usize, Option<InjectionOffset>)> {
     let injections = collect_injection_regions(node, root, text, injection_query)?;
 
     if injections.is_empty() {
@@ -513,7 +514,12 @@ pub(crate) fn detect_injection<'a>(
     // Return the innermost content node and its pattern index
     let innermost = sorted_injections.last()?;
 
-    Some((hierarchy, innermost.content_node, innermost.pattern_index))
+    Some((
+        hierarchy,
+        innermost.content_node,
+        innermost.pattern_index,
+        innermost.offset,
+    ))
 }
 
 /// Represents an injection region with its metadata (unresolved intermediate data).
@@ -523,6 +529,7 @@ struct RawInjectionRegion<'a> {
     language: String,
     content_node: Node<'a>,
     pattern_index: usize,
+    offset: Option<InjectionOffset>,
 }
 
 /// Collects all injection regions that contain the given node
@@ -545,24 +552,20 @@ fn collect_injection_regions<'a>(
     let mut injections_map = std::collections::HashMap::new();
 
     while let Some(match_) = matches.next() {
-        if let Some((content_node, language, pattern_index)) =
+        if let Some((content_node, language, pattern_index, offset, start_byte, end_byte)) =
             extract_content_and_language(node, match_, query, text)
         {
-            let key = (
-                content_node.start_byte(),
-                content_node.end_byte(),
-                language.clone(),
-                pattern_index,
-            );
+            let key = (start_byte, end_byte, language.clone(), pattern_index);
 
             // Keep the first match for each range/language pair; distinct
             // languages on the same range remain separate layers.
             injections_map.entry(key).or_insert(RawInjectionRegion {
-                start_byte: content_node.start_byte(),
-                end_byte: content_node.end_byte(),
+                start_byte,
+                end_byte,
                 language,
                 content_node,
                 pattern_index,
+                offset,
             });
         }
     }
@@ -593,19 +596,44 @@ fn extract_content_and_language<'a>(
     match_: &QueryMatch<'_, 'a>,
     query: &Query,
     text: &str,
-) -> Option<(Node<'a>, String, usize)> {
+) -> Option<(
+    Node<'a>,
+    String,
+    usize,
+    Option<InjectionOffset>,
+    usize,
+    usize,
+)> {
     for capture in iter_injection_content_captures(match_, query) {
         let content_node = capture.node;
 
-        // Check if our node is within this injection region
-        if is_node_within(node, &content_node) {
-            if !check_match_predicates(query, match_, text) {
-                return None;
-            }
-            // Extract the injection language
-            if let Some(language) = extract_injection_language(query, match_, text) {
-                return Some((content_node, language, match_.pattern_index));
-            }
+        if !check_match_predicates(query, match_, text) {
+            return None;
+        }
+        let offset = runtime_offset_for_capture(query, match_, capture, text);
+        let effective = if let Some(offset) = offset {
+            use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
+            let range = calculate_effective_range(
+                text,
+                ByteRange::new(content_node.start_byte(), content_node.end_byte()),
+                offset,
+            );
+            range.start..range.end
+        } else {
+            content_node.byte_range()
+        };
+        if node.start_byte() >= effective.start
+            && node.end_byte() <= effective.end
+            && let Some(language) = extract_injection_language(query, match_, text)
+        {
+            return Some((
+                content_node,
+                language,
+                match_.pattern_index,
+                offset,
+                effective.start,
+                effective.end,
+            ));
         }
     }
 
@@ -1556,7 +1584,7 @@ mod tests {
         let result = detect_injection(&node_in_string, &root, text, Some(&query), "rust");
 
         assert!(result.is_some());
-        let (hierarchy, _content_node, _pattern_index) = result.unwrap();
+        let (hierarchy, _content_node, _pattern_index, _offset) = result.unwrap();
 
         // Should detect rust -> markdown hierarchy
         assert_eq!(hierarchy, vec!["rust", "markdown"]);
@@ -1592,7 +1620,7 @@ mod tests {
 
         let result = detect_injection(&node.unwrap(), &root, text, Some(&query), "rust");
         assert_eq!(
-            result.map(|(h, _, _)| h),
+            result.map(|(h, _, _, _)| h),
             Some(vec!["rust".to_string(), "regex".to_string()])
         );
     }
@@ -1620,7 +1648,7 @@ mod tests {
         assert!(node.is_some());
 
         let result = detect_injection(&node.unwrap(), &root, text, Some(&query), "rust");
-        assert_eq!(result.map(|(h, _, _)| h), None);
+        assert_eq!(result.map(|(h, _, _, _)| h), None);
     }
 
     #[test]
@@ -1673,7 +1701,7 @@ mod tests {
         let result = detect_injection(&node, &root, text, Some(&query), "rust");
 
         assert!(result.is_some());
-        let (hierarchy, _, _) = result.unwrap();
+        let (hierarchy, _, _, _) = result.unwrap();
         assert_eq!(hierarchy, vec!["rust", "nested_lang"]);
 
         // The actual deep recursion is tested through integration with refactor.rs
@@ -1985,7 +2013,7 @@ mod tests {
         let result = detect_injection(&node_in_comment, &root, text, Some(&query), "rust");
 
         assert!(result.is_some(), "Should find injection");
-        let (hierarchy, _, _) = result.unwrap();
+        let (hierarchy, _, _, _) = result.unwrap();
         assert_eq!(
             hierarchy,
             vec!["rust", "doc"],
@@ -3213,7 +3241,7 @@ mod tests {
         assert_eq!(region.language, "regex");
     }
 
-    /// An `#offset!` whose bounds cross collapses the effective span to zero
+    /// An `#offset!` whose bounds meet collapses the effective span to zero
     /// width. Half-open containment is then vacuous by arithmetic — there is no
     /// character to hover — but the caret rule still routes at the collapse
     /// byte: that position IS the whole (empty) injection, which is the first
@@ -3225,18 +3253,17 @@ mod tests {
         let mut parser = create_rust_parser();
         let text = r#"fn main() { let s = "git co"; }"#;
         let tree = parse_rust_code(&mut parser, text);
-        // The string_literal spans [20, 28). Crossing bounds (start 25 > end 23)
-        // exercise `calculate_effective_range`'s normalization directly, rather
-        // than collapsing by out-of-range clamping.
+        // The string_literal spans [20, 28). Equal adjusted bounds collapse at
+        // byte 24 without relying on Neovim's invalid-range fallback.
         let crossing = InjectionOffset {
             start_row: 0,
-            start_column: 5,
+            start_column: 4,
             end_row: 0,
-            end_column: -5,
+            end_column: -4,
         };
         let (injections, raw_start, raw_end) =
             string_literal_injection_with_offset(&tree, text, crossing, false);
-        let collapse_byte = raw_start + 3;
+        let collapse_byte = raw_start + 4;
 
         for byte in raw_start..=raw_end {
             assert!(
@@ -3281,7 +3308,7 @@ mod tests {
                 &tree_sitter_rust::LANGUAGE.into(),
                 r#"((string_literal) @injection.content
                      (#set! injection.language "regex")
-                     (#offset! @injection.content 0 5 0 -5))"#,
+                     (#offset! @injection.content 0 4 0 -4))"#,
             )
             .expect("valid collapsing injection query"),
             collapse_byte,

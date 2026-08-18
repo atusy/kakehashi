@@ -27,14 +27,17 @@ pub(crate) use discovery::{
     RegionBoundary, ResolvedInjection, collect_all_injections, collect_all_injections_cancellable,
     detect_injection, effective_content_range,
 };
-pub(crate) use offset::{InjectionOffset, effective_offset_for_pattern, parse_offset_args};
+#[cfg(test)]
+pub(crate) use offset::effective_offset_for_pattern;
+pub(crate) use offset::{InjectionOffset, parse_offset_args};
 pub(crate) use ranges::{
-    compute_included_ranges, compute_included_ranges_clipped, has_combined_for_pattern,
-    has_include_children_for_pattern, intersect_included_ranges, sub_select_included_ranges,
+    compute_included_ranges, compute_included_ranges_clipped, has_include_children_for_pattern,
+    intersect_included_ranges, sub_select_included_ranges,
 };
 
 // parse_offset_directive_for_pattern is exposed for the selection-range
 // tests (analysis/selection.rs); the injection submodules test the rest
 // directly via their own cfg(test) modules.
+#[cfg(test)]
 #[cfg(test)]
 pub(crate) use offset::parse_offset_directive_for_pattern;

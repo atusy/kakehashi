@@ -1,7 +1,9 @@
 //! Parsing of the `#offset!` directive that shifts injection content
 //! boundaries (e.g. trimming frontmatter delimiters).
 
+#[cfg(test)]
 use crate::language::predicate_accessor::{UnifiedPredicate, get_all_predicates};
+#[cfg(test)]
 use tree_sitter::Query;
 
 /// Represents offset adjustments for injection content boundaries
@@ -37,6 +39,7 @@ pub(crate) fn parse_offset_args(
 /// that changes nothing. Use this instead of
 /// [`parse_offset_directive_for_pattern`] anywhere behavior branches on the
 /// offset's presence.
+#[cfg(test)]
 pub(crate) fn effective_offset_for_pattern(
     query: &Query,
     pattern_index: usize,
@@ -47,6 +50,7 @@ pub(crate) fn effective_offset_for_pattern(
 
 /// Parses offset directive for a specific pattern in the query.
 /// Returns None if the specified pattern has no #offset! directive for @injection.content.
+#[cfg(test)]
 pub(crate) fn parse_offset_directive_for_pattern(
     query: &Query,
     pattern_index: usize,
