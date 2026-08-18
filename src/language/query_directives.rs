@@ -245,10 +245,15 @@ fn trim_range(
             };
         }
     }
-    if trim_start_columns && start < linewise_end {
-        let line_end = text[start..linewise_end]
+    let start_line_limit = if linewise_end == 0 && trim_end_lines {
+        text.len()
+    } else {
+        linewise_end
+    };
+    if trim_start_columns && start < start_line_limit {
+        let line_end = text[start..start_line_limit]
             .find('\n')
-            .map_or(linewise_end, |newline| start + newline);
+            .map_or(start_line_limit, |newline| start + newline);
         let line = &text[start..line_end];
         start += line.len()
             - line
@@ -395,6 +400,19 @@ mod tests {
         assert_eq!((range.start_byte, range.end_byte), (0, 0));
         assert_eq!(range.start_point, tree_sitter::Point::new(0, 0));
         assert_eq!(range.end_point, tree_sitter::Point::new(0, 0));
+    }
+
+    #[test]
+    fn trim_rejects_an_inverted_all_whitespace_range() {
+        let source = "  ";
+        let raw = CaptureRange {
+            start_byte: 0,
+            end_byte: source.len(),
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(0, 2),
+        };
+
+        assert_eq!(trim_range(source, raw, (false, true, true, true)), None);
     }
 
     #[test]
