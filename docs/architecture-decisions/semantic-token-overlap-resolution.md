@@ -200,7 +200,7 @@ The sweep line operates **per-line**. Before normalization destroys cross-line i
 - **Inactive region preservation**: Unknown-language code blocks (e.g., `` ```unknown ``) correctly preserve the parent `@markup.raw.block` token, since no injection tokens suppress it.
 - **Spanning node correctness**: Host captures on nodes spanning injection boundaries are correctly excluded, fixing the overlapping output bug.
 - **Unified resolution point**: All overlap resolution happens in `finalize_tokens`, making the algorithm easy to reason about, test, and extend.
-- **24 unit tests** cover sweep line splitting, injection exclusion, and edge cases.
+- **Regression tests** cover sweep line splitting, injection exclusion, multiline exact matches, and boundary cases.
 
 ### Negative
 
