@@ -495,6 +495,6 @@ tests against the real grammars.
 Injected layers resolve natively too: the region under the cursor is parsed
 with included ranges and results map back through the region's content
 offset, per-layer and never crossing regions. Remaining gap:
-`#offset!`-shifted regions stay bridge-only (the native path does not clip
-effective windows yet). Cross-region resolution stays out of scope for v1 as
+runtime-range-adjusted regions (`#offset!` / `#trim!`) stay bridge-only (the
+native binding path does not clip effective windows yet). Cross-region resolution stays out of scope for v1 as
 decided above.
