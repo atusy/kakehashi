@@ -195,6 +195,8 @@ fn trim_range(
         } else {
             return None;
         }
+    } else if trim_end_lines && !trim_end_columns && text[..linewise_end].rfind('\n').is_none() {
+        linewise_end.checked_sub(raw.start_point.column)?
     } else {
         linewise_end
     };
@@ -408,6 +410,22 @@ mod tests {
         };
 
         assert_eq!(trim_range(source, raw, (true, false, false, false)), None);
+    }
+
+    #[test]
+    fn end_line_trim_uses_neovims_first_line_absolute_column() {
+        let source = "  foo\n  ";
+        let raw = CaptureRange {
+            start_byte: 2,
+            end_byte: source.len(),
+            start_point: tree_sitter::Point::new(0, 2),
+            end_point: tree_sitter::Point::new(1, 2),
+        };
+
+        let range = trim_range(source, raw, (false, false, true, false)).unwrap();
+
+        assert_eq!(&source[range.start_byte..range.end_byte], "f");
+        assert_eq!(range.end_point, tree_sitter::Point::new(0, 3));
     }
 
     #[test]
