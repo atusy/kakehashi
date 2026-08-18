@@ -173,6 +173,7 @@ fn trim_range(
     let text = clamped_slice(source, raw.start_byte..raw.end_byte);
     let whitespace_only = |line: &str| line.bytes().all(|byte| byte.is_ascii_whitespace());
     let mut linewise_end = text.len();
+    let mut removed_end_line = false;
     if trim_end_lines {
         loop {
             let line_start = text[..linewise_end]
@@ -181,6 +182,7 @@ fn trim_range(
             if !whitespace_only(&text[line_start..linewise_end]) {
                 break;
             }
+            removed_end_line = true;
             if line_start == 0 {
                 linewise_end = 0;
                 break;
@@ -195,7 +197,7 @@ fn trim_range(
         } else {
             return None;
         }
-    } else if trim_end_lines && !trim_end_columns && text[..linewise_end].rfind('\n').is_none() {
+    } else if removed_end_line && !trim_end_columns && text[..linewise_end].rfind('\n').is_none() {
         linewise_end.checked_sub(raw.start_point.column)?
     } else {
         linewise_end
@@ -426,6 +428,22 @@ mod tests {
 
         assert_eq!(&source[range.start_byte..range.end_byte], "f");
         assert_eq!(range.end_point, tree_sitter::Point::new(0, 3));
+    }
+
+    #[test]
+    fn default_trim_preserves_a_nonblank_single_line_capture() {
+        let source = "fn foo";
+        let raw = CaptureRange {
+            start_byte: 3,
+            end_byte: source.len(),
+            start_point: tree_sitter::Point::new(0, 3),
+            end_point: tree_sitter::Point::new(0, 6),
+        };
+
+        assert_eq!(
+            trim_range(source, raw, (false, false, true, false)),
+            Some(raw)
+        );
     }
 
     #[test]
