@@ -1355,7 +1355,7 @@ fn build_combined_virtual_content(
 
         while included
             .get(range_index)
-            .is_some_and(|range| range.end <= line_start)
+            .is_some_and(|range| range.start >= range.end || range.end <= line_start)
         {
             range_index += 1;
         }
@@ -1900,6 +1900,16 @@ mod tests {
 
         assert_eq!(content, "\n");
         assert_eq!(offsets, vec![2, 0]);
+    }
+
+    #[test]
+    fn combined_content_skips_empty_ranges_before_later_content() {
+        let text = "abcdef";
+
+        let (content, offsets) = build_combined_virtual_content(text, 0..text.len(), &[2..2, 4..5]);
+
+        assert_eq!(content, "e ");
+        assert_eq!(offsets, vec![4]);
     }
 
     #[test]
