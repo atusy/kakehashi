@@ -57,7 +57,7 @@ fn extract_dynamic_language(query: &Query, match_: &QueryMatch, text: &str) -> O
             // bogus injection region downstream), mirroring the info-string path.
             let transformed;
             let lang_text =
-                if query_directives::has_gsub_directive(query, match_.pattern_index, capture.index)
+                if query_directives::has_text_directive(query, match_.pattern_index, capture.index)
                 {
                     transformed =
                         query_directives::capture_text(query, match_, capture.index, text)?;
@@ -186,6 +186,47 @@ mod tests {
         assert_eq!(
             extract_injection_language(&query, m, text).as_deref(),
             Some("bash")
+        );
+    }
+
+    #[test]
+    fn range_and_text_directives_compose_in_query_order() {
+        let rust: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&rust).expect("load Rust grammar");
+        let text = "/* bash */\n";
+        let tree = parser.parse(text, None).expect("parse Rust");
+        let resolve = |directives: &str| {
+            let query = Query::new(
+                &rust,
+                &format!("((block_comment) @injection.language\n{directives})"),
+            )
+            .expect("valid query");
+            let mut cursor = QueryCursor::new();
+            let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+            let match_ = matches.next().expect("one match");
+            extract_injection_language(&query, match_, text)
+        };
+
+        assert_eq!(
+            resolve("(#offset! @injection.language 0 3 0 -3)").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            resolve(
+                "(#offset! @injection.language 0 3 0 -3)\n\
+                 (#gsub! @injection.language \"^.*$\" \"%0\")"
+            )
+            .as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            resolve(
+                "(#gsub! @injection.language \"^.*$\" \"%0\")\n\
+                 (#offset! @injection.language 0 3 0 -3)"
+            )
+            .as_deref(),
+            Some("/* bash */")
         );
     }
 

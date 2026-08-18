@@ -1,6 +1,6 @@
 //! Runtime evaluation of Neovim query directives.
 
-use tree_sitter::{Query, QueryMatch};
+use tree_sitter::{Query, QueryMatch, QueryPredicate};
 
 use crate::language::query_predicates::lua_gsub;
 use crate::text::clamped_slice;
@@ -49,6 +49,22 @@ pub(crate) fn capture_range(
     node: tree_sitter::Node,
     source: &str,
 ) -> CaptureRange {
+    capture_range_for_directives(
+        query.general_predicates(match_.pattern_index),
+        match_,
+        capture_id,
+        node,
+        source,
+    )
+}
+
+fn capture_range_for_directives(
+    directives: &[QueryPredicate],
+    match_: &QueryMatch,
+    capture_id: u32,
+    node: tree_sitter::Node,
+    source: &str,
+) -> CaptureRange {
     let raw = CaptureRange {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -58,7 +74,7 @@ pub(crate) fn capture_range(
     let mut offset = None;
     let mut trimmed = None;
     let mut is_single_capture = None;
-    for directive in query.general_predicates(match_.pattern_index) {
+    for directive in directives {
         if !matches!(
             directive.args.first(),
             Some(tree_sitter::QueryPredicateArg::Capture(id)) if *id == capture_id
@@ -263,13 +279,13 @@ fn trim_range(
     })
 }
 
-/// Whether this pattern transforms `capture_id` with `#gsub!`.
-pub(crate) fn has_gsub_directive(query: &Query, pattern_index: usize, capture_id: u32) -> bool {
+/// Whether this pattern can change the text observed for `capture_id`.
+pub(crate) fn has_text_directive(query: &Query, pattern_index: usize, capture_id: u32) -> bool {
     query
         .general_predicates(pattern_index)
         .iter()
         .any(|directive| {
-            directive.operator.as_ref() == "gsub!"
+            matches!(directive.operator.as_ref(), "gsub!" | "offset!" | "trim!")
                 && matches!(
                     directive.args.first(),
                     Some(tree_sitter::QueryPredicateArg::Capture(id)) if *id == capture_id
@@ -277,27 +293,36 @@ pub(crate) fn has_gsub_directive(query: &Query, pattern_index: usize, capture_id
         })
 }
 
-/// Return one capture's text after applying its `#gsub!` directives in query
-/// order. A quantified capture is left unresolved, matching Neovim's
-/// single-node requirement without letting a user query panic the server.
+/// Return one capture's text after applying its runtime directives in query
+/// order. Once `#gsub!` materializes text, later range directives do not alter
+/// it, matching Neovim's `metadata.text` precedence. A quantified capture with
+/// `#gsub!` is left unresolved rather than panicking the server.
 pub(crate) fn capture_text(
     query: &Query,
     match_: &QueryMatch,
     capture_id: u32,
     source: &str,
 ) -> Option<String> {
+    let directives = query.general_predicates(match_.pattern_index);
+    let has_gsub = directives.iter().any(|directive| {
+        directive.operator.as_ref() == "gsub!"
+            && matches!(
+                directive.args.first(),
+                Some(tree_sitter::QueryPredicateArg::Capture(id)) if *id == capture_id
+            )
+    });
     let mut nodes = match_
         .captures
         .iter()
         .filter(|capture| capture.index == capture_id)
         .map(|capture| capture.node);
     let node = nodes.next()?;
-    if nodes.next().is_some() {
+    if has_gsub && nodes.next().is_some() {
         return None;
     }
 
-    let mut text = clamped_slice(source, node.byte_range()).to_owned();
-    for directive in query.general_predicates(match_.pattern_index) {
+    let mut text = None;
+    for (index, directive) in directives.iter().enumerate() {
         if directive.operator.as_ref() != "gsub!"
             || !matches!(
                 directive.args.first(),
@@ -313,11 +338,25 @@ pub(crate) fn capture_text(
         else {
             continue;
         };
-        if let Some(replaced) = lua_gsub(pattern, replacement, &text) {
-            text = replaced;
+        let input = text.get_or_insert_with(|| {
+            let range = capture_range_for_directives(
+                &directives[..index],
+                match_,
+                capture_id,
+                node,
+                source,
+            );
+            clamped_slice(source, range.start_byte..range.end_byte).to_owned()
+        });
+        if let Some(replaced) = lua_gsub(pattern, replacement, input) {
+            *input = replaced;
         }
     }
-    Some(text)
+    if let Some(text) = text {
+        return Some(text);
+    }
+    let range = capture_range_for_directives(directives, match_, capture_id, node, source);
+    Some(clamped_slice(source, range.start_byte..range.end_byte).to_owned())
 }
 
 #[cfg(test)]
