@@ -51,6 +51,7 @@ pub(crate) fn parse_offset_directive_for_pattern(
     query: &Query,
     pattern_index: usize,
 ) -> Option<InjectionOffset> {
+    let mut offset = None;
     for predicate in get_all_predicates(query, pattern_index) {
         // Skip non-offset! directives
         if predicate.operator() != "offset!" {
@@ -76,9 +77,9 @@ pub(crate) fn parse_offset_directive_for_pattern(
             continue;
         };
 
-        return Some(parse_offset_args(&pred.args[1..]).unwrap_or_default());
+        offset = Some(parse_offset_args(&pred.args[1..]).unwrap_or_default());
     }
-    None
+    offset
 }
 
 #[cfg(test)]
@@ -122,6 +123,28 @@ mod tests {
                 end_column: 0
             }),
             "Pattern 1 should have offset (1, 0, -1, 0)"
+        );
+    }
+
+    #[test]
+    fn last_offset_directive_wins() {
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"((line_comment) @injection.content
+                 (#offset! @injection.content 0 1 0 0)
+                 (#offset! @injection.content 0 2 0 -1))"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_offset_directive_for_pattern(&query, 0),
+            Some(InjectionOffset {
+                start_row: 0,
+                start_column: 2,
+                end_row: 0,
+                end_column: -1,
+            })
         );
     }
 
