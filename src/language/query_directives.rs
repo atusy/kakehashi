@@ -168,14 +168,16 @@ fn trim_range(
     let mut end = if end_index == lines.len() {
         text.len()
     } else if end_index == 0 {
-        return None;
+        if trim_end_columns {
+            0
+        } else {
+            return None;
+        }
     } else {
         starts[end_index - 1] + lines[end_index - 1].len()
     };
     if trim_end_columns {
-        if end_index == 0 {
-            end = 0;
-        } else {
+        if end_index != 0 {
             let line = lines[end_index - 1];
             end = starts[end_index - 1]
                 + line
@@ -282,5 +284,22 @@ mod tests {
         assert_eq!(&source[range.start_byte..range.end_byte], "fn main() {}");
         assert_eq!(range.start_point, tree_sitter::Point::new(1, 2));
         assert_eq!(range.end_point, tree_sitter::Point::new(1, 14));
+    }
+
+    #[test]
+    fn end_charwise_trim_can_collapse_an_all_whitespace_range() {
+        let source = " \n\t";
+        let raw = CaptureRange {
+            start_byte: 0,
+            end_byte: source.len(),
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(1, 1),
+        };
+
+        let range = trim_range(source, raw, (false, false, true, true)).unwrap();
+
+        assert_eq!((range.start_byte, range.end_byte), (0, 0));
+        assert_eq!(range.start_point, tree_sitter::Point::new(0, 0));
+        assert_eq!(range.end_point, tree_sitter::Point::new(0, 0));
     }
 }
