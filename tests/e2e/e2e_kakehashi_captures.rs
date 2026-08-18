@@ -246,14 +246,15 @@ fn runtime_range_directives_adjust_wire_ranges() {
     std::fs::create_dir_all(&md).expect("create queries/markdown");
     std::fs::write(
         md.join("context.scm"),
-        "((atx_heading) @offset (#offset! @offset 0 1 0 -1))\n\
-         ((document) @trim (#trim! @trim))\n",
+        "((atx_heading) @offset (#offset! @offset 0 6 0 -1))\n\
+         ((document) @trim (#trim! @trim))\n\
+         ((document) @row (#offset! @row 1 0 0 0))\n",
     )
     .expect("write markdown context.scm");
     let mut client = LspClient::new();
     initialize(&mut client, dir.path());
     let uri = "file:///captures_runtime_ranges.md";
-    open_markdown(&mut client, uri, "# Title\n\n");
+    open_markdown(&mut client, uri, "# 😀Title\n\n");
 
     let result = full(&mut client, uri, "context");
 
@@ -273,15 +274,22 @@ fn runtime_range_directives_adjust_wire_ranges() {
     assert_eq!(
         named("offset")["range"],
         json!({
-            "start": { "line": 0, "character": 1 },
-            "end": { "line": 0, "character": 7 }
+            "start": { "line": 0, "character": 4 },
+            "end": { "line": 0, "character": 9 }
         })
     );
     assert_eq!(
         named("trim")["range"],
         json!({
             "start": { "line": 0, "character": 0 },
-            "end": { "line": 0, "character": 7 }
+            "end": { "line": 0, "character": 9 }
+        })
+    );
+    assert_eq!(
+        named("row")["range"],
+        json!({
+            "start": { "line": 1, "character": 0 },
+            "end": { "line": 2, "character": 0 }
         })
     );
 }
