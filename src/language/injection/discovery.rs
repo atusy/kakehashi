@@ -423,8 +423,9 @@ pub(crate) fn collect_all_injections_cancellable<'a>(
                     content_node: capture.node,
                     pattern_index: match_.pattern_index,
                     include_children: has_include_children_for_pattern(query, match_.pattern_index),
-                    // Match the semantic path: effective offsets and
-                    // multi-region grouping do not compose safely.
+                    // Combined grouping is independent of runtime range
+                    // adjustment; consumers compose each member's effective
+                    // range into the shared injected document.
                     combined: has_combined_for_pattern(query, match_.pattern_index),
                     identity_slot: 0,
                     offset,

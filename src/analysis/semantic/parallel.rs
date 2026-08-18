@@ -494,10 +494,8 @@ fn collect_injection_contexts_sync<'a>(
 
     // Partition out `injection.combined` regions: every capture of one
     // (language, pattern) pair parses as a single document so cross-block
-    // context survives (#187). Patterns that also carry #offset! stay on the
-    // per-region path — offset adjustment and multi-region merging don't
-    // compose (same exclusivity the included_ranges handling applies below),
-    // and no vendored query combines them.
+    // context survives (#187). Runtime range directives remain per-member;
+    // `build_combined_context` composes their effective ranges below.
     let mut singles = Vec::new();
     let mut combined_groups: indexmap::IndexMap<(String, usize), Vec<InjectionRegionInfo>> =
         indexmap::IndexMap::new();
