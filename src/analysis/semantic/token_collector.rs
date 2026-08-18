@@ -406,13 +406,8 @@ pub(super) fn collect_host_tokens(
                 return false;
             }
             let node = c.node;
-            let capture_range = crate::language::query_directives::capture_range(
-                query,
-                m.pattern_index,
-                c.index,
-                node,
-                text,
-            );
+            let capture_range =
+                crate::language::query_directives::capture_range(query, m, c.index, node, text);
             let start_pos = capture_range.start_point;
             let end_pos = capture_range.end_point;
 

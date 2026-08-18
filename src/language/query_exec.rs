@@ -105,13 +105,8 @@ pub(crate) fn execute_query(
             .iter()
             .map(|c| {
                 let node = c.node;
-                let range = crate::language::query_directives::capture_range(
-                    query,
-                    m.pattern_index,
-                    c.index,
-                    node,
-                    text,
-                );
+                let range =
+                    crate::language::query_directives::capture_range(query, m, c.index, node, text);
                 CapturedNode {
                     name: capture_names[c.index as usize].to_string(),
                     start_byte: node.start_byte(),
@@ -193,6 +188,41 @@ mod tests {
         let capture = &matches[0].captures[0];
         assert_eq!((capture.start_byte, capture.end_byte), (0, 5));
         assert_eq!((capture.range_start_byte, capture.range_end_byte), (1, 4));
+    }
+
+    #[test]
+    fn trim_directive_defaults_to_removing_trailing_blank_lines() {
+        let src = "fn main() {}\n\n";
+        let (language, tree) = rust_tree(src);
+        let query = compile(&language, "((source_file) @fold (#trim! @fold))");
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        assert_eq!(matches.len(), 1);
+        let capture = &matches[0].captures[0];
+        assert_eq!((capture.start_byte, capture.end_byte), (0, src.len()));
+        assert_eq!(
+            (capture.range_start_byte, capture.range_end_byte),
+            (0, "fn main() {}".len())
+        );
+    }
+
+    #[test]
+    fn trim_range_takes_precedence_over_offset_metadata() {
+        let src = "fn main() {}\n\n";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            "((source_file) @fold (#trim! @fold) (#offset! @fold 0 1 0 -1))",
+        );
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        let capture = &matches[0].captures[0];
+        assert_eq!(
+            (capture.range_start_byte, capture.range_end_byte),
+            (0, "fn main() {}".len())
+        );
     }
 
     #[test]
