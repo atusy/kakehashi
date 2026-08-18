@@ -83,12 +83,15 @@ fn multiline_exact_match_keys(
         if region.start_line == region.end_line {
             continue;
         }
-        let (Some(start_line), Some(end_line)) =
-            (lines.get(region.start_line), lines.get(region.end_line))
-        else {
+        let Some(start_line) = lines.get(region.start_line) else {
             continue;
         };
-        let (start_width, end_width) = (utf16_width(start_line), utf16_width(end_line));
+        let end_width = match lines.get(region.end_line) {
+            Some(end_line) => utf16_width(end_line),
+            None if region.end_line == lines.len() && region.end_col == 0 => 0,
+            None => continue,
+        };
+        let start_width = utf16_width(start_line);
         if region.start_col > start_width || region.end_col > end_width {
             continue;
         }
@@ -2262,6 +2265,38 @@ mod tests {
                 (0, 5, 5, comment_type, comment_modifiers),
                 (1, 0, 3, comment_type, comment_modifiers),
             ],
+        );
+    }
+
+    #[test]
+    fn finalize_preserves_exact_multiline_host_ending_after_trailing_newline() {
+        // `str::lines()` omits the virtual empty line after the final newline.
+        let lines: Vec<&str> = "a\nb\n".lines().collect();
+        let tokens = vec![
+            make_token(0, 0, 4, "comment.documentation", 0, 0),
+            make_token(0, 0, 1, "keyword", 1, 0),
+        ];
+        let regions = vec![ActiveInjectionBounds {
+            start_line: 0,
+            start_col: 0,
+            end_line: 2,
+            end_col: 0,
+        }];
+
+        let SemanticTokensResult::Tokens(st) =
+            finalize_tokens(tokens, &regions, &lines).expect("should produce tokens")
+        else {
+            panic!("Expected Tokens");
+        };
+        let (comment_type, _) =
+            map_capture_to_token_type_and_modifiers("comment.documentation").unwrap();
+
+        assert!(
+            st.data
+                .iter()
+                .any(|token| token.delta_line == 1 && token.token_type == comment_type),
+            "the exact host must remain on the second line: {:?}",
+            st.data
         );
     }
 }
