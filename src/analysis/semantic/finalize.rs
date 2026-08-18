@@ -74,42 +74,49 @@ fn multiline_exact_match_keys(
         return Some(HashSet::new());
     }
 
-    let mut line_offsets = Vec::with_capacity(lines.len());
-    let mut offset = 0usize;
     let mut work_items = 0usize;
-    for line in lines {
-        if cancellation_requested(cancel, &mut work_items) {
-            return None;
-        }
-        line_offsets.push(offset);
-        let Some(next_offset) = offset
-            .checked_add(utf16_width(line))
-            .and_then(|value| value.checked_add(1))
-        else {
-            return Some(HashSet::new());
-        };
-        offset = next_offset;
-    }
-
     let mut keys = HashSet::new();
-    for region in regions {
+    'regions: for region in regions {
         if cancellation_requested(cancel, &mut work_items) {
             return None;
         }
         if region.start_line == region.end_line {
             continue;
         }
-        let (Some(start), Some(end)) = (
-            line_offsets
-                .get(region.start_line)
-                .and_then(|offset| offset.checked_add(region.start_col)),
-            line_offsets
-                .get(region.end_line)
-                .and_then(|offset| offset.checked_add(region.end_col)),
-        ) else {
+        let (Some(start_line), Some(end_line)) =
+            (lines.get(region.start_line), lines.get(region.end_line))
+        else {
             continue;
         };
-        let Some(length) = end.checked_sub(start) else {
+        let (start_width, end_width) = (utf16_width(start_line), utf16_width(end_line));
+        if region.start_col > start_width || region.end_col > end_width {
+            continue;
+        }
+        let Some(mut length) = start_width.checked_sub(region.start_col) else {
+            continue;
+        };
+        let Some(first_inner_line) = region.start_line.checked_add(1) else {
+            continue;
+        };
+        for line_index in first_inner_line..region.end_line {
+            if cancellation_requested(cancel, &mut work_items) {
+                return None;
+            }
+            let Some(line) = lines.get(line_index) else {
+                continue 'regions;
+            };
+            let Some(next_length) = length
+                .checked_add(1)
+                .and_then(|value| value.checked_add(utf16_width(line)))
+            else {
+                continue 'regions;
+            };
+            length = next_length;
+        }
+        let Some(length) = length
+            .checked_add(1)
+            .and_then(|value| value.checked_add(region.end_col))
+        else {
             continue;
         };
         keys.insert((region.start_line, region.start_col, length));
@@ -808,8 +815,11 @@ pub(super) fn finalize_tokens_cancellable(
     // removed inside the region.
     let multiline_exact_matches =
         multiline_exact_match_keys(active_injection_regions, lines, cancel)?;
-    let (exact_match_tokens, filterable_tokens) =
-        partition_multiline_exact_matches(all_tokens, &multiline_exact_matches, cancel)?;
+    let (exact_match_tokens, filterable_tokens) = if multiline_exact_matches.is_empty() {
+        (Vec::new(), all_tokens)
+    } else {
+        partition_multiline_exact_matches(all_tokens, &multiline_exact_matches, cancel)?
+    };
 
     // Split multiline tokens into per-line tokens before the sweep line,
     // which treats [column, column+length) as a 1D interval on a single line.
@@ -1007,6 +1017,27 @@ mod tests {
             "classification must remain cancellable on large token sets"
         );
         assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn exact_match_key_collection_does_not_scan_lines_after_region() {
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel_after_polls(3);
+        let lines = vec!["x"; 512];
+        let regions = [ActiveInjectionBounds {
+            start_line: 0,
+            start_col: 0,
+            end_line: 1,
+            end_col: 1,
+        }];
+
+        let keys = multiline_exact_match_keys(&regions, &lines, Some(&cancel));
+
+        assert_eq!(keys, Some(HashSet::from([(0, 0, 3)])));
+        assert!(
+            !cancel.is_cancelled(),
+            "unrelated lines after the region must not be visited"
+        );
     }
 
     #[test]
