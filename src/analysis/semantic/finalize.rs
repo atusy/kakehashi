@@ -128,6 +128,28 @@ fn partition_multiline_exact_matches(
     multiline_exact_matches: &HashSet<(usize, usize, usize)>,
     cancel: Option<&crate::cancel::CancelToken>,
 ) -> Option<(Vec<RawToken>, Vec<RawToken>)> {
+    let is_exact_match = |token: &RawToken| {
+        token.depth == 0
+            && multiline_exact_matches.contains(&(token.line, token.column, token.length))
+    };
+    let mut scan_work_items = 0usize;
+    let mut has_exact_match = false;
+    for token in &tokens {
+        if cancellation_requested(cancel, &mut scan_work_items) {
+            return None;
+        }
+        if is_exact_match(token) {
+            has_exact_match = true;
+            break;
+        }
+    }
+    if !has_exact_match {
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
+        return Some((Vec::new(), tokens));
+    }
+
     let mut exact_match_tokens = Vec::new();
     let mut filterable_tokens = Vec::with_capacity(tokens.len());
     let mut work_items = 0usize;
@@ -135,9 +157,7 @@ fn partition_multiline_exact_matches(
         if cancellation_requested(cancel, &mut work_items) {
             return None;
         }
-        if token.depth == 0
-            && multiline_exact_matches.contains(&(token.line, token.column, token.length))
-        {
+        if is_exact_match(&token) {
             exact_match_tokens.push(token);
         } else {
             filterable_tokens.push(token);
@@ -1016,6 +1036,22 @@ mod tests {
             "classification must remain cancellable on large token sets"
         );
         assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn exact_match_partition_reuses_input_when_no_token_matches() {
+        let tokens = vec![make_token(0, 0, 1, "variable", 0, 0)];
+        let input_ptr = tokens.as_ptr();
+        let keys = HashSet::from([(1, 0, 1)]);
+
+        let (exact, filterable) = partition_multiline_exact_matches(tokens, &keys, None).unwrap();
+
+        assert!(exact.is_empty());
+        assert_eq!(
+            filterable.as_ptr(),
+            input_ptr,
+            "a nonmatching pass must return the original allocation"
+        );
     }
 
     #[test]
