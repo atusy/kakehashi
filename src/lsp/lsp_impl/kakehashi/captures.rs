@@ -328,6 +328,7 @@ struct KindQuery {
     query: tree_sitter::Query,
     skipped: Vec<crate::language::query_loader::SkippedPattern>,
     has_offset: bool,
+    has_expanding_range: bool,
 }
 
 /// Compiled-kind-query cache, `language → kind file → (query, generation)`.
@@ -447,10 +448,13 @@ fn load_kind_query(
         return KindQueryLoad::Broken(parsed.skipped);
     };
     let has_offset = crate::language::query_directives::has_offset_directive(&query);
+    let has_expanding_range =
+        crate::language::query_directives::has_expanding_range_directive(&query);
     KindQueryLoad::Loaded(KindQuery {
         query,
         skipped: parsed.skipped,
         has_offset,
+        has_expanding_range,
     })
 }
 
@@ -1427,7 +1431,10 @@ fn execute_captures_walk(
     // Hit/miss counters for the walk log line (cache-behavior diagnostics).
     let (mut layers_reused, mut layers_executed) = (0usize, 0usize);
 
-    let mut visit = |layer_language: &str, layer_tree: &tree_sitter::Tree, depth: usize| {
+    let mut visit = |layer_language: &str,
+                     layer_tree: &tree_sitter::Tree,
+                     depth: usize,
+                     known_span: Option<&std::ops::Range<usize>>| {
         // Per-layer cancellation checkpoint: a cancelled walk stops doing
         // query/mint work; the caller discards the (partial) result.
         if crate::cancel::is_cancelled(cancel) {
@@ -1447,6 +1454,29 @@ fn execute_captures_walk(
         let KindQueryLoad::Loaded(kind_query) = entry.as_ref() else {
             return;
         };
+        // A runtime offset may pull a capture beyond the injected layer's raw
+        // span and into the requested viewport. Only prune the layer before
+        // query execution when its kind query cannot expand capture ranges;
+        // `execute_query` performs the authoritative effective-range filter.
+        if depth > 0
+            && !kind_query.has_expanding_range
+            && let Some(filter) = &byte_range
+        {
+            let derived_span;
+            let span = if let Some(span) = known_span {
+                span
+            } else {
+                let included = layer_tree.included_ranges();
+                let (Some(first), Some(last)) = (included.first(), included.last()) else {
+                    return;
+                };
+                derived_span = first.start_byte..last.end_byte;
+                &derived_span
+            };
+            if span.end <= filter.start || span.start >= filter.end {
+                return;
+            }
+        }
         // Content-addressed cross-snapshot reuse: a layer whose included
         // ranges carry the same bytes in the same relative geometry (merely
         // translated by edits elsewhere) serves its cached MatchData and
@@ -1655,22 +1685,15 @@ fn execute_captures_walk(
     if injection {
         if let Some(layers) = layer_trees {
             // Pre-parsed layers from the snapshot's populate pass (the
-            // layer-tree half of never-discover-twice): identical to the
-            // inline walk below by construction — populate built them with
-            // that walk over this same (text, tree). The span check mirrors
-            // the walk's byte_filter pruning: a false-positive visit only
-            // makes the layer's query yield nothing for the clipped range.
-            visit(language_id, tree, 0);
+            // layer-tree half of never-discover-twice). Query-specific range
+            // pruning happens inside `visit`, after we know whether this
+            // layer's kind query can expand a capture beyond the layer span.
+            visit(language_id, tree, 0, None);
             for layer in layers {
                 if crate::cancel::is_cancelled(cancel) {
                     break;
                 }
-                if let Some(filter) = &byte_range
-                    && (layer.span.end <= filter.start || layer.span.start >= filter.end)
-                {
-                    continue;
-                }
-                visit(&layer.language, &layer.tree, layer.depth);
+                visit(&layer.language, &layer.tree, layer.depth, Some(&layer.span));
             }
         } else {
             walk_document_layers(
@@ -1678,13 +1701,16 @@ fn execute_captures_walk(
                 language_id,
                 text,
                 tree,
-                byte_range.as_ref(),
+                // The layer walker cannot know each visited language's kind
+                // query. Traverse all injection layers and let `visit` prune
+                // those whose query is guaranteed not to expand ranges.
+                None,
                 cancel,
-                &mut visit,
+                &mut |language, tree, depth| visit(language, tree, depth, None),
             );
         }
     } else {
-        visit(language_id, tree, 0);
+        visit(language_id, tree, 0, None);
     }
 
     // A cancelled walk must not shape a partial result: the caller answers
