@@ -406,8 +406,15 @@ pub(super) fn collect_host_tokens(
                 return false;
             }
             let node = c.node;
-            let start_pos = node.start_position();
-            let end_pos = node.end_position();
+            let capture_range = crate::language::query_directives::capture_range(
+                query,
+                m.pattern_index,
+                c.index,
+                node,
+                text,
+            );
+            let start_pos = capture_range.start_point;
+            let end_pos = capture_range.end_point;
 
             // Node byte length for specificity: smaller nodes win in sweep line
             let node_byte_len = node.end_byte() - node.start_byte();
@@ -1007,6 +1014,41 @@ mod tests {
             (19, 1),
             "y: byte col 25, but utf16 col 19 (three 3-byte CJK chars each collapse to 1 utf16 unit)"
         );
+    }
+
+    #[test]
+    fn collect_host_tokens_applies_capture_offset_directive() {
+        let code = r#""abc""#;
+        let tree = parse_rust_tree(code);
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"((string_literal) @string (#offset! @string 0 1 0 -1))"#,
+        )
+        .unwrap();
+        let lines: Vec<&str> = code.lines().collect();
+        let mut tokens = Vec::new();
+
+        collect_host_tokens(
+            code,
+            &tree,
+            &query,
+            Some("rust"),
+            None,
+            code,
+            &lines,
+            &build_line_start_bytes(code),
+            0,
+            0,
+            false,
+            &[],
+            &[],
+            None,
+            &mut tokens,
+        );
+
+        assert_eq!(tokens.len(), 1);
+        assert_eq!((tokens[0].column, tokens[0].length), (1, 3));
     }
 
     #[test]
