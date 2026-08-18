@@ -10,7 +10,7 @@
 //! SemanticTokensDelta optimization which is handled by the `delta` module.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use tower_lsp_server::ls_types::{SemanticToken, SemanticTokens, SemanticTokensResult};
 
@@ -58,6 +58,63 @@ fn cached_utf16_width(
         cache.resize(line + 1, None);
     }
     Some(*cache[line].get_or_insert_with(|| utf16_width(line_text)))
+}
+
+/// Identify multiline host tokens whose original span exactly matches an active
+/// injection region before per-line normalization destroys that information.
+fn multiline_exact_match_keys(
+    regions: &[ActiveInjectionBounds],
+    lines: &[&str],
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<HashSet<(usize, usize, usize)>> {
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
+    }
+    if !regions.iter().any(|r| r.start_line != r.end_line) {
+        return Some(HashSet::new());
+    }
+
+    let mut line_offsets = Vec::with_capacity(lines.len());
+    let mut offset = 0usize;
+    let mut work_items = 0usize;
+    for line in lines {
+        if cancellation_requested(cancel, &mut work_items) {
+            return None;
+        }
+        line_offsets.push(offset);
+        let Some(next_offset) = offset
+            .checked_add(utf16_width(line))
+            .and_then(|value| value.checked_add(1))
+        else {
+            return Some(HashSet::new());
+        };
+        offset = next_offset;
+    }
+
+    let mut keys = HashSet::new();
+    for region in regions {
+        if cancellation_requested(cancel, &mut work_items) {
+            return None;
+        }
+        if region.start_line == region.end_line {
+            continue;
+        }
+        let (Some(start), Some(end)) = (
+            line_offsets
+                .get(region.start_line)
+                .and_then(|offset| offset.checked_add(region.start_col)),
+            line_offsets
+                .get(region.end_line)
+                .and_then(|offset| offset.checked_add(region.end_col)),
+        ) else {
+            continue;
+        };
+        let Some(length) = end.checked_sub(start) else {
+            continue;
+        };
+        keys.insert((region.start_line, region.start_col, length));
+    }
+    Some(keys)
 }
 
 /// Split multiline tokens into per-line fragments, skipping empty multiline fragments.
@@ -717,16 +774,35 @@ pub(super) fn finalize_tokens_cancellable(
         return None;
     }
 
+    // Preserve the exact-match exception across normalization. Once a multiline
+    // host token is split into per-line fragments, none of those fragments can
+    // equal the original multiline injection region, so Stage 1 would mistake
+    // them for fully-contained host leakage. Partial overlaps (notably Markdown
+    // fenced-code containers) remain in `filterable_tokens` and are still
+    // removed inside the region.
+    let multiline_exact_matches =
+        multiline_exact_match_keys(active_injection_regions, lines, cancel)?;
+    let (exact_match_tokens, filterable_tokens): (Vec<_>, Vec<_>) =
+        all_tokens.into_iter().partition(|token| {
+            token.depth == 0
+                && multiline_exact_matches.contains(&(token.line, token.column, token.length))
+        });
+
     // Split multiline tokens into per-line tokens before the sweep line,
     // which treats [column, column+length) as a 1D interval on a single line.
-    let mut all_tokens = split_multiline_tokens_cancellable(all_tokens, lines, cancel)?;
+    let mut all_tokens = split_multiline_tokens_cancellable(filterable_tokens, lines, cancel)?;
 
     // Filter out zero-length tokens before the sweep line overlap resolution.
     // Unknown captures are already filtered at collection time (CaptureResult::Suppressed → continue).
     all_tokens.retain(|token| token.length > 0);
 
-    let all_tokens =
+    let mut all_tokens =
         filter_by_injection_regions(all_tokens, active_injection_regions, lines, cancel)?;
+    all_tokens.extend(split_multiline_tokens_cancellable(
+        exact_match_tokens,
+        lines,
+        cancel,
+    )?);
 
     let all_tokens = apply_none_preprocessing(all_tokens, cancel)?;
 
@@ -2066,6 +2142,56 @@ mod tests {
                 (4, 5, comment_type),  // comment [19, 24)  delta=19-15=4
             ],
             "Host comment should be split around injection number by sweep-line"
+        );
+    }
+
+    #[test]
+    fn finalize_preserves_multiline_host_token_exactly_matching_active_injection_region() {
+        let lines: Vec<&str> = vec!["/**", " * ERROR text", " */"];
+        let tokens = vec![
+            // Multiline lengths include one UTF-16 unit for each newline.
+            make_token(0, 0, 21, "comment.documentation", 0, 0),
+            make_token(1, 3, 5, "keyword", 1, 0),
+        ];
+        let regions = vec![ActiveInjectionBounds {
+            start_line: 0,
+            start_col: 0,
+            end_line: 2,
+            end_col: 3,
+        }];
+
+        let SemanticTokensResult::Tokens(st) =
+            finalize_tokens(tokens, &regions, &lines).expect("should produce tokens")
+        else {
+            panic!("Expected Tokens");
+        };
+        let (comment_type, comment_modifiers) =
+            map_capture_to_token_type_and_modifiers("comment.documentation").unwrap();
+        let (keyword_type, keyword_modifiers) =
+            map_capture_to_token_type_and_modifiers("keyword").unwrap();
+
+        let positions: Vec<(u32, u32, u32, u32, u32)> = st
+            .data
+            .iter()
+            .map(|t| {
+                (
+                    t.delta_line,
+                    t.delta_start,
+                    t.length,
+                    t.token_type,
+                    t.token_modifiers_bitset,
+                )
+            })
+            .collect();
+        assert_eq!(
+            positions,
+            vec![
+                (0, 0, 3, comment_type, comment_modifiers),
+                (1, 0, 3, comment_type, comment_modifiers),
+                (0, 3, 5, keyword_type, keyword_modifiers),
+                (0, 5, 5, comment_type, comment_modifiers),
+                (1, 0, 3, comment_type, comment_modifiers),
+            ],
         );
     }
 }
