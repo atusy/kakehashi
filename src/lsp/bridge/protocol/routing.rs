@@ -42,10 +42,26 @@ pub(crate) struct RoutingParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RoutingEntry {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_workspace_folders",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) workspace_folders: Option<Option<Vec<String>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) enabled: Option<bool>,
+}
+
+/// Preserve the protocol distinction between an omitted field and an explicit
+/// JSON `null`: both are meaningful to routing (`null` asks kakehashi to use
+/// its own workspace resolution, while omission leaves routing unspecified).
+fn deserialize_workspace_folders<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<Vec<String>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<String>>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +161,17 @@ mod tests {
         .unwrap();
         assert_eq!(answer.routing["lua"].enabled, Some(false));
         assert_eq!(answer.routing["lua"].workspace_folders, Some(Some(vec![])));
+
+        let answer = parse_routing_response(&serde_json::json!({
+            "result": {"routing": {
+                "null": {"workspaceFolders": null},
+                "missing": {}
+            }}
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(answer.routing["null"].workspace_folders, Some(None));
+        assert_eq!(answer.routing["missing"].workspace_folders, None);
     }
 
     #[test]

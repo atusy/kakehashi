@@ -49,8 +49,15 @@ impl LanguageServerPool {
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<CompletionList>> {
+        let host_incarnation = self.current_host_incarnation(host_uri);
         let handle = self
-            .get_or_create_connection(server_name, server_config, Some(host_uri))
+            .get_or_create_virtual_connection(
+                server_name,
+                server_config,
+                host_uri,
+                injection_language,
+                region_id,
+            )
             .await?;
         if !handle.has_capability("textDocument/completion") {
             return Ok(None);
@@ -77,6 +84,8 @@ impl LanguageServerPool {
                     Some(host_position.line),
                     Some(EnvelopeContext {
                         server_name,
+                        injection_language,
+                        incarnation: host_incarnation,
                         host_uri: host_uri.as_str(),
                         region_id,
                         offset: ctx.offset,
@@ -384,6 +393,13 @@ const ENVELOPE_KEY: &str = "kakehashi";
 pub(crate) struct KakehashiEnvelope {
     /// Server name identifying which downstream produced the item.
     pub origin: String,
+    /// Language used to construct the virtual document URI for resolve.
+    /// Empty for host-layer and legacy envelopes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub injection_language: String,
+    /// Host open incarnation that produced this item. Missing for legacy data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<u64>,
     /// Host document URI the completion was requested on. Used to re-resolve the
     /// same `(server, root)` connection for `completionItem/resolve` so the
     /// resolve reaches the very process that produced the item (#382) — without
@@ -486,6 +502,8 @@ impl From<&EnvelopeOffset> for RegionOffset {
 /// Context needed to create envelopes during completion response processing.
 pub(crate) struct EnvelopeContext<'a> {
     pub server_name: &'a str,
+    pub injection_language: &'a str,
+    pub incarnation: Option<u64>,
     /// Host document URI the completion ran on, stored in the envelope so
     /// `completionItem/resolve` can route back to the originating connection.
     pub host_uri: &'a str,
@@ -508,6 +526,8 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
     let inner = item.data.take();
     let envelope = KakehashiEnvelope {
         origin: ctx.server_name.to_string(),
+        injection_language: ctx.injection_language.to_string(),
+        incarnation: ctx.incarnation,
         host_uri: ctx.host_uri.to_string(),
         region_id: ctx.region_id.to_string(),
         inner: None,
@@ -596,6 +616,8 @@ pub(super) fn envelope_host_item(item: &mut CompletionItem, server_name: &str, h
     let inner = item.data.take();
     let envelope = KakehashiEnvelope {
         origin: server_name.to_string(),
+        injection_language: String::new(),
+        incarnation: None,
         host_uri: host_uri.to_string(),
         region_id: String::new(),
         inner: None,
@@ -1147,6 +1169,8 @@ mod tests {
         let offset = RegionOffset::new(3, 4);
         let ctx = EnvelopeContext {
             server_name: "lua-ls",
+            injection_language: "markdown",
+            incarnation: Some(1),
             host_uri: "file:///test/doc.md",
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
@@ -1342,6 +1366,8 @@ mod tests {
             &mut item,
             &EnvelopeContext {
                 server_name: "lua-ls",
+                injection_language: "markdown",
+                incarnation: Some(1),
                 host_uri: "file:///test/doc.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,
@@ -1364,6 +1390,8 @@ mod tests {
             &mut virt,
             &EnvelopeContext {
                 server_name: "lua-ls",
+                injection_language: "markdown",
+                incarnation: Some(1),
                 host_uri: "file:///test/doc.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,
@@ -1388,6 +1416,8 @@ mod tests {
         let offset = RegionOffset::new(3, 4);
         let ctx = EnvelopeContext {
             server_name: "lua-ls",
+            injection_language: "markdown",
+            incarnation: Some(1),
             host_uri: "file:///test/doc.md",
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
@@ -1429,6 +1459,8 @@ mod tests {
             &mut item,
             &EnvelopeContext {
                 server_name: "lua-ls",
+                injection_language: "markdown",
+                incarnation: Some(1),
                 host_uri: "file:///test/doc.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,

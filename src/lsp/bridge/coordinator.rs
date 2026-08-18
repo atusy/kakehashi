@@ -19,6 +19,7 @@ use crate::language::node_tracker::{EditInfo, NodeTracker};
 use crate::lsp::request_id::CancelForwarder;
 
 use super::LanguageServerPool;
+use super::pool::ConnectionKey;
 use super::pool::INIT_TIMEOUT_SECS;
 use super::protocol::{RoutingAnswer, RoutingLanguageServer, RoutingParams, RoutingTextDocument};
 
@@ -238,6 +239,30 @@ impl ConfigMemo {
 }
 
 impl BridgeCoordinator {
+    pub(crate) fn begin_virtual_routing_for_injections(
+        &self,
+        host_uri: &Url,
+        injections: &[BridgeInjection],
+    ) -> HashMap<Url, Arc<tokio::sync::watch::Sender<bool>>> {
+        let mut tokens = HashMap::new();
+        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return tokens;
+        };
+        for injection in injections {
+            let virtual_uri = super::protocol::VirtualDocumentUri::new(
+                &host_uri_lsp,
+                &injection.language,
+                &injection.region_id,
+            );
+            let Ok(virtual_uri) = Url::parse(&virtual_uri.to_uri_string()) else {
+                continue;
+            };
+            let token = self.pool.begin_virtual_routing(host_uri, &virtual_uri);
+            tokens.insert(virtual_uri, token);
+        }
+        tokens
+    }
+
     /// Create a new bridge coordinator with fresh pool and tracker.
     pub(crate) fn new() -> Self {
         let pool = Arc::new(LanguageServerPool::new());
@@ -628,7 +653,7 @@ impl BridgeCoordinator {
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
             return OpenOutcome::NotOpened;
         };
-        let routed = self
+        let (routed, _) = self
             .route_virtual_injections(
                 settings,
                 host_language,
@@ -636,6 +661,7 @@ impl BridgeCoordinator {
                 &host_uri_lsp,
                 injections,
                 Some(server_name),
+                None,
             )
             .await;
         let mut config = None;
@@ -657,6 +683,37 @@ impl BridgeCoordinator {
             // nothing to reject.
             return OpenOutcome::NotApplicable;
         };
+        // A repair is for one concrete connection. The same host can have
+        // injections routed to several keys, so do not pass the whole server
+        // batch to `eager_open_virtual_documents` and let its first injection
+        // represent the rest. The normal eager path is partitioned earlier;
+        // this filters the respawn path to the key being repaired.
+        let for_server = if let Some(expected_key) = expect.connection {
+            let mut matching = Vec::new();
+            for injection in for_server {
+                let virtual_uri = super::protocol::VirtualDocumentUri::new(
+                    &host_uri_lsp,
+                    &injection.language,
+                    &injection.region_id,
+                );
+                let Ok(routing_uri) = Url::parse(&virtual_uri.to_uri_string()) else {
+                    continue;
+                };
+                let routed_key = self
+                    .pool
+                    .resolved_connection_key(server_name, &config, &routing_uri)
+                    .await;
+                if &routed_key == expected_key {
+                    matching.push(injection);
+                }
+            }
+            matching
+        } else {
+            for_server
+        };
+        if for_server.is_empty() {
+            return OpenOutcome::NotApplicable;
+        }
         self.pool
             .eager_open_virtual_documents(
                 server_name,
@@ -1088,6 +1145,7 @@ impl BridgeCoordinator {
     // Eager spawn + open (warmup with document content)
     // ========================================
 
+    #[allow(clippy::too_many_arguments)]
     async fn route_virtual_injections(
         &self,
         settings: &WorkspaceSettings,
@@ -1096,9 +1154,11 @@ impl BridgeCoordinator {
         host_uri_lsp: &tower_lsp_server::ls_types::Uri,
         injections: Vec<BridgeInjection>,
         target_server: Option<&str>,
-    ) -> Vec<(BridgeInjection, Vec<ResolvedServerConfig>)> {
+        routing_tokens: Option<&HashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>>,
+    ) -> (Vec<(BridgeInjection, Vec<ResolvedServerConfig>)>, bool) {
         let mut configs_by_lang: HashMap<String, Vec<ResolvedServerConfig>> = HashMap::new();
         let mut routed = Vec::with_capacity(injections.len());
+        let mut superseded = false;
         for injection in injections {
             let virtual_uri = super::protocol::VirtualDocumentUri::new(
                 host_uri_lsp,
@@ -1122,8 +1182,21 @@ impl BridgeCoordinator {
                 None => configs,
             };
             if configs.is_empty() {
+                if let Some(token) = routing_tokens.and_then(|tokens| tokens.get(&document_uri)) {
+                    if !self
+                        .pool
+                        .is_virtual_routing_current(host_uri, &document_uri, token)
+                    {
+                        superseded = true;
+                    }
+                    self.pool
+                        .finish_virtual_routing(host_uri, &document_uri, token);
+                }
                 continue;
             }
+            let routing_guard = routing_tokens
+                .and_then(|tokens| tokens.get(&document_uri))
+                .map(|token| (host_uri, &document_uri, token));
             let selected = Self::resolve_document_routing(
                 &self.pool,
                 &document_uri,
@@ -1133,11 +1206,22 @@ impl BridgeCoordinator {
                     language_id: host_language.to_string(),
                 }),
                 configs,
+                routing_guard,
             )
             .await;
+            if let Some(token) = routing_tokens.and_then(|tokens| tokens.get(&document_uri)) {
+                if !self
+                    .pool
+                    .is_virtual_routing_current(host_uri, &document_uri, token)
+                {
+                    superseded = true;
+                }
+                self.pool
+                    .finish_virtual_routing(host_uri, &document_uri, token);
+            }
             routed.push((injection, selected));
         }
-        routed
+        (routed, superseded)
     }
 
     fn eager_open_groups_for_configs(
@@ -1237,6 +1321,7 @@ impl BridgeCoordinator {
         host_uri: &Url,
         incarnation: u64,
         injections: Vec<BridgeInjection>,
+        routing_tokens: HashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>,
     ) {
         // Convert host_uri to ls_types::Uri for VirtualDocumentUri construction
         let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
@@ -1253,7 +1338,7 @@ impl BridgeCoordinator {
 
         // Empty means current settings resolve no server for any injection —
         // the batch belongs to removed configuration and must stop.
-        let routed = self
+        let (routed, routing_superseded) = self
             .route_virtual_injections(
                 settings,
                 host_language,
@@ -1261,23 +1346,46 @@ impl BridgeCoordinator {
                 &host_uri_lsp,
                 injections,
                 None,
+                Some(&routing_tokens),
             )
             .await;
+        if routing_superseded {
+            return;
+        }
         let resolved_groups = Self::eager_open_groups_for_configs(routed);
         if resolved_groups.is_empty() {
             self.cancel_eager_open(host_uri);
             return;
         }
 
-        // Drop the regions already open on each server's connection. The key
-        // is per SERVER (`(server, root)`), so it is resolved once per group
-        // rather than once per region.
-        let mut server_groups: BTreeMap<String, ServerGroup> = BTreeMap::new();
+        // Drop the regions already open on each server's connection. A single
+        // server can receive different routing answers for different virtual
+        // documents, so group by the complete resolved connection key rather
+        // than only by server name or rootless-ness.
+        let mut server_groups: HashMap<ConnectionKey, (String, ServerGroup)> = HashMap::new();
         for (server_name, (config, group_injections)) in resolved_groups {
-            let connection_key = self
-                .pool
-                .resolved_connection_key(&server_name, &config, host_uri)
-                .await;
+            for injection in group_injections {
+                let routing_uri = super::protocol::VirtualDocumentUri::new(
+                    &host_uri_lsp,
+                    &injection.language,
+                    &injection.region_id,
+                );
+                let Ok(routing_uri) = Url::parse(&routing_uri.to_uri_string()) else {
+                    continue;
+                };
+                let connection_key = self
+                    .pool
+                    .resolved_connection_key(&server_name, &config, &routing_uri)
+                    .await;
+                let entry = server_groups
+                    .entry(connection_key)
+                    .or_insert_with(|| (server_name.clone(), (Arc::clone(&config), Vec::new())));
+                entry.1.1.push(injection);
+            }
+        }
+
+        let mut pending_groups: HashMap<ConnectionKey, (String, ServerGroup)> = HashMap::new();
+        for (connection_key, (server_name, (config, group_injections))) in server_groups {
             let pending: Vec<BridgeInjection> = group_injections
                 .into_iter()
                 .filter(|injection| {
@@ -1285,9 +1393,10 @@ impl BridgeCoordinator {
                 })
                 .collect();
             if !pending.is_empty() {
-                server_groups.insert(server_name, (config, pending));
+                pending_groups.insert(connection_key, (server_name, (config, pending)));
             }
         }
+        let server_groups = pending_groups;
 
         // Every resolved injection is already sent/open — preserve the batch.
         if server_groups.is_empty() {
@@ -1301,11 +1410,12 @@ impl BridgeCoordinator {
         let (generation, cancel) = self.supersede_eager_open_tasks(host_uri);
 
         // Spawn one task per server group, registering each handle immediately
-        for (server_name, (config, group_injections)) in server_groups {
+        for (connection_key, (server_name, (config, group_injections))) in server_groups {
             log::debug!(
                 target: "kakehashi::bridge",
-                "Eager open: spawning {} with {} injections",
+                "Eager open: spawning {} on {} with {} injections",
                 server_name,
+                connection_key,
                 group_injections.len()
             );
 
@@ -1329,6 +1439,7 @@ impl BridgeCoordinator {
                             incarnation,
                             // The eager batch opens wherever the host routes now.
                             connection: None,
+                            expected_connection: Some(connection_key.clone()),
                         },
                         group_injections,
                     ) => {}
@@ -1376,7 +1487,13 @@ impl BridgeCoordinator {
         language_id: &str,
         host: Option<super::protocol::RoutingHostDocument>,
         configs: Vec<ResolvedServerConfig>,
+        routing_guard: Option<(&Url, &Url, &Arc<tokio::sync::watch::Sender<bool>>)>,
     ) -> Vec<ResolvedServerConfig> {
+        if routing_guard.is_some_and(|(host_uri, virtual_uri, token)| {
+            !pool.is_virtual_routing_current(host_uri, virtual_uri, token)
+        }) {
+            return Vec::new();
+        }
         if configs.iter().all(|config| {
             pool.host_routing_by_server(document_uri, &config.server_name)
                 .is_some()
@@ -1474,6 +1591,11 @@ impl BridgeCoordinator {
 
         let mut selected = Vec::new();
         for config in configs {
+            if routing_guard.is_some_and(|(host_uri, virtual_uri, token)| {
+                !pool.is_virtual_routing_current(host_uri, virtual_uri, token)
+            }) {
+                return Vec::new();
+            }
             let enabled = answer
                 .as_ref()
                 .and_then(|answer| answer.routing.get(&config.server_name))
@@ -1488,6 +1610,12 @@ impl BridgeCoordinator {
                     .and_then(|answer| answer.routing.get(&config.server_name))
                     .and_then(|entry| entry.workspace_folders.clone()),
             );
+            let rootless = answer
+                .as_ref()
+                .and_then(|answer| answer.routing.get(&config.server_name))
+                .and_then(|entry| entry.workspace_folders.as_ref())
+                .is_some_and(|folders| folders.as_ref().is_some_and(Vec::is_empty));
+            pool.set_host_routing_rootless(document_uri, &config.server_name, rootless);
             let Some((_, handle)) = handles.iter().find(|(name, _)| name == &config.server_name)
             else {
                 if enabled {
@@ -1580,6 +1708,7 @@ impl BridgeCoordinator {
                         &language_id,
                         None,
                         configs_for_routing,
+                        None,
                     ).await
                 } => configs,
             };
@@ -2624,6 +2753,7 @@ mod tests {
                 crate::lsp::bridge::OpenExpectation {
                     incarnation: 1,
                     connection: None,
+                    expected_connection: None,
                 },
                 injections,
                 "other-server",
@@ -3084,6 +3214,8 @@ mod tests {
             config.cmd = Some(vec!["/nonexistent/kakehashi-test-server".to_string()]);
         }
         let host_uri = Url::parse("file:///test.md").unwrap();
+        let injections = vec![injection("rust", "r1")];
+        coordinator.begin_virtual_routing_for_injections(&host_uri, &injections);
 
         coordinator
             .eager_spawn_and_open_documents(
@@ -3091,7 +3223,8 @@ mod tests {
                 "markdown",
                 &host_uri,
                 1,
-                vec![injection("rust", "r1")],
+                injections,
+                HashMap::new(),
             )
             .await;
 

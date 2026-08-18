@@ -387,8 +387,13 @@ pub struct LanguageServerPool {
     /// means the routing provider supplied the field; an inner `None` is the
     /// explicit JSON `null` value.
     host_routing_workspace_folders: DashMap<(String, String), Option<Vec<String>>>,
+    host_routing_rootless: DashMap<(String, String), ()>,
     /// Host URIs whose routing decision is currently being resolved.
     host_routing_pending: DashMap<Url, Arc<tokio::sync::watch::Sender<bool>>>,
+    /// Pending per-host virtual-document routing. Interactive requests wait
+    /// here while the detached eager-routing pass is asking the provider, so
+    /// they cannot acquire a pre-routing marker connection.
+    virtual_routing_pending: DashMap<(Url, Url), Arc<tokio::sync::watch::Sender<bool>>>,
     /// Connections whose replacement still owes a virtual-document re-open, and
     /// the barrier requests wait on (respawn-reopen-derives-its-targets).
     /// `Arc` because the claim runs inside the spawned handshake task.
@@ -527,7 +532,9 @@ impl LanguageServerPool {
             host_routing_decided: DashMap::new(),
             host_routing_by_server: DashMap::new(),
             host_routing_workspace_folders: DashMap::new(),
+            host_routing_rootless: DashMap::new(),
             host_routing_pending: DashMap::new(),
+            virtual_routing_pending: DashMap::new(),
             pending_reopen: Arc::new(PendingReopenRegistry::default()),
             diagnostic_pull_baselines: DashMap::new(),
             diagnostic_document_generations: DashMap::new(),
@@ -1358,6 +1365,25 @@ impl LanguageServerPool {
         }
     }
 
+    pub(crate) fn set_host_routing_rootless(
+        &self,
+        host_uri: &Url,
+        server_name: &str,
+        rootless: bool,
+    ) {
+        let key = (host_uri.to_string(), server_name.to_string());
+        if rootless {
+            self.host_routing_rootless.insert(key, ());
+        } else {
+            self.host_routing_rootless.remove(&key);
+        }
+    }
+
+    pub(crate) fn host_routing_rootless(&self, host_uri: &Url, server_name: &str) -> bool {
+        self.host_routing_rootless
+            .contains_key(&(host_uri.to_string(), server_name.to_string()))
+    }
+
     pub(crate) fn host_routing_workspace_folders(
         &self,
         host_uri: &Url,
@@ -1382,19 +1408,12 @@ impl LanguageServerPool {
             return Ok(());
         };
         let Some(folders) = folders else {
-            log::debug!(
-                target: "kakehashi::bridge::routing",
-                "Routing provider supplied workspaceFolders=null for {}; keeping the connection's existing folders",
-                server_name
-            );
+            // `null` means that routing has no opinion. Let the ordinary
+            // kakehashi marker/client workspace resolution decide instead of
+            // replaying the client folders as routing announcements.
             return Ok(());
         };
         if folders.is_empty() {
-            log::debug!(
-                target: "kakehashi::bridge::routing",
-                "Routing provider supplied an empty workspaceFolders list for {}; keeping the connection's existing folders",
-                server_name
-            );
             return Ok(());
         }
         for folder in folders {
@@ -1427,6 +1446,90 @@ impl LanguageServerPool {
         self.host_routing_pending
             .insert(host_uri.clone(), Arc::clone(&sender));
         sender
+    }
+
+    pub(crate) fn begin_virtual_routing(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &Url,
+    ) -> Arc<tokio::sync::watch::Sender<bool>> {
+        let sender = Arc::new(tokio::sync::watch::channel(false).0);
+        let key = (host_uri.clone(), virtual_uri.clone());
+        if let Some(previous) = self
+            .virtual_routing_pending
+            .insert(key, Arc::clone(&sender))
+        {
+            let _ = previous.send(true);
+        }
+        sender
+    }
+
+    pub(crate) fn is_virtual_routing_current(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &Url,
+        sender: &Arc<tokio::sync::watch::Sender<bool>>,
+    ) -> bool {
+        self.virtual_routing_pending
+            .get(&(host_uri.clone(), virtual_uri.clone()))
+            .is_some_and(|current| Arc::ptr_eq(current.value(), sender))
+    }
+
+    pub(crate) async fn wait_for_virtual_routing(&self, host_uri: &Url, virtual_uri: &Url) {
+        let key = (host_uri.clone(), virtual_uri.clone());
+        loop {
+            let Some(sender) = self
+                .virtual_routing_pending
+                .get(&key)
+                .map(|entry| Arc::clone(entry.value()))
+            else {
+                return;
+            };
+            let mut receiver = sender.subscribe();
+            while !*receiver.borrow() {
+                if receiver.changed().await.is_err() {
+                    break;
+                }
+            }
+            // A notification can mean either completion (the entry was
+            // removed) or handoff (the entry was replaced by a newer pass).
+            // Re-read the map so an old pass cannot release a waiter into a
+            // connection acquired before the newest routing answer.
+        }
+    }
+
+    pub(crate) fn finish_virtual_routing(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &Url,
+        sender: &Arc<tokio::sync::watch::Sender<bool>>,
+    ) {
+        let key = (host_uri.clone(), virtual_uri.clone());
+        if self
+            .virtual_routing_pending
+            .remove_if(&key, |_, current| Arc::ptr_eq(current, sender))
+            .is_some()
+        {
+            let _ = sender.send(true);
+        }
+    }
+
+    pub(crate) fn finish_all_virtual_routing(&self, host_uri: &Url) {
+        let pending: Vec<_> = self
+            .virtual_routing_pending
+            .iter()
+            .filter(|entry| entry.key().0 == *host_uri)
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+        for (key, sender) in pending {
+            if self
+                .virtual_routing_pending
+                .remove_if(&key, |_, current| Arc::ptr_eq(current, &sender))
+                .is_some()
+            {
+                let _ = sender.send(true);
+            }
+        }
     }
 
     pub(crate) async fn wait_for_host_routing(&self, host_uri: &Url) {
@@ -1493,7 +1596,10 @@ impl LanguageServerPool {
             .retain(|(doc_uri, _), _| doc_uri != &uri);
         self.host_routing_workspace_folders
             .retain(|(doc_uri, _), _| doc_uri != &uri);
+        self.host_routing_rootless
+            .retain(|(doc_uri, _), _| doc_uri != &uri);
         self.finish_all_host_routing(host_uri);
+        self.finish_all_virtual_routing(host_uri);
     }
 
     pub(crate) fn clear_host_routing_for_connection(&self, connection_key: &ConnectionKey) {
@@ -1746,6 +1852,7 @@ impl LanguageServerPool {
                 key.clone(),
                 marker,
                 Duration::from_secs(INIT_TIMEOUT_SECS),
+                false,
             )
             .await
         {
@@ -1768,6 +1875,9 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         document_uri: &Url,
     ) -> ConnectionKey {
+        if self.host_routing_rootless(document_uri, server_name) {
+            return ConnectionKey::shared(server_name);
+        }
         self.resolve_acquire(server_name, server_config, Some(document_uri))
             .await
             .1
@@ -2130,6 +2240,39 @@ impl LanguageServerPool {
         .await
     }
 
+    /// Acquire the connection for an injected document using the URI under
+    /// which routing decisions are cached. The request handlers receive the
+    /// host URI for coordinate translation, but routing is decided per virtual
+    /// document and must use that virtual URI for connection selection.
+    pub(super) async fn get_or_create_virtual_connection(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+    ) -> io::Result<Arc<ConnectionHandle>> {
+        // Legacy or client-modified resolve envelopes may not carry the
+        // virtual identity. Do not feed an empty component to
+        // `VirtualDocumentUri::new` (debug builds assert, and release builds
+        // would select an unrelated `.txt` route); preserve the pre-routing
+        // host-URI fallback instead.
+        if injection_language.is_empty() || region_id.is_empty() {
+            return self
+                .get_or_create_connection(server_name, server_config, Some(host_uri))
+                .await;
+        }
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let virtual_uri =
+            super::protocol::VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
+        let routing_uri = Url::parse(&virtual_uri.to_uri_string())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        self.wait_for_virtual_routing(host_uri, &routing_uri).await;
+        self.get_or_create_connection(server_name, server_config, Some(&routing_uri))
+            .await
+    }
+
     /// [`Self::get_or_create_connection`], with a caller-supplied `admit`
     /// predicate evaluated **inside the acquire's critical section**.
     ///
@@ -2197,9 +2340,14 @@ impl LanguageServerPool {
         let start = std::time::Instant::now();
         // Resolve the marker workspace + key ONCE (one filesystem walk, plus the
         // shared-instance capability probe).
-        let (marker, connection_key) = self
+        let (mut marker, mut connection_key) = self
             .resolve_acquire(server_name, server_config, document_uri)
             .await;
+        let rootless = document_uri.is_some_and(|uri| self.host_routing_rootless(uri, server_name));
+        if rootless {
+            marker = None;
+            connection_key = ConnectionKey::shared(server_name);
+        }
 
         // Acquire and wait through initialization for the resolved key.
         let handle = self
@@ -2209,6 +2357,7 @@ impl LanguageServerPool {
                 connection_key,
                 marker.clone(),
                 timeout,
+                rootless,
             )
             .await?;
 
@@ -2255,6 +2404,7 @@ impl LanguageServerPool {
                         per_root_key,
                         marker,
                         remaining,
+                        false,
                     )
                     .await;
             }
@@ -2265,7 +2415,9 @@ impl LanguageServerPool {
         // path already announced; on the initializing-retry path it is the only
         // announce. Propagates a queue-full failure so the caller retries rather
         // than open a document for an unannounced root.
-        self.announce_shared_root(&handle, &marker).await?;
+        if !rootless {
+            self.announce_shared_root(&handle, &marker).await?;
+        }
         Ok(handle)
     }
 
@@ -2280,6 +2432,7 @@ impl LanguageServerPool {
         connection_key: ConnectionKey,
         marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         timeout: Duration,
+        rootless: bool,
     ) -> io::Result<Arc<ConnectionHandle>> {
         match self
             .get_or_create_connection_resolved(
@@ -2292,6 +2445,7 @@ impl LanguageServerPool {
                 // incapable-shared divert, which passes its REMAINING budget)
                 // stays within `timeout` overall.
                 timeout,
+                rootless,
                 None,
             )
             .await
@@ -2755,15 +2909,21 @@ impl LanguageServerPool {
         timeout: Duration,
         admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> io::Result<Arc<ConnectionHandle>> {
-        let (marker, connection_key) = self
+        let (marker, mut connection_key) = self
             .resolve_acquire(server_name, server_config, document_uri)
             .await;
+        let rootless = document_uri.is_some_and(|uri| self.host_routing_rootless(uri, server_name));
+        let marker = if rootless { None } else { marker };
+        if rootless {
+            connection_key = ConnectionKey::shared(server_name);
+        }
         self.get_or_create_connection_resolved(
             server_name,
             server_config,
             connection_key,
             marker,
             timeout,
+            rootless,
             admit,
         )
         .await
@@ -2776,6 +2936,11 @@ impl LanguageServerPool {
     /// `Initializing`, and run the LSP initialize handshake in a background task
     /// that transitions Ready or Failed. Requests against Initializing fail with
     /// REQUEST_FAILED; Failed causes removal and respawn on the next call.
+    // The rootless bit is intentionally separate from `ConnectionKey::shared`:
+    // both ordinary shared acquisitions and routed `[]` acquisitions use the
+    // same key, but only the latter may seed a fresh process without the client
+    // workspace. Keep this explicit at the spawn boundary.
+    #[allow(clippy::too_many_arguments)]
     async fn get_or_create_connection_resolved(
         &self,
         server_name: &str,
@@ -2783,6 +2948,7 @@ impl LanguageServerPool {
         connection_key: ConnectionKey,
         marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         timeout: Duration,
+        rootless: bool,
         admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         let mut connections = self.connections.lock().await;
@@ -2853,7 +3019,9 @@ impl LanguageServerPool {
                 // check, so it must not be held here (the tokio mutex is not
                 // reentrant).
                 drop(connections);
-                self.announce_shared_root(&handle, &marker).await?;
+                if !rootless {
+                    self.announce_shared_root(&handle, &marker).await?;
+                }
                 return Ok(handle);
             }
             ConnectionAction::FailFast(err) => {
@@ -2954,9 +3122,13 @@ impl LanguageServerPool {
         // matches `connection_key`.
         // Resolved before the reader task spawns because the reader answers
         // downstream `workspace/workspaceFolders` queries with these folders.
-        let (root_uri, init_folders) = super::root_markers::workspace_from_marker(marker, || {
-            (self.root_uri(), self.workspace_folders())
-        });
+        let (root_uri, init_folders) = if rootless {
+            (None, Some(Vec::new()))
+        } else {
+            super::root_markers::workspace_from_marker(marker, || {
+                (self.root_uri(), self.workspace_folders())
+            })
+        };
         log::debug!(
             target: "kakehashi::bridge::init",
             "[{}] workspace root for spawn: {:?}",
@@ -5787,6 +5959,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: None,
+                    expected_connection: None,
                 },
                 vec![super::super::coordinator::BridgeInjection {
                     language: "lua".to_string(),
@@ -5832,6 +6005,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: None,
+                    expected_connection: None,
                 },
                 vec![super::super::coordinator::BridgeInjection {
                     language: "lua".to_string(),
@@ -6149,6 +6323,40 @@ mod tests {
 
         done.send(true).expect("the waiter holds the receiver");
         waiter.await.expect("the request proceeds once re-opened");
+    }
+
+    /// Interactive virtual requests must not acquire a marker connection while
+    /// the detached eager pass is still waiting for the routing provider.
+    #[tokio::test]
+    async fn a_virtual_request_waits_for_pending_routing() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/pending-routing.md").unwrap();
+        let virtual_uri =
+            Url::parse("deno:///test/pending-routing.md?language=lua&region=r0").unwrap();
+        let sender = pool.begin_virtual_routing(&host_uri, &virtual_uri);
+        let waiter = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            let virtual_uri = virtual_uri.clone();
+            tokio::spawn(
+                async move { pool.wait_for_virtual_routing(&host_uri, &virtual_uri).await },
+            )
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a virtual request must wait for the routing answer"
+        );
+
+        let replacement = pool.begin_virtual_routing(&host_uri, &virtual_uri);
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "handoff from an old routing pass must keep waiting"
+        );
+        let _ = sender.send(true);
+        pool.finish_virtual_routing(&host_uri, &virtual_uri, &replacement);
+        waiter.await.expect("the request proceeds after routing");
     }
 
     /// A by-key fast path must not hand back a process spawned from a

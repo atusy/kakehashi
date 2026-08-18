@@ -42,7 +42,13 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<PrepareRenameResponse>> {
         let handle = self
-            .get_or_create_connection(server_name, server_config, Some(host_uri))
+            .get_or_create_virtual_connection(
+                server_name,
+                server_config,
+                host_uri,
+                injection_language,
+                region_id,
+            )
             .await?;
         if !handle.has_capability("textDocument/prepareRename") {
             // Returning None would cause clients to treat the symbol as "not renameable",

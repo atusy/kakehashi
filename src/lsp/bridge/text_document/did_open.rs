@@ -61,6 +61,10 @@ pub(crate) struct OpenExpectation<'a> {
     /// `None` opens wherever the host routes now, spawning if needed, which is
     /// what every other caller wants.
     pub(crate) connection: Option<&'a ConnectionKey>,
+    /// Expected key for a normal eager batch. Unlike `connection`, this does
+    /// not force a ready-only repair; it rejects a race that reacquires a
+    /// different key after the group was formed.
+    pub(crate) expected_connection: Option<ConnectionKey>,
 }
 
 struct LifecycleCleanup<'a> {
@@ -96,7 +100,22 @@ impl LanguageServerPool {
         let OpenExpectation {
             incarnation: expected_incarnation,
             connection: expected_key,
+            expected_connection,
         } = expect;
+        // Routing decisions for injected documents are cached by virtual URI.
+        // Use one of those URIs for connection acquisition; resolving from the
+        // host URI would miss an explicit `workspaceFolders: []` answer.
+        let routing_uri = injections
+            .first()
+            .and_then(|injection| {
+                let virtual_uri = VirtualDocumentUri::new(
+                    host_uri_lsp,
+                    &injection.language,
+                    &injection.region_id,
+                );
+                url::Url::parse(&virtual_uri.to_uri_string()).ok()
+            })
+            .unwrap_or_else(|| host_uri.clone());
         // A caller repairing a NAMED connection is acquired BY KEY. Resolving
         // from `host_uri` would find whatever that host routes to *now*, which
         // after a re-rooting config change is a different connection — and then
@@ -114,8 +133,8 @@ impl LanguageServerPool {
                 // compare. Read-only — unlike the `None` arm below it never
                 // spawns, so asking about a host that belongs to some other
                 // root cannot bring that root's server up.
-                let (_marker, routes_to) = self
-                    .resolve_acquire(server_name, server_config, Some(host_uri))
+                let routes_to = self
+                    .resolved_connection_key(server_name, server_config, &routing_uri)
                     .await;
                 if &routes_to != key {
                     log::debug!(
@@ -146,12 +165,42 @@ impl LanguageServerPool {
                 .get_or_create_connection_wait_ready(
                     server_name,
                     server_config,
-                    Some(host_uri),
+                    Some(&routing_uri),
                     Duration::from_secs(INIT_TIMEOUT_SECS),
                 )
                 .await
             {
-                Ok(h) => h,
+                Ok(h) => {
+                    let capability_fallback = if let Some(expected) =
+                        expected_connection.as_ref().filter(|expected| {
+                            h.key() != *expected && expected.is_shared() && !h.key().is_shared()
+                        }) {
+                        // A shared connection can legitimately divert to a
+                        // per-root key after it is Ready but lacks
+                        // workspace-folder change support. Confirm that the
+                        // routing decision itself is still the expected
+                        // shared key before accepting that fallback.
+                        self.resolved_connection_key(server_name, server_config, &routing_uri)
+                            .await
+                            == *expected
+                    } else {
+                        false
+                    };
+                    if expected_connection
+                        .as_ref()
+                        .is_some_and(|expected| h.key() != expected)
+                        && !capability_fallback
+                    {
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "Eager open: routing changed from expected {} to {}",
+                            expected_connection.as_ref().unwrap(),
+                            h.key()
+                        );
+                        return OpenOutcome::NotApplicable;
+                    }
+                    h
+                }
                 Err(e) => {
                     log::debug!(
                         target: "kakehashi::bridge",
@@ -518,6 +567,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: None,
+                    expected_connection: None,
                 },
                 injections,
             )
@@ -580,6 +630,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: Some(&claimed),
+                    expected_connection: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -630,6 +681,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: Some(&gone),
+                    expected_connection: None,
                 },
                 injections,
             )
@@ -684,6 +736,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: Some(&elsewhere),
+                    expected_connection: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -730,6 +783,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: Some(&routed_key),
+                    expected_connection: None,
                 },
                 vec![BridgeInjection {
                     language: "lua".to_string(),
@@ -786,6 +840,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: None,
+                    expected_connection: None,
                 },
                 injections.clone(),
             )
@@ -808,6 +863,7 @@ mod tests {
                 OpenExpectation {
                     incarnation: 1,
                     connection: None,
+                    expected_connection: None,
                 },
                 injections,
             )

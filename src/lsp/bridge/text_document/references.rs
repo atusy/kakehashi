@@ -44,7 +44,13 @@ impl LanguageServerPool {
         client_progress_token: Option<tower_lsp_server::ls_types::NumberOrString>,
     ) -> io::Result<Option<Vec<Location>>> {
         let handle = self
-            .get_or_create_connection(server_name, server_config, Some(host_uri))
+            .get_or_create_virtual_connection(
+                server_name,
+                server_config,
+                host_uri,
+                injection_language,
+                region_id,
+            )
             .await?;
         if !handle.has_capability("textDocument/references") {
             return Ok(None);
