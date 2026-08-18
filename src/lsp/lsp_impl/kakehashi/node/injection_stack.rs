@@ -89,10 +89,6 @@ pub(super) fn injection_stack_at(
     // semantic-tokens recursion limit so misconfigured grammars cannot make
     // this helper loop indefinitely.
     for _depth in 0..MAX_INJECTION_DEPTH {
-        let Some(injection_query) = coordinator.injection_query(&current_language) else {
-            break;
-        };
-
         // Take the **current deepest** layer's tree, ask it which injections
         // overlap the cursor, and pick the smallest containing one. Using
         // the deepest tree (rather than always the host) ensures we discover
@@ -103,62 +99,18 @@ pub(super) fn injection_stack_at(
             .last()
             .expect("stack always contains at least the host layer");
         let parent_ranges = parent_layer.ranges.clone();
-        let root = parent_layer.tree.root_node();
-        let Some(injections) = collect_all_injections(&root, host_text, Some(&injection_query))
-        else {
-            break;
-        };
-
-        // Materialise the effective absolute ranges for every candidate so the
-        // containment check considers the bytes the injection parser will
-        // actually see — not the raw `@injection.content` span:
-        //   - apply any `#offset!` directive so prefixes / suffixes excluded by
-        //     the query (e.g., frontmatter fences, string quotes) are out;
-        //   - intersect with `compute_included_ranges` so blockquote `> `
-        //     prefixes (`block_continuation` children) are out.
-        // A cursor on an excluded byte must NOT push a new injection layer —
-        // node-reference-protocol §"Half-Open Intervals" works against the effective ranges.
-        let host_len = host_text.len();
-        let mut candidates: Vec<(_, Vec<tree_sitter::Range>)> = Vec::new();
-        for region in injections {
-            // Fast bounds check: when there is no `#offset!` directive the
-            // effective ranges can only ever be a *sub*-range of the raw
-            // content node (include-children gaps only remove bytes), so a
-            // cursor outside the raw span cannot be inside them — reject before
-            // the expensive build_effective_ranges call. We must NOT apply this
-            // shortcut when an offset directive is present: positive end /
-            // negative start offsets can *extend* the effective range past the
-            // raw content node, so containment has to be judged on the
-            // effective ranges alone.
-            if region.offset.is_none() {
-                let raw_start = region.content_node.start_byte();
-                let raw_end = region.content_node.end_byte();
-                let outside_raw = if byte == host_len {
-                    byte < raw_start || byte > raw_end
-                } else {
-                    byte < raw_start || byte >= raw_end
-                };
-                if outside_raw {
-                    continue;
-                }
-            }
-            let own_ranges = build_effective_ranges(&region, host_text, &injection_query);
-            if own_ranges.is_empty() {
-                continue;
-            }
-            // Inherit parent exclusions: a byte the parent layer already
-            // excluded (e.g. a blockquote `> ` prefix on an intermediate line)
-            // must stay excluded for the nested parser. For the host layer the
-            // parent range is the whole document, so this is a no-op there.
-            let absolute_ranges = intersect_included_ranges(&parent_ranges, &own_ranges);
-            if absolute_ranges.is_empty() {
-                continue;
-            }
-            if !ranges_contain_byte(&absolute_ranges, byte, host_len) {
-                continue;
-            }
-            candidates.push((region, absolute_ranges));
-        }
+        // Group `injection.combined` siblings before the point filter. A cursor
+        // in any member selects one parser layer whose included ranges contain
+        // every member, preserving syntax state across the gaps.
+        let point_filter = byte..byte;
+        let mut candidates = effective_child_regions(
+            coordinator,
+            &current_language,
+            &parent_layer.tree,
+            &parent_ranges,
+            host_text,
+            Some(&point_filter),
+        );
         // Smallest effective span wins — that's the most specific injection at
         // the cursor after offset/include adjustments.
         candidates.sort_by_key(|(_, ranges)| total_span(ranges));
@@ -396,48 +348,19 @@ pub(super) fn collect_injection_languages_at(
     let mut current_lang = host_language.to_string();
     let mut current_tree = host_tree.clone();
     let mut parent_ranges = vec![whole_document_range(host_text)];
-    let host_len = host_text.len();
-
     for _depth in 0..MAX_INJECTION_DEPTH {
-        let Some(injection_query) = coordinator.injection_query(&current_lang) else {
-            break;
-        };
-        let root = current_tree.root_node();
-        let Some(injections) = collect_all_injections(&root, host_text, Some(&injection_query))
-        else {
-            break;
-        };
-
         // Pick the smallest injection that actually contains the cursor — the
         // same selection `injection_stack_at` makes — so discovery follows the
         // one path the per-position stack will walk.
-        let mut candidates: Vec<(_, Vec<tree_sitter::Range>)> = Vec::new();
-        for region in injections {
-            if region.offset.is_none() {
-                let raw_start = region.content_node.start_byte();
-                let raw_end = region.content_node.end_byte();
-                let outside_raw = if byte == host_len {
-                    byte < raw_start || byte > raw_end
-                } else {
-                    byte < raw_start || byte >= raw_end
-                };
-                if outside_raw {
-                    continue;
-                }
-            }
-            let own_ranges = build_effective_ranges(&region, host_text, &injection_query);
-            if own_ranges.is_empty() {
-                continue;
-            }
-            let absolute_ranges = intersect_included_ranges(&parent_ranges, &own_ranges);
-            if absolute_ranges.is_empty() {
-                continue;
-            }
-            if !ranges_contain_byte(&absolute_ranges, byte, host_len) {
-                continue;
-            }
-            candidates.push((region, absolute_ranges));
-        }
+        let point_filter = byte..byte;
+        let mut candidates = effective_child_regions(
+            coordinator,
+            &current_lang,
+            &current_tree,
+            &parent_ranges,
+            host_text,
+            Some(&point_filter),
+        );
         candidates.sort_by_key(|(_, ranges)| total_span(ranges));
         let Some((region, absolute_ranges)) = candidates.into_iter().next() else {
             break;
@@ -646,13 +569,31 @@ fn total_span(ranges: &[tree_sitter::Range]) -> usize {
         .sum()
 }
 
+fn normalize_absolute_ranges(mut ranges: Vec<tree_sitter::Range>) -> Vec<tree_sitter::Range> {
+    ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
+    let mut normalized: Vec<tree_sitter::Range> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(last) = normalized.last_mut()
+            && range.start_byte <= last.end_byte
+        {
+            if range.end_byte > last.end_byte {
+                last.end_byte = range.end_byte;
+                last.end_point = range.end_point;
+            }
+        } else {
+            normalized.push(range);
+        }
+    }
+    normalized
+}
+
 /// Materialize every child injection region of `parent_tree` with its
 /// effective absolute ranges, sorted by start byte (document order across
 /// siblings — the deterministic order captures-protocol's positional delta
 /// requires). Shared by the cursor-path stack ([`injection_stack_at`]) and the
-/// document-wide walkers below; unlike the cursor path there is no byte
-/// containment or smallest-wins selection — every region qualifies, optionally
-/// pruned to those intersecting `byte_filter`.
+/// document-wide walkers below. `injection.combined` siblings are collapsed
+/// into one region with the union of their included ranges before the optional
+/// `byte_filter` is applied; the caller performs any smallest-wins selection.
 fn effective_child_regions<'t>(
     coordinator: &LanguageCoordinator,
     parent_language: &str,
@@ -672,8 +613,30 @@ fn effective_child_regions<'t>(
         return Vec::new();
     };
 
-    let mut regions = Vec::new();
+    let mut regions: Vec<(
+        crate::language::injection::InjectionRegionInfo<'t>,
+        Vec<tree_sitter::Range>,
+    )> = Vec::new();
+    let mut combined_slots: std::collections::HashMap<(String, usize), usize> =
+        std::collections::HashMap::new();
     for region in injections {
+        // A non-combined unadjusted region cannot grow beyond its raw node, so
+        // preserve the cursor-path fast rejection. Combined groups must retain
+        // every sibling even when only one member intersects the filter.
+        if !region.combined
+            && region.offset.is_none()
+            && let Some(filter) = byte_filter
+        {
+            let raw = [tree_sitter::Range {
+                start_byte: region.content_node.start_byte(),
+                end_byte: region.content_node.end_byte(),
+                start_point: region.content_node.start_position(),
+                end_point: region.content_node.end_position(),
+            }];
+            if !ranges_intersect(&raw, filter, host_text.len()) {
+                continue;
+            }
+        }
         let own_ranges = build_effective_ranges(&region, host_text, &injection_query);
         if own_ranges.is_empty() {
             continue;
@@ -684,12 +647,30 @@ fn effective_child_regions<'t>(
         if absolute_ranges.is_empty() {
             continue;
         }
-        if let Some(filter) = byte_filter
-            && !ranges_intersect(&absolute_ranges, filter, host_text.len())
-        {
-            continue;
+        if region.combined {
+            let key = (region.language.clone(), region.pattern_index);
+            if let Some(&slot) = combined_slots.get(&key) {
+                let candidate_start = absolute_ranges.first().map_or(usize::MAX, |r| r.start_byte);
+                let current_start = regions[slot].1.first().map_or(usize::MAX, |r| r.start_byte);
+                if candidate_start < current_start {
+                    regions[slot].0 = region;
+                }
+                regions[slot].1.extend(absolute_ranges);
+            } else {
+                combined_slots.insert(key, regions.len());
+                regions.push((region, absolute_ranges));
+            }
+        } else {
+            regions.push((region, absolute_ranges));
         }
-        regions.push((region, absolute_ranges));
+    }
+    for (region, ranges) in &mut regions {
+        if region.combined {
+            *ranges = normalize_absolute_ranges(std::mem::take(ranges));
+        }
+    }
+    if let Some(filter) = byte_filter {
+        regions.retain(|(_, ranges)| ranges_intersect(ranges, filter, host_text.len()));
     }
     // `sort_by_key` is stable, so ties would already keep the deterministic
     // query-match order — the extra raw-span/pattern components just make the
@@ -964,6 +945,45 @@ mod tests {
             })
             .collect();
         assert_eq!(stored_shape, inline, "stored layers == inline walk");
+    }
+
+    #[test]
+    fn cursor_stack_parses_combined_injection_members_as_one_layer() {
+        let coordinator = crate::language::LanguageCoordinator::new();
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                std::env::var("TREE_SITTER_GRAMMARS")
+                    .unwrap_or_else(|_| "deps/tree-sitter".to_string()),
+            ],
+            ..Default::default()
+        };
+        let _ = coordinator.load_settings(&settings);
+        for lang in ["markdown", "html"] {
+            if !coordinator.ensure_language_loaded(lang).success {
+                eprintln!("Skipping: {lang} parser not available");
+                return;
+            }
+        }
+
+        // CommonMark splits the opening and closing tags at blank lines into
+        // separate html_block captures. `injection.combined` keeps the HTML
+        // parser state shared across both blocks.
+        let text = "<div>\n\nprose\n\n</div>\n";
+        let mut pool = coordinator.create_document_parser_pool();
+        let Some(mut parser) = pool.acquire("markdown") else {
+            return;
+        };
+        let tree = parser.parse(text, None).expect("parse markdown");
+        pool.release("markdown".to_string(), parser);
+
+        let cursor = text.rfind("</div>").expect("closing tag");
+        let stack = injection_stack_at(&coordinator, "markdown", text, &tree, cursor);
+
+        assert!(stack.len() >= 2, "cursor enters the combined HTML layer");
+        let html_ranges = &stack[1].ranges;
+        assert_eq!(html_ranges.len(), 2);
+        assert!(text[html_ranges[0].start_byte..html_ranges[0].end_byte].starts_with("<div>"));
+        assert!(text[html_ranges[1].start_byte..html_ranges[1].end_byte].starts_with("</div>"));
     }
 
     #[test]
