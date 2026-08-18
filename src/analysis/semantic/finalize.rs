@@ -70,10 +70,6 @@ fn multiline_exact_match_keys(
     if crate::cancel::is_cancelled(cancel) {
         return None;
     }
-    if !regions.iter().any(|r| r.start_line != r.end_line) {
-        return Some(HashSet::new());
-    }
-
     let mut work_items = 0usize;
     let mut keys = HashSet::new();
     'regions: for region in regions {
@@ -1041,6 +1037,27 @@ mod tests {
             !cancel.is_cancelled(),
             "unrelated lines after the region must not be visited"
         );
+    }
+
+    #[test]
+    fn exact_match_key_collection_checks_cancellation_for_single_line_regions() {
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel_after_polls(2);
+        let lines = vec!["x"; 512];
+        let regions: Vec<_> = (0..512)
+            .map(|line| ActiveInjectionBounds {
+                start_line: line,
+                start_col: 0,
+                end_line: line,
+                end_col: 1,
+            })
+            .collect();
+
+        assert!(
+            multiline_exact_match_keys(&regions, &lines, Some(&cancel)).is_none(),
+            "the all-single-line region pass must remain cancellable"
+        );
+        assert!(cancel.is_cancelled());
     }
 
     #[test]
