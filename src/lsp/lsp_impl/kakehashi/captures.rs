@@ -1696,31 +1696,18 @@ fn execute_captures_walk(
                 visit(&layer.language, &layer.tree, layer.depth, Some(&layer.span));
             }
         } else {
-            // An off-viewport parent must still be parsed when any loaded
-            // descendant language could expand a capture into the viewport.
-            // Prove subtree pruning safe globally for this kind/generation;
-            // checking only the immediate language would hide nested layers.
-            let any_loaded_kind_expands = registry.language_ids().into_iter().any(|language_id| {
-                matches!(
-                    load_kind_query_cached(
-                        &registry,
-                        &search_paths,
-                        &language_id,
-                        &file_name,
-                        generation,
-                    )
-                    .as_ref(),
-                    KindQueryLoad::Loaded(query) if query.has_expanding_range
-                )
-            });
             walk_document_layers(
                 language,
                 language_id,
                 text,
                 tree,
-                byte_range.as_ref(),
+                // This fallback is used only by direct tests; production
+                // injection walks always receive the snapshot's prebuilt flat
+                // layer list above. Traverse every ancestor conservatively:
+                // an off-viewport parent may contain a descendant whose kind
+                // query expands a capture into the viewport.
+                None,
                 cancel,
-                !any_loaded_kind_expands,
                 &mut |language, tree, depth| visit(language, tree, depth, None),
             );
         }

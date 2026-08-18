@@ -42,14 +42,6 @@ impl LanguageRegistry {
     pub(crate) fn contains(&self, language_id: &str) -> bool {
         self.languages.contains_key(language_id)
     }
-
-    /// Snapshot the identifiers whose parsers are currently available.
-    pub(crate) fn language_ids(&self) -> Vec<String> {
-        self.languages
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -76,13 +68,5 @@ mod tests {
         // Don't register anything
 
         assert!(!registry.contains("nonexistent"));
-    }
-
-    #[test]
-    fn language_ids_returns_registered_languages() {
-        let registry = LanguageRegistry::new();
-        registry.register("rust".to_string(), dummy_language());
-
-        assert_eq!(registry.language_ids(), vec!["rust"]);
     }
 }
