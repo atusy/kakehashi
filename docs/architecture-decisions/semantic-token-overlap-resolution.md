@@ -187,7 +187,7 @@ Note: The `exclusion_ranges` parameter in `collect_host_tokens` is still used fo
 
 The sweep line operates **per-line**. Before normalization destroys cross-line identity, `finalize_tokens` records top-level host tokens that exactly match multiline active regions. It then calls `split_multiline_tokens`, which normalizes multiline tokens into single-line fragments. Stage 1 filters non-exact host fragments, and the preserved exact hosts re-enter before the sweep line processes all remaining fragments.
 
-- Top-level host captures retain their multiline raw span until exact-match classification, independent of the client's `multilineTokenSupport` capability
+- Prefix-free top-level host captures retain their multiline raw span until exact-match classification, independent of the client's `multilineTokenSupport` capability; captures with structural prefix widths remain per-line so prefixes can be excluded
 - Injection captures may still be collected per-line when `supports_multiline = false`; `split_multiline_tokens` normalizes every remaining multiline raw token before overlap resolution
 - Advanced cross-line merging heuristics (e.g., re-joining fragments after splitting) are deferred to a future phase
 
