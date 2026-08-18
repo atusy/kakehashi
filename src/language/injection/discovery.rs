@@ -79,7 +79,6 @@ fn runtime_offset_for_capture(
 }
 
 /// Checks if a node is within the bounds of another node
-#[cfg(test)]
 fn is_node_within(node: &Node, container: &Node) -> bool {
     node.start_byte() >= container.start_byte() && node.end_byte() <= container.end_byte()
 }
@@ -622,8 +621,7 @@ fn extract_content_and_language<'a>(
         } else {
             content_node.byte_range()
         };
-        if node.start_byte() >= effective.start
-            && node.end_byte() <= effective.end
+        if is_node_within(node, &content_node)
             && let Some(language) = extract_injection_language(query, match_, text)
         {
             return Some((
@@ -3577,6 +3575,32 @@ mod tests {
             injection.is_none(),
             "a failed helper-capture predicate must reject point detection"
         );
+    }
+
+    #[test]
+    fn detect_injection_keeps_a_trimmed_leaf_capture() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let value = "body"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+        let content = root
+            .descendant_for_byte_range(
+                text.find("\"body\"").unwrap(),
+                text.find("\"body\"").unwrap(),
+            )
+            .unwrap();
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"((string_literal) @injection.content
+                 (#set! injection.language "html")
+                 (#offset! @injection.content 0 1 0 -1))"#,
+        )
+        .unwrap();
+
+        let detected = detect_injection(&content, &root, text, Some(&query), "rust").unwrap();
+
+        assert_eq!(detected.0, vec!["rust", "html"]);
+        assert!(detected.3.is_some());
     }
 
     #[rstest]
