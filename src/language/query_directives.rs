@@ -222,6 +222,20 @@ fn trim_range(
     })
 }
 
+/// Whether this pattern transforms `capture_id` with `#gsub!`.
+pub(crate) fn has_gsub_directive(query: &Query, pattern_index: usize, capture_id: u32) -> bool {
+    query
+        .general_predicates(pattern_index)
+        .iter()
+        .any(|directive| {
+            directive.operator.as_ref() == "gsub!"
+                && matches!(
+                    directive.args.first(),
+                    Some(tree_sitter::QueryPredicateArg::Capture(id)) if *id == capture_id
+                )
+        })
+}
+
 /// Return one capture's text after applying its `#gsub!` directives in query
 /// order. A quantified capture is left unresolved, matching Neovim's
 /// single-node requirement without letting a user query panic the server.

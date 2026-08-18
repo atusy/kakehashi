@@ -56,12 +56,15 @@ fn extract_dynamic_language(query: &Query, match_: &QueryMatch, text: &str) -> O
             // rather than emitting an empty language id (which would create a
             // bogus injection region downstream), mirroring the info-string path.
             let transformed;
-            let lang_text = if query.general_predicates(match_.pattern_index).is_empty() {
-                clamped_slice(text, capture.node.byte_range())
-            } else {
-                transformed = query_directives::capture_text(query, match_, capture.index, text)?;
-                &transformed
-            };
+            let lang_text =
+                if query_directives::has_gsub_directive(query, match_.pattern_index, capture.index)
+                {
+                    transformed =
+                        query_directives::capture_text(query, match_, capture.index, text)?;
+                    &transformed
+                } else {
+                    clamped_slice(text, capture.node.byte_range())
+                };
             if lang_text.is_empty() {
                 return None;
             }
@@ -173,6 +176,32 @@ mod tests {
             r#"((block_comment) @injection.language
                  (#gsub! @injection.language "/%*%s*([%w%p]+)%s*%*/" "%1")
                  (#gsub! @injection.language "%.sh$" ""))"#,
+        )
+        .expect("valid query");
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+        let m = matches.next().expect("one match");
+
+        assert_eq!(
+            extract_injection_language(&query, m, text).as_deref(),
+            Some("bash")
+        );
+    }
+
+    #[test]
+    fn unrelated_directive_keeps_quantified_dynamic_language_capture() {
+        let rust: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&rust).expect("load Rust grammar");
+        let text = "fn bash() {}\nfn python() {}\n";
+        let tree = parser.parse(text, None).expect("parse Rust");
+        let query = Query::new(
+            &rust,
+            r#"((source_file
+                   (function_item name: (identifier) @injection.language)
+                   (function_item name: (identifier) @injection.language) @other)
+                 (#offset! @other 0 0 0 0))"#,
         )
         .expect("valid query");
 
