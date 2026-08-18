@@ -725,7 +725,7 @@ pub(crate) fn collect_document_layer_trees(
         host_tree,
         None,
         None,
-        &mut |_| false,
+        true,
         &mut |language, tree, depth| {
             // The host layer (depth 0) already lives on the snapshot as
             // `ParseSnapshot::tree`; store only the injected layers.
@@ -780,7 +780,7 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
     host_tree: &tree_sitter::Tree,
     byte_filter: Option<&std::ops::Range<usize>>,
     cancel: Option<&crate::cancel::CancelToken>,
-    range_can_expand: &mut dyn FnMut(&str) -> bool,
+    allow_range_pruning: bool,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
 ) {
     visit(host_language, host_tree, 0);
@@ -793,7 +793,7 @@ pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
         1,
         byte_filter,
         cancel,
-        range_can_expand,
+        allow_range_pruning,
         visit,
     );
 }
@@ -808,7 +808,7 @@ fn walk_child_layers(
     depth: usize,
     byte_filter: Option<&std::ops::Range<usize>>,
     cancel: Option<&crate::cancel::CancelToken>,
-    range_can_expand: &mut dyn FnMut(&str) -> bool,
+    allow_range_pruning: bool,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
 ) {
     // Allows injected depths 1..=MAX_INJECTION_DEPTH — deliberately matching
@@ -852,7 +852,7 @@ fn walk_child_layers(
         };
         if let Some(filter) = byte_filter
             && !ranges_intersect(&absolute_ranges, filter, host_text.len())
-            && !range_can_expand(&resolved_lang)
+            && allow_range_pruning
         {
             continue;
         }
@@ -875,7 +875,7 @@ fn walk_child_layers(
             depth + 1,
             byte_filter,
             cancel,
-            range_can_expand,
+            allow_range_pruning,
             visit,
         );
     }
@@ -924,7 +924,7 @@ mod tests {
             &tree,
             None,
             None,
-            &mut |_| false,
+            true,
             &mut |lang, layer_tree, depth| {
                 if depth == 0 {
                     return;
