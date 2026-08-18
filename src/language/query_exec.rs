@@ -191,6 +191,21 @@ mod tests {
     }
 
     #[test]
+    fn invalid_offset_directive_keeps_the_raw_capture_range() {
+        let src = r#""abc""#;
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((string_literal) @string (#offset! @string 0 10 0 0))"#,
+        );
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        let capture = &matches[0].captures[0];
+        assert_eq!((capture.range_start_byte, capture.range_end_byte), (0, 5));
+    }
+
+    #[test]
     fn trim_directive_defaults_to_removing_trailing_blank_lines() {
         let src = "fn main() {}\n\n";
         let (language, tree) = rust_tree(src);

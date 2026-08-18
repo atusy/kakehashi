@@ -101,6 +101,17 @@ pub(crate) fn capture_range(
     }
 
     let Some(offset) = offset else { return raw };
+    let adjusted_start = (
+        raw.start_point.row as i128 + offset.start_row as i128,
+        raw.start_point.column as i128 + offset.start_column as i128,
+    );
+    let adjusted_end = (
+        raw.end_point.row as i128 + offset.end_row as i128,
+        raw.end_point.column as i128 + offset.end_column as i128,
+    );
+    if adjusted_start > adjusted_end {
+        return raw;
+    }
 
     let effective = crate::analysis::offset_calculator::calculate_effective_range(
         source,
