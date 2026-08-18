@@ -218,6 +218,9 @@ fn trim_range(
                 linewise_end
             };
         }
+        if !trim_end_lines && start == text.len() {
+            return None;
+        }
     }
     let start_line_limit = if linewise_end == 0 && trim_end_lines {
         text.len()
@@ -387,6 +390,19 @@ mod tests {
         };
 
         assert_eq!(trim_range(source, raw, (false, true, true, true)), None);
+    }
+
+    #[test]
+    fn start_line_trim_rejects_an_exhausted_whitespace_range() {
+        let source = "  ";
+        let raw = CaptureRange {
+            start_byte: 0,
+            end_byte: source.len(),
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(0, 2),
+        };
+
+        assert_eq!(trim_range(source, raw, (true, false, false, false)), None);
     }
 
     #[test]
