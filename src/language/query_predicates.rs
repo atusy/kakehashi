@@ -29,6 +29,10 @@ use tree_sitter::{Query, QueryCapture, QueryMatch};
 static LUA_REGEX_CACHE: LazyLock<RwLock<HashMap<String, Option<Arc<Regex>>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Byte-oriented regexes for Lua `string.gsub`, whose matching unit is a byte.
+static LUA_BYTES_REGEX_CACHE: LazyLock<RwLock<HashMap<String, Option<Arc<regex::bytes::Regex>>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
 /// Check if a capture passes all predicates returned by
 /// [`Query::general_predicates`] for the capture's pattern.
 ///
@@ -242,15 +246,38 @@ fn get_or_compile_lua_regex(pattern_str: &str) -> Option<Arc<Regex>> {
         .clone()
 }
 
-/// Apply Lua's string `gsub` replacement notation with the same cached regex
-/// used by `#lua-match?`.
+fn get_or_compile_lua_bytes_regex(pattern_str: &str) -> Option<Arc<regex::bytes::Regex>> {
+    {
+        let cache = LUA_BYTES_REGEX_CACHE
+            .read()
+            .recover_poison("query_predicates::get_or_compile_lua_bytes_regex (read)");
+        if let Some(cached) = cache.get(pattern_str) {
+            return cached.clone();
+        }
+    }
+
+    let result = compile_lua_bytes_regex(pattern_str).map(Arc::new);
+    LUA_BYTES_REGEX_CACHE
+        .write()
+        .recover_poison("query_predicates::get_or_compile_lua_bytes_regex (write)")
+        .entry(pattern_str.to_string())
+        .or_insert(result)
+        .clone()
+}
+
+/// Apply Lua's byte-oriented string `gsub` replacement notation.
 pub(crate) fn lua_gsub(pattern: &str, replacement: &str, text: &str) -> Option<String> {
     if has_lua_position_capture(pattern) {
         return None;
     }
-    let regex = get_or_compile_lua_regex(pattern)?;
+    let regex = get_or_compile_lua_bytes_regex(pattern)?;
     let replacement = lua_replacement_to_regex(replacement, regex.captures_len())?;
-    Some(regex.replace_all(text, replacement.as_str()).into_owned())
+    String::from_utf8(
+        regex
+            .replace_all(text.as_bytes(), replacement.as_bytes())
+            .into_owned(),
+    )
+    .ok()
 }
 
 fn has_lua_position_capture(pattern: &str) -> bool {
@@ -304,6 +331,39 @@ fn lua_replacement_to_regex(replacement: &str, captures_len: usize) -> Option<St
 
 /// Compile a Lua pattern string into a Regex. Returns None on any error.
 fn compile_lua_regex(pattern_str: &str) -> Option<Regex> {
+    let regex_str = lua_regex_source(pattern_str)?;
+    match Regex::new(&regex_str) {
+        Ok(re) => Some(re),
+        Err(err) => {
+            log::info!(
+                target: "kakehashi::query",
+                "Failed to compile regex from lua-pattern: {} ({err:?})",
+                regex_str
+            );
+            None
+        }
+    }
+}
+
+fn compile_lua_bytes_regex(pattern_str: &str) -> Option<regex::bytes::Regex> {
+    let regex_str = lua_regex_source(pattern_str)?;
+    match regex::bytes::RegexBuilder::new(&regex_str)
+        .unicode(false)
+        .build()
+    {
+        Ok(re) => Some(re),
+        Err(err) => {
+            log::info!(
+                target: "kakehashi::query",
+                "Failed to compile byte regex from lua-pattern: {} ({err:?})",
+                regex_str
+            );
+            None
+        }
+    }
+}
+
+fn lua_regex_source(pattern_str: &str) -> Option<String> {
     let parsed_pattern = match lua_pattern::parse(pattern_str) {
         Ok(p) => p,
         Err(_) => {
@@ -328,17 +388,7 @@ fn compile_lua_regex(pattern_str: &str) -> Option<Regex> {
         }
     };
 
-    match Regex::new(&regex_str) {
-        Ok(re) => Some(re),
-        Err(err) => {
-            log::info!(
-                target: "kakehashi::query",
-                "Failed to compile regex from lua-pattern: {} ({err:?})",
-                regex_str
-            );
-            None
-        }
-    }
+    Some(regex_str)
 }
 
 /// Check contains? predicate - returns true if ANY string arg is a substring of node_text.
@@ -440,6 +490,11 @@ mod tests {
 
     #[test]
     fn lua_gsub_converts_lua_replacement_escapes() {
+        assert_eq!(
+            lua_gsub(".", "x", "あ").as_deref(),
+            Some("xxx"),
+            "Lua patterns operate on bytes rather than Unicode scalars"
+        );
         assert_eq!(
             lua_gsub("%w+", "[%0] %% $", "abc").as_deref(),
             Some("[abc] % $")
