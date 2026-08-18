@@ -246,11 +246,11 @@ fn get_or_compile_lua_regex(pattern_str: &str) -> Option<Arc<Regex>> {
 /// used by `#lua-match?`.
 pub(crate) fn lua_gsub(pattern: &str, replacement: &str, text: &str) -> Option<String> {
     let regex = get_or_compile_lua_regex(pattern)?;
-    let replacement = lua_replacement_to_regex(replacement)?;
+    let replacement = lua_replacement_to_regex(replacement, regex.captures_len())?;
     Some(regex.replace_all(text, replacement.as_str()).into_owned())
 }
 
-fn lua_replacement_to_regex(replacement: &str) -> Option<String> {
+fn lua_replacement_to_regex(replacement: &str, captures_len: usize) -> Option<String> {
     let mut converted = String::with_capacity(replacement.len());
     let mut chars = replacement.chars();
     while let Some(ch) = chars.next() {
@@ -258,8 +258,14 @@ fn lua_replacement_to_regex(replacement: &str) -> Option<String> {
             '%' => match chars.next()? {
                 '%' => converted.push('%'),
                 digit @ '0'..='9' => {
+                    let mut capture = digit.to_digit(10)? as usize;
+                    if capture == 1 && captures_len == 1 {
+                        capture = 0;
+                    } else if capture >= captures_len {
+                        return None;
+                    }
                     converted.push_str("${");
-                    converted.push(digit);
+                    converted.push_str(&capture.to_string());
                     converted.push('}');
                 }
                 _ => return None,
@@ -421,6 +427,16 @@ mod tests {
         assert_eq!(
             lua_gsub("(%a+)", "%1_lang", "abc").as_deref(),
             Some("abc_lang")
+        );
+        assert_eq!(
+            lua_gsub("%a+", "%1", "abc").as_deref(),
+            Some("abc"),
+            "Lua aliases %1 to the whole match when the pattern has no captures"
+        );
+        assert_eq!(
+            lua_gsub("(%a+)", "%2", "abc"),
+            None,
+            "out-of-range Lua capture references are invalid"
         );
     }
 
