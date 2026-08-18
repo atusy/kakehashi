@@ -242,6 +242,34 @@ fn get_or_compile_lua_regex(pattern_str: &str) -> Option<Arc<Regex>> {
         .clone()
 }
 
+/// Apply Lua's string `gsub` replacement notation with the same cached regex
+/// used by `#lua-match?`.
+pub(crate) fn lua_gsub(pattern: &str, replacement: &str, text: &str) -> Option<String> {
+    let regex = get_or_compile_lua_regex(pattern)?;
+    let replacement = lua_replacement_to_regex(replacement)?;
+    Some(regex.replace_all(text, replacement.as_str()).into_owned())
+}
+
+fn lua_replacement_to_regex(replacement: &str) -> Option<String> {
+    let mut converted = String::with_capacity(replacement.len());
+    let mut chars = replacement.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '%' => match chars.next()? {
+                '%' => converted.push('%'),
+                digit @ '0'..='9' => {
+                    converted.push('$');
+                    converted.push(digit);
+                }
+                _ => return None,
+            },
+            '$' => converted.push_str("$$"),
+            _ => converted.push(ch),
+        }
+    }
+    Some(converted)
+}
+
 /// Compile a Lua pattern string into a Regex. Returns None on any error.
 fn compile_lua_regex(pattern_str: &str) -> Option<Regex> {
     let parsed_pattern = match lua_pattern::parse(pattern_str) {

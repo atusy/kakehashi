@@ -3,6 +3,7 @@
 //! `@injection.language` capture.
 
 use crate::language::predicate_accessor::{UnifiedPredicate, get_all_predicates};
+use crate::language::query_directives;
 use crate::text::clamped_slice;
 use tree_sitter::{Query, QueryMatch};
 
@@ -54,7 +55,13 @@ fn extract_dynamic_language(query: &Query, match_: &QueryMatch, text: &str) -> O
             // the capture didn't resolve to real text — treat it as "no language"
             // rather than emitting an empty language id (which would create a
             // bogus injection region downstream), mirroring the info-string path.
-            let lang_text = clamped_slice(text, capture.node.byte_range());
+            let transformed;
+            let lang_text = if query.general_predicates(match_.pattern_index).is_empty() {
+                clamped_slice(text, capture.node.byte_range())
+            } else {
+                transformed = query_directives::capture_text(query, match_, capture.index, text)?;
+                &transformed
+            };
             if lang_text.is_empty() {
                 return None;
             }
@@ -152,5 +159,29 @@ mod tests {
         // normalization → None, but crucially no panic.
         let lang = extract_language_from_info_string(&query, m, "x");
         assert_eq!(lang, None);
+    }
+
+    #[test]
+    fn gsub_directive_transforms_dynamic_injection_language() {
+        let rust: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&rust).expect("load Rust grammar");
+        let text = "/* bash */\nfn main() {}\n";
+        let tree = parser.parse(text, None).expect("parse Rust");
+        let query = Query::new(
+            &rust,
+            r#"((block_comment) @injection.language
+                 (#gsub! @injection.language "/%*%s*([%w%p]+)%s*%*/" "%1"))"#,
+        )
+        .expect("valid query");
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+        let m = matches.next().expect("one match");
+
+        assert_eq!(
+            extract_injection_language(&query, m, text).as_deref(),
+            Some("bash")
+        );
     }
 }
