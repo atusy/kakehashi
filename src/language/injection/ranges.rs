@@ -52,7 +52,10 @@ pub(crate) fn has_include_children_for_pattern(
 /// Returns `None` when:
 /// - `include_children` is true (the injection parser should see everything)
 /// - The content node has no named children (no gaps to compute)
-/// - All content is covered by named children (no gaps exist)
+///
+/// Returns `Some(vec![])` when all content is covered by named children.  The
+/// distinction matters because an empty included-range set must not fall back
+/// to parsing the whole content node.
 ///
 /// The returned ranges are **relative** to the content node's start position:
 /// byte offsets are subtracted by `content_node.start_byte()`, and row/column
@@ -214,11 +217,7 @@ fn compute_included_ranges_in_window(
         });
     }
 
-    if ranges.is_empty() {
-        None
-    } else {
-        Some(ranges)
-    }
+    Some(ranges)
 }
 
 /// Clip the parent's `included_ranges` to the nested injection's byte window
@@ -629,16 +628,17 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_included_ranges_clipped_returns_none_when_children_cover_window() {
+    fn test_compute_included_ranges_clipped_returns_empty_when_children_cover_window() {
         let mut parser = create_rust_parser();
         let text = "fn main() {}";
         let tree = parser.parse(text, None).unwrap();
         let func = tree.root_node().named_child(0).expect("function_item");
 
         // Window [10..12) lies entirely inside the body child: no gaps.
-        assert!(
-            compute_included_ranges_clipped(&func, false, text, 10..12).is_none(),
-            "window fully covered by a child has no gaps"
+        assert_eq!(
+            compute_included_ranges_clipped(&func, false, text, 10..12),
+            Some(Vec::new()),
+            "window fully covered by a child has an explicitly empty gap set"
         );
     }
 

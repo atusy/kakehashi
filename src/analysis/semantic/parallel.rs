@@ -701,17 +701,27 @@ fn discover_single_region(
     } else {
         compute_included_ranges(&injection.content_node, injection.include_children)
     };
-    let from_parent = parent_included_ranges.and_then(|parent_ranges| {
-        sub_select_included_ranges(parent_ranges, inj_start_byte, inj_end_byte)
-    });
+    if from_children.as_ref().is_some_and(Vec::is_empty) {
+        return SingleDiscovery::Skip;
+    }
+    let from_parent = match parent_included_ranges {
+        Some(parent_ranges) => {
+            let Some(ranges) =
+                sub_select_included_ranges(parent_ranges, inj_start_byte, inj_end_byte)
+            else {
+                return SingleDiscovery::Skip;
+            };
+            Some(ranges)
+        }
+        None => None,
+    };
     let included_ranges = match (from_children, from_parent) {
         (Some(child_ranges), Some(parent_ranges)) => {
             let intersected = intersect_included_ranges(&child_ranges, &parent_ranges);
             if intersected.is_empty() {
-                None
-            } else {
-                Some(intersected)
+                return SingleDiscovery::Skip;
             }
+            Some(intersected)
         }
         (Some(ranges), None) | (None, Some(ranges)) => Some(ranges),
         (None, None) => None,
@@ -1258,8 +1268,19 @@ fn build_combined_context<'a>(
     let group_ranges = normalized_ranges;
 
     // Inherit parent exclusions exactly like the per-region path.
-    let from_parent = parent_included_ranges
-        .and_then(|pr| sub_select_included_ranges(pr, group_start, group_end));
+    if group_ranges.is_empty() {
+        return Ok(None);
+    }
+    let from_parent = match parent_included_ranges {
+        Some(parent_ranges) => {
+            let Some(ranges) = sub_select_included_ranges(parent_ranges, group_start, group_end)
+            else {
+                return Ok(None);
+            };
+            Some(ranges)
+        }
+        None => None,
+    };
     let included_ranges = match from_parent {
         Some(parent_ranges) => {
             let intersected = intersect_included_ranges(&group_ranges, &parent_ranges);
@@ -2662,6 +2683,70 @@ local b = 2
     ///   "```\n"          55..59
     const COMBINED_LUA_DOC: &str =
         "```lua\nlocal x = 1\n```\n\nplain text\n\n```lua\nlocal y = 2\n```\n";
+
+    fn parent_range(start_byte: usize, end_byte: usize) -> tree_sitter::Range {
+        tree_sitter::Range {
+            start_byte,
+            end_byte,
+            start_point: tree_sitter::Point::new(0, start_byte),
+            end_point: tree_sitter::Point::new(0, end_byte),
+        }
+    }
+
+    #[test]
+    fn parent_exclusions_do_not_fall_back_to_unrestricted_injection_parsing() {
+        let Some(coordinator) = combined_lua_coordinator() else {
+            return;
+        };
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let mut parser = parser_pool.acquire("markdown").unwrap();
+        let tree = parser.parse(COMBINED_LUA_DOC, None).unwrap();
+        parser_pool.release("markdown".to_string(), parser);
+
+        // The only parent-included bytes precede both injected content spans.
+        // A missing overlap means the child layer is excluded, not that its
+        // parser may see the whole content window.
+        let parent_ranges = [parent_range(0, 5)];
+        let (combined, _, _) = collect_injection_contexts_sync(
+            COMBINED_LUA_DOC,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            0,
+            Some(&parent_ranges),
+            None,
+            None,
+        );
+        assert!(combined.is_empty());
+
+        let md_language = coordinator
+            .language_registry_for_parallel()
+            .get("markdown")
+            .unwrap();
+        let query = Query::new(
+            &md_language,
+            r#"(fenced_code_block
+                 (info_string (language) @injection.language)
+                 (code_fence_content) @injection.content
+                 (#set! injection.include-children))"#,
+        )
+        .unwrap();
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(query));
+
+        let (singles, _, _) = collect_injection_contexts_sync(
+            COMBINED_LUA_DOC,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            0,
+            Some(&parent_ranges),
+            None,
+            None,
+        );
+        assert!(singles.is_empty());
+    }
 
     #[test]
     fn test_combined_injections_group_into_single_context() {

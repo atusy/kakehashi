@@ -174,6 +174,13 @@ pub(crate) fn parse_with_ranges(
     log_target: &str,
     lang_name: &str,
 ) -> Option<tree_sitter::Tree> {
+    // Tree-sitter treats an empty included-range slice like a reset to the
+    // default whole-document range.  Here it means child/parent exclusions
+    // removed every byte, so there is intentionally nothing to parse.
+    if included_ranges.is_some_and(<[tree_sitter::Range]>::is_empty) {
+        return None;
+    }
+
     if let Some(ranges) = included_ranges
         && let Err(e) = parser.set_included_ranges(ranges)
     {
@@ -539,6 +546,18 @@ mod tests {
             let_columns,
             vec![2, 2],
             "Both 'let' keywords should be at column 2 (from Range.start_point), not 0"
+        );
+    }
+
+    #[test]
+    fn parse_with_empty_included_ranges_skips_instead_of_parsing_everything() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+
+        assert!(
+            parse_with_ranges(&mut parser, "fn main() {}", Some(&[]), "test", "rust").is_none()
         );
     }
 
