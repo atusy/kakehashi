@@ -327,7 +327,7 @@ impl Drop for WalkFlightGuard<'_> {
 struct KindQuery {
     query: tree_sitter::Query,
     skipped: Vec<crate::language::query_loader::SkippedPattern>,
-    has_row_offset: bool,
+    has_offset: bool,
 }
 
 /// Compiled-kind-query cache, `language → kind file → (query, generation)`.
@@ -446,11 +446,11 @@ fn load_kind_query(
         );
         return KindQueryLoad::Broken(parsed.skipped);
     };
-    let has_row_offset = crate::language::query_directives::has_row_offset_directive(&query);
+    let has_offset = crate::language::query_directives::has_offset_directive(&query);
     KindQueryLoad::Loaded(KindQuery {
         query,
         skipped: parsed.skipped,
-        has_row_offset,
+        has_offset,
     })
 }
 
@@ -1460,7 +1460,7 @@ fn execute_captures_walk(
         // FNV pass over the layer bytes per visit — about twice the
         // document bytes per full walk, sub-ms against the walk times the
         // per-walk debug line reports (see the reused/executed counters).
-        let cache_safe = depth == 0 || !kind_query.has_row_offset;
+        let cache_safe = depth == 0 || !kind_query.has_offset;
         let cache_key = (cache_full_walk && cache_safe).then(|| {
             super::captures_match_cache::tree_cache_key(kind, layer_language, layer_tree, text)
         });

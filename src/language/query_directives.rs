@@ -14,12 +14,12 @@ pub(crate) struct CaptureRange {
     pub end_point: tree_sitter::Point,
 }
 
-/// Whether any valid `#offset!` in the query moves a row boundary.
+/// Whether any valid `#offset!` in the query moves a boundary.
 ///
-/// Row movement searches for newlines beyond the captured node. Injected-layer
-/// match caches hash only the layer's outer span, so callers use this to avoid
-/// reusing results whose range calculation may inspect unhashed host bytes.
-pub(crate) fn has_row_offset_directive(query: &Query) -> bool {
+/// Offset calculation can inspect host bytes beyond an injected layer while
+/// locating rows or snapping a column endpoint to a UTF-8 boundary. Callers use
+/// this to avoid reusing results based on an under-keyed layer cache entry.
+pub(crate) fn has_offset_directive(query: &Query) -> bool {
     (0..query.pattern_count()).any(|pattern_index| {
         query
             .general_predicates(pattern_index)
@@ -28,13 +28,9 @@ pub(crate) fn has_row_offset_directive(query: &Query) -> bool {
                 if directive.operator.as_ref() != "offset!" {
                     return false;
                 }
-                [1, 3].into_iter().any(|index| {
-                    matches!(
-                        directive.args.get(index),
-                        Some(tree_sitter::QueryPredicateArg::String(value))
-                            if value.parse::<i32>().is_ok_and(|row| row != 0)
-                    )
-                })
+                crate::language::injection::parse_offset_args(&directive.args[1..]).is_some_and(
+                    |offset| offset != crate::language::injection::InjectionOffset::default(),
+                )
             })
     })
 }
@@ -394,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_only_row_bearing_offsets_as_external_scan_dependencies() {
+    fn detects_any_nonzero_offset_as_an_external_scan_dependency() {
         let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
         let query = |operator: &str, args: &str| {
             Query::new(
@@ -404,9 +400,9 @@ mod tests {
             .unwrap()
         };
 
-        assert!(has_row_offset_directive(&query("offset!", "1 0 0 0")));
-        assert!(has_row_offset_directive(&query("offset!", "0 0 -1 0")));
-        assert!(!has_row_offset_directive(&query("offset!", "0 1 0 -1")));
-        assert!(!has_row_offset_directive(&query("trim!", "1 1 1 1")));
+        assert!(has_offset_directive(&query("offset!", "1 0 0 0")));
+        assert!(has_offset_directive(&query("offset!", "0 1 0 -1")));
+        assert!(!has_offset_directive(&query("offset!", "0 0 0 0")));
+        assert!(!has_offset_directive(&query("trim!", "1 1 1 1")));
     }
 }
