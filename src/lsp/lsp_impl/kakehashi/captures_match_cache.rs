@@ -153,17 +153,23 @@ pub(in crate::lsp::lsp_impl) fn tree_cache_key(
 }
 
 /// Shift every capture offset down by `anchor`, in place. Returns `false`
-/// (leaving the matches untouched) if any capture starts below the anchor —
-/// a tree whose root node reaches outside its included ranges must simply
-/// not be cached, never corrupted by a wrapping subtraction. Ignoring the
-/// verdict would cache un-rebased (absolute) offsets, hence `must_use`.
+/// (leaving the matches untouched) if any raw or directive-adjusted capture
+/// escapes the hashed outer span. Such a match may observe bytes absent from
+/// the cache key and must not be reused; the lower-bound check also prevents
+/// wrapping subtraction. Ignoring the verdict would cache unsafe absolute or
+/// under-keyed offsets, hence `must_use`.
 #[must_use]
-pub(in crate::lsp::lsp_impl) fn rebase_matches(matches: &mut [MatchData], anchor: usize) -> bool {
-    if matches
-        .iter()
-        .flat_map(|m| &m.captures)
-        .any(|c| c.start_byte < anchor || c.range_start_byte < anchor)
-    {
+pub(in crate::lsp::lsp_impl) fn rebase_matches(
+    matches: &mut [MatchData],
+    anchor: usize,
+    outer_end: usize,
+) -> bool {
+    if matches.iter().flat_map(|m| &m.captures).any(|c| {
+        c.start_byte < anchor
+            || c.range_start_byte < anchor
+            || c.end_byte > outer_end
+            || c.range_end_byte > outer_end
+    }) {
         return false;
     }
     for m in matches {
@@ -518,7 +524,7 @@ mod tests {
         let mut ok = vec![match_data(&[(10, 14), (12, 13)])];
         ok[0].captures[0].range_start_byte = 11;
         ok[0].captures[0].range_end_byte = 13;
-        assert!(rebase_matches(&mut ok, 10));
+        assert!(rebase_matches(&mut ok, 10, 20));
         assert_eq!(ok[0].captures[0].start_byte, 0);
         assert_eq!(ok[0].captures[0].end_byte, 4);
         assert_eq!(ok[0].captures[0].range_start_byte, 1);
@@ -528,15 +534,23 @@ mod tests {
         // A capture below the anchor (root node reaching outside the layer's
         // included ranges) must refuse the rebase and leave data untouched.
         let mut bad = vec![match_data(&[(10, 14)]), match_data(&[(4, 6)])];
-        assert!(!rebase_matches(&mut bad, 10));
+        assert!(!rebase_matches(&mut bad, 10, 20));
         assert_eq!(bad[0].captures[0].start_byte, 10, "untouched on refusal");
 
         let mut adjusted_below_anchor = vec![match_data(&[(10, 14)])];
         adjusted_below_anchor[0].captures[0].range_start_byte = 9;
-        assert!(!rebase_matches(&mut adjusted_below_anchor, 10));
+        assert!(!rebase_matches(&mut adjusted_below_anchor, 10, 20));
         assert_eq!(
             adjusted_below_anchor[0].captures[0].range_start_byte, 9,
             "directive-adjusted ranges must not underflow during rebase"
+        );
+
+        let mut adjusted_past_span = vec![match_data(&[(10, 14)])];
+        adjusted_past_span[0].captures[0].range_end_byte = 21;
+        assert!(!rebase_matches(&mut adjusted_past_span, 10, 20));
+        assert_eq!(
+            adjusted_past_span[0].captures[0].range_end_byte, 21,
+            "ranges depending on unhashed bytes must not be cached"
         );
     }
 

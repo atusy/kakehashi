@@ -1458,9 +1458,17 @@ fn execute_captures_walk(
         // document bytes per full walk, sub-ms against the walk times the
         // per-walk debug line reports (see the reused/executed counters).
         let cache_key = cache_full_walk.then(|| {
-            super::captures_match_cache::tree_cache_key(kind, layer_language, layer_tree, text)
+            let (anchor, hash) =
+                super::captures_match_cache::tree_cache_key(kind, layer_language, layer_tree, text);
+            let outer_end = layer_tree
+                .included_ranges()
+                .iter()
+                .map(|range| range.end_byte.min(text.len()))
+                .max()
+                .unwrap_or(anchor);
+            (anchor, outer_end, hash)
         });
-        let reused = cache_key.and_then(|(_, hash)| {
+        let reused = cache_key.and_then(|(_, _, hash)| {
             if depth == 0 {
                 match_cache.get_host(uri, kind, hash, generation)
             } else {
@@ -1470,7 +1478,7 @@ fn execute_captures_walk(
         let (layer_matches, anchor): (
             std::sync::Arc<Vec<crate::language::query_exec::MatchData>>,
             usize,
-        ) = if let (Some(cached), Some((anchor, hash))) = (reused, cache_key) {
+        ) = if let (Some(cached), Some((anchor, _, hash))) = (reused, cache_key) {
             if depth > 0 {
                 touched_layer_hashes.insert(hash);
             }
@@ -1482,11 +1490,11 @@ fn execute_captures_walk(
             // Rebase to anchor-relative before storing; a refusal (a capture
             // below the layer anchor, e.g. a root node reaching outside its
             // included ranges) leaves the matches absolute and uncached.
-            let rebased_key = cache_key.filter(|&(anchor, _)| {
-                super::captures_match_cache::rebase_matches(&mut fresh, anchor)
+            let rebased_key = cache_key.filter(|&(anchor, outer_end, _)| {
+                super::captures_match_cache::rebase_matches(&mut fresh, anchor, outer_end)
             });
             let arc = std::sync::Arc::new(fresh);
-            if let Some((anchor, hash)) = rebased_key {
+            if let Some((anchor, _, hash)) = rebased_key {
                 // The doc-open probe only runs when the store must CREATE the
                 // per-document slot (first store after open, or a walk racing
                 // its own didClose) — see the resurrection-leak note on
