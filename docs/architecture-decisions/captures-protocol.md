@@ -94,7 +94,14 @@ span remains the source of node identity and cache tracking. As in
 offset. `#gsub!` is evaluated where transformed capture text has a consumer —
 currently dynamic `@injection.language` resolution — but this protocol does
 not expose Neovim's `metadata[capture_id].text` because its capture shape has
-no transformed-text field.
+no transformed-text field. The evaluator uses the same Lua-pattern translator
+as `#lua-match?`; unsupported Lua constructs (`%b`, `%f`, and pattern capture
+backreferences) fail soft and leave the prior text unchanged. It also does not
+compose `#set! @capture text ...` with `#gsub!`: tree-sitter's Rust API exposes
+property settings separately from general directives without their relative
+source order, so reproducing Neovim's ordered metadata updates would require
+guessing. These limits do not affect the `#gsub!` forms currently shipped by
+nvim-treesitter.
 
 ### Kind resolution
 
