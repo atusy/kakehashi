@@ -278,7 +278,21 @@ pub(crate) fn lua_gsub_bytes(pattern: &str, replacement: &str, text: &[u8]) -> O
     }
     let regex = get_or_compile_lua_bytes_regex(pattern)?;
     let replacement = lua_replacement_to_regex(replacement, regex.captures_len())?;
-    Some(regex.replace_all(text, replacement.as_bytes()).into_owned())
+    let mut result = Vec::with_capacity(text.len());
+    let mut copied_until = 0;
+    let mut previous_nonempty_end = None;
+    for captures in regex.captures_iter(text) {
+        let matched = captures.get(0)?;
+        if matched.is_empty() && previous_nonempty_end == Some(matched.start()) {
+            continue;
+        }
+        result.extend_from_slice(&text[copied_until..matched.start()]);
+        captures.expand(replacement.as_bytes(), &mut result);
+        copied_until = matched.end();
+        previous_nonempty_end = (!matched.is_empty()).then_some(matched.end());
+    }
+    result.extend_from_slice(&text[copied_until..]);
+    Some(result)
 }
 
 fn has_lua_position_capture(pattern: &str) -> bool {
@@ -498,6 +512,7 @@ mod tests {
             "Lua patterns operate on bytes rather than Unicode scalars"
         );
         assert_eq!(lua_gsub(".", "x", "a\nb").as_deref(), Some("xxx"));
+        assert_eq!(lua_gsub("a*", "x", "a").as_deref(), Some("x"));
         let intermediate = lua_gsub_bytes("^.", "", "é".as_bytes()).unwrap();
         assert!(std::str::from_utf8(&intermediate).is_err());
         let final_text = lua_gsub_bytes(".", "x", &intermediate).unwrap();
