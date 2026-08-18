@@ -1582,8 +1582,8 @@ fn execute_captures_walk(
                     capture_idx += 1;
                     // A capture whose bytes don't map to positions (corrupt
                     // span) is dropped rather than failing the whole request.
-                    let start_byte = c.start_byte + anchor;
-                    let end_byte = c.end_byte + anchor;
+                    let start_byte = c.range_start_byte + anchor;
+                    let end_byte = c.range_end_byte + anchor;
                     let start = mapper.byte_to_position(start_byte)?;
                     let end = mapper.byte_to_position(end_byte)?;
                     // Direct Map construction, MOVING every sub-value: a
@@ -3127,6 +3127,8 @@ mod tests {
                         name: "dropped".to_string(),
                         start_byte: text.len() + 10,
                         end_byte: text.len() + 12,
+                        range_start_byte: text.len() + 10,
+                        range_end_byte: text.len() + 12,
                         kind: "identifier",
                         metadata: Vec::new(),
                     },
@@ -3134,6 +3136,8 @@ mod tests {
                         name: "survivor".to_string(),
                         start_byte: 3,
                         end_byte: 4,
+                        range_start_byte: 3,
+                        range_end_byte: 4,
                         kind: "identifier",
                         metadata: Vec::new(),
                     },
@@ -3246,6 +3250,8 @@ mod tests {
                     name: "sentinel-from-cache".to_string(),
                     start_byte: 4,
                     end_byte: 5,
+                    range_start_byte: 4,
+                    range_end_byte: 5,
                     kind: "identifier",
                     metadata: Vec::new(),
                 }],
@@ -3373,6 +3379,8 @@ mod tests {
                     name: "sentinel-must-not-serve".to_string(),
                     start_byte: 0,
                     end_byte: 3,
+                    range_start_byte: 0,
+                    range_end_byte: 3,
                     kind: "identifier",
                     metadata: Vec::new(),
                 }],
@@ -3548,6 +3556,8 @@ mod tests {
                     name: "sentinel-host-slot".to_string(),
                     start_byte: 4,
                     end_byte: 5,
+                    range_start_byte: 4,
+                    range_end_byte: 5,
                     kind: "identifier",
                     metadata: Vec::new(),
                 }],

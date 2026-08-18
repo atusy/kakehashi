@@ -35,8 +35,12 @@ use crate::language::query_predicates::check_match_predicates;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CapturedNode {
     pub name: String,
+    /// Raw node span used for node identity.
     pub start_byte: usize,
     pub end_byte: usize,
+    /// Directive-adjusted span exposed as the capture range.
+    pub range_start_byte: usize,
+    pub range_end_byte: usize,
     pub kind: &'static str,
     pub metadata: Vec<(String, Option<String>)>,
 }
@@ -105,6 +109,8 @@ pub(crate) fn execute_query(
                     name: capture_names[c.index as usize].to_string(),
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
+                    range_start_byte: node.start_byte(),
+                    range_end_byte: node.end_byte(),
                     kind: node.kind(),
                     metadata: metadata_for(Some(c.index as usize)),
                 }

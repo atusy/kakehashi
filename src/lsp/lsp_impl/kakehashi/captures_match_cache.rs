@@ -172,6 +172,8 @@ pub(in crate::lsp::lsp_impl) fn rebase_matches(matches: &mut [MatchData], anchor
             // (end >= start >= anchor by construction).
             c.start_byte -= anchor;
             c.end_byte -= anchor;
+            c.range_start_byte -= anchor;
+            c.range_end_byte -= anchor;
         }
     }
     true
@@ -364,6 +366,8 @@ mod tests {
                     name: "cap".to_string(),
                     start_byte,
                     end_byte,
+                    range_start_byte: start_byte,
+                    range_end_byte: end_byte,
                     kind: "identifier",
                     metadata: Vec::new(),
                 })
