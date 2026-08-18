@@ -23,9 +23,9 @@ use crate::document::{DiscoveredInjections, DiscoveredRegion, DiscoveredRegionCa
 use crate::language::LanguageCoordinator;
 use crate::language::NodeTracker;
 use crate::language::injection::{
-    CacheableInjectionRegion, InjectionRegionInfo, MAX_INJECTION_DEPTH, compute_included_ranges,
-    compute_included_ranges_clipped, effective_content_range, intersect_included_ranges,
-    parse_with_ranges, sub_select_included_ranges,
+    CacheableInjectionRegion, InjectionRegionInfo, MAX_INJECTION_DEPTH, byte_to_point,
+    compute_included_ranges, compute_included_ranges_clipped, effective_content_range,
+    intersect_included_ranges, parse_with_ranges, sub_select_included_ranges,
 };
 use crate::text::position::byte_to_utf16_col;
 
@@ -675,28 +675,10 @@ fn discover_single_region(
         None
     };
 
-    // Offset directive resolved at collection time (single source of truth
-    // with the bridge path, which applies it in from_region_info)
+    // Runtime range directive resolved at collection time (single source of
+    // truth with the bridge path).
     let offset = injection.offset;
-
-    // Calculate effective content range
-    let content_node = injection.content_node;
-    let (inj_start_byte, inj_end_byte) = if let Some(off) = offset {
-        use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
-        let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
-        // calculate_effective_range clamps, snaps inward to char
-        // boundaries, and normalizes start <= end, so the content slice
-        // below cannot panic.
-        let effective = calculate_effective_range(text, byte_range, off);
-        (effective.start, effective.end)
-    } else {
-        (content_node.start_byte(), content_node.end_byte())
-    };
-
-    // Validate effective range after offset adjustment
-    if inj_start_byte > inj_end_byte || inj_end_byte > text.len() {
-        return SingleDiscovery::Skip;
-    }
+    let (inj_start_byte, inj_end_byte) = (start, end);
 
     // Compute included ranges for the injection parser (Problem 1: blockquote prefixes).
     // When include_children is false and content_node has named children
@@ -1146,9 +1128,15 @@ fn build_combined_context<'a>(
     let Some(first) = regions.first() else {
         return Ok(None);
     };
-    let group_start = first.content_node.start_byte();
-    let group_start_pos = first.content_node.start_position();
-    let Some(group_end) = regions.iter().map(|r| r.content_node.end_byte()).max() else {
+    let effective_ranges: Vec<_> = regions
+        .iter()
+        .map(|region| effective_content_range(region, text))
+        .collect();
+    let Some(group_start) = effective_ranges.iter().map(|range| range.start).min() else {
+        return Ok(None);
+    };
+    let group_start_pos = byte_to_point(text, group_start);
+    let Some(group_end) = effective_ranges.iter().map(|range| range.end).max() else {
         return Ok(None);
     };
     if group_start >= group_end || group_end > text.len() {
@@ -1158,7 +1146,7 @@ fn build_combined_context<'a>(
     // Resolve the language once from the first block's content — the grouping
     // key guarantees every region shares the raw injection language. A missing
     // language/query is transient (loads later without the content changing).
-    let first_content = &text[first.content_node.start_byte()..first.content_node.end_byte()];
+    let first_content = &text[effective_ranges[0].clone()];
     let Some((resolved_lang, _)) =
         coordinator.resolve_injection_language(&first.language, first_content)
     else {
@@ -1178,37 +1166,39 @@ fn build_combined_context<'a>(
         },
     };
 
-    // Each block contributes its child-exclusion gaps (or its whole node),
-    // rebased from node-relative to group-relative coordinates.
+    // Each block contributes its directive-adjusted, child-filtered ranges,
+    // rebased from host coordinates into the combined content slice.
     let mut group_ranges: Vec<tree_sitter::Range> = Vec::with_capacity(regions.len());
-    for region in regions {
+    for (region, effective) in regions.iter().zip(&effective_ranges) {
         let node = &region.content_node;
-        let node_start = node.start_byte();
-        let node_pos = node.start_position();
-        let lift_point = |rel: tree_sitter::Point| tree_sitter::Point {
-            row: node_pos.row + rel.row,
-            column: if rel.row == 0 {
-                node_pos.column + rel.column
-            } else {
-                rel.column
-            },
+        let ranges = if region.offset.is_some() {
+            compute_included_ranges_clipped(node, region.include_children, text, effective.clone())
+        } else {
+            compute_included_ranges(node, region.include_children)
         };
-        match compute_included_ranges(node, region.include_children) {
-            Some(gaps) => {
-                for g in gaps {
+        let base = if region.offset.is_some() {
+            effective.start
+        } else {
+            node.start_byte()
+        };
+        match ranges {
+            Some(ranges) => {
+                for range in ranges {
+                    let start = base + range.start_byte;
+                    let end = base + range.end_byte;
                     group_ranges.push(tree_sitter::Range {
-                        start_byte: node_start - group_start + g.start_byte,
-                        end_byte: node_start - group_start + g.end_byte,
-                        start_point: to_relative_point(lift_point(g.start_point)),
-                        end_point: to_relative_point(lift_point(g.end_point)),
+                        start_byte: start - group_start,
+                        end_byte: end - group_start,
+                        start_point: to_relative_point(byte_to_point(text, start)),
+                        end_point: to_relative_point(byte_to_point(text, end)),
                     });
                 }
             }
             None => group_ranges.push(tree_sitter::Range {
-                start_byte: node_start - group_start,
-                end_byte: node.end_byte() - group_start,
-                start_point: to_relative_point(node_pos),
-                end_point: to_relative_point(node.end_position()),
+                start_byte: effective.start - group_start,
+                end_byte: effective.end - group_start,
+                start_point: to_relative_point(byte_to_point(text, effective.start)),
+                end_point: to_relative_point(byte_to_point(text, effective.end)),
             }),
         }
     }
@@ -2677,6 +2667,59 @@ local b = 2
             "each combined block must register an exclusion range, got {:?}",
             exclusions
         );
+    }
+
+    #[test]
+    fn combined_context_uses_each_runtime_adjusted_range() {
+        let Some(coordinator) = combined_lua_coordinator() else {
+            return;
+        };
+        let md_language = coordinator
+            .language_registry_for_parallel()
+            .get("markdown")
+            .unwrap();
+        let query = Query::new(
+            &md_language,
+            r#"(fenced_code_block
+                 (info_string (language) @injection.language)
+                 (code_fence_content) @injection.content
+                 (#set! injection.combined)
+                 (#set! injection.include-children)
+                 (#offset! @injection.content 0 2))"#,
+        )
+        .unwrap();
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(query));
+
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let mut parser = parser_pool.acquire("markdown").unwrap();
+        let tree = parser.parse(COMBINED_LUA_DOC, None).unwrap();
+        parser_pool.release("markdown".to_string(), parser);
+
+        let (contexts, exclusions, _) = collect_injection_contexts_sync(
+            COMBINED_LUA_DOC,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            0,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(contexts.len(), 1);
+        let context = &contexts[0];
+        assert_eq!(context.host_start_byte, 9);
+        let ranges: Vec<_> = context
+            .included_ranges
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|range| (range.start_byte, range.end_byte))
+            .collect();
+        assert_eq!(ranges, vec![(0, 10), (36, 46)]);
+        assert!(exclusions.contains(&(9, 19)) && exclusions.contains(&(45, 55)));
     }
 
     /// The **vendored** markdown injection query marks `html_block` combined —

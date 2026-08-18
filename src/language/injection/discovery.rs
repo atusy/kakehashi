@@ -422,8 +422,7 @@ pub(crate) fn collect_all_injections_cancellable<'a>(
                     include_children: has_include_children_for_pattern(query, match_.pattern_index),
                     // Match the semantic path: effective offsets and
                     // multi-region grouping do not compose safely.
-                    combined: has_combined_for_pattern(query, match_.pattern_index)
-                        && offset.is_none(),
+                    combined: has_combined_for_pattern(query, match_.pattern_index),
                     identity_slot: 0,
                     offset,
                 }
@@ -437,16 +436,6 @@ pub(crate) fn collect_all_injections_cancellable<'a>(
 
     // Sort by start_byte (primary) and end_byte (secondary) to ensure deterministic ordering
     let mut injections: Vec<_> = injections_map.into_values().collect();
-    let adjusted_groups: std::collections::HashSet<_> = injections
-        .iter()
-        .filter(|region| region.offset.is_some())
-        .map(|region| (region.language.clone(), region.pattern_index))
-        .collect();
-    for region in &mut injections {
-        if adjusted_groups.contains(&(region.language.clone(), region.pattern_index)) {
-            region.combined = false;
-        }
-    }
     injections.sort_by(|a, b| {
         (
             a.content_node.start_byte(),
@@ -1923,7 +1912,7 @@ mod tests {
     }
 
     #[test]
-    fn combined_patterns_with_offsets_remain_separate() {
+    fn combined_patterns_preserve_runtime_offsets() {
         let mut parser = create_rust_parser();
         let text = r#"fn main() { let a = "abc"; let b = "def"; }"#;
         let tree = parse_rust_code(&mut parser, text);
@@ -1950,10 +1939,10 @@ mod tests {
             0,
         );
 
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].virtual_content, "b");
-        assert_eq!(resolved[1].virtual_content, "e");
-        assert!(resolved.iter().all(|region| region.contiguous));
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].virtual_content.contains('b'));
+        assert!(resolved[0].virtual_content.contains('e'));
+        assert!(!resolved[0].contiguous);
     }
 
     #[test]
@@ -1987,7 +1976,7 @@ mod tests {
     }
 
     #[test]
-    fn one_adjusted_capture_disables_combining_for_its_whole_group() {
+    fn adjusted_captures_remain_combined() {
         let mut parser = create_rust_parser();
         let text = r#"fn main() { let a = "body"; let b = "  body  "; }"#;
         let tree = parse_rust_code(&mut parser, text);
@@ -2004,7 +1993,7 @@ mod tests {
         let regions = collect_all_injections(&tree.root_node(), text, Some(&query)).unwrap();
 
         assert_eq!(regions.len(), 2);
-        assert!(regions.iter().all(|region| !region.combined));
+        assert!(regions.iter().all(|region| region.combined));
     }
 
     #[test]
