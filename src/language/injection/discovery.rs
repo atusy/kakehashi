@@ -79,6 +79,7 @@ fn runtime_offset_for_capture(
 }
 
 /// Checks if a node is within the bounds of another node
+#[cfg(test)]
 fn is_node_within(node: &Node, container: &Node) -> bool {
     node.start_byte() >= container.start_byte() && node.end_byte() <= container.end_byte()
 }
@@ -462,13 +463,13 @@ pub(crate) fn collect_all_injections_cancellable<'a>(
 /// Detects injection and returns both the language and the content node
 /// Also returns the pattern index of the innermost injection for offset lookups
 pub(crate) fn detect_injection<'a>(
-    node: &Node<'a>,
     root: &Node<'a>,
     text: &str,
+    cursor_byte: usize,
     injection_query: Option<&Query>,
     base_language: &str,
 ) -> Option<(Vec<String>, Node<'a>, usize, Option<InjectionOffset>)> {
-    let injections = collect_injection_regions(node, root, text, injection_query)?;
+    let injections = collect_injection_regions(root, text, cursor_byte, injection_query)?;
 
     if injections.is_empty() {
         return None;
@@ -534,9 +535,9 @@ struct RawInjectionRegion<'a> {
 /// Collects all injection regions that contain the given node
 /// Returns a list of `RawInjectionRegion` values for each injection containing the node.
 fn collect_injection_regions<'a>(
-    node: &Node<'a>,
     root: &Node<'a>,
     text: &str,
+    cursor_byte: usize,
     injection_query: Option<&Query>,
 ) -> Option<Vec<RawInjectionRegion<'a>>> {
     let query = injection_query?;
@@ -552,7 +553,7 @@ fn collect_injection_regions<'a>(
 
     while let Some(match_) = matches.next() {
         if let Some((content_node, language, pattern_index, offset, start_byte, end_byte)) =
-            extract_content_and_language(node, match_, query, text)
+            extract_content_and_language(cursor_byte, match_, query, text)
         {
             let key = (start_byte, end_byte, language.clone(), pattern_index);
 
@@ -591,7 +592,7 @@ fn collect_injection_regions<'a>(
 /// Extracts the injection content node and language if the given node is within it
 /// Also returns the pattern index for offset lookups
 fn extract_content_and_language<'a>(
-    node: &Node<'a>,
+    cursor_byte: usize,
     match_: &QueryMatch<'_, 'a>,
     query: &Query,
     text: &str,
@@ -621,7 +622,8 @@ fn extract_content_and_language<'a>(
         } else {
             content_node.byte_range()
         };
-        if is_node_within(node, &content_node)
+        if cursor_byte >= effective.start
+            && cursor_byte < effective.end
             && let Some(language) = extract_injection_language(query, match_, text)
         {
             return Some((
@@ -1586,7 +1588,13 @@ mod tests {
         let node_in_string = find_node_at_byte(&root, 20).expect("node at position");
 
         // Detect injection with content
-        let result = detect_injection(&node_in_string, &root, text, Some(&query), "rust");
+        let result = detect_injection(
+            &root,
+            text,
+            node_in_string.start_byte(),
+            Some(&query),
+            "rust",
+        );
 
         assert!(result.is_some());
         let (hierarchy, _content_node, _pattern_index, _offset) = result.unwrap();
@@ -1623,7 +1631,13 @@ mod tests {
         let node = find_node_at_byte(&root, 35); // Position in regex string
         assert!(node.is_some());
 
-        let result = detect_injection(&node.unwrap(), &root, text, Some(&query), "rust");
+        let result = detect_injection(
+            &root,
+            text,
+            node.unwrap().start_byte(),
+            Some(&query),
+            "rust",
+        );
         assert_eq!(
             result.map(|(h, _, _, _)| h),
             Some(vec!["rust".to_string(), "regex".to_string()])
@@ -1652,7 +1666,13 @@ mod tests {
         let node = find_node_at_byte(&root, 20); // Position in string
         assert!(node.is_some());
 
-        let result = detect_injection(&node.unwrap(), &root, text, Some(&query), "rust");
+        let result = detect_injection(
+            &root,
+            text,
+            node.unwrap().start_byte(),
+            Some(&query),
+            "rust",
+        );
         assert_eq!(result.map(|(h, _, _, _)| h), None);
     }
 
@@ -1664,7 +1684,7 @@ mod tests {
         let root = tree.root_node();
 
         let node = root.child(0).unwrap();
-        let result = detect_injection(&node, &root, text, None, "rust");
+        let result = detect_injection(&root, text, node.start_byte(), None, "rust");
         assert_eq!(result, None);
     }
 
@@ -1703,7 +1723,7 @@ mod tests {
         let query = Query::new(&language, query_str).expect("valid query");
 
         let node = find_node_at_byte(&root, 22).expect("node in string");
-        let result = detect_injection(&node, &root, text, Some(&query), "rust");
+        let result = detect_injection(&root, text, node.start_byte(), Some(&query), "rust");
 
         assert!(result.is_some());
         let (hierarchy, _, _, _) = result.unwrap();
@@ -2036,7 +2056,13 @@ mod tests {
 
         // Now test our detection from inside the comment
         let node_in_comment = find_node_at_byte(&root, 14).expect("node in comment");
-        let result = detect_injection(&node_in_comment, &root, text, Some(&query), "rust");
+        let result = detect_injection(
+            &root,
+            text,
+            node_in_comment.start_byte(),
+            Some(&query),
+            "rust",
+        );
 
         assert!(result.is_some(), "Should find injection");
         let (hierarchy, _, _, _) = result.unwrap();
@@ -3569,7 +3595,7 @@ mod tests {
         let language = tree_sitter_rust::LANGUAGE.into();
         let query = Query::new(&language, query_str).expect("valid query");
 
-        let injection = detect_injection(&node, &root, text, Some(&query), "rust");
+        let injection = detect_injection(&root, text, node.start_byte(), Some(&query), "rust");
 
         assert!(
             injection.is_none(),
@@ -3597,10 +3623,32 @@ mod tests {
         )
         .unwrap();
 
-        let detected = detect_injection(&content, &root, text, Some(&query), "rust").unwrap();
+        let detected =
+            detect_injection(&root, text, content.start_byte() + 1, Some(&query), "rust").unwrap();
 
         assert_eq!(detected.0, vec!["rust", "html"]);
         assert!(detected.3.is_some());
+    }
+
+    #[test]
+    fn detect_injection_reaches_an_offset_extension() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let value = "body"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+        let quote = text.find("\"body\"").unwrap();
+        let content = root.descendant_for_byte_range(quote, quote).unwrap();
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"((string_literal) @injection.content
+                 (#set! injection.language "html")
+                 (#offset! @injection.content 0 0 0 1))"#,
+        )
+        .unwrap();
+
+        let detected = detect_injection(&root, text, content.end_byte(), Some(&query), "rust");
+
+        assert!(detected.is_some());
     }
 
     #[rstest]
