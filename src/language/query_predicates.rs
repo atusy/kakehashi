@@ -349,6 +349,7 @@ fn compile_lua_bytes_regex(pattern_str: &str) -> Option<regex::bytes::Regex> {
     let regex_str = lua_regex_source(pattern_str)?;
     match regex::bytes::RegexBuilder::new(&regex_str)
         .unicode(false)
+        .dot_matches_new_line(true)
         .build()
     {
         Ok(re) => Some(re),
@@ -495,6 +496,7 @@ mod tests {
             Some("xxx"),
             "Lua patterns operate on bytes rather than Unicode scalars"
         );
+        assert_eq!(lua_gsub(".", "x", "a\nb").as_deref(), Some("xxx"));
         assert_eq!(
             lua_gsub("%w+", "[%0] %% $", "abc").as_deref(),
             Some("[abc] % $")
