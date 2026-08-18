@@ -19,7 +19,8 @@ use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
     MAX_INJECTION_DEPTH, byte_to_point, byte_to_point_anchored, collect_all_injections,
-    compute_included_ranges, compute_included_ranges_clipped, intersect_included_ranges,
+    compute_included_ranges, compute_included_ranges_clipped, effective_content_range,
+    intersect_included_ranges,
 };
 use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
 
@@ -168,7 +169,7 @@ pub(super) fn injection_stack_at(
         // Pass the actual injection content to the language resolver so its
         // shebang / first-line heuristics (language-detection-fallback-chain) can fire for nested
         // injections — passing "" would silently disable detection.
-        let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
+        let content = &host_text[effective_content_range(&region, host_text)];
         let Some((resolved_lang, _)) =
             coordinator.resolve_injection_language(&region.language, content)
         else {
@@ -442,7 +443,7 @@ pub(super) fn collect_injection_languages_at(
             break;
         };
 
-        let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
+        let content = &host_text[effective_content_range(&region, host_text)];
         let Some((resolved_lang, _)) =
             coordinator.resolve_injection_language(&region.language, content)
         else {
@@ -854,7 +855,7 @@ fn walk_child_layers(
         if crate::cancel::is_cancelled(cancel) {
             return;
         }
-        let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
+        let content = &host_text[effective_content_range(&region, host_text)];
         let Some((resolved_lang, _)) =
             coordinator.resolve_injection_language(&region.language, content)
         else {

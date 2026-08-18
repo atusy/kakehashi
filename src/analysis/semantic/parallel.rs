@@ -24,8 +24,8 @@ use crate::language::LanguageCoordinator;
 use crate::language::NodeTracker;
 use crate::language::injection::{
     CacheableInjectionRegion, InjectionRegionInfo, MAX_INJECTION_DEPTH, compute_included_ranges,
-    compute_included_ranges_clipped, intersect_included_ranges, parse_with_ranges,
-    sub_select_included_ranges,
+    compute_included_ranges_clipped, effective_content_range, intersect_included_ranges,
+    parse_with_ranges, sub_select_included_ranges,
 };
 use crate::text::position::byte_to_utf16_col;
 
@@ -640,8 +640,9 @@ fn discover_single_region(
     // lets reuse re-resolve the query (self-healing), so it must not gate here.
     require_highlight_query: bool,
 ) -> SingleDiscovery {
-    let start = injection.content_node.start_byte();
-    let end = injection.content_node.end_byte();
+    let effective = effective_content_range(injection, text);
+    let start = effective.start;
+    let end = effective.end;
 
     // Validate bounds
     if start > end || end > text.len() {
