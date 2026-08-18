@@ -544,6 +544,9 @@ type CapturesDelta = {
   (e.g. `@context` and `@context.end`) stay together.
 - **Each capture carries both a `node` and its `range`**, so a bulk result needs no
   per-capture follow-up call. The `node.id` works with every accessor above.
+  `#offset!` and `#trim!` adjust the returned `range` with Neovim semantics
+  without changing the raw node used by that id; a valid trim range takes
+  precedence over an offset.
 - **Predicates are evaluated server-side** — the built-in `#eq?` / `#match?` /
   `#any-of?` and the Neovim-flavored `#lua-match?` / `#has-parent?` /
   `#has-ancestor?` (and their negations) — with Neovim's `iter_matches`
@@ -556,6 +559,10 @@ type CapturesDelta = {
   `(#set! @cap key value)` rides on that capture as its `metadata[key]` —
   e.g. `((codeblock) @context (#set! kind "block"))` lets a client label
   matches without parsing capture names. Repeated keys are last-write-wins.
+- **`#gsub!` transforms dynamic injection-language captures** before language
+  normalization. Multiple transformations run in query order using Lua-pattern
+  and replacement syntax. The captures protocol itself has no transformed-text
+  field, so `#gsub!` does not add capture metadata to these responses.
 - **Tolerant compilation**: if some patterns reference symbols absent from the
   grammar, the valid patterns still run and the rest are reported in `skipped`.
 - **`null` means "nothing here"**: the document isn't open, or no involved
