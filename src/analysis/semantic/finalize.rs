@@ -117,6 +117,32 @@ fn multiline_exact_match_keys(
     Some(keys)
 }
 
+fn partition_multiline_exact_matches(
+    tokens: Vec<RawToken>,
+    multiline_exact_matches: &HashSet<(usize, usize, usize)>,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<(Vec<RawToken>, Vec<RawToken>)> {
+    let mut exact_match_tokens = Vec::new();
+    let mut filterable_tokens = Vec::with_capacity(tokens.len());
+    let mut work_items = 0usize;
+    for token in tokens {
+        if cancellation_requested(cancel, &mut work_items) {
+            return None;
+        }
+        if token.depth == 0
+            && multiline_exact_matches.contains(&(token.line, token.column, token.length))
+        {
+            exact_match_tokens.push(token);
+        } else {
+            filterable_tokens.push(token);
+        }
+    }
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
+    }
+    Some((exact_match_tokens, filterable_tokens))
+}
+
 /// Split multiline tokens into per-line fragments, skipping empty multiline fragments.
 ///
 /// The sweep line algorithm groups tokens by `token.line` and treats
@@ -782,11 +808,8 @@ pub(super) fn finalize_tokens_cancellable(
     // removed inside the region.
     let multiline_exact_matches =
         multiline_exact_match_keys(active_injection_regions, lines, cancel)?;
-    let (exact_match_tokens, filterable_tokens): (Vec<_>, Vec<_>) =
-        all_tokens.into_iter().partition(|token| {
-            token.depth == 0
-                && multiline_exact_matches.contains(&(token.line, token.column, token.length))
-        });
+    let (exact_match_tokens, filterable_tokens) =
+        partition_multiline_exact_matches(all_tokens, &multiline_exact_matches, cancel)?;
 
     // Split multiline tokens into per-line tokens before the sweep line,
     // which treats [column, column+length) as a 1D interval on a single line.
@@ -967,6 +990,22 @@ mod tests {
         let lines = vec!["x"; 512];
 
         assert!(finalize_tokens_cancellable(tokens, &[], &lines, Some(&cancel)).is_none());
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn exact_match_partition_stops_at_periodic_mid_pass_checkpoint() {
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel_after_polls(1);
+        let tokens = (0..512)
+            .map(|line| make_token(line, 0, 1, "variable", 0, 0))
+            .collect();
+        let keys = HashSet::from([(0, 0, 1)]);
+
+        assert!(
+            partition_multiline_exact_matches(tokens, &keys, Some(&cancel)).is_none(),
+            "classification must remain cancellable on large token sets"
+        );
         assert!(cancel.is_cancelled());
     }
 
