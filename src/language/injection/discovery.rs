@@ -232,7 +232,7 @@ fn extract_virtual_content_and_offsets(
     region: &InjectionRegionInfo,
     cacheable: &CacheableInjectionRegion,
     text: &str,
-) -> (String, Vec<u32>) {
+) -> Option<(String, Vec<u32>)> {
     // Child-exclusion gaps restricted to the effective window (#186):
     // cacheable.byte_range already reflects any #offset! directive (applied
     // and char-boundary-aligned by from_region_info), so gaps are clipped to
@@ -249,6 +249,9 @@ fn extract_virtual_content_and_offsets(
     } else {
         compute_included_ranges(&region.content_node, region.include_children)
     };
+    if included_ranges.as_ref().is_some_and(Vec::is_empty) {
+        return None;
+    }
     let virtual_content = extract_clean_content(
         text,
         cacheable.byte_range.clone(),
@@ -260,7 +263,7 @@ fn extract_virtual_content_and_offsets(
         cacheable.start_column,
         included_ranges.as_deref(),
     );
-    (virtual_content, line_column_offsets)
+    Some((virtual_content, line_column_offsets))
 }
 
 impl CacheableInjectionRegion {
@@ -937,7 +940,7 @@ impl InjectionResolver {
         let cacheable_region =
             CacheableInjectionRegion::from_region_info(region, &region_id_str, text);
         let (virtual_content, line_column_offsets) =
-            extract_virtual_content_and_offsets(region, &cacheable_region, text);
+            extract_virtual_content_and_offsets(region, &cacheable_region, text)?;
         let resolved_language =
             Self::resolve_language(coordinator, &region.language, &virtual_content);
         Some(ResolvedInjection {
@@ -983,11 +986,11 @@ impl InjectionResolver {
                 owned_cacheable.iter().collect()
             }
         };
-        let first = regions[0];
-        let first_cacheable = cacheable[0];
         if regions.len() == 1 {
+            let first = regions[0];
+            let first_cacheable = cacheable[0];
             let (virtual_content, line_column_offsets) =
-                extract_virtual_content_and_offsets(first, first_cacheable, text);
+                extract_virtual_content_and_offsets(first, first_cacheable, text)?;
             let injection_language =
                 Self::resolve_language(coordinator, &first.language, &virtual_content);
             let mut region = first_cacheable.clone();
@@ -1000,34 +1003,67 @@ impl InjectionResolver {
                 contiguous: true,
             });
         }
-        let anchor_index = cacheable
+        let included_sets: Vec<_> = regions
+            .iter()
+            .zip(&cacheable)
+            .map(|(region, cacheable)| {
+                if region.offset.is_some() {
+                    compute_included_ranges_clipped(
+                        &region.content_node,
+                        region.include_children,
+                        text,
+                        cacheable.byte_range.clone(),
+                    )
+                } else {
+                    compute_included_ranges(&region.content_node, region.include_children)
+                }
+            })
+            .collect();
+        let active_indices: Vec<_> = included_sets
             .iter()
             .enumerate()
-            .min_by_key(|(_, region)| (region.byte_range.start, region.byte_range.end))
-            .map(|(index, _)| index)?;
+            .filter_map(|(index, ranges)| {
+                (!ranges.as_ref().is_some_and(Vec::is_empty)).then_some(index)
+            })
+            .collect();
+        if active_indices.len() == 1 {
+            let index = active_indices[0];
+            let first = regions[index];
+            let first_cacheable = cacheable[index];
+            let (virtual_content, line_column_offsets) =
+                extract_virtual_content_and_offsets(first, first_cacheable, text)?;
+            let injection_language =
+                Self::resolve_language(coordinator, &first.language, &virtual_content);
+            let mut region = first_cacheable.clone();
+            region.content_hash = CacheableInjectionRegion::hash_content(&virtual_content);
+            return Some(ResolvedInjection {
+                region,
+                injection_language,
+                virtual_content,
+                line_column_offsets,
+                contiguous: true,
+            });
+        }
+        let anchor_index = active_indices.iter().copied().min_by_key(|&index| {
+            (
+                cacheable[index].byte_range.start,
+                cacheable[index].byte_range.end,
+            )
+        })?;
         let first = regions[anchor_index];
         let first_cacheable = cacheable[anchor_index];
         let group_start = first_cacheable.byte_range.start;
-        let group_end = cacheable
+        let group_end = active_indices
             .iter()
-            .map(|region| region.byte_range.end)
+            .map(|&index| cacheable[index].byte_range.end)
             .max()
             .unwrap_or(group_start);
 
         let mut included = Vec::new();
-        for (region, cacheable) in regions.iter().zip(&cacheable) {
-            let ranges = if region.offset.is_some() {
-                compute_included_ranges_clipped(
-                    &region.content_node,
-                    region.include_children,
-                    text,
-                    cacheable.byte_range.clone(),
-                )
-            } else {
-                compute_included_ranges(&region.content_node, region.include_children)
-            };
-            match ranges {
-                Some(ranges) => included.extend(ranges.into_iter().map(|range| {
+        for &index in &active_indices {
+            let cacheable = cacheable[index];
+            match &included_sets[index] {
+                Some(ranges) => included.extend(ranges.iter().map(|range| {
                     cacheable.byte_range.start + range.start_byte
                         ..cacheable.byte_range.start + range.end_byte
                 })),
@@ -1048,9 +1084,9 @@ impl InjectionResolver {
 
         let mut combined_region = first_cacheable.clone();
         combined_region.byte_range.end = group_end;
-        combined_region.line_range.end = cacheable
+        combined_region.line_range.end = active_indices
             .iter()
-            .map(|region| region.line_range.end)
+            .map(|&index| cacheable[index].line_range.end)
             .max()
             .unwrap_or(combined_region.line_range.end);
         combined_region.content_hash = CacheableInjectionRegion::hash_content(&virtual_content);
@@ -1118,6 +1154,12 @@ impl InjectionResolver {
                 && Self::region_identity_layer(tracker, uri, candidate, incarnation)
                     == Some(identity_layer)
         })?;
+
+        // An opaque ID for a capture whose child exclusions leave no bytes is
+        // not a bridge layer, even when another member of the same combined
+        // group remains active.
+        let selected = CacheableInjectionRegion::from_region_info(region, region_id, text);
+        extract_virtual_content_and_offsets(region, &selected, text)?;
 
         if region.combined {
             let group: Vec<_> = regions
@@ -1260,8 +1302,11 @@ impl InjectionResolver {
             };
             let region = &regions[index];
             if let Some(cacheable) = prebuilt {
-                let (virtual_content, line_column_offsets) =
-                    extract_virtual_content_and_offsets(region, &cacheable[index], text);
+                let Some((virtual_content, line_column_offsets)) =
+                    extract_virtual_content_and_offsets(region, &cacheable[index], text)
+                else {
+                    continue;
+                };
                 let resolved_language =
                     Self::resolve_language(coordinator, &region.language, &virtual_content);
                 resolved.push(ResolvedInjection {
@@ -1779,6 +1824,75 @@ mod tests {
         .expect("a non-first combined capture resolves the shared document");
         assert_eq!(via_second.region.region_id, resolved[0].region.region_id);
         assert_eq!(via_second.virtual_content, resolved[0].virtual_content);
+    }
+
+    #[test]
+    fn resolve_all_skips_content_fully_excluded_by_named_children() {
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"((source_file) @injection.content
+                 (#set! injection.language "rust"))"#,
+        )
+        .unwrap();
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("fully_excluded"),
+            &tree,
+            text,
+            &query,
+            0,
+        );
+
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn combined_resolution_drops_empty_members_from_group_geometry() {
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let empty_query = Query::new(
+            &language,
+            r#"((source_file) @injection.content
+                 (#set! injection.language "rust")
+                 (#set! injection.combined))"#,
+        )
+        .unwrap();
+        let active_query = Query::new(
+            &language,
+            r#"((function_item) @injection.content
+                 (#set! injection.language "rust")
+                 (#set! injection.combined))"#,
+        )
+        .unwrap();
+
+        let empty = collect_all_injections(&tree.root_node(), text, Some(&empty_query))
+            .unwrap()
+            .remove(0);
+        let active = collect_all_injections(&tree.root_node(), text, Some(&active_query))
+            .unwrap()
+            .remove(0);
+        let tracker = NodeTracker::new();
+        let uri = test_uri("combined_empty_member");
+        let resolved = InjectionResolver::build_combined_injection(
+            &test_coordinator(),
+            Some((&tracker, &uri, 0)),
+            &[&empty, &active],
+            None,
+            text,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.region.byte_range, active.content_node.byte_range());
+        assert!(!resolved.virtual_content.is_empty());
+        assert!(resolved.contiguous);
     }
 
     #[test]
