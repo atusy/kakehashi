@@ -1457,7 +1457,9 @@ fn execute_captures_walk(
         // FNV pass over the layer bytes per visit — about twice the
         // document bytes per full walk, sub-ms against the walk times the
         // per-walk debug line reports (see the reused/executed counters).
-        let cache_key = cache_full_walk.then(|| {
+        let cache_safe = depth == 0
+            || !crate::language::query_directives::has_row_offset_directive(&kind_query.query);
+        let cache_key = (cache_full_walk && cache_safe).then(|| {
             super::captures_match_cache::tree_cache_key(kind, layer_language, layer_tree, text)
         });
         let reused = cache_key.and_then(|(_, _, hash)| {

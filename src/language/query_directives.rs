@@ -14,6 +14,31 @@ pub(crate) struct CaptureRange {
     pub end_point: tree_sitter::Point,
 }
 
+/// Whether any valid `#offset!` in the query moves a row boundary.
+///
+/// Row movement searches for newlines beyond the captured node. Injected-layer
+/// match caches hash only the layer's outer span, so callers use this to avoid
+/// reusing results whose range calculation may inspect unhashed host bytes.
+pub(crate) fn has_row_offset_directive(query: &Query) -> bool {
+    (0..query.pattern_count()).any(|pattern_index| {
+        query
+            .general_predicates(pattern_index)
+            .iter()
+            .any(|directive| {
+                if directive.operator.as_ref() != "offset!" {
+                    return false;
+                }
+                [1, 3].into_iter().any(|index| {
+                    matches!(
+                        directive.args.get(index),
+                        Some(tree_sitter::QueryPredicateArg::String(value))
+                            if value.parse::<i32>().is_ok_and(|row| row != 0)
+                    )
+                })
+            })
+    })
+}
+
 /// Apply Neovim's `#offset!` and `#trim!` range metadata for `capture_id`.
 /// A valid trim range takes precedence over an offset, as in
 /// `vim.treesitter.get_range()`.
@@ -331,5 +356,22 @@ mod tests {
         assert_eq!((range.start_byte, range.end_byte), (0, 0));
         assert_eq!(range.start_point, tree_sitter::Point::new(0, 0));
         assert_eq!(range.end_point, tree_sitter::Point::new(0, 0));
+    }
+
+    #[test]
+    fn detects_only_row_bearing_offsets_as_external_scan_dependencies() {
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = |operator: &str, args: &str| {
+            Query::new(
+                &language,
+                &format!("((string_literal) @string (#{operator} @string {args}))"),
+            )
+            .unwrap()
+        };
+
+        assert!(has_row_offset_directive(&query("offset!", "1 0 0 0")));
+        assert!(has_row_offset_directive(&query("offset!", "0 0 -1 0")));
+        assert!(!has_row_offset_directive(&query("offset!", "0 1 0 -1")));
+        assert!(!has_row_offset_directive(&query("trim!", "1 1 1 1")));
     }
 }
