@@ -39,5 +39,4 @@ pub(crate) use ranges::{
 // tests (analysis/selection.rs); the injection submodules test the rest
 // directly via their own cfg(test) modules.
 #[cfg(test)]
-#[cfg(test)]
 pub(crate) use offset::parse_offset_directive_for_pattern;

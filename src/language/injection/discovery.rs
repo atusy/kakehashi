@@ -97,10 +97,11 @@ pub(crate) struct InjectionRegionInfo<'a> {
     /// When true, the injection parser sees the full content node (including named children).
     /// When false, named children (e.g., `block_continuation`) should be excluded.
     pub include_children: bool,
-    /// The `#offset!` directive for this pattern, resolved at collection time
+    /// The effective `#offset!` or `#trim!` range encoded as boundary deltas
+    /// and resolved at collection time
     /// (the query goes out of scope before consumers like
     /// `CacheableInjectionRegion::from_region_info` run). `None` when the
-    /// pattern has no directive.
+    /// runtime directives leave the raw range unchanged.
     pub offset: Option<InjectionOffset>,
     /// Whether this pattern's captures form one virtual document.
     pub combined: bool,
@@ -165,10 +166,10 @@ fn position_of_byte(
     (row as u32, column)
 }
 
-/// The effective (post-`#offset!`) byte span of `info`'s content node within
+/// The effective runtime-directive byte span of `info`'s content node within
 /// `text`, snapped to in-bounds UTF-8 char boundaries.
 ///
-/// `#offset!` narrows (or widens) the raw `@injection.content` span to the
+/// `#offset!` and `#trim!` narrow (or widen) the raw `@injection.content` span to the
 /// bytes the injection parser actually sees — trimming frontmatter `---`
 /// fences, string quotes, and the like. The request-routing paths that must
 /// agree on *where the injected content is* share this one helper rather than
@@ -179,7 +180,7 @@ fn position_of_byte(
 /// `calculate_effective_range` themselves — each layers its own gap handling
 /// on top, so they are not folded in here.
 ///
-/// Scope: this applies `#offset!` only. Child-exclusion gaps (blockquote `> `
+/// Scope: this applies range directives only. Child-exclusion gaps (blockquote `> `
 /// prefixes, excluded named children) are *not* subtracted here, because the
 /// bridge's coordinate translation models a region as one contiguous
 /// `byte_range` plus per-line column offsets — a lookup that rejected gap
@@ -436,6 +437,16 @@ pub(crate) fn collect_all_injections_cancellable<'a>(
 
     // Sort by start_byte (primary) and end_byte (secondary) to ensure deterministic ordering
     let mut injections: Vec<_> = injections_map.into_values().collect();
+    let adjusted_groups: std::collections::HashSet<_> = injections
+        .iter()
+        .filter(|region| region.offset.is_some())
+        .map(|region| (region.language.clone(), region.pattern_index))
+        .collect();
+    for region in &mut injections {
+        if adjusted_groups.contains(&(region.language.clone(), region.pattern_index)) {
+            region.combined = false;
+        }
+    }
     injections.sort_by(|a, b| {
         (
             a.content_node.start_byte(),
@@ -1973,6 +1984,27 @@ mod tests {
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].virtual_content, "body");
+    }
+
+    #[test]
+    fn one_adjusted_capture_disables_combining_for_its_whole_group() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let a = "body"; let b = "  body  "; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"((string_content) @injection.content
+                 (#set! injection.language "html")
+                 (#set! injection.combined)
+                 (#trim! @injection.content 0 1 0 1))"#,
+        )
+        .unwrap();
+
+        let regions = collect_all_injections(&tree.root_node(), text, Some(&query)).unwrap();
+
+        assert_eq!(regions.len(), 2);
+        assert!(regions.iter().all(|region| !region.combined));
     }
 
     #[test]
