@@ -933,7 +933,8 @@ impl Kakehashi {
             snapshot.incarnation(),
             region_boundary_for_method(method_name),
         ) else {
-            // Not in an injection region - return None
+            // Not in an injection region — the virt layer stays silent and the
+            // host/native layers own the answer.
             return None;
         };
 
@@ -942,13 +943,16 @@ impl Kakehashi {
         }
 
         // Bounds precheck at the resolution choke point: a position inside the
-        // raw capture but outside the extracted content (excluded trailing
-        // children, `#offset!` trims) would otherwise be rejected only
-        // per-server by the dispatch guard — after every fan-out arm has
-        // acquired (possibly spawned) its connection. Rejecting here keeps the
-        // virt layer silent without touching any connection. The dispatch
-        // guard stays: it covers callers that bypass this preamble
+        // region's span but outside the extracted content (excluded trailing
+        // children, inter-capture gaps — #996 item 6) would otherwise be
+        // rejected only per-server by the dispatch guard — after every fan-out
+        // arm has acquired (possibly spawned) its connection. Rejecting here
+        // keeps the virt layer silent without touching any connection. The
+        // dispatch guard stays: it covers callers that bypass this preamble
         // (stored-region paths) and remains the stale-race backstop.
+        //
+        // `#offset!` trims no longer reach here: the region lookup measures the
+        // effective span, so a trimmed byte is in no region at all.
         let precheck_offset = crate::lsp::bridge::RegionOffset::with_per_line_offsets(
             resolved.region.line_range.start,
             resolved.line_column_offsets.clone(),

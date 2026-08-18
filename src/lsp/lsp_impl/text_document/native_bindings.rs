@@ -218,22 +218,37 @@ impl Kakehashi {
         byte: usize,
     ) -> Option<Option<LayerInputs>> {
         use crate::language::injection::{
-            collect_all_injections, compute_included_ranges, parse_with_ranges,
+            collect_all_injections, compute_included_ranges, effective_content_range,
+            parse_with_ranges,
         };
 
         let injection_query = self.language.injection_query(host_language)?;
         let regions = collect_all_injections(&tree.root_node(), text, Some(&injection_query))?;
         // Innermost containing region: under nesting (an include-children
         // outer region wrapping a fence) the smallest layer owns the cursor.
+        //
+        // Containment is measured on the effective post-`#offset!` span, the
+        // same span the bridge's region lookup uses. Measuring the raw node
+        // here instead would make this layer claim bytes a directive trimmed
+        // off — a frontmatter `---` fence, a string's quotes — and then go
+        // silent on them via the `offset.is_some()` bail below, while the
+        // bridge has already handed those bytes to the host layer. For a
+        // region without a directive the two spans are identical.
         let region = regions
             .iter()
-            .filter(|r| r.content_node.start_byte() <= byte && byte < r.content_node.end_byte())
-            .min_by_key(|r| r.content_node.end_byte() - r.content_node.start_byte())?;
+            .filter_map(|r| {
+                let range = effective_content_range(r, text);
+                (range.start <= byte && byte < range.end).then_some((r, range))
+            })
+            .min_by_key(|(_, range)| range.end - range.start)
+            .map(|(r, _)| r)?;
 
         // From here on the cursor IS in a region: every bail is silence.
         if region.offset.is_some() {
             // `#offset!`-shifted regions need window clipping the native
-            // path does not do yet; the bridge keeps owning them.
+            // path does not do yet, so the bridge keeps owning them — and,
+            // now that the filter above measures the effective span, this
+            // only silences bytes that really are inside the shifted content.
             return Some(None);
         }
         let content_range = region.content_node.byte_range();
@@ -761,6 +776,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offset_narrowed_region_owns_the_effectively_innermost_cursor() {
+        // The document capture is raw-outermost, but its offset narrows the
+        // effective span to the `print(v)` line inside the Lua fence. At that
+        // cursor it is therefore the innermost containing injection and must
+        // own the position. Offset regions stay silent in the native path.
+        let text = "# t\n\n```lua\nlocal v = 1\nprint(v)\n```\n";
+        let (service, uri) = server_with_markdown_doc(text);
+        let server = service.inner();
+        let nested_query = Query::new(
+            &tree_sitter_md::LANGUAGE.into(),
+            r#"
+            ((document) @injection.content
+             (#set! injection.language "yaml")
+             (#set! injection.include-children)
+             (#offset! @injection.content 4 0 -1 0))
+            (fenced_code_block
+              (info_string (language) @injection.language)
+              (code_fence_content) @injection.content)
+            "#,
+        )
+        .unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(nested_query));
+
+        let links = server
+            .native_bindings_answer(&uri, Position::new(4, 6), |ctx| {
+                native_definition(ctx, &uri)
+            })
+            .await
+            .unwrap();
+        assert!(
+            links.is_none(),
+            "the narrower effective offset region must own the cursor and stay silent"
+        );
+    }
+
+    #[tokio::test]
     async fn native_definition_resolves_inside_an_injected_layer() {
         // line 3: `local v = 1`; line 4: `print(v)`.
         let text = "# t\n\n```lua\nlocal v = 1\nprint(v)\n```\n";
@@ -840,6 +894,58 @@ mod tests {
         assert!(
             links.is_none(),
             "cross-region resolution is out of scope for v1: {links:?}"
+        );
+    }
+
+    /// Bytes an `#offset!` trims off belong to the host layer, not to this
+    /// one. Claiming them would hit the `offset.is_some()` bail and silence
+    /// the position, while the bridge's region lookup has already handed the
+    /// same byte to the host server — the two layers must agree on where the
+    /// injected content is.
+    #[tokio::test]
+    async fn offset_trimmed_bytes_are_left_to_the_host_layer() {
+        // `minus_metadata` spans 0..23; `#offset! 1 0 -1 0` trims it to 4..19,
+        // so byte 19 (the closing `---`) is host, byte 4 (`title`) is YAML.
+        let text = "---\ntitle: awesome\n---\n";
+        let (service, _uri) = server_with_markdown_doc(text);
+        let server = service.inner();
+        let frontmatter_query = Query::new(
+            &tree_sitter_md::LANGUAGE.into(),
+            r#"
+            ((minus_metadata) @injection.content
+              (#set! injection.language "yaml")
+              (#offset! @injection.content 1 0 -1 0))
+            "#,
+        )
+        .unwrap();
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(frontmatter_query));
+
+        let url = Url::parse("file:///test/native_bindings.md").unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_md::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(text, None).unwrap();
+
+        assert!(
+            server
+                .injected_bindings_layer(&url, text, &tree, "markdown", 19)
+                .await
+                .is_none(),
+            "the closing fence is outside the injected content: host layer"
+        );
+        assert!(
+            matches!(
+                server
+                    .injected_bindings_layer(&url, text, &tree, "markdown", 4)
+                    .await,
+                Some(None)
+            ),
+            "a body byte IS injected content, and an offset region stays silent \
+             here because the native path does not clip windows yet"
         );
     }
 
