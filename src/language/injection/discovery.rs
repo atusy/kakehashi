@@ -9,7 +9,7 @@ use url::Url;
 
 use super::content::{compute_line_column_offsets, extract_clean_content};
 use super::language::extract_injection_language;
-use super::offset::{InjectionOffset, effective_offset_for_pattern};
+use super::offset::InjectionOffset;
 use super::ranges::{
     compute_included_ranges, compute_included_ranges_clipped, has_combined_for_pattern,
     has_include_children_for_pattern,
@@ -34,6 +34,47 @@ fn iter_injection_content_captures<'a, 'b>(
             .capture_names()
             .get(capture.index as usize)
             .is_some_and(|name| *name == "injection.content")
+    })
+}
+
+fn runtime_offset_for_capture(
+    query: &Query,
+    match_: &QueryMatch<'_, '_>,
+    capture: QueryCapture<'_>,
+    text: &str,
+) -> Option<InjectionOffset> {
+    let range = crate::language::query_directives::capture_range(
+        query,
+        match_,
+        capture.index,
+        capture.node,
+        text,
+    );
+    let node = capture.node;
+    let raw = (
+        node.start_byte(),
+        node.end_byte(),
+        node.start_position(),
+        node.end_position(),
+    );
+    if (
+        range.start_byte,
+        range.end_byte,
+        range.start_point,
+        range.end_point,
+    ) == raw
+    {
+        return None;
+    }
+    let delta = |adjusted: usize, original: usize| {
+        let value = adjusted as i128 - original as i128;
+        i32::try_from(value).ok()
+    };
+    Some(InjectionOffset {
+        start_row: delta(range.start_point.row, raw.2.row)?,
+        start_column: delta(range.start_point.column, raw.2.column)?,
+        end_row: delta(range.end_point.row, raw.3.row)?,
+        end_column: delta(range.end_point.column, raw.3.column)?,
     })
 }
 
@@ -371,7 +412,7 @@ pub(crate) fn collect_all_injections_cancellable<'a>(
             // an earlier matching pattern for the same language. Same
             // resulting language layers, fewer scans.
             injections_map.entry(key).or_insert_with(|| {
-                let offset = effective_offset_for_pattern(query, match_.pattern_index);
+                let offset = runtime_offset_for_capture(query, match_, capture, text);
                 InjectionRegionInfo {
                     language: language.clone(),
                     content_node: capture.node,
@@ -1874,6 +1915,36 @@ mod tests {
         assert_eq!(resolved[0].virtual_content, "b");
         assert_eq!(resolved[1].virtual_content, "e");
         assert!(resolved.iter().all(|region| region.contiguous));
+    }
+
+    #[test]
+    fn trim_directive_adjusts_injection_content() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let value = "  body  "; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((string_content) @injection.content
+                 (#set! injection.language "html")
+                 (#trim! @injection.content 0 1 0 1))
+            "#,
+        )
+        .expect("valid query");
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("trimmed_content"),
+            &tree,
+            text,
+            &query,
+            0,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].virtual_content, "body");
     }
 
     #[test]
