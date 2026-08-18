@@ -85,6 +85,15 @@ fn run_sequential_injection<T>(
     (!cancelled && host_complete).then(injection_work)
 }
 
+/// Choose the raw representation used while collecting top-level host tokens.
+///
+/// Kept separate from the client's wire capability because finalization owns
+/// the conversion to single-line LSP tokens. Retaining a multiline capture here
+/// also retains its source-span identity for injection exact-match handling.
+fn top_level_host_multiline_collection(_supports_multiline: bool) -> bool {
+    true
+}
+
 /// Compute full-document semantic tokens (host + injections) as one work-unit
 /// on the bounded compute pool; the injection fan-out's `par_iter` runs on the
 /// same pool (a Rayon parallel iterator invoked from a pool thread stays on
@@ -166,7 +175,7 @@ pub(crate) async fn handle_semantic_tokens_full(
                 &line_starts,
                 0,
                 0,
-                supports_multiline,
+                top_level_host_multiline_collection(supports_multiline),
                 &[],
                 &[],
                 cancel.as_ref(),
@@ -346,6 +355,82 @@ mod tests {
                 (abs_line, abs_col, st.length, st.token_type)
             })
             .collect()
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    fn top_level_multiline_exact_host_survives_client_capability(#[case] supports_multiline: bool) {
+        use token_collector::ActiveInjectionBounds;
+
+        let text = "/**\n * ERROR text\n */";
+        let lines: Vec<&str> = text.lines().collect();
+        let language: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let query = Query::new(&language, "(comment) @comment.documentation").unwrap();
+        let mut tokens = Vec::new();
+
+        assert!(collect_host_tokens(
+            text,
+            &tree,
+            &query,
+            Some("typescript"),
+            None,
+            text,
+            &lines,
+            &build_line_start_bytes(text),
+            0,
+            0,
+            top_level_host_multiline_collection(supports_multiline),
+            &[],
+            &[],
+            None,
+            &mut tokens,
+        ));
+
+        let (keyword_type, keyword_modifiers) =
+            legend::map_capture_to_token_type_and_modifiers("keyword").unwrap();
+        tokens.push(RawToken {
+            line: 1,
+            column: 3,
+            length: 5,
+            kind: TokenKind::Mapped(keyword_type, keyword_modifiers),
+            depth: 1,
+            pattern_index: 0,
+            priority: 100,
+            node_byte_len: 5,
+        });
+        let regions = [ActiveInjectionBounds {
+            start_line: 0,
+            start_col: 0,
+            end_line: 2,
+            end_col: 3,
+        }];
+
+        let SemanticTokensResult::Tokens(result) =
+            finalize_tokens_cancellable(tokens, &regions, &lines, None)
+                .expect("exact host and injected token should survive")
+        else {
+            panic!("expected full semantic tokens");
+        };
+        let (comment_type, _) =
+            legend::map_capture_to_token_type_and_modifiers("comment.documentation").unwrap();
+        let decoded = decode_tokens(&result.data);
+
+        assert!(
+            [0, 1, 2].into_iter().all(|line| decoded
+                .iter()
+                .any(|token| token.0 == line && token.3 == comment_type)),
+            "the exact host comment must remain visible on every line: {decoded:?}"
+        );
+        assert!(
+            decoded
+                .iter()
+                .any(|token| token.0 == 1 && token.1 == 3 && token.3 == keyword_type),
+            "the injected token must remain visible: {decoded:?}"
+        );
     }
 
     #[test]
