@@ -24,8 +24,9 @@ use crate::language::LanguageCoordinator;
 use crate::language::NodeTracker;
 use crate::language::injection::{
     CacheableInjectionRegion, InjectionRegionInfo, MAX_INJECTION_DEPTH, byte_to_point,
-    compute_included_ranges, compute_included_ranges_clipped, effective_content_range,
-    intersect_included_ranges, parse_with_ranges, sub_select_included_ranges,
+    byte_to_point_anchored, compute_included_ranges, compute_included_ranges_clipped,
+    effective_content_range, intersect_included_ranges, parse_with_ranges,
+    sub_select_included_ranges,
 };
 use crate::text::position::byte_to_utf16_col;
 
@@ -1171,35 +1172,69 @@ fn build_combined_context<'a>(
     let mut group_ranges: Vec<tree_sitter::Range> = Vec::with_capacity(regions.len());
     for (region, effective) in regions.iter().zip(&effective_ranges) {
         let node = &region.content_node;
-        let ranges = if region.offset.is_some() {
-            compute_included_ranges_clipped(node, region.include_children, text, effective.clone())
-        } else {
-            compute_included_ranges(node, region.include_children)
-        };
-        let base = if region.offset.is_some() {
-            effective.start
-        } else {
-            node.start_byte()
-        };
-        match ranges {
-            Some(ranges) => {
-                for range in ranges {
-                    let start = base + range.start_byte;
-                    let end = base + range.end_byte;
-                    group_ranges.push(tree_sitter::Range {
-                        start_byte: start - group_start,
-                        end_byte: end - group_start,
-                        start_point: to_relative_point(byte_to_point(text, start)),
-                        end_point: to_relative_point(byte_to_point(text, end)),
-                    });
+        if region.offset.is_some() {
+            let effective_start_point = byte_to_point_anchored(
+                text,
+                effective.start,
+                node.start_byte(),
+                node.start_position(),
+            );
+            let point_for =
+                |byte| byte_to_point_anchored(text, byte, effective.start, effective_start_point);
+            match compute_included_ranges_clipped(
+                node,
+                region.include_children,
+                text,
+                effective.clone(),
+            ) {
+                Some(ranges) => {
+                    for range in ranges {
+                        let start = effective.start + range.start_byte;
+                        let end = effective.start + range.end_byte;
+                        group_ranges.push(tree_sitter::Range {
+                            start_byte: start - group_start,
+                            end_byte: end - group_start,
+                            start_point: to_relative_point(point_for(start)),
+                            end_point: to_relative_point(point_for(end)),
+                        });
+                    }
                 }
+                None => group_ranges.push(tree_sitter::Range {
+                    start_byte: effective.start - group_start,
+                    end_byte: effective.end - group_start,
+                    start_point: to_relative_point(effective_start_point),
+                    end_point: to_relative_point(point_for(effective.end)),
+                }),
             }
-            None => group_ranges.push(tree_sitter::Range {
-                start_byte: effective.start - group_start,
-                end_byte: effective.end - group_start,
-                start_point: to_relative_point(byte_to_point(text, effective.start)),
-                end_point: to_relative_point(byte_to_point(text, effective.end)),
-            }),
+        } else {
+            let node_start = node.start_byte();
+            let node_position = node.start_position();
+            let lift_point = |relative: tree_sitter::Point| tree_sitter::Point {
+                row: node_position.row + relative.row,
+                column: if relative.row == 0 {
+                    node_position.column + relative.column
+                } else {
+                    relative.column
+                },
+            };
+            match compute_included_ranges(node, region.include_children) {
+                Some(ranges) => {
+                    for range in ranges {
+                        group_ranges.push(tree_sitter::Range {
+                            start_byte: node_start - group_start + range.start_byte,
+                            end_byte: node_start - group_start + range.end_byte,
+                            start_point: to_relative_point(lift_point(range.start_point)),
+                            end_point: to_relative_point(lift_point(range.end_point)),
+                        });
+                    }
+                }
+                None => group_ranges.push(tree_sitter::Range {
+                    start_byte: node_start - group_start,
+                    end_byte: node.end_byte() - group_start,
+                    start_point: to_relative_point(node_position),
+                    end_point: to_relative_point(node.end_position()),
+                }),
+            }
         }
     }
     group_ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
