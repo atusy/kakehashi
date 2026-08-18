@@ -71,9 +71,9 @@ pub(crate) fn has_expanding_range_directive(query: &Query) -> bool {
                 };
                 crate::language::injection::parse_offset_args(args).is_some_and(|offset| {
                     offset.start_row < 0
-                        || (offset.start_row == 0 && offset.start_column < 0)
+                        || offset.start_column < 0
                         || offset.end_row > 0
-                        || (offset.end_row == 0 && offset.end_column > 0)
+                        || offset.end_column > 0
                 })
             })
     })
@@ -505,6 +505,14 @@ mod tests {
 
         assert!(has_expanding_range_directive(&query("offset!", "0 -1 0 0")));
         assert!(has_expanding_range_directive(&query("offset!", "0 0 1 0")));
+        assert!(has_expanding_range_directive(&query(
+            "offset!",
+            "1 -1000 0 0"
+        )));
+        assert!(has_expanding_range_directive(&query(
+            "offset!",
+            "0 0 -1 1000"
+        )));
         assert!(!has_expanding_range_directive(&query(
             "offset!", "1 0 -1 0"
         )));
