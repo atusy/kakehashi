@@ -2,7 +2,7 @@
 
 use tree_sitter::{Query, QueryMatch, QueryPredicate};
 
-use crate::language::query_predicates::lua_gsub;
+use crate::language::query_predicates::lua_gsub_bytes;
 use crate::text::clamped_slice;
 
 /// A capture's directive-adjusted byte and point range.
@@ -337,14 +337,16 @@ pub(crate) fn capture_text(
                 node,
                 source,
             );
-            clamped_slice(source, range.start_byte..range.end_byte).to_owned()
+            clamped_slice(source, range.start_byte..range.end_byte)
+                .as_bytes()
+                .to_owned()
         });
-        if let Some(replaced) = lua_gsub(pattern, replacement, input) {
+        if let Some(replaced) = lua_gsub_bytes(pattern, replacement, input) {
             *input = replaced;
         }
     }
     if let Some(text) = text {
-        return Some(text);
+        return String::from_utf8(text).ok();
     }
     let range = capture_range_for_directives(directives, match_, capture_id, node, source);
     Some(clamped_slice(source, range.start_byte..range.end_byte).to_owned())

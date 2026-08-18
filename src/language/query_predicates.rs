@@ -266,18 +266,19 @@ fn get_or_compile_lua_bytes_regex(pattern_str: &str) -> Option<Arc<regex::bytes:
 }
 
 /// Apply Lua's byte-oriented string `gsub` replacement notation.
-pub(crate) fn lua_gsub(pattern: &str, replacement: &str, text: &str) -> Option<String> {
+#[cfg(test)]
+fn lua_gsub(pattern: &str, replacement: &str, text: &str) -> Option<String> {
+    String::from_utf8(lua_gsub_bytes(pattern, replacement, text.as_bytes())?).ok()
+}
+
+/// Apply Lua `gsub` without requiring intermediate byte strings to be UTF-8.
+pub(crate) fn lua_gsub_bytes(pattern: &str, replacement: &str, text: &[u8]) -> Option<Vec<u8>> {
     if has_lua_position_capture(pattern) {
         return None;
     }
     let regex = get_or_compile_lua_bytes_regex(pattern)?;
     let replacement = lua_replacement_to_regex(replacement, regex.captures_len())?;
-    String::from_utf8(
-        regex
-            .replace_all(text.as_bytes(), replacement.as_bytes())
-            .into_owned(),
-    )
-    .ok()
+    Some(regex.replace_all(text, replacement.as_bytes()).into_owned())
 }
 
 fn has_lua_position_capture(pattern: &str) -> bool {
@@ -497,6 +498,10 @@ mod tests {
             "Lua patterns operate on bytes rather than Unicode scalars"
         );
         assert_eq!(lua_gsub(".", "x", "a\nb").as_deref(), Some("xxx"));
+        let intermediate = lua_gsub_bytes("^.", "", "é".as_bytes()).unwrap();
+        assert!(std::str::from_utf8(&intermediate).is_err());
+        let final_text = lua_gsub_bytes(".", "x", &intermediate).unwrap();
+        assert_eq!(String::from_utf8(final_text).unwrap(), "x");
         assert_eq!(
             lua_gsub("%w+", "[%0] %% $", "abc").as_deref(),
             Some("[abc] % $")
