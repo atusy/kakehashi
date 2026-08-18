@@ -1202,6 +1202,21 @@ fn build_combined_context<'a>(
             }),
         }
     }
+    group_ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
+    let mut normalized_ranges: Vec<tree_sitter::Range> = Vec::with_capacity(group_ranges.len());
+    for range in group_ranges {
+        if let Some(last) = normalized_ranges.last_mut()
+            && range.start_byte <= last.end_byte
+        {
+            if range.end_byte > last.end_byte {
+                last.end_byte = range.end_byte;
+                last.end_point = range.end_point;
+            }
+        } else {
+            normalized_ranges.push(range);
+        }
+    }
+    let group_ranges = normalized_ranges;
 
     // Inherit parent exclusions exactly like the per-region path.
     let from_parent = parent_included_ranges
@@ -2720,6 +2735,49 @@ local b = 2
             .collect();
         assert_eq!(ranges, vec![(0, 10), (36, 46)]);
         assert!(exclusions.contains(&(9, 19)) && exclusions.contains(&(45, 55)));
+    }
+
+    #[test]
+    fn combined_context_coalesces_overlapping_adjusted_ranges() {
+        let Some(coordinator) = combined_lua_coordinator() else {
+            return;
+        };
+        let md_language = coordinator
+            .language_registry_for_parallel()
+            .get("markdown")
+            .unwrap();
+        let query = Query::new(
+            &md_language,
+            r#"(fenced_code_block
+                 (info_string (language) @injection.language)
+                 (code_fence_content) @injection.content
+                 (#set! injection.combined)
+                 (#set! injection.include-children)
+                 (#offset! @injection.content 0 0 6 0))"#,
+        )
+        .unwrap();
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(query));
+
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let mut parser = parser_pool.acquire("markdown").unwrap();
+        let tree = parser.parse(COMBINED_LUA_DOC, None).unwrap();
+        parser_pool.release("markdown".to_string(), parser);
+
+        let (contexts, _, _) = collect_injection_contexts_sync(
+            COMBINED_LUA_DOC,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            0,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].included_ranges.as_ref().unwrap().len(), 1);
     }
 
     /// The **vendored** markdown injection query marks `html_block` combined —

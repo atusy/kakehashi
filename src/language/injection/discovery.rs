@@ -1000,6 +1000,13 @@ impl InjectionResolver {
                 contiguous: true,
             });
         }
+        let anchor_index = cacheable
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, region)| (region.byte_range.start, region.byte_range.end))
+            .map(|(index, _)| index)?;
+        let first = regions[anchor_index];
+        let first_cacheable = cacheable[anchor_index];
         let group_start = first_cacheable.byte_range.start;
         let group_end = cacheable
             .iter()
