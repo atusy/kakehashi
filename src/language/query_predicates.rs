@@ -245,9 +245,34 @@ fn get_or_compile_lua_regex(pattern_str: &str) -> Option<Arc<Regex>> {
 /// Apply Lua's string `gsub` replacement notation with the same cached regex
 /// used by `#lua-match?`.
 pub(crate) fn lua_gsub(pattern: &str, replacement: &str, text: &str) -> Option<String> {
+    if has_lua_position_capture(pattern) {
+        return None;
+    }
     let regex = get_or_compile_lua_regex(pattern)?;
     let replacement = lua_replacement_to_regex(replacement, regex.captures_len())?;
     Some(regex.replace_all(text, replacement.as_str()).into_owned())
+}
+
+fn has_lua_position_capture(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    let mut in_class = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => index = (index + 2).min(bytes.len()),
+            b'[' if !in_class => {
+                in_class = true;
+                index += 1;
+            }
+            b']' if in_class => {
+                in_class = false;
+                index += 1;
+            }
+            b'(' if !in_class && bytes.get(index + 1) == Some(&b')') => return true,
+            _ => index += 1,
+        }
+    }
+    false
 }
 
 fn lua_replacement_to_regex(replacement: &str, captures_len: usize) -> Option<String> {
@@ -437,6 +462,11 @@ mod tests {
             lua_gsub("(%a+)", "%2", "abc"),
             None,
             "out-of-range Lua capture references are invalid"
+        );
+        assert_eq!(
+            lua_gsub("()a", "%1", "abc"),
+            None,
+            "Lua position captures must not be misread as empty text captures"
         );
     }
 

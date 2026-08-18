@@ -561,8 +561,9 @@ type CapturesDelta = {
   matches without parsing capture names. Repeated keys are last-write-wins.
 - **`#gsub!` transforms dynamic injection-language captures** before language
   normalization. Multiple transformations run in query order using the same
-  Lua-pattern subset as `#lua-match?`; unsupported `%b`, `%f`, and pattern
-  capture-backreference forms fail soft and leave the prior text unchanged.
+  Lua-pattern subset as `#lua-match?`; unsupported `%b`, `%f`, position
+  captures `()`, and pattern capture-backreference forms fail soft and leave
+  the prior text unchanged.
   Composition with `#set! @capture text ...` is not supported because the Rust
   tree-sitter API does not retain its source order relative to general
   directives. The captures protocol itself has no transformed-text field, so
