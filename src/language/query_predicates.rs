@@ -407,6 +407,14 @@ mod tests {
     }
 
     #[test]
+    fn lua_gsub_converts_lua_replacement_escapes() {
+        assert_eq!(
+            lua_gsub("%w+", "[%0] %% $", "abc").as_deref(),
+            Some("[abc] % $")
+        );
+    }
+
+    #[test]
     fn lua_match_predicates() {
         let source_code = r#"
             fn main() {

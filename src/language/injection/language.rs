@@ -166,12 +166,13 @@ mod tests {
         let rust: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
         let mut parser = Parser::new();
         parser.set_language(&rust).expect("load Rust grammar");
-        let text = "/* bash */\nfn main() {}\n";
+        let text = "/* bash.sh */\nfn main() {}\n";
         let tree = parser.parse(text, None).expect("parse Rust");
         let query = Query::new(
             &rust,
             r#"((block_comment) @injection.language
-                 (#gsub! @injection.language "/%*%s*([%w%p]+)%s*%*/" "%1"))"#,
+                 (#gsub! @injection.language "/%*%s*([%w%p]+)%s*%*/" "%1")
+                 (#gsub! @injection.language "%.sh$" ""))"#,
         )
         .expect("valid query");
 
