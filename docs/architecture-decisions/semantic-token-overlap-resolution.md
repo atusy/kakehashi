@@ -107,6 +107,8 @@ The single-line/multiline distinction applies only to **partial overlaps** and i
 - **Partially overlapping multiline regions** arise from container injections (e.g., blockquoted code fence content). The host token should not leak into the container's content.
 - **Exactly matching multiline regions** can represent two semantic views of the same source node (e.g., a TypeScript JSDoc capture and its comment injection). The host token remains available to fill gaps around the injected tokens.
 
+The exact-match exception is local to the matching region. If another active region overlaps the same host token, that region's normal containment or partial-overlap rule still applies.
+
 Key concepts:
 
 - **Active region**: An injection region that produced at least one token (depth >= 1). If a language was resolved but the highlight query produced no captures, the region is *inactive* and host tokens are preserved.
