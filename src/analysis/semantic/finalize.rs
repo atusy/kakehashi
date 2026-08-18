@@ -113,18 +113,24 @@ fn multiline_region_key(
     Ok(Some((region.start_line, region.start_col, length)))
 }
 
+struct MultilineRegionMetadata {
+    exact_match_keys: HashSet<MultilineSpanKey>,
+    keys_by_region: Vec<Option<MultilineSpanKey>>,
+}
+
 /// Identify multiline host tokens whose original span exactly matches an active
 /// injection region before per-line normalization destroys that information.
-fn multiline_exact_match_keys(
+fn multiline_region_metadata(
     regions: &[ActiveInjectionBounds],
     lines: &[&str],
     cancel: Option<&crate::cancel::CancelToken>,
-) -> Option<HashSet<MultilineSpanKey>> {
+) -> Option<MultilineRegionMetadata> {
     if crate::cancel::is_cancelled(cancel) {
         return None;
     }
     let mut work_items = 0usize;
     let mut keys = HashSet::new();
+    let mut keys_by_region = Vec::with_capacity(regions.len());
     for region in regions {
         if cancellation_requested(cancel, &mut work_items) {
             return None;
@@ -132,12 +138,16 @@ fn multiline_exact_match_keys(
         match multiline_region_key(region, lines, cancel, &mut work_items) {
             Ok(Some(key)) => {
                 keys.insert(key);
+                keys_by_region.push(Some(key));
             }
-            Ok(None) => {}
+            Ok(None) => keys_by_region.push(None),
             Err(()) => return None,
         }
     }
-    Some(keys)
+    Some(MultilineRegionMetadata {
+        exact_match_keys: keys,
+        keys_by_region,
+    })
 }
 
 fn partition_multiline_exact_matches(
@@ -693,7 +703,27 @@ fn apply_none_preprocessing(
     Some(result)
 }
 
-/// Filter host tokens (depth=0) against active injection regions.
+/// Request-local region metadata shared by ordinary and exact-host filtering.
+struct InjectionRegionIndex {
+    regions_by_line: HashMap<usize, Vec<usize>>,
+    region_intervals: HashMap<usize, Vec<(usize, usize)>>,
+    multiline_keys: Vec<Option<MultilineSpanKey>>,
+}
+
+fn build_injection_region_index(
+    regions: &[ActiveInjectionBounds],
+    lines: &[&str],
+    multiline_keys: Vec<Option<MultilineSpanKey>>,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<InjectionRegionIndex> {
+    Some(InjectionRegionIndex {
+        regions_by_line: build_regions_by_line(regions, cancel)?,
+        region_intervals: build_region_intervals_map(regions, lines, cancel)?,
+        multiline_keys,
+    })
+}
+
+/// Filter host tokens (depth=0) against pre-indexed active injection regions.
 ///
 /// - Depth > 0 tokens pass through unchanged.
 /// - Exact-match tokens are kept for sweep-line resolution (fish comment pattern).
@@ -705,26 +735,14 @@ fn apply_none_preprocessing(
 /// - Multiline partial overlaps are split; only fragments outside the region
 ///   are kept (e.g., in a blockquoted code fence the `> ` prefix survives,
 ///   the code content is removed).
-fn filter_by_injection_regions(
+fn filter_by_injection_regions_indexed(
     tokens: Vec<RawToken>,
     regions: &[ActiveInjectionBounds],
     lines: &[&str],
+    index: &InjectionRegionIndex,
+    exempt_multiline_key: Option<MultilineSpanKey>,
     cancel: Option<&crate::cancel::CancelToken>,
 ) -> Option<Vec<RawToken>> {
-    if crate::cancel::is_cancelled(cancel) {
-        return None;
-    }
-    if regions.is_empty() {
-        return Some(tokens);
-    }
-    // Index regions by every host line they span, so each host token only
-    // examines the regions on its own line. Without this index the three
-    // per-token region checks below each scan ALL regions, making the pass
-    // O(tokens × regions); when the region count grows with document size
-    // (e.g. one injection per comment/macro in Rust), that is quadratic on
-    // the hot path — the dominant cost found by profiling.
-    let regions_by_line = build_regions_by_line(regions, cancel)?;
-    let region_map = build_region_intervals_map(regions, lines, cancel)?;
     let mut filtered = Vec::with_capacity(tokens.len());
     let mut work_items = 0usize;
     for token in tokens {
@@ -735,20 +753,26 @@ fn filter_by_injection_regions(
             filtered.push(token);
             continue;
         }
-        let line_regions = regions_by_line
+        let line_regions = index
+            .regions_by_line
             .get(&token.line)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
+        let is_exempt = |region_index: usize| {
+            exempt_multiline_key.is_some_and(|key| {
+                index.multiline_keys.get(region_index).copied().flatten() == Some(key)
+            })
+        };
         if line_regions
             .iter()
-            .any(|&i| token_exact_matches_region(&token, &regions[i]))
+            .any(|&i| !is_exempt(i) && token_exact_matches_region(&token, &regions[i]))
         {
             filtered.push(token);
             continue;
         }
         if line_regions
             .iter()
-            .any(|&i| token_fully_in_region(&token, &regions[i]))
+            .any(|&i| !is_exempt(i) && token_fully_in_region(&token, &regions[i]))
         {
             continue;
         }
@@ -766,7 +790,8 @@ fn filter_by_injection_regions(
         let token_end = token.column + token.length;
         let overlaps_single_line_region = line_regions.iter().any(|&i| {
             let r = &regions[i];
-            r.start_line == r.end_line
+            !is_exempt(i)
+                && r.start_line == r.end_line
                 && r.start_line == token.line
                 && r.start_col < token_end
                 && r.end_col > token.column
@@ -774,10 +799,39 @@ fn filter_by_injection_regions(
         if overlaps_single_line_region {
             filtered.push(token);
         } else {
-            let intervals = region_map
-                .get(&token.line)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
+            let mut unexempted_intervals = Vec::new();
+            let intervals = if exempt_multiline_key.is_some() {
+                let line_width = lines.get(token.line).map(|line| utf16_width(line));
+                if let Some(line_width) = line_width {
+                    for &i in line_regions {
+                        if is_exempt(i) {
+                            continue;
+                        }
+                        let region = &regions[i];
+                        let start_col = if token.line == region.start_line {
+                            region.start_col
+                        } else {
+                            0
+                        };
+                        let end_col = if token.line == region.end_line {
+                            region.end_col
+                        } else {
+                            line_width
+                        };
+                        if start_col < end_col {
+                            unexempted_intervals.push((start_col, end_col));
+                        }
+                    }
+                    unexempted_intervals.sort_unstable();
+                }
+                unexempted_intervals.as_slice()
+            } else {
+                index
+                    .region_intervals
+                    .get(&token.line)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[])
+            };
             filtered.extend(split_host_token_around_regions(&token, intervals));
         }
     }
@@ -837,6 +891,7 @@ fn filter_multiline_exact_match_tokens(
     tokens: Vec<RawToken>,
     active_injection_regions: &[ActiveInjectionBounds],
     lines: &[&str],
+    index: &InjectionRegionIndex,
     cancel: Option<&crate::cancel::CancelToken>,
 ) -> Option<Vec<RawToken>> {
     let mut filtered = Vec::new();
@@ -849,24 +904,13 @@ fn filter_multiline_exact_match_tokens(
         // The exact-match exception is region-local. Exclude only regions with
         // these original bounds, then apply normal Stage 1 filtering for any
         // other overlapping active region before restoring the fragments.
-        let mut other_regions = Vec::with_capacity(active_injection_regions.len());
-        for region in active_injection_regions {
-            if cancellation_requested(cancel, &mut work_items) {
-                return None;
-            }
-            let matches_token = match multiline_region_key(region, lines, cancel, &mut work_items) {
-                Ok(key) => key == Some(token_key),
-                Err(()) => return None,
-            };
-            if !matches_token {
-                other_regions.push(region.clone());
-            }
-        }
         let fragments = split_multiline_tokens_cancellable(vec![token], lines, cancel)?;
-        filtered.extend(filter_by_injection_regions(
+        filtered.extend(filter_by_injection_regions_indexed(
             fragments,
-            &other_regions,
+            active_injection_regions,
             lines,
+            index,
+            Some(token_key),
             cancel,
         )?);
     }
@@ -890,13 +934,18 @@ pub(super) fn finalize_tokens_cancellable(
     // fenced-code containers) remain in `filterable_tokens` and are still
     // removed inside the region. Preserved exact hosts are later filtered
     // against every *other* overlapping region; the exception is not global.
-    let multiline_exact_matches =
-        multiline_exact_match_keys(active_injection_regions, lines, cancel)?;
-    let (exact_match_tokens, filterable_tokens) = if multiline_exact_matches.is_empty() {
+    let multiline_regions = multiline_region_metadata(active_injection_regions, lines, cancel)?;
+    let (exact_match_tokens, filterable_tokens) = if multiline_regions.exact_match_keys.is_empty() {
         (Vec::new(), all_tokens)
     } else {
-        partition_multiline_exact_matches(all_tokens, &multiline_exact_matches, cancel)?
+        partition_multiline_exact_matches(all_tokens, &multiline_regions.exact_match_keys, cancel)?
     };
+    let region_index = build_injection_region_index(
+        active_injection_regions,
+        lines,
+        multiline_regions.keys_by_region,
+        cancel,
+    )?;
 
     // Split multiline tokens into per-line tokens before the sweep line,
     // which treats [column, column+length) as a 1D interval on a single line.
@@ -906,12 +955,19 @@ pub(super) fn finalize_tokens_cancellable(
     // Unknown captures are already filtered at collection time (CaptureResult::Suppressed → continue).
     all_tokens.retain(|token| token.length > 0);
 
-    let mut all_tokens =
-        filter_by_injection_regions(all_tokens, active_injection_regions, lines, cancel)?;
+    let mut all_tokens = filter_by_injection_regions_indexed(
+        all_tokens,
+        active_injection_regions,
+        lines,
+        &region_index,
+        None,
+        cancel,
+    )?;
     all_tokens.extend(filter_multiline_exact_match_tokens(
         exact_match_tokens,
         active_injection_regions,
         lines,
+        &region_index,
         cancel,
     )?);
 
@@ -1125,9 +1181,12 @@ mod tests {
             end_col: 1,
         }];
 
-        let keys = multiline_exact_match_keys(&regions, &lines, Some(&cancel));
+        let metadata = multiline_region_metadata(&regions, &lines, Some(&cancel));
 
-        assert_eq!(keys, Some(HashSet::from([(0, 0, 3)])));
+        assert_eq!(
+            metadata.map(|metadata| metadata.exact_match_keys),
+            Some(HashSet::from([(0, 0, 3)]))
+        );
         assert!(
             !cancel.is_cancelled(),
             "unrelated lines after the region must not be visited"
@@ -1149,7 +1208,7 @@ mod tests {
             .collect();
 
         assert!(
-            multiline_exact_match_keys(&regions, &lines, Some(&cancel)).is_none(),
+            multiline_region_metadata(&regions, &lines, Some(&cancel)).is_none(),
             "the all-single-line region pass must remain cancellable"
         );
         assert!(cancel.is_cancelled());
