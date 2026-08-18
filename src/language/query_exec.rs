@@ -105,12 +105,19 @@ pub(crate) fn execute_query(
             .iter()
             .map(|c| {
                 let node = c.node;
+                let range = crate::language::query_directives::capture_range(
+                    query,
+                    m.pattern_index,
+                    c.index,
+                    node,
+                    text,
+                );
                 CapturedNode {
                     name: capture_names[c.index as usize].to_string(),
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
-                    range_start_byte: node.start_byte(),
-                    range_end_byte: node.end_byte(),
+                    range_start_byte: range.start_byte,
+                    range_end_byte: range.end_byte,
                     kind: node.kind(),
                     metadata: metadata_for(Some(c.index as usize)),
                 }
@@ -169,6 +176,23 @@ mod tests {
         assert_eq!(c.name, "name");
         assert_eq!(&src[c.start_byte..c.end_byte], "foo");
         assert_eq!(c.kind, "identifier");
+    }
+
+    #[test]
+    fn offset_directive_adjusts_capture_range_without_changing_node_span() {
+        let src = r#""abc""#;
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((string_literal) @string (#offset! @string 0 1 0 -1))"#,
+        );
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        assert_eq!(matches.len(), 1);
+        let capture = &matches[0].captures[0];
+        assert_eq!((capture.start_byte, capture.end_byte), (0, 5));
+        assert_eq!((capture.range_start_byte, capture.range_end_byte), (1, 4));
     }
 
     #[test]

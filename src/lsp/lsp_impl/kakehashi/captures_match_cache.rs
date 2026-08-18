@@ -162,7 +162,7 @@ pub(in crate::lsp::lsp_impl) fn rebase_matches(matches: &mut [MatchData], anchor
     if matches
         .iter()
         .flat_map(|m| &m.captures)
-        .any(|c| c.start_byte < anchor)
+        .any(|c| c.start_byte < anchor || c.range_start_byte < anchor)
     {
         return false;
     }
@@ -516,9 +516,13 @@ mod tests {
     #[test]
     fn rebase_shifts_offsets_and_rejects_sub_anchor_captures() {
         let mut ok = vec![match_data(&[(10, 14), (12, 13)])];
+        ok[0].captures[0].range_start_byte = 11;
+        ok[0].captures[0].range_end_byte = 13;
         assert!(rebase_matches(&mut ok, 10));
         assert_eq!(ok[0].captures[0].start_byte, 0);
         assert_eq!(ok[0].captures[0].end_byte, 4);
+        assert_eq!(ok[0].captures[0].range_start_byte, 1);
+        assert_eq!(ok[0].captures[0].range_end_byte, 3);
         assert_eq!(ok[0].captures[1].start_byte, 2);
 
         // A capture below the anchor (root node reaching outside the layer's
@@ -526,6 +530,14 @@ mod tests {
         let mut bad = vec![match_data(&[(10, 14)]), match_data(&[(4, 6)])];
         assert!(!rebase_matches(&mut bad, 10));
         assert_eq!(bad[0].captures[0].start_byte, 10, "untouched on refusal");
+
+        let mut adjusted_below_anchor = vec![match_data(&[(10, 14)])];
+        adjusted_below_anchor[0].captures[0].range_start_byte = 9;
+        assert!(!rebase_matches(&mut adjusted_below_anchor, 10));
+        assert_eq!(
+            adjusted_below_anchor[0].captures[0].range_start_byte, 9,
+            "directive-adjusted ranges must not underflow during rebase"
+        );
     }
 
     #[test]
