@@ -305,6 +305,12 @@ fn has_lua_position_capture(pattern: &str) -> bool {
             b'[' if !in_class => {
                 in_class = true;
                 index += 1;
+                if bytes.get(index) == Some(&b'^') {
+                    index += 1;
+                }
+                if bytes.get(index) == Some(&b']') {
+                    index += 1;
+                }
             }
             b']' if in_class => {
                 in_class = false;
@@ -513,6 +519,7 @@ mod tests {
         );
         assert_eq!(lua_gsub(".", "x", "a\nb").as_deref(), Some("xxx"));
         assert_eq!(lua_gsub("a*", "x", "a").as_deref(), Some("x"));
+        assert_eq!(lua_gsub("[]()]", "x", "]()").as_deref(), Some("xxx"));
         let intermediate = lua_gsub_bytes("^.", "", "é".as_bytes()).unwrap();
         assert!(std::str::from_utf8(&intermediate).is_err());
         let final_text = lua_gsub_bytes(".", "x", &intermediate).unwrap();
