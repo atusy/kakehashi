@@ -173,7 +173,7 @@ fn position_of_byte(
 /// bytes the injection parser actually sees — trimming frontmatter `---`
 /// fences, string quotes, and the like. The request-routing paths that must
 /// agree on *where the injected content is* share this one helper rather than
-/// each deriving it: region lookup ([`find_injection_at_position`]), region
+/// each deriving it: region lookup (`find_injection_at_position`), region
 /// resolution ([`CacheableInjectionRegion::from_region_info`]), and the native
 /// lexical layer's containment filter (`native_bindings`). The semantic,
 /// selection-range, and `kakehashi/node` paths still call
@@ -662,6 +662,7 @@ fn extract_content_and_language<'a>(
 ///
 /// Returns `(index, region)` for use with `calculate_region_id`, or `None`
 /// when no region matches under the boundary rule.
+#[cfg(test)]
 fn find_injection_at_position<'a>(
     injections: &'a [InjectionRegionInfo<'a>],
     byte_offset: usize,
@@ -755,7 +756,9 @@ fn ends_mid_line(text: &str, end: usize) -> bool {
 /// from the injection the user is visibly typing in.
 ///
 /// Both variants measure the effective post-`#offset!` span, never the raw
-/// `@injection.content` node — see [`effective_content_range`].
+/// `@injection.content` node — see [`effective_content_range`]. The raw
+/// candidate-order policy is pinned by the `find_injection_at_position` unit
+/// tests.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RegionBoundary {
     /// Strict half-open `[start, end)`: a cursor at the end byte is outside.
@@ -830,27 +833,56 @@ impl InjectionResolver {
         boundary: RegionBoundary,
     ) -> Option<ResolvedInjection> {
         let injections = collect_all_injections(&tree.root_node(), text, Some(injection_query))?;
-        let (_region_index, region) =
-            find_injection_at_position(&injections, byte_offset, text, boundary)?;
-        if region.combined {
-            let group: Vec<_> = injections
-                .iter()
-                .filter(|candidate| {
-                    candidate.combined
-                        && candidate.pattern_index == region.pattern_index
-                        && candidate.language == region.language
-                })
-                .collect();
-            Self::build_combined_injection(
-                coordinator,
-                Some((tracker, uri, incarnation)),
-                &group,
-                None,
-                text,
-            )
-        } else {
-            Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
+        let resolve = |region: &InjectionRegionInfo<'_>| {
+            if region.combined {
+                // A member with no included bytes is not a positional entry
+                // into the surviving members of its combined group.
+                let id = Self::calculate_region_id(tracker, uri, region, incarnation)?;
+                let cacheable =
+                    CacheableInjectionRegion::from_region_info(region, &id.to_string(), text);
+                extract_virtual_content_and_offsets(region, &cacheable, text)?;
+
+                let group: Vec<_> = injections
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.combined
+                            && candidate.pattern_index == region.pattern_index
+                            && candidate.language == region.language
+                    })
+                    .collect();
+                Self::build_combined_injection(
+                    coordinator,
+                    Some((tracker, uri, incarnation)),
+                    &group,
+                    None,
+                    text,
+                )
+            } else {
+                Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
+            }
+        };
+
+        for region in &injections {
+            let range = effective_content_range(region, text);
+            if byte_offset >= range.start
+                && byte_offset < range.end
+                && let Some(resolved) = resolve(region)
+            {
+                return Some(resolved);
+            }
         }
+        if boundary == RegionBoundary::CaretEndFallback {
+            for region in &injections {
+                let range = effective_content_range(region, text);
+                if range.end == byte_offset
+                    && (ends_mid_line(text, range.end) || byte_offset == text.len())
+                    && let Some(resolved) = resolve(region)
+                {
+                    return Some(resolved);
+                }
+            }
+        }
+        None
     }
 
     /// Calculate a stable ULID-based region_id for an injection.
@@ -865,7 +897,7 @@ impl InjectionResolver {
     /// injection depths used by `kakehashi/node`.
     ///
     /// Deliberately keyed on the **raw** `content_node` bytes, not the
-    /// effective post-`#offset!` span that [`find_injection_at_position`]
+    /// effective post-`#offset!` span that `find_injection_at_position`
     /// measures. This is a tracker identity key — "which host node is this?" —
     /// not a containment question, and [`Self::resolve_by_region_id`] looks the
     /// region back up by those same raw bytes. Re-keying it on the effective
@@ -1850,6 +1882,54 @@ mod tests {
         );
 
         assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn positional_resolution_skips_fully_excluded_shadowing_candidates() {
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"((source_file) @injection.content
+                 (#set! injection.language "dead"))
+               ((function_item) @injection.content
+                 (#set! injection.language "rust")
+                 (#set! injection.include-children))"#,
+        )
+        .unwrap();
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("excluded_shadow");
+
+        let inside = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            1,
+            0,
+            RegionBoundary::HalfOpen,
+        )
+        .expect("the later active overlapping candidate must remain reachable");
+        assert_eq!(inside.injection_language, "rust");
+
+        let at_end = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            text.len(),
+            0,
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("caret fallback must also continue past an excluded candidate");
+        assert_eq!(at_end.injection_language, "rust");
     }
 
     #[test]
