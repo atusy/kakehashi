@@ -10,15 +10,16 @@ use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
 
 use super::legend::{CaptureResult, resolve_capture};
 
-/// Check whether a node is strictly contained within any exclusion range.
+/// Check whether an effective capture span is strictly contained within any
+/// exclusion range.
 ///
 /// A node is excluded only if it is **properly inside** a range — meaning fully
 /// contained but NOT exactly equal. Nodes whose range exactly equals an exclusion
 /// range are preserved; conflicts at the same position are resolved downstream
 /// by the sweep line algorithm in `finalize_tokens()`.
-fn is_in_exclusion_range(node: &Node, ranges: &[(usize, usize)]) -> bool {
-    let node_start = node.start_byte();
-    let node_end = node.end_byte();
+fn is_in_exclusion_range(capture_range: std::ops::Range<usize>, ranges: &[(usize, usize)]) -> bool {
+    let node_start = capture_range.start;
+    let node_end = capture_range.end;
     ranges.iter().any(|&(range_start, range_end)| {
         node_start >= range_start
             && node_end <= range_end
@@ -434,7 +435,10 @@ pub(super) fn collect_host_tokens(
             };
 
             // Skip captures that fall within a child injection region
-            if is_in_exclusion_range(&node, exclusion_ranges) {
+            if is_in_exclusion_range(
+                capture_range.start_byte..capture_range.end_byte,
+                exclusion_ranges,
+            ) {
                 continue;
             }
 
@@ -630,7 +634,7 @@ mod tests {
         let tree = parse_rust_tree("fn main() {}");
         let root = tree.root_node();
         assert!(
-            !is_in_exclusion_range(&root, &[]),
+            !is_in_exclusion_range(root.byte_range(), &[]),
             "Empty exclusion ranges should never match"
         );
     }
@@ -645,7 +649,7 @@ mod tests {
         // This matches the Markdown heading case: @markup.heading.1 is captured on
         // the same node as the markdown_inline injection content.
         assert!(
-            !is_in_exclusion_range(&root, &[(0, 12)]),
+            !is_in_exclusion_range(root.byte_range(), &[(0, 12)]),
             "Exact match should NOT be excluded"
         );
     }
@@ -687,7 +691,7 @@ mod tests {
         let fn_node = tree.root_node().child(0).unwrap().child(0).unwrap();
         assert_eq!((fn_node.start_byte(), fn_node.end_byte()), (0, 2));
         assert!(
-            is_in_exclusion_range(&fn_node, &[(0, 12)]),
+            is_in_exclusion_range(fn_node.byte_range(), &[(0, 12)]),
             "Node strictly inside range should be excluded"
         );
     }
@@ -698,7 +702,7 @@ mod tests {
         let root = tree.root_node();
         // Root [0, 12), range [0, 3) — root extends beyond range → not contained
         assert!(
-            !is_in_exclusion_range(&root, &[(0, 3)]),
+            !is_in_exclusion_range(root.byte_range(), &[(0, 3)]),
             "Node extending beyond range should NOT be excluded"
         );
     }
@@ -709,7 +713,7 @@ mod tests {
         let root = tree.root_node();
         // Root [0, 12), range [10, 15) — root starts before range → not contained
         assert!(
-            !is_in_exclusion_range(&root, &[(10, 15)]),
+            !is_in_exclusion_range(root.byte_range(), &[(10, 15)]),
             "Node starting before range should NOT be excluded"
         );
     }
@@ -723,7 +727,7 @@ mod tests {
         let end = fn_node.end_byte();
         assert_eq!((start, end), (0, 2));
         // Range is entirely after the node
-        assert!(!is_in_exclusion_range(&fn_node, &[(5, 10)]));
+        assert!(!is_in_exclusion_range(fn_node.byte_range(), &[(5, 10)]));
     }
 
     #[test]
@@ -732,7 +736,7 @@ mod tests {
         let fn_node = tree.root_node().child(0).unwrap().child(0).unwrap();
         // Range is entirely before the node (empty range at byte 0 doesn't overlap [0, 2))
         // Actually [0, 0) is empty so no overlap. Let's use a range that ends at node start.
-        assert!(!is_in_exclusion_range(&fn_node, &[(10, 12)]));
+        assert!(!is_in_exclusion_range(fn_node.byte_range(), &[(10, 12)]));
     }
 
     #[test]
@@ -742,7 +746,7 @@ mod tests {
         let fn_node = tree.root_node().child(0).unwrap().child(0).unwrap();
         assert_eq!(fn_node.end_byte(), 2);
         assert!(
-            !is_in_exclusion_range(&fn_node, &[(2, 5)]),
+            !is_in_exclusion_range(fn_node.byte_range(), &[(2, 5)]),
             "Adjacent range should NOT overlap"
         );
     }
@@ -754,7 +758,10 @@ mod tests {
         let fn_node = tree.root_node().child(0).unwrap().child(0).unwrap();
         assert_eq!((fn_node.start_byte(), fn_node.end_byte()), (0, 2));
         // First range misses, second strictly contains [0, 2)
-        assert!(is_in_exclusion_range(&fn_node, &[(100, 200), (0, 12)]));
+        assert!(is_in_exclusion_range(
+            fn_node.byte_range(),
+            &[(100, 200), (0, 12)]
+        ));
     }
 
     // ── collect_host_tokens exclusion behavior ───────────────────────
@@ -1044,6 +1051,40 @@ mod tests {
 
         assert_eq!(tokens.len(), 1);
         assert_eq!((tokens[0].column, tokens[0].length), (1, 3));
+    }
+
+    #[test]
+    fn collect_host_tokens_excludes_the_adjusted_capture_span() {
+        let code = r#""abc""#;
+        let tree = parse_rust_tree(code);
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"((string_literal) @string (#offset! @string 0 1 0 -1))"#,
+        )
+        .unwrap();
+        let lines: Vec<&str> = code.lines().collect();
+        let mut tokens = Vec::new();
+
+        collect_host_tokens(
+            code,
+            &tree,
+            &query,
+            Some("rust"),
+            None,
+            code,
+            &lines,
+            &build_line_start_bytes(code),
+            0,
+            0,
+            false,
+            &[(0, 4)],
+            &[],
+            None,
+            &mut tokens,
+        );
+
+        assert!(tokens.is_empty());
     }
 
     #[test]
