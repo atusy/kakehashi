@@ -138,18 +138,25 @@ pub(in crate::lsp::lsp_impl) fn tree_cache_key(
     language: &str,
     tree: &tree_sitter::Tree,
     text: &str,
-) -> (usize, u64) {
-    layer_cache_key(
+) -> (usize, usize, u64) {
+    let ranges = tree.included_ranges();
+    let outer_end = ranges
+        .iter()
+        .map(|range| range.end_byte.min(text.len()))
+        .max()
+        .unwrap_or(0);
+    let (anchor, hash) = layer_cache_key(
         kind,
         language,
-        tree.included_ranges().iter().map(|r| KeyRange {
+        ranges.iter().map(|r| KeyRange {
             start_byte: r.start_byte,
             end_byte: r.end_byte,
             start_col: r.start_point.column,
             end_col: r.end_point.column,
         }),
         text,
-    )
+    );
+    (anchor, outer_end, hash)
 }
 
 /// Shift every capture offset down by `anchor`, in place. Returns `false`

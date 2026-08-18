@@ -1458,15 +1458,7 @@ fn execute_captures_walk(
         // document bytes per full walk, sub-ms against the walk times the
         // per-walk debug line reports (see the reused/executed counters).
         let cache_key = cache_full_walk.then(|| {
-            let (anchor, hash) =
-                super::captures_match_cache::tree_cache_key(kind, layer_language, layer_tree, text);
-            let outer_end = layer_tree
-                .included_ranges()
-                .iter()
-                .map(|range| range.end_byte.min(text.len()))
-                .max()
-                .unwrap_or(anchor);
-            (anchor, outer_end, hash)
+            super::captures_match_cache::tree_cache_key(kind, layer_language, layer_tree, text)
         });
         let reused = cache_key.and_then(|(_, _, hash)| {
             if depth == 0 {
@@ -3118,7 +3110,7 @@ mod tests {
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse(text, None).unwrap();
-        let (anchor, hash) =
+        let (anchor, _, hash) =
             super::super::captures_match_cache::tree_cache_key("locals", "rust", &tree, text);
         assert_eq!(anchor, 0, "host layer anchors at 0");
         rig.match_cache.store_host(
@@ -3236,7 +3228,7 @@ mod tests {
         // The shifted layer must key IDENTICALLY to what v1 stored
         // (translation invariance); plant a sentinel there to discriminate
         // "served from cache" from "silently re-executed".
-        let (anchor_v2, hash_v2) = super::super::captures_match_cache::tree_cache_key(
+        let (anchor_v2, _, hash_v2) = super::super::captures_match_cache::tree_cache_key(
             "locals",
             "rust",
             &layer_v2.tree,
@@ -3343,7 +3335,7 @@ mod tests {
         let text = "let a = 1;\n";
         let rig = MatchCacheRig::new("file:///match_cache_range.rs", text);
         let layer = rust_layer(text, 0, text.len());
-        let (_, host_hash) =
+        let (_, _, host_hash) =
             super::super::captures_match_cache::tree_cache_key("locals", "rust", &layer.tree, text);
 
         rig.walk(
@@ -3374,7 +3366,7 @@ mod tests {
         let text = "let a = 1;\n";
         let rig = MatchCacheRig::new("file:///match_cache_range_read.rs", text);
         let layer = rust_layer(text, 0, text.len());
-        let (_, layer_hash) =
+        let (_, _, layer_hash) =
             super::super::captures_match_cache::tree_cache_key("locals", "rust", &layer.tree, text);
         rig.match_cache.store_layer(
             &rig.uri,
@@ -3445,7 +3437,7 @@ mod tests {
         let (text_v2, layer_v2) = make("AAAA\nBBBB\n");
         rig.store
             .update_document(rig.uri.clone(), text_v2.clone(), None);
-        let (_, hash_v2) = super::super::captures_match_cache::tree_cache_key(
+        let (_, _, hash_v2) = super::super::captures_match_cache::tree_cache_key(
             "locals",
             "rust",
             &layer_v2.tree,
@@ -3500,7 +3492,7 @@ mod tests {
         let rig = MatchCacheRig::new("file:///match_cache_cancel_sweep.rs", &text);
         rig.walk(&text, &[rust_layer(&text, start, text.len())], 0, None)
             .expect("kind query should load");
-        let (_, hash) = super::super::captures_match_cache::tree_cache_key(
+        let (_, _, hash) = super::super::captures_match_cache::tree_cache_key(
             "locals",
             "rust",
             &rust_layer(&text, start, text.len()).tree,
@@ -3544,7 +3536,7 @@ mod tests {
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let host_tree = parser.parse(text, None).unwrap();
-        let (anchor, host_hash) =
+        let (anchor, _, host_hash) =
             super::super::captures_match_cache::tree_cache_key("locals", "rust", &host_tree, text);
         assert_eq!(anchor, 0, "host layer anchors at 0");
         assert!(
