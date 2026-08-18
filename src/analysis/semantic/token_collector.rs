@@ -412,7 +412,10 @@ pub(super) fn collect_host_tokens(
             // Node byte length for specificity: smaller nodes win in sweep line
             let node_byte_len = node.end_byte() - node.start_byte();
 
-            // Check if this is a single-line token or trailing newline case
+            // A trailing-newline capture is only normalized early when raw
+            // multiline identity is not requested. Top-level host collection
+            // keeps that endpoint so finalize can recognize an exact injection
+            // span before converting it back to single-line LSP tokens.
             let is_single_line = start_pos.row == end_pos.row;
             let is_trailing_newline = end_pos.row == start_pos.row + 1 && end_pos.column == 0;
 
@@ -433,7 +436,7 @@ pub(super) fn collect_host_tokens(
                 continue;
             }
 
-            if is_single_line || is_trailing_newline {
+            if is_single_line || (is_trailing_newline && !supports_multiline) {
                 // Single-line token: emit as before
                 let host_line = content_start_line + start_pos.row;
                 let host_line_text = host_lines.get(host_line).unwrap_or(&"");

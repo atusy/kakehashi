@@ -102,9 +102,12 @@ Host tokens (depth=0) overlapping **active** injection regions are handled with 
 | **Partial overlap, single-line region** | Token extends beyond a single-line region | Keep entire token for sweep line | Heading `## foo **bar**` overlapping `(inline)` injection |
 | **Partial overlap, multiline region** | Token extends beyond a multiline region | Split, keep outside fragments only | In a blockquoted code fence, the `>` prefix and its following space survive; code content is removed |
 
-The single-line/multiline distinction for partial overlaps identifies the injection's nature:
+The single-line/multiline distinction applies only to **partial overlaps** and identifies the injection's nature. Exact matches are kept whether they span one line or many:
 - **Single-line regions** arise from direct child injections (e.g., `markdown_inline` within a heading). The host token should fill gaps where the injection produces no tokens (e.g., plain text in headings). Blockquote *prose* gaps are trimmed of their trailing newline at the exclusion-range push site (`rebuild_context`) precisely so they classify here and gap-fill uniformly on every paragraph line.
-- **Multiline regions** arise from container injections (e.g., blockquoted code fence content). The host token should not leak into the container's content.
+- **Partially overlapping multiline regions** arise from container injections (e.g., blockquoted code fence content). The host token should not leak into the container's content.
+- **Exactly matching multiline regions** can represent two semantic views of the same source node (e.g., a TypeScript JSDoc capture and its comment injection). The host token remains available to fill gaps around the injected tokens.
+
+The exact-match exception is local to the matching region. If another active region overlaps the same host token, that region's normal containment or partial-overlap rule still applies.
 
 Key concepts:
 
@@ -170,9 +173,11 @@ semantic.rs::handle_semantic_tokens_full
   |
   +-- finalize_tokens(all_tokens, &active_injection_regions, &lines)
         |
+        +-- Classify exact-match multiline host spans
         +-- split_multiline_tokens (normalize to single-line fragments)
         +-- retain(length > 0)
-        +-- Stage 1: injection region exclusion
+        +-- Stage 1: injection region exclusion for non-exact hosts
+        +-- Add normalized fragments from preserved exact hosts
         +-- Stage 2: split_overlapping_tokens (sweep line)
         |     +-- merge_adjacent_fragments
         +-- Delta encoding -> SemanticTokensResult
@@ -182,10 +187,10 @@ Note: The `exclusion_ranges` parameter in `collect_host_tokens` is still used fo
 
 ### Multiline Token Handling
 
-The sweep line operates **per-line**. Before running the sweep line, `finalize_tokens` calls `split_multiline_tokens`, which normalizes any multiline tokens into single-line fragments. The sweep line then processes those fragments together with tokens that were already single-line.
+The sweep line operates **per-line**. Before normalization destroys cross-line identity, `finalize_tokens` records top-level host tokens that exactly match multiline active regions. It then calls `split_multiline_tokens`, which normalizes multiline tokens into single-line fragments. Stage 1 filters non-exact host fragments, and the preserved exact hosts re-enter before the sweep line processes all remaining fragments.
 
-- When `supports_multiline = false` (the common case), tokens are already split per-line during collection
-- When `supports_multiline = true`, `split_multiline_tokens` ensures multiline tokens participate correctly in overlap resolution
+- Prefix-free top-level host captures retain their multiline raw span until exact-match classification, independent of the client's `multilineTokenSupport` capability; captures with structural prefix widths remain per-line so prefixes can be excluded
+- Injection captures may still be collected per-line when `supports_multiline = false`; `split_multiline_tokens` normalizes every remaining multiline raw token before overlap resolution
 - Advanced cross-line merging heuristics (e.g., re-joining fragments after splitting) are deferred to a future phase
 
 ## Consequences
@@ -197,7 +202,7 @@ The sweep line operates **per-line**. Before running the sweep line, `finalize_t
 - **Inactive region preservation**: Unknown-language code blocks (e.g., `` ```unknown ``) correctly preserve the parent `@markup.raw.block` token, since no injection tokens suppress it.
 - **Spanning node correctness**: Host captures on nodes spanning injection boundaries are correctly excluded, fixing the overlapping output bug.
 - **Unified resolution point**: All overlap resolution happens in `finalize_tokens`, making the algorithm easy to reason about, test, and extend.
-- **24 unit tests** cover sweep line splitting, injection exclusion, and edge cases.
+- **Regression tests** cover sweep line splitting, injection exclusion, multiline exact matches, and boundary cases.
 
 ### Negative
 
