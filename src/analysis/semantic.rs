@@ -434,6 +434,77 @@ mod tests {
     }
 
     #[test]
+    fn top_level_trailing_newline_capture_retains_endpoint_identity() {
+        use token_collector::ActiveInjectionBounds;
+
+        let text = "xy\n";
+        let lines: Vec<&str> = text.lines().collect();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let query = Query::new(&language, "(source_file) @comment.documentation").unwrap();
+        let mut tokens = Vec::new();
+
+        assert!(collect_host_tokens(
+            text,
+            &tree,
+            &query,
+            Some("rust"),
+            None,
+            text,
+            &lines,
+            &build_line_start_bytes(text),
+            0,
+            0,
+            top_level_host_multiline_collection(false),
+            &[],
+            &[],
+            None,
+            &mut tokens,
+        ));
+        assert_eq!(
+            tokens[0].length, 3,
+            "the raw host span must retain its trailing newline"
+        );
+
+        let (keyword_type, keyword_modifiers) =
+            legend::map_capture_to_token_type_and_modifiers("keyword").unwrap();
+        tokens.push(RawToken {
+            line: 0,
+            column: 0,
+            length: 1,
+            kind: TokenKind::Mapped(keyword_type, keyword_modifiers),
+            depth: 1,
+            pattern_index: 0,
+            priority: 100,
+            node_byte_len: 1,
+        });
+        let regions = [ActiveInjectionBounds {
+            start_line: 0,
+            start_col: 0,
+            end_line: 1,
+            end_col: 0,
+        }];
+
+        let SemanticTokensResult::Tokens(result) =
+            finalize_tokens_cancellable(tokens, &regions, &lines, None)
+                .expect("exact host fallback should survive")
+        else {
+            panic!("expected full semantic tokens");
+        };
+        let (comment_type, _) =
+            legend::map_capture_to_token_type_and_modifiers("comment.documentation").unwrap();
+        let decoded = decode_tokens(&result.data);
+        assert!(
+            decoded
+                .iter()
+                .any(|token| token.0 == 0 && token.1 == 1 && token.3 == comment_type),
+            "the uncovered host character must remain highlighted: {decoded:?}"
+        );
+    }
+
+    #[test]
     fn test_semantic_tokens_range() {
         use tower_lsp_server::ls_types::Position;
 
