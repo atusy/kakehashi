@@ -19,8 +19,7 @@ use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
     MAX_INJECTION_DEPTH, byte_to_point, byte_to_point_anchored, collect_all_injections,
-    compute_included_ranges, compute_included_ranges_clipped, effective_offset_for_pattern,
-    intersect_included_ranges,
+    compute_included_ranges, compute_included_ranges_clipped, intersect_included_ranges,
 };
 use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
 
@@ -44,10 +43,6 @@ pub(super) struct InjectionLayer {
 /// Whether `pattern_index` carries an `#offset!` directive. Used to decide if
 /// the raw-content-node fast bounds check is safe: an offset can extend the
 /// effective range past the raw node, so the shortcut only holds without one.
-fn pattern_has_offset(injection_query: &tree_sitter::Query, pattern_index: usize) -> bool {
-    effective_offset_for_pattern(injection_query, pattern_index).is_some()
-}
-
 /// Build the full-document range used to seed the host layer.
 fn whole_document_range(host_text: &str) -> tree_sitter::Range {
     tree_sitter::Range {
@@ -134,7 +129,7 @@ pub(super) fn injection_stack_at(
             // negative start offsets can *extend* the effective range past the
             // raw content node, so containment has to be judged on the
             // effective ranges alone.
-            if !pattern_has_offset(&injection_query, region.pattern_index) {
+            if region.offset.is_none() {
                 let raw_start = region.content_node.start_byte();
                 let raw_end = region.content_node.end_byte();
                 let outside_raw = if byte == host_len {
@@ -417,7 +412,7 @@ pub(super) fn collect_injection_languages_at(
         // one path the per-position stack will walk.
         let mut candidates: Vec<(_, Vec<tree_sitter::Range>)> = Vec::new();
         for region in injections {
-            if !pattern_has_offset(&injection_query, region.pattern_index) {
+            if region.offset.is_none() {
                 let raw_start = region.content_node.start_byte();
                 let raw_end = region.content_node.end_byte();
                 let outside_raw = if byte == host_len {
@@ -516,10 +511,10 @@ fn parse_with_absolute_ranges(
 fn build_effective_ranges(
     region: &crate::language::injection::InjectionRegionInfo<'_>,
     host_text: &str,
-    injection_query: &tree_sitter::Query,
+    _injection_query: &tree_sitter::Query,
 ) -> Vec<tree_sitter::Range> {
     // 1. Apply #offset! to the raw content_node span.
-    let offset = effective_offset_for_pattern(injection_query, region.pattern_index);
+    let offset = region.offset;
     let (eff_start, eff_end) = match offset {
         Some(off) => {
             let byte_range = ByteRange::new(
