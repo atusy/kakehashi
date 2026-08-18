@@ -151,50 +151,64 @@ fn trim_range(
     ),
 ) -> Option<CaptureRange> {
     let text = clamped_slice(source, raw.start_byte..raw.end_byte);
-    let lines: Vec<&str> = text.split('\n').collect();
-    let mut starts = Vec::with_capacity(lines.len());
-    let mut next_start = 0;
-    for line in &lines {
-        starts.push(next_start);
-        next_start += line.len() + 1;
-    }
-
     let whitespace_only = |line: &str| line.bytes().all(|byte| byte.is_ascii_whitespace());
-    let mut start_index = 0;
-    let mut end_index = lines.len();
-
+    let mut linewise_end = text.len();
     if trim_end_lines {
-        while end_index > 0 && whitespace_only(lines[end_index - 1]) {
-            end_index -= 1;
+        loop {
+            let line_start = text[..linewise_end]
+                .rfind('\n')
+                .map_or(0, |newline| newline + 1);
+            if !whitespace_only(&text[line_start..linewise_end]) {
+                break;
+            }
+            if line_start == 0 {
+                linewise_end = 0;
+                break;
+            }
+            linewise_end = line_start - 1;
         }
     }
 
-    let mut end = if end_index == lines.len() {
-        text.len()
-    } else if end_index == 0 {
+    let mut end = if linewise_end == 0 && trim_end_lines {
         if trim_end_columns {
             0
         } else {
             return None;
         }
     } else {
-        starts[end_index - 1] + lines[end_index - 1].len()
+        linewise_end
     };
-    if trim_end_columns && end_index != 0 {
-        let line = lines[end_index - 1];
-        end = starts[end_index - 1]
-            + line
+    if trim_end_columns && linewise_end != 0 {
+        let line_start = text[..linewise_end]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        end = line_start
+            + text[line_start..linewise_end]
                 .trim_end_matches(|character: char| character.is_ascii_whitespace())
                 .len();
     }
 
+    let mut start = 0;
     if trim_start_lines {
-        while start_index < end_index && whitespace_only(lines[start_index]) {
-            start_index += 1;
+        while start < linewise_end {
+            let line_end = text[start..linewise_end]
+                .find('\n')
+                .map_or(linewise_end, |newline| start + newline);
+            if !whitespace_only(&text[start..line_end]) {
+                break;
+            }
+            start = if line_end < linewise_end {
+                line_end + 1
+            } else {
+                linewise_end
+            };
         }
     }
-    let mut start = starts.get(start_index).copied().unwrap_or(text.len());
-    if trim_start_columns && let Some(line) = lines.get(start_index) {
+    if trim_start_columns && start < linewise_end {
+        let line_end = text[start..linewise_end]
+            .find('\n')
+            .map_or(linewise_end, |newline| start + newline);
+        let line = &text[start..line_end];
         start += line.len()
             - line
                 .trim_start_matches(|character: char| character.is_ascii_whitespace())
