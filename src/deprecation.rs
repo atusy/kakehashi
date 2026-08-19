@@ -38,11 +38,88 @@ pub(crate) use enforce_deprecation_deadline;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, process::Command};
+
+    fn compile_fixture(version: &str) -> std::process::Output {
+        let fixture = tempfile::tempdir().expect("fixture temp dir");
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let deprecation_module = manifest_dir.join("src/deprecation.rs");
+        let module_path = deprecation_module
+            .to_str()
+            .expect("repository path must be valid UTF-8");
+
+        fs::create_dir(fixture.path().join("src")).expect("fixture src dir");
+        fs::copy(
+            manifest_dir.join("build.rs"),
+            fixture.path().join("build.rs"),
+        )
+        .expect("copy production build script");
+        fs::write(
+            fixture.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"deprecation-deadline-fixture\"\nversion = \"{version}\"\nedition = \"2024\"\n"
+            ),
+        )
+        .expect("write fixture manifest");
+        fs::write(
+            fixture.path().join("src/lib.rs"),
+            format!(
+                r#"
+#[path = {module_path:?}]
+mod deprecation;
+
+mod policies {{
+    crate::deprecation::enforce_deprecation_deadline!(
+        name = "v0 path",
+        deprecated_in = 0,
+        remove_in = 2,
+    );
+    crate::deprecation::enforce_deprecation_deadline!(
+        name = "v1 path",
+        deprecated_in = 1,
+        remove_in = 3,
+    );
+}}
+"#
+            ),
+        )
+        .expect("write fixture library");
+
+        Command::new(env!("CARGO"))
+            .args(["check", "--offline", "--quiet"])
+            .current_dir(fixture.path())
+            .env("CARGO_TARGET_DIR", fixture.path().join("target"))
+            .output()
+            .expect("run cargo check for deadline fixture")
+    }
 
     #[test]
     fn v0_deprecation_remains_valid_through_v1_and_expires_in_v2() {
         assert!(!removal_is_due(0, 2));
         assert!(!removal_is_due(1, 2));
         assert!(removal_is_due(2, 2));
+    }
+
+    #[test]
+    fn compile_gate_tracks_cargo_major_and_keeps_generations_independent() {
+        let v1 = compile_fixture("1.0.0");
+        assert!(
+            v1.status.success(),
+            "both policies must compile in v1: {}",
+            String::from_utf8_lossy(&v1.stderr)
+        );
+
+        let v2 = compile_fixture("2.0.0");
+        assert!(!v2.status.success(), "the v0 policy must expire in v2");
+        let stderr = String::from_utf8_lossy(&v2.stderr);
+        assert!(
+            stderr
+                .contains("`v0 path` was deprecated in v0 and must be removed before releasing v2"),
+            "the failure must identify the expired policy: {stderr}"
+        );
+        assert!(
+            !stderr.contains("`v1 path` was deprecated"),
+            "the independently scheduled v1 policy must remain valid in v2: {stderr}"
+        );
     }
 }
