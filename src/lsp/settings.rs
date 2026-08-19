@@ -575,11 +575,14 @@ fn emptied_container_names(settings: &RawWorkspaceSettings) -> Vec<String> {
         Some(mappings) if mappings.is_empty() => {
             named.push("features.\"textDocument/semanticTokens\".captureMappings".to_string())
         }
-        Some(mappings) => named.extend(mappings.iter().filter_map(|(lang, mappings)| {
+        Some(mappings) => named.extend(
             mappings
-                .is_empty()
-                .then(|| format!("features.\"textDocument/semanticTokens\".captureMappings.{lang}"))
-        })),
+                .iter()
+                .filter(|(_, mappings)| mappings.is_empty())
+                .map(|(lang, _)| {
+                    format!("features.\"textDocument/semanticTokens\".captureMappings.{lang}")
+                }),
+        ),
         None => {}
     }
 
