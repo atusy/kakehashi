@@ -115,6 +115,28 @@ pub(crate) fn aliases_deprecation_notice(language: &str, aliases: &[String]) -> 
             ALIASES_DEPRECATION.remove_in_major()
         );
     }
+    let has_reserved_alias = aliases.contains("_");
+    let has_self_alias = aliases.contains(language);
+    let aliases = aliases
+        .into_iter()
+        .filter(|alias| *alias != "_" && *alias != language)
+        .collect::<Vec<_>>();
+    let special_guidance = match (has_reserved_alias, has_self_alias) {
+        (true, true) => {
+            "The `_` alias is reserved and must not become a base entry. \
+             A self-alias needs no base entry.\n"
+        }
+        (true, false) => "The `_` alias is reserved and must not become a base entry.\n",
+        (false, true) => "A self-alias needs no base entry.\n",
+        (false, false) => "",
+    };
+    if aliases.is_empty() {
+        return format!(
+            "Language '{language}' uses deprecated 'aliases' field. Remove the 'aliases' field. \
+             {special_guidance}The 'aliases' field will be removed in kakehashi v{}.",
+            ALIASES_DEPRECATION.remove_in_major()
+        );
+    }
     let language_toml = toml::Value::String(language.to_owned()).to_string();
     let toml_examples = aliases
         .iter()
@@ -134,7 +156,7 @@ pub(crate) fn aliases_deprecation_notice(language: &str, aliases: &[String]) -> 
          Use 'base' on each derived language instead.\n\
          TOML:\n{toml_examples}\n\
          JSON:\n{json}\n\
-         The 'aliases' field will be removed in kakehashi v{}.",
+         {special_guidance}The 'aliases' field will be removed in kakehashi v{}.",
         ALIASES_DEPRECATION.remove_in_major()
     )
 }
@@ -417,6 +439,20 @@ rootMarkers = [".git"]
         assert_eq!(
             parsed_json["languages"]["qmd"]["base"].as_str(),
             Some("markdown")
+        );
+    }
+
+    #[test]
+    fn aliases_notice_does_not_migrate_reserved_or_self_aliases() {
+        let aliases = vec!["_".to_owned(), "markdown".to_owned(), "rmd".to_owned()];
+        let notice = aliases_deprecation_notice("markdown", &aliases);
+        assert!(notice.contains("[languages.\"rmd\"]"), "{notice}");
+        assert!(!notice.contains("[languages.\"_\"]"), "{notice}");
+        assert!(!notice.contains("[languages.\"markdown\"]"), "{notice}");
+        assert!(notice.contains("`_` alias is reserved"), "{notice}");
+        assert!(
+            notice.contains("self-alias needs no base entry"),
+            "{notice}"
         );
     }
 

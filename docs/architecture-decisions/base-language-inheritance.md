@@ -131,7 +131,9 @@ through v1 so the server can emit a client-visible migration warning. It is
 removed from the configuration schema and parser in v2, in accordance with
 deprecation-removal-deadlines.
 
-**Migration**: Each `aliases = ["x", "y"]` on language `L` becomes:
+**Migration**: Each distinct alias other than the reserved `_` key or `L`
+itself becomes a derived language. Remove `_` and self-aliases without creating
+`base` entries. For example, `aliases = ["x", "y"]` on language `L` becomes:
 
 ```toml
 [languages.x]
