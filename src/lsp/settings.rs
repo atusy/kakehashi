@@ -70,6 +70,9 @@ pub struct SettingsLoadOutcome {
     /// Which deprecated keys the loaded layers spelled — see
     /// [`DeprecatedKeysSeen`] for why this is not an `events` entry.
     pub(crate) deprecated_keys: DeprecatedKeysSeen,
+    /// First migration notice produced by an authored layer before merge-time
+    /// normalization erases its legacy spelling.
+    pub(crate) empty_container_notice: Option<String>,
 }
 
 /// Fold configuration layers into the settings they describe, lowest
@@ -424,6 +427,12 @@ pub fn load_settings(
             settings
         });
 
+    let empty_container_notice = config_layers
+        .iter()
+        .filter_map(Option::as_ref)
+        .chain(override_settings.as_ref())
+        .find_map(|settings| emptied_container_notice(Some(settings)));
+
     // Merge all layers: defaults < config_layers < override (later layers override earlier)
     let mut layers = vec![defaults];
     layers.extend(config_layers);
@@ -437,6 +446,7 @@ pub fn load_settings(
         raw_settings,
         events,
         deprecated_keys,
+        empty_container_notice,
     }
 }
 
@@ -947,6 +957,30 @@ mod tests {
             emptied_container_notice(Some(&inheriting)).is_none(),
             "omitting the keys is the inheriting spelling and must stay quiet"
         );
+    }
+
+    #[test]
+    fn load_settings_preserves_legacy_empty_mapping_notice_before_normalization() {
+        let outcome = load_settings(
+            None,
+            Some((
+                SettingsSource::InitializationOptions,
+                serde_json::json!({ "captureMappings": {} }),
+            )),
+            None,
+            |_| None,
+            Some(ExplicitConfig {
+                layers: Vec::new(),
+                events: Vec::new(),
+                deprecated_keys: DeprecatedKeysSeen::default(),
+                fatal_error: None,
+            }),
+        );
+
+        let notice = outcome
+            .empty_container_notice
+            .expect("normalization must not erase the authored empty-container signal");
+        assert!(notice.contains("captureMappings"), "{notice}");
     }
 
     #[test]

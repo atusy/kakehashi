@@ -425,8 +425,7 @@ impl Kakehashi {
         }
         // Same shape for the empty-container rule change: what the layers said
         // still parses, and now means something else.
-        if let Some(notice) =
-            crate::lsp::settings::emptied_container_notice(settings_outcome.raw_settings.as_ref())
+        if let Some(notice) = settings_outcome.empty_container_notice.as_deref()
             && self
                 .settings_manager
                 .claim_empty_container_migration_warning()
