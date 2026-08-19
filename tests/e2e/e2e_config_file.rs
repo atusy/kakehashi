@@ -54,6 +54,10 @@ fn query_effective_settings(client: &mut LspClient) -> serde_json::Value {
         .clone()
 }
 
+fn semantic_token_capture_mappings(settings: &Value) -> &Value {
+    &settings["features"]["textDocument/semanticTokens"]["captureMappings"]
+}
+
 /// Poll effective settings until `predicate` returns true, or panic after timeout.
 ///
 /// Use after `didChangeConfiguration` to avoid fixed sleeps. Polls every 100ms for
@@ -766,7 +770,7 @@ fn test_config_file_deep_merge_capture_mappings_with_init_options() {
         }),
     );
 
-    let highlights = &settings["captureMappings"]["_"]["highlights"];
+    let highlights = &semantic_token_capture_mappings(&settings)["_"];
 
     assert_eq!(
         highlights["variable.builtin"],
@@ -1375,7 +1379,8 @@ fn test_did_change_configuration_warns_on_nested_capture_mapping_unknown_keys() 
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
-    let initial_capture_mappings = get_effective_settings(&mut client)["captureMappings"].clone();
+    let initial_settings = get_effective_settings(&mut client);
+    let initial_capture_mappings = semantic_token_capture_mappings(&initial_settings).clone();
 
     client.send_notification(
         "workspace/didChangeConfiguration",
@@ -1413,7 +1418,8 @@ fn test_did_change_configuration_warns_on_nested_capture_mapping_unknown_keys() 
         "nested capture mapping unknown-key update must not also log success; got: {unexpected_success:?}"
     );
 
-    let updated_capture_mappings = query_effective_settings(&mut client)["captureMappings"].clone();
+    let updated_settings = query_effective_settings(&mut client);
+    let updated_capture_mappings = semantic_token_capture_mappings(&updated_settings).clone();
     assert_eq!(
         updated_capture_mappings, initial_capture_mappings,
         "nested capture mapping unknown-key update should leave captureMappings unchanged",
