@@ -434,10 +434,7 @@ mod tests {
 
     #[test]
     fn known_bridge_server_setting_keys_match_schema_properties_and_aliases() {
-        assert_known_keys_match_schema::<BridgeServerConfig>(
-            KNOWN_BRIDGE_SERVER_SETTING_KEYS,
-            &["rootMarkers"],
-        );
+        assert_known_keys_match_schema::<BridgeServerConfig>(KNOWN_BRIDGE_SERVER_SETTING_KEYS, &[]);
     }
 
     #[test]

@@ -373,8 +373,34 @@ impl RootMarker {
 ///
 /// This is used to configure external language servers (like rust-analyzer, pyright)
 /// that kakehashi can redirect requests to for injection regions.
+fn add_deprecated_root_markers_schema(schema: &mut schemars::Schema) {
+    let Some(properties) = schema
+        .as_object_mut()
+        .and_then(|schema| schema.get_mut("properties"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(mut root_markers) = properties.get("workspaceMarkers").cloned() else {
+        return;
+    };
+    let Some(root_markers) = root_markers.as_object_mut() else {
+        return;
+    };
+    root_markers.insert("deprecated".to_owned(), serde_json::Value::Bool(true));
+    root_markers.insert(
+        "description".to_owned(),
+        serde_json::Value::String(
+            "Deprecated alias for `workspaceMarkers`; accepted through v1 and removed in v2."
+                .to_owned(),
+        ),
+    );
+    properties.insert("rootMarkers".to_owned(), root_markers.clone().into());
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(transform = add_deprecated_root_markers_schema)]
 pub struct BridgeServerConfig {
     /// Command array: first element is the program, rest are arguments
     /// e.g., ["rust-analyzer"] or ["pyright-langserver", "--stdio"].
@@ -1290,6 +1316,20 @@ mod tests {
         assert_eq!(
             legacy_aliases.get("deprecated"),
             Some(&serde_json::Value::Bool(true))
+        );
+        let legacy_root_markers = value["$defs"]["BridgeServerConfig"]["properties"]["rootMarkers"]
+            .as_object()
+            .expect("missing languageServers.*.rootMarkers");
+        assert_eq!(
+            legacy_root_markers.get("deprecated"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(
+            legacy_root_markers["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("workspaceMarkers")
+                    && description.contains("removed in v2")),
+            "deprecated rootMarkers schema property should name replacement and deadline"
         );
 
         // snake_case variants must NOT appear
