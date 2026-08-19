@@ -13,6 +13,7 @@
 use crate::helpers::lsp_client::LspClient;
 use crate::helpers::lsp_polling::poll_until;
 use serde_json::json;
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// A directory holding a project config whose `searchPaths` names it.
@@ -70,6 +71,55 @@ fn poll_search_paths(client: &mut LspClient, expected: serde_json::Value, msg: &
         settled.is_some(),
         "{msg}; last seen: {}",
         query_effective_settings(client)["searchPaths"]
+    );
+}
+
+#[test]
+fn test_folder_change_warns_for_legacy_capture_mappings() {
+    let original = project_dir("original");
+    let legacy = project_dir("legacy");
+    std::fs::write(
+        legacy.path().join("kakehashi.toml"),
+        "searchPaths = [\"/legacy\"]\n[captureMappings._.highlights]\nvariable = \"variable\"\n",
+    )
+    .unwrap();
+
+    let mut client = LspClient::builder()
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "workspaceFolders": [folder(&original, "original")],
+            "capabilities": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [folder(&legacy, "legacy")],
+                "removed": [folder(&original, "original")],
+            }
+        }),
+    );
+
+    let (_, params) = client
+        .wait_for_notification_where(&["window/showMessage"], Duration::from_secs(15), |params| {
+            params["message"].as_str().is_some_and(|message| {
+                message.contains("captureMappings") && message.contains("deprecated")
+            })
+        })
+        .expect("the newly selected legacy project config should warn");
+    assert_eq!(params["type"].as_i64(), Some(2));
+    poll_search_paths(
+        &mut client,
+        json!(["/legacy"]),
+        "the legacy project config should still apply",
     );
 }
 

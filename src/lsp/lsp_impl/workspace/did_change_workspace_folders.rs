@@ -103,6 +103,15 @@ impl Kakehashi {
             None,
         );
         self.notifier().log_settings_events(&outcome.events).await;
+        if outcome.deprecated_keys.capture_mappings
+            && self
+                .settings_manager
+                .claim_capture_mappings_deprecation_warning()
+        {
+            self.notifier()
+                .show_warning(crate::config::deprecation::CAPTURE_MAPPINGS_DEPRECATION_NOTICE)
+                .await;
+        }
         let raw = outcome
             .raw_settings
             .unwrap_or_else(crate::config::defaults::default_settings);
