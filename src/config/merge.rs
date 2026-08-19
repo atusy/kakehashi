@@ -2094,6 +2094,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_capture_mappings_override_legacy_mappings_in_the_same_layer() {
+        let settings: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [captureMappings._.highlights]
+            shared = "legacy"
+            legacy_only = "legacy"
+
+            [features."textDocument/semanticTokens".captureMappings._]
+            shared = "canonical"
+            canonical_only = "canonical"
+            "#,
+        )
+        .expect("both spellings should parse during migration");
+
+        let normalized = merge_workspace_settings(Some(settings), None).expect("one layer");
+        let mappings = &semantic_token_capture_mappings(&normalized)[WILDCARD_KEY];
+        assert_eq!(mappings["shared"], "canonical");
+        assert_eq!(mappings["legacy_only"], "legacy");
+        assert_eq!(mappings["canonical_only"], "canonical");
+    }
+
+    #[test]
+    fn higher_layer_wins_across_legacy_and_canonical_spellings() {
+        let legacy: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [captureMappings._.highlights]
+            shared = "legacy"
+            "#,
+        )
+        .expect("legacy settings");
+        let canonical: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."textDocument/semanticTokens".captureMappings._]
+            shared = "canonical"
+            "#,
+        )
+        .expect("canonical settings");
+
+        let canonical_overlay =
+            merge_workspace_settings(Some(legacy.clone()), Some(canonical.clone()))
+                .expect("two layers");
+        assert_eq!(
+            semantic_token_capture_mappings(&canonical_overlay)[WILDCARD_KEY]["shared"],
+            "canonical"
+        );
+
+        let legacy_overlay =
+            merge_workspace_settings(Some(canonical), Some(legacy)).expect("two layers");
+        assert_eq!(
+            semantic_token_capture_mappings(&legacy_overlay)[WILDCARD_KEY]["shared"],
+            "legacy"
+        );
+    }
+
     /// An explicit empty `cmd` says "this server has no command", not "inherit
     /// the wildcard's". Same for `languages`: a list the layer wrote is the
     /// list, empty or not. Omitting the key is what inherits.
