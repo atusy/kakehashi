@@ -129,7 +129,7 @@ Alias resolution is removed: retained `aliases` values no longer register
 alternative language IDs. The input field itself remains accepted and ignored
 through v1 so the server can emit a client-visible migration warning. It is
 removed from the configuration schema and parser in v2, in accordance with
-[Deprecation removal deadlines](deprecation-removal-deadlines.md).
+deprecation-removal-deadlines.
 
 **Migration**: Each `aliases = ["x", "y"]` on language `L` becomes:
 
