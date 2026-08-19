@@ -78,7 +78,7 @@ once the kind is gone — filename inference yields nothing for an unknown
 filename, so they degrade to silently skipped rather than erroring. The
 No capture-mapping counterpart appears for `bindings`, because its vocabulary
 is fixed by this spec rather than user-mapped. Capture remapping belongs only
-to `features.textDocument/semanticTokens` (see
+to `features."textDocument/semanticTokens".captureMappings` (see
 semantic-token-capture-mapping-config), so bindings resolution never consults
 it.
 
