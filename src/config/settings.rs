@@ -369,44 +369,12 @@ impl RootMarker {
     }
 }
 
-fn add_deprecated_root_markers_schema(schema: &mut schemars::Schema) {
-    let Some(schema) = schema.as_object_mut() else {
-        return;
-    };
-    let Some(properties) = schema
-        .get_mut("properties")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
-    };
-    let Some(mut root_markers) = properties.get("workspaceMarkers").cloned() else {
-        return;
-    };
-    let Some(root_markers) = root_markers.as_object_mut() else {
-        return;
-    };
-    root_markers.insert("deprecated".to_owned(), serde_json::Value::Bool(true));
-    root_markers.insert(
-        "description".to_owned(),
-        serde_json::Value::String(
-            "Deprecated alias for `workspaceMarkers`; accepted through v1 and removed in v2."
-                .to_owned(),
-        ),
-    );
-    properties.insert("rootMarkers".to_owned(), root_markers.clone().into());
-    schema.insert(
-        "not".to_owned(),
-        serde_json::json!({ "required": ["workspaceMarkers", "rootMarkers"] }),
-    );
-}
-
 /// Configuration for a bridge language server.
 ///
 /// This is used to configure external language servers (like rust-analyzer, pyright)
 /// that kakehashi can redirect requests to for injection regions.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-#[schemars(transform = add_deprecated_root_markers_schema)]
 pub struct BridgeServerConfig {
     /// Command array: first element is the program, rest are arguments
     /// e.g., ["rust-analyzer"] or ["pyright-langserver", "--stdio"].
@@ -451,9 +419,7 @@ pub struct BridgeServerConfig {
     /// `None` = inherit (built-in default `[".git"]`); an explicit `[]`
     /// disables the search (the client-supplied root is forwarded as-is).
     /// When no marker matches, the client-supplied root is the fallback.
-    ///
-    /// The wire key is `workspaceMarkers`; the pre-rename key `rootMarkers` is
-    /// kept as a deprecated serde alias through v1 and removed in v2.
+    // Compatibility-only v0 spelling; intentionally absent from generated docs.
     #[serde(alias = "rootMarkers")]
     pub workspace_markers: Option<Vec<RootMarker>>,
     /// Trigger characters for bridged `textDocument/onTypeFormatting` (#354).
@@ -811,19 +777,14 @@ pub struct RawWorkspaceSettings {
     /// Per-language configuration (parser paths, queries, bridge filters, base inheritance).
     #[serde(default)]
     pub languages: HashMap<String, LanguageSettings>,
-    /// Deprecated: use
-    /// `features["textDocument/semanticTokens"].captureMappings` instead. This
-    /// legacy shape remains accepted during migration; only its `highlights`
-    /// entries are consumed. It is removed in v2.
+    // Compatibility-only v0 input; intentionally absent from generated docs.
+    #[doc(hidden)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("deprecated" = true))]
+    #[schemars(skip)]
     pub capture_mappings: Option<CaptureMappings>,
-    /// Deprecated: use `languages._.autoInstall` (and per-language
-    /// `languages.<lang>.autoInstall`) instead. Whether to automatically
-    /// install missing parsers and queries. Still honored when no per-language
-    /// value is set, but setting it shows a one-time migration notice. It is
-    /// removed in v2.
-    #[schemars(extend("deprecated" = true))]
+    // Compatibility-only v0 input; intentionally absent from generated docs.
+    #[doc(hidden)]
+    #[schemars(skip)]
     pub auto_install: Option<bool>,
     /// Debounce delay, in milliseconds, between a `didChange` and the diagnostic
     /// pull it triggers. Higher values cut refresh/pull volume during rapid typing
@@ -1022,9 +983,10 @@ pub fn json_schema() -> schemars::Schema {
 /// `rename_all` is load-bearing now that a field is multi-word: the config
 /// surface is camelCase throughout, and dropping it fails
 /// `known_language_setting_keys_match_schema_properties`, which compares the
-/// camelCase `KNOWN_LANGUAGE_SETTING_KEYS` against this struct's generated
-/// schema property names. (The `snake_case leak` assertions nearby only cover
-/// `RawWorkspaceSettings`' own top-level keys, not this type's.)
+/// camelCase `KNOWN_LANGUAGE_SETTING_KEYS` against this struct's canonical
+/// schema properties plus explicitly hidden compatibility inputs. (The
+/// `snake_case leak` assertions nearby only cover `RawWorkspaceSettings`' own
+/// top-level keys, not this type's.)
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LanguageSettings {
@@ -1045,10 +1007,9 @@ pub struct LanguageSettings {
     /// (`virt`/`host`/`native`) per LSP method (`"_"` = method wildcard).
     /// Omit to use the default order `["virt", "host", "native"]`.
     pub layers: Option<LayersConfig>,
-    /// Deprecated and ignored alternative language IDs. The field remains
-    /// accepted for migration warnings through v1 and is removed in v2; use
-    /// `base` on each derived language instead.
-    #[schemars(extend("deprecated" = true))]
+    // Compatibility-only v0 input; intentionally absent from generated docs.
+    #[doc(hidden)]
+    #[schemars(skip)]
     pub aliases: Option<Vec<String>>,
     /// Whether missing parsers/queries for this language may be auto-installed.
     ///
@@ -1289,43 +1250,30 @@ mod tests {
         // Top-level properties should use camelCase (from serde renames)
         let props = value.get("properties").expect("should have properties");
         assert!(props.get("searchPaths").is_some(), "missing searchPaths");
-        let legacy_auto_install = props.get("autoInstall").expect("missing autoInstall");
-        assert_eq!(
-            legacy_auto_install.get("deprecated"),
-            Some(&serde_json::Value::Bool(true))
+        assert!(
+            props.get("autoInstall").is_none(),
+            "deprecated top-level autoInstall must not be advertised"
         );
         assert!(
             props.get("diagnosticsDebounceMs").is_some(),
             "missing diagnosticsDebounceMs"
         );
-        let legacy_capture_mappings = props
-            .get("captureMappings")
-            .expect("missing captureMappings");
-        assert_eq!(
-            legacy_capture_mappings.get("deprecated"),
-            Some(&serde_json::Value::Bool(true))
-        );
         assert!(
-            legacy_capture_mappings["description"]
-                .as_str()
-                .is_some_and(|description| description
-                    .contains("features[\"textDocument/semanticTokens\"].captureMappings")),
-            "deprecated schema property should name its replacement"
+            props.get("captureMappings").is_none(),
+            "deprecated top-level captureMappings must not be advertised"
         );
         assert!(
             props.get("languageServers").is_some(),
             "missing languageServers"
         );
-        let legacy_aliases = value["$defs"]["LanguageSettings"]["properties"]["aliases"]
-            .as_object()
-            .expect("missing languages.*.aliases");
-        assert_eq!(
-            legacy_aliases.get("deprecated"),
-            Some(&serde_json::Value::Bool(true))
+        assert!(
+            value["$defs"]["LanguageSettings"]["properties"]["aliases"].is_null(),
+            "deprecated aliases must not be advertised"
         );
-        let legacy_root_markers = value["$defs"]["BridgeServerConfig"]["properties"]["rootMarkers"]
-            .as_object()
-            .expect("missing languageServers.*.rootMarkers");
+        assert!(
+            value["$defs"]["BridgeServerConfig"]["properties"]["rootMarkers"].is_null(),
+            "deprecated rootMarkers must not be advertised"
+        );
         assert!(
             value["$defs"]["BridgeServerConfig"]["description"]
                 .as_str()
@@ -1334,21 +1282,9 @@ mod tests {
                 ),
             "BridgeServerConfig should retain its public type description"
         );
-        assert_eq!(
-            value["$defs"]["BridgeServerConfig"]["not"]["required"],
-            serde_json::json!(["workspaceMarkers", "rootMarkers"]),
-            "canonical and deprecated marker keys should be mutually exclusive"
-        );
-        assert_eq!(
-            legacy_root_markers.get("deprecated"),
-            Some(&serde_json::Value::Bool(true))
-        );
         assert!(
-            legacy_root_markers["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("workspaceMarkers")
-                    && description.contains("removed in v2")),
-            "deprecated rootMarkers schema property should name replacement and deadline"
+            value["$defs"]["BridgeServerConfig"]["not"].is_null(),
+            "schema should not encode constraints for an unadvertised alias"
         );
 
         // snake_case variants must NOT appear

@@ -387,7 +387,10 @@ mod tests {
 
     #[test]
     fn known_workspace_setting_keys_match_schema_properties() {
-        assert_known_keys_match_schema::<RawWorkspaceSettings>(KNOWN_WORKSPACE_SETTING_KEYS, &[]);
+        assert_known_keys_match_schema::<RawWorkspaceSettings>(
+            KNOWN_WORKSPACE_SETTING_KEYS,
+            &["autoInstall", "captureMappings"],
+        );
     }
 
     #[test]
@@ -434,7 +437,10 @@ mod tests {
 
     #[test]
     fn known_bridge_server_setting_keys_match_schema_properties_and_aliases() {
-        assert_known_keys_match_schema::<BridgeServerConfig>(KNOWN_BRIDGE_SERVER_SETTING_KEYS, &[]);
+        assert_known_keys_match_schema::<BridgeServerConfig>(
+            KNOWN_BRIDGE_SERVER_SETTING_KEYS,
+            &["rootMarkers"],
+        );
     }
 
     #[test]
@@ -494,7 +500,10 @@ mod tests {
 
     #[test]
     fn known_language_setting_keys_match_schema_properties() {
-        assert_known_keys_match_schema::<LanguageSettings>(KNOWN_LANGUAGE_SETTING_KEYS, &[]);
+        assert_known_keys_match_schema::<LanguageSettings>(
+            KNOWN_LANGUAGE_SETTING_KEYS,
+            &["aliases"],
+        );
     }
 
     #[test]
