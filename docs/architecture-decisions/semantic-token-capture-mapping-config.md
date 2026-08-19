@@ -37,15 +37,15 @@ Configuration layering continues to follow configuration-merging-strategy:
 later layers override duplicate capture names while inheriting names they omit.
 Within one layer that contains both spellings, the canonical feature-scoped
 value wins duplicate names and retains names present only in the legacy shape.
-Merge order is inherited mappings, then the legacy spelling (including an
-empty root or language clear), then the canonical spelling. Thus a legacy
-clear removes the corresponding inherited mappings before canonical entries
-from the same layer are added.
-An explicitly empty root map clears every language mapping, and an explicitly
-empty language map clears that language entry inherited from lower
-configuration layers. The `_` mappings still apply during the later wildcard
-resolution step, so an empty language entry does not opt that language out of
-wildcard mappings.
+Merge order is inherited mappings, then the legacy spelling (including a
+clear), then the canonical spelling. In the legacy spelling,
+`captureMappings = {}` clears every inherited language mapping, while
+`highlights = {}` under a `[captureMappings.<language>]` table clears that
+language's inherited entry. A bare legacy `[captureMappings.<language>]` table
+omits `highlights` and therefore does not clear it. The clear is applied before
+canonical entries from the same layer are added. The `_` mappings still apply
+during the later wildcard resolution step, so a language clear does not opt
+that language out of wildcard mappings.
 
 Wildcard resolution continues to follow wildcard-config-inheritance: `_`
 provides defaults for language-specific entries after cross-layer merging.
