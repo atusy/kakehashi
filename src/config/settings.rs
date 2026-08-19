@@ -369,10 +369,6 @@ impl RootMarker {
     }
 }
 
-/// Configuration for a bridge language server.
-///
-/// This is used to configure external language servers (like rust-analyzer, pyright)
-/// that kakehashi can redirect requests to for injection regions.
 fn add_deprecated_root_markers_schema(schema: &mut schemars::Schema) {
     let Some(properties) = schema
         .as_object_mut()
@@ -398,6 +394,10 @@ fn add_deprecated_root_markers_schema(schema: &mut schemars::Schema) {
     properties.insert("rootMarkers".to_owned(), root_markers.clone().into());
 }
 
+/// Configuration for a bridge language server.
+///
+/// This is used to configure external language servers (like rust-analyzer, pyright)
+/// that kakehashi can redirect requests to for injection regions.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(transform = add_deprecated_root_markers_schema)]
@@ -1320,6 +1320,14 @@ mod tests {
         let legacy_root_markers = value["$defs"]["BridgeServerConfig"]["properties"]["rootMarkers"]
             .as_object()
             .expect("missing languageServers.*.rootMarkers");
+        assert!(
+            value["$defs"]["BridgeServerConfig"]["description"]
+                .as_str()
+                .is_some_and(
+                    |description| description.contains("configure external language servers")
+                ),
+            "BridgeServerConfig should retain its public type description"
+        );
         assert_eq!(
             legacy_root_markers.get("deprecated"),
             Some(&serde_json::Value::Bool(true))
