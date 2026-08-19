@@ -657,7 +657,6 @@ pub(crate) fn on_type_formatting_trigger_union(
 
 /// Deprecated wrapper around semantic-token highlight mappings.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct QueryTypeMappings {
     /// Capture mappings for highlights queries. Omit to inherit; `{}` clears.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1574,16 +1573,23 @@ mod tests {
     }
 
     #[test]
-    fn legacy_folds_capture_mappings_are_rejected() {
-        let result = toml::from_str::<RawWorkspaceSettings>(
+    fn legacy_folds_does_not_discard_sibling_highlights() {
+        let settings = toml::from_str::<RawWorkspaceSettings>(
             r#"
             [captureMappings._.folds]
             comment = "comment"
+
+            [captureMappings._.highlights]
+            variable = "variable"
             "#,
-        );
-        assert!(
-            result.is_err(),
-            "the never-consumed folds field was removed"
+        )
+        .expect("unknown legacy query kinds should follow the normal tolerant parser policy");
+        assert_eq!(
+            settings.capture_mappings.expect("legacy mappings")["_"]
+                .highlights
+                .as_ref()
+                .expect("highlights")["variable"],
+            "variable"
         );
     }
 
