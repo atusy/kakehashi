@@ -64,6 +64,14 @@ pub(crate) const AUTO_INSTALL_DEPRECATION_NOTICE: &str = "kakehashi: the top-lev
      `base` inherits nothing from `_`, so give those an explicit value. The \
      top-level key still works for now but may be removed in a future release.";
 
+/// User-facing text for the one-per-session top-level `captureMappings`
+/// notice. The dotted path is usable for both TOML and JSON configuration.
+pub(crate) const CAPTURE_MAPPINGS_DEPRECATION_NOTICE: &str = "kakehashi: the top-level `captureMappings` config key is deprecated; move highlight mappings to \
+     `features.textDocument/semanticTokens.captureMappings` and remove the \
+     intermediate `highlights` key. The top-level key still works for now but \
+     may be removed in a future release; its unused `folds` mappings have no \
+     replacement.";
+
 /// Which deprecated keys the raw TOML text spells.
 ///
 /// Returns all-false for unparseable input: this is a best-effort migration

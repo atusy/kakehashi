@@ -76,6 +76,7 @@ pub(crate) struct SettingsManager {
     /// which path (initialize or didChangeConfiguration) first sees it.
     root_markers_deprecation_warned: AtomicBool,
     auto_install_deprecation_warned: AtomicBool,
+    capture_mappings_deprecation_warned: AtomicBool,
     /// Latches once an unwrapped runtime `workspace/didChangeConfiguration`
     /// payload has been warned about. Unlike `rootMarkers`, this applies only to
     /// client-pushed runtime settings, not initializationOptions or TOML files.
@@ -133,6 +134,7 @@ impl SettingsManager {
             client_capabilities: OnceLock::new(),
             root_markers_deprecation_warned: AtomicBool::new(false),
             auto_install_deprecation_warned: AtomicBool::new(false),
+            capture_mappings_deprecation_warned: AtomicBool::new(false),
             unwrapped_didchange_deprecation_warned: AtomicBool::new(false),
             empty_container_migration_warned: AtomicBool::new(false),
         }
@@ -155,6 +157,14 @@ impl SettingsManager {
     pub(crate) fn claim_auto_install_deprecation_warning(&self) -> bool {
         !self
             .auto_install_deprecation_warned
+            .swap(true, Ordering::Relaxed)
+    }
+
+    /// Claim the one-per-session slot for the deprecated top-level
+    /// `captureMappings` key.
+    pub(crate) fn claim_capture_mappings_deprecation_warning(&self) -> bool {
+        !self
+            .capture_mappings_deprecation_warned
             .swap(true, Ordering::Relaxed)
     }
 
@@ -834,6 +844,13 @@ mod tests {
     }
 
     #[test]
+    fn claim_capture_mappings_deprecation_warning_is_true_exactly_once() {
+        let manager = SettingsManager::new();
+        assert!(manager.claim_capture_mappings_deprecation_warning());
+        assert!(!manager.claim_capture_mappings_deprecation_warning());
+    }
+
+    #[test]
     fn deprecation_claim_slots_are_independent() {
         // A config carrying both deprecated keys must warn about both; one
         // shared latch would silently drop the second notice.
@@ -844,6 +861,10 @@ mod tests {
             "claiming rootMarkers must not consume the autoInstall slot"
         );
         assert!(manager.claim_unwrapped_didchange_deprecation_warning());
+        assert!(
+            manager.claim_capture_mappings_deprecation_warning(),
+            "claiming other deprecations must not consume the captureMappings slot"
+        );
     }
 
     #[test]

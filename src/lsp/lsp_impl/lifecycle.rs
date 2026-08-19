@@ -414,6 +414,15 @@ impl Kakehashi {
                 .show_warning(crate::config::deprecation::AUTO_INSTALL_DEPRECATION_NOTICE)
                 .await;
         }
+        if settings_outcome.deprecated_keys.capture_mappings
+            && self
+                .settings_manager
+                .claim_capture_mappings_deprecation_warning()
+        {
+            self.notifier()
+                .show_warning(crate::config::deprecation::CAPTURE_MAPPINGS_DEPRECATION_NOTICE)
+                .await;
+        }
         // Same shape for the empty-container rule change: what the layers said
         // still parses, and now means something else.
         if let Some(notice) =

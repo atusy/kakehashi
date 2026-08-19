@@ -337,6 +337,15 @@ impl Kakehashi {
                 .show_warning(crate::config::deprecation::AUTO_INSTALL_DEPRECATION_NOTICE)
                 .await;
         }
+        if pushed_deprecated_keys.capture_mappings
+            && self
+                .settings_manager
+                .claim_capture_mappings_deprecation_warning()
+        {
+            self.notifier()
+                .show_warning(crate::config::deprecation::CAPTURE_MAPPINGS_DEPRECATION_NOTICE)
+                .await;
+        }
 
         if uses_deprecated_unwrapped_shape
             && self
