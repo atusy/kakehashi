@@ -366,6 +366,46 @@ pub fn load_settings(
     env_fn: impl Fn(&str) -> Option<String>,
     explicit: Option<ExplicitConfig>,
 ) -> SettingsLoadOutcome {
+    load_settings_impl(
+        root_path,
+        ClientSettingsLayers::Serialized(override_settings),
+        home,
+        env_fn,
+        explicit,
+    )
+}
+
+/// Reload settings while replaying already parsed client layers in their
+/// original order. Keeping the layers distinct preserves non-associative clear
+/// operations across workspace-root changes.
+pub(crate) fn load_settings_with_client_layers(
+    root_path: Option<&Path>,
+    client_layers: Vec<RawWorkspaceSettings>,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+    explicit: Option<ExplicitConfig>,
+) -> SettingsLoadOutcome {
+    load_settings_impl(
+        root_path,
+        ClientSettingsLayers::Parsed(client_layers),
+        home,
+        env_fn,
+        explicit,
+    )
+}
+
+enum ClientSettingsLayers {
+    Serialized(Option<(SettingsSource, Value)>),
+    Parsed(Vec<RawWorkspaceSettings>),
+}
+
+fn load_settings_impl(
+    root_path: Option<&Path>,
+    client_layers: ClientSettingsLayers,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+    explicit: Option<ExplicitConfig>,
+) -> SettingsLoadOutcome {
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
     let mut deprecated_keys = DeprecatedKeysSeen::default();
@@ -414,30 +454,34 @@ pub fn load_settings(
         ]
     };
 
-    // Layer 4: Override settings from initialization options or client configuration.
+    // Layers 4+: Override settings from initialization options or client configuration.
     //
     // Client-supplied paths are workspace-local: the client knows the workspace
     // it opened, not the directory the server was launched from.
-    let override_settings = override_settings
-        .and_then(|(source, value)| {
-            parse_override_settings(source, value, &mut events, &mut deprecated_keys)
-        })
-        .map(|mut settings| {
-            let _ = anchor_settings_paths(&mut settings, root_path);
-            settings
-        });
+    let mut client_layers = match client_layers {
+        ClientSettingsLayers::Serialized(settings) => settings
+            .and_then(|(source, value)| {
+                parse_override_settings(source, value, &mut events, &mut deprecated_keys)
+            })
+            .into_iter()
+            .collect(),
+        ClientSettingsLayers::Parsed(settings) => settings,
+    };
+    for settings in &mut client_layers {
+        let _ = anchor_settings_paths(settings, root_path);
+    }
 
     let empty_container_notice = empty_container_notice_for_layers(
         config_layers
             .iter()
             .filter_map(Option::as_ref)
-            .chain(override_settings.as_ref()),
+            .chain(client_layers.iter()),
     );
 
-    // Merge all layers: defaults < config_layers < override (later layers override earlier)
+    // Merge all layers: defaults < config layers < client layers.
     let mut layers = vec![defaults];
     layers.extend(config_layers);
-    layers.push(override_settings);
+    layers.extend(client_layers.into_iter().map(Some));
     let merged = fold_layers(layers);
     let raw_settings = merged.clone();
     let settings = expand_merged_settings(merged, home, &env_fn, &mut events);
@@ -925,6 +969,76 @@ mod tests {
         // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", config_home) };
         f()
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn replayed_client_layers_are_anchored_to_the_reloaded_root() {
+        let config_home = TempDir::new().expect("config home");
+        let root = TempDir::new().expect("workspace root");
+        let client_layer = RawWorkspaceSettings {
+            search_paths: Some(vec!["relative-parser".to_string()]),
+            ..Default::default()
+        };
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings_with_client_layers(
+                Some(root.path()),
+                vec![client_layer],
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        assert_eq!(
+            outcome.raw_settings.expect("merged settings").search_paths,
+            Some(vec![
+                root.path()
+                    .join("relative-parser")
+                    .to_string_lossy()
+                    .into_owned()
+            ])
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn replayed_client_layers_replace_invalid_lower_values_before_validation() {
+        let config_home = TempDir::new().expect("config home");
+        let root = TempDir::new().expect("workspace root");
+        std::fs::write(
+            root.path().join("kakehashi.toml"),
+            "searchPaths = [\"$MISSING_PROJECT_PATH\"]\n",
+        )
+        .expect("project config");
+        let client_layer = RawWorkspaceSettings {
+            search_paths: Some(vec!["client-parser".to_string()]),
+            ..Default::default()
+        };
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings_with_client_layers(
+                Some(root.path()),
+                vec![client_layer],
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        assert!(
+            outcome.settings.is_some(),
+            "client layer should repair base"
+        );
+        assert!(
+            outcome
+                .events
+                .iter()
+                .all(|event| !event.message.contains("Invalid configuration")),
+            "only the fully merged layers should be validated: {:?}",
+            outcome.events
+        );
     }
 
     /// A user config file at `<config_home>/kakehashi/kakehashi.toml`, returning
