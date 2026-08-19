@@ -370,9 +370,11 @@ impl RootMarker {
 }
 
 fn add_deprecated_root_markers_schema(schema: &mut schemars::Schema) {
+    let Some(schema) = schema.as_object_mut() else {
+        return;
+    };
     let Some(properties) = schema
-        .as_object_mut()
-        .and_then(|schema| schema.get_mut("properties"))
+        .get_mut("properties")
         .and_then(serde_json::Value::as_object_mut)
     else {
         return;
@@ -392,6 +394,10 @@ fn add_deprecated_root_markers_schema(schema: &mut schemars::Schema) {
         ),
     );
     properties.insert("rootMarkers".to_owned(), root_markers.clone().into());
+    schema.insert(
+        "not".to_owned(),
+        serde_json::json!({ "required": ["workspaceMarkers", "rootMarkers"] }),
+    );
 }
 
 /// Configuration for a bridge language server.
@@ -1327,6 +1333,11 @@ mod tests {
                     |description| description.contains("configure external language servers")
                 ),
             "BridgeServerConfig should retain its public type description"
+        );
+        assert_eq!(
+            value["$defs"]["BridgeServerConfig"]["not"]["required"],
+            serde_json::json!(["workspaceMarkers", "rootMarkers"]),
+            "canonical and deprecated marker keys should be mutually exclusive"
         );
         assert_eq!(
             legacy_root_markers.get("deprecated"),
