@@ -1268,14 +1268,14 @@ mod tests {
     }
 
     #[test]
-    fn feature_policy_rejects_unknown_methods_and_fields() {
-        for invalid in [
+    fn feature_policy_deserialization_tolerates_unknown_methods_and_fields() {
+        for input in [
             r#"[features."workspace/diagnostic/refresh"]
                debouncMs = 100"#,
             r#"[features."workspace/diagnostics/refresh"]
                debounceMs = 100"#,
         ] {
-            assert!(toml::from_str::<RawWorkspaceSettings>(invalid).is_err());
+            assert!(toml::from_str::<RawWorkspaceSettings>(input).is_ok());
         }
     }
 

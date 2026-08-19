@@ -1180,18 +1180,24 @@ mod tests {
     }
 
     #[test]
-    fn log_message_level_rejects_unknown_values_and_fields() {
+    fn log_message_level_rejects_unknown_values_but_tolerates_unknown_fields() {
         assert!(
             toml::from_str::<RawWorkspaceSettings>(
                 "[features.\"window/logMessage\"]\nlogLevel = \"debug\""
             )
             .is_err()
         );
-        assert!(
-            toml::from_str::<RawWorkspaceSettings>(
-                "[features.\"window/logMessage\"]\nlevel = \"info\""
-            )
-            .is_err()
+        let raw = toml::from_str::<RawWorkspaceSettings>(
+            "[features.\"window/logMessage\"]\nlevel = \"info\"\nlogLevel = \"warning\"",
+        );
+        assert_eq!(
+            raw.unwrap()
+                .features
+                .unwrap()
+                .window_log_message
+                .unwrap()
+                .log_level,
+            Some(LogMessageLevel::Warning)
         );
     }
 
