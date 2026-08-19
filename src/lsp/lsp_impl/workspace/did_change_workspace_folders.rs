@@ -73,18 +73,6 @@ impl Kakehashi {
             self.settings_manager.folderless_root_path(),
         );
 
-        // An explicit `--config-file` replaces the whole config-file stack, so
-        // the project layer at the workspace root is never consulted and no
-        // file layer can change when the root does. Those files are also read
-        // exactly once by contract, which leaves this reload nothing to read
-        // and only initialize's settings events to re-emit. Refreshing the root
-        // — which still anchors relative paths — and stopping there is the whole
-        // of it.
-        if crate::config::expand::config_file_override().is_some() {
-            self.settings_manager.set_root_path(root_path);
-            return;
-        }
-
         // The root stays local until the settings derived from it are the ones
         // in effect. Publishing it earlier would leave a rejected reload with
         // the new root over the old snapshot, so the next pushed layer would
@@ -99,8 +87,10 @@ impl Kakehashi {
             client_overrides,
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
-            // The branch above returned for every session that has one.
-            None,
+            // Explicit files are never re-read. Initialize retained their
+            // already-parsed, already-anchored layers specifically for this
+            // replay; only client-relative layers move with the workspace.
+            self.explicit_config.get().cloned().flatten(),
         );
         self.notifier().log_settings_events(&outcome.events).await;
         if outcome.deprecated_keys.capture_mappings

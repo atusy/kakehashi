@@ -116,6 +116,7 @@ const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
 /// second time. (Naming a stream is not a supported workflow — one with no
 /// writer will simply block initialization — but reading once is what keeps the
 /// failure mode that of the path the user chose.)
+#[derive(Clone)]
 pub(crate) struct ExplicitConfig {
     layers: Vec<Option<RawWorkspaceSettings>>,
     events: Vec<SettingsEvent>,
@@ -123,6 +124,19 @@ pub(crate) struct ExplicitConfig {
     /// Why this configuration cannot be used, if it cannot. `initialize` must
     /// reject the session when this is set.
     pub(crate) fatal_error: Option<String>,
+}
+
+impl ExplicitConfig {
+    /// Retain the already-read layers for workspace-root replay without
+    /// pretending the files were read again or re-emitting their load events.
+    pub(crate) fn for_replay(&self) -> Self {
+        Self {
+            layers: self.layers.clone(),
+            events: Vec::new(),
+            deprecated_keys: self.deprecated_keys,
+            fatal_error: None,
+        }
+    }
 }
 
 /// Read and judge the `--config-file` inputs, or `None` if there are none.

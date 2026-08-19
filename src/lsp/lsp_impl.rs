@@ -342,6 +342,9 @@ pub struct Kakehashi {
     /// effective snapshot so a workspace-root change can replay clears as well
     /// as values without carrying the previous project's layer forward.
     client_settings_overrides: std::sync::RwLock<Vec<RawWorkspaceSettings>>,
+    /// Explicit config layers retained after their single allowed read, so a
+    /// workspace-root change can replay relative client layers above them.
+    explicit_config: std::sync::OnceLock<Option<crate::lsp::settings::ExplicitConfig>>,
     /// Isolated coordinator for parser auto-installation
     auto_install: AutoInstallManager,
     /// Bridge coordinator for downstream LS pool and node tracking
@@ -495,6 +498,7 @@ impl Kakehashi {
             cache: std::sync::Arc::new(CacheCoordinator::new()),
             settings_manager: std::sync::Arc::new(SettingsManager::new()),
             client_settings_overrides: std::sync::RwLock::new(Vec::new()),
+            explicit_config: std::sync::OnceLock::new(),
             auto_install,
             bridge: std::sync::Arc::new(bridge),
             synthetic_diagnostics: std::sync::Arc::new(SyntheticDiagnosticsManager::new()),

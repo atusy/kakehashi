@@ -297,6 +297,11 @@ impl Kakehashi {
         {
             return Err(configuration_load_error(error));
         }
+        let _ = self.explicit_config.set(
+            explicit_config
+                .as_ref()
+                .map(crate::lsp::settings::ExplicitConfig::for_replay),
+        );
 
         let position_encoding = host_position_encoding(&params.capabilities);
         // Store client capabilities for LSP compliance checks (e.g., refresh support).
