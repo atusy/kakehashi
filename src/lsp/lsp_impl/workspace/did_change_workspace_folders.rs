@@ -112,6 +112,13 @@ impl Kakehashi {
                 .show_warning(crate::config::deprecation::CAPTURE_MAPPINGS_DEPRECATION_NOTICE)
                 .await;
         }
+        if let Some(notice) = outcome.empty_container_notice.as_deref()
+            && self
+                .settings_manager
+                .claim_empty_container_migration_warning()
+        {
+            self.notifier().show_warning(notice).await;
+        }
         let raw = outcome
             .raw_settings
             .unwrap_or_else(crate::config::defaults::default_settings);

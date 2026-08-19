@@ -123,6 +123,54 @@ fn test_folder_change_warns_for_legacy_capture_mappings() {
     );
 }
 
+#[test]
+fn test_folder_change_preserves_empty_mapping_migration_notice() {
+    let original = project_dir("original");
+    let legacy = project_dir("legacy-empty");
+    std::fs::write(
+        legacy.path().join("kakehashi.toml"),
+        "searchPaths = [\"/legacy-empty\"]\ncaptureMappings = {}\n",
+    )
+    .unwrap();
+
+    let mut client = LspClient::builder()
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "workspaceFolders": [folder(&original, "original")],
+            "capabilities": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [folder(&legacy, "legacy")],
+                "removed": [folder(&original, "original")],
+            }
+        }),
+    );
+
+    let (_, params) = client
+        .wait_for_notification_where(&["window/showMessage"], Duration::from_secs(15), |params| {
+            params["message"].as_str().is_some_and(|message| {
+                message.contains("empty list or map") && message.contains("captureMappings")
+            })
+        })
+        .expect("the authored empty mapping should retain its migration notice");
+    assert_eq!(params["type"].as_i64(), Some(2));
+    poll_search_paths(
+        &mut client,
+        json!(["/legacy-empty"]),
+        "the empty mapping project config should still apply",
+    );
+}
+
 /// Removing the last workspace folder must not leave the session rootless when
 /// the client named another root.
 ///
