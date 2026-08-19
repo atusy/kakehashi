@@ -78,6 +78,15 @@ pub(crate) fn sort_and_dedup_unknown_keys(unknown_keys: &mut Vec<String>) {
     unknown_keys.dedup();
 }
 
+pub(crate) fn unknown_toml_workspace_setting_keys(contents: &str) -> Vec<String> {
+    let Ok(value) = toml::from_str::<Value>(contents) else {
+        return Vec::new();
+    };
+    let mut keys = unknown_workspace_setting_keys(&value);
+    sort_and_dedup_unknown_keys(&mut keys);
+    keys
+}
+
 fn unknown_object_keys(path: &str, value: &Value, known_keys: &[&str]) -> Vec<String> {
     let Some(object) = value.as_object() else {
         return Vec::new();

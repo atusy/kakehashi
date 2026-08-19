@@ -141,28 +141,21 @@ pub(crate) fn load_explicit_config(
     Some(read_explicit_layers(files, home, env_fn))
 }
 
-/// Keys in a TOML config file that kakehashi does not recognise.
-///
-/// Reuses the walker the `workspace/didChangeConfiguration` path uses, via a
-/// JSON round-trip, so both routes judge a key by the same schema. An empty
-/// result when the TOML cannot be re-read as a generic value is deliberate:
-/// this only ever *reports*, so a limitation of the conversion must not be
-/// louder than the settings it is describing.
-fn unknown_config_keys(contents: &str) -> Vec<String> {
-    let Ok(value) = toml::from_str::<Value>(contents) else {
-        return Vec::new();
-    };
-    let mut keys = crate::config::unknown_keys::unknown_workspace_setting_keys(&value);
-    crate::config::unknown_keys::sort_and_dedup_unknown_keys(&mut keys);
-    keys
-}
-
 fn append_unknown_config_key_warnings(
     contents: &str,
     config_path: &Path,
     events: &mut Vec<SettingsEvent>,
 ) {
-    for key in unknown_config_keys(contents) {
+    let keys = crate::config::unknown_keys::unknown_toml_workspace_setting_keys(contents);
+    append_unknown_key_warnings(&keys, config_path, events);
+}
+
+fn append_unknown_key_warnings(
+    unknown_keys: &[String],
+    config_path: &Path,
+    events: &mut Vec<SettingsEvent>,
+) {
+    for key in unknown_keys {
         events.push(SettingsEvent::warning(format!(
             "Unknown configuration key in {}: {key}",
             config_path.display()
@@ -643,6 +636,7 @@ fn load_user_config_with_events(
             events.push(SettingsEvent::info(
                 "Loaded user config from XDG_CONFIG_HOME",
             ));
+            append_unknown_key_warnings(&config.unknown_keys, &config.path, events);
             deprecated_keys.merge(config.deprecated_keys);
             Some((config.settings, config.path))
         }
@@ -2316,6 +2310,56 @@ mod tests {
                         .message
                         .contains("features.textDocument/publishDiagnostics.futureOption")),
             "the ignored key and workspace file should be named: {events:?}"
+        );
+        assert_eq!(
+            settings
+                .features
+                .expect("features")
+                .text_document_publish_diagnostics
+                .expect("publish diagnostics")
+                .debounce_ms,
+            Some(12)
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn load_user_config_warns_about_unknown_feature_key_without_discarding_siblings() {
+        let original_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let dir = TempDir::new().unwrap();
+        let config_dir = dir.path().join("kakehashi");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("kakehashi.toml");
+        std::fs::write(
+            &config_path,
+            "[features.\"textDocument/publishDiagnostics\"]\ndebounceMs = 12\nfutureOption = 1\n",
+        )
+        .unwrap();
+        // SAFETY: serial(xdg_env) prevents concurrent mutation in this test module.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+
+        let mut events = Vec::new();
+        let mut deprecated_keys = DeprecatedKeysSeen::default();
+        let loaded = load_user_config_with_events(&mut events, &mut deprecated_keys);
+
+        // SAFETY: serial(xdg_env) prevents concurrent mutation in this test module.
+        unsafe {
+            match original_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        let settings = loaded.expect("user config").0;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == SettingsEventKind::Warning
+                    && event.message.contains(&config_path.display().to_string())
+                    && event
+                        .message
+                        .contains("features.textDocument/publishDiagnostics.futureOption")),
+            "the ignored key and user config should be named: {events:?}"
         );
         assert_eq!(
             settings
