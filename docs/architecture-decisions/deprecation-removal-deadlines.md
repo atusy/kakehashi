@@ -4,6 +4,7 @@
 - [configuration-merging-strategy](configuration-merging-strategy.md)
 - [semantic-token-capture-mapping-config](semantic-token-capture-mapping-config.md)
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)
+- [base-language-inheritance](base-language-inheritance.md)
 
 ## Context
 

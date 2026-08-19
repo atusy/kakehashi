@@ -540,6 +540,7 @@ languageServers:
 - **[bridge-routing-protocol](bridge-routing-protocol.md)**: Downstream routing delegation
   - A routing provider's `workspaceFolders` answer overrides the marker-walk root resolution
   - `forceStart` spawns eagerly — the `#shared` key with the primary-root seed for `preferSharedInstance` servers, the marker-less fallback shape otherwise
+- **[deprecation-removal-deadlines](deprecation-removal-deadlines.md)**: Compile-time removal boundary for the `rootMarkers` compatibility key
 
 ## Amendment History
 
@@ -577,8 +578,8 @@ languageServers:
   walk's URL cannot fake a mismatch).
 - **2026-07-01**: Renamed the `languageServers.*.rootMarkers` config key to
   `workspaceMarkers` (aligning with the LSP spec's `workspaceFolders`); the old
-  `rootMarkers` is accepted as a deprecated serde alias for backward
-  compatibility. The marker walk itself and the pool-keying behavior are
+  `rootMarkers` is accepted as a deprecated serde alias through v1 and removed
+  in v2. The marker walk itself and the pool-keying behavior are
   unchanged; only the config key name moved. Earlier amendment entries below
   still reference the pre-rename key as the historical record of their date.
 - **2026-06-20**: Added the per-server `preferSharedInstance` opt-in (#391): capability-gated routing to one `ConnectionKey::shared` connection across roots, a mutable per-connection `WorkspaceFolderSet`, and `workspace/didChangeWorkspaceFolders` emission ahead of `didOpen` for newly joined roots. Default stays per-root (#382); incapable servers (no `workspace.workspaceFolders.{supported, changeNotifications}`) log once and fall back to per-root.

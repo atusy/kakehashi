@@ -210,6 +210,7 @@ base = "L"
 - [language-detection-fallback-chain](language-detection-fallback-chain.md): Language detection fallback chain (alias resolution replaced by base resolution)
 - [configuration-merging-strategy](configuration-merging-strategy.md): Cross-layer configuration merging (base chain operates after layer merging)
 - [wildcard-config-inheritance](wildcard-config-inheritance.md): Wildcard config inheritance (`base` generalizes `_` inheritance)
+- [deprecation-removal-deadlines](deprecation-removal-deadlines.md): Compile-time removal boundary for the retained `aliases` input field
 
 ## Appendix: Configuration Examples
 
