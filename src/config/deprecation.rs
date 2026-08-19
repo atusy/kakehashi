@@ -29,12 +29,15 @@ pub(crate) struct DeprecatedKeysSeen {
     pub(crate) root_markers: bool,
     /// Top-level `autoInstall`, superseded by `[languages.*] autoInstall`.
     pub(crate) auto_install: bool,
+    /// Top-level `captureMappings`, superseded by the semantic-token feature.
+    pub(crate) capture_mappings: bool,
 }
 
 impl DeprecatedKeysSeen {
     pub(crate) fn merge(&mut self, other: Self) {
         self.root_markers |= other.root_markers;
         self.auto_install |= other.auto_install;
+        self.capture_mappings |= other.capture_mappings;
     }
 }
 
@@ -87,6 +90,9 @@ pub(crate) fn toml_deprecated_keys(contents: &str) -> DeprecatedKeysSeen {
         auto_install: value
             .as_table()
             .is_some_and(|table| table.contains_key("autoInstall")),
+        capture_mappings: value
+            .as_table()
+            .is_some_and(|table| table.contains_key("captureMappings")),
     }
 }
 
@@ -107,6 +113,7 @@ pub(crate) fn json_deprecated_keys(value: &JsonValue) -> DeprecatedKeysSeen {
         auto_install: value
             .as_object()
             .is_some_and(|object| object.contains_key("autoInstall")),
+        capture_mappings: false,
     }
 }
 
@@ -123,18 +130,25 @@ mod tests {
         let mut seen = DeprecatedKeysSeen {
             root_markers: true,
             auto_install: true,
+            capture_mappings: true,
         };
         seen.merge(DeprecatedKeysSeen::default());
         assert!(seen.root_markers, "a later clean layer must not clear this");
         assert!(seen.auto_install, "a later clean layer must not clear this");
+        assert!(
+            seen.capture_mappings,
+            "a later clean layer must not clear this"
+        );
 
         // And it must still pick flags UP from a later layer.
         let mut none = DeprecatedKeysSeen::default();
         none.merge(DeprecatedKeysSeen {
             root_markers: false,
             auto_install: true,
+            capture_mappings: true,
         });
         assert!(none.auto_install);
+        assert!(none.capture_mappings);
         assert!(!none.root_markers);
     }
 
@@ -142,6 +156,25 @@ mod tests {
     fn toml_detects_the_deprecated_top_level_auto_install() {
         assert!(toml_deprecated_keys("autoInstall = true").auto_install);
         assert!(toml_deprecated_keys("autoInstall = false").auto_install);
+    }
+
+    #[test]
+    fn toml_distinguishes_deprecated_and_canonical_capture_mappings() {
+        let deprecated = toml_deprecated_keys(
+            r#"
+            [captureMappings._.highlights]
+            variable = "variable"
+            "#,
+        );
+        assert!(deprecated.capture_mappings);
+
+        let canonical = toml_deprecated_keys(
+            r#"
+            [features."textDocument/semanticTokens".captureMappings._]
+            variable = "variable"
+            "#,
+        );
+        assert!(!canonical.capture_mappings);
     }
 
     #[test]
