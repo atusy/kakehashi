@@ -157,6 +157,15 @@ pub(crate) fn json_deprecated_keys(value: &JsonValue) -> DeprecatedKeysSeen {
 mod tests {
     use super::*;
 
+    fn v0_deprecation_notices() -> [&'static str; 4] {
+        [
+            ROOT_MARKERS_DEPRECATION_NOTICE,
+            UNWRAPPED_DIDCHANGE_CONFIGURATION_NOTICE,
+            AUTO_INSTALL_DEPRECATION_NOTICE,
+            CAPTURE_MAPPINGS_DEPRECATION_NOTICE,
+        ]
+    }
+
     #[test]
     fn merge_ors_flags_so_a_clean_later_layer_cannot_clear_them() {
         // The regression: `=` instead of `|=` would let a clean higher layer
@@ -282,6 +291,16 @@ rootMarkers = [".git"]
             CAPTURE_MAPPINGS_DEPRECATION_NOTICE
                 .contains("features[\"textDocument/semanticTokens\"].captureMappings")
         );
+    }
+
+    #[test]
+    fn every_v0_notice_names_the_v2_removal() {
+        for notice in v0_deprecation_notices() {
+            assert!(
+                notice.contains("removed in kakehashi v2"),
+                "v0 deprecation notice must name its removal deadline: {notice}"
+            );
+        }
     }
 
     #[test]
