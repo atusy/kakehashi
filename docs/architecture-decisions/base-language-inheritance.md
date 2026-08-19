@@ -123,9 +123,13 @@ first-line normalization with base fallback. This keeps configured injection
 keys authoritative while still canonicalizing unconfigured aliases such as
 `py` -> `python` without requiring a parser to be loaded.
 
-### Removed: `aliases` Field
+### Removed behavior and staged removal: `aliases` Field
 
-The `aliases` field is removed from language configuration with a deprecation warning. When `aliases` is still present, the server emits a client-visible warning with migration guidance.
+Alias resolution is removed: retained `aliases` values no longer register
+alternative language IDs. The input field itself remains accepted and ignored
+through v1 so the server can emit a client-visible migration warning. It is
+removed from the configuration schema and parser in v2, in accordance with
+[Deprecation removal deadlines](deprecation-removal-deadlines.md).
 
 **Migration**: Each `aliases = ["x", "y"]` on language `L` becomes:
 
