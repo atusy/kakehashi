@@ -1012,8 +1012,9 @@ pub struct LanguageSettings {
     /// (`virt`/`host`/`native`) per LSP method (`"_"` = method wildcard).
     /// Omit to use the default order `["virt", "host", "native"]`.
     pub layers: Option<LayersConfig>,
-    /// Deprecated: use `base` on the derived language instead. Removed in v2.
-    /// Alternative languageId values that should use this parser.
+    /// Deprecated and ignored alternative language IDs. The field remains
+    /// accepted for migration warnings through v1 and is removed in v2; use
+    /// `base` on each derived language instead.
     pub aliases: Option<Vec<String>>,
     /// Whether missing parsers/queries for this language may be auto-installed.
     ///

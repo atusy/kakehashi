@@ -302,7 +302,7 @@ Per-language configuration. Usually not needed as kakehashi auto-detects languag
 | `queries` | Array of query configurations with `path` and `kind` (highlights, bindings, injections) |
 | `bridge` | Per-injection-language bridge filter and aggregation settings |
 | `autoInstall` | Whether missing parsers/queries for this language may be auto-installed |
-| `aliases` | Deprecated alternative language IDs, supported through v1 and removed in v2. Prefer `base` on the derived language instead. |
+| `aliases` | Deprecated and ignored alternative language IDs. The field is accepted for migration warnings through v1 and removed in v2; use `base` on each derived language instead. |
 
 ##### `languages[*].autoInstall`
 
