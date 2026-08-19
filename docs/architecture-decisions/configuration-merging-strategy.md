@@ -317,15 +317,19 @@ path the user typed carries intent; a path kakehashi went looking for does not.
      explicit configuration only, because their operands merge independently —
      one file may legitimately supply just one half
    - Unrecognised key names: reported as a warning on TOML configuration files,
-     both explicit `--config-file` layers and the discovered workspace
-     `kakehashi.toml`, but not fatal. Serde drops an unknown field silently, so
-     a typo otherwise reads as "not specified"; but a key this version does not
-     know may be one the next one does, and rejecting the file would
-     version-lock it.
-     `workspace/didChangeConfiguration` rejects the whole update instead —
-     a live edit is not a file shared across versions. Nested `features` keys
-     use this same walker and source-specific policy; a typo there does not
-     make a TOML file fatal or discard recognized sibling settings.
+     including the implicit user and workspace files and explicit
+     `--config-file` layers, but not fatal. Serde drops an unknown field
+     silently, so a typo otherwise reads as "not specified"; but a key this
+     version does not know may be one the next one does, and rejecting the file
+     would version-lock it.
+     A pushed `workspace/didChangeConfiguration` update rejects the whole layer
+     instead — a live edit is not a file shared across versions. When an empty
+     notification makes kakehashi pull `workspace/configuration`, unknown keys
+     are logged at info and ignored while recognized siblings apply: the editor
+     may return unrelated settings such as `trace.server` in that shared
+     section. Nested `features` keys use this same walker and source-specific
+     policy; a typo there does not make a TOML file fatal or discard recognized
+     sibling settings.
      Client-supplied `initializationOptions` remain tolerant and silent, as
      before; they do not pass through the TOML warning channel.
    - One pre-existing inconsistency remains: CLI mode has no channel for
