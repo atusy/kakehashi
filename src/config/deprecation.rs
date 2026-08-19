@@ -67,7 +67,8 @@ pub(crate) const AUTO_INSTALL_DEPRECATION_NOTICE: &str = "kakehashi: the top-lev
 /// User-facing text for the one-per-session top-level `captureMappings`
 /// notice. The dotted path is usable for both TOML and JSON configuration.
 pub(crate) const CAPTURE_MAPPINGS_DEPRECATION_NOTICE: &str = "kakehashi: the top-level `captureMappings` config key is deprecated; move highlight mappings to \
-     `features.textDocument/semanticTokens.captureMappings` and remove the \
+     `features.\"textDocument/semanticTokens\".captureMappings` in TOML (or \
+     `features[\"textDocument/semanticTokens\"].captureMappings` in JSON) and remove the \
      intermediate `highlights` key. The top-level key still works for now but \
      may be removed in a future release; its unused `folds` mappings have no \
      replacement.";
@@ -244,6 +245,18 @@ rootMarkers = [".git"]
             }
         });
         assert!(!json_deprecated_keys(&canonical).capture_mappings);
+    }
+
+    #[test]
+    fn capture_mapping_notice_gives_valid_toml_and_json_paths() {
+        assert!(
+            CAPTURE_MAPPINGS_DEPRECATION_NOTICE
+                .contains("features.\"textDocument/semanticTokens\".captureMappings")
+        );
+        assert!(
+            CAPTURE_MAPPINGS_DEPRECATION_NOTICE
+                .contains("features[\"textDocument/semanticTokens\"].captureMappings")
+        );
     }
 
     #[test]
