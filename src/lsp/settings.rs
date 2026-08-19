@@ -157,6 +157,19 @@ fn unknown_config_keys(contents: &str) -> Vec<String> {
     keys
 }
 
+fn append_unknown_config_key_warnings(
+    contents: &str,
+    config_path: &Path,
+    events: &mut Vec<SettingsEvent>,
+) {
+    for key in unknown_config_keys(contents) {
+        events.push(SettingsEvent::warning(format!(
+            "Unknown configuration key in {}: {key}",
+            config_path.display()
+        )));
+    }
+}
+
 /// The explicit layers merged with nothing beneath them — the subject of the
 /// strict gate.
 ///
@@ -754,12 +767,7 @@ fn load_toml_file(
     // Warn rather than reject: a key kakehashi does not recognise may be a
     // typo, but it may equally be one this version has not learned yet, and
     // refusing to start over it would make the file version-locked.
-    for key in unknown_config_keys(&contents) {
-        events.push(SettingsEvent::warning(format!(
-            "Unknown configuration key in {}: {key}",
-            path.display()
-        )));
-    }
+    append_unknown_config_key_warnings(&contents, path, events);
 
     events.push(SettingsEvent::info(format!(
         "Successfully loaded {}",
@@ -825,6 +833,7 @@ fn load_toml_settings(
     )));
 
     deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
+    append_unknown_config_key_warnings(&contents, &config_path, events);
     match toml::from_str::<RawWorkspaceSettings>(&contents) {
         Ok(settings) => {
             events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
@@ -2280,6 +2289,42 @@ mod tests {
         assert!(
             used_deprecated.root_markers,
             "rootMarkers should set the flag"
+        );
+    }
+
+    #[test]
+    fn load_toml_settings_warns_about_unknown_feature_key_without_discarding_siblings() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("kakehashi.toml");
+        std::fs::write(
+            &config_path,
+            "[features.\"textDocument/publishDiagnostics\"]\ndebounceMs = 12\nfutureOption = 1\n",
+        )
+        .unwrap();
+
+        let mut events = Vec::new();
+        let mut deprecated_keys = DeprecatedKeysSeen::default();
+        let settings = load_toml_settings(Some(dir.path()), &mut events, &mut deprecated_keys)
+            .expect("an unknown feature key should not reject a workspace config");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == SettingsEventKind::Warning
+                    && event.message.contains(&config_path.display().to_string())
+                    && event
+                        .message
+                        .contains("features.textDocument/publishDiagnostics.futureOption")),
+            "the ignored key and workspace file should be named: {events:?}"
+        );
+        assert_eq!(
+            settings
+                .features
+                .expect("features")
+                .text_document_publish_diagnostics
+                .expect("publish diagnostics")
+                .debounce_ms,
+            Some(12)
         );
     }
 
