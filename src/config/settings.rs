@@ -791,6 +791,7 @@ pub struct RawWorkspaceSettings {
     /// install missing parsers and queries. Still honored when no per-language
     /// value is set, but setting it shows a one-time migration notice. It is
     /// removed in v2.
+    #[schemars(extend("deprecated" = true))]
     pub auto_install: Option<bool>,
     /// Debounce delay, in milliseconds, between a `didChange` and the diagnostic
     /// pull it triggers. Higher values cut refresh/pull volume during rapid typing
@@ -1015,6 +1016,7 @@ pub struct LanguageSettings {
     /// Deprecated and ignored alternative language IDs. The field remains
     /// accepted for migration warnings through v1 and is removed in v2; use
     /// `base` on each derived language instead.
+    #[schemars(extend("deprecated" = true))]
     pub aliases: Option<Vec<String>>,
     /// Whether missing parsers/queries for this language may be auto-installed.
     ///
@@ -1255,7 +1257,11 @@ mod tests {
         // Top-level properties should use camelCase (from serde renames)
         let props = value.get("properties").expect("should have properties");
         assert!(props.get("searchPaths").is_some(), "missing searchPaths");
-        assert!(props.get("autoInstall").is_some(), "missing autoInstall");
+        let legacy_auto_install = props.get("autoInstall").expect("missing autoInstall");
+        assert_eq!(
+            legacy_auto_install.get("deprecated"),
+            Some(&serde_json::Value::Bool(true))
+        );
         assert!(
             props.get("diagnosticsDebounceMs").is_some(),
             "missing diagnosticsDebounceMs"
@@ -1277,6 +1283,13 @@ mod tests {
         assert!(
             props.get("languageServers").is_some(),
             "missing languageServers"
+        );
+        let legacy_aliases = value["$defs"]["LanguageSettings"]["properties"]["aliases"]
+            .as_object()
+            .expect("missing languages.*.aliases");
+        assert_eq!(
+            legacy_aliases.get("deprecated"),
+            Some(&serde_json::Value::Bool(true))
         );
 
         // snake_case variants must NOT appear
