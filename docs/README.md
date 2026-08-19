@@ -464,7 +464,9 @@ Remap Tree-sitter capture names to LSP semantic token types. Use `_` as a wildca
 The former top-level `captureMappings.<language>.highlights` shape remains
 accepted for migration, but is deprecated. If both spellings occur in one
 layer, the feature-scoped value wins for duplicate capture names; otherwise
-their entries are combined. The old `folds` table was unused and has no
+their entries are combined. A legacy empty root or language map in that layer
+first clears the corresponding inherited mappings, then canonical entries in
+the same layer are added. The old `folds` table was unused and has no
 replacement. It is absent from the schema and has no effect. Like another
 unrecognized key, it is ignored where the configuration source tolerates
 unknown keys and causes a pushed runtime update to be rejected by that

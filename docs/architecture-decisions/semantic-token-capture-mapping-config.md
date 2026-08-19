@@ -37,6 +37,10 @@ Configuration layering continues to follow configuration-merging-strategy:
 later layers override duplicate capture names while inheriting names they omit.
 Within one layer that contains both spellings, the canonical feature-scoped
 value wins duplicate names and retains names present only in the legacy shape.
+Merge order is inherited mappings, then the legacy spelling (including an
+empty root or language clear), then the canonical spelling. Thus a legacy
+clear removes the corresponding inherited mappings before canonical entries
+from the same layer are added.
 An explicitly empty root map clears every language mapping, and an explicitly
 empty language map clears that language entry inherited from lower
 configuration layers. The `_` mappings still apply during the later wildcard
