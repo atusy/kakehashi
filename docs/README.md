@@ -196,6 +196,33 @@ default `info` forwards Error, Warning, and Info while suppressing LSP `Log` and
 }
 ```
 
+### Live configuration updates
+
+When pushing configuration with `workspace/didChangeConfiguration`, put
+kakehashi's settings below `settings.kakehashi`:
+
+```json
+{
+  "settings": {
+    "kakehashi": {
+      "searchPaths": ["/path/to/kakehashi-data"]
+    }
+  }
+}
+```
+
+The older flat shape below is deprecated. It remains accepted through v1 and
+is removed in v2, so clients must migrate to the wrapper above before upgrading
+to v2.
+
+```json
+{
+  "settings": {
+    "searchPaths": ["/path/to/kakehashi-data"]
+  }
+}
+```
+
 ### Environment Variable Expansion
 
 Path fields support environment variable expansion and tilde (`~`) expansion, making configurations portable across machines.
