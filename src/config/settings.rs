@@ -421,7 +421,7 @@ pub struct BridgeServerConfig {
     /// When no marker matches, the client-supplied root is the fallback.
     ///
     /// The wire key is `workspaceMarkers`; the pre-rename key `rootMarkers` is
-    /// kept as a deprecated serde alias for backward compatibility.
+    /// kept as a deprecated serde alias through v1 and removed in v2.
     #[serde(alias = "rootMarkers")]
     pub workspace_markers: Option<Vec<RootMarker>>,
     /// Trigger characters for bridged `textDocument/onTypeFormatting` (#354).
@@ -782,14 +782,15 @@ pub struct RawWorkspaceSettings {
     /// Deprecated: use
     /// `features["textDocument/semanticTokens"].captureMappings` instead. This
     /// legacy shape remains accepted during migration; only its `highlights`
-    /// entries are consumed.
+    /// entries are consumed. It is removed in v2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("deprecated" = true))]
     pub capture_mappings: Option<CaptureMappings>,
     /// Deprecated: use `languages._.autoInstall` (and per-language
     /// `languages.<lang>.autoInstall`) instead. Whether to automatically
     /// install missing parsers and queries. Still honored when no per-language
-    /// value is set, but setting it shows a one-time migration notice.
+    /// value is set, but setting it shows a one-time migration notice. It is
+    /// removed in v2.
     pub auto_install: Option<bool>,
     /// Debounce delay, in milliseconds, between a `didChange` and the diagnostic
     /// pull it triggers. Higher values cut refresh/pull volume during rapid typing
@@ -1011,7 +1012,7 @@ pub struct LanguageSettings {
     /// (`virt`/`host`/`native`) per LSP method (`"_"` = method wildcard).
     /// Omit to use the default order `["virt", "host", "native"]`.
     pub layers: Option<LayersConfig>,
-    /// Deprecated: use `base` on the derived language instead.
+    /// Deprecated: use `base` on the derived language instead. Removed in v2.
     /// Alternative languageId values that should use this parser.
     pub aliases: Option<Vec<String>>,
     /// Whether missing parsers/queries for this language may be auto-installed.

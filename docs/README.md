@@ -302,7 +302,7 @@ Per-language configuration. Usually not needed as kakehashi auto-detects languag
 | `queries` | Array of query configurations with `path` and `kind` (highlights, bindings, injections) |
 | `bridge` | Per-injection-language bridge filter and aggregation settings |
 | `autoInstall` | Whether missing parsers/queries for this language may be auto-installed |
-| `aliases` | Deprecated alternative language IDs. Prefer `base` on the derived language instead. |
+| `aliases` | Deprecated alternative language IDs, supported through v1 and removed in v2. Prefer `base` on the derived language instead. |
 
 ##### `languages[*].autoInstall`
 
@@ -462,11 +462,12 @@ Remap Tree-sitter capture names to LSP semantic token types. Use `_` as a wildca
 ```
 
 The former top-level `captureMappings.<language>.highlights` shape remains
-accepted for migration, but is deprecated. If both spellings occur in one
-layer, the feature-scoped value wins for duplicate capture names; otherwise
-their entries are combined. In the legacy spelling, `captureMappings = {}`
-clears the inherited root and `highlights = {}` under a
-`[captureMappings.<language>]` table clears that language's inherited entry.
+accepted for migration through v1, but is deprecated and will be removed in
+v2. If both spellings occur in one layer, the feature-scoped value wins for
+duplicate capture names; otherwise their entries are combined. In the legacy
+spelling, `captureMappings = {}` clears the inherited root and `highlights = {}`
+under a `[captureMappings.<language>]` table clears that language's inherited
+entry.
 The clear is applied before canonical entries in the same layer are added. The
 old `folds` table was unused and has no
 replacement. It is absent from the schema and has no effect. Like another
@@ -531,10 +532,10 @@ Configure language servers for bridging LSP requests in injection regions.
 
 > **Migration note**: `workspaceMarkers` was previously named `rootMarkers`
 > (aligning with the LSP spec's `workspaceFolders`). The old `rootMarkers` key
-> still works as a deprecated alias, so existing configs need no change; new
-> configs should prefer `workspaceMarkers`. When a config still uses
-> `rootMarkers`, kakehashi shows a one-time deprecation notice per session as a
-> visible `window/showMessage` popup.
+> remains accepted through v1 but will be removed in v2, so existing configs
+> must migrate to `workspaceMarkers` before upgrading to v2. When a config
+> still uses `rootMarkers`, kakehashi shows a one-time deprecation notice per
+> session as a visible `window/showMessage` popup.
 
 A `languageServers._` wildcard entry supplies defaults that every server
 inherits field-by-field (wildcard-config-inheritance) — e.g. set
