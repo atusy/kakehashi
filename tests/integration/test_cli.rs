@@ -610,14 +610,14 @@ fn test_config_schema_outputs_valid_json_to_stdout() {
         stdout
     );
     assert!(
-        props.get("autoInstall").is_some(),
-        "Should have autoInstall property. Got: {}",
+        props.get("autoInstall").is_none(),
+        "Should not advertise deprecated top-level autoInstall. Got: {}",
         stdout
     );
-    assert_eq!(
-        schema.pointer("/properties/captureMappings/deprecated"),
-        Some(&serde_json::json!(true)),
-        "legacy captureMappings should be marked deprecated"
+    assert!(
+        schema.pointer("/properties/captureMappings").is_none(),
+        "Should not advertise deprecated top-level captureMappings. Got: {}",
+        stdout
     );
     assert!(
         schema
