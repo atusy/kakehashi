@@ -532,11 +532,13 @@ pub(crate) fn merge_semantic_token_capture_mappings(
 
 pub(crate) fn legacy_capture_mappings_to_semantic(
     mappings: CaptureMappings,
-) -> SemanticTokenCaptureMappings {
-    mappings
+) -> Option<SemanticTokenCaptureMappings> {
+    let root_was_empty = mappings.is_empty();
+    let mappings = mappings
         .into_iter()
         .filter_map(|(language, entry)| entry.highlights.map(|mapping| (language, mapping)))
-        .collect()
+        .collect::<SemanticTokenCaptureMappings>();
+    (root_was_empty || !mappings.is_empty()).then_some(mappings)
 }
 
 fn normalize_deprecated_capture_mappings(
@@ -545,7 +547,9 @@ fn normalize_deprecated_capture_mappings(
     let Some(legacy) = settings.capture_mappings.take() else {
         return settings;
     };
-    let legacy = legacy_capture_mappings_to_semantic(legacy);
+    let Some(legacy) = legacy_capture_mappings_to_semantic(legacy) else {
+        return settings;
+    };
     let semantic_tokens = settings
         .features
         .get_or_insert_default()
@@ -2266,6 +2270,27 @@ mod tests {
 
         assert_eq!(wildcard["keyword"], "keyword");
         assert!(!wildcard.contains_key("comment"));
+    }
+
+    #[test]
+    fn deprecated_folds_only_overlay_does_not_clear_highlight_mappings() {
+        use crate::config::defaults::default_settings;
+
+        let folds_only: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [captureMappings.rust.folds]
+            comment = "comment"
+            "#,
+        )
+        .expect("legacy folds should still parse during migration");
+
+        let merged = merge_workspace_settings(Some(default_settings()), Some(folds_only))
+            .expect("two settings merge");
+        assert_eq!(
+            semantic_token_capture_mappings(&merged)[WILDCARD_KEY]["variable.builtin"],
+            "variable.defaultLibrary",
+            "an unused folds-only layer must not become an explicit root clear"
+        );
     }
 
     /// The whole map clears too, so a layer can drop every language's mappings.

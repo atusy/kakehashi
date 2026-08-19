@@ -51,7 +51,7 @@ fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
     let legacy = settings
         .capture_mappings
         .clone()
-        .map(merge::legacy_capture_mappings_to_semantic);
+        .and_then(merge::legacy_capture_mappings_to_semantic);
     let canonical = settings
         .features
         .as_ref()
