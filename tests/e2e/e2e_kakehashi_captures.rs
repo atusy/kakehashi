@@ -15,6 +15,7 @@
 //! - `range` returning only matches intersecting the range (no `resultId`)
 //! - `#set!` directives → `metadata` on the match (`(#set! k v)`) or on the
 //!   capture (`(#set! @cap k v)`), absent on unannotated patterns/captures
+//! - `#offset!` / `#trim!` directives → adjusted capture ranges
 //! - a kind with no query file → `null`
 //! - a malformed kind (path traversal) → JSON-RPC error
 //!
@@ -235,6 +236,61 @@ fn full_returns_grouped_matches_with_ranges_and_result_id() {
             .and_then(Value::as_u64),
         Some(4),
         "## Section A starts on line 4"
+    );
+}
+
+#[test]
+fn runtime_range_directives_adjust_wire_ranges() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let md = dir.path().join("queries").join("markdown");
+    std::fs::create_dir_all(&md).expect("create queries/markdown");
+    std::fs::write(
+        md.join("context.scm"),
+        "((atx_heading) @offset (#offset! @offset 0 6 0 -1))\n\
+         ((document) @trim (#trim! @trim))\n\
+         ((document) @row (#offset! @row 1 0 0 0))\n",
+    )
+    .expect("write markdown context.scm");
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_runtime_ranges.md";
+    open_markdown(&mut client, uri, "# 😀Title\n\n");
+
+    let result = full(&mut client, uri, "context");
+
+    let captures: Vec<&Value> = result["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .flat_map(|match_| match_["captures"].as_array().expect("captures"))
+        .collect();
+    let named = |name: &str| {
+        captures
+            .iter()
+            .copied()
+            .find(|capture| capture["name"] == name)
+            .unwrap_or_else(|| panic!("missing @{name}: {result:?}"))
+    };
+    assert_eq!(
+        named("offset")["range"],
+        json!({
+            "start": { "line": 0, "character": 4 },
+            "end": { "line": 0, "character": 9 }
+        })
+    );
+    assert_eq!(
+        named("trim")["range"],
+        json!({
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 0, "character": 9 }
+        })
+    );
+    assert_eq!(
+        named("row")["range"],
+        json!({
+            "start": { "line": 1, "character": 0 },
+            "end": { "line": 2, "character": 0 }
+        })
     );
 }
 

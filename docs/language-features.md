@@ -31,8 +31,8 @@ the embedded language, or (for the surrounding document) a `bridge._self`
 host server. Without a server they generally return nothing, though under
 `KAKEHASHI_EXPERIMENTAL=true` a native Tree-sitter layer answers
 definition/references/document highlight/rename lexically — for languages
-that ship a `bindings.scm`, and not in `#offset!`-shifted regions (e.g.
-frontmatter).
+that ship a `bindings.scm`, and not in regions shifted by runtime range
+directives (`#offset!` / `#trim!`, e.g. frontmatter).
 
 ### Embedded code blocks
 
@@ -277,7 +277,8 @@ client-driven resolve routing additionally requires the client to declare
 `dataSupport` and `resolveSupport` covering `"edit"`; without those,
 injection-layer lazy actions are eagerly resolved by the bridge and
 host-layer ones are disabled or dropped. (Known limitation: CLIENT-driven
-resolve of lazy actions in `#offset!`-adjusted regions such as bundled
+resolve of lazy actions in runtime-range-adjusted regions (`#offset!` /
+`#trim!`) such as bundled
 YAML/TOML frontmatter always fails soft — the resolve freshness check cannot
 match there; the eager-resolve path taken for non-envelope clients bypasses
 that check.)
@@ -544,6 +545,12 @@ type CapturesDelta = {
   (e.g. `@context` and `@context.end`) stay together.
 - **Each capture carries both a `node` and its `range`**, so a bulk result needs no
   per-capture follow-up call. The `node.id` works with every accessor above.
+  `#offset!` and `#trim!` adjust the returned `range` with Neovim semantics
+  without changing the raw node used by that id; a valid trim range takes
+  precedence over an offset.
+  On `@injection.content`, the same directives define the effective parser,
+  routing, semantic, selection, and node-layer range. They also compose with
+  `injection.combined`: each capture is adjusted before the ranges are grouped.
 - **Predicates are evaluated server-side** — the built-in `#eq?` / `#match?` /
   `#any-of?` and the Neovim-flavored `#lua-match?` / `#has-parent?` /
   `#has-ancestor?` (and their negations) — with Neovim's `iter_matches`
@@ -556,6 +563,17 @@ type CapturesDelta = {
   `(#set! @cap key value)` rides on that capture as its `metadata[key]` —
   e.g. `((codeblock) @context (#set! kind "block"))` lets a client label
   matches without parsing capture names. Repeated keys are last-write-wins.
+- **`#gsub!` transforms dynamic injection-language captures** before language
+  normalization. `#offset!` and `#trim!` also adjust a dynamic language's text
+  until `#gsub!` materializes it; later range directives leave that text intact.
+  Multiple transformations run in query order using the same Lua-pattern
+  subset as `#lua-match?`; unsupported `%b`, `%f`, position
+  captures `()`, and pattern capture-backreference forms fail soft and leave
+  the prior text unchanged.
+  Composition with `#set! @capture text ...` is not supported because the Rust
+  tree-sitter API does not retain its source order relative to general
+  directives. The captures protocol itself has no transformed-text field, so
+  `#gsub!` does not add capture metadata to these responses.
 - **Tolerant compilation**: if some patterns reference symbols absent from the
   grammar, the valid patterns still run and the rest are reported in `skipped`.
 - **`null` means "nothing here"**: the document isn't open, or no involved

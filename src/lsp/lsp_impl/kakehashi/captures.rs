@@ -327,6 +327,8 @@ impl Drop for WalkFlightGuard<'_> {
 struct KindQuery {
     query: tree_sitter::Query,
     skipped: Vec<crate::language::query_loader::SkippedPattern>,
+    has_offset: bool,
+    has_expanding_range: bool,
 }
 
 /// Compiled-kind-query cache, `language → kind file → (query, generation)`.
@@ -445,9 +447,14 @@ fn load_kind_query(
         );
         return KindQueryLoad::Broken(parsed.skipped);
     };
+    let has_offset = crate::language::query_directives::has_offset_directive(&query);
+    let has_expanding_range =
+        crate::language::query_directives::has_expanding_range_directive(&query);
     KindQueryLoad::Loaded(KindQuery {
         query,
         skipped: parsed.skipped,
+        has_offset,
+        has_expanding_range,
     })
 }
 
@@ -1424,7 +1431,10 @@ fn execute_captures_walk(
     // Hit/miss counters for the walk log line (cache-behavior diagnostics).
     let (mut layers_reused, mut layers_executed) = (0usize, 0usize);
 
-    let mut visit = |layer_language: &str, layer_tree: &tree_sitter::Tree, depth: usize| {
+    let mut visit = |layer_language: &str,
+                     layer_tree: &tree_sitter::Tree,
+                     depth: usize,
+                     known_span: Option<&std::ops::Range<usize>>| {
         // Per-layer cancellation checkpoint: a cancelled walk stops doing
         // query/mint work; the caller discards the (partial) result.
         if crate::cancel::is_cancelled(cancel) {
@@ -1444,6 +1454,29 @@ fn execute_captures_walk(
         let KindQueryLoad::Loaded(kind_query) = entry.as_ref() else {
             return;
         };
+        // A runtime offset may pull a capture beyond the injected layer's raw
+        // span and into the requested viewport. Only prune the layer before
+        // query execution when its kind query cannot expand capture ranges;
+        // `execute_query` performs the authoritative effective-range filter.
+        if depth > 0
+            && !kind_query.has_expanding_range
+            && let Some(filter) = &byte_range
+        {
+            let derived_span;
+            let span = if let Some(span) = known_span {
+                span
+            } else {
+                let included = layer_tree.included_ranges();
+                let (Some(first), Some(last)) = (included.first(), included.last()) else {
+                    return;
+                };
+                derived_span = first.start_byte..last.end_byte;
+                &derived_span
+            };
+            if span.end <= filter.start || span.start >= filter.end {
+                return;
+            }
+        }
         // Content-addressed cross-snapshot reuse: a layer whose included
         // ranges carry the same bytes in the same relative geometry (merely
         // translated by edits elsewhere) serves its cached MatchData and
@@ -1457,10 +1490,11 @@ fn execute_captures_walk(
         // FNV pass over the layer bytes per visit — about twice the
         // document bytes per full walk, sub-ms against the walk times the
         // per-walk debug line reports (see the reused/executed counters).
-        let cache_key = cache_full_walk.then(|| {
+        let cache_safe = depth == 0 || !kind_query.has_offset;
+        let cache_key = (cache_full_walk && cache_safe).then(|| {
             super::captures_match_cache::tree_cache_key(kind, layer_language, layer_tree, text)
         });
-        let reused = cache_key.and_then(|(_, hash)| {
+        let reused = cache_key.and_then(|(_, _, hash)| {
             if depth == 0 {
                 match_cache.get_host(uri, kind, hash, generation)
             } else {
@@ -1470,7 +1504,7 @@ fn execute_captures_walk(
         let (layer_matches, anchor): (
             std::sync::Arc<Vec<crate::language::query_exec::MatchData>>,
             usize,
-        ) = if let (Some(cached), Some((anchor, hash))) = (reused, cache_key) {
+        ) = if let (Some(cached), Some((anchor, _, hash))) = (reused, cache_key) {
             if depth > 0 {
                 touched_layer_hashes.insert(hash);
             }
@@ -1482,11 +1516,11 @@ fn execute_captures_walk(
             // Rebase to anchor-relative before storing; a refusal (a capture
             // below the layer anchor, e.g. a root node reaching outside its
             // included ranges) leaves the matches absolute and uncached.
-            let rebased_key = cache_key.filter(|&(anchor, _)| {
-                super::captures_match_cache::rebase_matches(&mut fresh, anchor)
+            let rebased_key = cache_key.filter(|&(anchor, outer_end, _)| {
+                super::captures_match_cache::rebase_matches(&mut fresh, anchor, outer_end)
             });
             let arc = std::sync::Arc::new(fresh);
-            if let Some((anchor, hash)) = rebased_key {
+            if let Some((anchor, _, hash)) = rebased_key {
                 // The doc-open probe only runs when the store must CREATE the
                 // per-document slot (first store after open, or a walk racing
                 // its own didClose) — see the resurrection-leak note on
@@ -1582,8 +1616,8 @@ fn execute_captures_walk(
                     capture_idx += 1;
                     // A capture whose bytes don't map to positions (corrupt
                     // span) is dropped rather than failing the whole request.
-                    let start_byte = c.start_byte + anchor;
-                    let end_byte = c.end_byte + anchor;
+                    let start_byte = c.range_start_byte + anchor;
+                    let end_byte = c.range_end_byte + anchor;
                     let start = mapper.byte_to_position(start_byte)?;
                     let end = mapper.byte_to_position(end_byte)?;
                     // Direct Map construction, MOVING every sub-value: a
@@ -1651,22 +1685,15 @@ fn execute_captures_walk(
     if injection {
         if let Some(layers) = layer_trees {
             // Pre-parsed layers from the snapshot's populate pass (the
-            // layer-tree half of never-discover-twice): identical to the
-            // inline walk below by construction — populate built them with
-            // that walk over this same (text, tree). The span check mirrors
-            // the walk's byte_filter pruning: a false-positive visit only
-            // makes the layer's query yield nothing for the clipped range.
-            visit(language_id, tree, 0);
+            // layer-tree half of never-discover-twice). Query-specific range
+            // pruning happens inside `visit`, after we know whether this
+            // layer's kind query can expand a capture beyond the layer span.
+            visit(language_id, tree, 0, None);
             for layer in layers {
                 if crate::cancel::is_cancelled(cancel) {
                     break;
                 }
-                if let Some(filter) = &byte_range
-                    && (layer.span.end <= filter.start || layer.span.start >= filter.end)
-                {
-                    continue;
-                }
-                visit(&layer.language, &layer.tree, layer.depth);
+                visit(&layer.language, &layer.tree, layer.depth, Some(&layer.span));
             }
         } else {
             walk_document_layers(
@@ -1674,13 +1701,18 @@ fn execute_captures_walk(
                 language_id,
                 text,
                 tree,
-                byte_range.as_ref(),
+                // This fallback is used only by direct tests; production
+                // injection walks always receive the snapshot's prebuilt flat
+                // layer list above. Traverse every ancestor conservatively:
+                // an off-viewport parent may contain a descendant whose kind
+                // query expands a capture into the viewport.
+                None,
                 cancel,
-                &mut visit,
+                &mut |language, tree, depth| visit(language, tree, depth, None),
             );
         }
     } else {
-        visit(language_id, tree, 0);
+        visit(language_id, tree, 0, None);
     }
 
     // A cancelled walk must not shape a partial result: the caller answers
@@ -3110,7 +3142,7 @@ mod tests {
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse(text, None).unwrap();
-        let (anchor, hash) =
+        let (anchor, _, hash) =
             super::super::captures_match_cache::tree_cache_key("locals", "rust", &tree, text);
         assert_eq!(anchor, 0, "host layer anchors at 0");
         rig.match_cache.store_host(
@@ -3127,6 +3159,8 @@ mod tests {
                         name: "dropped".to_string(),
                         start_byte: text.len() + 10,
                         end_byte: text.len() + 12,
+                        range_start_byte: text.len() + 10,
+                        range_end_byte: text.len() + 12,
                         kind: "identifier",
                         metadata: Vec::new(),
                     },
@@ -3134,6 +3168,8 @@ mod tests {
                         name: "survivor".to_string(),
                         start_byte: 3,
                         end_byte: 4,
+                        range_start_byte: 3,
+                        range_end_byte: 4,
                         kind: "identifier",
                         metadata: Vec::new(),
                     },
@@ -3224,7 +3260,7 @@ mod tests {
         // The shifted layer must key IDENTICALLY to what v1 stored
         // (translation invariance); plant a sentinel there to discriminate
         // "served from cache" from "silently re-executed".
-        let (anchor_v2, hash_v2) = super::super::captures_match_cache::tree_cache_key(
+        let (anchor_v2, _, hash_v2) = super::super::captures_match_cache::tree_cache_key(
             "locals",
             "rust",
             &layer_v2.tree,
@@ -3246,6 +3282,8 @@ mod tests {
                     name: "sentinel-from-cache".to_string(),
                     start_byte: 4,
                     end_byte: 5,
+                    range_start_byte: 4,
+                    range_end_byte: 5,
                     kind: "identifier",
                     metadata: Vec::new(),
                 }],
@@ -3329,7 +3367,7 @@ mod tests {
         let text = "let a = 1;\n";
         let rig = MatchCacheRig::new("file:///match_cache_range.rs", text);
         let layer = rust_layer(text, 0, text.len());
-        let (_, host_hash) =
+        let (_, _, host_hash) =
             super::super::captures_match_cache::tree_cache_key("locals", "rust", &layer.tree, text);
 
         rig.walk(
@@ -3360,7 +3398,7 @@ mod tests {
         let text = "let a = 1;\n";
         let rig = MatchCacheRig::new("file:///match_cache_range_read.rs", text);
         let layer = rust_layer(text, 0, text.len());
-        let (_, layer_hash) =
+        let (_, _, layer_hash) =
             super::super::captures_match_cache::tree_cache_key("locals", "rust", &layer.tree, text);
         rig.match_cache.store_layer(
             &rig.uri,
@@ -3373,6 +3411,8 @@ mod tests {
                     name: "sentinel-must-not-serve".to_string(),
                     start_byte: 0,
                     end_byte: 3,
+                    range_start_byte: 0,
+                    range_end_byte: 3,
                     kind: "identifier",
                     metadata: Vec::new(),
                 }],
@@ -3429,7 +3469,7 @@ mod tests {
         let (text_v2, layer_v2) = make("AAAA\nBBBB\n");
         rig.store
             .update_document(rig.uri.clone(), text_v2.clone(), None);
-        let (_, hash_v2) = super::super::captures_match_cache::tree_cache_key(
+        let (_, _, hash_v2) = super::super::captures_match_cache::tree_cache_key(
             "locals",
             "rust",
             &layer_v2.tree,
@@ -3484,7 +3524,7 @@ mod tests {
         let rig = MatchCacheRig::new("file:///match_cache_cancel_sweep.rs", &text);
         rig.walk(&text, &[rust_layer(&text, start, text.len())], 0, None)
             .expect("kind query should load");
-        let (_, hash) = super::super::captures_match_cache::tree_cache_key(
+        let (_, _, hash) = super::super::captures_match_cache::tree_cache_key(
             "locals",
             "rust",
             &rust_layer(&text, start, text.len()).tree,
@@ -3528,7 +3568,7 @@ mod tests {
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let host_tree = parser.parse(text, None).unwrap();
-        let (anchor, host_hash) =
+        let (anchor, _, host_hash) =
             super::super::captures_match_cache::tree_cache_key("locals", "rust", &host_tree, text);
         assert_eq!(anchor, 0, "host layer anchors at 0");
         assert!(
@@ -3548,6 +3588,8 @@ mod tests {
                     name: "sentinel-host-slot".to_string(),
                     start_byte: 4,
                     end_byte: 5,
+                    range_start_byte: 4,
+                    range_end_byte: 5,
                     kind: "identifier",
                     metadata: Vec::new(),
                 }],

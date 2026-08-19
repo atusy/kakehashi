@@ -3,6 +3,7 @@
 //! `@injection.language` capture.
 
 use crate::language::predicate_accessor::{UnifiedPredicate, get_all_predicates};
+use crate::language::query_directives;
 use crate::text::clamped_slice;
 use tree_sitter::{Query, QueryMatch};
 
@@ -54,7 +55,16 @@ fn extract_dynamic_language(query: &Query, match_: &QueryMatch, text: &str) -> O
             // the capture didn't resolve to real text — treat it as "no language"
             // rather than emitting an empty language id (which would create a
             // bogus injection region downstream), mirroring the info-string path.
-            let lang_text = clamped_slice(text, capture.node.byte_range());
+            let transformed;
+            let lang_text =
+                if query_directives::has_text_directive(query, match_.pattern_index, capture.index)
+                {
+                    transformed =
+                        query_directives::capture_text(query, match_, capture.index, text)?;
+                    &transformed
+                } else {
+                    clamped_slice(text, capture.node.byte_range())
+                };
             if lang_text.is_empty() {
                 return None;
             }
@@ -152,5 +162,101 @@ mod tests {
         // normalization → None, but crucially no panic.
         let lang = extract_language_from_info_string(&query, m, "x");
         assert_eq!(lang, None);
+    }
+
+    #[test]
+    fn gsub_directive_transforms_dynamic_injection_language() {
+        let rust: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&rust).expect("load Rust grammar");
+        let text = "/* bash.sh */\nfn main() {}\n";
+        let tree = parser.parse(text, None).expect("parse Rust");
+        let query = Query::new(
+            &rust,
+            r#"((block_comment) @injection.language
+                 (#gsub! @injection.language "/%*%s*([%w%p]+)%s*%*/" "%1")
+                 (#gsub! @injection.language "%.sh$" ""))"#,
+        )
+        .expect("valid query");
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+        let m = matches.next().expect("one match");
+
+        assert_eq!(
+            extract_injection_language(&query, m, text).as_deref(),
+            Some("bash")
+        );
+    }
+
+    #[test]
+    fn range_and_text_directives_compose_in_query_order() {
+        let rust: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&rust).expect("load Rust grammar");
+        let text = "/* bash */\n";
+        let tree = parser.parse(text, None).expect("parse Rust");
+        let resolve = |directives: &str| {
+            let query = Query::new(
+                &rust,
+                &format!("((block_comment) @injection.language\n{directives})"),
+            )
+            .expect("valid query");
+            let mut cursor = QueryCursor::new();
+            let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+            let match_ = matches.next().expect("one match");
+            extract_injection_language(&query, match_, text)
+        };
+
+        assert_eq!(
+            resolve("(#offset! @injection.language 0 3 0 -3)").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            resolve("(#offset! @injection.language 0 3)").as_deref(),
+            Some("bash */")
+        );
+        assert_eq!(
+            resolve(
+                "(#offset! @injection.language 0 3 0 -3)\n\
+                 (#gsub! @injection.language \"^.*$\" \"%0\")"
+            )
+            .as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            resolve(
+                "(#gsub! @injection.language \"^.*$\" \"%0\")\n\
+                 (#offset! @injection.language 0 3 0 -3)"
+            )
+            .as_deref(),
+            Some("/* bash */")
+        );
+    }
+
+    #[test]
+    fn unrelated_directive_keeps_quantified_dynamic_language_capture() {
+        let rust: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&rust).expect("load Rust grammar");
+        let text = "fn bash() {}\nfn python() {}\n";
+        let tree = parser.parse(text, None).expect("parse Rust");
+        let query = Query::new(
+            &rust,
+            r#"((source_file
+                   (function_item name: (identifier) @injection.language)
+                   (function_item name: (identifier) @injection.language) @other)
+                 (#offset! @other 0 0 0 0))"#,
+        )
+        .expect("valid query");
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+        let m = matches.next().expect("one match");
+
+        assert_eq!(
+            extract_injection_language(&query, m, text).as_deref(),
+            Some("bash")
+        );
     }
 }

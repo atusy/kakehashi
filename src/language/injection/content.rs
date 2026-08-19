@@ -174,6 +174,14 @@ pub(crate) fn parse_with_ranges(
     log_target: &str,
     lang_name: &str,
 ) -> Option<tree_sitter::Tree> {
+    // Tree-sitter treats an empty included-range slice like a reset to the
+    // default whole-document range.  Here it means child/parent exclusions
+    // removed every byte, so there is intentionally nothing to parse.
+    if included_ranges.is_some_and(<[tree_sitter::Range]>::is_empty) {
+        let _ = parser.set_included_ranges(&[]);
+        return None;
+    }
+
     if let Some(ranges) = included_ranges
         && let Err(e) = parser.set_included_ranges(ranges)
     {
@@ -540,6 +548,30 @@ mod tests {
             vec![2, 2],
             "Both 'let' keywords should be at column 2 (from Range.start_point), not 0"
         );
+    }
+
+    #[test]
+    fn parse_with_empty_included_ranges_skips_instead_of_parsing_everything() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        parser
+            .set_included_ranges(&[tree_sitter::Range {
+                start_byte: 0,
+                end_byte: 1,
+                start_point: tree_sitter::Point::new(0, 0),
+                end_point: tree_sitter::Point::new(0, 1),
+            }])
+            .unwrap();
+
+        assert!(
+            parse_with_ranges(&mut parser, "fn main() {}", Some(&[]), "test", "rust").is_none()
+        );
+        let reparsed = parser
+            .parse("fn main() {}", None)
+            .expect("empty-range skip must leave the parser unrestricted");
+        assert_eq!(reparsed.root_node().byte_range(), 0..12);
     }
 
     // --- stale-tree hardening: byte offsets that no longer match `text` must

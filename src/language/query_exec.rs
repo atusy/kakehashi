@@ -35,8 +35,12 @@ use crate::language::query_predicates::check_match_predicates;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CapturedNode {
     pub name: String,
+    /// Raw node span used for node identity.
     pub start_byte: usize,
     pub end_byte: usize,
+    /// Directive-adjusted span exposed as the capture range.
+    pub range_start_byte: usize,
+    pub range_end_byte: usize,
     pub kind: &'static str,
     pub metadata: Vec<(String, Option<String>)>,
 }
@@ -58,8 +62,11 @@ pub(crate) struct MatchData {
 
 /// Run an already-compiled `query` over `tree`, collecting matches over `text`.
 ///
-/// `byte_range` restricts matching via `QueryCursor::set_byte_range` (matches
-/// whose nodes intersect the range); `None` walks the whole tree. There is
+/// `byte_range` restricts results to captures whose effective ranges intersect
+/// the range. Queries without runtime range directives use
+/// `QueryCursor::set_byte_range` as an early pruning step; range-adjusting
+/// queries walk the tree before filtering because `#offset!` can move a raw
+/// node into the requested range. `None` walks the whole tree. There is
 /// deliberately no match cap: silent truncation would poison the captures
 /// delta lineage, and scoping is the byte range's job (captures-protocol
 /// §"Considered Options").
@@ -72,7 +79,11 @@ pub(crate) fn execute_query(
     let capture_names = query.capture_names();
     let mut out = Vec::new();
     let mut cursor = QueryCursor::new();
-    if let Some(range) = byte_range {
+    let requires_effective_range_filter =
+        byte_range.is_some() && crate::language::query_directives::has_range_directive(query);
+    let requires_full_walk = byte_range.is_some()
+        && crate::language::query_directives::has_expanding_range_directive(query);
+    if let Some(range) = byte_range.clone().filter(|_| !requires_full_walk) {
         cursor.set_byte_range(range);
     }
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
@@ -101,10 +112,14 @@ pub(crate) fn execute_query(
             .iter()
             .map(|c| {
                 let node = c.node;
+                let range =
+                    crate::language::query_directives::capture_range(query, m, c.index, node, text);
                 CapturedNode {
                     name: capture_names[c.index as usize].to_string(),
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
+                    range_start_byte: range.start_byte,
+                    range_end_byte: range.end_byte,
                     kind: node.kind(),
                     metadata: metadata_for(Some(c.index as usize)),
                 }
@@ -114,6 +129,19 @@ pub(crate) fn execute_query(
         // tree-sitter can yield capture-less matches for patterns whose
         // captures are all quantified-out; an empty envelope says nothing.
         if captures.is_empty() {
+            continue;
+        }
+        // Tree-sitter's range cursor retains an entire correlated match when
+        // any capture intersects. Preserve that contract after runtime range
+        // evaluation instead of pruning individual captures from the match.
+        if requires_effective_range_filter
+            && !captures.iter().any(|capture| {
+                byte_range.as_ref().is_none_or(|requested| {
+                    capture.range_start_byte < requested.end
+                        && capture.range_end_byte > requested.start
+                })
+            })
+        {
             continue;
         }
 
@@ -166,6 +194,73 @@ mod tests {
     }
 
     #[test]
+    fn offset_directive_adjusts_capture_range_without_changing_node_span() {
+        let src = r#""abc""#;
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((string_literal) @string (#offset! @string 0 1 0 -1))"#,
+        );
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        assert_eq!(matches.len(), 1);
+        let capture = &matches[0].captures[0];
+        assert_eq!((capture.start_byte, capture.end_byte), (0, 5));
+        assert_eq!((capture.range_start_byte, capture.range_end_byte), (1, 4));
+    }
+
+    #[test]
+    fn invalid_offset_directive_keeps_the_raw_capture_range() {
+        let src = r#""abc""#;
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((string_literal) @string (#offset! @string 0 10 0 0))"#,
+        );
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        let capture = &matches[0].captures[0];
+        assert_eq!((capture.range_start_byte, capture.range_end_byte), (0, 5));
+    }
+
+    #[test]
+    fn trim_directive_defaults_to_removing_trailing_blank_lines() {
+        let src = "fn main() {}\n\n";
+        let (language, tree) = rust_tree(src);
+        let query = compile(&language, "((source_file) @fold (#trim! @fold))");
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        assert_eq!(matches.len(), 1);
+        let capture = &matches[0].captures[0];
+        assert_eq!((capture.start_byte, capture.end_byte), (0, src.len()));
+        assert_eq!(
+            (capture.range_start_byte, capture.range_end_byte),
+            (0, "fn main() {}".len())
+        );
+    }
+
+    #[test]
+    fn trim_range_takes_precedence_over_offset_metadata() {
+        let src = "fn main() {}\n\n";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            "((source_file) @fold (#trim! @fold) (#offset! @fold 0 1 0 -1))",
+        );
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        let capture = &matches[0].captures[0];
+        assert_eq!(
+            (capture.range_start_byte, capture.range_end_byte),
+            (0, "fn main() {}".len())
+        );
+    }
+
+    #[test]
     fn byte_range_scopes_the_walk() {
         let src = "fn a() {} fn b() {} fn c() {}";
         let (language, tree) = rust_tree(src);
@@ -179,6 +274,54 @@ mod tests {
         assert_eq!(scoped.len(), 1, "only the function intersecting the range");
         let c = &scoped[0].captures[0];
         assert_eq!(&src[c.start_byte..c.end_byte], "b");
+    }
+
+    #[test]
+    fn byte_range_uses_outward_offset_capture_span() {
+        let src = "fn a() {} fn b() {}";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            "((function_item name: (identifier) @name) (#offset! @name 0 -3 0 0))",
+        );
+
+        let scoped = execute_query(&query, &tree, src, Some(0..2));
+
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(
+            &src[scoped[0].captures[0].start_byte..scoped[0].captures[0].end_byte],
+            "a"
+        );
+        assert_eq!(scoped[0].captures[0].range_start_byte, 0);
+    }
+
+    #[test]
+    fn byte_range_rejects_capture_shifted_outside_viewport() {
+        let src = "fn a() {}";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            "((function_item) @item (#offset! @item 0 3 0 -5))",
+        );
+
+        assert!(execute_query(&query, &tree, src, Some(5..8)).is_empty());
+    }
+
+    #[test]
+    fn byte_range_preserves_all_captures_in_an_intersecting_match() {
+        let src = "fn a() {}";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            "((function_item name: (identifier) @name body: (block) @body) (#offset! @name 0 0 0 0))",
+        );
+
+        let scoped = execute_query(&query, &tree, src, Some(3..4));
+
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].captures.len(), 2);
+        assert_eq!(scoped[0].captures[0].name, "name");
+        assert_eq!(scoped[0].captures[1].name, "body");
     }
 
     #[test]

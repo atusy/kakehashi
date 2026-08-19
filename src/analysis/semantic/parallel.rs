@@ -23,9 +23,10 @@ use crate::document::{DiscoveredInjections, DiscoveredRegion, DiscoveredRegionCa
 use crate::language::LanguageCoordinator;
 use crate::language::NodeTracker;
 use crate::language::injection::{
-    CacheableInjectionRegion, InjectionRegionInfo, MAX_INJECTION_DEPTH, compute_included_ranges,
-    compute_included_ranges_clipped, effective_offset_for_pattern, has_combined_for_pattern,
-    intersect_included_ranges, parse_with_ranges, sub_select_included_ranges,
+    CacheableInjectionRegion, InjectionRegionInfo, MAX_INJECTION_DEPTH, byte_to_point,
+    byte_to_point_anchored, compute_included_ranges, compute_included_ranges_clipped,
+    effective_content_range, intersect_included_ranges, parse_with_ranges,
+    sub_select_included_ranges,
 };
 use crate::text::position::byte_to_utf16_col;
 
@@ -493,21 +494,13 @@ fn collect_injection_contexts_sync<'a>(
 
     // Partition out `injection.combined` regions: every capture of one
     // (language, pattern) pair parses as a single document so cross-block
-    // context survives (#187). Patterns that also carry #offset! stay on the
-    // per-region path — offset adjustment and multi-region merging don't
-    // compose (same exclusivity the included_ranges handling applies below),
-    // and no vendored query combines them.
+    // context survives (#187). Runtime range directives remain per-member;
+    // `build_combined_context` composes their effective ranges below.
     let mut singles = Vec::new();
     let mut combined_groups: indexmap::IndexMap<(String, usize), Vec<InjectionRegionInfo>> =
         indexmap::IndexMap::new();
     for injection in injections {
-        if has_combined_for_pattern(&injection_query, injection.pattern_index)
-            // effective_offset_for_pattern (not the raw directive parser):
-            // an all-zero #offset! is a no-op and must not exile the pattern
-            // to the singles path — the rest of the codebase branches on the
-            // effective offset for the same reason (cf. injection_stack.rs).
-            && effective_offset_for_pattern(&injection_query, injection.pattern_index).is_none()
-        {
+        if injection.combined {
             combined_groups
                 .entry((injection.language.clone(), injection.pattern_index))
                 .or_default()
@@ -646,11 +639,12 @@ fn discover_single_region(
     // lets reuse re-resolve the query (self-healing), so it must not gate here.
     require_highlight_query: bool,
 ) -> SingleDiscovery {
-    let start = injection.content_node.start_byte();
-    let end = injection.content_node.end_byte();
+    let effective = effective_content_range(injection, text);
+    let start = effective.start;
+    let end = effective.end;
 
     // Validate bounds
-    if start > end || end > text.len() {
+    if start >= end || end > text.len() {
         return SingleDiscovery::Skip;
     }
 
@@ -680,28 +674,10 @@ fn discover_single_region(
         None
     };
 
-    // Offset directive resolved at collection time (single source of truth
-    // with the bridge path, which applies it in from_region_info)
+    // Runtime range directive resolved at collection time (single source of
+    // truth with the bridge path).
     let offset = injection.offset;
-
-    // Calculate effective content range
-    let content_node = injection.content_node;
-    let (inj_start_byte, inj_end_byte) = if let Some(off) = offset {
-        use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
-        let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
-        // calculate_effective_range clamps, snaps inward to char
-        // boundaries, and normalizes start <= end, so the content slice
-        // below cannot panic.
-        let effective = calculate_effective_range(text, byte_range, off);
-        (effective.start, effective.end)
-    } else {
-        (content_node.start_byte(), content_node.end_byte())
-    };
-
-    // Validate effective range after offset adjustment
-    if inj_start_byte > inj_end_byte || inj_end_byte > text.len() {
-        return SingleDiscovery::Skip;
-    }
+    let (inj_start_byte, inj_end_byte) = (start, end);
 
     // Compute included ranges for the injection parser (Problem 1: blockquote prefixes).
     // When include_children is false and content_node has named children
@@ -723,17 +699,27 @@ fn discover_single_region(
     } else {
         compute_included_ranges(&injection.content_node, injection.include_children)
     };
-    let from_parent = parent_included_ranges.and_then(|parent_ranges| {
-        sub_select_included_ranges(parent_ranges, inj_start_byte, inj_end_byte)
-    });
+    if from_children.as_ref().is_some_and(Vec::is_empty) {
+        return SingleDiscovery::Skip;
+    }
+    let from_parent = match parent_included_ranges {
+        Some(parent_ranges) => {
+            let Some(ranges) =
+                sub_select_included_ranges(parent_ranges, inj_start_byte, inj_end_byte)
+            else {
+                return SingleDiscovery::Skip;
+            };
+            Some(ranges)
+        }
+        None => None,
+    };
     let included_ranges = match (from_children, from_parent) {
         (Some(child_ranges), Some(parent_ranges)) => {
             let intersected = intersect_included_ranges(&child_ranges, &parent_ranges);
             if intersected.is_empty() {
-                None
-            } else {
-                Some(intersected)
+                return SingleDiscovery::Skip;
             }
+            Some(intersected)
         }
         (Some(ranges), None) | (None, Some(ranges)) => Some(ranges),
         (None, None) => None,
@@ -999,7 +985,7 @@ pub(crate) fn build_document_discovery(
 pub(crate) fn build_document_discovery_cancellable(
     regions: &[InjectionRegionInfo<'_>],
     prebuilt_cacheable: &[CacheableInjectionRegion],
-    injection_query: &tree_sitter::Query,
+    _injection_query: &tree_sitter::Query,
     text: &str,
     coordinator: &LanguageCoordinator,
     uri: &Url,
@@ -1022,9 +1008,7 @@ pub(crate) fn build_document_discovery_cancellable(
         if crate::cancel::is_cancelled(cancel) {
             return None;
         }
-        if has_combined_for_pattern(injection_query, injection.pattern_index)
-            && effective_offset_for_pattern(injection_query, injection.pattern_index).is_none()
-        {
+        if injection.combined {
             log::debug!(
                 target: "kakehashi::semantic",
                 "discovery stored partial: combined-group region dropped (lang={})",
@@ -1149,15 +1133,25 @@ fn build_combined_context<'a>(
     parent_included_ranges: Option<&[tree_sitter::Range]>,
     exclusion_ranges: &mut Vec<(usize, usize)>,
 ) -> Result<Option<InjectionContext<'a>>, CombinedDiscoveryIncomplete> {
-    // collect_all_injections sorts by start byte, so `first` anchors the group.
-    let Some(first) = regions.first() else {
+    let effective_regions: Vec<_> = regions
+        .iter()
+        .map(|region| (region, effective_content_range(region, text)))
+        .filter(|(_, range)| range.start < range.end)
+        .collect();
+    let Some((first, first_range)) = effective_regions.first() else {
         return Ok(None);
     };
-    let group_start = first.content_node.start_byte();
-    let group_start_pos = first.content_node.start_position();
-    let Some(group_end) = regions.iter().map(|r| r.content_node.end_byte()).max() else {
-        return Ok(None);
-    };
+    let group_start = effective_regions
+        .iter()
+        .map(|(_, range)| range.start)
+        .min()
+        .unwrap_or(first_range.start);
+    let group_start_pos = byte_to_point(text, group_start);
+    let group_end = effective_regions
+        .iter()
+        .map(|(_, range)| range.end)
+        .max()
+        .unwrap_or(first_range.end);
     if group_start >= group_end || group_end > text.len() {
         return Ok(None);
     }
@@ -1165,7 +1159,7 @@ fn build_combined_context<'a>(
     // Resolve the language once from the first block's content — the grouping
     // key guarantees every region shares the raw injection language. A missing
     // language/query is transient (loads later without the content changing).
-    let first_content = &text[first.content_node.start_byte()..first.content_node.end_byte()];
+    let first_content = &text[first_range.clone()];
     let Some((resolved_lang, _)) =
         coordinator.resolve_injection_language(&first.language, first_content)
     else {
@@ -1185,44 +1179,106 @@ fn build_combined_context<'a>(
         },
     };
 
-    // Each block contributes its child-exclusion gaps (or its whole node),
-    // rebased from node-relative to group-relative coordinates.
+    // Each block contributes its directive-adjusted, child-filtered ranges,
+    // rebased from host coordinates into the combined content slice.
     let mut group_ranges: Vec<tree_sitter::Range> = Vec::with_capacity(regions.len());
-    for region in regions {
+    for (region, effective) in effective_regions {
         let node = &region.content_node;
-        let node_start = node.start_byte();
-        let node_pos = node.start_position();
-        let lift_point = |rel: tree_sitter::Point| tree_sitter::Point {
-            row: node_pos.row + rel.row,
-            column: if rel.row == 0 {
-                node_pos.column + rel.column
-            } else {
-                rel.column
-            },
-        };
-        match compute_included_ranges(node, region.include_children) {
-            Some(gaps) => {
-                for g in gaps {
-                    group_ranges.push(tree_sitter::Range {
-                        start_byte: node_start - group_start + g.start_byte,
-                        end_byte: node_start - group_start + g.end_byte,
-                        start_point: to_relative_point(lift_point(g.start_point)),
-                        end_point: to_relative_point(lift_point(g.end_point)),
-                    });
+        if region.offset.is_some() {
+            let effective_start_point = byte_to_point_anchored(
+                text,
+                effective.start,
+                node.start_byte(),
+                node.start_position(),
+            );
+            let point_for =
+                |byte| byte_to_point_anchored(text, byte, effective.start, effective_start_point);
+            match compute_included_ranges_clipped(
+                node,
+                region.include_children,
+                text,
+                effective.clone(),
+            ) {
+                Some(ranges) => {
+                    for range in ranges {
+                        let start = effective.start + range.start_byte;
+                        let end = effective.start + range.end_byte;
+                        group_ranges.push(tree_sitter::Range {
+                            start_byte: start - group_start,
+                            end_byte: end - group_start,
+                            start_point: to_relative_point(point_for(start)),
+                            end_point: to_relative_point(point_for(end)),
+                        });
+                    }
                 }
+                None => group_ranges.push(tree_sitter::Range {
+                    start_byte: effective.start - group_start,
+                    end_byte: effective.end - group_start,
+                    start_point: to_relative_point(effective_start_point),
+                    end_point: to_relative_point(point_for(effective.end)),
+                }),
             }
-            None => group_ranges.push(tree_sitter::Range {
-                start_byte: node_start - group_start,
-                end_byte: node.end_byte() - group_start,
-                start_point: to_relative_point(node_pos),
-                end_point: to_relative_point(node.end_position()),
-            }),
+        } else {
+            let node_start = node.start_byte();
+            let node_position = node.start_position();
+            let lift_point = |relative: tree_sitter::Point| tree_sitter::Point {
+                row: node_position.row + relative.row,
+                column: if relative.row == 0 {
+                    node_position.column + relative.column
+                } else {
+                    relative.column
+                },
+            };
+            match compute_included_ranges(node, region.include_children) {
+                Some(ranges) => {
+                    for range in ranges {
+                        group_ranges.push(tree_sitter::Range {
+                            start_byte: node_start - group_start + range.start_byte,
+                            end_byte: node_start - group_start + range.end_byte,
+                            start_point: to_relative_point(lift_point(range.start_point)),
+                            end_point: to_relative_point(lift_point(range.end_point)),
+                        });
+                    }
+                }
+                None => group_ranges.push(tree_sitter::Range {
+                    start_byte: node_start - group_start,
+                    end_byte: node.end_byte() - group_start,
+                    start_point: to_relative_point(node_position),
+                    end_point: to_relative_point(node.end_position()),
+                }),
+            }
         }
     }
+    group_ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
+    let mut normalized_ranges: Vec<tree_sitter::Range> = Vec::with_capacity(group_ranges.len());
+    for range in group_ranges {
+        if let Some(last) = normalized_ranges.last_mut()
+            && range.start_byte <= last.end_byte
+        {
+            if range.end_byte > last.end_byte {
+                last.end_byte = range.end_byte;
+                last.end_point = range.end_point;
+            }
+        } else {
+            normalized_ranges.push(range);
+        }
+    }
+    let group_ranges = normalized_ranges;
 
     // Inherit parent exclusions exactly like the per-region path.
-    let from_parent = parent_included_ranges
-        .and_then(|pr| sub_select_included_ranges(pr, group_start, group_end));
+    if group_ranges.is_empty() {
+        return Ok(None);
+    }
+    let from_parent = match parent_included_ranges {
+        Some(parent_ranges) => {
+            let Some(ranges) = sub_select_included_ranges(parent_ranges, group_start, group_end)
+            else {
+                return Ok(None);
+            };
+            Some(ranges)
+        }
+        None => None,
+    };
     let included_ranges = match from_parent {
         Some(parent_ranges) => {
             let intersected = intersect_included_ranges(&group_ranges, &parent_ranges);
@@ -2626,6 +2682,70 @@ local b = 2
     const COMBINED_LUA_DOC: &str =
         "```lua\nlocal x = 1\n```\n\nplain text\n\n```lua\nlocal y = 2\n```\n";
 
+    fn parent_range(start_byte: usize, end_byte: usize) -> tree_sitter::Range {
+        tree_sitter::Range {
+            start_byte,
+            end_byte,
+            start_point: tree_sitter::Point::new(0, start_byte),
+            end_point: tree_sitter::Point::new(0, end_byte),
+        }
+    }
+
+    #[test]
+    fn parent_exclusions_do_not_fall_back_to_unrestricted_injection_parsing() {
+        let Some(coordinator) = combined_lua_coordinator() else {
+            return;
+        };
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let mut parser = parser_pool.acquire("markdown").unwrap();
+        let tree = parser.parse(COMBINED_LUA_DOC, None).unwrap();
+        parser_pool.release("markdown".to_string(), parser);
+
+        // The only parent-included bytes precede both injected content spans.
+        // A missing overlap means the child layer is excluded, not that its
+        // parser may see the whole content window.
+        let parent_ranges = [parent_range(0, 5)];
+        let (combined, _, _) = collect_injection_contexts_sync(
+            COMBINED_LUA_DOC,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            0,
+            Some(&parent_ranges),
+            None,
+            None,
+        );
+        assert!(combined.is_empty());
+
+        let md_language = coordinator
+            .language_registry_for_parallel()
+            .get("markdown")
+            .unwrap();
+        let query = Query::new(
+            &md_language,
+            r#"(fenced_code_block
+                 (info_string (language) @injection.language)
+                 (code_fence_content) @injection.content
+                 (#set! injection.include-children))"#,
+        )
+        .unwrap();
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(query));
+
+        let (singles, _, _) = collect_injection_contexts_sync(
+            COMBINED_LUA_DOC,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            0,
+            Some(&parent_ranges),
+            None,
+            None,
+        );
+        assert!(singles.is_empty());
+    }
+
     #[test]
     fn test_combined_injections_group_into_single_context() {
         let Some(coordinator) = combined_lua_coordinator() else {
@@ -2684,6 +2804,102 @@ local b = 2
             "each combined block must register an exclusion range, got {:?}",
             exclusions
         );
+    }
+
+    #[test]
+    fn combined_context_uses_each_runtime_adjusted_range() {
+        let Some(coordinator) = combined_lua_coordinator() else {
+            return;
+        };
+        let md_language = coordinator
+            .language_registry_for_parallel()
+            .get("markdown")
+            .unwrap();
+        let query = Query::new(
+            &md_language,
+            r#"(fenced_code_block
+                 (info_string (language) @injection.language)
+                 (code_fence_content) @injection.content
+                 (#set! injection.combined)
+                 (#set! injection.include-children)
+                 (#offset! @injection.content 0 2))"#,
+        )
+        .unwrap();
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(query));
+
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let mut parser = parser_pool.acquire("markdown").unwrap();
+        let tree = parser.parse(COMBINED_LUA_DOC, None).unwrap();
+        parser_pool.release("markdown".to_string(), parser);
+
+        let (contexts, exclusions, _) = collect_injection_contexts_sync(
+            COMBINED_LUA_DOC,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            0,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(contexts.len(), 1);
+        let context = &contexts[0];
+        assert_eq!(context.host_start_byte, 9);
+        let ranges: Vec<_> = context
+            .included_ranges
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|range| (range.start_byte, range.end_byte))
+            .collect();
+        assert_eq!(ranges, vec![(0, 10), (36, 46)]);
+        assert!(exclusions.contains(&(9, 19)) && exclusions.contains(&(45, 55)));
+    }
+
+    #[test]
+    fn combined_context_coalesces_overlapping_adjusted_ranges() {
+        let Some(coordinator) = combined_lua_coordinator() else {
+            return;
+        };
+        let md_language = coordinator
+            .language_registry_for_parallel()
+            .get("markdown")
+            .unwrap();
+        let query = Query::new(
+            &md_language,
+            r#"(fenced_code_block
+                 (info_string (language) @injection.language)
+                 (code_fence_content) @injection.content
+                 (#set! injection.combined)
+                 (#set! injection.include-children)
+                 (#offset! @injection.content 0 0 6 0))"#,
+        )
+        .unwrap();
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(query));
+
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let mut parser = parser_pool.acquire("markdown").unwrap();
+        let tree = parser.parse(COMBINED_LUA_DOC, None).unwrap();
+        parser_pool.release("markdown".to_string(), parser);
+
+        let (contexts, _, _) = collect_injection_contexts_sync(
+            COMBINED_LUA_DOC,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            0,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].included_ranges.as_ref().unwrap().len(), 1);
     }
 
     /// The **vendored** markdown injection query marks `html_block` combined —
@@ -3401,7 +3617,7 @@ local b = 2
         let expected_hashes: std::collections::HashSet<u64> = regions
             .iter()
             .zip(prebuilt.iter())
-            .filter(|(r, _)| !has_combined_for_pattern(injection_query.as_ref(), r.pattern_index))
+            .filter(|(region, _)| !region.combined)
             .map(|(_, c)| {
                 crate::analysis::semantic_cache::region_validity_hash(c.content_hash, "lua")
             })

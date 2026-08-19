@@ -16,9 +16,11 @@ use super::injection_aware::{
     is_node_in_selection_chain,
 };
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
+#[cfg(test)]
+use crate::language::injection::effective_offset_for_pattern;
 use crate::language::injection::{
     self, InjectionOffset, compute_included_ranges, compute_included_ranges_clipped,
-    effective_offset_for_pattern, has_include_children_for_pattern, parse_with_ranges,
+    has_include_children_for_pattern, parse_with_ranges,
 };
 use crate::text::{PositionMapper, ceil_char_boundary, floor_char_boundary};
 
@@ -166,23 +168,20 @@ pub fn build(
     let injection_query_ref = injection_query.as_ref().map(|q| q.as_ref());
 
     let injection_info = injection::detect_injection(
-        &node,
         &doc_ctx.root,
         doc_ctx.text,
+        cursor_byte,
         injection_query_ref,
         doc_ctx.base_language,
     );
 
-    let Some((hierarchy, content_node, pattern_index)) = injection_info else {
+    let Some((hierarchy, content_node, pattern_index, offset_from_query)) = injection_info else {
         return build_from_node(node, doc_ctx.mapper);
     };
 
     if hierarchy.len() < 2 {
         return build_from_node(node, doc_ctx.mapper);
     }
-
-    let offset_from_query =
-        injection_query_ref.and_then(|q| effective_offset_for_pattern(q, pattern_index));
 
     if let Some(offset) = offset_from_query
         && !is_cursor_within_effective_range(doc_ctx.text, &content_node, cursor_byte, offset)
@@ -240,19 +239,16 @@ pub fn build(
 
     let injected_selection = if let Some(nested_inj_query) = nested_injection_query.as_ref() {
         let nested_injection_info = injection::detect_injection(
-            &injected_node,
             &injected_root,
             content_text,
+            relative_byte,
             Some(nested_inj_query.as_ref()),
             injected_lang,
         );
 
-        if let Some((nested_hierarchy, nested_content_node, nested_pattern_index)) =
+        if let Some((nested_hierarchy, nested_content_node, _nested_pattern_index, nested_offset)) =
             nested_injection_info
         {
-            let nested_offset =
-                effective_offset_for_pattern(nested_inj_query.as_ref(), nested_pattern_index);
-
             let cursor_in_nested = match nested_offset {
                 Some(offset) => is_cursor_within_effective_range(
                     content_text,
@@ -311,10 +307,15 @@ fn build_nested_injection(
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     }
 
-    let injection_info =
-        injection::detect_injection(node, root, text, Some(injection_query), base_language);
+    let injection_info = injection::detect_injection(
+        root,
+        text,
+        cursor_byte,
+        Some(injection_query),
+        base_language,
+    );
 
-    let Some((hierarchy, content_node, pattern_index)) = injection_info else {
+    let Some((hierarchy, content_node, pattern_index, offset)) = injection_info else {
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     };
 
@@ -327,7 +328,6 @@ fn build_nested_injection(
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     }
 
-    let offset = effective_offset_for_pattern(injection_query, pattern_index);
     let nested_window = effective_window_for(text, &content_node, offset);
     let nested_text = &text[nested_window.clone()];
     let nested_window_start = nested_window.start;

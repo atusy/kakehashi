@@ -9,7 +9,7 @@ use url::Url;
 
 use super::content::{compute_line_column_offsets, extract_clean_content};
 use super::language::extract_injection_language;
-use super::offset::{InjectionOffset, effective_offset_for_pattern};
+use super::offset::InjectionOffset;
 use super::ranges::{
     compute_included_ranges, compute_included_ranges_clipped, has_combined_for_pattern,
     has_include_children_for_pattern,
@@ -37,7 +37,49 @@ fn iter_injection_content_captures<'a, 'b>(
     })
 }
 
+fn runtime_offset_for_capture(
+    query: &Query,
+    match_: &QueryMatch<'_, '_>,
+    capture: QueryCapture<'_>,
+    text: &str,
+) -> Option<InjectionOffset> {
+    let range = crate::language::query_directives::capture_range(
+        query,
+        match_,
+        capture.index,
+        capture.node,
+        text,
+    );
+    let node = capture.node;
+    let raw = (
+        node.start_byte(),
+        node.end_byte(),
+        node.start_position(),
+        node.end_position(),
+    );
+    if (
+        range.start_byte,
+        range.end_byte,
+        range.start_point,
+        range.end_point,
+    ) == raw
+    {
+        return None;
+    }
+    let delta = |adjusted: usize, original: usize| {
+        let value = adjusted as i128 - original as i128;
+        i32::try_from(value).ok()
+    };
+    Some(InjectionOffset {
+        start_row: delta(range.start_point.row, raw.2.row)?,
+        start_column: delta(range.start_point.column, raw.2.column)?,
+        end_row: delta(range.end_point.row, raw.3.row)?,
+        end_column: delta(range.end_point.column, raw.3.column)?,
+    })
+}
+
 /// Checks if a node is within the bounds of another node
+#[cfg(test)]
 fn is_node_within(node: &Node, container: &Node) -> bool {
     node.start_byte() >= container.start_byte() && node.end_byte() <= container.end_byte()
 }
@@ -55,10 +97,11 @@ pub(crate) struct InjectionRegionInfo<'a> {
     /// When true, the injection parser sees the full content node (including named children).
     /// When false, named children (e.g., `block_continuation`) should be excluded.
     pub include_children: bool,
-    /// The `#offset!` directive for this pattern, resolved at collection time
+    /// The effective `#offset!` or `#trim!` range encoded as boundary deltas
+    /// and resolved at collection time
     /// (the query goes out of scope before consumers like
     /// `CacheableInjectionRegion::from_region_info` run). `None` when the
-    /// pattern has no directive.
+    /// runtime directives leave the raw range unchanged.
     pub offset: Option<InjectionOffset>,
     /// Whether this pattern's captures form one virtual document.
     pub combined: bool,
@@ -123,21 +166,21 @@ fn position_of_byte(
     (row as u32, column)
 }
 
-/// The effective (post-`#offset!`) byte span of `info`'s content node within
+/// The effective runtime-directive byte span of `info`'s content node within
 /// `text`, snapped to in-bounds UTF-8 char boundaries.
 ///
-/// `#offset!` narrows (or widens) the raw `@injection.content` span to the
+/// `#offset!` and `#trim!` narrow (or widen) the raw `@injection.content` span to the
 /// bytes the injection parser actually sees — trimming frontmatter `---`
 /// fences, string quotes, and the like. The request-routing paths that must
 /// agree on *where the injected content is* share this one helper rather than
-/// each deriving it: region lookup ([`find_injection_at_position`]), region
+/// each deriving it: region lookup (`find_injection_at_position`), region
 /// resolution ([`CacheableInjectionRegion::from_region_info`]), and the native
 /// lexical layer's containment filter (`native_bindings`). The semantic,
 /// selection-range, and `kakehashi/node` paths still call
 /// `calculate_effective_range` themselves — each layers its own gap handling
 /// on top, so they are not folded in here.
 ///
-/// Scope: this applies `#offset!` only. Child-exclusion gaps (blockquote `> `
+/// Scope: this applies range directives only. Child-exclusion gaps (blockquote `> `
 /// prefixes, excluded named children) are *not* subtracted here, because the
 /// bridge's coordinate translation models a region as one contiguous
 /// `byte_range` plus per-line column offsets — a lookup that rejected gap
@@ -189,7 +232,7 @@ fn extract_virtual_content_and_offsets(
     region: &InjectionRegionInfo,
     cacheable: &CacheableInjectionRegion,
     text: &str,
-) -> (String, Vec<u32>) {
+) -> Option<(String, Vec<u32>)> {
     // Child-exclusion gaps restricted to the effective window (#186):
     // cacheable.byte_range already reflects any #offset! directive (applied
     // and char-boundary-aligned by from_region_info), so gaps are clipped to
@@ -206,6 +249,9 @@ fn extract_virtual_content_and_offsets(
     } else {
         compute_included_ranges(&region.content_node, region.include_children)
     };
+    if included_ranges.as_ref().is_some_and(Vec::is_empty) {
+        return None;
+    }
     let virtual_content = extract_clean_content(
         text,
         cacheable.byte_range.clone(),
@@ -217,7 +263,7 @@ fn extract_virtual_content_and_offsets(
         cacheable.start_column,
         included_ranges.as_deref(),
     );
-    (virtual_content, line_column_offsets)
+    Some((virtual_content, line_column_offsets))
 }
 
 impl CacheableInjectionRegion {
@@ -371,16 +417,16 @@ pub(crate) fn collect_all_injections_cancellable<'a>(
             // an earlier matching pattern for the same language. Same
             // resulting language layers, fewer scans.
             injections_map.entry(key).or_insert_with(|| {
-                let offset = effective_offset_for_pattern(query, match_.pattern_index);
+                let offset = runtime_offset_for_capture(query, match_, capture, text);
                 InjectionRegionInfo {
                     language: language.clone(),
                     content_node: capture.node,
                     pattern_index: match_.pattern_index,
                     include_children: has_include_children_for_pattern(query, match_.pattern_index),
-                    // Match the semantic path: effective offsets and
-                    // multi-region grouping do not compose safely.
-                    combined: has_combined_for_pattern(query, match_.pattern_index)
-                        && offset.is_none(),
+                    // Combined grouping is independent of runtime range
+                    // adjustment; consumers compose each member's effective
+                    // range into the shared injected document.
+                    combined: has_combined_for_pattern(query, match_.pattern_index),
                     identity_slot: 0,
                     offset,
                 }
@@ -421,13 +467,13 @@ pub(crate) fn collect_all_injections_cancellable<'a>(
 /// Detects injection and returns both the language and the content node
 /// Also returns the pattern index of the innermost injection for offset lookups
 pub(crate) fn detect_injection<'a>(
-    node: &Node<'a>,
     root: &Node<'a>,
     text: &str,
+    cursor_byte: usize,
     injection_query: Option<&Query>,
     base_language: &str,
-) -> Option<(Vec<String>, Node<'a>, usize)> {
-    let injections = collect_injection_regions(node, root, text, injection_query)?;
+) -> Option<(Vec<String>, Node<'a>, usize, Option<InjectionOffset>)> {
+    let injections = collect_injection_regions(root, text, cursor_byte, injection_query)?;
 
     if injections.is_empty() {
         return None;
@@ -472,7 +518,12 @@ pub(crate) fn detect_injection<'a>(
     // Return the innermost content node and its pattern index
     let innermost = sorted_injections.last()?;
 
-    Some((hierarchy, innermost.content_node, innermost.pattern_index))
+    Some((
+        hierarchy,
+        innermost.content_node,
+        innermost.pattern_index,
+        innermost.offset,
+    ))
 }
 
 /// Represents an injection region with its metadata (unresolved intermediate data).
@@ -482,14 +533,15 @@ struct RawInjectionRegion<'a> {
     language: String,
     content_node: Node<'a>,
     pattern_index: usize,
+    offset: Option<InjectionOffset>,
 }
 
 /// Collects all injection regions that contain the given node
 /// Returns a list of `RawInjectionRegion` values for each injection containing the node.
 fn collect_injection_regions<'a>(
-    node: &Node<'a>,
     root: &Node<'a>,
     text: &str,
+    cursor_byte: usize,
     injection_query: Option<&Query>,
 ) -> Option<Vec<RawInjectionRegion<'a>>> {
     let query = injection_query?;
@@ -504,24 +556,20 @@ fn collect_injection_regions<'a>(
     let mut injections_map = std::collections::HashMap::new();
 
     while let Some(match_) = matches.next() {
-        if let Some((content_node, language, pattern_index)) =
-            extract_content_and_language(node, match_, query, text)
+        if let Some((content_node, language, pattern_index, offset, start_byte, end_byte)) =
+            extract_content_and_language(cursor_byte, match_, query, text)
         {
-            let key = (
-                content_node.start_byte(),
-                content_node.end_byte(),
-                language.clone(),
-                pattern_index,
-            );
+            let key = (start_byte, end_byte, language.clone(), pattern_index);
 
             // Keep the first match for each range/language pair; distinct
             // languages on the same range remain separate layers.
             injections_map.entry(key).or_insert(RawInjectionRegion {
-                start_byte: content_node.start_byte(),
-                end_byte: content_node.end_byte(),
+                start_byte,
+                end_byte,
                 language,
                 content_node,
                 pattern_index,
+                offset,
             });
         }
     }
@@ -548,23 +596,48 @@ fn collect_injection_regions<'a>(
 /// Extracts the injection content node and language if the given node is within it
 /// Also returns the pattern index for offset lookups
 fn extract_content_and_language<'a>(
-    node: &Node<'a>,
+    cursor_byte: usize,
     match_: &QueryMatch<'_, 'a>,
     query: &Query,
     text: &str,
-) -> Option<(Node<'a>, String, usize)> {
+) -> Option<(
+    Node<'a>,
+    String,
+    usize,
+    Option<InjectionOffset>,
+    usize,
+    usize,
+)> {
     for capture in iter_injection_content_captures(match_, query) {
         let content_node = capture.node;
 
-        // Check if our node is within this injection region
-        if is_node_within(node, &content_node) {
-            if !check_match_predicates(query, match_, text) {
-                return None;
-            }
-            // Extract the injection language
-            if let Some(language) = extract_injection_language(query, match_, text) {
-                return Some((content_node, language, match_.pattern_index));
-            }
+        if !check_match_predicates(query, match_, text) {
+            return None;
+        }
+        let offset = runtime_offset_for_capture(query, match_, capture, text);
+        let effective = if let Some(offset) = offset {
+            use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
+            let range = calculate_effective_range(
+                text,
+                ByteRange::new(content_node.start_byte(), content_node.end_byte()),
+                offset,
+            );
+            range.start..range.end
+        } else {
+            content_node.byte_range()
+        };
+        if cursor_byte >= effective.start
+            && cursor_byte < effective.end
+            && let Some(language) = extract_injection_language(query, match_, text)
+        {
+            return Some((
+                content_node,
+                language,
+                match_.pattern_index,
+                offset,
+                effective.start,
+                effective.end,
+            ));
         }
     }
 
@@ -590,6 +663,7 @@ fn extract_content_and_language<'a>(
 ///
 /// Returns `(index, region)` for use with `calculate_region_id`, or `None`
 /// when no region matches under the boundary rule.
+#[cfg(test)]
 fn find_injection_at_position<'a>(
     injections: &'a [InjectionRegionInfo<'a>],
     byte_offset: usize,
@@ -683,7 +757,9 @@ fn ends_mid_line(text: &str, end: usize) -> bool {
 /// from the injection the user is visibly typing in.
 ///
 /// Both variants measure the effective post-`#offset!` span, never the raw
-/// `@injection.content` node — see [`effective_content_range`].
+/// `@injection.content` node — see [`effective_content_range`]. The raw
+/// candidate-order policy is pinned by the `find_injection_at_position` unit
+/// tests.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RegionBoundary {
     /// Strict half-open `[start, end)`: a cursor at the end byte is outside.
@@ -758,27 +834,56 @@ impl InjectionResolver {
         boundary: RegionBoundary,
     ) -> Option<ResolvedInjection> {
         let injections = collect_all_injections(&tree.root_node(), text, Some(injection_query))?;
-        let (_region_index, region) =
-            find_injection_at_position(&injections, byte_offset, text, boundary)?;
-        if region.combined {
-            let group: Vec<_> = injections
-                .iter()
-                .filter(|candidate| {
-                    candidate.combined
-                        && candidate.pattern_index == region.pattern_index
-                        && candidate.language == region.language
-                })
-                .collect();
-            Self::build_combined_injection(
-                coordinator,
-                Some((tracker, uri, incarnation)),
-                &group,
-                None,
-                text,
-            )
-        } else {
-            Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
+        let resolve = |region: &InjectionRegionInfo<'_>| {
+            if region.combined {
+                // A member with no included bytes is not a positional entry
+                // into the surviving members of its combined group.
+                let id = Self::calculate_region_id(tracker, uri, region, incarnation)?;
+                let cacheable =
+                    CacheableInjectionRegion::from_region_info(region, &id.to_string(), text);
+                extract_virtual_content_and_offsets(region, &cacheable, text)?;
+
+                let group: Vec<_> = injections
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.combined
+                            && candidate.pattern_index == region.pattern_index
+                            && candidate.language == region.language
+                    })
+                    .collect();
+                Self::build_combined_injection(
+                    coordinator,
+                    Some((tracker, uri, incarnation)),
+                    &group,
+                    None,
+                    text,
+                )
+            } else {
+                Self::build_resolved_injection(coordinator, tracker, uri, region, text, incarnation)
+            }
+        };
+
+        for region in &injections {
+            let range = effective_content_range(region, text);
+            if byte_offset >= range.start
+                && byte_offset < range.end
+                && let Some(resolved) = resolve(region)
+            {
+                return Some(resolved);
+            }
         }
+        if boundary == RegionBoundary::CaretEndFallback {
+            for region in &injections {
+                let range = effective_content_range(region, text);
+                if range.end == byte_offset
+                    && (ends_mid_line(text, range.end) || byte_offset == text.len())
+                    && let Some(resolved) = resolve(region)
+                {
+                    return Some(resolved);
+                }
+            }
+        }
+        None
     }
 
     /// Calculate a stable ULID-based region_id for an injection.
@@ -793,7 +898,7 @@ impl InjectionResolver {
     /// injection depths used by `kakehashi/node`.
     ///
     /// Deliberately keyed on the **raw** `content_node` bytes, not the
-    /// effective post-`#offset!` span that [`find_injection_at_position`]
+    /// effective post-`#offset!` span that `find_injection_at_position`
     /// measures. This is a tracker identity key — "which host node is this?" —
     /// not a containment question, and [`Self::resolve_by_region_id`] looks the
     /// region back up by those same raw bytes. Re-keying it on the effective
@@ -868,7 +973,7 @@ impl InjectionResolver {
         let cacheable_region =
             CacheableInjectionRegion::from_region_info(region, &region_id_str, text);
         let (virtual_content, line_column_offsets) =
-            extract_virtual_content_and_offsets(region, &cacheable_region, text);
+            extract_virtual_content_and_offsets(region, &cacheable_region, text)?;
         let resolved_language =
             Self::resolve_language(coordinator, &region.language, &virtual_content);
         Some(ResolvedInjection {
@@ -914,11 +1019,11 @@ impl InjectionResolver {
                 owned_cacheable.iter().collect()
             }
         };
-        let first = regions[0];
-        let first_cacheable = cacheable[0];
         if regions.len() == 1 {
+            let first = regions[0];
+            let first_cacheable = cacheable[0];
             let (virtual_content, line_column_offsets) =
-                extract_virtual_content_and_offsets(first, first_cacheable, text);
+                extract_virtual_content_and_offsets(first, first_cacheable, text)?;
             let injection_language =
                 Self::resolve_language(coordinator, &first.language, &virtual_content);
             let mut region = first_cacheable.clone();
@@ -931,27 +1036,67 @@ impl InjectionResolver {
                 contiguous: true,
             });
         }
-        let group_start = first_cacheable.byte_range.start;
-        let group_end = cacheable
+        let included_sets: Vec<_> = regions
             .iter()
-            .map(|region| region.byte_range.end)
+            .zip(&cacheable)
+            .map(|(region, cacheable)| {
+                if region.offset.is_some() {
+                    compute_included_ranges_clipped(
+                        &region.content_node,
+                        region.include_children,
+                        text,
+                        cacheable.byte_range.clone(),
+                    )
+                } else {
+                    compute_included_ranges(&region.content_node, region.include_children)
+                }
+            })
+            .collect();
+        let active_indices: Vec<_> = included_sets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ranges)| {
+                (!ranges.as_ref().is_some_and(Vec::is_empty)).then_some(index)
+            })
+            .collect();
+        if active_indices.len() == 1 {
+            let index = active_indices[0];
+            let first = regions[index];
+            let first_cacheable = cacheable[index];
+            let (virtual_content, line_column_offsets) =
+                extract_virtual_content_and_offsets(first, first_cacheable, text)?;
+            let injection_language =
+                Self::resolve_language(coordinator, &first.language, &virtual_content);
+            let mut region = first_cacheable.clone();
+            region.content_hash = CacheableInjectionRegion::hash_content(&virtual_content);
+            return Some(ResolvedInjection {
+                region,
+                injection_language,
+                virtual_content,
+                line_column_offsets,
+                contiguous: true,
+            });
+        }
+        let anchor_index = active_indices.iter().copied().min_by_key(|&index| {
+            (
+                cacheable[index].byte_range.start,
+                cacheable[index].byte_range.end,
+            )
+        })?;
+        let first = regions[anchor_index];
+        let first_cacheable = cacheable[anchor_index];
+        let group_start = first_cacheable.byte_range.start;
+        let group_end = active_indices
+            .iter()
+            .map(|&index| cacheable[index].byte_range.end)
             .max()
             .unwrap_or(group_start);
 
         let mut included = Vec::new();
-        for (region, cacheable) in regions.iter().zip(&cacheable) {
-            let ranges = if region.offset.is_some() {
-                compute_included_ranges_clipped(
-                    &region.content_node,
-                    region.include_children,
-                    text,
-                    cacheable.byte_range.clone(),
-                )
-            } else {
-                compute_included_ranges(&region.content_node, region.include_children)
-            };
-            match ranges {
-                Some(ranges) => included.extend(ranges.into_iter().map(|range| {
+        for &index in &active_indices {
+            let cacheable = cacheable[index];
+            match &included_sets[index] {
+                Some(ranges) => included.extend(ranges.iter().map(|range| {
                     cacheable.byte_range.start + range.start_byte
                         ..cacheable.byte_range.start + range.end_byte
                 })),
@@ -972,9 +1117,9 @@ impl InjectionResolver {
 
         let mut combined_region = first_cacheable.clone();
         combined_region.byte_range.end = group_end;
-        combined_region.line_range.end = cacheable
+        combined_region.line_range.end = active_indices
             .iter()
-            .map(|region| region.line_range.end)
+            .map(|&index| cacheable[index].line_range.end)
             .max()
             .unwrap_or(combined_region.line_range.end);
         combined_region.content_hash = CacheableInjectionRegion::hash_content(&virtual_content);
@@ -1042,6 +1187,12 @@ impl InjectionResolver {
                 && Self::region_identity_layer(tracker, uri, candidate, incarnation)
                     == Some(identity_layer)
         })?;
+
+        // An opaque ID for a capture whose child exclusions leave no bytes is
+        // not a bridge layer, even when another member of the same combined
+        // group remains active.
+        let selected = CacheableInjectionRegion::from_region_info(region, region_id, text);
+        extract_virtual_content_and_offsets(region, &selected, text)?;
 
         if region.combined {
             let group: Vec<_> = regions
@@ -1184,8 +1335,11 @@ impl InjectionResolver {
             };
             let region = &regions[index];
             if let Some(cacheable) = prebuilt {
-                let (virtual_content, line_column_offsets) =
-                    extract_virtual_content_and_offsets(region, &cacheable[index], text);
+                let Some((virtual_content, line_column_offsets)) =
+                    extract_virtual_content_and_offsets(region, &cacheable[index], text)
+                else {
+                    continue;
+                };
                 let resolved_language =
                     Self::resolve_language(coordinator, &region.language, &virtual_content);
                 resolved.push(ResolvedInjection {
@@ -1279,7 +1433,7 @@ fn build_combined_virtual_content(
 
         while included
             .get(range_index)
-            .is_some_and(|range| range.end <= line_start)
+            .is_some_and(|range| range.start >= range.end || range.end <= line_start)
         {
             range_index += 1;
         }
@@ -1512,10 +1666,16 @@ mod tests {
         let node_in_string = find_node_at_byte(&root, 20).expect("node at position");
 
         // Detect injection with content
-        let result = detect_injection(&node_in_string, &root, text, Some(&query), "rust");
+        let result = detect_injection(
+            &root,
+            text,
+            node_in_string.start_byte(),
+            Some(&query),
+            "rust",
+        );
 
         assert!(result.is_some());
-        let (hierarchy, _content_node, _pattern_index) = result.unwrap();
+        let (hierarchy, _content_node, _pattern_index, _offset) = result.unwrap();
 
         // Should detect rust -> markdown hierarchy
         assert_eq!(hierarchy, vec!["rust", "markdown"]);
@@ -1549,9 +1709,15 @@ mod tests {
         let node = find_node_at_byte(&root, 35); // Position in regex string
         assert!(node.is_some());
 
-        let result = detect_injection(&node.unwrap(), &root, text, Some(&query), "rust");
+        let result = detect_injection(
+            &root,
+            text,
+            node.unwrap().start_byte(),
+            Some(&query),
+            "rust",
+        );
         assert_eq!(
-            result.map(|(h, _, _)| h),
+            result.map(|(h, _, _, _)| h),
             Some(vec!["rust".to_string(), "regex".to_string()])
         );
     }
@@ -1578,8 +1744,14 @@ mod tests {
         let node = find_node_at_byte(&root, 20); // Position in string
         assert!(node.is_some());
 
-        let result = detect_injection(&node.unwrap(), &root, text, Some(&query), "rust");
-        assert_eq!(result.map(|(h, _, _)| h), None);
+        let result = detect_injection(
+            &root,
+            text,
+            node.unwrap().start_byte(),
+            Some(&query),
+            "rust",
+        );
+        assert_eq!(result.map(|(h, _, _, _)| h), None);
     }
 
     #[test]
@@ -1590,7 +1762,7 @@ mod tests {
         let root = tree.root_node();
 
         let node = root.child(0).unwrap();
-        let result = detect_injection(&node, &root, text, None, "rust");
+        let result = detect_injection(&root, text, node.start_byte(), None, "rust");
         assert_eq!(result, None);
     }
 
@@ -1629,10 +1801,10 @@ mod tests {
         let query = Query::new(&language, query_str).expect("valid query");
 
         let node = find_node_at_byte(&root, 22).expect("node in string");
-        let result = detect_injection(&node, &root, text, Some(&query), "rust");
+        let result = detect_injection(&root, text, node.start_byte(), Some(&query), "rust");
 
         assert!(result.is_some());
-        let (hierarchy, _, _) = result.unwrap();
+        let (hierarchy, _, _, _) = result.unwrap();
         assert_eq!(hierarchy, vec!["rust", "nested_lang"]);
 
         // The actual deep recursion is tested through integration with refactor.rs
@@ -1685,6 +1857,123 @@ mod tests {
         .expect("a non-first combined capture resolves the shared document");
         assert_eq!(via_second.region.region_id, resolved[0].region.region_id);
         assert_eq!(via_second.virtual_content, resolved[0].virtual_content);
+    }
+
+    #[test]
+    fn resolve_all_skips_content_fully_excluded_by_named_children() {
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"((source_file) @injection.content
+                 (#set! injection.language "rust"))"#,
+        )
+        .unwrap();
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("fully_excluded"),
+            &tree,
+            text,
+            &query,
+            0,
+        );
+
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn positional_resolution_skips_fully_excluded_shadowing_candidates() {
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"((source_file) @injection.content
+                 (#set! injection.language "dead"))
+               ((function_item) @injection.content
+                 (#set! injection.language "rust")
+                 (#set! injection.include-children))"#,
+        )
+        .unwrap();
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("excluded_shadow");
+
+        let inside = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            1,
+            0,
+            RegionBoundary::HalfOpen,
+        )
+        .expect("the later active overlapping candidate must remain reachable");
+        assert_eq!(inside.injection_language, "rust");
+
+        let at_end = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            text.len(),
+            0,
+            RegionBoundary::CaretEndFallback,
+        )
+        .expect("caret fallback must also continue past an excluded candidate");
+        assert_eq!(at_end.injection_language, "rust");
+    }
+
+    #[test]
+    fn combined_resolution_drops_empty_members_from_group_geometry() {
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let empty_query = Query::new(
+            &language,
+            r#"((source_file) @injection.content
+                 (#set! injection.language "rust")
+                 (#set! injection.combined))"#,
+        )
+        .unwrap();
+        let active_query = Query::new(
+            &language,
+            r#"((function_item) @injection.content
+                 (#set! injection.language "rust")
+                 (#set! injection.combined))"#,
+        )
+        .unwrap();
+
+        let empty = collect_all_injections(&tree.root_node(), text, Some(&empty_query))
+            .unwrap()
+            .remove(0);
+        let active = collect_all_injections(&tree.root_node(), text, Some(&active_query))
+            .unwrap()
+            .remove(0);
+        let tracker = NodeTracker::new();
+        let uri = test_uri("combined_empty_member");
+        let resolved = InjectionResolver::build_combined_injection(
+            &test_coordinator(),
+            Some((&tracker, &uri, 0)),
+            &[&empty, &active],
+            None,
+            text,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.region.byte_range, active.content_node.byte_range());
+        assert!(!resolved.virtual_content.is_empty());
+        assert!(resolved.contiguous);
     }
 
     #[test]
@@ -1809,6 +2098,16 @@ mod tests {
     }
 
     #[test]
+    fn combined_content_skips_empty_ranges_before_later_content() {
+        let text = "abcdef";
+
+        let (content, offsets) = build_combined_virtual_content(text, 0..text.len(), &[2..2, 4..5]);
+
+        assert_eq!(content, "e ");
+        assert_eq!(offsets, vec![4]);
+    }
+
+    #[test]
     fn single_combined_blockquote_uses_contiguous_single_region_mapping() {
         let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
         let mut parser = Parser::new();
@@ -1843,7 +2142,7 @@ mod tests {
     }
 
     #[test]
-    fn combined_patterns_with_offsets_remain_separate() {
+    fn combined_patterns_preserve_runtime_offsets() {
         let mut parser = create_rust_parser();
         let text = r#"fn main() { let a = "abc"; let b = "def"; }"#;
         let tree = parse_rust_code(&mut parser, text);
@@ -1870,10 +2169,61 @@ mod tests {
             0,
         );
 
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].virtual_content, "b");
-        assert_eq!(resolved[1].virtual_content, "e");
-        assert!(resolved.iter().all(|region| region.contiguous));
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].virtual_content.contains('b'));
+        assert!(resolved[0].virtual_content.contains('e'));
+        assert!(!resolved[0].contiguous);
+    }
+
+    #[test]
+    fn trim_directive_adjusts_injection_content() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let value = "  body  "; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"
+                ((string_content) @injection.content
+                 (#set! injection.language "html")
+                 (#trim! @injection.content 0 1 0 1))
+            "#,
+        )
+        .expect("valid query");
+
+        let resolved = InjectionResolver::resolve_all(
+            &test_coordinator(),
+            &NodeTracker::new(),
+            &test_uri("trimmed_content"),
+            &tree,
+            text,
+            &query,
+            0,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].virtual_content, "body");
+    }
+
+    #[test]
+    fn adjusted_captures_remain_combined() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let a = "body"; let b = "  body  "; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"((string_content) @injection.content
+                 (#set! injection.language "html")
+                 (#set! injection.combined)
+                 (#trim! @injection.content 0 1 0 1))"#,
+        )
+        .unwrap();
+
+        let regions = collect_all_injections(&tree.root_node(), text, Some(&query)).unwrap();
+
+        assert_eq!(regions.len(), 2);
+        assert!(regions.iter().all(|region| region.combined));
     }
 
     #[test]
@@ -1911,10 +2261,16 @@ mod tests {
 
         // Now test our detection from inside the comment
         let node_in_comment = find_node_at_byte(&root, 14).expect("node in comment");
-        let result = detect_injection(&node_in_comment, &root, text, Some(&query), "rust");
+        let result = detect_injection(
+            &root,
+            text,
+            node_in_comment.start_byte(),
+            Some(&query),
+            "rust",
+        );
 
         assert!(result.is_some(), "Should find injection");
-        let (hierarchy, _, _) = result.unwrap();
+        let (hierarchy, _, _, _) = result.unwrap();
         assert_eq!(
             hierarchy,
             vec!["rust", "doc"],
@@ -3142,7 +3498,7 @@ mod tests {
         assert_eq!(region.language, "regex");
     }
 
-    /// An `#offset!` whose bounds cross collapses the effective span to zero
+    /// An `#offset!` whose bounds meet collapses the effective span to zero
     /// width. Half-open containment is then vacuous by arithmetic — there is no
     /// character to hover — but the caret rule still routes at the collapse
     /// byte: that position IS the whole (empty) injection, which is the first
@@ -3154,18 +3510,17 @@ mod tests {
         let mut parser = create_rust_parser();
         let text = r#"fn main() { let s = "git co"; }"#;
         let tree = parse_rust_code(&mut parser, text);
-        // The string_literal spans [20, 28). Crossing bounds (start 25 > end 23)
-        // exercise `calculate_effective_range`'s normalization directly, rather
-        // than collapsing by out-of-range clamping.
+        // The string_literal spans [20, 28). Equal adjusted bounds collapse at
+        // byte 24 without relying on Neovim's invalid-range fallback.
         let crossing = InjectionOffset {
             start_row: 0,
-            start_column: 5,
+            start_column: 4,
             end_row: 0,
-            end_column: -5,
+            end_column: -4,
         };
         let (injections, raw_start, raw_end) =
             string_literal_injection_with_offset(&tree, text, crossing, false);
-        let collapse_byte = raw_start + 3;
+        let collapse_byte = raw_start + 4;
 
         for byte in raw_start..=raw_end {
             assert!(
@@ -3210,7 +3565,7 @@ mod tests {
                 &tree_sitter_rust::LANGUAGE.into(),
                 r#"((string_literal) @injection.content
                      (#set! injection.language "regex")
-                     (#offset! @injection.content 0 5 0 -5))"#,
+                     (#offset! @injection.content 0 4 0 -4))"#,
             )
             .expect("valid collapsing injection query"),
             collapse_byte,
@@ -3445,12 +3800,60 @@ mod tests {
         let language = tree_sitter_rust::LANGUAGE.into();
         let query = Query::new(&language, query_str).expect("valid query");
 
-        let injection = detect_injection(&node, &root, text, Some(&query), "rust");
+        let injection = detect_injection(&root, text, node.start_byte(), Some(&query), "rust");
 
         assert!(
             injection.is_none(),
             "a failed helper-capture predicate must reject point detection"
         );
+    }
+
+    #[test]
+    fn detect_injection_keeps_a_trimmed_leaf_capture() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let value = "body"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+        let content = root
+            .descendant_for_byte_range(
+                text.find("\"body\"").unwrap(),
+                text.find("\"body\"").unwrap(),
+            )
+            .unwrap();
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"((string_literal) @injection.content
+                 (#set! injection.language "html")
+                 (#offset! @injection.content 0 1 0 -1))"#,
+        )
+        .unwrap();
+
+        let detected =
+            detect_injection(&root, text, content.start_byte() + 1, Some(&query), "rust").unwrap();
+
+        assert_eq!(detected.0, vec!["rust", "html"]);
+        assert!(detected.3.is_some());
+    }
+
+    #[test]
+    fn detect_injection_reaches_an_offset_extension() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let value = "body"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+        let quote = text.find("\"body\"").unwrap();
+        let content = root.descendant_for_byte_range(quote, quote).unwrap();
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"((string_literal) @injection.content
+                 (#set! injection.language "html")
+                 (#offset! @injection.content 0 0 0 1))"#,
+        )
+        .unwrap();
+
+        let detected = detect_injection(&root, text, content.end_byte(), Some(&query), "rust");
+
+        assert!(detected.is_some());
     }
 
     #[rstest]

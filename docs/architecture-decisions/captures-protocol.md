@@ -87,9 +87,24 @@ an identical match. Values stay the strings written in the query (clients
 coerce, as Neovim consumers do); the bare flag form `(#set! key)` surfaces as
 `true` rather than Neovim's nil no-op, so a flag is actually observable.
 Repeated keys are last-write-wins, matching Neovim's in-order directive
-application. Other directives (`#offset!`, `#gsub!`, `#trim!`) compute
-runtime-dependent metadata and are **not** implemented — `#set!` is purely
-static, so it falls out of tree-sitter's own `property_settings` parsing.
+application. Runtime range directives are evaluated separately:
+`#offset!` and `#trim!` adjust the capture's wire `range`, while the raw node
+span remains the source of node identity and cache tracking. As in
+`vim.treesitter.get_range()`, a valid trim range takes precedence over an
+offset. `#gsub!` is evaluated where transformed capture text has a consumer —
+currently dynamic `@injection.language` resolution — but this protocol does
+not expose Neovim's `metadata[capture_id].text` because its capture shape has
+no transformed-text field. Dynamic language resolution evaluates runtime
+directives in query order: range metadata affects text until `#gsub!`
+materializes it, after which Neovim's `metadata.text` precedence applies. The
+evaluator uses the same Lua-pattern translator
+as `#lua-match?`; unsupported Lua constructs (`%b`, `%f`, position captures
+`()` and pattern capture backreferences) fail soft and leave the prior text unchanged. It also does not
+compose `#set! @capture text ...` with `#gsub!`: tree-sitter's Rust API exposes
+property settings separately from general directives without their relative
+source order, so reproducing Neovim's ordered metadata updates would require
+guessing. These limits do not affect the `#gsub!` forms currently shipped by
+nvim-treesitter.
 
 ### Kind resolution
 

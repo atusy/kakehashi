@@ -1,7 +1,9 @@
 //! Parsing of the `#offset!` directive that shifts injection content
 //! boundaries (e.g. trimming frontmatter delimiters).
 
+#[cfg(test)]
 use crate::language::predicate_accessor::{UnifiedPredicate, get_all_predicates};
+#[cfg(test)]
 use tree_sitter::Query;
 
 /// Represents offset adjustments for injection content boundaries
@@ -13,6 +15,23 @@ pub(crate) struct InjectionOffset {
     pub end_column: i32,
 }
 
+/// Parse Neovim's offset arguments, defaulting omitted positions to zero.
+pub(crate) fn parse_offset_args(
+    args: &[tree_sitter::QueryPredicateArg],
+) -> Option<InjectionOffset> {
+    let parse = |index: usize| match args.get(index) {
+        None => Some(0),
+        Some(tree_sitter::QueryPredicateArg::String(value)) => value.parse::<i32>().ok(),
+        Some(tree_sitter::QueryPredicateArg::Capture(_)) => None,
+    };
+    Some(InjectionOffset {
+        start_row: parse(0)?,
+        start_column: parse(1)?,
+        end_row: parse(2)?,
+        end_column: parse(3)?,
+    })
+}
+
 /// The `#offset!` directive for a pattern, normalized: a directive that
 /// parses to all zeros (malformed, or an explicit `#offset! … 0 0 0 0`) is a
 /// no-op and is reported as `None`, so consumers never disable
@@ -20,6 +39,7 @@ pub(crate) struct InjectionOffset {
 /// that changes nothing. Use this instead of
 /// [`parse_offset_directive_for_pattern`] anywhere behavior branches on the
 /// offset's presence.
+#[cfg(test)]
 pub(crate) fn effective_offset_for_pattern(
     query: &Query,
     pattern_index: usize,
@@ -30,10 +50,12 @@ pub(crate) fn effective_offset_for_pattern(
 
 /// Parses offset directive for a specific pattern in the query.
 /// Returns None if the specified pattern has no #offset! directive for @injection.content.
+#[cfg(test)]
 pub(crate) fn parse_offset_directive_for_pattern(
     query: &Query,
     pattern_index: usize,
 ) -> Option<InjectionOffset> {
+    let mut offset = None;
     for predicate in get_all_predicates(query, pattern_index) {
         // Skip non-offset! directives
         if predicate.operator() != "offset!" {
@@ -59,74 +81,9 @@ pub(crate) fn parse_offset_directive_for_pattern(
             continue;
         };
 
-        // Parse the 4 numeric arguments after the capture
-        // Format: (#offset! @injection.content start_row start_col end_row end_col)
-        let arg_count = pred.args.len();
-
-        // Validate argument count (should be 5: capture + 4 offsets)
-        if arg_count < 5 {
-            log::info!(
-                target: "kakehashi::query",
-                "Malformed #offset! directive for pattern {}: expected 4 offset values, got {}. \
-                Using default offset (0, 0, 0, 0). \
-                Correct format: (#offset! @injection.content start_row start_col end_row end_col)",
-                pattern_index,
-                arg_count - 1 // Subtract 1 for the capture argument
-            );
-            return Some(InjectionOffset::default());
-        }
-
-        // Try to parse each argument as i32
-        let parse_arg = |idx: usize| -> Result<i32, String> {
-            if let Some(tree_sitter::QueryPredicateArg::String(s)) = pred.args.get(idx) {
-                s.parse().map_err(|_| s.to_string())
-            } else {
-                Err(String::from("missing"))
-            }
-        };
-
-        // Parse all 4 offset values
-        let parse_results = [
-            ("start_row", parse_arg(1)),
-            ("start_col", parse_arg(2)),
-            ("end_row", parse_arg(3)),
-            ("end_col", parse_arg(4)),
-        ];
-
-        // Pattern match on all 4 results - more idiomatic than all(is_ok) + unwrap()
-        if let [
-            ("start_row", Ok(start_row)),
-            ("start_col", Ok(start_col)),
-            ("end_row", Ok(end_row)),
-            ("end_col", Ok(end_col)),
-        ] = parse_results.as_slice()
-        {
-            return Some(InjectionOffset {
-                start_row: *start_row,
-                start_column: *start_col,
-                end_row: *end_row,
-                end_column: *end_col,
-            });
-        }
-
-        // Log which values failed to parse
-        let error_details: Vec<String> = parse_results
-            .into_iter()
-            .filter_map(|(name, result)| result.err().map(|val| format!("{} = '{}'", name, val)))
-            .collect();
-
-        log::info!(
-            target: "kakehashi::query",
-            "Failed to parse #offset! directive for pattern {}: invalid values [{}]. \
-            Using default offset (0, 0, 0, 0). \
-            All offset values must be integers.",
-            pattern_index,
-            error_details.join(", ")
-        );
-
-        return Some(InjectionOffset::default());
+        offset = Some(parse_offset_args(&pred.args[1..]).unwrap_or_default());
     }
-    None
+    offset
 }
 
 #[cfg(test)]
@@ -173,9 +130,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn last_offset_directive_wins() {
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"((line_comment) @injection.content
+                 (#offset! @injection.content 0 1 0 0)
+                 (#offset! @injection.content 0 2 0 -1))"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_offset_directive_for_pattern(&query, 0),
+            Some(InjectionOffset {
+                start_row: 0,
+                start_column: 2,
+                end_row: 0,
+                end_column: -1,
+            })
+        );
+    }
+
     #[rstest]
     #[case::non_numeric_values("foo bar baz qux", Some(InjectionOffset::default()))]
-    #[case::missing_arguments("1 0", Some(InjectionOffset::default()))]
+    #[case::missing_arguments("1 0", Some(InjectionOffset { start_row: 1, start_column: 0, end_row: 0, end_column: 0 }))]
     #[case::extra_arguments("1 0 -1 0 5", Some(InjectionOffset { start_row: 1, start_column: 0, end_row: -1, end_column: 0 }))]
     #[case::mixed_valid_invalid("1 invalid -1 0", Some(InjectionOffset::default()))]
     #[case::empty_args("", Some(InjectionOffset::default()))]
