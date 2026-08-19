@@ -836,11 +836,11 @@ When `--config-file` is specified:
 - A key kakehashi does not recognise is **reported but not fatal**, so a file
   can carry a key a newer version understands without the older one refusing to
   start. Serde would otherwise drop `autoInstal = false` silently and leave you
-  wondering why the default applied. Two caveats: keys inside `features` are an
-  exception — the parser rejects them outright, so an unknown one there *is*
-  fatal — and in `format`/`diagnose` the warning has nowhere to go, since CLI
-  mode surfaces only hard errors. (`workspace/didChangeConfiguration` is
-  stricter still and rejects the whole update — that one is a live edit, not a
+  wondering why the default applied. Nested `features` keys follow the same
+  warning policy, and recognized sibling settings remain effective. One
+  caveat: in `format`/`diagnose` the warning has nowhere to go, since CLI mode
+  surfaces only hard errors. (`workspace/didChangeConfiguration` is stricter
+  still and rejects the whole pushed update — that one is a live edit, not a
   file you may share across versions.)
 - Cross-field invariants (e.g. `debounceMs` ≤ `maxWaitMs`) are judged on the
   merged explicit configuration, so splitting the two halves across two files is

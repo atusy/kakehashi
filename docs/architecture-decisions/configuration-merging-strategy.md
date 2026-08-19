@@ -122,9 +122,11 @@ Bases per layer: a config file uses its own directory (each `--config-file`
 layer its own), `initializationOptions` and `didChangeConfiguration` use the
 workspace root, and the programmed defaults have no base. That root is not
 fixed at initialize: `workspace/didChangeWorkspaceFolders` re-selects it from
-the current folder list. A layer anchored earlier keeps the root it was
-anchored to, because anchoring yields absolute paths and is idempotent — see
-#948.
+the current folder list. Config-file layers keep their own anchoring, but client
+layers are retained in authored form and replayed against the newly selected
+root, including in an explicit `--config-file` session. Reusing an already
+anchored client layer would keep the old root because anchoring yields absolute
+paths and is idempotent — see #948.
 
 Resolution is therefore two distinct steps, in this order:
 
