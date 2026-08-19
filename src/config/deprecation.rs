@@ -153,7 +153,8 @@ pub(crate) fn aliases_deprecation_notice(language: &str, aliases: &[String]) -> 
     let json = serde_json::json!({ "languages": derived_languages });
     format!(
         "Language '{language}' uses deprecated 'aliases' field. \
-         Use 'base' on each derived language instead.\n\
+         Use 'base' on each derived language instead. Edit each existing language entry in \
+         place; do not add a duplicate table or object key.\n\
          TOML:\n{toml_examples}\n\
          JSON:\n{json}\n\
          {special_guidance}The 'aliases' field will be removed in kakehashi v{}.",
@@ -371,7 +372,8 @@ rootMarkers = [".git"]
         let notice = aliases_deprecation_notice("markdown", &["rmd".to_owned()]);
         let expected = format!(
             "Language 'markdown' uses deprecated 'aliases' field. Use 'base' on each derived \
-             language instead.\nTOML:\n[languages.\"rmd\"]\nbase = \"markdown\"\nJSON:\n\
+             language instead. Edit each existing language entry in place; do not add a \
+             duplicate table or object key.\nTOML:\n[languages.\"rmd\"]\nbase = \"markdown\"\nJSON:\n\
              {{\"languages\":{{\"rmd\":{{\"base\":\"markdown\"}}}}}}\n\
              The 'aliases' field will be removed in kakehashi v{}.",
             ALIASES_DEPRECATION.remove_in_major()

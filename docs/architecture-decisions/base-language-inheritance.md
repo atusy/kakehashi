@@ -133,7 +133,9 @@ deprecation-removal-deadlines.
 
 **Migration**: Each distinct alias other than the reserved `_` key or `L`
 itself becomes a derived language. Remove `_` and self-aliases without creating
-`base` entries. For example, `aliases = ["x", "y"]` on language `L` becomes:
+`base` entries. If the alias already has a language entry, add or update `base`
+in that entry rather than declaring the table or object key a second time. For
+example, `aliases = ["x", "y"]` on language `L` becomes:
 
 ```toml
 [languages.x]
