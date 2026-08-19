@@ -11,6 +11,27 @@
 
 use serde_json::Value as JsonValue;
 
+crate::deprecation::enforce_deprecation_deadline!(
+    name = "languageServers.*.rootMarkers",
+    deprecated_in = 0,
+    remove_in = 2,
+);
+crate::deprecation::enforce_deprecation_deadline!(
+    name = "unwrapped workspace/didChangeConfiguration settings",
+    deprecated_in = 0,
+    remove_in = 2,
+);
+crate::deprecation::enforce_deprecation_deadline!(
+    name = "top-level autoInstall",
+    deprecated_in = 0,
+    remove_in = 2,
+);
+crate::deprecation::enforce_deprecation_deadline!(
+    name = "top-level captureMappings",
+    deprecated_in = 0,
+    remove_in = 2,
+);
+
 /// Which deprecated config keys any loaded layer actually spelled.
 ///
 /// Serde collapses deprecated and canonical spellings (via `alias`, or by the
@@ -44,14 +65,14 @@ impl DeprecatedKeysSeen {
 /// User-facing text for the one-per-session `rootMarkers` deprecation notice,
 /// shared by every path that can surface it (initialize, didChangeConfiguration).
 pub(crate) const ROOT_MARKERS_DEPRECATION_NOTICE: &str = "kakehashi: the `rootMarkers` config key is deprecated; rename it to \
-     `workspaceMarkers`. `rootMarkers` still works for now but may be removed \
-     in a future release.";
+     `workspaceMarkers`. `rootMarkers` still works for now but will be removed \
+     in kakehashi v2.";
 
 /// User-facing text for runtime client-pushed configuration that still uses the
 /// old unwrapped/flat `workspace/didChangeConfiguration` shape.
 pub(crate) const UNWRAPPED_DIDCHANGE_CONFIGURATION_NOTICE: &str = "kakehashi: unwrapped `workspace/didChangeConfiguration` settings are deprecated; \
      send runtime settings in the notification's `settings.kakehashi` object. \
-     Flat didChange settings still work for now but may be removed in a future release.";
+     Flat didChange settings still work for now but will be removed in kakehashi v2.";
 
 /// User-facing text for the one-per-session top-level `autoInstall` notice.
 ///
@@ -62,7 +83,7 @@ pub(crate) const AUTO_INSTALL_DEPRECATION_NOTICE: &str = "kakehashi: the top-lev
      `languages._.autoInstall` (and override per language with \
      `languages.<lang>.autoInstall`). A language with a self-referential \
      `base` inherits nothing from `_`, so give those an explicit value. The \
-     top-level key still works for now but may be removed in a future release.";
+     top-level key still works for now but will be removed in kakehashi v2.";
 
 /// User-facing text for the one-per-session top-level `captureMappings`
 /// notice. The dotted path is usable for both TOML and JSON configuration.
@@ -70,7 +91,7 @@ pub(crate) const CAPTURE_MAPPINGS_DEPRECATION_NOTICE: &str = "kakehashi: the top
      `features.\"textDocument/semanticTokens\".captureMappings` in TOML (or \
      `features[\"textDocument/semanticTokens\"].captureMappings` in JSON) and remove the \
      intermediate `highlights` key. The top-level key still works for now but \
-     may be removed in a future release.";
+     will be removed in kakehashi v2.";
 
 /// Which deprecated keys the raw TOML text spells.
 ///

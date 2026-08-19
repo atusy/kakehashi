@@ -284,7 +284,7 @@ is itself resolved by language name and so must follow it too.
 **Deprecated:** use [`languages[*].autoInstall`](#languagesautoinstall) instead.
 The top-level key still works — it answers whenever no per-language value is
 set — but kakehashi shows a one-time migration notice when it is present, and
-it may be removed in a future release.
+it will be removed in kakehashi v2.
 
 Move `autoInstall = true` to `[languages._] autoInstall = true` — equivalent in
 every case but one, see the migration caveat under
