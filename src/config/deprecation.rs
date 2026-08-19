@@ -113,7 +113,9 @@ pub(crate) fn json_deprecated_keys(value: &JsonValue) -> DeprecatedKeysSeen {
         auto_install: value
             .as_object()
             .is_some_and(|object| object.contains_key("autoInstall")),
-        capture_mappings: false,
+        capture_mappings: value
+            .as_object()
+            .is_some_and(|object| object.contains_key("captureMappings")),
     }
 }
 
@@ -217,6 +219,23 @@ rootMarkers = [".git"]
             "languages": { "_": { "autoInstall": true } }
         });
         assert!(!json_deprecated_keys(&canonical).auto_install);
+    }
+
+    #[test]
+    fn json_distinguishes_deprecated_and_canonical_capture_mappings() {
+        let deprecated = serde_json::json!({
+            "captureMappings": { "_": { "highlights": { "variable": "variable" } } }
+        });
+        assert!(json_deprecated_keys(&deprecated).capture_mappings);
+
+        let canonical = serde_json::json!({
+            "features": {
+                "textDocument/semanticTokens": {
+                    "captureMappings": { "_": { "variable": "variable" } }
+                }
+            }
+        });
+        assert!(!json_deprecated_keys(&canonical).capture_mappings);
     }
 
     #[test]
