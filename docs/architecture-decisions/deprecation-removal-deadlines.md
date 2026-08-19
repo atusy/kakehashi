@@ -19,10 +19,11 @@ reviewable deadline instead of inheriting that schedule accidentally.
 
 ## Decision
 
-Every retained compatibility path declares both the major version in which it
-was deprecated and the major version in which it must be removed. A build at or
-after the removal major fails while that declaration remains, naming the
-expired compatibility path and its deadline.
+Every retained path explicitly designated as deprecated declares both the major
+version in which it was deprecated and the major version in which it must be
+removed. A build at or after the removal major fails while that declaration
+remains, naming the expired compatibility path and its deadline. Compatibility
+fallbacks that are not deprecated are outside this removal policy.
 
 All compatibility paths deprecated during v0 declare v2 as their removal
 major. They remain valid in v0 and v1. A compatibility path first deprecated in
