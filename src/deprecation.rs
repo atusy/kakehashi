@@ -57,7 +57,7 @@ mod tests {
         fs::write(
             fixture.path().join("Cargo.toml"),
             format!(
-                "[package]\nname = \"deprecation-deadline-fixture\"\nversion = \"{version}\"\nedition = \"2024\"\n"
+                "[package]\nname = \"deprecation-deadline-fixture\"\nversion = \"{version}\"\nedition = \"2024\"\n\n[workspace]\n"
             ),
         )
         .expect("write fixture manifest");
