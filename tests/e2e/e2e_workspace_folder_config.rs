@@ -561,3 +561,51 @@ fn test_folder_change_preserves_capture_mapping_clear_before_later_addition() {
         "the earlier clear must still suppress lower-layer mappings: {settings}"
     );
 }
+
+#[test]
+fn test_folder_change_reanchors_relative_runtime_paths() {
+    let primary = project_dir("from-primary");
+    let secondary = project_dir("from-secondary");
+
+    let mut client = LspClient::builder()
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "workspaceFolders": [
+                folder(&primary, "primary"),
+                folder(&secondary, "secondary"),
+            ],
+            "capabilities": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "kakehashi": { "searchPaths": ["relative-parser"] } } }),
+    );
+    poll_search_paths(
+        &mut client,
+        json!([primary.path().join("relative-parser")]),
+        "runtime paths should initially anchor to the current root",
+    );
+
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [],
+                "removed": [folder(&primary, "primary")],
+            }
+        }),
+    );
+    poll_search_paths(
+        &mut client,
+        json!([secondary.path().join("relative-parser")]),
+        "replayed runtime paths should anchor to the newly selected root",
+    );
+}

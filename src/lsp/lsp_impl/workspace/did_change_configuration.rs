@@ -404,6 +404,9 @@ impl Kakehashi {
                 return;
             }
         };
+        // Retain the authored relative paths for a future workspace-root
+        // reload; the copy applied below is anchored to the root current now.
+        let replay_layer = parsed.clone();
 
         // Snapshot read, derivation, and publication must share the same reload
         // transaction as post-install search-path updates, or either path can
@@ -467,7 +470,7 @@ impl Kakehashi {
                 self.client_settings_overrides
                     .write()
                     .expect("client settings overrides lock poisoned")
-                    .push(parsed);
+                    .push(replay_layer);
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 self.apply_raw_settings_locked(&reload, merged_ts, settings)
                     .await;
