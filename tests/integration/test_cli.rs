@@ -275,7 +275,7 @@ fn test_config_init_emits_no_auto_install_spelling() {
     );
 }
 
-/// Test that config init includes captureMappings in output
+/// Test that config init emits only the canonical semantic-token mappings.
 #[test]
 fn test_config_init_includes_capture_mappings() {
     let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
@@ -285,10 +285,14 @@ fn test_config_init_includes_capture_mappings() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Should contain captureMappings section
     assert!(
-        stdout.contains("[captureMappings._.highlights]"),
-        "Should contain captureMappings section. Got: {}",
+        stdout.contains("[features.\"textDocument/semanticTokens\".captureMappings._]"),
+        "Should contain canonical captureMappings section. Got: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("[captureMappings."),
+        "Must not emit the deprecated top-level captureMappings section. Got: {}",
         stdout
     );
 
