@@ -566,6 +566,23 @@ fn emptied_container_names(settings: &RawWorkspaceSettings) -> Vec<String> {
         None => {}
     }
 
+    let canonical = settings
+        .features
+        .as_ref()
+        .and_then(|features| features.text_document_semantic_tokens.as_ref())
+        .and_then(|semantic_tokens| semantic_tokens.capture_mappings.as_ref());
+    match canonical {
+        Some(mappings) if mappings.is_empty() => {
+            named.push("features.\"textDocument/semanticTokens\".captureMappings".to_string())
+        }
+        Some(mappings) => named.extend(mappings.iter().filter_map(|(lang, mappings)| {
+            mappings
+                .is_empty()
+                .then(|| format!("features.\"textDocument/semanticTokens\".captureMappings.{lang}"))
+        })),
+        None => {}
+    }
+
     named
 }
 
@@ -1086,6 +1103,28 @@ mod tests {
             emptied_container_notice(Some(&inheriting)).is_none(),
             "omitting the keys is the inheriting spelling and must stay quiet"
         );
+
+        let canonical_root: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."textDocument/semanticTokens"]
+            captureMappings = {}
+            "#,
+        )
+        .expect("canonical root clear");
+        let message = emptied_container_notice(Some(&canonical_root)).expect("root notice");
+        assert!(
+            message.contains("features.\"textDocument/semanticTokens\".captureMappings"),
+            "{message}"
+        );
+
+        let canonical_language: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."textDocument/semanticTokens".captureMappings.rust]
+            "#,
+        )
+        .expect("canonical language clear");
+        let message = emptied_container_notice(Some(&canonical_language)).expect("entry notice");
+        assert!(message.contains("captureMappings.rust"), "{message}");
     }
 
     #[test]
