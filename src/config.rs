@@ -17,7 +17,7 @@ pub(crate) use merge::{
     is_server_spawnable, merge_bridge_language_configs, merge_bridge_server_configs,
     merge_layer_aggregation_configs, merge_workspace_settings, resolve_with_wildcard,
 };
-pub(crate) use settings::{CaptureMapping, CaptureMappings, DEFAULT_DEBOUNCE_MS};
+pub(crate) use settings::{CaptureMappings, DEFAULT_DEBOUNCE_MS};
 // Raw and effective settings share this type, so converting between them no
 // longer names it; only the tests that build fixtures do.
 #[cfg(test)]
@@ -48,9 +48,28 @@ fn default_search_paths() -> Vec<String> {
 /// internally by `try_from_settings`.
 fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
     let languages = settings.languages.clone();
-    // The raw and effective sides share `QueryTypeMappings`, so the layer's map
-    // carries over as-is; a raw layer that named none contributes nothing.
-    let capture_mappings = settings.capture_mappings.clone().unwrap_or_default();
+    let legacy = settings
+        .capture_mappings
+        .clone()
+        .map(merge::legacy_capture_mappings_to_semantic);
+    let canonical = settings
+        .features
+        .as_ref()
+        .and_then(|features| features.text_document_semantic_tokens.as_ref())
+        .and_then(|semantic_tokens| semantic_tokens.capture_mappings.clone());
+    let capture_mappings = merge::merge_semantic_token_capture_mappings(legacy, canonical)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(language, highlights)| {
+            (
+                language,
+                settings::QueryTypeMappings {
+                    highlights: Some(highlights),
+                    folds: None,
+                },
+            )
+        })
+        .collect();
 
     // Use explicit search_paths if provided, otherwise use platform defaults
     let search_paths = settings
@@ -448,17 +467,24 @@ impl WorkspaceSettings {
 impl From<&WorkspaceSettings> for RawWorkspaceSettings {
     fn from(settings: &WorkspaceSettings) -> Self {
         let languages = strip_inherited_languages(&settings.languages);
-        let capture_mappings = Some(settings.capture_mappings.clone());
+        let semantic_token_capture_mappings = settings
+            .capture_mappings
+            .iter()
+            .map(|(language, mappings)| (language.clone(), mappings.highlights().clone()))
+            .collect();
 
         let search_paths = Some(settings.search_paths.clone());
 
         RawWorkspaceSettings {
             search_paths,
             languages,
-            capture_mappings,
+            capture_mappings: None,
             auto_install: Some(settings.auto_install),
             diagnostics_debounce_ms: Some(settings.diagnostics_debounce_ms),
             features: Some(settings::FeatureSettings {
+                text_document_semantic_tokens: Some(settings::SemanticTokensFeatureSettings {
+                    capture_mappings: Some(semantic_token_capture_mappings),
+                }),
                 text_document_publish_diagnostics: Some(settings::DebounceFeatureSettings {
                     debounce_ms: Some(
                         settings
@@ -975,6 +1001,45 @@ mod tests {
     }
 
     #[test]
+    fn semantic_token_feature_capture_mappings_feed_token_resolution() {
+        let raw: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."textDocument/semanticTokens".captureMappings._]
+            "variable.builtin" = "variable.defaultLibrary"
+            "markup.strong" = ""
+
+            [features."textDocument/semanticTokens".captureMappings.rust]
+            "type.builtin" = "type.defaultLibrary"
+            "#,
+        )
+        .expect("the semantic-token feature schema should parse");
+
+        let settings = WorkspaceSettings::try_from_settings(&raw, None, |_| None)
+            .expect("the semantic-token feature settings should resolve");
+        assert_eq!(
+            settings.capture_mappings[WILDCARD_KEY]
+                .highlights()
+                .get("variable.builtin")
+                .map(String::as_str),
+            Some("variable.defaultLibrary")
+        );
+        assert_eq!(
+            settings.capture_mappings[WILDCARD_KEY]
+                .highlights()
+                .get("markup.strong")
+                .map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            settings.capture_mappings["rust"]
+                .highlights()
+                .get("type.builtin")
+                .map(String::as_str),
+            Some("type.defaultLibrary")
+        );
+    }
+
+    #[test]
     fn test_default_search_paths_used_when_none_configured() {
         // When search_paths is None in RawWorkspaceSettings, WorkspaceSettings
         // should use the default data directory paths (not an empty vector)
@@ -1190,6 +1255,7 @@ mod tests {
         for max_wait_ms in [0, settings::MAX_FEATURE_TIMING_MS + 1] {
             let raw = RawWorkspaceSettings {
                 features: Some(settings::FeatureSettings {
+                    text_document_semantic_tokens: None,
                     text_document_publish_diagnostics: None,
                     window_log_message: None,
                     workspace_diagnostic_refresh: Some(settings::DebounceFeatureSettings {

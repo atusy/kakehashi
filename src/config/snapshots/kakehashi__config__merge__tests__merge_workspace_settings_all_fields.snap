@@ -47,32 +47,28 @@ expression: result
       "autoInstall": null
     }
   },
-  "captureMappings": {
-    "_": {
-      "highlights": {
-        "function.builtin": "base.function",
-        "type.builtin": "overlay.type",
-        "variable.builtin": "overlay.variable"
-      },
-      "folds": {
-        "fold.comment": "base.comment",
-        "fold.function": "overlay.function"
-      }
-    },
-    "lua": {
-      "highlights": {
-        "keyword": "base.keyword"
-      }
-    },
-    "rust": {
-      "highlights": {
-        "type.builtin": "rust.type"
-      }
-    }
-  },
   "autoInstall": false,
   "diagnosticsDebounceMs": null,
-  "features": null,
+  "features": {
+    "textDocument/publishDiagnostics": null,
+    "textDocument/semanticTokens": {
+      "captureMappings": {
+        "_": {
+          "function.builtin": "base.function",
+          "type.builtin": "overlay.type",
+          "variable.builtin": "overlay.variable"
+        },
+        "lua": {
+          "keyword": "base.keyword"
+        },
+        "rust": {
+          "type.builtin": "rust.type"
+        }
+      }
+    },
+    "window/logMessage": null,
+    "workspace/diagnostic/refresh": null
+  },
   "languageServers": {
     "lua-language-server": {
       "cmd": [

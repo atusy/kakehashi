@@ -25,6 +25,7 @@ pub(crate) const KNOWN_WORKSPACE_SETTING_KEYS: &[&str] = &[
 ];
 
 pub(crate) const KNOWN_FEATURE_SETTING_KEYS: &[&str] = &[
+    "textDocument/semanticTokens",
     "textDocument/publishDiagnostics",
     "window/logMessage",
     "workspace/diagnostic/refresh",

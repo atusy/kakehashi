@@ -685,6 +685,13 @@ impl QueryTypeMappings {
 
 pub type CaptureMappings = HashMap<String, QueryTypeMappings>;
 
+/// Per-language Tree-sitter capture names mapped to LSP semantic-token roles.
+///
+/// Unlike the deprecated top-level [`CaptureMappings`] shape, the semantic
+/// token feature already supplies the consumer context, so there is no nested
+/// query-kind key such as `highlights`.
+pub type SemanticTokenCaptureMappings = HashMap<String, CaptureMapping>;
+
 /// Query type for tree-sitter query files.
 ///
 /// Used in the unified `queries` field to specify what kind of query a file contains.
@@ -876,9 +883,20 @@ pub struct LogMessageFeatureSettings {
     pub log_level: Option<LogMessageLevel>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SemanticTokensFeatureSettings {
+    /// Per-language capture-to-token mappings. Omit to inherit; `{}` clears
+    /// every language mapping in the layer below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_mappings: Option<SemanticTokenCaptureMappings>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FeatureSettings {
+    #[serde(rename = "textDocument/semanticTokens")]
+    pub text_document_semantic_tokens: Option<SemanticTokensFeatureSettings>,
     #[serde(rename = "textDocument/publishDiagnostics")]
     pub text_document_publish_diagnostics: Option<DebounceFeatureSettings>,
     #[serde(rename = "window/logMessage")]
@@ -894,7 +912,11 @@ impl Serialize for FeatureSettings {
     {
         use serde::ser::SerializeMap;
 
-        let mut map = serializer.serialize_map(Some(3))?;
+        let mut map = serializer.serialize_map(Some(4))?;
+        map.serialize_entry(
+            "textDocument/semanticTokens",
+            &self.text_document_semantic_tokens,
+        )?;
         map.serialize_entry(
             "textDocument/publishDiagnostics",
             &self.text_document_publish_diagnostics,

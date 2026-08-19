@@ -11,6 +11,7 @@ use super::settings::{
     DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_MAX_WAIT_MS, DebounceFeatureSettings, FeatureSettings,
     LanguageSettings, LayerAggregationConfig, LayerSource, LayersConfig, LogMessageFeatureSettings,
     LogMessageLevel, QueryTypeMappings, RawWorkspaceSettings, RootMarker,
+    SemanticTokenCaptureMappings, SemanticTokensFeatureSettings,
 };
 use std::collections::HashMap;
 
@@ -21,7 +22,7 @@ pub fn default_settings() -> RawWorkspaceSettings {
     RawWorkspaceSettings {
         search_paths: Some(vec!["${KAKEHASHI_DATA_DIR}".to_string()]),
         languages: default_languages(),
-        capture_mappings: Some(default_capture_mappings()),
+        capture_mappings: None,
         // Safe to carry here even though the key is deprecated: this struct is
         // also merge layer 1, and a user's own top-level value overlays THE
         // SAME key, so it wins. `languages._.autoInstall` is the one that must
@@ -31,6 +32,9 @@ pub fn default_settings() -> RawWorkspaceSettings {
         auto_install: Some(true),
         diagnostics_debounce_ms: Some(DEFAULT_DEBOUNCE_MS),
         features: Some(FeatureSettings {
+            text_document_semantic_tokens: Some(SemanticTokensFeatureSettings {
+                capture_mappings: Some(default_semantic_token_capture_mappings()),
+            }),
             text_document_publish_diagnostics: Some(DebounceFeatureSettings {
                 debounce_ms: Some(DEFAULT_PUBLISH_DIAGNOSTICS_DEBOUNCE_MS),
                 max_wait_ms: Some(DEFAULT_PUBLISH_DIAGNOSTICS_MAX_WAIT_MS),
@@ -241,6 +245,10 @@ pub fn default_capture_mappings() -> CaptureMappings {
 
     mappings.insert(WILDCARD_KEY.to_string(), wildcard);
     mappings
+}
+
+fn default_semantic_token_capture_mappings() -> SemanticTokenCaptureMappings {
+    SemanticTokenCaptureMappings::from([(WILDCARD_KEY.to_string(), default_highlight_mappings())])
 }
 
 /// Returns the default highlight capture mappings.
@@ -710,23 +718,19 @@ mod tests {
     #[test]
     fn default_settings_has_capture_mappings() {
         let settings = default_settings();
+        let mappings = settings
+            .features
+            .as_ref()
+            .and_then(|features| features.text_document_semantic_tokens.as_ref())
+            .and_then(|semantic_tokens| semantic_tokens.capture_mappings.as_ref())
+            .expect("semantic-token capture mappings");
 
         // Should have capture mappings populated
-        assert!(
-            settings
-                .capture_mappings
-                .as_ref()
-                .is_some_and(|m| !m.is_empty()),
-            "capture_mappings should not be empty"
-        );
+        assert!(!mappings.is_empty(), "capture_mappings should not be empty");
 
         // Should contain the wildcard "_" key
         assert!(
-            settings
-                .capture_mappings
-                .as_ref()
-                .unwrap()
-                .contains_key(WILDCARD_KEY),
+            mappings.contains_key(WILDCARD_KEY),
             "capture_mappings should contain wildcard '_' key"
         );
     }
@@ -755,7 +759,7 @@ mod tests {
 
         // Should contain captureMappings section
         assert!(
-            toml_string.contains("[captureMappings._.highlights]"),
+            toml_string.contains("[features.\"textDocument/semanticTokens\".captureMappings._]"),
             "TOML should contain captureMappings section. Got:\n{}",
             toml_string
         );
