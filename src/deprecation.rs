@@ -60,7 +60,8 @@ macro_rules! declare_deprecation_notice {
         remove_in = $remove_in:literal,
         message = $message:literal $(,)?
     ) => {
-        const _: () = {
+        $(#[$attribute])*
+        $visibility const $notice: &str = {
             assert!(
                 $deprecated_in < $remove_in,
                 "a deprecation must precede its removal major"
@@ -79,10 +80,8 @@ macro_rules! declare_deprecation_notice {
                     stringify!($remove_in),
                 )
             );
+            concat!($message, stringify!($remove_in), ".")
         };
-        $(#[$attribute])*
-        $visibility const $notice: &str =
-            concat!($message, stringify!($remove_in), ".");
     };
 }
 
@@ -123,6 +122,14 @@ mod deprecation;
 
 mod policies {{
     crate::deprecation::declare_deprecation_notice!(
+        #[cfg(any())]
+        const DISABLED_EXPIRED_NOTICE;
+        name = "disabled expired path",
+        deprecated_in = 0,
+        remove_in = 1,
+        message = "disabled expired path is removed in v"
+    );
+    crate::deprecation::declare_deprecation_notice!(
         const V0_NOTICE;
         name = "v0 path",
         deprecated_in = 0,
@@ -161,7 +168,7 @@ mod policies {{
         let v1 = compile_fixture("1.0.0");
         assert!(
             v1.status.success(),
-            "both policies must compile in v1: {}",
+            "enabled policies and cfg-disabled deadlines must compile in v1: {}",
             String::from_utf8_lossy(&v1.stderr)
         );
 
