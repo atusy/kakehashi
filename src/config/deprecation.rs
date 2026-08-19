@@ -102,7 +102,15 @@ crate::deprecation::declare_deprecation!(
     deprecated_in = 0,
     remove_in = 2,
 );
-pub(crate) fn aliases_deprecation_notice(language: &str, example_alias: &str) -> String {
+pub(crate) fn aliases_deprecation_notice(language: &str, example_alias: Option<&str>) -> String {
+    let Some(example_alias) = example_alias else {
+        return format!(
+            "Language '{language}' uses an empty deprecated 'aliases' field. \
+             Remove the empty 'aliases' field. The 'aliases' field will be removed in \
+             kakehashi v{}.",
+            ALIASES_DEPRECATION.remove_in_major()
+        );
+    };
     let language_toml = toml::Value::String(language.to_owned()).to_string();
     let alias_toml = toml::Value::String(example_alias.to_owned()).to_string();
     let mut derived_languages = serde_json::Map::new();
@@ -328,7 +336,7 @@ rootMarkers = [".git"]
 
     #[test]
     fn aliases_notice_gives_valid_toml_and_json_migrations_with_declared_deadline() {
-        let notice = aliases_deprecation_notice("markdown", "rmd");
+        let notice = aliases_deprecation_notice("markdown", Some("rmd"));
         let expected = format!(
             "Language 'markdown' uses deprecated 'aliases' field. Use 'base' on each derived \
              language instead.\nTOML:\n[languages.\"rmd\"]\nbase = \"markdown\"\nJSON:\n\
@@ -341,7 +349,7 @@ rootMarkers = [".git"]
 
     #[test]
     fn aliases_notice_escapes_language_ids_in_both_migration_formats() {
-        let notice = aliases_deprecation_notice("mark\"down", "r.md\"x");
+        let notice = aliases_deprecation_notice("mark\"down", Some("r.md\"x"));
         let toml_example = notice
             .split_once("TOML:\n")
             .and_then(|(_, examples)| examples.split_once("\nJSON:\n"))
@@ -364,6 +372,18 @@ rootMarkers = [".git"]
             parsed_json["languages"]["r.md\"x"]["base"].as_str(),
             Some("mark\"down")
         );
+    }
+
+    #[test]
+    fn empty_aliases_notice_only_requests_removing_the_field() {
+        let notice = aliases_deprecation_notice("markdown", None);
+        assert!(
+            notice.contains("Remove the empty 'aliases' field"),
+            "{notice}"
+        );
+        assert!(!notice.contains("<derived>"), "{notice}");
+        assert!(!notice.contains("TOML:"), "{notice}");
+        assert!(!notice.contains("JSON:"), "{notice}");
     }
 
     #[test]

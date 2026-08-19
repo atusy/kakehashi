@@ -759,14 +759,9 @@ impl LanguageCoordinator {
             }
 
             if let Some(aliases) = &config.aliases {
-                let example_alias = aliases
-                    .iter()
-                    .next()
-                    .map(|a| a.as_str())
-                    .unwrap_or("<derived>");
                 let message = crate::config::deprecation::aliases_deprecation_notice(
                     lang_name,
-                    example_alias,
+                    aliases.first().map(String::as_str),
                 );
                 log::warn!(target: "kakehashi::config", "{message}");
                 config_warnings.push(message);
