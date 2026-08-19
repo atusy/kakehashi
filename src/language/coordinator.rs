@@ -2568,7 +2568,7 @@ mod tests {
                 LanguageEvent::ShowMessage { level, message }
                     if *level == LanguageLogLevel::Warning
                         && message.contains("deprecated 'aliases' field")
-                        && message.contains("Use 'base' on derived languages instead")
+                        && message.contains("Use 'base' on each derived language instead")
             )),
             "load_settings should emit a client-visible migration warning for deprecated aliases"
         );
