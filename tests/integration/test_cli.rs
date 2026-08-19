@@ -607,6 +607,30 @@ fn test_config_schema_outputs_valid_json_to_stdout() {
         "Should have autoInstall property. Got: {}",
         stdout
     );
+    assert_eq!(
+        schema.pointer("/properties/captureMappings/deprecated"),
+        Some(&serde_json::json!(true)),
+        "legacy captureMappings should be marked deprecated"
+    );
+    assert!(
+        schema
+            .pointer("/$defs/FeatureSettings/properties/textDocument~1semanticTokens")
+            .is_some(),
+        "features should advertise textDocument/semanticTokens"
+    );
+    assert_eq!(
+        schema.pointer(
+            "/$defs/SemanticTokensFeatureSettings/properties/captureMappings/additionalProperties/additionalProperties/type"
+        ),
+        Some(&serde_json::json!("string")),
+        "canonical language entries should map captures directly to token roles"
+    );
+    assert!(
+        schema
+            .pointer("/$defs/QueryTypeMappings/properties/folds")
+            .is_none(),
+        "the never-consumed legacy folds field should not be advertised"
+    );
 }
 
 /// Test that config --help shows schema action
