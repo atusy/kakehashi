@@ -26,17 +26,21 @@ macro_rules! declare_deprecation {
         deprecated_in = $deprecated_in:literal,
         remove_in = $remove_in:literal $(,)?
     ) => {
-        $visibility const $policy: $crate::deprecation::Deprecation =
-            $crate::deprecation::Deprecation::new($remove_in);
+        $visibility const $policy: $crate::deprecation::Deprecation = {
+            let remove_in: u64 = $remove_in;
+            $crate::deprecation::Deprecation::new(remove_in)
+        };
         const _: () = {
+            let deprecated_in: u64 = $deprecated_in;
+            let remove_in: u64 = $remove_in;
             assert!(
-                $deprecated_in < $remove_in,
+                deprecated_in < remove_in,
                 "a deprecation must precede its removal major"
             );
             assert!(
                 !$crate::deprecation::removal_is_due(
                     $crate::deprecation::PACKAGE_MAJOR,
-                    $remove_in,
+                    remove_in,
                 ),
                 concat!(
                     "`",
@@ -62,14 +66,16 @@ macro_rules! declare_deprecation_notice {
     ) => {
         $(#[$attribute])*
         $visibility const $notice: &str = {
+            let deprecated_in: u64 = $deprecated_in;
+            let remove_in: u64 = $remove_in;
             assert!(
-                $deprecated_in < $remove_in,
+                deprecated_in < remove_in,
                 "a deprecation must precede its removal major"
             );
             assert!(
                 !$crate::deprecation::removal_is_due(
                     $crate::deprecation::PACKAGE_MAJOR,
-                    $remove_in,
+                    remove_in,
                 ),
                 concat!(
                     "`",
@@ -141,6 +147,12 @@ mod policies {{
         name = "v1 path",
         deprecated_in = 1,
         remove_in = 3,
+    );
+    crate::deprecation::declare_deprecation!(
+        const LARGE_MAJOR_POLICY;
+        name = "large major path",
+        deprecated_in = 4_294_967_296,
+        remove_in = 4_294_967_297,
     );
 }}
 "#
