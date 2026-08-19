@@ -364,6 +364,20 @@ mod tests {
     }
 
     #[test]
+    fn removed_legacy_folds_uses_the_common_unknown_key_path() {
+        let unknown = unknown_workspace_setting_keys(&serde_json::json!({
+            "captureMappings": {
+                "_": {
+                    "folds": { "comment": "comment" },
+                    "highlights": { "variable": "variable" }
+                }
+            }
+        }));
+
+        assert_eq!(unknown, ["captureMappings._.folds"]);
+    }
+
+    #[test]
     fn known_language_setting_keys_match_schema_properties() {
         assert_known_keys_match_schema::<LanguageSettings>(KNOWN_LANGUAGE_SETTING_KEYS, &[]);
     }

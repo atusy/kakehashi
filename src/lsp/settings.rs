@@ -1918,6 +1918,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_load_toml_file_warns_about_folds_without_discarding_highlights() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy-folds.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [captureMappings._.folds]
+            comment = "comment"
+
+            [captureMappings._.highlights]
+            variable = "variable"
+            "#,
+        )
+        .unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+        let settings = load_toml_file(&path, &mut events, &mut ignored_deprecation)
+            .expect("an unknown key should not reject an explicit config file")
+            .expect("settings");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == SettingsEventKind::Warning
+                    && event.message.contains("captureMappings._.folds")),
+            "the removed key should use the common file warning policy: {events:?}"
+        );
+        assert_eq!(
+            settings.capture_mappings.expect("legacy mappings")["_"]
+                .highlights
+                .as_ref()
+                .expect("highlights")["variable"],
+            "variable"
+        );
+    }
+
     /// Records, rather than endorses, an inconsistency: `FeatureSettings` and
     /// its children carry `deny_unknown_fields`, so an unknown key *inside*
     /// `features` fails typed deserialization and is fatal — while the same
