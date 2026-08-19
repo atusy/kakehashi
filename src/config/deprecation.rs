@@ -70,8 +70,7 @@ pub(crate) const CAPTURE_MAPPINGS_DEPRECATION_NOTICE: &str = "kakehashi: the top
      `features.\"textDocument/semanticTokens\".captureMappings` in TOML (or \
      `features[\"textDocument/semanticTokens\"].captureMappings` in JSON) and remove the \
      intermediate `highlights` key. The top-level key still works for now but \
-     may be removed in a future release; its unused `folds` mappings have no \
-     replacement.";
+     may be removed in a future release.";
 
 /// Which deprecated keys the raw TOML text spells.
 ///

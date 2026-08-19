@@ -815,10 +815,6 @@ mod tests {
                             ("variable.builtin".to_string(), "base.variable".to_string()),
                             ("function.builtin".to_string(), "base.function".to_string()),
                         ])),
-                        folds: Some(HashMap::from([(
-                            "fold.comment".to_string(),
-                            "base.comment".to_string(),
-                        )])),
                     },
                 ),
                 (
@@ -898,8 +894,7 @@ mod tests {
             ])),
             capture_mappings: Some(HashMap::from([
                 (
-                    // shared key: _ — overlay overrides variable.builtin, adds type.builtin;
-                    //   adds folds fold.function
+                    // shared key: _ — overlay overrides variable.builtin and adds type.builtin
                     "_".to_string(),
                     QueryTypeMappings {
                         highlights: Some(HashMap::from([
@@ -909,10 +904,6 @@ mod tests {
                             ),
                             ("type.builtin".to_string(), "overlay.type".to_string()),
                         ])),
-                        folds: Some(HashMap::from([(
-                            "fold.function".to_string(),
-                            "overlay.function".to_string(),
-                        )])),
                     },
                 ),
                 (
@@ -2242,54 +2233,6 @@ mod tests {
         assert!(
             semantic_token_capture_mappings(&merged)[WILDCARD_KEY].is_empty(),
             "an explicit empty highlights map should clear the defaults"
-        );
-    }
-
-    /// The legacy `folds` table never had a consumer and has no semantic-token
-    /// counterpart; normalizing the deprecated shape keeps only highlights.
-    #[test]
-    fn deprecated_folds_do_not_leak_into_semantic_token_mappings() {
-        let base: RawWorkspaceSettings = toml::from_str(
-            r#"
-            [captureMappings._.folds]
-            "comment" = "comment"
-        "#,
-        )
-        .expect("should parse");
-        let overlay: RawWorkspaceSettings = toml::from_str(
-            r#"
-            [captureMappings._.highlights]
-            "keyword" = "keyword"
-        "#,
-        )
-        .expect("should parse");
-
-        let merged =
-            merge_workspace_settings(Some(base), Some(overlay)).expect("two settings merge");
-        let wildcard = &semantic_token_capture_mappings(&merged)[WILDCARD_KEY];
-
-        assert_eq!(wildcard["keyword"], "keyword");
-        assert!(!wildcard.contains_key("comment"));
-    }
-
-    #[test]
-    fn deprecated_folds_only_overlay_does_not_clear_highlight_mappings() {
-        use crate::config::defaults::default_settings;
-
-        let folds_only: RawWorkspaceSettings = toml::from_str(
-            r#"
-            [captureMappings.rust.folds]
-            comment = "comment"
-            "#,
-        )
-        .expect("legacy folds should still parse during migration");
-
-        let merged = merge_workspace_settings(Some(default_settings()), Some(folds_only))
-            .expect("two settings merge");
-        assert_eq!(
-            semantic_token_capture_mappings(&merged)[WILDCARD_KEY]["variable.builtin"],
-            "variable.defaultLibrary",
-            "an unused folds-only layer must not become an explicit root clear"
         );
     }
 

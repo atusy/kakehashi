@@ -26,7 +26,7 @@ no intermediate `highlights` key.
 
 The former top-level `captureMappings.<language>.highlights` spelling remains
 accepted during migration and produces a deprecation warning at most once per
-session. Its `folds` entries remain unused and have no replacement.
+session. The never-consumed `folds` field is removed without a replacement.
 
 Configuration layering continues to follow configuration-merging-strategy:
 later layers override duplicate capture names while inheriting names they omit.

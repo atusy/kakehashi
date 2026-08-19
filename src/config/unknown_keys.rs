@@ -54,7 +54,7 @@ pub(crate) const KNOWN_BRIDGE_SERVER_SETTING_KEYS: &[&str] = &[
     "workspaceMarkers",
 ];
 
-pub(crate) const KNOWN_CAPTURE_MAPPINGS_SETTING_KEYS: &[&str] = &["folds", "highlights"];
+pub(crate) const KNOWN_CAPTURE_MAPPINGS_SETTING_KEYS: &[&str] = &["highlights"];
 
 pub(crate) const KNOWN_LANGUAGE_SETTING_KEYS: &[&str] = &[
     "aliases",

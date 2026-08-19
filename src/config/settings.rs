@@ -655,21 +655,13 @@ pub(crate) fn on_type_formatting_trigger_union(
     Some((first, iter.collect()))
 }
 
-/// Custom mappings from Tree-sitter capture names to semantic token types, per query kind.
-///
-/// Both fields are optional so that omitting one and writing an empty one say
-/// different things: omit to inherit the layer below, write `{}` to clear it.
-/// A layer that configures only `highlights` must not silently drop the folds
-/// a lower layer supplied, which a non-optional field could not express.
+/// Deprecated wrapper around semantic-token highlight mappings.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QueryTypeMappings {
     /// Capture mappings for highlights queries. Omit to inherit; `{}` clears.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlights: Option<CaptureMapping>,
-    /// Capture mappings for folds queries. Omit to inherit; `{}` clears.
-    /// Reserved for future folding range support — populated and merged but not yet consumed by analysis.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub folds: Option<CaptureMapping>,
 }
 
 /// The empty map an unset [`QueryTypeMappings`] field reads as.
@@ -1579,6 +1571,20 @@ mod tests {
         snap_settings.bind(|| {
             insta::assert_json_snapshot!(settings.capture_mappings);
         });
+    }
+
+    #[test]
+    fn legacy_folds_capture_mappings_are_rejected() {
+        let result = toml::from_str::<RawWorkspaceSettings>(
+            r#"
+            [captureMappings._.folds]
+            comment = "comment"
+            "#,
+        );
+        assert!(
+            result.is_err(),
+            "the never-consumed folds field was removed"
+        );
     }
 
     #[test]

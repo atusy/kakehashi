@@ -65,7 +65,6 @@ fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
                 language,
                 settings::QueryTypeMappings {
                     highlights: Some(highlights),
-                    folds: None,
                 },
             )
         })
@@ -982,7 +981,6 @@ mod tests {
 
         let query_type_mappings = QueryTypeMappings {
             highlights: Some(highlights),
-            folds: None,
         };
 
         capture_mappings.insert(WILDCARD_KEY.to_string(), query_type_mappings);

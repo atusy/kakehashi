@@ -238,9 +238,6 @@ pub fn default_capture_mappings() -> CaptureMappings {
     let highlights = default_highlight_mappings();
     let wildcard = QueryTypeMappings {
         highlights: Some(highlights),
-        // Omitted rather than empty: the defaults layer names no folds, and an
-        // empty map would clear whatever a user layer supplies.
-        folds: None,
     };
 
     mappings.insert(WILDCARD_KEY.to_string(), wildcard);

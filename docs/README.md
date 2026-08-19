@@ -465,7 +465,7 @@ The former top-level `captureMappings.<language>.highlights` shape remains
 accepted for migration, but is deprecated. If both spellings occur in one
 layer, the feature-scoped value wins for duplicate capture names; otherwise
 their entries are combined. The old `folds` table was unused and has no
-replacement.
+replacement; it is no longer accepted.
 
 ### Bridge Configuration
 

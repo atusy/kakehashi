@@ -447,7 +447,7 @@ pub fn load_settings(
 ///
 /// - an empty `cmd` or `languages` used to defer to the `_` wildcard's list;
 ///   it now says the entry has none, and omitting the key is what inherits;
-/// - an empty `captureMappings`, `highlights`, or `folds` used to be a no-op —
+/// - an empty `captureMappings` or `highlights` used to be a no-op —
 ///   the merge only extended — and now clears the layer below, which for a
 ///   top-level `captureMappings = {}` means every built-in mapping.
 ///
@@ -483,8 +483,7 @@ pub(crate) fn emptied_container_notice(settings: Option<&RawWorkspaceSettings>) 
     match settings.capture_mappings.as_ref() {
         Some(mappings) if mappings.is_empty() => named.push("captureMappings".to_string()),
         Some(mappings) => named.extend(mappings.iter().filter_map(|(lang, entry)| {
-            let cleared = entry.highlights.as_ref().is_some_and(|m| m.is_empty())
-                || entry.folds.as_ref().is_some_and(|m| m.is_empty());
+            let cleared = entry.highlights.as_ref().is_some_and(|m| m.is_empty());
             cleared.then(|| format!("captureMappings.{lang}"))
         })),
         None => {}
