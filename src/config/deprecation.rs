@@ -103,10 +103,19 @@ crate::deprecation::declare_deprecation!(
     remove_in = 2,
 );
 pub(crate) fn aliases_deprecation_notice(language: &str, example_alias: &str) -> String {
+    let language_toml = toml::Value::String(language.to_owned()).to_string();
+    let alias_toml = toml::Value::String(example_alias.to_owned()).to_string();
+    let mut derived_languages = serde_json::Map::new();
+    derived_languages.insert(
+        example_alias.to_owned(),
+        serde_json::json!({ "base": language }),
+    );
+    let json = serde_json::json!({ "languages": derived_languages });
     format!(
         "Language '{language}' uses deprecated 'aliases' field. \
-         Use 'base' on derived languages instead. \
-         Example: [languages.{example_alias}] base = \"{language}\". \
+         Use 'base' on each derived language instead.\n\
+         TOML:\n[languages.{alias_toml}]\nbase = {language_toml}\n\
+         JSON:\n{json}\n\
          The 'aliases' field will be removed in kakehashi v{}.",
         ALIASES_DEPRECATION.remove_in_major()
     )
@@ -318,13 +327,43 @@ rootMarkers = [".git"]
     }
 
     #[test]
-    fn aliases_notice_uses_its_declared_removal_major() {
+    fn aliases_notice_gives_valid_toml_and_json_migrations_with_declared_deadline() {
         let notice = aliases_deprecation_notice("markdown", "rmd");
         let expected = format!(
-            "removed in kakehashi v{}",
+            "Language 'markdown' uses deprecated 'aliases' field. Use 'base' on each derived \
+             language instead.\nTOML:\n[languages.\"rmd\"]\nbase = \"markdown\"\nJSON:\n\
+             {{\"languages\":{{\"rmd\":{{\"base\":\"markdown\"}}}}}}\n\
+             The 'aliases' field will be removed in kakehashi v{}.",
             ALIASES_DEPRECATION.remove_in_major()
         );
-        assert!(notice.contains(&expected), "{notice}");
+        assert_eq!(notice, expected);
+    }
+
+    #[test]
+    fn aliases_notice_escapes_language_ids_in_both_migration_formats() {
+        let notice = aliases_deprecation_notice("mark\"down", "r.md\"x");
+        let toml_example = notice
+            .split_once("TOML:\n")
+            .and_then(|(_, examples)| examples.split_once("\nJSON:\n"))
+            .map(|(toml, _)| toml)
+            .expect("TOML migration example");
+        let parsed_toml: toml::Value = toml::from_str(toml_example).expect("valid TOML example");
+        assert_eq!(
+            parsed_toml["languages"]["r.md\"x"]["base"].as_str(),
+            Some("mark\"down")
+        );
+
+        let json_example = notice
+            .split_once("\nJSON:\n")
+            .and_then(|(_, rest)| rest.split_once("\nThe 'aliases' field"))
+            .map(|(json, _)| json)
+            .expect("JSON migration example");
+        let parsed_json: serde_json::Value =
+            serde_json::from_str(json_example).expect("valid JSON example");
+        assert_eq!(
+            parsed_json["languages"]["r.md\"x"]["base"].as_str(),
+            Some("mark\"down")
+        );
     }
 
     #[test]
