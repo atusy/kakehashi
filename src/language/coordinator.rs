@@ -764,12 +764,9 @@ impl LanguageCoordinator {
                     .next()
                     .map(|a| a.as_str())
                     .unwrap_or("<derived>");
-                let message = format!(
-                    "Language '{}' uses deprecated 'aliases' field. \
-                     Use 'base' on derived languages instead. \
-                     Example: [languages.{}] base = \"{}\". \
-                     The 'aliases' field will be removed in kakehashi v2.",
-                    lang_name, example_alias, lang_name
+                let message = crate::config::deprecation::aliases_deprecation_notice(
+                    lang_name,
+                    example_alias,
                 );
                 log::warn!(target: "kakehashi::config", "{message}");
                 config_warnings.push(message);
@@ -2572,7 +2569,6 @@ mod tests {
                     if *level == LanguageLogLevel::Warning
                         && message.contains("deprecated 'aliases' field")
                         && message.contains("Use 'base' on derived languages instead")
-                        && message.contains("removed in kakehashi v2")
             )),
             "load_settings should emit a client-visible migration warning for deprecated aliases"
         );

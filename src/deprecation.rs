@@ -1,15 +1,33 @@
 include!(concat!(env!("OUT_DIR"), "/package_version.rs"));
 
+#[derive(Clone, Copy)]
+pub(crate) struct Deprecation {
+    remove_in_major: u64,
+}
+
+impl Deprecation {
+    pub(crate) const fn new(remove_in_major: u64) -> Self {
+        Self { remove_in_major }
+    }
+
+    pub(crate) const fn remove_in_major(self) -> u64 {
+        self.remove_in_major
+    }
+}
+
 pub(crate) const fn removal_is_due(current_major: u64, remove_in_major: u64) -> bool {
     current_major >= remove_in_major
 }
 
-macro_rules! enforce_deprecation_deadline {
+macro_rules! declare_deprecation {
     (
+        $visibility:vis const $policy:ident;
         name = $name:literal,
         deprecated_in = $deprecated_in:literal,
         remove_in = $remove_in:literal $(,)?
     ) => {
+        $visibility const $policy: $crate::deprecation::Deprecation =
+            $crate::deprecation::Deprecation::new($remove_in);
         const _: () = {
             assert!(
                 $deprecated_in < $remove_in,
@@ -33,7 +51,42 @@ macro_rules! enforce_deprecation_deadline {
     };
 }
 
-pub(crate) use enforce_deprecation_deadline;
+macro_rules! declare_deprecation_notice {
+    (
+        $(#[$attribute:meta])*
+        $visibility:vis const $notice:ident;
+        name = $name:literal,
+        deprecated_in = $deprecated_in:literal,
+        remove_in = $remove_in:literal,
+        message = $message:literal $(,)?
+    ) => {
+        const _: () = {
+            assert!(
+                $deprecated_in < $remove_in,
+                "a deprecation must precede its removal major"
+            );
+            assert!(
+                !$crate::deprecation::removal_is_due(
+                    $crate::deprecation::PACKAGE_MAJOR,
+                    $remove_in,
+                ),
+                concat!(
+                    "`",
+                    $name,
+                    "` was deprecated in v",
+                    stringify!($deprecated_in),
+                    " and must be removed before releasing v",
+                    stringify!($remove_in),
+                )
+            );
+        };
+        $(#[$attribute])*
+        $visibility const $notice: &str =
+            concat!($message, stringify!($remove_in), ".");
+    };
+}
+
+pub(crate) use {declare_deprecation, declare_deprecation_notice};
 
 #[cfg(test)]
 mod tests {
@@ -69,12 +122,15 @@ mod tests {
 mod deprecation;
 
 mod policies {{
-    crate::deprecation::enforce_deprecation_deadline!(
+    crate::deprecation::declare_deprecation_notice!(
+        const V0_NOTICE;
         name = "v0 path",
         deprecated_in = 0,
         remove_in = 2,
+        message = "v0 path is removed in v"
     );
-    crate::deprecation::enforce_deprecation_deadline!(
+    crate::deprecation::declare_deprecation!(
+        const V1_POLICY;
         name = "v1 path",
         deprecated_in = 1,
         remove_in = 3,
