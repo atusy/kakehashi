@@ -413,11 +413,10 @@ the layer below decided". Removing a key never removes a value: to override
 one, write the value you want (see the `workspace/didChangeConfiguration`
 notes above).
 
-An *entry* is not a container:
-`[features."textDocument/semanticTokens".captureMappings.rust]` or
-`[languageServers.foo]` with no keys under it sets no field, so it inherits
-rather than clears. Clear a field, not the table —
-`features."textDocument/semanticTokens".captureMappings.rust = {}`.
+A semantic-token language entry is itself a map, so an empty
+`[features."textDocument/semanticTokens".captureMappings.rust]` table clears
+Rust's inherited mappings; omit the `rust` entry to inherit them. By contrast,
+`[languageServers.foo]` with no fields sets no field and therefore inherits.
 
 Two settings stand outside this: the top-level `languages` map still ignores
 `{}` (it has no clear spelling yet), and semantic-token `captureMappings` is
