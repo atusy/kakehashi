@@ -1956,30 +1956,39 @@ mod tests {
         );
     }
 
-    /// Records, rather than endorses, an inconsistency: `FeatureSettings` and
-    /// its children carry `deny_unknown_fields`, so an unknown key *inside*
-    /// `features` fails typed deserialization and is fatal — while the same
-    /// mistake anywhere else is a warning. Pinned so that changing it is a
-    /// deliberate act with a test to update, not a silent drift.
     #[test]
-    fn test_load_toml_file_unknown_feature_key_is_fatal_today() {
+    fn test_load_toml_file_warns_about_unknown_feature_key_without_discarding_siblings() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("feature-typo.toml");
         std::fs::write(
             &path,
-            "[features.\"textDocument/publishDiagnostics\"]\nfutureOption = 1\n",
+            "[features.\"textDocument/publishDiagnostics\"]\ndebounceMs = 12\nfutureOption = 1\n",
         )
         .unwrap();
 
         let mut events = Vec::new();
         let mut ignored_deprecation = DeprecatedKeysSeen::default();
-        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+        let settings = load_toml_file(&path, &mut events, &mut ignored_deprecation)
+            .expect("an unknown feature key should use the common file policy")
+            .expect("settings");
 
-        let message = result
-            .expect_err("today an unknown key under `features` is fatal, unlike anywhere else");
         assert!(
-            message.contains("futureOption"),
-            "the rejected key must be named: {message}"
+            events
+                .iter()
+                .any(|event| event.kind == SettingsEventKind::Warning
+                    && event
+                        .message
+                        .contains("features.textDocument/publishDiagnostics.futureOption")),
+            "the ignored key should be named in a warning: {events:?}"
+        );
+        assert_eq!(
+            settings
+                .features
+                .expect("features")
+                .text_document_publish_diagnostics
+                .expect("publish diagnostics")
+                .debounce_ms,
+            Some(12)
         );
     }
 

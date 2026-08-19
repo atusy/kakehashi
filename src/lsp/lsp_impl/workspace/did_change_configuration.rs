@@ -612,6 +612,32 @@ mod tests {
     }
 
     #[test]
+    fn settings_payload_rejects_unknown_semantic_tokens_feature_key() {
+        let (payload, unknown_keys) = settings_payload(serde_json::json!({
+            "features": {
+                "textDocument/semanticTokens": {
+                    "captureMapping": {}
+                }
+            }
+        }));
+
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "features": {
+                    "textDocument/semanticTokens": {
+                        "captureMapping": {}
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            unknown_keys,
+            ["features.textDocument/semanticTokens.captureMapping"]
+        );
+    }
+
+    #[test]
     fn settings_payload_keeps_unwrapped_log_message_feature() {
         let features = serde_json::json!({
             "window/logMessage": {

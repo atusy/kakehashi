@@ -811,7 +811,7 @@ pub const DEFAULT_PUBLISH_DIAGNOSTICS_MAX_WAIT_MS: u64 = 1000;
 pub const MAX_FEATURE_TIMING_MS: u64 = 86_400_000;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct DebounceFeatureSettings {
     #[schemars(range(max = 86_400_000))]
     pub debounce_ms: Option<u64>,
@@ -872,13 +872,13 @@ impl LogMessageLevel {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct LogMessageFeatureSettings {
     pub log_level: Option<LogMessageLevel>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SemanticTokensFeatureSettings {
     /// Per-language capture-to-token mappings. Omit to inherit; `{}` clears
     /// every language mapping in the layer below.
@@ -887,7 +887,6 @@ pub struct SemanticTokensFeatureSettings {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct FeatureSettings {
     #[serde(rename = "textDocument/semanticTokens")]
     pub text_document_semantic_tokens: Option<SemanticTokensFeatureSettings>,
