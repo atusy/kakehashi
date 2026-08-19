@@ -415,8 +415,10 @@ notes above).
 
 A semantic-token language entry is itself a map, so an empty
 `[features."textDocument/semanticTokens".captureMappings.rust]` table clears
-Rust's inherited mappings; omit the `rust` entry to inherit them. By contrast,
-`[languageServers.foo]` with no fields sets no field and therefore inherits.
+the Rust-specific entry inherited from lower configuration layers; omit the
+`rust` entry to inherit it. The `_` wildcard mappings still apply afterward,
+so this is not a per-language opt-out. By contrast, `[languageServers.foo]`
+with no fields sets no field and therefore inherits.
 
 Two settings stand outside this: the top-level `languages` map still ignores
 `{}` (it has no clear spelling yet), and semantic-token `captureMappings` is

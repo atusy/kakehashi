@@ -33,7 +33,10 @@ later layers override duplicate capture names while inheriting names they omit.
 Within one layer that contains both spellings, the canonical feature-scoped
 value wins duplicate names and retains names present only in the legacy shape.
 An explicitly empty root map clears every language mapping, and an explicitly
-empty language map clears that language's inherited captures.
+empty language map clears that language entry inherited from lower
+configuration layers. The `_` mappings still apply during the later wildcard
+resolution step, so an empty language entry does not opt that language out of
+wildcard mappings.
 
 Wildcard resolution continues to follow wildcard-config-inheritance: `_`
 provides defaults for language-specific entries after cross-layer merging.
