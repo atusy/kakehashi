@@ -465,11 +465,13 @@ impl Kakehashi {
             };
             (raw_settings, settings)
         };
-        self.client_settings_override.store(
-            initialization_options
-                .and_then(|value| serde_json::from_value(value).ok())
-                .map(std::sync::Arc::new),
-        );
+        *self
+            .client_settings_overrides
+            .write()
+            .expect("client settings overrides lock poisoned") = initialization_options
+            .and_then(|value| serde_json::from_value(value).ok())
+            .into_iter()
+            .collect();
         // Derive the onTypeFormatting trigger union before settings move into
         // apply_raw_settings: kakehashi cannot know downstream trigger
         // characters at initialize time (servers spawn lazily), so the

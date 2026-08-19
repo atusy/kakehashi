@@ -2,8 +2,8 @@
 
 use tower_lsp_server::ls_types::DidChangeWorkspaceFoldersParams;
 
-use crate::config::WorkspaceSettings;
-use crate::lsp::{SettingsSource, load_settings};
+use crate::config::{WorkspaceSettings, merge_workspace_settings};
+use crate::lsp::load_settings;
 
 use super::super::{Kakehashi, lifecycle::config_root_after_folder_change, lock_settings_reload};
 
@@ -89,14 +89,14 @@ impl Kakehashi {
         // in effect. Publishing it earlier would leave a rejected reload with
         // the new root over the old snapshot, so the next pushed layer would
         // anchor to a workspace the settings in effect know nothing about.
-        let client_override = self.client_settings_override.load_full();
+        let client_overrides = self
+            .client_settings_overrides
+            .read()
+            .expect("client settings overrides lock poisoned")
+            .clone();
         let outcome = load_settings(
             root_path.as_deref(),
-            client_override.as_deref().and_then(|settings| {
-                serde_json::to_value(settings)
-                    .ok()
-                    .map(|value| (SettingsSource::InitializationOptions, value))
-            }),
+            None,
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
             // The branch above returned for every session that has one.
@@ -119,9 +119,15 @@ impl Kakehashi {
         {
             self.notifier().show_warning(notice).await;
         }
-        let raw = outcome
-            .raw_settings
-            .unwrap_or_else(crate::config::defaults::default_settings);
+        let raw = client_overrides.into_iter().fold(
+            outcome
+                .raw_settings
+                .unwrap_or_else(crate::config::defaults::default_settings),
+            |base, overlay| {
+                merge_workspace_settings(Some(base), Some(overlay))
+                    .expect("merging two client settings layers must produce settings")
+            },
+        );
         match WorkspaceSettings::try_from_settings(
             &raw,
             self.home_dir.as_deref(),

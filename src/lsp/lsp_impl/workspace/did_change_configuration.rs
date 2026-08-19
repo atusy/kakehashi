@@ -464,11 +464,10 @@ impl Kakehashi {
                 // Remembered under the same reload transaction that publishes
                 // the merged settings, so a concurrent workspace-root change
                 // cannot rebuild the layers from a half-updated override.
-                let client_override = self.client_settings_override.load_full();
-                let merged_override =
-                    merge_workspace_settings(client_override.as_deref().cloned(), Some(parsed));
-                self.client_settings_override
-                    .store(merged_override.map(std::sync::Arc::new));
+                self.client_settings_overrides
+                    .write()
+                    .expect("client settings overrides lock poisoned")
+                    .push(parsed);
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 self.apply_raw_settings_locked(&reload, merged_ts, settings)
                     .await;

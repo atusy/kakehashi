@@ -484,3 +484,80 @@ fn test_folder_change_preserves_client_layers() {
         "the client layers must survive a project-layer reload: {settings}"
     );
 }
+
+/// Client updates are replayed as ordered layers after a project reload. An
+/// explicit root clear cannot be collapsed into a later non-empty map: doing
+/// so would let defaults or the newly selected project reappear.
+#[test]
+fn test_folder_change_preserves_capture_mapping_clear_before_later_addition() {
+    let primary = project_dir("from-primary");
+    let secondary = project_dir("from-secondary");
+
+    let mut client = LspClient::builder()
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "workspaceFolders": [
+                folder(&primary, "primary"),
+                folder(&secondary, "secondary"),
+            ],
+            "capabilities": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": { "kakehashi": {
+                "features": { "textDocument/semanticTokens": { "captureMappings": {} } }
+            } }
+        }),
+    );
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": { "kakehashi": {
+                "features": { "textDocument/semanticTokens": { "captureMappings": {
+                    "rust": { "comment": "comment" }
+                } } }
+            } }
+        }),
+    );
+
+    let expected = json!({ "rust": { "comment": "comment" } });
+    let pushed = poll_until(20, 100, || {
+        let settings = query_effective_settings(&mut client);
+        (settings["features"]["textDocument/semanticTokens"]["captureMappings"] == expected)
+            .then_some(settings)
+    });
+    assert!(
+        pushed.is_some(),
+        "precondition: clear then add should apply"
+    );
+
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [],
+                "removed": [folder(&primary, "primary")],
+            }
+        }),
+    );
+    poll_search_paths(
+        &mut client,
+        json!(["/from-secondary"]),
+        "the project layer should follow the new root",
+    );
+
+    let settings = query_effective_settings(&mut client);
+    assert_eq!(
+        settings["features"]["textDocument/semanticTokens"]["captureMappings"], expected,
+        "the earlier clear must still suppress lower-layer mappings: {settings}"
+    );
+}
