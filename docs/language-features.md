@@ -90,8 +90,9 @@ Highlights the whole document from Tree-sitter queries,
 **including embedded code blocks** — you get highlighting inside fenced code blocks
 even without a language server configured for that language. Delta updates and range
 requests are supported. Highlight colors are driven by the token types/modifiers
-kakehashi exposes; capture names can be remapped via `captureMappings`
-(see [the configuration guide](README.md#capturemappings)).
+kakehashi exposes; capture names can be remapped via
+`features.textDocument/semanticTokens.captureMappings`
+(see [the configuration guide](README.md#featurestextdocumentsemantictokenscapturemappings)).
 
 ### Selection range
 
@@ -471,6 +472,11 @@ configured `searchPaths` — the same place highlight queries live, with the sam
 `; inherits:` support. Drop a file into a search path and the kind exists; no
 server configuration needed. (nvim-treesitter-context's own `context.scm` files
 work as-is once their directory is on a search path.)
+
+Capture names in these responses are the raw query capture names with `@`
+removed. `features.textDocument/semanticTokens.captureMappings` only controls
+semantic-token presentation; it never renames or filters
+`kakehashi/captures/*` results.
 
 The three methods mirror `textDocument/semanticTokens`, so live features can
 re-request cheaply on every cursor move or edit:

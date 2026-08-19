@@ -70,6 +70,9 @@ pub struct SettingsLoadOutcome {
     /// Which deprecated keys the loaded layers spelled — see
     /// [`DeprecatedKeysSeen`] for why this is not an `events` entry.
     pub(crate) deprecated_keys: DeprecatedKeysSeen,
+    /// First migration notice produced by an authored layer before merge-time
+    /// normalization erases its legacy spelling.
+    pub(crate) empty_container_notice: Option<String>,
 }
 
 /// Fold configuration layers into the settings they describe, lowest
@@ -113,6 +116,7 @@ const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
 /// second time. (Naming a stream is not a supported workflow — one with no
 /// writer will simply block initialization — but reading once is what keeps the
 /// failure mode that of the path the user chose.)
+#[derive(Clone)]
 pub(crate) struct ExplicitConfig {
     layers: Vec<Option<RawWorkspaceSettings>>,
     events: Vec<SettingsEvent>,
@@ -120,6 +124,19 @@ pub(crate) struct ExplicitConfig {
     /// Why this configuration cannot be used, if it cannot. `initialize` must
     /// reject the session when this is set.
     pub(crate) fatal_error: Option<String>,
+}
+
+impl ExplicitConfig {
+    /// Retain the already-read layers for workspace-root replay without
+    /// pretending the files were read again or re-emitting their load events.
+    pub(crate) fn for_replay(&self) -> Self {
+        Self {
+            layers: self.layers.clone(),
+            events: Vec::new(),
+            deprecated_keys: self.deprecated_keys,
+            fatal_error: None,
+        }
+    }
 }
 
 /// Read and judge the `--config-file` inputs, or `None` if there are none.
@@ -138,20 +155,26 @@ pub(crate) fn load_explicit_config(
     Some(read_explicit_layers(files, home, env_fn))
 }
 
-/// Keys in a TOML config file that kakehashi does not recognise.
-///
-/// Reuses the walker the `workspace/didChangeConfiguration` path uses, via a
-/// JSON round-trip, so both routes judge a key by the same schema. An empty
-/// result when the TOML cannot be re-read as a generic value is deliberate:
-/// this only ever *reports*, so a limitation of the conversion must not be
-/// louder than the settings it is describing.
-fn unknown_config_keys(contents: &str) -> Vec<String> {
-    let Ok(value) = toml::from_str::<Value>(contents) else {
-        return Vec::new();
-    };
-    let mut keys = crate::config::unknown_keys::unknown_workspace_setting_keys(&value);
-    crate::config::unknown_keys::sort_and_dedup_unknown_keys(&mut keys);
-    keys
+fn append_unknown_config_key_warnings(
+    contents: &str,
+    config_path: &Path,
+    events: &mut Vec<SettingsEvent>,
+) {
+    let keys = crate::config::unknown_keys::unknown_toml_workspace_setting_keys(contents);
+    append_unknown_key_warnings(&keys, config_path, events);
+}
+
+fn append_unknown_key_warnings(
+    unknown_keys: &[String],
+    config_path: &Path,
+    events: &mut Vec<SettingsEvent>,
+) {
+    for key in unknown_keys {
+        events.push(SettingsEvent::warning(format!(
+            "Unknown configuration key in {}: {key}",
+            config_path.display()
+        )));
+    }
 }
 
 /// The explicit layers merged with nothing beneath them — the subject of the
@@ -363,6 +386,46 @@ pub fn load_settings(
     env_fn: impl Fn(&str) -> Option<String>,
     explicit: Option<ExplicitConfig>,
 ) -> SettingsLoadOutcome {
+    load_settings_impl(
+        root_path,
+        ClientSettingsLayers::Serialized(override_settings),
+        home,
+        env_fn,
+        explicit,
+    )
+}
+
+/// Reload settings while replaying already parsed client layers in their
+/// original order. Keeping the layers distinct preserves non-associative clear
+/// operations across workspace-root changes.
+pub(crate) fn load_settings_with_client_layers(
+    root_path: Option<&Path>,
+    client_layers: Vec<RawWorkspaceSettings>,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+    explicit: Option<ExplicitConfig>,
+) -> SettingsLoadOutcome {
+    load_settings_impl(
+        root_path,
+        ClientSettingsLayers::Parsed(client_layers),
+        home,
+        env_fn,
+        explicit,
+    )
+}
+
+enum ClientSettingsLayers {
+    Serialized(Option<(SettingsSource, Value)>),
+    Parsed(Vec<RawWorkspaceSettings>),
+}
+
+fn load_settings_impl(
+    root_path: Option<&Path>,
+    client_layers: ClientSettingsLayers,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+    explicit: Option<ExplicitConfig>,
+) -> SettingsLoadOutcome {
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
     let mut deprecated_keys = DeprecatedKeysSeen::default();
@@ -411,23 +474,34 @@ pub fn load_settings(
         ]
     };
 
-    // Layer 4: Override settings from initialization options or client configuration.
+    // Layers 4+: Override settings from initialization options or client configuration.
     //
     // Client-supplied paths are workspace-local: the client knows the workspace
     // it opened, not the directory the server was launched from.
-    let override_settings = override_settings
-        .and_then(|(source, value)| {
-            parse_override_settings(source, value, &mut events, &mut deprecated_keys)
-        })
-        .map(|mut settings| {
-            let _ = anchor_settings_paths(&mut settings, root_path);
-            settings
-        });
+    let mut client_layers = match client_layers {
+        ClientSettingsLayers::Serialized(settings) => settings
+            .and_then(|(source, value)| {
+                parse_override_settings(source, value, &mut events, &mut deprecated_keys)
+            })
+            .into_iter()
+            .collect(),
+        ClientSettingsLayers::Parsed(settings) => settings,
+    };
+    for settings in &mut client_layers {
+        let _ = anchor_settings_paths(settings, root_path);
+    }
 
-    // Merge all layers: defaults < config_layers < override (later layers override earlier)
+    let empty_container_notice = empty_container_notice_for_layers(
+        config_layers
+            .iter()
+            .filter_map(Option::as_ref)
+            .chain(client_layers.iter()),
+    );
+
+    // Merge all layers: defaults < config layers < client layers.
     let mut layers = vec![defaults];
     layers.extend(config_layers);
-    layers.push(override_settings);
+    layers.extend(client_layers.into_iter().map(Some));
     let merged = fold_layers(layers);
     let raw_settings = merged.clone();
     let settings = expand_merged_settings(merged, home, &env_fn, &mut events);
@@ -437,6 +511,7 @@ pub fn load_settings(
         raw_settings,
         events,
         deprecated_keys,
+        empty_container_notice,
     }
 }
 
@@ -447,7 +522,7 @@ pub fn load_settings(
 ///
 /// - an empty `cmd` or `languages` used to defer to the `_` wildcard's list;
 ///   it now says the entry has none, and omitting the key is what inherits;
-/// - an empty `captureMappings`, `highlights`, or `folds` used to be a no-op —
+/// - an empty `captureMappings` or `highlights` used to be a no-op —
 ///   the merge only extended — and now clears the layer below, which for a
 ///   top-level `captureMappings = {}` means every built-in mapping.
 ///
@@ -465,7 +540,29 @@ pub fn load_settings(
 /// spelling it names is also the one the documentation now recommends for
 /// "this entry has none": worth explaining once, not worth nagging about.
 pub(crate) fn emptied_container_notice(settings: Option<&RawWorkspaceSettings>) -> Option<String> {
-    let settings = settings?;
+    empty_container_notice_for_layers(settings)
+}
+
+fn empty_container_notice_for_layers<'a>(
+    layers: impl IntoIterator<Item = &'a RawWorkspaceSettings>,
+) -> Option<String> {
+    let mut named = layers
+        .into_iter()
+        .flat_map(emptied_container_names)
+        .collect::<Vec<_>>();
+    if named.is_empty() {
+        return None;
+    }
+    named.sort_unstable();
+    named.dedup();
+    Some(format!(
+        "kakehashi: an empty list or map now clears the layer below rather than \
+         deferring to it — omit the key to inherit. Affected: {}",
+        named.join(", ")
+    ))
+}
+
+fn emptied_container_names(settings: &RawWorkspaceSettings) -> Vec<String> {
     let mut named: Vec<String> = Vec::new();
 
     if let Some(servers) = settings.language_servers.as_ref() {
@@ -483,22 +580,33 @@ pub(crate) fn emptied_container_notice(settings: Option<&RawWorkspaceSettings>) 
     match settings.capture_mappings.as_ref() {
         Some(mappings) if mappings.is_empty() => named.push("captureMappings".to_string()),
         Some(mappings) => named.extend(mappings.iter().filter_map(|(lang, entry)| {
-            let cleared = entry.highlights.as_ref().is_some_and(|m| m.is_empty())
-                || entry.folds.as_ref().is_some_and(|m| m.is_empty());
+            let cleared = entry.highlights.as_ref().is_some_and(|m| m.is_empty());
             cleared.then(|| format!("captureMappings.{lang}"))
         })),
         None => {}
     }
 
-    if named.is_empty() {
-        return None;
+    let canonical = settings
+        .features
+        .as_ref()
+        .and_then(|features| features.text_document_semantic_tokens.as_ref())
+        .and_then(|semantic_tokens| semantic_tokens.capture_mappings.as_ref());
+    match canonical {
+        Some(mappings) if mappings.is_empty() => {
+            named.push("features.\"textDocument/semanticTokens\".captureMappings".to_string())
+        }
+        Some(mappings) => named.extend(
+            mappings
+                .iter()
+                .filter(|(_, mappings)| mappings.is_empty())
+                .map(|(lang, _)| {
+                    format!("features.\"textDocument/semanticTokens\".captureMappings.{lang}")
+                }),
+        ),
+        None => {}
     }
-    named.sort_unstable();
-    Some(format!(
-        "kakehashi: an empty list or map now clears the layer below rather than \
-         deferring to it — omit the key to inherit. Affected: {}",
-        named.join(", ")
-    ))
+
+    named
 }
 
 /// Expand and validate the fully merged configuration, `initializationOptions`
@@ -542,6 +650,7 @@ fn load_user_config_with_events(
             events.push(SettingsEvent::info(
                 "Loaded user config from XDG_CONFIG_HOME",
             ));
+            append_unknown_key_warnings(&config.unknown_keys, &config.path, events);
             deprecated_keys.merge(config.deprecated_keys);
             Some((config.settings, config.path))
         }
@@ -666,18 +775,7 @@ fn load_toml_file(
     // Warn rather than reject: a key kakehashi does not recognise may be a
     // typo, but it may equally be one this version has not learned yet, and
     // refusing to start over it would make the file version-locked.
-    //
-    // Not reached for a key inside `features`: those structs carry
-    // `deny_unknown_fields`, so the parse above already failed and this file is
-    // fatal. Inconsistent with the rule stated here, pre-existing, and pinned
-    // by `test_load_toml_file_unknown_feature_key_is_fatal_today` so a future
-    // change to it is a deliberate one.
-    for key in unknown_config_keys(&contents) {
-        events.push(SettingsEvent::warning(format!(
-            "Unknown configuration key in {}: {key}",
-            path.display()
-        )));
-    }
+    append_unknown_config_key_warnings(&contents, path, events);
 
     events.push(SettingsEvent::info(format!(
         "Successfully loaded {}",
@@ -743,6 +841,7 @@ fn load_toml_settings(
     )));
 
     deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
+    append_unknown_config_key_warnings(&contents, &config_path, events);
     match toml::from_str::<RawWorkspaceSettings>(&contents) {
         Ok(settings) => {
             events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
@@ -903,6 +1002,76 @@ mod tests {
         f()
     }
 
+    #[test]
+    #[serial(xdg_env)]
+    fn replayed_client_layers_are_anchored_to_the_reloaded_root() {
+        let config_home = TempDir::new().expect("config home");
+        let root = TempDir::new().expect("workspace root");
+        let client_layer = RawWorkspaceSettings {
+            search_paths: Some(vec!["relative-parser".to_string()]),
+            ..Default::default()
+        };
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings_with_client_layers(
+                Some(root.path()),
+                vec![client_layer],
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        assert_eq!(
+            outcome.raw_settings.expect("merged settings").search_paths,
+            Some(vec![
+                root.path()
+                    .join("relative-parser")
+                    .to_string_lossy()
+                    .into_owned()
+            ])
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn replayed_client_layers_replace_invalid_lower_values_before_validation() {
+        let config_home = TempDir::new().expect("config home");
+        let root = TempDir::new().expect("workspace root");
+        std::fs::write(
+            root.path().join("kakehashi.toml"),
+            "searchPaths = [\"$MISSING_PROJECT_PATH\"]\n",
+        )
+        .expect("project config");
+        let client_layer = RawWorkspaceSettings {
+            search_paths: Some(vec!["client-parser".to_string()]),
+            ..Default::default()
+        };
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings_with_client_layers(
+                Some(root.path()),
+                vec![client_layer],
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        assert!(
+            outcome.settings.is_some(),
+            "client layer should repair base"
+        );
+        assert!(
+            outcome
+                .events
+                .iter()
+                .all(|event| !event.message.contains("Invalid configuration")),
+            "only the fully merged layers should be validated: {:?}",
+            outcome.events
+        );
+    }
+
     /// A user config file at `<config_home>/kakehashi/kakehashi.toml`, returning
     /// the directory it was written to — the base its relative paths anchor to.
     fn write_user_config(config_home: &Path, contents: &str) -> PathBuf {
@@ -948,6 +1117,60 @@ mod tests {
             emptied_container_notice(Some(&inheriting)).is_none(),
             "omitting the keys is the inheriting spelling and must stay quiet"
         );
+
+        let canonical_root: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."textDocument/semanticTokens"]
+            captureMappings = {}
+            "#,
+        )
+        .expect("canonical root clear");
+        let message = emptied_container_notice(Some(&canonical_root)).expect("root notice");
+        assert!(
+            message.contains("features.\"textDocument/semanticTokens\".captureMappings"),
+            "{message}"
+        );
+
+        let canonical_language: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."textDocument/semanticTokens".captureMappings.rust]
+            "#,
+        )
+        .expect("canonical language clear");
+        let message = emptied_container_notice(Some(&canonical_language)).expect("entry notice");
+        assert!(message.contains("captureMappings.rust"), "{message}");
+    }
+
+    #[test]
+    fn load_settings_aggregates_empty_notices_before_normalization() {
+        let lower_layer: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [languageServers.empty]
+            cmd = []
+            "#,
+        )
+        .expect("lower layer");
+        let outcome = load_settings(
+            None,
+            Some((
+                SettingsSource::InitializationOptions,
+                serde_json::json!({ "captureMappings": {} }),
+            )),
+            None,
+            |_| None,
+            Some(ExplicitConfig {
+                layers: vec![Some(lower_layer)],
+                events: Vec::new(),
+                deprecated_keys: DeprecatedKeysSeen::default(),
+                fatal_error: None,
+            }),
+        );
+
+        let notice = outcome
+            .empty_container_notice
+            .expect("normalization must not erase the authored empty-container signal");
+        assert!(notice.contains("captureMappings"), "{notice}");
+        assert!(notice.contains("languageServers.empty"), "{notice}");
     }
 
     #[test]
@@ -1706,30 +1929,77 @@ mod tests {
         );
     }
 
-    /// Records, rather than endorses, an inconsistency: `FeatureSettings` and
-    /// its children carry `deny_unknown_fields`, so an unknown key *inside*
-    /// `features` fails typed deserialization and is fatal — while the same
-    /// mistake anywhere else is a warning. Pinned so that changing it is a
-    /// deliberate act with a test to update, not a silent drift.
     #[test]
-    fn test_load_toml_file_unknown_feature_key_is_fatal_today() {
+    fn test_load_toml_file_warns_about_folds_without_discarding_highlights() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("feature-typo.toml");
+        let path = dir.path().join("legacy-folds.toml");
         std::fs::write(
             &path,
-            "[features.\"textDocument/publishDiagnostics\"]\nfutureOption = 1\n",
+            r#"
+            [captureMappings._.folds]
+            comment = "comment"
+
+            [captureMappings._.highlights]
+            variable = "variable"
+            "#,
         )
         .unwrap();
 
         let mut events = Vec::new();
         let mut ignored_deprecation = DeprecatedKeysSeen::default();
-        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+        let settings = load_toml_file(&path, &mut events, &mut ignored_deprecation)
+            .expect("an unknown key should not reject an explicit config file")
+            .expect("settings");
 
-        let message = result
-            .expect_err("today an unknown key under `features` is fatal, unlike anywhere else");
         assert!(
-            message.contains("futureOption"),
-            "the rejected key must be named: {message}"
+            events
+                .iter()
+                .any(|event| event.kind == SettingsEventKind::Warning
+                    && event.message.contains("captureMappings._.folds")),
+            "the removed key should use the common file warning policy: {events:?}"
+        );
+        assert_eq!(
+            settings.capture_mappings.expect("legacy mappings")["_"]
+                .highlights
+                .as_ref()
+                .expect("highlights")["variable"],
+            "variable"
+        );
+    }
+
+    #[test]
+    fn test_load_toml_file_warns_about_unknown_feature_key_without_discarding_siblings() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("feature-typo.toml");
+        std::fs::write(
+            &path,
+            "[features.\"textDocument/publishDiagnostics\"]\ndebounceMs = 12\nfutureOption = 1\n",
+        )
+        .unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+        let settings = load_toml_file(&path, &mut events, &mut ignored_deprecation)
+            .expect("an unknown feature key should use the common file policy")
+            .expect("settings");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == SettingsEventKind::Warning
+                    && event
+                        .message
+                        .contains("features.textDocument/publishDiagnostics.futureOption")),
+            "the ignored key should be named in a warning: {events:?}"
+        );
+        assert_eq!(
+            settings
+                .features
+                .expect("features")
+                .text_document_publish_diagnostics
+                .expect("publish diagnostics")
+                .debounce_ms,
+            Some(12)
         );
     }
 
@@ -2027,6 +2297,92 @@ mod tests {
         assert!(
             used_deprecated.root_markers,
             "rootMarkers should set the flag"
+        );
+    }
+
+    #[test]
+    fn load_toml_settings_warns_about_unknown_feature_key_without_discarding_siblings() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("kakehashi.toml");
+        std::fs::write(
+            &config_path,
+            "[features.\"textDocument/publishDiagnostics\"]\ndebounceMs = 12\nfutureOption = 1\n",
+        )
+        .unwrap();
+
+        let mut events = Vec::new();
+        let mut deprecated_keys = DeprecatedKeysSeen::default();
+        let settings = load_toml_settings(Some(dir.path()), &mut events, &mut deprecated_keys)
+            .expect("an unknown feature key should not reject a workspace config");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == SettingsEventKind::Warning
+                    && event.message.contains(&config_path.display().to_string())
+                    && event
+                        .message
+                        .contains("features.textDocument/publishDiagnostics.futureOption")),
+            "the ignored key and workspace file should be named: {events:?}"
+        );
+        assert_eq!(
+            settings
+                .features
+                .expect("features")
+                .text_document_publish_diagnostics
+                .expect("publish diagnostics")
+                .debounce_ms,
+            Some(12)
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn load_user_config_warns_about_unknown_feature_key_without_discarding_siblings() {
+        let original_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let dir = TempDir::new().unwrap();
+        let config_dir = dir.path().join("kakehashi");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("kakehashi.toml");
+        std::fs::write(
+            &config_path,
+            "[features.\"textDocument/publishDiagnostics\"]\ndebounceMs = 12\nfutureOption = 1\n",
+        )
+        .unwrap();
+        // SAFETY: serial(xdg_env) prevents concurrent mutation in this test module.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+
+        let mut events = Vec::new();
+        let mut deprecated_keys = DeprecatedKeysSeen::default();
+        let loaded = load_user_config_with_events(&mut events, &mut deprecated_keys);
+
+        // SAFETY: serial(xdg_env) prevents concurrent mutation in this test module.
+        unsafe {
+            match original_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        let settings = loaded.expect("user config").0;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == SettingsEventKind::Warning
+                    && event.message.contains(&config_path.display().to_string())
+                    && event
+                        .message
+                        .contains("features.textDocument/publishDiagnostics.futureOption")),
+            "the ignored key and user config should be named: {events:?}"
+        );
+        assert_eq!(
+            settings
+                .features
+                .expect("features")
+                .text_document_publish_diagnostics
+                .expect("publish diagnostics")
+                .debounce_ms,
+            Some(12)
         );
     }
 

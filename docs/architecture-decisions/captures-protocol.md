@@ -3,6 +3,7 @@
 **Related Decisions**:
 - [node-reference-protocol](node-reference-protocol.md) — Node identity, `NodeInfo`, and the `kakehashi/node/*` accessor family the capture results compose with
 - [lazy-node-identity-tracking](lazy-node-identity-tracking.md) — ULID identity tracking reused to make captured nodes addressable across edits
+- [semantic-token-capture-mapping-config](semantic-token-capture-mapping-config.md) — capture-to-token remapping is scoped to semantic tokens and does not transform this protocol
 
 ## Context and Problem Statement
 
@@ -21,6 +22,10 @@ A first iteration shipped `kakehashi/query`: a one-shot method taking a **client
 * **Match correlation preserved**: `@context` and `@context.end` within one pattern must stay grouped; a flat capture stream loses which `.end` bounds which `@context`.
 * **Reuse proven mechanics**: the semanticTokens `full`/`delta`/`range` interaction model, the existing tolerant query compilation (`; inherits:`, per-pattern skip), predicate evaluation, ULID minting, and the prefix/suffix single-edit delta algorithm.
 * **Minimal API surface**: one protocol for query execution; `kakehashi/query` is replaced, not kept alongside.
+* **Raw capture identity**: capture names on this protocol are the query's names
+  after removing `@`; semantic-token `captureMappings` never renames or filters
+  them. Consumers can therefore address query-defined captures without a
+  presentation setting changing their protocol identity.
 
 ## Decision Outcome
 

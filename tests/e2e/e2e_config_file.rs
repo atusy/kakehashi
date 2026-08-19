@@ -54,6 +54,10 @@ fn query_effective_settings(client: &mut LspClient) -> serde_json::Value {
         .clone()
 }
 
+fn semantic_token_capture_mappings(settings: &Value) -> &Value {
+    &settings["features"]["textDocument/semanticTokens"]["captureMappings"]
+}
+
 /// Poll effective settings until `predicate` returns true, or panic after timeout.
 ///
 /// Use after `didChangeConfiguration` to avoid fixed sleeps. Polls every 100ms for
@@ -735,7 +739,7 @@ fn test_config_file_deep_merge_languages_from_two_files() {
     );
 }
 
-/// Deep merge: captureMappings from config file + initializationOptions.
+/// Deep merge: canonical semantic-token mappings from config file + initializationOptions.
 #[test]
 fn test_config_file_deep_merge_capture_mappings_with_init_options() {
     let dir = TempDir::new().unwrap();
@@ -743,7 +747,7 @@ fn test_config_file_deep_merge_capture_mappings_with_init_options() {
     let config = dir.path().join("capture.toml");
     std::fs::write(
         &config,
-        "[captureMappings._.highlights]\n\"variable.builtin\" = \"from.file\"\n",
+        "[features.\"textDocument/semanticTokens\".captureMappings._]\n\"variable.builtin\" = \"from.file\"\n",
     )
     .unwrap();
 
@@ -756,17 +760,19 @@ fn test_config_file_deep_merge_capture_mappings_with_init_options() {
     let settings = get_effective_settings_with_init_options(
         &mut client,
         json!({
-            "captureMappings": {
-                "_": {
-                    "highlights": {
+            "features": {
+                "textDocument/semanticTokens": {
+                    "captureMappings": {
+                        "_": {
                         "function.builtin": "from.init"
+                        }
                     }
                 }
             }
         }),
     );
 
-    let highlights = &settings["captureMappings"]["_"]["highlights"];
+    let highlights = &semantic_token_capture_mappings(&settings)["_"];
 
     assert_eq!(
         highlights["variable.builtin"],
@@ -1375,7 +1381,8 @@ fn test_did_change_configuration_warns_on_nested_capture_mapping_unknown_keys() 
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
-    let initial_capture_mappings = get_effective_settings(&mut client)["captureMappings"].clone();
+    let initial_settings = get_effective_settings(&mut client);
+    let initial_capture_mappings = semantic_token_capture_mappings(&initial_settings).clone();
 
     client.send_notification(
         "workspace/didChangeConfiguration",
@@ -1413,7 +1420,8 @@ fn test_did_change_configuration_warns_on_nested_capture_mapping_unknown_keys() 
         "nested capture mapping unknown-key update must not also log success; got: {unexpected_success:?}"
     );
 
-    let updated_capture_mappings = query_effective_settings(&mut client)["captureMappings"].clone();
+    let updated_settings = query_effective_settings(&mut client);
+    let updated_capture_mappings = semantic_token_capture_mappings(&updated_settings).clone();
     assert_eq!(
         updated_capture_mappings, initial_capture_mappings,
         "nested capture mapping unknown-key update should leave captureMappings unchanged",

@@ -76,10 +76,11 @@ surfaced as-is rather than aliased, per the delete-on-supersede posture —
 while stale `locals.scm` paths without an explicit kind stop being inferred
 once the kind is gone — filename inference yields nothing for an unknown
 filename, so they degrade to silently skipped rather than erroring. The
-`captureMappings.locals` table goes with the pipeline (it is equally
-consumerless — the semantic-token legend consults only `.highlights`); no
-`bindings` counterpart appears, because the bindings vocabulary is fixed by
-this spec, not user-mapped.
+No capture-mapping counterpart appears for `bindings`, because its vocabulary
+is fixed by this spec rather than user-mapped. Capture remapping belongs only
+to `features."textDocument/semanticTokens".captureMappings` (see
+semantic-token-capture-mapping-config), so bindings resolution never consults
+it.
 
 ### Capture vocabulary
 

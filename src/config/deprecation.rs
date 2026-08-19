@@ -29,12 +29,15 @@ pub(crate) struct DeprecatedKeysSeen {
     pub(crate) root_markers: bool,
     /// Top-level `autoInstall`, superseded by `[languages.*] autoInstall`.
     pub(crate) auto_install: bool,
+    /// Top-level `captureMappings`, superseded by the semantic-token feature.
+    pub(crate) capture_mappings: bool,
 }
 
 impl DeprecatedKeysSeen {
     pub(crate) fn merge(&mut self, other: Self) {
         self.root_markers |= other.root_markers;
         self.auto_install |= other.auto_install;
+        self.capture_mappings |= other.capture_mappings;
     }
 }
 
@@ -60,6 +63,14 @@ pub(crate) const AUTO_INSTALL_DEPRECATION_NOTICE: &str = "kakehashi: the top-lev
      `languages.<lang>.autoInstall`). A language with a self-referential \
      `base` inherits nothing from `_`, so give those an explicit value. The \
      top-level key still works for now but may be removed in a future release.";
+
+/// User-facing text for the one-per-session top-level `captureMappings`
+/// notice. The dotted path is usable for both TOML and JSON configuration.
+pub(crate) const CAPTURE_MAPPINGS_DEPRECATION_NOTICE: &str = "kakehashi: the top-level `captureMappings` config key is deprecated; move highlight mappings to \
+     `features.\"textDocument/semanticTokens\".captureMappings` in TOML (or \
+     `features[\"textDocument/semanticTokens\"].captureMappings` in JSON) and remove the \
+     intermediate `highlights` key. The top-level key still works for now but \
+     may be removed in a future release.";
 
 /// Which deprecated keys the raw TOML text spells.
 ///
@@ -87,6 +98,9 @@ pub(crate) fn toml_deprecated_keys(contents: &str) -> DeprecatedKeysSeen {
         auto_install: value
             .as_table()
             .is_some_and(|table| table.contains_key("autoInstall")),
+        capture_mappings: value
+            .as_table()
+            .is_some_and(|table| table.contains_key("captureMappings")),
     }
 }
 
@@ -107,6 +121,9 @@ pub(crate) fn json_deprecated_keys(value: &JsonValue) -> DeprecatedKeysSeen {
         auto_install: value
             .as_object()
             .is_some_and(|object| object.contains_key("autoInstall")),
+        capture_mappings: value
+            .as_object()
+            .is_some_and(|object| object.contains_key("captureMappings")),
     }
 }
 
@@ -123,18 +140,25 @@ mod tests {
         let mut seen = DeprecatedKeysSeen {
             root_markers: true,
             auto_install: true,
+            capture_mappings: true,
         };
         seen.merge(DeprecatedKeysSeen::default());
         assert!(seen.root_markers, "a later clean layer must not clear this");
         assert!(seen.auto_install, "a later clean layer must not clear this");
+        assert!(
+            seen.capture_mappings,
+            "a later clean layer must not clear this"
+        );
 
         // And it must still pick flags UP from a later layer.
         let mut none = DeprecatedKeysSeen::default();
         none.merge(DeprecatedKeysSeen {
             root_markers: false,
             auto_install: true,
+            capture_mappings: true,
         });
         assert!(none.auto_install);
+        assert!(none.capture_mappings);
         assert!(!none.root_markers);
     }
 
@@ -142,6 +166,25 @@ mod tests {
     fn toml_detects_the_deprecated_top_level_auto_install() {
         assert!(toml_deprecated_keys("autoInstall = true").auto_install);
         assert!(toml_deprecated_keys("autoInstall = false").auto_install);
+    }
+
+    #[test]
+    fn toml_distinguishes_deprecated_and_canonical_capture_mappings() {
+        let deprecated = toml_deprecated_keys(
+            r#"
+            [captureMappings._.highlights]
+            variable = "variable"
+            "#,
+        );
+        assert!(deprecated.capture_mappings);
+
+        let canonical = toml_deprecated_keys(
+            r#"
+            [features."textDocument/semanticTokens".captureMappings._]
+            variable = "variable"
+            "#,
+        );
+        assert!(!canonical.capture_mappings);
     }
 
     #[test]
@@ -184,6 +227,35 @@ rootMarkers = [".git"]
             "languages": { "_": { "autoInstall": true } }
         });
         assert!(!json_deprecated_keys(&canonical).auto_install);
+    }
+
+    #[test]
+    fn json_distinguishes_deprecated_and_canonical_capture_mappings() {
+        let deprecated = serde_json::json!({
+            "captureMappings": { "_": { "highlights": { "variable": "variable" } } }
+        });
+        assert!(json_deprecated_keys(&deprecated).capture_mappings);
+
+        let canonical = serde_json::json!({
+            "features": {
+                "textDocument/semanticTokens": {
+                    "captureMappings": { "_": { "variable": "variable" } }
+                }
+            }
+        });
+        assert!(!json_deprecated_keys(&canonical).capture_mappings);
+    }
+
+    #[test]
+    fn capture_mapping_notice_gives_valid_toml_and_json_paths() {
+        assert!(
+            CAPTURE_MAPPINGS_DEPRECATION_NOTICE
+                .contains("features.\"textDocument/semanticTokens\".captureMappings")
+        );
+        assert!(
+            CAPTURE_MAPPINGS_DEPRECATION_NOTICE
+                .contains("features[\"textDocument/semanticTokens\"].captureMappings")
+        );
     }
 
     #[test]

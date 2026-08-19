@@ -25,5 +25,8 @@ pub(crate) use ingress_order::current_writer_ticket;
 pub use lsp_impl::Kakehashi;
 pub(crate) use request_id::current_upstream_id;
 pub use request_id::{CancelForwarder, RequestIdCapture};
-pub(crate) use settings::{SettingsEvent, SettingsEventKind, SettingsSource, load_settings};
+pub(crate) use settings::{
+    SettingsEvent, SettingsEventKind, SettingsSource, load_settings,
+    load_settings_with_client_layers,
+};
 pub use wire_repair::repair_inbound_frames;

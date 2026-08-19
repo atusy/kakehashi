@@ -7,11 +7,6 @@
 //! with the answer is that caller's policy — the former rejects the update, the
 //! latter warns.
 //!
-//! The walk does not cover `features`: `FeatureSettings` and its children carry
-//! `deny_unknown_fields`, so an unknown key there fails typed deserialization
-//! before any of this runs. That makes it fatal on a config file, unlike every
-//! other unknown key, which is a wrinkle worth removing rather than a design.
-
 use serde_json::Value;
 
 pub(crate) const KNOWN_WORKSPACE_SETTING_KEYS: &[&str] = &[
@@ -25,10 +20,17 @@ pub(crate) const KNOWN_WORKSPACE_SETTING_KEYS: &[&str] = &[
 ];
 
 pub(crate) const KNOWN_FEATURE_SETTING_KEYS: &[&str] = &[
+    "textDocument/semanticTokens",
     "textDocument/publishDiagnostics",
     "window/logMessage",
     "workspace/diagnostic/refresh",
 ];
+
+pub(crate) const KNOWN_DEBOUNCE_FEATURE_SETTING_KEYS: &[&str] = &["debounceMs", "maxWaitMs"];
+
+pub(crate) const KNOWN_LOG_MESSAGE_FEATURE_SETTING_KEYS: &[&str] = &["logLevel"];
+
+pub(crate) const KNOWN_SEMANTIC_TOKENS_FEATURE_SETTING_KEYS: &[&str] = &["captureMappings"];
 
 pub(crate) const KNOWN_AGGREGATION_SETTING_KEYS: &[&str] = &[
     "maxFanOut",
@@ -53,7 +55,7 @@ pub(crate) const KNOWN_BRIDGE_SERVER_SETTING_KEYS: &[&str] = &[
     "workspaceMarkers",
 ];
 
-pub(crate) const KNOWN_CAPTURE_MAPPINGS_SETTING_KEYS: &[&str] = &["folds", "highlights"];
+pub(crate) const KNOWN_CAPTURE_MAPPINGS_SETTING_KEYS: &[&str] = &["highlights"];
 
 pub(crate) const KNOWN_LANGUAGE_SETTING_KEYS: &[&str] = &[
     "aliases",
@@ -76,6 +78,15 @@ pub(crate) fn sort_and_dedup_unknown_keys(unknown_keys: &mut Vec<String>) {
     unknown_keys.dedup();
 }
 
+pub(crate) fn unknown_toml_workspace_setting_keys(contents: &str) -> Vec<String> {
+    let Ok(value) = toml::from_str::<Value>(contents) else {
+        return Vec::new();
+    };
+    let mut keys = unknown_workspace_setting_keys(&value);
+    sort_and_dedup_unknown_keys(&mut keys);
+    keys
+}
+
 fn unknown_object_keys(path: &str, value: &Value, known_keys: &[&str]) -> Vec<String> {
     let Some(object) = value.as_object() else {
         return Vec::new();
@@ -91,6 +102,13 @@ fn unknown_object_keys(path: &str, value: &Value, known_keys: &[&str]) -> Vec<St
 pub(crate) fn is_workspace_setting_key_or_typo(key: &str) -> bool {
     KNOWN_WORKSPACE_SETTING_KEYS.contains(&key)
         || KNOWN_WORKSPACE_SETTING_KEYS
+            .iter()
+            .any(|known_key| is_one_edit_apart(key, known_key))
+}
+
+pub(crate) fn is_feature_setting_key_or_typo(key: &str) -> bool {
+    KNOWN_FEATURE_SETTING_KEYS.contains(&key)
+        || KNOWN_FEATURE_SETTING_KEYS
             .iter()
             .any(|known_key| is_one_edit_apart(key, known_key))
 }
@@ -148,9 +166,51 @@ pub(crate) fn unknown_workspace_setting_keys(settings: &Value) -> Vec<String> {
 
     append_unknown_bridge_server_setting_keys(object, &mut unknown_keys);
     append_unknown_capture_mappings_setting_keys(object, &mut unknown_keys);
+    append_unknown_feature_setting_keys(object, &mut unknown_keys);
     append_unknown_language_setting_keys(object, &mut unknown_keys);
 
     unknown_keys
+}
+
+fn append_unknown_feature_setting_keys(
+    object: &serde_json::Map<String, Value>,
+    unknown_keys: &mut Vec<String>,
+) {
+    let Some(features) = object.get("features").and_then(Value::as_object) else {
+        return;
+    };
+
+    unknown_keys.extend(
+        features
+            .keys()
+            .filter(|key| !KNOWN_FEATURE_SETTING_KEYS.contains(&key.as_str()))
+            .map(|key| format!("features.{key}")),
+    );
+
+    for (feature, known_keys) in [
+        (
+            "textDocument/semanticTokens",
+            KNOWN_SEMANTIC_TOKENS_FEATURE_SETTING_KEYS,
+        ),
+        (
+            "textDocument/publishDiagnostics",
+            KNOWN_DEBOUNCE_FEATURE_SETTING_KEYS,
+        ),
+        ("window/logMessage", KNOWN_LOG_MESSAGE_FEATURE_SETTING_KEYS),
+        (
+            "workspace/diagnostic/refresh",
+            KNOWN_DEBOUNCE_FEATURE_SETTING_KEYS,
+        ),
+    ] {
+        let Some(value) = features.get(feature) else {
+            continue;
+        };
+        unknown_keys.extend(unknown_object_keys(
+            &format!("features.{feature}"),
+            value,
+            known_keys,
+        ));
+    }
 }
 
 fn append_unknown_bridge_server_setting_keys(
@@ -298,9 +358,10 @@ fn append_unknown_layers_keys(
 mod tests {
     use super::*;
     use crate::config::settings::{
-        AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, FeatureSettings,
-        LanguageSettings, LayerAggregationConfig, LayersConfig, QueryItem, QueryTypeMappings,
-        RawWorkspaceSettings,
+        AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, DebounceFeatureSettings,
+        FeatureSettings, LanguageSettings, LayerAggregationConfig, LayersConfig,
+        LogMessageFeatureSettings, QueryItem, QueryTypeMappings, RawWorkspaceSettings,
+        SemanticTokensFeatureSettings,
     };
     use std::collections::BTreeSet;
 
@@ -335,6 +396,22 @@ mod tests {
     }
 
     #[test]
+    fn known_feature_child_keys_match_schema_properties() {
+        assert_known_keys_match_schema::<SemanticTokensFeatureSettings>(
+            KNOWN_SEMANTIC_TOKENS_FEATURE_SETTING_KEYS,
+            &[],
+        );
+        assert_known_keys_match_schema::<DebounceFeatureSettings>(
+            KNOWN_DEBOUNCE_FEATURE_SETTING_KEYS,
+            &[],
+        );
+        assert_known_keys_match_schema::<LogMessageFeatureSettings>(
+            KNOWN_LOG_MESSAGE_FEATURE_SETTING_KEYS,
+            &[],
+        );
+    }
+
+    #[test]
     fn section_sibling_filter_matches_workspace_keys_and_typos_only() {
         assert!(is_workspace_setting_key_or_typo("autoInstall"));
         assert!(is_workspace_setting_key_or_typo("autoInstal"));
@@ -344,6 +421,15 @@ mod tests {
         assert!(!is_workspace_setting_key_or_typo("editor"));
         assert!(!is_workspace_setting_key_or_typo("files"));
         assert!(!is_workspace_setting_key_or_typo("workbench"));
+    }
+
+    #[test]
+    fn feature_sibling_filter_matches_feature_keys_and_typos_only() {
+        assert!(is_feature_setting_key_or_typo(
+            "textDocument/semanticTokens"
+        ));
+        assert!(is_feature_setting_key_or_typo("textDocument/semanticToken"));
+        assert!(!is_feature_setting_key_or_typo("someOtherClientFeature"));
     }
 
     #[test]
@@ -359,6 +445,53 @@ mod tests {
         assert_known_keys_match_schema::<QueryTypeMappings>(
             KNOWN_CAPTURE_MAPPINGS_SETTING_KEYS,
             &[],
+        );
+    }
+
+    #[test]
+    fn removed_legacy_folds_uses_the_common_unknown_key_path() {
+        let unknown = unknown_workspace_setting_keys(&serde_json::json!({
+            "captureMappings": {
+                "_": {
+                    "folds": { "comment": "comment" },
+                    "highlights": { "variable": "variable" }
+                }
+            }
+        }));
+
+        assert_eq!(unknown, ["captureMappings._.folds"]);
+    }
+
+    #[test]
+    fn feature_typos_use_the_common_unknown_key_path() {
+        let unknown = unknown_workspace_setting_keys(&serde_json::json!({
+            "features": {
+                "textDocument/semanticToken": {},
+                "textDocument/semanticTokens": {
+                    "captureMapping": {},
+                    "captureMappings": { "_": { "variable": "variable" } }
+                },
+                "textDocument/publishDiagnostics": {
+                    "debounceMS": 1
+                },
+                "window/logMessage": {
+                    "level": "debug"
+                },
+                "workspace/diagnostic/refresh": {
+                    "maxWaitMS": 1
+                }
+            }
+        }));
+
+        assert_eq!(
+            unknown,
+            [
+                "features.textDocument/semanticToken",
+                "features.textDocument/semanticTokens.captureMapping",
+                "features.textDocument/publishDiagnostics.debounceMS",
+                "features.window/logMessage.level",
+                "features.workspace/diagnostic/refresh.maxWaitMS",
+            ]
         );
     }
 

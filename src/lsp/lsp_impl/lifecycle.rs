@@ -297,6 +297,11 @@ impl Kakehashi {
         {
             return Err(configuration_load_error(error));
         }
+        let _ = self.explicit_config.set(
+            explicit_config
+                .as_ref()
+                .map(crate::lsp::settings::ExplicitConfig::for_replay),
+        );
 
         let position_encoding = host_position_encoding(&params.capabilities);
         // Store client capabilities for LSP compliance checks (e.g., refresh support).
@@ -414,10 +419,18 @@ impl Kakehashi {
                 .show_warning(crate::config::deprecation::AUTO_INSTALL_DEPRECATION_NOTICE)
                 .await;
         }
+        if settings_outcome.deprecated_keys.capture_mappings
+            && self
+                .settings_manager
+                .claim_capture_mappings_deprecation_warning()
+        {
+            self.notifier()
+                .show_warning(crate::config::deprecation::CAPTURE_MAPPINGS_DEPRECATION_NOTICE)
+                .await;
+        }
         // Same shape for the empty-container rule change: what the layers said
         // still parses, and now means something else.
-        if let Some(notice) =
-            crate::lsp::settings::emptied_container_notice(settings_outcome.raw_settings.as_ref())
+        if let Some(notice) = settings_outcome.empty_container_notice.as_deref()
             && self
                 .settings_manager
                 .claim_empty_container_migration_warning()
@@ -430,6 +443,7 @@ impl Kakehashi {
         // for zero-config experience. Use default_settings() instead of RawWorkspaceSettings::default()
         // because the derived Default creates empty capture_mappings while default_settings() includes
         // the full default capture_mappings (markup.strong → "", etc.)
+        let initialization_merge_was_accepted = settings_outcome.settings.is_some();
         let (raw_settings, settings) = if let Some(s) = settings_outcome.settings {
             (
                 settings_outcome
@@ -457,11 +471,15 @@ impl Kakehashi {
             };
             (raw_settings, settings)
         };
-        self.client_settings_override.store(
-            initialization_options
-                .and_then(|value| serde_json::from_value(value).ok())
-                .map(std::sync::Arc::new),
-        );
+        *self
+            .client_settings_overrides
+            .write()
+            .expect("client settings overrides lock poisoned") = initialization_merge_was_accepted
+            .then_some(initialization_options)
+            .flatten()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .into_iter()
+            .collect();
         // Derive the onTypeFormatting trigger union before settings move into
         // apply_raw_settings: kakehashi cannot know downstream trigger
         // characters at initialize time (servers spawn lazily), so the

@@ -184,10 +184,12 @@ default `info` forwards Error, Warning, and Info while suppressing LSP `Log` and
       }
     }
   },
-  "captureMappings": {
-    "_": {
-      "highlights": {
-        "variable.builtin": "variable.defaultLibrary"
+  "features": {
+    "textDocument/semanticTokens": {
+      "captureMappings": {
+        "_": {
+          "variable.builtin": "variable.defaultLibrary"
+        }
       }
     }
   }
@@ -405,18 +407,22 @@ it comes from:
 | list | inherit the layer below | **clear** it | replace wholesale |
 
 So `queries = []`, `bridge = {}`, `languageServers = {}`, `cmd = []`, and
-`captureMappings = {}` all mean "none", while leaving the key out means "I have
-nothing to say about this — keep what the layer below decided". Removing a key
-never removes a value: to override one, write the value you want (see the
-`workspace/didChangeConfiguration` notes above).
+`features.textDocument/semanticTokens.captureMappings = {}` all mean "none",
+while leaving the key out means "I have nothing to say about this — keep what
+the layer below decided". Removing a key never removes a value: to override
+one, write the value you want (see the `workspace/didChangeConfiguration`
+notes above).
 
-An *entry* is not a container: `[captureMappings.rust]` or `[languageServers.foo]`
-with no keys under it sets no field, so it inherits rather than clears. Clear a
-field, not the table — `[captureMappings.rust] highlights = {}`.
+A semantic-token language entry is itself a map, so an empty
+`[features."textDocument/semanticTokens".captureMappings.rust]` table clears
+the Rust-specific entry inherited from lower configuration layers; omit the
+`rust` entry to inherit it. The `_` wildcard mappings still apply afterward,
+so this is not a per-language opt-out. By contrast, `[languageServers.foo]`
+with no fields sets no field and therefore inherits.
 
 Two settings stand outside this: the top-level `languages` map still ignores
-`{}` (it has no clear spelling yet), and `captureMappings` is additive per
-capture name rather than per language — see below.
+`{}` (it has no clear spelling yet), and semantic-token `captureMappings` is
+additive per capture name rather than per language — see below.
 
 For `rmd`, kakehashi will try `rmd`-specific parser/query settings first and fall back through `markdown` and then `_`. Fields set on the derived language override inherited fields. Omitted fields inherit from the base chain; `queries: []` and `bridge: {}` explicitly clear inherited query and bridge settings.
 
@@ -433,27 +439,41 @@ Set `base` to the same language name to make a self-contained language that does
 }
 ```
 
-#### `captureMappings`
+#### `features.textDocument/semanticTokens.captureMappings`
 
 Remap Tree-sitter capture names to LSP semantic token types. Use `_` as a wildcard for all languages.
 
 ```json
 {
-  "captureMappings": {
-    "_": {
-      "highlights": {
-        "variable.builtin": "variable.defaultLibrary",
-        "function.builtin": "function.defaultLibrary"
-      }
-    },
-    "python": {
-      "highlights": {
-        "type.builtin": "type.defaultLibrary"
+  "features": {
+    "textDocument/semanticTokens": {
+      "captureMappings": {
+        "_": {
+          "variable.builtin": "variable.defaultLibrary",
+          "function.builtin": "function.defaultLibrary"
+        },
+        "python": {
+          "type.builtin": "type.defaultLibrary"
+        }
       }
     }
   }
 }
 ```
+
+The former top-level `captureMappings.<language>.highlights` shape remains
+accepted for migration, but is deprecated. If both spellings occur in one
+layer, the feature-scoped value wins for duplicate capture names; otherwise
+their entries are combined. In the legacy spelling, `captureMappings = {}`
+clears the inherited root and `highlights = {}` under a
+`[captureMappings.<language>]` table clears that language's inherited entry.
+The clear is applied before canonical entries in the same layer are added. The
+old `folds` table was unused and has no
+replacement. It is absent from the schema and has no effect. Like another
+unrecognized key, it is ignored where the configuration source tolerates
+unknown keys and causes a pushed runtime update to be rejected by that
+ingress's existing unknown-key policy; valid siblings such as `highlights` are
+not discarded merely because `folds` is present.
 
 ### Bridge Configuration
 
@@ -761,7 +781,7 @@ The `bridge` map in language configuration controls which injection languages ar
 kakehashi loads configuration from `~/.config/kakehashi/kakehashi.toml` (user config) and `./kakehashi.toml` (project config). Both use the same TOML format:
 
 ```toml
-[captureMappings._.highlights]
+[features."textDocument/semanticTokens".captureMappings._]
 "variable.builtin" = "variable.defaultLibrary"
 
 [languages.custom_lang]
@@ -818,11 +838,11 @@ When `--config-file` is specified:
 - A key kakehashi does not recognise is **reported but not fatal**, so a file
   can carry a key a newer version understands without the older one refusing to
   start. Serde would otherwise drop `autoInstal = false` silently and leave you
-  wondering why the default applied. Two caveats: keys inside `features` are an
-  exception — the parser rejects them outright, so an unknown one there *is*
-  fatal — and in `format`/`diagnose` the warning has nowhere to go, since CLI
-  mode surfaces only hard errors. (`workspace/didChangeConfiguration` is
-  stricter still and rejects the whole update — that one is a live edit, not a
+  wondering why the default applied. Nested `features` keys follow the same
+  warning policy, and recognized sibling settings remain effective. One
+  caveat: in `format`/`diagnose` the warning has nowhere to go, since CLI mode
+  surfaces only hard errors. (`workspace/didChangeConfiguration` is stricter
+  still and rejects the whole pushed update — that one is a live edit, not a
   file you may share across versions.)
 - Cross-field invariants (e.g. `debounceMs` ≤ `maxWaitMs`) are judged on the
   merged explicit configuration, so splitting the two halves across two files is

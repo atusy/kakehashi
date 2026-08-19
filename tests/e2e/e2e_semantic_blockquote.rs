@@ -109,15 +109,25 @@ fn build_token_snapshot(tokens: &[DecodedToken], content: &str) -> Vec<serde_jso
         .collect()
 }
 
-/// E2E test: blockquote multiline injection with full captureMappings.
+fn semantic_token_initialization_options(mappings: serde_json::Value) -> serde_json::Value {
+    json!({
+        "features": {
+            "textDocument/semanticTokens": {
+                "captureMappings": { "_": mappings }
+            }
+        }
+    })
+}
+
+/// E2E test: blockquote multiline injection with full semantic-token mappings.
 ///
-/// Uses a comprehensive captureMappings config (matching typical user configs) with
+/// Uses a comprehensive canonical mapping config (matching typical user configs) with
 /// both heading and code block examples in a single document.
 #[test]
 fn test_blockquote_multiline_support_with_full_config() {
     let mut client = LspClient::new();
 
-    // User's EXACT captureMappings config
+    // A representative canonical semantic-token mapping config.
     client.send_request(
         "initialize",
         json!({
@@ -134,10 +144,7 @@ fn test_blockquote_multiline_support_with_full_config() {
                     }
                 }
             },
-            "initializationOptions": {
-                "captureMappings": {
-                    "_": {
-                        "highlights": {
+            "initializationOptions": semantic_token_initialization_options(json!({
                             "markup.heading": "class",
                             "markup.heading.1": "class",
                             "markup.heading.2": "class",
@@ -159,10 +166,7 @@ fn test_blockquote_multiline_support_with_full_config() {
                             "markup.strikethrough": "keyword.deprecated",
                             "markup.strong": "keyword",
                             "markup.underline": "keyword"
-                        }
-                    }
-                }
-            }
+            }))
         }),
     );
     client.send_notification("initialized", json!({}));
@@ -284,17 +288,11 @@ fn test_blockquote_multiline_injection_token_prefix() {
                     }
                 }
             },
-            "initializationOptions": {
-                "captureMappings": {
-                    "_": {
-                        "highlights": {
+            "initializationOptions": semantic_token_initialization_options(json!({
                             "markup.quote": "keyword",
                             "markup.raw.block": "string",
                             "markup.raw": "string"
-                        }
-                    }
-                }
-            }
+            }))
         }),
     );
     client.send_notification("initialized", json!({}));
@@ -410,16 +408,10 @@ fn test_blockquote_heading_host_token_preservation() {
                     }
                 }
             },
-            "initializationOptions": {
-                "captureMappings": {
-                    "_": {
-                        "highlights": {
+            "initializationOptions": semantic_token_initialization_options(json!({
                             "markup.heading.1": "class",
                             "markup.quote": "keyword"
-                        }
-                    }
-                }
-            }
+            }))
         }),
     );
     client.send_notification("initialized", json!({}));
@@ -528,16 +520,10 @@ fn test_blockquote_heading_multiline_support_prefix_type() {
                     }
                 }
             },
-            "initializationOptions": {
-                "captureMappings": {
-                    "_": {
-                        "highlights": {
+            "initializationOptions": semantic_token_initialization_options(json!({
                             "markup.heading.1": "class",
                             "markup.quote": "keyword"
-                        }
-                    }
-                }
-            }
+            }))
         }),
     );
     client.send_notification("initialized", json!({}));
@@ -643,15 +629,9 @@ fn test_blockquote_injection_tokens() {
                     }
                 }
             },
-            "initializationOptions": {
-                "captureMappings": {
-                    "_": {
-                        "highlights": {
+            "initializationOptions": semantic_token_initialization_options(json!({
                             "markup.quote": "string"
-                        }
-                    }
-                }
-            }
+            }))
         }),
     );
     client.send_notification("initialized", json!({}));
@@ -850,18 +830,12 @@ fn test_blockquote_shortcut_link_uniform_highlight() {
                     }
                 }
             },
-            "initializationOptions": {
-                "captureMappings": {
-                    "_": {
-                        "highlights": {
+            "initializationOptions": semantic_token_initialization_options(json!({
                             "markup.quote": "string",
                             "markup.link": "",
                             "markup.link.label": "keyword",
                             "markup.heading.1": "class"
-                        }
-                    }
-                }
-            }
+            }))
         }),
     );
     client.send_notification("initialized", json!({}));
@@ -969,10 +943,7 @@ fn init_client_with_full_config(client: &mut LspClient) {
                     }
                 }
             },
-            "initializationOptions": {
-                "captureMappings": {
-                    "_": {
-                        "highlights": {
+            "initializationOptions": semantic_token_initialization_options(json!({
                             "markup.heading": "class",
                             "markup.heading.1": "class",
                             "markup.heading.2": "class",
@@ -994,10 +965,7 @@ fn init_client_with_full_config(client: &mut LspClient) {
                             "markup.strikethrough": "keyword.deprecated",
                             "markup.strong": "keyword",
                             "markup.underline": "keyword"
-                        }
-                    }
-                }
-            }
+            }))
         }),
     );
     client.send_notification("initialized", json!({}));

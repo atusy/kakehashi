@@ -439,11 +439,13 @@ fn test_semantic_tokens_markdown_inline_bold() {
                 }
             },
             "initializationOptions": {
-                "captureMappings": {
-                    "_": {
-                        "highlights": {
+                "features": {
+                    "textDocument/semanticTokens": {
+                        "captureMappings": {
+                            "_": {
                             "markup.strong": "keyword",
                             "markup.heading.1": "class"
+                            }
                         }
                     }
                 }

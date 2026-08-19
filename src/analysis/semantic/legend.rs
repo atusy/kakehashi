@@ -194,7 +194,6 @@ mod tests {
             WILDCARD_KEY.to_string(),
             QueryTypeMappings {
                 highlights: Some(wildcard_highlights),
-                folds: None,
             },
         );
 
@@ -209,7 +208,6 @@ mod tests {
             "rust".to_string(),
             QueryTypeMappings {
                 highlights: Some(rust_highlights),
-                folds: None,
             },
         );
 
@@ -248,7 +246,6 @@ mod tests {
             "rust".to_string(),
             QueryTypeMappings {
                 highlights: Some(highlights),
-                folds: None,
             },
         );
         assert_eq!(

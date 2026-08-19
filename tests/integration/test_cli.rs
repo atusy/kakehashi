@@ -275,7 +275,7 @@ fn test_config_init_emits_no_auto_install_spelling() {
     );
 }
 
-/// Test that config init includes captureMappings in output
+/// Test that config init emits only the canonical semantic-token mappings.
 #[test]
 fn test_config_init_includes_capture_mappings() {
     let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
@@ -285,11 +285,22 @@ fn test_config_init_includes_capture_mappings() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Should contain captureMappings section
     assert!(
-        stdout.contains("[captureMappings._.highlights]"),
-        "Should contain captureMappings section. Got: {}",
+        stdout.contains("[features.\"textDocument/semanticTokens\".captureMappings._]"),
+        "Should contain canonical captureMappings section. Got: {}",
         stdout
+    );
+    assert!(
+        !stdout.contains("[captureMappings."),
+        "Must not emit the deprecated top-level captureMappings section. Got: {}",
+        stdout
+    );
+    let parsed: toml::Value = toml::from_str(&stdout).expect("config init should emit valid TOML");
+    assert!(
+        parsed
+            .as_table()
+            .is_some_and(|settings| !settings.contains_key("captureMappings")),
+        "Must not emit deprecated top-level captureMappings in any TOML form. Got: {stdout}"
     );
 
     // Should contain variable mapping
@@ -602,6 +613,30 @@ fn test_config_schema_outputs_valid_json_to_stdout() {
         props.get("autoInstall").is_some(),
         "Should have autoInstall property. Got: {}",
         stdout
+    );
+    assert_eq!(
+        schema.pointer("/properties/captureMappings/deprecated"),
+        Some(&serde_json::json!(true)),
+        "legacy captureMappings should be marked deprecated"
+    );
+    assert!(
+        schema
+            .pointer("/$defs/FeatureSettings/properties/textDocument~1semanticTokens")
+            .is_some(),
+        "features should advertise textDocument/semanticTokens"
+    );
+    assert_eq!(
+        schema.pointer(
+            "/$defs/SemanticTokensFeatureSettings/properties/captureMappings/additionalProperties/additionalProperties/type"
+        ),
+        Some(&serde_json::json!("string")),
+        "canonical language entries should map captures directly to token roles"
+    );
+    assert!(
+        schema
+            .pointer("/$defs/QueryTypeMappings/properties/folds")
+            .is_none(),
+        "the never-consumed legacy folds field should not be advertised"
     );
 }
 

@@ -1,7 +1,7 @@
 //! didChangeConfiguration notification handler for Kakehashi.
 
 use crate::config::unknown_keys::{
-    KNOWN_FEATURE_SETTING_KEYS, is_workspace_setting_key_or_typo, sort_and_dedup_unknown_keys,
+    is_feature_setting_key_or_typo, is_workspace_setting_key_or_typo, sort_and_dedup_unknown_keys,
     unknown_workspace_setting_keys,
 };
 use serde_json::Value;
@@ -62,8 +62,7 @@ fn kakehashi_targeted_payload(object: serde_json::Map<String, Value>) -> serde_j
             if key == "features"
                 && let Some(features) = value.as_object_mut()
             {
-                features
-                    .retain(|feature, _| KNOWN_FEATURE_SETTING_KEYS.contains(&feature.as_str()));
+                features.retain(|feature, _| is_feature_setting_key_or_typo(feature));
             }
             Some((key, value))
         })
@@ -93,9 +92,9 @@ fn format_rejected_keys(keys: &[String]) -> String {
 fn is_kakehashi_workspace_entry(key: &str, value: &Value) -> bool {
     if key == "features" {
         return value.as_object().is_some_and(|features| {
-            KNOWN_FEATURE_SETTING_KEYS
-                .iter()
-                .any(|key| features.contains_key(*key))
+            features
+                .keys()
+                .any(|feature| is_feature_setting_key_or_typo(feature))
         });
     }
     is_workspace_setting_key_or_typo(key)
@@ -337,6 +336,15 @@ impl Kakehashi {
                 .show_warning(crate::config::deprecation::AUTO_INSTALL_DEPRECATION_NOTICE)
                 .await;
         }
+        if pushed_deprecated_keys.capture_mappings
+            && self
+                .settings_manager
+                .claim_capture_mappings_deprecation_warning()
+        {
+            self.notifier()
+                .show_warning(crate::config::deprecation::CAPTURE_MAPPINGS_DEPRECATION_NOTICE)
+                .await;
+        }
 
         if uses_deprecated_unwrapped_shape
             && self
@@ -395,6 +403,9 @@ impl Kakehashi {
                 return;
             }
         };
+        // Retain the authored relative paths for a future workspace-root
+        // reload; the copy applied below is anchored to the root current now.
+        let replay_layer = parsed.clone();
 
         // Snapshot read, derivation, and publication must share the same reload
         // transaction as post-install search-path updates, or either path can
@@ -455,11 +466,10 @@ impl Kakehashi {
                 // Remembered under the same reload transaction that publishes
                 // the merged settings, so a concurrent workspace-root change
                 // cannot rebuild the layers from a half-updated override.
-                let client_override = self.client_settings_override.load_full();
-                let merged_override =
-                    merge_workspace_settings(client_override.as_deref().cloned(), Some(parsed));
-                self.client_settings_override
-                    .store(merged_override.map(std::sync::Arc::new));
+                self.client_settings_overrides
+                    .write()
+                    .expect("client settings overrides lock poisoned")
+                    .push(replay_layer);
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 self.apply_raw_settings_locked(&reload, merged_ts, settings)
                     .await;
@@ -598,6 +608,55 @@ mod tests {
 
         assert_eq!(payload, serde_json::json!({ "features": features }));
         assert!(unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn settings_payload_rejects_unknown_semantic_tokens_feature_key() {
+        let (payload, unknown_keys) = settings_payload(serde_json::json!({
+            "features": {
+                "textDocument/semanticTokens": {
+                    "captureMapping": {}
+                }
+            }
+        }));
+
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "features": {
+                    "textDocument/semanticTokens": {
+                        "captureMapping": {}
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            unknown_keys,
+            ["features.textDocument/semanticTokens.captureMapping"]
+        );
+    }
+
+    #[test]
+    fn settings_payload_rejects_semantic_tokens_feature_method_typo() {
+        let (payload, unknown_keys) = settings_payload(serde_json::json!({
+            "features": {
+                "textDocument/semanticToken": {
+                    "captureMappings": {}
+                }
+            }
+        }));
+
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "features": {
+                    "textDocument/semanticToken": {
+                        "captureMappings": {}
+                    }
+                }
+            })
+        );
+        assert_eq!(unknown_keys, ["features.textDocument/semanticToken"]);
     }
 
     #[test]

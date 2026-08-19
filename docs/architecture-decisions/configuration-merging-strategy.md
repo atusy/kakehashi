@@ -13,7 +13,7 @@ The limitations of the current system are:
 
 - Missing **User-wide defaults**
 - **Project-specific settings** are only based on `./kakehashi.toml`
-- Complex `captureMappings` overrides must be duplicated in each project's `kakehashi.toml`
+- Complex semantic-token `captureMappings` overrides must be duplicated in each project's `kakehashi.toml`
 
 The standard pattern in many language servers and CLI tools is layered configuration with clear precedence rules. This decision proposes adding a **user configuration layer** between programmed defaults and project config.
 
@@ -66,7 +66,7 @@ queries = [
 2. **User configuration file**
    - Location: `$XDG_CONFIG_HOME/kakehashi/kakehashi.toml`
    - Falls back to `~/.config/kakehashi/kakehashi.toml` on most Unix systems
-   - Purpose: User-wide defaults (e.g., default `searchPaths`, global `captureMappings` overrides)
+   - Purpose: User-wide defaults (e.g., default `searchPaths`, global semantic-token `captureMappings` overrides)
 
 3. **Project configuration file**
    - Location: `./kakehashi.toml` in workspace root (loaded via `load_toml_settings()`)
@@ -122,9 +122,12 @@ Bases per layer: a config file uses its own directory (each `--config-file`
 layer its own), `initializationOptions` and `didChangeConfiguration` use the
 workspace root, and the programmed defaults have no base. That root is not
 fixed at initialize: `workspace/didChangeWorkspaceFolders` re-selects it from
-the current folder list. A layer anchored earlier keeps the root it was
-anchored to, because anchoring yields absolute paths and is idempotent — see
-#948.
+the current folder list. Config-file layers keep their own anchoring, but
+accepted client layers are retained in authored form and replayed against the
+newly selected root, including in an explicit `--config-file` session. A client
+layer discarded by initialization fallback is not retained. Reusing an already
+anchored client layer would keep the old root because anchoring yields absolute
+paths and is idempotent — see #948.
 
 Resolution is therefore two distinct steps, in this order:
 
@@ -251,22 +254,22 @@ silently shadow every user-supplied top-level opt-out.
   initializationOptions = { linkedProjects = ["./Cargo.toml"] }  # added by project
   ```
 
-**Capture mappings** (`captureMappings`):
-- **Deep merge**: Individual capture mappings are merged per-language, per-query-type
+**Capture mappings** (`features."textDocument/semanticTokens".captureMappings`):
+- **Deep merge**: Individual capture mappings are merged per-language and capture name
 - Later sources override specific keys while preserving unmentioned keys from earlier sources
 - Example:
   ```toml
   # user config
-  [captureMappings._.highlights]
+  [features."textDocument/semanticTokens".captureMappings._]
   "variable.builtin" = "fallback.variable"
   "function.builtin" = "fallback.function"
 
   # project config
-  [captureMappings._.highlights]
+  [features."textDocument/semanticTokens".captureMappings._]
   "variable.builtin" = "project.variable"
 
   # final (deep merge)
-  [captureMappings._.highlights]
+  [features."textDocument/semanticTokens".captureMappings._]
   "variable.builtin" = "project.variable"  # overridden
   "function.builtin" = "fallback.function" # inherited
   ```
@@ -316,18 +319,25 @@ path the user typed carries intent; a path kakehashi went looking for does not.
    - Cross-field invariants (e.g. `debounceMs` ≤ `maxWaitMs`): on the merged
      explicit configuration only, because their operands merge independently —
      one file may legitimately supply just one half
-   - Unrecognised key names: reported as a warning on an explicit file, not
-     fatal. Serde drops an unknown field silently, so a typo otherwise reads as
-     "not specified"; but a key this version does not know may be one the next
-     one does, and rejecting the file would version-lock it.
-     `workspace/didChangeConfiguration` rejects the whole update instead —
-     a live edit is not a file shared across versions.
-   - Two known inconsistencies, both pre-existing and both worth closing
-     separately: `FeatureSettings` and its children carry
-     `deny_unknown_fields`, so an unknown key *inside* `features` fails typed
-     deserialization and is fatal before the warning walker ever sees it; and
-     CLI mode has no channel for non-fatal settings events at all, so
-     `format`/`diagnose` users never see these warnings.
+   - Unrecognised key names: reported as a warning on TOML configuration files,
+     including the implicit user and workspace files and explicit
+     `--config-file` layers, but not fatal. Serde drops an unknown field
+     silently, so a typo otherwise reads as "not specified"; but a key this
+     version does not know may be one the next one does, and rejecting the file
+     would version-lock it.
+     A pushed `workspace/didChangeConfiguration` update rejects the whole layer
+     instead — a live edit is not a file shared across versions. When an empty
+     notification makes kakehashi pull `workspace/configuration`, unknown keys
+     are logged at info and ignored while recognized siblings apply: the editor
+     may return unrelated settings such as `trace.server` in that shared
+     section. Nested `features` keys use this same walker and source-specific
+     policy; a typo there does not make a TOML file fatal or discard recognized
+     sibling settings.
+     Client-supplied `initializationOptions` remain tolerant and silent, as
+     before; they do not pass through the TOML warning channel.
+   - One pre-existing inconsistency remains: CLI mode has no channel for
+     non-fatal settings events at all, so `format`/`diagnose` users never see
+     these warnings.
    - `initializationOptions`: never fatal, and judged last. A client-supplied
      override that fails to expand does not abort — but "non-fatal" only means
      the session starts: the *whole* merged configuration is discarded in
@@ -419,7 +429,7 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 - [x] Implement `merge_workspace_settings()` function for layered config merging
 - [x] Deep merge for `languages` HashMap
 - [x] Deep merge for `languageServers` HashMap
-- [x] Deep merge for `captureMappings`
+- [x] Deep merge for semantic-token `captureMappings`
 
 ### Phase 3: User Configuration File (Completed - Sprint 120, PBI-149)
 - [x] XDG Base Directory compliance for config path
@@ -444,7 +454,7 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 - Pro: Simple to implement and understand
 - Con: Users must repeat all fields when overriding a single field (e.g., must specify `parser` again just to change `queries`)
 - Con: Less intuitive — users expect inheritance
-- Decision: **Change to deep merge** for `languages` to match `captureMappings` behavior; arrays within language config (e.g., `queries`) are replaced, not merged
+- Decision: **Change to deep merge** for `languages` to match semantic-token `captureMappings` behavior; arrays within language config (e.g., `queries`) are replaced, not merged
 
 ### 2. Prepend arrays instead of replace
 - Pro: Allow extending `searchPaths` from earlier layers

@@ -655,21 +655,12 @@ pub(crate) fn on_type_formatting_trigger_union(
     Some((first, iter.collect()))
 }
 
-/// Custom mappings from Tree-sitter capture names to semantic token types, per query kind.
-///
-/// Both fields are optional so that omitting one and writing an empty one say
-/// different things: omit to inherit the layer below, write `{}` to clear it.
-/// A layer that configures only `highlights` must not silently drop the folds
-/// a lower layer supplied, which a non-optional field could not express.
+/// Deprecated wrapper around semantic-token highlight mappings.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq, JsonSchema)]
 pub struct QueryTypeMappings {
     /// Capture mappings for highlights queries. Omit to inherit; `{}` clears.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlights: Option<CaptureMapping>,
-    /// Capture mappings for folds queries. Omit to inherit; `{}` clears.
-    /// Reserved for future folding range support — populated and merged but not yet consumed by analysis.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub folds: Option<CaptureMapping>,
 }
 
 /// The empty map an unset [`QueryTypeMappings`] field reads as.
@@ -684,6 +675,13 @@ impl QueryTypeMappings {
 }
 
 pub type CaptureMappings = HashMap<String, QueryTypeMappings>;
+
+/// Per-language Tree-sitter capture names mapped to LSP semantic-token roles.
+///
+/// Unlike the deprecated top-level [`CaptureMappings`] shape, the semantic
+/// token feature already supplies the consumer context, so there is no nested
+/// query-kind key such as `highlights`.
+pub type SemanticTokenCaptureMappings = HashMap<String, CaptureMapping>;
 
 /// Query type for tree-sitter query files.
 ///
@@ -781,9 +779,12 @@ pub struct RawWorkspaceSettings {
     /// Per-language configuration (parser paths, queries, bridge filters, base inheritance).
     #[serde(default)]
     pub languages: HashMap<String, LanguageSettings>,
-    /// Custom mappings from Tree-sitter capture names to semantic token types.
-    /// Omit to inherit the layer below; `{}` clears every language's entry.
+    /// Deprecated: use
+    /// `features["textDocument/semanticTokens"].captureMappings` instead. This
+    /// legacy shape remains accepted during migration; only its `highlights`
+    /// entries are consumed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("deprecated" = true))]
     pub capture_mappings: Option<CaptureMappings>,
     /// Deprecated: use `languages._.autoInstall` (and per-language
     /// `languages.<lang>.autoInstall`) instead. Whether to automatically
@@ -810,7 +811,7 @@ pub const DEFAULT_PUBLISH_DIAGNOSTICS_MAX_WAIT_MS: u64 = 1000;
 pub const MAX_FEATURE_TIMING_MS: u64 = 86_400_000;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct DebounceFeatureSettings {
     #[schemars(range(max = 86_400_000))]
     pub debounce_ms: Option<u64>,
@@ -871,14 +872,24 @@ impl LogMessageLevel {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct LogMessageFeatureSettings {
     pub log_level: Option<LogMessageLevel>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticTokensFeatureSettings {
+    /// Per-language capture-to-token mappings. Omit to inherit; `{}` clears
+    /// every language mapping in the layer below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_mappings: Option<SemanticTokenCaptureMappings>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct FeatureSettings {
+    #[serde(rename = "textDocument/semanticTokens")]
+    pub text_document_semantic_tokens: Option<SemanticTokensFeatureSettings>,
     #[serde(rename = "textDocument/publishDiagnostics")]
     pub text_document_publish_diagnostics: Option<DebounceFeatureSettings>,
     #[serde(rename = "window/logMessage")]
@@ -894,7 +905,11 @@ impl Serialize for FeatureSettings {
     {
         use serde::ser::SerializeMap;
 
-        let mut map = serializer.serialize_map(Some(3))?;
+        let mut map = serializer.serialize_map(Some(4))?;
+        map.serialize_entry(
+            "textDocument/semanticTokens",
+            &self.text_document_semantic_tokens,
+        )?;
         map.serialize_entry(
             "textDocument/publishDiagnostics",
             &self.text_document_publish_diagnostics,
@@ -1165,18 +1180,24 @@ mod tests {
     }
 
     #[test]
-    fn log_message_level_rejects_unknown_values_and_fields() {
+    fn log_message_level_rejects_unknown_values_but_tolerates_unknown_fields() {
         assert!(
             toml::from_str::<RawWorkspaceSettings>(
                 "[features.\"window/logMessage\"]\nlogLevel = \"debug\""
             )
             .is_err()
         );
-        assert!(
-            toml::from_str::<RawWorkspaceSettings>(
-                "[features.\"window/logMessage\"]\nlevel = \"info\""
-            )
-            .is_err()
+        let raw = toml::from_str::<RawWorkspaceSettings>(
+            "[features.\"window/logMessage\"]\nlevel = \"info\"\nlogLevel = \"warning\"",
+        );
+        assert_eq!(
+            raw.unwrap()
+                .features
+                .unwrap()
+                .window_log_message
+                .unwrap()
+                .log_level,
+            Some(LogMessageLevel::Warning)
         );
     }
 
@@ -1237,9 +1258,19 @@ mod tests {
             props.get("diagnosticsDebounceMs").is_some(),
             "missing diagnosticsDebounceMs"
         );
+        let legacy_capture_mappings = props
+            .get("captureMappings")
+            .expect("missing captureMappings");
+        assert_eq!(
+            legacy_capture_mappings.get("deprecated"),
+            Some(&serde_json::Value::Bool(true))
+        );
         assert!(
-            props.get("captureMappings").is_some(),
-            "missing captureMappings"
+            legacy_capture_mappings["description"]
+                .as_str()
+                .is_some_and(|description| description
+                    .contains("features[\"textDocument/semanticTokens\"].captureMappings")),
+            "deprecated schema property should name its replacement"
         );
         assert!(
             props.get("languageServers").is_some(),
@@ -1544,6 +1575,27 @@ mod tests {
         snap_settings.bind(|| {
             insta::assert_json_snapshot!(settings.capture_mappings);
         });
+    }
+
+    #[test]
+    fn legacy_folds_does_not_discard_sibling_highlights() {
+        let settings = toml::from_str::<RawWorkspaceSettings>(
+            r#"
+            [captureMappings._.folds]
+            comment = "comment"
+
+            [captureMappings._.highlights]
+            variable = "variable"
+            "#,
+        )
+        .expect("unknown legacy query kinds should follow the normal tolerant parser policy");
+        assert_eq!(
+            settings.capture_mappings.expect("legacy mappings")["_"]
+                .highlights
+                .as_ref()
+                .expect("highlights")["variable"],
+            "variable"
+        );
     }
 
     #[test]
