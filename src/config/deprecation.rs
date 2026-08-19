@@ -102,27 +102,37 @@ crate::deprecation::declare_deprecation!(
     deprecated_in = 0,
     remove_in = 2,
 );
-pub(crate) fn aliases_deprecation_notice(language: &str, example_alias: Option<&str>) -> String {
-    let Some(example_alias) = example_alias else {
+pub(crate) fn aliases_deprecation_notice(language: &str, aliases: &[String]) -> String {
+    let aliases = aliases
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if aliases.is_empty() {
         return format!(
             "Language '{language}' uses an empty deprecated 'aliases' field. \
              Remove the empty 'aliases' field. The 'aliases' field will be removed in \
              kakehashi v{}.",
             ALIASES_DEPRECATION.remove_in_major()
         );
-    };
+    }
     let language_toml = toml::Value::String(language.to_owned()).to_string();
-    let alias_toml = toml::Value::String(example_alias.to_owned()).to_string();
+    let toml_examples = aliases
+        .iter()
+        .map(|alias| {
+            let alias = toml::Value::String((*alias).to_owned()).to_string();
+            format!("[languages.{alias}]\nbase = {language_toml}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let mut derived_languages = serde_json::Map::new();
-    derived_languages.insert(
-        example_alias.to_owned(),
-        serde_json::json!({ "base": language }),
-    );
+    for alias in aliases {
+        derived_languages.insert(alias.to_owned(), serde_json::json!({ "base": language }));
+    }
     let json = serde_json::json!({ "languages": derived_languages });
     format!(
         "Language '{language}' uses deprecated 'aliases' field. \
          Use 'base' on each derived language instead.\n\
-         TOML:\n[languages.{alias_toml}]\nbase = {language_toml}\n\
+         TOML:\n{toml_examples}\n\
          JSON:\n{json}\n\
          The 'aliases' field will be removed in kakehashi v{}.",
         ALIASES_DEPRECATION.remove_in_major()
@@ -336,7 +346,7 @@ rootMarkers = [".git"]
 
     #[test]
     fn aliases_notice_gives_valid_toml_and_json_migrations_with_declared_deadline() {
-        let notice = aliases_deprecation_notice("markdown", Some("rmd"));
+        let notice = aliases_deprecation_notice("markdown", &["rmd".to_owned()]);
         let expected = format!(
             "Language 'markdown' uses deprecated 'aliases' field. Use 'base' on each derived \
              language instead.\nTOML:\n[languages.\"rmd\"]\nbase = \"markdown\"\nJSON:\n\
@@ -349,7 +359,7 @@ rootMarkers = [".git"]
 
     #[test]
     fn aliases_notice_escapes_language_ids_in_both_migration_formats() {
-        let notice = aliases_deprecation_notice("mark\"down", Some("r.md\"x"));
+        let notice = aliases_deprecation_notice("mark\"down", &["r.md\"x".to_owned()]);
         let toml_example = notice
             .split_once("TOML:\n")
             .and_then(|(_, examples)| examples.split_once("\nJSON:\n"))
@@ -376,7 +386,7 @@ rootMarkers = [".git"]
 
     #[test]
     fn empty_aliases_notice_only_requests_removing_the_field() {
-        let notice = aliases_deprecation_notice("markdown", None);
+        let notice = aliases_deprecation_notice("markdown", &[]);
         assert!(
             notice.contains("Remove the empty 'aliases' field"),
             "{notice}"
@@ -384,6 +394,30 @@ rootMarkers = [".git"]
         assert!(!notice.contains("<derived>"), "{notice}");
         assert!(!notice.contains("TOML:"), "{notice}");
         assert!(!notice.contains("JSON:"), "{notice}");
+    }
+
+    #[test]
+    fn aliases_notice_migrates_every_distinct_alias() {
+        let aliases = vec!["rmd".to_owned(), "qmd".to_owned(), "rmd".to_owned()];
+        let notice = aliases_deprecation_notice("markdown", &aliases);
+        assert_eq!(notice.matches("[languages.\"rmd\"]").count(), 1);
+        assert_eq!(notice.matches("[languages.\"qmd\"]").count(), 1);
+
+        let json_example = notice
+            .split_once("\nJSON:\n")
+            .and_then(|(_, rest)| rest.split_once("\nThe 'aliases' field"))
+            .map(|(json, _)| json)
+            .expect("JSON migration example");
+        let parsed_json: serde_json::Value =
+            serde_json::from_str(json_example).expect("valid JSON example");
+        assert_eq!(
+            parsed_json["languages"]["rmd"]["base"].as_str(),
+            Some("markdown")
+        );
+        assert_eq!(
+            parsed_json["languages"]["qmd"]["base"].as_str(),
+            Some("markdown")
+        );
     }
 
     #[test]
