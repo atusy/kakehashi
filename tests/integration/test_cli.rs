@@ -295,6 +295,13 @@ fn test_config_init_includes_capture_mappings() {
         "Must not emit the deprecated top-level captureMappings section. Got: {}",
         stdout
     );
+    let parsed: toml::Value = toml::from_str(&stdout).expect("config init should emit valid TOML");
+    assert!(
+        parsed
+            .as_table()
+            .is_some_and(|settings| !settings.contains_key("captureMappings")),
+        "Must not emit deprecated top-level captureMappings in any TOML form. Got: {stdout}"
+    );
 
     // Should contain variable mapping
     assert!(
