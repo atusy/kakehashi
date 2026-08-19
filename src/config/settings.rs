@@ -788,9 +788,12 @@ pub struct RawWorkspaceSettings {
     /// Per-language configuration (parser paths, queries, bridge filters, base inheritance).
     #[serde(default)]
     pub languages: HashMap<String, LanguageSettings>,
-    /// Custom mappings from Tree-sitter capture names to semantic token types.
-    /// Omit to inherit the layer below; `{}` clears every language's entry.
+    /// Deprecated: use
+    /// `features["textDocument/semanticTokens"].captureMappings` instead. This
+    /// legacy shape remains accepted during migration; only its `highlights`
+    /// entries are consumed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("deprecated" = true))]
     pub capture_mappings: Option<CaptureMappings>,
     /// Deprecated: use `languages._.autoInstall` (and per-language
     /// `languages.<lang>.autoInstall`) instead. Whether to automatically
@@ -1259,9 +1262,19 @@ mod tests {
             props.get("diagnosticsDebounceMs").is_some(),
             "missing diagnosticsDebounceMs"
         );
+        let legacy_capture_mappings = props
+            .get("captureMappings")
+            .expect("missing captureMappings");
+        assert_eq!(
+            legacy_capture_mappings.get("deprecated"),
+            Some(&serde_json::Value::Bool(true))
+        );
         assert!(
-            props.get("captureMappings").is_some(),
-            "missing captureMappings"
+            legacy_capture_mappings["description"]
+                .as_str()
+                .is_some_and(|description| description
+                    .contains("features[\"textDocument/semanticTokens\"].captureMappings")),
+            "deprecated schema property should name its replacement"
         );
         assert!(
             props.get("languageServers").is_some(),
