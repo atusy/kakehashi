@@ -26,7 +26,12 @@ no intermediate `highlights` key.
 
 The former top-level `captureMappings.<language>.highlights` spelling remains
 accepted during migration and produces a deprecation warning at most once per
-session. The never-consumed `folds` field is removed without a replacement.
+session. The never-consumed `folds` field is removed from the schema without a
+replacement and has no effect. It follows the same source-specific unknown-key
+policy as any other unrecognized field: tolerant sources ignore it, while a
+pushed runtime update carrying it is rejected. Its presence does not turn an
+otherwise valid legacy layer into a parse error or discard sibling
+`highlights` entries.
 
 Configuration layering continues to follow configuration-merging-strategy:
 later layers override duplicate capture names while inheriting names they omit.
@@ -68,6 +73,8 @@ compatibility while making the new ownership visible.
 - The schema communicates that mappings affect semantic tokens only.
 - The unused query-kind level disappears from canonical configuration.
 - Raw capture protocols remain clearly independent of token presentation.
+- Removing `folds` does not introduce a stricter parser policy for the legacy
+  wrapper than sibling configuration uses.
 
 ### Negative
 

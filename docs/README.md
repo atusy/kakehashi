@@ -465,7 +465,11 @@ The former top-level `captureMappings.<language>.highlights` shape remains
 accepted for migration, but is deprecated. If both spellings occur in one
 layer, the feature-scoped value wins for duplicate capture names; otherwise
 their entries are combined. The old `folds` table was unused and has no
-replacement; it is no longer accepted.
+replacement. It is absent from the schema and has no effect. Like another
+unrecognized key, it is ignored where the configuration source tolerates
+unknown keys and causes a pushed runtime update to be rejected by that
+ingress's existing unknown-key policy; valid siblings such as `highlights` are
+not discarded merely because `folds` is present.
 
 ### Bridge Configuration
 
