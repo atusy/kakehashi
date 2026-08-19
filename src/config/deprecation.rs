@@ -31,6 +31,11 @@ crate::deprecation::enforce_deprecation_deadline!(
     deprecated_in = 0,
     remove_in = 2,
 );
+crate::deprecation::enforce_deprecation_deadline!(
+    name = "languages.*.aliases",
+    deprecated_in = 0,
+    remove_in = 2,
+);
 
 /// Which deprecated config keys any loaded layer actually spelled.
 ///
