@@ -97,6 +97,13 @@ pub(crate) fn is_workspace_setting_key_or_typo(key: &str) -> bool {
             .any(|known_key| is_one_edit_apart(key, known_key))
 }
 
+pub(crate) fn is_feature_setting_key_or_typo(key: &str) -> bool {
+    KNOWN_FEATURE_SETTING_KEYS.contains(&key)
+        || KNOWN_FEATURE_SETTING_KEYS
+            .iter()
+            .any(|known_key| is_one_edit_apart(key, known_key))
+}
+
 fn is_one_edit_apart(candidate: &str, known: &str) -> bool {
     let candidate = candidate.as_bytes();
     let known = known.as_bytes();
@@ -405,6 +412,15 @@ mod tests {
         assert!(!is_workspace_setting_key_or_typo("editor"));
         assert!(!is_workspace_setting_key_or_typo("files"));
         assert!(!is_workspace_setting_key_or_typo("workbench"));
+    }
+
+    #[test]
+    fn feature_sibling_filter_matches_feature_keys_and_typos_only() {
+        assert!(is_feature_setting_key_or_typo(
+            "textDocument/semanticTokens"
+        ));
+        assert!(is_feature_setting_key_or_typo("textDocument/semanticToken"));
+        assert!(!is_feature_setting_key_or_typo("someOtherClientFeature"));
     }
 
     #[test]

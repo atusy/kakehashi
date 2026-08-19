@@ -754,12 +754,6 @@ fn load_toml_file(
     // Warn rather than reject: a key kakehashi does not recognise may be a
     // typo, but it may equally be one this version has not learned yet, and
     // refusing to start over it would make the file version-locked.
-    //
-    // Not reached for a key inside `features`: those structs carry
-    // `deny_unknown_fields`, so the parse above already failed and this file is
-    // fatal. Inconsistent with the rule stated here, pre-existing, and pinned
-    // by `test_load_toml_file_unknown_feature_key_is_fatal_today` so a future
-    // change to it is a deliberate one.
     for key in unknown_config_keys(&contents) {
         events.push(SettingsEvent::warning(format!(
             "Unknown configuration key in {}: {key}",

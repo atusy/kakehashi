@@ -1,7 +1,7 @@
 //! didChangeConfiguration notification handler for Kakehashi.
 
 use crate::config::unknown_keys::{
-    KNOWN_FEATURE_SETTING_KEYS, is_workspace_setting_key_or_typo, sort_and_dedup_unknown_keys,
+    is_feature_setting_key_or_typo, is_workspace_setting_key_or_typo, sort_and_dedup_unknown_keys,
     unknown_workspace_setting_keys,
 };
 use serde_json::Value;
@@ -62,8 +62,7 @@ fn kakehashi_targeted_payload(object: serde_json::Map<String, Value>) -> serde_j
             if key == "features"
                 && let Some(features) = value.as_object_mut()
             {
-                features
-                    .retain(|feature, _| KNOWN_FEATURE_SETTING_KEYS.contains(&feature.as_str()));
+                features.retain(|feature, _| is_feature_setting_key_or_typo(feature));
             }
             Some((key, value))
         })
@@ -93,9 +92,9 @@ fn format_rejected_keys(keys: &[String]) -> String {
 fn is_kakehashi_workspace_entry(key: &str, value: &Value) -> bool {
     if key == "features" {
         return value.as_object().is_some_and(|features| {
-            KNOWN_FEATURE_SETTING_KEYS
-                .iter()
-                .any(|key| features.contains_key(*key))
+            features
+                .keys()
+                .any(|feature| is_feature_setting_key_or_typo(feature))
         });
     }
     is_workspace_setting_key_or_typo(key)
@@ -635,6 +634,29 @@ mod tests {
             unknown_keys,
             ["features.textDocument/semanticTokens.captureMapping"]
         );
+    }
+
+    #[test]
+    fn settings_payload_rejects_semantic_tokens_feature_method_typo() {
+        let (payload, unknown_keys) = settings_payload(serde_json::json!({
+            "features": {
+                "textDocument/semanticToken": {
+                    "captureMappings": {}
+                }
+            }
+        }));
+
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "features": {
+                    "textDocument/semanticToken": {
+                        "captureMappings": {}
+                    }
+                }
+            })
+        );
+        assert_eq!(unknown_keys, ["features.textDocument/semanticToken"]);
     }
 
     #[test]
