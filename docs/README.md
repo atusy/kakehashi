@@ -184,10 +184,12 @@ default `info` forwards Error, Warning, and Info while suppressing LSP `Log` and
       }
     }
   },
-  "captureMappings": {
-    "_": {
-      "highlights": {
-        "variable.builtin": "variable.defaultLibrary"
+  "features": {
+    "textDocument/semanticTokens": {
+      "captureMappings": {
+        "_": {
+          "variable.builtin": "variable.defaultLibrary"
+        }
       }
     }
   }
@@ -405,18 +407,21 @@ it comes from:
 | list | inherit the layer below | **clear** it | replace wholesale |
 
 So `queries = []`, `bridge = {}`, `languageServers = {}`, `cmd = []`, and
-`captureMappings = {}` all mean "none", while leaving the key out means "I have
-nothing to say about this — keep what the layer below decided". Removing a key
-never removes a value: to override one, write the value you want (see the
-`workspace/didChangeConfiguration` notes above).
+`features.textDocument/semanticTokens.captureMappings = {}` all mean "none",
+while leaving the key out means "I have nothing to say about this — keep what
+the layer below decided". Removing a key never removes a value: to override
+one, write the value you want (see the `workspace/didChangeConfiguration`
+notes above).
 
-An *entry* is not a container: `[captureMappings.rust]` or `[languageServers.foo]`
-with no keys under it sets no field, so it inherits rather than clears. Clear a
-field, not the table — `[captureMappings.rust] highlights = {}`.
+An *entry* is not a container:
+`[features."textDocument/semanticTokens".captureMappings.rust]` or
+`[languageServers.foo]` with no keys under it sets no field, so it inherits
+rather than clears. Clear a field, not the table —
+`features."textDocument/semanticTokens".captureMappings.rust = {}`.
 
 Two settings stand outside this: the top-level `languages` map still ignores
-`{}` (it has no clear spelling yet), and `captureMappings` is additive per
-capture name rather than per language — see below.
+`{}` (it has no clear spelling yet), and semantic-token `captureMappings` is
+additive per capture name rather than per language — see below.
 
 For `rmd`, kakehashi will try `rmd`-specific parser/query settings first and fall back through `markdown` and then `_`. Fields set on the derived language override inherited fields. Omitted fields inherit from the base chain; `queries: []` and `bridge: {}` explicitly clear inherited query and bridge settings.
 
@@ -433,27 +438,33 @@ Set `base` to the same language name to make a self-contained language that does
 }
 ```
 
-#### `captureMappings`
+#### `features.textDocument/semanticTokens.captureMappings`
 
 Remap Tree-sitter capture names to LSP semantic token types. Use `_` as a wildcard for all languages.
 
 ```json
 {
-  "captureMappings": {
-    "_": {
-      "highlights": {
-        "variable.builtin": "variable.defaultLibrary",
-        "function.builtin": "function.defaultLibrary"
-      }
-    },
-    "python": {
-      "highlights": {
-        "type.builtin": "type.defaultLibrary"
+  "features": {
+    "textDocument/semanticTokens": {
+      "captureMappings": {
+        "_": {
+          "variable.builtin": "variable.defaultLibrary",
+          "function.builtin": "function.defaultLibrary"
+        },
+        "python": {
+          "type.builtin": "type.defaultLibrary"
+        }
       }
     }
   }
 }
 ```
+
+The former top-level `captureMappings.<language>.highlights` shape remains
+accepted for migration, but is deprecated. If both spellings occur in one
+layer, the feature-scoped value wins for duplicate capture names; otherwise
+their entries are combined. The old `folds` table was unused and has no
+replacement.
 
 ### Bridge Configuration
 
@@ -761,7 +772,7 @@ The `bridge` map in language configuration controls which injection languages ar
 kakehashi loads configuration from `~/.config/kakehashi/kakehashi.toml` (user config) and `./kakehashi.toml` (project config). Both use the same TOML format:
 
 ```toml
-[captureMappings._.highlights]
+[features."textDocument/semanticTokens".captureMappings._]
 "variable.builtin" = "variable.defaultLibrary"
 
 [languages.custom_lang]

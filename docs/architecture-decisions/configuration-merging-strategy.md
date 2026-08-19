@@ -13,7 +13,7 @@ The limitations of the current system are:
 
 - Missing **User-wide defaults**
 - **Project-specific settings** are only based on `./kakehashi.toml`
-- Complex `captureMappings` overrides must be duplicated in each project's `kakehashi.toml`
+- Complex semantic-token `captureMappings` overrides must be duplicated in each project's `kakehashi.toml`
 
 The standard pattern in many language servers and CLI tools is layered configuration with clear precedence rules. This decision proposes adding a **user configuration layer** between programmed defaults and project config.
 
@@ -66,7 +66,7 @@ queries = [
 2. **User configuration file**
    - Location: `$XDG_CONFIG_HOME/kakehashi/kakehashi.toml`
    - Falls back to `~/.config/kakehashi/kakehashi.toml` on most Unix systems
-   - Purpose: User-wide defaults (e.g., default `searchPaths`, global `captureMappings` overrides)
+   - Purpose: User-wide defaults (e.g., default `searchPaths`, global semantic-token `captureMappings` overrides)
 
 3. **Project configuration file**
    - Location: `./kakehashi.toml` in workspace root (loaded via `load_toml_settings()`)
@@ -251,22 +251,22 @@ silently shadow every user-supplied top-level opt-out.
   initializationOptions = { linkedProjects = ["./Cargo.toml"] }  # added by project
   ```
 
-**Capture mappings** (`captureMappings`):
-- **Deep merge**: Individual capture mappings are merged per-language, per-query-type
+**Capture mappings** (`features."textDocument/semanticTokens".captureMappings`):
+- **Deep merge**: Individual capture mappings are merged per-language and capture name
 - Later sources override specific keys while preserving unmentioned keys from earlier sources
 - Example:
   ```toml
   # user config
-  [captureMappings._.highlights]
+  [features."textDocument/semanticTokens".captureMappings._]
   "variable.builtin" = "fallback.variable"
   "function.builtin" = "fallback.function"
 
   # project config
-  [captureMappings._.highlights]
+  [features."textDocument/semanticTokens".captureMappings._]
   "variable.builtin" = "project.variable"
 
   # final (deep merge)
-  [captureMappings._.highlights]
+  [features."textDocument/semanticTokens".captureMappings._]
   "variable.builtin" = "project.variable"  # overridden
   "function.builtin" = "fallback.function" # inherited
   ```
@@ -419,7 +419,7 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 - [x] Implement `merge_workspace_settings()` function for layered config merging
 - [x] Deep merge for `languages` HashMap
 - [x] Deep merge for `languageServers` HashMap
-- [x] Deep merge for `captureMappings`
+- [x] Deep merge for semantic-token `captureMappings`
 
 ### Phase 3: User Configuration File (Completed - Sprint 120, PBI-149)
 - [x] XDG Base Directory compliance for config path
@@ -444,7 +444,7 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 - Pro: Simple to implement and understand
 - Con: Users must repeat all fields when overriding a single field (e.g., must specify `parser` again just to change `queries`)
 - Con: Less intuitive — users expect inheritance
-- Decision: **Change to deep merge** for `languages` to match `captureMappings` behavior; arrays within language config (e.g., `queries`) are replaced, not merged
+- Decision: **Change to deep merge** for `languages` to match semantic-token `captureMappings` behavior; arrays within language config (e.g., `queries`) are replaced, not merged
 
 ### 2. Prepend arrays instead of replace
 - Pro: Allow extending `searchPaths` from earlier layers

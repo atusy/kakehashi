@@ -90,8 +90,9 @@ Highlights the whole document from Tree-sitter queries,
 **including embedded code blocks** — you get highlighting inside fenced code blocks
 even without a language server configured for that language. Delta updates and range
 requests are supported. Highlight colors are driven by the token types/modifiers
-kakehashi exposes; capture names can be remapped via `captureMappings`
-(see [the configuration guide](README.md#capturemappings)).
+kakehashi exposes; capture names can be remapped via
+`features.textDocument/semanticTokens.captureMappings`
+(see [the configuration guide](README.md#featurestextdocumentsemantictokenscapturemappings)).
 
 ### Selection range
 

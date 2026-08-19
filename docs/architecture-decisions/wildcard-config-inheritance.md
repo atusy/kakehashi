@@ -4,9 +4,9 @@
 
 configuration-merging-strategy defines how configuration merges across layers (user → project → InitializationOptions). However, there's another dimension of merging: **within a single config**, the `_` (wildcard) key serves as defaults that should be inherited by specific entries.
 
-Currently in `captureMappings`:
-- `captureMappings._` defines default capture-to-token mappings for all languages
-- `captureMappings.rust` can define rust-specific overrides
+Currently in semantic-token `captureMappings`:
+- `features."textDocument/semanticTokens".captureMappings._` defines default capture-to-token mappings for all languages
+- `features."textDocument/semanticTokens".captureMappings.rust` can define rust-specific overrides
 
 The expected behavior is that `rust` inherits all mappings from `_` and only overrides what it explicitly specifies. This is similar to how CSS cascading works with wildcards.
 
@@ -42,14 +42,14 @@ Wildcard inheritance happens **after** cross-layer merging (configuration-mergin
 ```
 
 This means:
-- Layer merging produces a single `captureMappings` with both `_` and language-specific entries
+- Layer merging produces a single semantic-token `captureMappings` with both `_` and language-specific entries
 - At resolution time, `_` is applied as defaults for each language
 
 ### Affected HashMaps
 
 | HashMap | Wildcard Key | Use Case |
 |---------|--------------|----------|
-| `captureMappings` | `_` | Default capture-to-token mappings for all languages |
+| `features."textDocument/semanticTokens".captureMappings` | `_` | Default capture-to-token mappings for all languages |
 | `languages` | `_` | Default language settings (see nested wildcards below) |
 | `languages.{lang}.bridge` | `_` | Default bridge settings for all injection targets |
 | `languageServers` | `_` | Default server settings |
@@ -93,13 +93,13 @@ enabled = false
 ### Example: captureMappings
 
 ```toml
-[captureMappings._.highlights]
+[features."textDocument/semanticTokens".captureMappings._]
 "variable" = "variable"
 "variable.builtin" = "variable.defaultLibrary"
 "function" = "function"
 "function.builtin" = "function.defaultLibrary"
 
-[captureMappings.rust.highlights]
+[features."textDocument/semanticTokens".captureMappings.rust]
 "type.builtin" = "type.defaultLibrary"  # rust-specific addition
 
 # Effective config for rust:
@@ -113,10 +113,10 @@ enabled = false
 ### Example: Overriding a wildcard value
 
 ```toml
-[captureMappings._.highlights]
+[features."textDocument/semanticTokens".captureMappings._]
 "comment" = "comment"
 
-[captureMappings.lua.highlights]
+[features."textDocument/semanticTokens".captureMappings.lua]
 "comment" = ""  # suppress comments for lua specifically
 
 # Effective config for lua:
