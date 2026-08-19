@@ -662,3 +662,54 @@ fn test_folder_change_reanchors_relative_runtime_paths_with_explicit_config() {
         "explicit config sessions should replay runtime paths against the new root",
     );
 }
+
+#[test]
+fn test_folder_change_does_not_replay_discarded_initialization_options() {
+    let primary = project_dir("from-primary");
+    let secondary = project_dir("from-secondary");
+    let config_dir = tempfile::TempDir::new().expect("config temp dir");
+    let config_path = config_dir.path().join("explicit.toml");
+    std::fs::write(&config_path, "searchPaths = []\n").expect("explicit config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("UTF-8 config path"))
+        .env_remove("KAKEHASHI_TEST_UNDEFINED")
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "workspaceFolders": [
+                folder(&primary, "primary"),
+                folder(&secondary, "secondary"),
+            ],
+            "initializationOptions": {
+                "searchPaths": ["$KAKEHASHI_TEST_UNDEFINED/path"]
+            },
+            "capabilities": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [],
+                "removed": [folder(&primary, "primary")],
+            }
+        }),
+    );
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "kakehashi": { "searchPaths": ["relative-parser"] } } }),
+    );
+    poll_search_paths(
+        &mut client,
+        json!([secondary.path().join("relative-parser")]),
+        "discarded initialization options must not pin later pushes to the old root",
+    );
+}

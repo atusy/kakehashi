@@ -443,6 +443,7 @@ impl Kakehashi {
         // for zero-config experience. Use default_settings() instead of RawWorkspaceSettings::default()
         // because the derived Default creates empty capture_mappings while default_settings() includes
         // the full default capture_mappings (markup.strong → "", etc.)
+        let initialization_merge_was_accepted = settings_outcome.settings.is_some();
         let (raw_settings, settings) = if let Some(s) = settings_outcome.settings {
             (
                 settings_outcome
@@ -473,7 +474,9 @@ impl Kakehashi {
         *self
             .client_settings_overrides
             .write()
-            .expect("client settings overrides lock poisoned") = initialization_options
+            .expect("client settings overrides lock poisoned") = initialization_merge_was_accepted
+            .then_some(initialization_options)
+            .flatten()
             .and_then(|value| serde_json::from_value(value).ok())
             .into_iter()
             .collect();
