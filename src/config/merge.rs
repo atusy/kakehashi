@@ -422,10 +422,26 @@ pub(crate) fn merge_workspace_settings(
     base: Option<RawWorkspaceSettings>,
     overlay: Option<RawWorkspaceSettings>,
 ) -> Option<RawWorkspaceSettings> {
-    let base = base.map(normalize_deprecated_capture_mappings);
-    let overlay = overlay.map(normalize_deprecated_capture_mappings);
     match (base, overlay) {
-        (Some(base), Some(overlay)) => {
+        (Some(base), Some(mut overlay)) => {
+            let mut base = normalize_deprecated_capture_mappings(base);
+            let base_capture_mappings = take_semantic_token_capture_mappings(&mut base.features);
+            let legacy_capture_mappings = overlay
+                .capture_mappings
+                .take()
+                .and_then(legacy_capture_mappings_to_semantic);
+            let canonical_capture_mappings =
+                take_semantic_token_capture_mappings(&mut overlay.features);
+            let capture_mappings = merge_semantic_token_capture_mappings(
+                merge_semantic_token_capture_mappings(
+                    base_capture_mappings,
+                    legacy_capture_mappings,
+                ),
+                canonical_capture_mappings,
+            );
+            let mut features = merge_features(base.features, overlay.features);
+            set_semantic_token_capture_mappings(&mut features, capture_mappings);
+
             let merged = RawWorkspaceSettings {
                 search_paths: overlay.search_paths.or(base.search_paths),
                 languages: merge_languages(base.languages, overlay.languages),
@@ -434,7 +450,7 @@ pub(crate) fn merge_workspace_settings(
                 diagnostics_debounce_ms: overlay
                     .diagnostics_debounce_ms
                     .or(base.diagnostics_debounce_ms),
-                features: merge_features(base.features, overlay.features),
+                features,
                 language_servers: merge_language_servers(
                     base.language_servers,
                     overlay.language_servers,
@@ -442,8 +458,33 @@ pub(crate) fn merge_workspace_settings(
             };
             Some(merged)
         }
-        (base, overlay) => base.or(overlay),
+        (base, overlay) => base.or(overlay).map(normalize_deprecated_capture_mappings),
     }
+}
+
+fn take_semantic_token_capture_mappings(
+    features: &mut Option<FeatureSettings>,
+) -> Option<SemanticTokenCaptureMappings> {
+    features
+        .as_mut()?
+        .text_document_semantic_tokens
+        .as_mut()?
+        .capture_mappings
+        .take()
+}
+
+fn set_semantic_token_capture_mappings(
+    features: &mut Option<FeatureSettings>,
+    capture_mappings: Option<SemanticTokenCaptureMappings>,
+) {
+    let Some(capture_mappings) = capture_mappings else {
+        return;
+    };
+    features
+        .get_or_insert_default()
+        .text_document_semantic_tokens
+        .get_or_insert_default()
+        .capture_mappings = Some(capture_mappings);
 }
 
 fn merge_features(
@@ -2250,6 +2291,61 @@ mod tests {
         assert!(
             semantic_token_capture_mappings(&merged).is_empty(),
             "an explicit empty captureMappings should clear every language entry"
+        );
+    }
+
+    #[test]
+    fn legacy_root_clear_precedes_canonical_entries_in_the_same_layer() {
+        use crate::config::defaults::default_settings;
+
+        let overlay: RawWorkspaceSettings = toml::from_str(
+            r#"
+            captureMappings = {}
+
+            [features."textDocument/semanticTokens".captureMappings._]
+            custom = "keyword"
+        "#,
+        )
+        .expect("should parse");
+
+        let merged = merge_workspace_settings(Some(default_settings()), Some(overlay))
+            .expect("two settings merge");
+        let mappings = semantic_token_capture_mappings(&merged);
+
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(
+            mappings[WILDCARD_KEY],
+            HashMap::from([("custom".to_string(), "keyword".to_string())])
+        );
+    }
+
+    #[test]
+    fn legacy_language_clear_precedes_canonical_entries_in_the_same_layer() {
+        let base: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."textDocument/semanticTokens".captureMappings.rust]
+            old_one = "variable"
+            old_two = "function"
+        "#,
+        )
+        .expect("should parse");
+        let overlay: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [captureMappings.rust]
+            highlights = {}
+
+            [features."textDocument/semanticTokens".captureMappings.rust]
+            fresh = "keyword"
+        "#,
+        )
+        .expect("should parse");
+
+        let merged =
+            merge_workspace_settings(Some(base), Some(overlay)).expect("two settings merge");
+
+        assert_eq!(
+            semantic_token_capture_mappings(&merged)["rust"],
+            HashMap::from([("fresh".to_string(), "keyword".to_string())])
         );
     }
 
