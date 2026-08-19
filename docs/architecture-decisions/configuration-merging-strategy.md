@@ -321,13 +321,12 @@ path the user typed carries intent; a path kakehashi went looking for does not.
      "not specified"; but a key this version does not know may be one the next
      one does, and rejecting the file would version-lock it.
      `workspace/didChangeConfiguration` rejects the whole update instead —
-     a live edit is not a file shared across versions.
-   - Two known inconsistencies, both pre-existing and both worth closing
-     separately: `FeatureSettings` and its children carry
-     `deny_unknown_fields`, so an unknown key *inside* `features` fails typed
-     deserialization and is fatal before the warning walker ever sees it; and
-     CLI mode has no channel for non-fatal settings events at all, so
-     `format`/`diagnose` users never see these warnings.
+     a live edit is not a file shared across versions. Nested `features` keys
+     use this same walker and source-specific policy; a typo there does not
+     make an explicit file fatal or discard recognized sibling settings.
+   - One pre-existing inconsistency remains: CLI mode has no channel for
+     non-fatal settings events at all, so `format`/`diagnose` users never see
+     these warnings.
    - `initializationOptions`: never fatal, and judged last. A client-supplied
      override that fails to expand does not abort — but "non-fatal" only means
      the session starts: the *whole* merged configuration is discarded in
