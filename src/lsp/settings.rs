@@ -427,11 +427,12 @@ pub fn load_settings(
             settings
         });
 
-    let empty_container_notice = config_layers
-        .iter()
-        .filter_map(Option::as_ref)
-        .chain(override_settings.as_ref())
-        .find_map(|settings| emptied_container_notice(Some(settings)));
+    let empty_container_notice = empty_container_notice_for_layers(
+        config_layers
+            .iter()
+            .filter_map(Option::as_ref)
+            .chain(override_settings.as_ref()),
+    );
 
     // Merge all layers: defaults < config_layers < override (later layers override earlier)
     let mut layers = vec![defaults];
@@ -475,7 +476,29 @@ pub fn load_settings(
 /// spelling it names is also the one the documentation now recommends for
 /// "this entry has none": worth explaining once, not worth nagging about.
 pub(crate) fn emptied_container_notice(settings: Option<&RawWorkspaceSettings>) -> Option<String> {
-    let settings = settings?;
+    empty_container_notice_for_layers(settings)
+}
+
+fn empty_container_notice_for_layers<'a>(
+    layers: impl IntoIterator<Item = &'a RawWorkspaceSettings>,
+) -> Option<String> {
+    let mut named = layers
+        .into_iter()
+        .flat_map(emptied_container_names)
+        .collect::<Vec<_>>();
+    if named.is_empty() {
+        return None;
+    }
+    named.sort_unstable();
+    named.dedup();
+    Some(format!(
+        "kakehashi: an empty list or map now clears the layer below rather than \
+         deferring to it — omit the key to inherit. Affected: {}",
+        named.join(", ")
+    ))
+}
+
+fn emptied_container_names(settings: &RawWorkspaceSettings) -> Vec<String> {
     let mut named: Vec<String> = Vec::new();
 
     if let Some(servers) = settings.language_servers.as_ref() {
@@ -499,15 +522,7 @@ pub(crate) fn emptied_container_notice(settings: Option<&RawWorkspaceSettings>) 
         None => {}
     }
 
-    if named.is_empty() {
-        return None;
-    }
-    named.sort_unstable();
-    Some(format!(
-        "kakehashi: an empty list or map now clears the layer below rather than \
-         deferring to it — omit the key to inherit. Affected: {}",
-        named.join(", ")
-    ))
+    named
 }
 
 /// Expand and validate the fully merged configuration, `initializationOptions`
@@ -960,7 +975,14 @@ mod tests {
     }
 
     #[test]
-    fn load_settings_preserves_legacy_empty_mapping_notice_before_normalization() {
+    fn load_settings_aggregates_empty_notices_before_normalization() {
+        let lower_layer: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [languageServers.empty]
+            cmd = []
+            "#,
+        )
+        .expect("lower layer");
         let outcome = load_settings(
             None,
             Some((
@@ -970,7 +992,7 @@ mod tests {
             None,
             |_| None,
             Some(ExplicitConfig {
-                layers: Vec::new(),
+                layers: vec![Some(lower_layer)],
                 events: Vec::new(),
                 deprecated_keys: DeprecatedKeysSeen::default(),
                 fatal_error: None,
@@ -981,6 +1003,7 @@ mod tests {
             .empty_container_notice
             .expect("normalization must not erase the authored empty-container signal");
         assert!(notice.contains("captureMappings"), "{notice}");
+        assert!(notice.contains("languageServers.empty"), "{notice}");
     }
 
     #[test]
