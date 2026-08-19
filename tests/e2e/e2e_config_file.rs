@@ -739,7 +739,7 @@ fn test_config_file_deep_merge_languages_from_two_files() {
     );
 }
 
-/// Deep merge: captureMappings from config file + initializationOptions.
+/// Deep merge: canonical semantic-token mappings from config file + initializationOptions.
 #[test]
 fn test_config_file_deep_merge_capture_mappings_with_init_options() {
     let dir = TempDir::new().unwrap();
@@ -747,7 +747,7 @@ fn test_config_file_deep_merge_capture_mappings_with_init_options() {
     let config = dir.path().join("capture.toml");
     std::fs::write(
         &config,
-        "[captureMappings._.highlights]\n\"variable.builtin\" = \"from.file\"\n",
+        "[features.\"textDocument/semanticTokens\".captureMappings._]\n\"variable.builtin\" = \"from.file\"\n",
     )
     .unwrap();
 
@@ -760,10 +760,12 @@ fn test_config_file_deep_merge_capture_mappings_with_init_options() {
     let settings = get_effective_settings_with_init_options(
         &mut client,
         json!({
-            "captureMappings": {
-                "_": {
-                    "highlights": {
+            "features": {
+                "textDocument/semanticTokens": {
+                    "captureMappings": {
+                        "_": {
                         "function.builtin": "from.init"
+                        }
                     }
                 }
             }
