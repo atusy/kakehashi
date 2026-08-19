@@ -1,8 +1,8 @@
 //! E2E tests for the one-per-session config deprecation notices
-//! (`rootMarkers`, the top-level `autoInstall`, and the unwrapped
+//! (`rootMarkers`, top-level `autoInstall`/`captureMappings`, and the unwrapped
 //! `didChangeConfiguration` shape).
 //!
-//! The `rootMarkers` and `autoInstall` notices can each be surfaced by
+//! The key-deprecation notices can each be surfaced by
 //! `initialize` OR by `workspace/didChangeConfiguration`, sharing one
 //! session-scoped claim guard so each fires at most once however often config
 //! keeps carrying the key. The unwrapped-shape notice is didChange-only — there
@@ -94,6 +94,36 @@ fn flat_didchange_config(auto_install: bool) -> Value {
 
 fn wrapped_didchange_config(auto_install: bool) -> Value {
     json!({ "settings": { "kakehashi": { "autoInstall": auto_install } } })
+}
+
+fn is_capture_mappings_deprecation_notice(params: &Value) -> bool {
+    params["message"].as_str().is_some_and(|message| {
+        message.contains("captureMappings") && message.contains("deprecated")
+    })
+}
+
+fn canonical_capture_mappings(value: &str) -> Value {
+    json!({
+        "settings": {
+            "kakehashi": {
+                "features": {
+                    "textDocument/semanticTokens": {
+                        "captureMappings": { "_": { "variable": value } }
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn legacy_capture_mappings(value: &str) -> Value {
+    json!({
+        "settings": {
+            "kakehashi": {
+                "captureMappings": { "_": { "highlights": { "variable": value } } }
+            }
+        }
+    })
 }
 
 fn query_effective_settings(client: &mut LspClient) -> Value {
@@ -487,6 +517,134 @@ fn e2e_auto_install_deprecation_warns_at_initialize_and_not_again_on_didchange()
     assert_eq!(
         method, "window/logMessage",
         "initialize must have claimed the session's only slot; got: {params:?}"
+    );
+
+    let _ = client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_capture_mappings_deprecation_warns_once_and_ignores_canonical_shape() {
+    let config_dir = tempfile::TempDir::new().expect("temp config dir");
+    let config_path = config_dir.path().join("kakehashi.toml");
+    std::fs::write(&config_path, "").expect("write empty config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf-8 temp path"))
+        .build();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        canonical_capture_mappings("canonical"),
+    );
+    let (method, params) = client
+        .wait_for_notification_where(&["window/showMessage", "window/logMessage"], TIMEOUT, |p| {
+            is_capture_mappings_deprecation_notice(p) || is_config_updated(p)
+        })
+        .expect("canonical reconfig should log success");
+    assert_eq!(
+        method, "window/logMessage",
+        "canonical capture mappings must not warn; got: {params:?}"
+    );
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        legacy_capture_mappings("legacy"),
+    );
+    let (_, notice) = client
+        .wait_for_notification_where(
+            &["window/showMessage"],
+            TIMEOUT,
+            is_capture_mappings_deprecation_notice,
+        )
+        .expect("legacy capture mappings should warn");
+    assert_eq!(notice["type"].as_i64(), Some(2));
+    client
+        .wait_for_notification_where(&["window/logMessage"], TIMEOUT, is_config_updated)
+        .expect("legacy reconfig should still apply");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        legacy_capture_mappings("legacy-again"),
+    );
+    let (method, params) = client
+        .wait_for_notification_where(&["window/showMessage", "window/logMessage"], TIMEOUT, |p| {
+            is_capture_mappings_deprecation_notice(p) || is_config_updated(p)
+        })
+        .expect("second legacy reconfig should log success");
+    assert_eq!(
+        method, "window/logMessage",
+        "the session must not warn twice; got: {params:?}"
+    );
+
+    let _ = client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_capture_mappings_initialize_warning_claims_didchange_slot() {
+    let config_dir = tempfile::TempDir::new().expect("temp config dir");
+    let config_path = config_dir.path().join("kakehashi.toml");
+    std::fs::write(
+        &config_path,
+        "[captureMappings._.highlights]\nvariable = \"variable\"\n",
+    )
+    .expect("write legacy config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf-8 temp path"))
+        .build();
+
+    let initialize_id = client.send_request_async(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {}
+        }),
+    );
+    let (_response, watched) = client
+        .receive_response_for_id_watching_notifications(initialize_id, &["window/showMessage"]);
+    let mut notice = watched
+        .into_iter()
+        .find(|(_, params)| is_capture_mappings_deprecation_notice(params));
+    client.send_notification("initialized", json!({}));
+    if notice.is_none() {
+        notice = client.wait_for_notification_where(
+            &["window/showMessage"],
+            TIMEOUT,
+            is_capture_mappings_deprecation_notice,
+        );
+    }
+    let (_, notice) = notice.expect("legacy config file should warn at initialize");
+    assert_eq!(notice["type"].as_i64(), Some(2));
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        legacy_capture_mappings("runtime"),
+    );
+    let (method, params) = client
+        .wait_for_notification_where(&["window/showMessage", "window/logMessage"], TIMEOUT, |p| {
+            is_capture_mappings_deprecation_notice(p) || is_config_updated(p)
+        })
+        .expect("runtime update should log success");
+    assert_eq!(
+        method, "window/logMessage",
+        "initialize must have consumed the shared warning slot; got: {params:?}"
     );
 
     let _ = client.send_request("shutdown", json!(null));
