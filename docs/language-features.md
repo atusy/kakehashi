@@ -473,6 +473,11 @@ configured `searchPaths` — the same place highlight queries live, with the sam
 server configuration needed. (nvim-treesitter-context's own `context.scm` files
 work as-is once their directory is on a search path.)
 
+Capture names in these responses are the raw query capture names with `@`
+removed. `features.textDocument/semanticTokens.captureMappings` only controls
+semantic-token presentation; it never renames or filters
+`kakehashi/captures/*` results.
+
 The three methods mirror `textDocument/semanticTokens`, so live features can
 re-request cheaply on every cursor move or edit:
 
