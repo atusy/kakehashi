@@ -1,0 +1,1911 @@
+# Workspace Scoped Symbol Search
+
+**Related Decisions**: [cross-layer-aggregation](cross-layer-aggregation.md),
+[language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md),
+[language-server-bridge-request-strategies](language-server-bridge-request-strategies.md),
+[aggregation-priorities-wildcard](aggregation-priorities-wildcard.md),
+[host-document-bridge](host-document-bridge.md),
+[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md),
+[ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md),
+[respawn-reopen-derives-its-targets](respawn-reopen-derives-its-targets.md),
+[parse-decoupled-document-lifecycle](parse-decoupled-document-lifecycle.md)
+
+## Context
+
+`workspace/symbol` is the first request kakehashi bridges that carries **no
+`textDocument`**. Every existing bridged request resolves a host document, then
+an injection region, then a `RegionOffset`, and that chain is what makes the
+current fan-out and fan-in work:
+
+- **Fan-out** is driven by `bridge_configs_for_injection_language(host_language,
+  injection_language)` — the region's language picks the servers.
+- **Fan-in** is driven by `transform_location_for_goto(location,
+  request_virtual_uri, host_uri, offset)`, whose contract is "translate results
+  addressed to *the request's* virtual URI, drop every other virtual URI".
+- **Arbitration** is `preferred`, first-non-empty-wins, at both the bridge and
+  the layer level.
+
+None of the three survives the loss of the document. There is no injection
+language to select servers with, and no single virtual URI to translate against.
+
+The arbitration problem is subtler than "no document", and it is the one that
+shapes this decision: a `workspace/symbol` response is **not attributable to a
+language**. A server answers "here are the workspace's symbols matching
+`query`", and what it indexes is its workspace root, not a language — so a
+server reached through one configured **pair** (throughout this decision, a
+`(host_language, bridge_key)` entry in `languages.<lang>.bridge.<key>`)
+routinely returns symbols belonging to another pair's language. Nothing in the response says which configured pair
+"owns" an entry, so no arbitration between pairs can be principled.
+
+```
+DOCUMENT-SCOPED  (every existing bridged request)
+
+  params.textDocument.uri
+         │
+         ▼
+   host document ──▶ region at position ──▶ RegionOffset ──▶ one virtual URI
+         │                   │                    │                 │
+         │                   ▼                    └────────┬────────┘
+         │           injection_language                    ▼
+         │                   │                    FAN-IN filter: keep THIS
+         │                   ▼                    virtual URI, translate by
+         │      bridge_configs_for_               THIS offset, drop every
+         │      injection_language()              other virtual URI
+         │                   │
+         │                   ▼
+         │              FAN-OUT set
+         ▼
+   arbitration: first non-empty wins (preferred)
+
+
+WORKSPACE-SCOPED  (workspace/symbol)
+
+  params.query                        ← no textDocument at all
+         │
+         ✗ no host document   ✗ no region   ✗ no offset   ✗ no virtual URI
+         │
+         ├─▶ FAN-OUT cannot be selected by injection language
+         ├─▶ FAN-IN has no "request virtual URI" to filter against
+         └─▶ ARBITRATION has no way to attribute an entry to a pair, so any
+             "prefer A over B" silently discards symbols on a basis kakehashi
+             cannot compute
+```
+
+Three facts in the existing code make the feature tractable anyway:
+
+- The pool's tracker holds a **global** virtual→host mapping — it is what
+  `window/showDocument` translation reaches through `resolve_virtual_uri` — and
+  the document store keeps **generation-stamped resolved-region snapshots**,
+  from which a region's offset, end, content, and language can be read without
+  re-resolving anything.
+- `LanguageServerPool::connections()` enumerates the pool's connection map.
+- `send_execute_command_on_handle` (`bridge/workspace/execute_command.rs`) is an
+  existing precedent for sending a request on a connection **without** a virtual
+  document, and it shows exactly what that costs (see point 4).
+
+kakehashi today sends downstream no `workspace.symbol` client capability at all
+(`bridge/protocol/client_capabilities.rs` sets no `symbol` field on
+`WorkspaceClientCapabilities`), so in particular no `resolveSupport`. Per LSP
+3.18, a conformant downstream must therefore return a full `Location` rather
+than the location-without-range form. Point 5 keeps that property for
+`resolveSupport` while declaring the rest of the capability.
+
+Absence is the right answer only for `resolveSupport`. `symbolKind` and
+`tagSupport` are independent of it, and leaving the whole capability absent
+tells a conformant server to omit tags and to restrict itself to the legacy
+`File`–`Array` kind set — silently degrading results kakehashi's own client
+could have used. So this decision **declares `workspace.symbol` downstream**,
+mirroring the upstream client's `symbolKind` and `tagSupport`, setting
+`dynamicRegistration: true`, and keeping `resolveSupport` absent.
+
+`dynamicRegistration` is an independent field and needs its own answer, not
+silence. The bridge already records downstream registrations and consults them
+*before* static capabilities, so a server that registers `workspace/symbol`
+dynamically would be usable — but only if it was told it could. Leaving the
+field absent would tell it otherwise and lose those servers entirely. Mirroring rather than asserting is deliberate:
+kakehashi must not accept a kind or tag it cannot pass on.
+
+Exact mirroring has one exception, and it is the legacy spelling again. An
+upstream `tagSupport: true` deserializes to an empty `value_set`, and mirroring
+that verbatim would advertise `{ valueSet: [] }` downstream — telling a
+conformant server that no tag is supported. The legacy `deprecated` field is
+modelled independently and is not forbidden by that, but neither is it
+guaranteed: a server may reasonably send neither form, leaving the fallback
+below nothing to preserve. For that
+representation kakehashi advertises `DEPRECATED` downstream instead, because it
+can convert a tag back into the legacy boolean but cannot invent information a
+server was told not to send.
+
+Nothing currently advertises the provider: `workspace_symbol_provider` is never
+set in the initialize result, and `LanguageServer::symbol` is never overridden,
+so the request today reaches tower-lsp-server's default and is unimplemented.
+
+## Decision
+
+Implement `workspace/symbol` as a **workspace-scoped** bridged request: a
+candidate-set walk over configuration intersected with live connections, a
+per-entry global fan-in translator, and a single deduplicating union. Defer
+`workspaceSymbol/resolve`.
+
+```
+ client                    kakehashi                    downstream servers
+   │
+   │ workspace/symbol   ┌───────────────┐
+   │  { query }    ────▶│ fan-out (§3): │─── request ──▶  lua_ls   @ rootA
+   │                    │ pairs ∩ live, │─── request ──▶  tsgo     @ rootA
+   │                    │ capped, then  │─── request ──▶  tsgo     @ rootB
+   │                    │ deduped       │
+   │                    └───────────────┘                         │
+   │                                                              │
+   │                    ┌───────────────┐                         │
+   │                    │ classify and  │◀── every response ──────┘
+   │                    │ translate     │    NOT first-win: every target
+   │                    │ (fan-in, §5)  │    is awaited before answering
+   │                    └───────┬───────┘
+   │                            ▼
+   │             ┌────────────────────────────────┐
+   │             │ union (§1) — the ONLY merge,   │
+   │             │ no per-target arbitration      │
+   │             │  1. collect every entry        │
+   │             │  2. dedup  (name, kind,        │
+   │             │             uri, range)        │
+   │             │  3. sort   (uri, start, end,   │
+   │             │             name, kind)        │
+   │             └───────────────┬────────────────┘
+   │◀── SymbolInformation[] ─────┘
+   │    (always; never null — §5)
+   │
+   │ $/cancelRequest ─▶ forwarded to every in-flight target, best effort:
+   │                    a downstream may ignore it (LSP allows this). The
+   │                    hard bounds are the pool's own timeouts (§6).
+```
+
+### 1. A dedicated `union` aggregation strategy
+
+`AggregationStrategy` gains a third variant:
+
+```rust
+pub enum AggregationStrategy {
+    Preferred,
+    Concatenated,
+    Union,
+}
+```
+
+`Union` = collect from **every** target, then **deduplicate** on
+`(name, kind, uri, range)`, then **sort deterministically** by
+`(uri, start.line, start.character, end.line, end.character, name, kind)`.
+
+The sort key is deliberately a **superset** of the dedup key. Two entries that
+survive dedup differ in at least one key field, so a superset sort leaves no
+ties and the order cannot fall back to `JoinSet` completion order. Dropping
+`end` from the sort would break exactly the case this decision predicts below —
+two servers agreeing on a symbol's start and disagreeing on its end.
+
+It is a distinct value rather than a reuse of `Concatenated` because
+`Concatenated` deliberately preserves duplicates and source ordering (diagnostics
+and code actions from different servers are complementary and each must survive).
+A symbol search is set-valued: the same real file indexed by two servers, or by
+one server under two workspace roots, should appear once. Sorting is part of the
+strategy, not a caller detail — `JoinSet` completion order is nondeterministic
+and an unstable result order is a self-inflicted test flake.
+
+`container_name` is deliberately **excluded** from the dedup key. LSP defines it
+as "for user interface purposes… It can't be used to re-infer a hierarchy" and
+imposes no format or stability contract, so two servers naming the same symbol
+`"Foo"` and `"Foo.Bar"` (or omitting it) would defeat dedup on a field the spec
+says carries no identity. `(uri, range)` after translation already identifies a
+location; `(name, kind)` guards against a server reporting several symbols at one
+range.
+
+Dedup is **exact-match only**. Two servers that disagree on range granularity —
+a full-declaration span versus a name-only span — produce two entries that both
+survive. That is a real limit of the mechanism, not something the strategy
+promises away.
+
+When two entries *do* collide, the survivor's non-key fields are **merged by
+rule**, not taken from whichever arrived first — otherwise the payload would
+still vary with `JoinSet` completion order even though its ordering does not.
+`tags` are unioned and sorted; `container_name` takes the lexicographically
+smallest `Some`, or `None` if no entry carried one; `data` is **dropped
+entirely**, since it is server-private state whose only purpose is
+`workspaceSymbol/resolve`, which this decision does not support.
+
+`Union` is **normalized away at resolution time** for every other method:
+`resolve_aggregation` yields `Union` only for `workspace/symbol`, and a `Union`
+configured anywhere else resolves to that method's existing default before any
+handler sees it. The same normalization applies to `LayerAggregationConfig`,
+which shares this enum.
+
+Normalizing at the single resolution point — rather than adding behavior at each
+consumer — is not a style preference. `AggregationStrategy` is matched
+exhaustively at 7 sites, but `plan_region_format` does **not** match: it tests
+`strategy != Concatenated` and treats everything else as `Preferred`. So a
+`Union` that reached the handlers would mean `Concatenated` at the exhaustive
+sites and `Preferred` inside formatting — one configured value with two
+behaviors in the same method. And because a method-level `"_"` entry resolves
+into every method, `_ = union` is a configuration a user can plausibly write,
+so this is reachable, not hypothetical.
+
+The exhaustive sites still need a `Union` arm to compile; with normalization in
+front of them it is unreachable, and each site should say so rather than invent
+a behavior. `Union` is meaningful for `workspace/symbol` and nothing else.
+
+`workspace/symbol` does not go through the cross-layer walk at all — there are
+no layers without a document — so only the bridge-level default matters.
+The cross-layer-aggregation per-method table gains no row.
+
+### 2. `preferred` is wrong for this method, and is overridden
+
+The repo's own criterion for choosing a strategy is stated at
+`default_aggregation_strategy_for_method`: code actions concatenate because,
+"unlike formatting (**competing** whole-document edits), code actions from
+different servers are **complementary**."
+
+Two servers' `workspace/symbol` responses are complementary in that sense, and —
+per the attribution argument in Context — kakehashi cannot even tell which parts
+of a response a given pair "asked for". Concretely, given
+
+```toml
+[languages.LANG_1.bridge._self.aggregation]
+"workspace/symbol" = { priorities = ["B"] }
+
+[languages.LANG_2.bridge._self.aggregation]
+"workspace/symbol" = { priorities = ["C"] }
+```
+
+B's LANG_2-related symbols are **kept**. Dropping them because LANG_2 nominates
+C would assume C covers what B indexes — unknowable, and pure loss whenever it
+is false.
+
+An explicit non-`union` strategy for this method is therefore overridden to
+`union`, with one warning at settings-apply time, following the existing
+misconfiguration path (`misconfigured_settings_warnings`, which already warns
+about `concatenated`-without-`priorities` for formatting). The same walk warns
+in the **other** direction too: a `union` that cannot take effect is worth
+saying so about, and warning on only one direction would leave the more likely
+user mistake silent. "Cannot take effect" is broader than "another method",
+though — at the **bridge** level `union` is inert for every method but this one,
+and at the **layer** level it is inert for *every* method including this one,
+since a document-less request never reaches the cross-layer walk. So
+`layers.aggregation["workspace/symbol"].strategy = "union"` warns too, rather
+than looking correct because the method name matches.
+
+The override and the warning ask **different questions**, and conflating them
+would make the warning fire for everyone.
+
+The **override** asks "what strategy would this method resolve to?", so it
+resolves through `resolve_with_wildcard` like everything else — a method-level
+`"_"` entry legitimately supplies a strategy to `workspace/symbol`, and the
+override must catch that.
+
+The **warning** asks "did a user ask for this?", and must not answer it by
+resolution. The built-in defaults themselves install a wildcard `preferred`, so
+after resolution an untouched session is indistinguishable from a hand-written
+override — a warning driven off the resolved value would fire for every user.
+Nor can it be answered from provenance: `load_settings` merges the default,
+user, project and override layers and keeps only the merged result, so no layer
+attribution survives, and naively scanning the original layers would warn about
+a lower-precedence `preferred` that a higher layer already replaced with
+`union`.
+
+So the warning fires only on a **method-specific `workspace/symbol` entry**
+whose strategy is non-`union`. Writing that key is unambiguously deliberate, the
+shipped defaults never do it, and it needs no provenance machinery. A `_`
+wildcard that happens to reach this method is silently overridden without a
+warning — deliberately, since it is far more likely to be the user configuring
+everything else than to be an opinion about workspace symbols.
+
+Two servers indexing the *identical* root — say two TypeScript servers — are
+genuinely competing rather than complementary, and this decision does make their
+near-duplicate entries survive when their ranges differ.
+
+Overriding `preferred` does cost something real, and it should be stated
+plainly rather than argued away: **`union` cannot express conditional fallback
+at all.** `preferred` suppresses B when A answers non-empty and consults B when
+A fails or comes back empty. `union` has no such conditional — with both
+selected it always merges B, and with `priorities` naming only A there is no B
+to fall back to. So a user gets *either* B's duplicates always, *or* no backup;
+not "A normally, B when A has nothing".
+
+The trade is accepted as **uniformity**, not because fallback-on-empty is
+invalid. It would be easy to over-argue this, so: an empty answer from A
+establishes only that A's index has no match, and says nothing about B's — which
+is exactly why `union` returns B's matches when A is empty, and why treating
+empty as a reason to consult B is a defensible policy rather than a semantic
+error. `preferred` already treats empty as failed for priority purposes.
+
+What this decision chooses instead is that **every selected server's view
+appears, unconditionally**, because kakehashi cannot attribute a response to a
+pair (point 2's central argument) and so cannot justify suppressing one server's
+results on the strength of another's. Accepting that means accepting its
+corollary: no configuration expresses "suppress B's duplicates but keep B as a
+backup". If that combination turns out to matter, it belongs in a mode of its
+own with a name that says what it does. Until then the lever is `priorities`, an
+allowlist: name only the server you want. That is a
+static, deliberate exclusion the user writes, not an inference kakehashi draws
+from an empty response — which is the distinction that makes it acceptable here
+and `preferred` not. It does cost the user an edit in **every** pair that names
+the unwanted server, because fan-out unions candidates across all pairs.
+
+### 3. Fan-out: select synchronously, and never wait to select
+
+A request has no document, so it cannot pick one `(host_language, bridge_key)`
+pair — it walks **all** of them, purely to collect candidates. Both axes must be
+**concrete**, and neither is the config map's raw key set.
+
+`"_"` is a configuration **template**, never a target. Everywhere else in
+kakehashi it is resolved *against an actual language*:
+`is_language_bridgeable("python")` merges `_` into `python`, and servers are
+then selected by whether they handle `python`. Walking `bridge_map.keys()`
+literally would ask for the servers that handle a language named `_` — and
+because the shipped defaults populate only `languages._.bridge._`, the default
+configuration would contribute **no candidates at all**. Treating `_` instead as
+"every server" is worse: it would re-admit servers that a concrete
+`bridge.python.enabled = false` or `priorities = []` excluded, and union has no
+way to subtract that contribution.
+
+Both axes therefore come from **what is actually open**, which is also the set
+the live-only rule already commits to:
+
+- **Host languages**: the languages of the currently open documents
+  (`DocumentStore::open_uris()` + language detection). Concrete by
+  construction — it never comes from a map key.
+- **Injection languages**: the languages of the currently **open virtual
+  documents**, read from `VirtualDocumentUri::language()` on the pool's tracked
+  `OpenedVirtualDoc` entries, plus `_self` for the host tier.
+
+Deriving the injection axis from configuration instead — concrete bridge keys
+plus the languages servers declare — looks equivalent and is not. It loses every
+`languages = ["*"]` server, which is the whole point of the any-language-server
+wildcard: an open Markdown document with Python fences, the default `bridge._`,
+and only a `["*"]` server configured yields no non-`_` bridge key and no
+declared concrete language, so no injection language would be generated and the
+server would never be asked. Normal routing avoids this because it starts from
+the region's actual `"python"` and lets `handles_language` recognize `"*"`.
+Starting from open virtual documents restores exactly that: the language is the
+region's real one.
+
+`OpenedVirtualDoc` also carries the `connection_key` the document was opened on,
+so the walk can pair each open virtual document with its host document's
+language directly rather than taking a cross product of the two axes.
+
+`_self` needs its **own** source. Host-bridge opens are not `OpenedVirtualDoc`s
+— they live in the pool's `host_documents`, keyed by `(uri, ConnectionKey)` — so
+a host-only document can have a perfectly valid `_self` connection that no
+virtual document names. Deriving `_self` targets from virtual documents would
+therefore either omit host bridging entirely or fall back to expanding a server
+name across roots, recreating the leak point 3 exists to prevent. The
+`(host_language, _self, ConnectionKey)` triples come from `host_documents`
+directly.
+
+That is a second async map, read **under** `connections` by the batch validator
+below rather than snapshotted separately, so selection's acquisitions are the
+tracker snapshot and then `connections`, each falling under point 6's budget —
+not the "one acquisition then synchronous work" shape an earlier draft assumed.
+
+The two snapshots also have to be **joined safely**. Host language comes from
+the document store, while the exact keys come from pool tracking read later, and
+neither `OpenedVirtualDoc` nor the host-document sync state records the host
+language or its incarnation. A close/reopen — or a language change — between the
+two reads would therefore apply the *new* lifetime's policy to the *old*
+lifetime's downstream opens: precisely the policy-boundary leak this point
+exists to prevent, in transient form. So before a pair contributes, the host
+document's current language and incarnation are re-read and must match what the
+walk assumed; a mismatch drops that pair's contribution rather than guessing
+which lifetime it belonged to.
+
+An entry must be **validated before it contributes**, because the tracker's
+host→virtual map is not an "already open downstream" set: `register_pending_document`
+inserts an entry to own its close-cleanup *before* `didOpen` reaches the writer
+FIFO, and only `mark_open_sent` promotes it into the live reverse index. A
+cloned entry can also outlive a connection purge. Taken at face value, the walk
+would derive a pair from a `didOpen` the downstream has not seen, or from a
+replaced connection whose documents were never replayed.
+
+The save path establishes most of the discipline this needs: snapshot the
+tracker, then take `connections` **once** and hold it across the checks with no
+`.await` inside. Holding `connections` is what makes it sound — a membership
+check alone would not, since a purge could swap in a fresh handle that never
+opened the document. The lock order is `connections` → tracker, matching the
+respawn purge.
+
+This method departs from that precedent in one respect, and step 2 below spells
+it out: **currency is confirmed first**, before state, capability or
+configuration. The save path can check liveness first because it only decides
+whether to send; this one also has to decide what a *missing* target means, and
+a stale entry misclassified as a dead connection would be counted as an outage. This composes with the
+stale-handle re-check the send already performs (point 4): the enqueue is
+non-blocking, so both happen under the same lock and only the response is
+awaited outside it.
+
+Candidates for each `(host, injection)` pair then come from the **existing
+routing entry point**, `get_all_configs_for_language`, rather than from a
+hand-rolled lookup. That function already applies the `is_language_bridgeable`
+gate — with `_` inheritance — and already selects servers by whether they handle
+the injection language, so reusing it is what keeps this method's routing
+identical to every other method's. `_self` goes through the host tier's own
+gate instead (`is_host_bridging_enabled`), which is opt-in and direct, unlike
+the opt-out, wildcard-resolved gate beside it.
+
+`priorities` / `strategy` / `max_fan_out` are read with
+`resolve_aggregation(method)` on the wildcard-resolved bridge config, so values
+set only on `bridge._` still apply to a concrete pair — the property that keeps
+existing configuration from becoming a silent no-op here.
+
+**No candidate is waited for; the only waits are lock acquisitions and the
+final barrier.** The order is fixed:
+
+1. **Snapshot the tracker's host→virtual map** under its own lock and release
+   it. This only *enumerates* candidates; every entry is re-validated in step 2
+   before it can contribute.
+2. Hand the candidate set to a **pool-owned batch validator**, which takes
+   `connections` **once** and, without awaiting inside, per candidate — **in
+   this order**:
+
+   a. **Confirm the candidate is still current.** The check differs by kind,
+      because the available evidence does:
+
+      - *Virtual* — the live reverse index, **and**
+        `OpenedVirtualDoc.connection_generation` equal to the tracker's current
+        generation for that key. The generation lives on the tracked document
+        and the tracker, not on the handle: `ConnectionHandle` has no such
+        field, so "matches the handle's generation" would be unimplementable.
+      - *`_self`* — fresh `host_documents` membership, read while `connections`
+        is held. No generation is needed or available (`HostDocSyncState`
+        carries only a version and a fingerprint); holding `connections` across
+        the read is itself what prevents a purge and replacement from
+        interleaving.
+
+      A candidate that fails this is **stale, not failed**: it is discarded
+      silently, before any accounting.
+
+   b. **Drop connections rooted outside the client's workspace.** `open_uris()`
+      returns every document opened in the session, `didOpen` accepts any URI
+      the client sends, and marker discovery walks a stray file's ancestors with
+      no workspace boundary — so opening one file from another project spawns a
+      connection rooted there, and its real-file symbols would flow into this
+      workspace's search unchanged.
+
+      The test is **overlap**, not containment in one direction: a connection is
+      admitted if its root either lies inside a declared workspace folder **or
+      encloses one**. Requiring the root to be inside the workspace would be
+      wrong for the most ordinary layout there is — open `/repo/pkg` as the
+      workspace with `.git` at `/repo`, and marker discovery roots the server at
+      `/repo`, which is outside `/repo/pkg`. That test would drop the only
+      server serving the workspace's own documents.
+
+      Admitting an enclosing root has an unavoidable cost, stated rather than
+      hidden: such a server indexes `/repo` entire, so a search of `/repo/pkg`
+      also returns symbols from sibling packages. That is inherent to the
+      server's rooting, not something this query can filter without also
+      discarding legitimate in-workspace results, and it is the better error —
+      too many symbols is recoverable, none is not. Only roots that neither
+      contain nor are contained by any declared folder are dropped.
+
+      The filter is on the **connection's root**, not on result URIs: a server
+      legitimately rooted inside the workspace may return symbols from a
+      dependency outside it, and that is its own call, not pollution.
+      The boundary is the declared **workspace folders**, or — when the client
+      sent an explicit empty folder list but did keep a `rootUri` — that root.
+      The two are stored separately and an empty list is preserved deliberately,
+      so this case is real and needs saying: without the rule, an implementer
+      could equally drop every marker-rooted target or admit every disjoint
+      project. Filtering is disabled only when **neither** exists, where there
+      is no boundary to enforce and the alternative would be to answer nothing.
+
+      `ClientFallback`-rooted connections sit at the client root and always
+      pass. That is a **third leak**, not a clean case: a stray file with no
+      marker above it — or with markers disabled — also routes to
+      `ClientFallback`, so its document is opened on that process and its
+      symbols can come back. Since result URIs are deliberately unfiltered,
+      nothing here removes them. Dropping the fallback connection instead would
+      discard the client root's own symbols, which is worse.
+
+      A `preferSharedInstance` connection needs its own rule, because `Shared`
+      exposes **no** marker root: the roots it actually serves live in the
+      handle's mutable **workspace-folder set**, which grows as capable servers
+      take on later roots. So a `Shared` connection is admitted if **any folder
+      in that set** overlaps the client workspace by the same test, and dropped
+      only if none does.
+      Reading the folder set rather than the key is the whole of the rule;
+      testing the key would either drop every shared target or treat it as
+      rootless.
+
+      That admission is all-or-nothing, and it leaks: an instance that took on
+      both an in-workspace root and a stray external one brings the external
+      project's symbols with it. One connection cannot be half-admitted, and
+      filtering the external *candidate* does not help, because an in-workspace
+      candidate selects the same connection. The durable fix is to keep external
+      roots out of shared instances in the first place, which belongs to the
+      routing change rather than to this query.
+
+   c. Then keep only `Ready` handles (`connections()` returns the raw map, and
+      `ConnectionState` also has `Initializing`, `Failed`, `Closing`, `Closed`),
+      drop handles lacking `workspace/symbol`, and drop handles whose recorded
+      launch configuration no longer matches the `BridgeServerConfig` that
+      admitted them. A candidate dropped here because its connection is
+      `Failed`, `Closing`, or `Closed` is recorded as an **infrastructure
+      failure** (point 5) rather than as an absent candidate — but only if
+      policy would have admitted it; see below.
+
+   Step (a) must precede (c), and this is the subtle part. A purge removes the
+   document state and then installs a replacement under the **same**
+   `ConnectionKey`; if that replacement fails its handshake, a cloned snapshot
+   entry from before the purge resolves to a brand-new `Failed` handle with no
+   capabilities recorded. Accounting first would file that as an infrastructure
+   failure — reintroducing the "never initialized" case this decision withdrew
+   as unreachable, through a door the ordering closes. The stale entry never
+   named a live document on that connection, so it is not evidence of anything.
+
+   The reverse index is a sharded map and answers synchronously. `host_documents`
+   is a separate Tokio mutex, so it is taken with **`try_lock`**, never awaited:
+   on contention the `_self` candidates are dropped for that query and the
+   virtual ones are unaffected. Awaiting it while holding `connections` would
+   make this path exactly the kind of unbounded holder that forced every budget
+   in point 6, and there is no version of "briefly" that is safe there.
+3. Apply the per-pair `priorities` allowlist and `max_fan_out` cap to the
+   survivors — pure computation, after the lock is released.
+4. Dedup by **connection key** `(server, root)`.
+5. Await `wait_for_pending_reopen` for the survivors, **concurrently**, then
+   send.
+
+The validator is **pool-owned** for two reasons. It is the only way to do all of
+this under one acquisition — `launch_config` and its comparator are private to
+the pool, and the exposed comparison helper takes `connections` itself, so a
+caller in `bridge/workspace/symbol.rs` doing these checks piecemeal would
+re-lock between them and validate against a map that had already moved. And it
+is what lets `host_documents` be consulted **while `connections` is held**
+rather than snapshotted first: a `_self` candidate has no reverse-index check to fall
+back on, `HostDocSyncState` records neither connection generation nor handle
+identity, and a respawn can purge the entry and install a fresh `Ready` handle
+under the same `ConnectionKey` — so a released snapshot would let a connection
+that never opened the host document pass every other check. The language and
+incarnation recheck does not catch that, because the host lifetime never
+changed; only the connection did.
+
+The resulting order is `connections` → {tracker, `host_documents`}, which is the
+pool's own nesting and the one the respawn purge takes.
+
+Every filter in step 2 precedes the cap in step 3, and that ordering is
+load-bearing: with `priorities = [A, B]` and `max_fan_out = 1`, an A that is
+incapable or stale-configured would otherwise take the only slot and then be
+dropped, leaving the query to consult nobody. Filtering on what is already
+knowable before allocating slots costs nothing.
+
+Failure *bookkeeping*, though, runs the other way round — a candidate must clear
+the allowlist and cap before its death counts against the query, per the rule
+above. Filtering and accounting are separate questions: the first asks who to
+ask, the second asks whether silence means anything.
+
+Step 5 exists because a connection reaches `Ready` *before* its virtual
+documents are replayed after a respawn, so a query landing in that window would
+under-report that server's embedded symbols indistinguishably from "no matches".
+
+It closes **part** of that window, not all of it. Selection admits a candidate
+only if the tracker still records the document on that connection, and a respawn
+purge removes exactly those records — so a query arriving between the purge and
+the first replayed `didOpen` discovers no candidate at all and never reaches the
+barrier. The barrier helps once a target is discoverable but not yet replayed;
+before that, the connection is invisible to selection. Both halves have the same
+root cause, and point 9 names it as a **shipping blocker** rather than
+something this decision patches.
+The barrier is **bounded to two seconds** and enforced with a timeout, and
+awaiting the survivors concurrently costs that bound once for the whole query —
+not once per target.
+
+A target whose barrier **fails** — timeout, or repair that did not complete — is
+**dropped, not sent to**. The barrier reports that outcome and its contract is
+that callers must not proceed; sending anyway would query a connection known to
+be missing its documents, which is the failure step 5 exists to prevent. Losing
+that one target is the same coverage cost point 7 already describes, now with a
+bound on how long the query waits to find out.
+
+The bounds here are **per phase, not one budget spanning them** (point 6). A
+single outer deadline would let a slow `connections` acquisition eat into the
+barrier's two seconds and cancel it early — and that cancellation is not the
+barrier returning `false`, so the drop policy above would not even cover it.
+Each phase that can block on the pool gets its own budget instead.
+
+**Only a candidate the request would actually have used counts as a failure.**
+The dead-connection bookkeeping is applied to what survives current
+configuration and the `priorities` allowlist and cap — not to every dead handle
+the admissions name. A server the user removed from `priorities`, or excluded
+with the `[]` kill switch, or capped out, is not part of this query; whether its
+process is alive is none of the query's business, and letting its death produce
+an error would make a deliberate exclusion behave like an outage. `priorities =
+[]` and `max_fan_out = 0` admit **no** candidates, so there is nothing for them
+to fail.
+
+Capability **is** part of that test, wherever it can be read. A handle's
+initialize capabilities live in a `OnceLock` that outlives its state, and
+`has_capability` does not require `Ready` — so a server that was once up and is
+known not to support `workspace/symbol` is still known not to. Its death removes
+no symbol-search coverage, and counting it would turn a legitimate "no matches"
+into an outage on the strength of a server that was never going to answer.
+
+That leaves two cases for a dead candidate, and only the first is silent:
+
+- **Known incapable** — excluded, exactly as it would be while alive. Not a
+  failure.
+- **Known capable** — an infrastructure failure. It would have answered.
+
+There is no third, "never initialized" case, and it is worth saying why rather
+than leaving a reader to wonder. A candidate exists only because a document was
+successfully opened on that connection, and both eager-open paths wait for
+`Ready` and bail on initialization failure *before* recording any document
+state. A handle that never completed its handshake is therefore named by no
+candidate at all — selection cannot see it, so it cannot classify it. The one
+way it could have been seen is a stale snapshot entry resolving to a failed
+replacement under the same key, which step 2(a) discards before any accounting
+runs.
+
+The consequence is a real one and belongs to point 9's first blocker rather than
+to this rule: a workspace whose servers **all failed to start** answers `[]`,
+because coverage is derived from successful document opens and there were none.
+That is the same defect as a connection not outliving its documents, seen from
+the other end — coverage tied to document lifecycle — and it is fixed by
+whatever fixes that.
+
+Recording a dead connection as a failure rather than as a non-candidate is what
+keeps the outcome rule honest. A liveness timeout marks a handle `Failed` in
+place, and the pool only replaces it when a later acquisition happens to
+encounter it — so a workspace whose servers have all died sits with every
+connection `Failed` indefinitely. Treating those as "no candidates" would answer
+`[]`, telling the user the workspace contains no matching symbols at the exact
+moment nothing is running. They were routable; they are unreachable; that is an
+outage.
+
+`Initializing` is different and keeps its own behavior: those connections are
+skipped as a deliberate coverage choice below, not because they failed, so a
+query that finds only initializing candidates legitimately answers `[]` — the
+servers are starting, not dead.
+
+**`Initializing` connections are excluded.** Including them, and waiting for
+Ready before dispatch, was tried and abandoned — it looked like it removed a
+timing dependence and instead produced a cascade:
+
+- Capability is unknowable for an `Initializing` handle, so the cap either ran
+  before the capability check (letting a known-incapable server take the last
+  slot and answer nobody) or after the wait (making the cap a global barrier
+  that delayed a ready target by another target's 30-second `wait_for_ready`).
+- A reserved slot could die four ways — timeout, failure, close, handle
+  replacement — turning `max_fan_out = 1` with a slow high-priority candidate
+  from "slower" into "empty".
+- Backfilling the dead slot has no well-defined unit: the cap selects server
+  *names* per pair, while failure happens per `(server, root)` *connection*, and
+  a deduplicated connection can carry several pairs' priority lists, so there is
+  no single "next candidate". Sequential backfill also gives each replacement a
+  fresh 30-second wait, so three slow candidates cost 90 seconds before any
+  response wait — breaking the latency account outright.
+
+Excluding them costs one thing: a query issued in the seconds after opening a
+file may miss a server still starting for it. That is not a new class of
+surprise — this method's contract is already "coverage is what is live", and
+coverage already grows and shrinks under the client's own actions (point 7). It
+buys a selection that is synchronous, deterministic, capability-exact, and free
+of every failure mode above.
+
+The cap sits after the liveness and capability filters, and that placement is
+load-bearing.
+
+Putting the cap *before* the liveness filter would let dead or absent servers
+consume cap slots and silently exclude a live server ranked below the cutoff,
+contradicting this decision's own coverage contract. (In the abandoned waiting
+design this placement had a second failure mode too — the cap became a global
+barrier — but with `Initializing` excluded there is nothing left to wait for,
+so only the coverage argument applies.)
+Deciding membership synchronously removes the interaction entirely.
+
+Step 3's config check exists because settings are published before the pool
+finishes propagating them, so a reload leaves a window in which a live handle
+was spawned from a configuration the current settings have already superseded.
+Being `Ready`, capable, and holding the right documents does not make it the
+process the current config describes; the pool's own by-key acquisition compares
+launch configurations for exactly this reason. The resolved config is therefore compared inside the batch validator, which is
+also where it is reachable at all.
+
+The pre-enqueue check does **not** repeat that comparison, and does not need to.
+It checks pointer identity — that this handle is still the pool's current one
+for its key — which is the precedent's own discipline and is sufficient here: a
+settings reload removes and shuts down a connection whose spawn-time config
+changed rather than mutating it in place, so a config change necessarily
+installs a different handle and fails the identity check. Pointer identity after
+batch validation therefore implies config validity, and re-comparing would need
+either a pool-owned check-and-enqueue primitive or wider visibility for a
+guarantee already in hand.
+
+Step 2 must precede step 3: capping first would let a **known-incapable**
+server take a slot from a capable one — with `priorities = [A, B]`,
+`max_fan_out = 1`, and A incapable, the query would consult nobody. Keeping only
+`Ready` candidates is what makes that ordering possible at all, since capability
+is unknowable before the handshake.
+
+`priorities` is an allowlist: listed servers are candidates, `"*"` stands for
+the rest, and an explicit `[]` remains the per-method kill switch. Its **order**
+still decides which N survive a `max_fan_out` cap (`truncate_entries` keeps the
+highest-priority N in walk order); only the *arbitration* meaning of order is
+dropped. A `_self` pair contributes candidates only when
+`bridge._self.enabled = true` for that language — `is_host_bridging_enabled` is
+a **direct** lookup with no wildcard fallback, unlike the aggregation fields
+beside it, so a `bridge._self.aggregation` block without `enabled` contributes
+nothing at all.
+
+Every **other** bridge key is gated by `is_language_bridgeable`, which resolves
+`enabled` through the wildcard and defaults to `true` — and which
+`get_all_configs_for_language` already applies, which is the main reason to
+route through it rather than re-deriving the gates.
+
+Dedup is by connection key, not server name: the response depends on the
+connection's own indexed workspace, so a connection named by several pairs is
+asked **once**, while the same server name under two roots is genuinely two
+connections and two requests.
+
+`max_fan_out` applies **per pair only**, and that is the whole of it here.
+
+Within a pair it works as everywhere else: `truncate_entries` truncates a
+flattened name list in walk order, keeping the highest-priority N names.
+
+A surviving name admits **only the connections that pair actually opened**, not
+every live connection of that server. The tracker records each open virtual
+document's `ConnectionKey` next to its language, so a pair's targets are known
+exactly and never derived by expanding a name across roots. That distinction is
+load-bearing: expanding would let a Python pair that admits A reach `A/root2`
+even when the pair that actually opened A on root2 excluded it with
+`priorities = []` — turning `priorities` from a policy boundary into a hint, and
+leaking one language's configuration into another's connections. The exact keys
+are already there; deriving them would be both more work and wrong.
+
+A per-pair name cap still bounds neither requests nor connections overall,
+because a connection one pair's cap excluded re-enters through another pair that
+legitimately opened it. So `max_fan_out = 1` can still produce more than one
+request, contradicting the setting's documented promise to "cap the number of
+concurrent server requests" — a generic load control quietly losing its
+load-controlling property in exactly the method most able to fan out.
+
+A second, global cap after dedup was tried and **rejected**. It cannot be given
+coherent semantics:
+
+- An uncapped pair must mean "no limit" — that is what `None` means everywhere
+  else — so any workspace containing one uncapped pair has no global cap at all.
+  Since uncapped is the default, the cap would be inert in almost every real
+  configuration, and present only where a user capped *something*, throttling
+  languages they never mentioned.
+- It has no principled victim order. `priorities` exists per pair and pairs may
+  rank the same server differently; merging those rankings is exactly what this
+  decision rejects elsewhere as unprincipled. Falling back to walk order is
+  worse than arbitrary — open documents and connections live in hash maps, so
+  which connections survived would vary run to run.
+
+So `max_fan_out` stays a **per-pair name-selection rule** here and bounds
+neither the query's requests nor its connections. Its documented promise to
+"cap the number of concurrent server requests" therefore does not hold, and the
+setting's description must record that (point 8) — but recording it is not the
+fix. Nothing in this design bounds the query at all, which point 9 names as a
+**shipping blocker**; what closes it is left to the change that implements it.
+
+```
+  open host docs × their open virtual docs    ← concrete languages only,
+        │  (never a raw `_` map key)             no arbitration
+        ▼
+  ┌──────────────────────┐   ┌──────────────────────┐
+  │ (LANG_1, _self)      │   │ (LANG_2, _self)      │  ... every pair
+  │ priorities ["B"]     │   │ priorities ["C"]     │
+  └──────────┬───────────┘   └──────────┬───────────┘
+             └────────────┬─────────────┘
+                          ▼
+        ┌──────────────────────────────────────┐
+        │ SELECTION (3s per AWAITED lock, §6)  │
+        │ pool-owned batch validator, one lock:│
+        │ (a) confirm still current — else it  │
+        │     is STALE, not failed             │
+        │ (b) drop roots outside the workspace │
+        │ (c) Ready only, drop incapable, drop │
+        │     stale-config                     │
+        │ then: allowlist + per-pair maxFanOut │
+        │ NEVER spawns a connection            │
+        └──────────────────┬───────────────────┘
+                           ▼
+        ┌──────────────────────────────────────┐
+        │ dedup by CONNECTION KEY (server,root)│
+        │   each pair admits ONLY the conns it │
+        │   actually opened — never a name     │
+        │   expanded across roots              │
+        │ (no global cap — see §3)             │
+        └──────────────────┬───────────────────┘
+                           ▼
+              await the 2s reopen barrier concurrently,
+              dropping targets whose repair failed,
+              then send to each survivor (§4),
+              then per-entry fan-in (§5),
+              then UNION → dedup → sort (§1)
+```
+
+### 4. The send lives in the `bridge` module; the translation does not
+
+`connections()` is `pub(super)` to `crate::lsp::bridge`, and `lsp_impl` is a
+sibling module, not a descendant — so the fan-out **cannot** live beside the
+handler. It goes in `src/lsp/bridge/workspace/symbol.rs` as an
+`impl LanguageServerPool`, exactly where `execute_command.rs` already puts the
+one existing document-free send.
+
+That precedent also shows the primitive list is longer than
+`has_capability` / `send_request` / `wait_for_response`. Per target:
+`register_upstream_request(id, key)` at the pool level, then
+`handle.register_request_with_upstream(...)`, a `RouterCleanupGuard` armed
+around the request, and — under the `connections()` lock — a re-check that the
+handle is *still* the pool's current connection for its key before enqueueing,
+because a concurrent respawn may have replaced it. Unregistering on every early
+return is part of the pattern.
+
+`has_capability` needs two things before it can be used at all:
+
+- **A `workspace/symbol` arm.** Its `match` ends in `_ => false`, so an unlisted
+  method reports every server incapable. The arm reads
+  `workspace_symbol_provider: Option<OneOf<bool, WorkspaceSymbolOptions>>` in the
+  same shape as the existing `textDocument/definition` arm.
+- **A completed handshake to read.** It falls back to `server_capabilities()`,
+  which is `None` until `set_server_capabilities` runs — but that is a
+  `OnceLock`, so it stays readable afterwards regardless of state. `Ready` is
+  what *dispatch* requires; capability classification only requires that the
+  handshake happened, which is why point 3 can classify a dead handle and cannot
+  classify an `Initializing` one, where every server would report incapable.
+
+Cancellation needs nothing new **downstream**: `register_upstream_request`
+already holds many `(server, root)` keys per upstream id,
+`forward_cancel_by_upstream_id_if_current` already iterates all of them, and
+`UpstreamRegistrySweepGuard` unregisters the whole entry. Multi-target
+cancellation falls out of using the pattern.
+
+It does need something **upstream**. Downstream registration happens inside the
+per-target send, so it can only cancel work that has already been dispatched —
+it does nothing for the selection and index-building the handler does first, nor
+for the handler's own future. The handler therefore subscribes to
+`$/cancelRequest` **before its first await** and selects against the whole
+dispatch, exactly as the existing document-free handler does. Not because the
+signal would otherwise be lost — the request registry latches a cancel that
+arrives between request acceptance and subscription and delivers it on
+subscribe — but because selecting on it is what makes the handler abandon
+promptly rather than only at its next dispatch boundary.
+
+Fan-in lives in `lsp_impl`. Not because it must — the store's snapshot
+accessor is `pub(crate)`, so a `bridge` module handed the store could call it —
+but because that is where the `DocumentStore` / `LanguageCoordinator` /
+`BridgeCoordinator` handles already sit together, as they do for
+`ShowDocumentTranslator`. Putting it in `bridge` would mean threading the store
+into a module whose job is wire protocol. This is a coupling choice, unlike the
+fan-out's placement in point 4, which is a real visibility constraint.
+
+The value crossing that boundary is **typed, not raw JSON**: the bridge module
+owns deserialization for every other bridged request, and this one keeps that
+property. A `null` result normalizes to an empty vector first (point 5);
+otherwise each target's response is parsed into `Vec<WorkspaceSymbol>` there,
+normalizing a `SymbolInformation[]` answer into the same shape, and is handed
+back **with its source connection key and that connection's URI→content-identity
+snapshot** — fan-in cannot validate a symbol without knowing which connection
+produced it (point 5). That works for
+`location` because `WorkspaceSymbol.location` is a `OneOf` that models the
+range-less form rather than rejecting it, but it is not field-for-field:
+`SymbolInformation` carries a (itself deprecated) `deprecated: Option<bool>`
+that `WorkspaceSymbol` has no counterpart for, so the normalization must fold
+`Some(true)` into `tags` as `SymbolTag::DEPRECATED` or silently lose it.
+
+`lsp_impl` then classifies and translates those typed values. Its classification
+is unit-testable as a pure function once the URI index and the per-host geometry
+map are injected — both are plain data, which is a side benefit of fan-in
+resolving nothing.
+
+### 5. Fan-in: a global virtual→host translator
+
+Every entry is classified independently, and each is translated against **its
+own** region's offset — which is what lets this path cross blocks where the goto
+path may not: the goto filter exists because only one region's offset is in
+hand. "Its own offset" does not mean "its own resolution", though; see pass 3.
+
+```
+  one entry of the downstream's result array
+             │
+             ▼
+     ┌───────────────────┐  no
+     │ has a WELL-FORMED ├─────▶ DROP as a PROTOCOL FAILURE (see below)
+     │ range? (present,  │
+     │ start ≤ end)      │
+     └─────────┬─────────┘
+               │ yes
+               ▼
+     ┌───────────────────┐  no
+     │ is_virtual_uri ?  ├─────▶ REAL FILE ─▶ pass through untouched,
+     └─────────┬─────────┘                     unless it names a drifted
+               │ yes                            `_self` host (§5)
+               ▼
+     ┌───────────────────┐  yes
+     │ is_scratch_uri ?  ├─────▶ DROP  (a formatting scratch document; names
+     └─────────┬─────────┘             no place in any host file)
+               │ no
+               ▼
+     look up in the REQUEST-LOCAL URI index (pass 0)
+               │
+               ├── absent ───────▶ DROP  (retired region, or a real file in
+               │                          the reserved virtual-URI namespace)
+               ▼ (host_url, region_id, language)
+     look up region_id in that HOST's geometry map (pass 3, read once)
+               │
+               ├── absent ───────▶ DROP  (region invalidated by edits, or
+               │                          host document closed)
+               ├── language ≠ ────▶ DROP  (region now hosts another language)
+               │   current
+               ▼ (offset, region_end, virtual_content)
+     TRANSLATE
+       uri   := host_url
+       range := translate_virtual_range_to_host(range, offset)
+       └─ validate against virtual_content and region_end — see below
+
+  Neither lookup rescans: the URI index is built once per request and the
+  region map once per host.
+```
+
+Bounds validation is necessary but **not sufficient**, so translation also
+pins the content the result was computed from. A range measured against an older
+version of a region can remain perfectly in-bounds in the current one — insert a
+line above a symbol while the request is in flight and its old range still
+validates, then translates onto unrelated text. No amount of geometry checking
+catches that, because the geometry is fine; what changed is the text the
+downstream was looking at.
+
+Each virtual document's **content identity at dispatch** is therefore captured
+and re-checked before its entries are translated, using the per-connection
+revision and the fingerprint of the content last *confirmed enqueued* that the
+tracker already maintains.
+
+Two things about *when* and *per what* are load-bearing:
+
+- **Captured before the request is enqueued**, not after. Requests and
+  `didChange` notifications share one writer FIFO, so capturing afterwards
+  inverts the check: enqueue R against content A, let a `didChange(B)` follow,
+  then read identity as B — R still executes first, against A, while every
+  later comparison sees B and agrees. Capturing first makes the recorded
+  identity the one the request actually raced.
+
+  **In the same `connections` critical section as the enqueue**, not merely
+  before it. The revisions live behind their own Tokio mutex, so the snapshot is
+  taken with `try_lock` inside the section that performs the stale-handle check
+  and the enqueue, never awaited beside it. Contention drops that target,
+  counted as a failure like any other.
+
+  This closes the `didOpen` gap: eager open holds `connections` while opening,
+  so taking the snapshot outside the section would let a virtual document be
+  opened between snapshot and enqueue — the request would see it and the late
+  URI index would contain it, while the target's identity map would not, and its
+  symbols would be dropped for a document legitimately open when the request
+  ran.
+
+  It does **not** make the pair atomic against `didChange`, and the ADR does not
+  claim it does. `didChange` releases `connections` *before* it increments the
+  revision, enqueues, and records the fingerprint, so an already-admitted change
+  can land in that window or expose an intermediate revision/fingerprint pair
+  that no snapshot matches. The checks fail safe — the entries are dropped, not
+  mistranslated — so this is a **false-negative window**, not a correctness
+  hole: symbols that were legitimately valid can go missing from one query while
+  a document is being edited. Closing it needs an enqueue-coupled identity
+  primitive or synchronization with the per-document transition state, and both
+  are changes to the bridge's write path rather than to this method.
+- **Per connection, and covering `_self`.** Both tracker values are keyed by
+  `ConnectionKey`, and one virtual URI can be open on several connections with
+  different confirmed content. A `_self` target's identity is its host
+  document's own downstream version and fingerprint from `host_documents`, not a
+  virtual one.
+
+  Version and fingerprint alone cannot tell a **close/reopen** from no change at
+  all. Closing removes the sync state and reopening recreates it at version 1
+  with the same fingerprint when the text is unchanged, so both the recorded
+  comparison and the current-text comparison pass — while on a multilingual
+  server the document may have reopened under a *different language*, and an
+  answer computed for the prior lifetime would be accepted. So the host's
+  **incarnation and language** are captured per URI alongside the `_self`
+  dispatch identity and compared with it. This is the same lifetime check the
+  candidate walk already makes at selection; it has to survive into fan-in,
+  because the reopen can happen after dispatch.
+
+  Comparing the recorded pair across the request is also **not enough on its
+  own**, and for a sharper reason than in the virtual case. Downstream host
+  synchronization is deferred to the diagnostic debounce and then launched
+  asynchronously, so an edit can update the `DocumentStore` and leave
+  `HostDocSyncState` untouched for some time — both readings equal, both stale.
+  The recorded fingerprint must therefore also be compared against the host's
+  **current `DocumentStore` text**, exactly as the virtual path compares against
+  the region's current content. Only that catches an edit the downstream has not
+  been told about yet. An identity snapshot is therefore taken per
+  target, and travels **with that target's response** — the bridge module hands
+  back the source connection key and its URI→identity map alongside the
+  `Vec<WorkspaceSymbol>`, rather than a bare vector. Fan-in validates each
+  entry against the identity of the connection that produced it.
+
+Comparing those two values across dispatch and translation is not enough on its
+own. The revision advances before the `didChange` is enqueued and stays advanced
+when the enqueue fails, while the recorded fingerprint deliberately does
+not move — so after an `A → B` edit whose notification was dropped, both
+readings agree at `(revision 2, fingerprint A)` while the current geometry
+describes B and the server is still answering about A. Stability across the
+request proves nothing when both halves were already wrong.
+
+The recorded fingerprint must therefore also **equal the current region's
+content identity**. That is the check relating what the downstream was told to
+what the geometry describes; the dispatch/translation comparison only catches
+movement *during* the request. Entries failing either are dropped, exactly like
+entries whose region moved.
+
+The fingerprint is content **confirmed enqueued**, not confirmed delivered, and
+this decision claims no more than that. It is recorded once the `didChange`
+enters the writer queue; notifications carry no acknowledgement, and the writer
+continues after a write error rather than failing the connection. So a
+notification that was queued and then failed to write leaves a fingerprint
+naming content the server never received, and these checks narrow the
+stale-result window sharply without closing it. Closing it needs either writer
+acknowledgement, or a rule that a failed notification write makes the connection
+terminal before any later request on it can succeed — both broader than this
+decision, and both better fixed once for every bridged request than here.
+
+With that in place, translation **validates the region bounds** too; it does not
+translate blindly.
+Region ids deliberately survive edits, so an in-flight response can carry a
+range measured against an older, larger region while offset resolution against
+the current parse still succeeds — and plain range translation performs no
+boundary check, so the result could point into the closing fence or the host
+text after it. The region map already carries each region's current
+`region_end` alongside its offset, but that bound alone is not enough: a stale
+virtual position like `(0, 1000)` inside a region ending on line 5 compares as
+before the end while carrying a column that never existed, and the workspace-edit
+precedent checks only per-line floors and a global endpoint.
+
+Validation therefore runs against the region's **current `virtual_content`** —
+the same field the language check above needs retained: both endpoints must be
+real positions in that text and the range must be correctly ordered, using the
+existing strict position machinery rather than a new comparison, and only then
+is the range translated and checked against the host-side region bound. Validating in virtual coordinates before translating is
+what catches the column case; the host bound catches what survives it.
+
+The first check is **well-formedness, before the virtual/real branch** — the
+range must be present *and* correctly ordered. Bounds validation is necessarily
+per-document and happens later, against the region's own content, but ordering
+is not: a `start > end` range is malformed whatever it describes, and a real-file
+or `_self` entry carrying one would otherwise sail past untouched, since
+non-virtual locations are passed through unvalidated. Checking order once, up
+front, is what makes "an unusable range is a failure" true for every entry
+rather than only for the ones that happen to be translated.
+
+A malformed entry is **not** a semantic rejection, and the distinction matters:
+the server reported a match and kakehashi could not use it. Counting it as
+semantic would let a response consisting entirely of range-less entries come
+back as an informative `[]` — telling the user there are no symbols at the
+moment a server has just said there are. It is an infrastructure failure in the
+accounting of point 5, so such a response errors instead.
+
+The range check comes first because `WorkspaceSymbol.location` is
+`OneOf<Location, WorkspaceLocation>` and the `WorkspaceLocation` form carries a
+`uri` and nothing else. A conformant downstream cannot send it here — kakehashi
+declares no `resolveSupport` (point 9) — but `OneOf` is `#[serde(untagged)]`, so
+it deserializes anyway. The classifier must reject it explicitly rather than
+reach for a `range` that is not there.
+
+Dropping — rather than passing through — an unresolvable virtual URI is
+deliberate: a virtual URI that escapes to the editor names a file that does not
+exist on disk, so the symbol is unopenable. This mirrors `window/showDocument`
+translation, which drops the selection it cannot translate.
+
+**Parse freshness is load-bearing here.** The region snapshot tracks the live
+parse, and `didChange` clears the tree and reparses off-ingress, so during the
+reparse window the edited document has no current geometry for any of its
+regions — which
+this classifier would silently turn into "no embedded symbols". The
+whole-document handlers avoid this by calling `ensure_document_parsed` first;
+this method has no target document to name.
+
+Fan-in therefore runs in **four passes**, not one, over a **request-local
+index** built once up front:
+
+0. **After every target's result is collected**, and not before, snapshot the
+   tracker's host→virtual map once and build a
+   `virtual_uri_string → (host_url, region_id, language)` map for this request.
+1. Classify every entry against that index, **grouping entries by host**. No
+   parse and no lock is involved, so nothing waits here.
+2. Ensure the distinct hosts that actually appear, **concurrently**.
+3. Read each host's region geometry **once** from its snapshot, then translate
+   that host's entries against it.
+
+Pass 0 is built **late, and verified late**, because a single early snapshot
+is wrong in both directions across a collection phase that runs concurrently and
+can reach the 30-second response bound.
+
+Too-early **under-reports**: a virtual document opened after the snapshot but
+before a downstream request can legitimately appear in that response, and would
+then be dropped for being absent from a map that predates it. Waiting for the
+*first* response is not enough either — other targets can stay in flight for
+another 30 seconds and answer with documents opened in the meantime. The index
+is therefore built once all results are in hand, immediately before
+classification. It covers documents opened up to the enqueue of each request,
+which is as far as it can: a per-target identity map fixes what that target
+could legitimately have seen, captured in the same `connections` section as that
+target's enqueue — which excludes a concurrent `didOpen`, though not a
+concurrent `didChange` (point 4).
+
+Staleness in the other direction is worse and survives any snapshot time, so it
+is closed by a check rather than by timing. A region keeps its ULID across
+edits, but its **injection language can change** — the close path removes the old
+virtual URI and a new one is opened for the new language. The geometry is keyed
+by host and region id alone, so a stale entry naming the *old* URI would still
+find a live region, and a Python result would be
+translated into a region that is now Rust. So the index must carry each entry's
+**language**, taken from `OpenedVirtualDoc.virtual_uri.language()`, and that
+language must equal the region's current `injection_language`; a mismatch is a
+retired document and the entry is dropped.
+
+Comparing *reconstructed URIs* instead would not work. A virtual URI renders the
+language only as a file extension, and that mapping is not injective —
+`python` and a literal `py` both render `.py`, as do `rust`/`rs` and
+`javascript`/`js` — so exactly the language changes most likely to occur would
+compare equal. The tracked language string is the identity; the URI is not.
+
+Both that check and the range validation below need data the current helper
+throws away rather than data the system lacks: `ResolvedInjection` already
+carries `injection_language` and `virtual_content`, and
+`resolved_region_geometry` discards both, returning only offset, region end, and
+contiguity. The fan-in path needs a snapshot accessor that **retains** them.
+No parse and no resolution is involved: fan-in only reads what the store has
+already resolved.
+
+Pass 0 is also not an optimization. `BridgeCoordinator::resolve_virtual_uri` is
+**not** a map lookup: its own doc comment records that it is "O(N) over open
+virtual docs" — the virtual URI encodes the host *directory* and region id but
+not the host filename, so the host cannot be derived without a scan — and
+justifies that cost with "`window/showDocument` is rare, so the scan is
+acceptable". Calling it once per returned symbol destroys exactly that premise:
+an interactive endpoint returning thousands of symbols would pay
+`symbols × open_virtual_docs`, serialized through repeated acquisition of the
+tracker's async mutex. Snapshotting once makes it one scan plus O(1) per entry.
+It is a *separate* snapshot from the one point 3 takes to enumerate candidates —
+that one is taken at selection time, before `connections` is acquired, and
+answers a different question.
+
+The index also becomes the **identity test**. `is_virtual_uri` is only a
+basename pattern — it accepts any URI ending in
+`kakehashi-virtual-uri-<id>.<ext>` — so pattern-matching alone would let a real
+file that happens to be named that way be treated as virtual. Membership in the
+index is the real answer for the entries that matter. What the pattern still
+decides is the *drop* case: a pattern match that is absent from the index is
+either a region that has since died or a real file with that name, and the two
+are indistinguishable. Dropping is chosen, because letting a dead region's
+virtual URI reach the editor is the worse failure. **The
+`kakehashi-virtual-uri-*` filename space is reserved**; a real file named into
+it is not visible to workspace symbol search.
+
+Ensuring one host at a time while translating would make the cost additive:
+`distinct_hosts × 200ms` in series, which for a query touching many stale hosts
+would dwarf the fan-out it follows and contradict point 6's max-over-targets
+account. Grouping first makes the whole pass cost about one 200ms wait.
+
+Sweeping every open document up front instead — alongside the fan-out — was the
+first shape considered and is worse on both axes. It does work for documents no
+result mentions, and it completes up to 30 seconds before the value is used (a
+target may take the full response timeout), so an edit arriving in between
+re-clears the tree and the sweep guarantees nothing. Ensuring immediately before the
+snapshot is read closes that gap to the width of one pass.
+
+Only documents that **already have a snapshot** are ensured. `ensure_document_parsed`
+asks for a 200ms wait, but `wait_for_current_snapshot` escalates to the
+15-second `FIRST_PARSE_BACKSTOP` when no snapshot exists at all, regardless of
+the caller's wait. Skipping them loses nothing: a never-parsed document has no
+resolved injection regions, hence no virtual documents downstream, hence no
+result can address it.
+
+The precheck alone does not make the 200ms hold: a close/reopen between the
+check and the ensure moves the URI into a fresh, snapshot-less lifetime and the
+15-second deadline applies after all. Each ensure therefore carries its **own
+outer 200ms timeout**, so the phase's bound is a property of this call site
+rather than an inference about the callee's internal state.
+
+**Geometry is read per host, not resolved per entry.** Calling the resolver per
+entry would run the whole injection walk over the host every time —
+`symbols × regions` work, a 2,000-symbol response walking a 100-region host
+2,000 times — while holding a lock that blocks every `didChange` and close for
+it. Memoizing individual ids does not fix that: the first lookup for each
+distinct region still walks, so the worst case stays quadratic.
+
+Each host's geometry is therefore read **once** into a request-local
+`region_id → (offset, region_end, virtual_content, injection_language)` map,
+built from the **generation-stamped resolved-region snapshot** the document
+store already keeps. When a host has no current snapshot, its entries are
+**dropped** — fan-in never resolves inline.
+
+That refusal is the load-bearing part, not a shortcut. Resolving inline would
+mean calling `resolve_by_region_id`, which **mutates** the tracker: it reaches
+the named-layer allocator and then `calculate_region_id`, which can mint a ULID.
+Every attempt to make that safe produced a worse problem than it solved:
+
+- Guarding it with the edit lock and a generation check does not help on
+  cancellation. The walk must run on the compute pool (it is documented as
+  taking hundreds of milliseconds and having starved Tokio before), and the pool
+  **detaches** its work behind a oneshot — dropping the awaiting future does not
+  stop the closure. A cancelled query would therefore release both guards while
+  `resolve_all` kept mutating the tracker, reopening exactly the ghost-id and
+  mixed-generation races the guards existed to close.
+- The pool has no queue or execution deadline, so the wait is unbounded — while
+  holding that host's edit lock *and* the process-wide settings-reload guard.
+  One symbol search could stall edits for a document and configuration reload
+  for the whole server.
+- Timing out the awaiter does not rescue it; that is precisely the detached-work
+  case above.
+
+Dropping keeps the whole fan-in **read-only** — no minting, no detached work, no
+unbounded wait, and no global guard held across one — which is what makes every
+other guarantee in this section cheap enough to hold.
+
+Its cost is **not** uniformly transient, and this decision does not claim
+otherwise. Usually it is: the pre-warm in pass 2 exists to make the snapshot
+current, and a host caught mid-reparse is served on the next query. But the
+region cache can also be left **persistently** empty. A populate pass refused
+after an epoch race publishes a current snapshot whose resolved regions are
+`None` and marks parsing finished, while injection processing falls back inline
+and still opens the virtual documents — and `ensure_document_parsed` only checks
+that the snapshot is current, so it will not repopulate that field. A host in
+that state has indexable virtual URIs and no geometry, so symbol search silently
+drops it until an unrelated edit forces a reparse.
+
+That is real coverage loss with no signal, and it is accepted here only because
+the alternative was the resolve-inline path rejected above. The durable fixes
+are outside this decision: populate the region cache whenever virtual documents
+exist for a host, or give the cache a repair path an idle reader may trigger
+safely. Either is a better place to spend the effort than making fan-in mutate.
+
+Two identities must hold, not one:
+
+- **Document freshness.** The retained content/parsed version *and* incarnation
+  are compared against a single live `SnapshotView`. Incarnation alone is
+  insufficient: an ordinary edit preserves it and only bumps the content
+  version, which `DocumentSnapshot` does not carry. This is the discipline the
+  semantic token path already uses, and only the whole of it works — the
+  incarnation half alone would leave "the tree is gone" as the only edit race
+  the design notices.
+- **Query generation.** A settings reload replaces the injection queries and
+  bumps the settings generation *before* invalidating parses, and takes no
+  document edit lock — so a document-version check alone would accept geometry
+  produced under queries that no longer apply. The generation is captured and
+  re-checked, as the other query-sensitive paths already do. Because the
+  snapshot is generation-stamped, this is a comparison rather than a repair:
+  a mismatch drops the entries, and nothing has been mutated to undo.
+
+Translation takes the host's document edit lock before the final freshness
+comparison and holds it through translation. The cached snapshot is not exempt
+from needing this: it validates freshness only while handing out its `Arc`, so a
+`didChange` landing afterwards invalidates the geometry before the translation
+uses it, and an unlocked post-check races the same way. The lock is what makes
+"validated" and "used" the same instant.
+
+Because the path is read-only, that lock is held only across a map lookup, a
+version comparison, and arithmetic — no parse, no walk, no await on another
+runtime. That is the whole reason it is safe to hold at all.
+
+Keeping it that short requires care with the range validation above, which is
+where the cost hides. The strict position machinery builds a `PositionMapper`
+whose line index scans the whole text, and the codebase documents that as
+O(document). Rebuilding it per symbol under the lock would be
+`symbols × virtual_content` — the same multiplicative shape this section already
+rejected once. One mapper is built **per referenced region**, before the lock is
+taken; only the freshness comparison and the arithmetic happen inside it.
+
+Taking that lock carries an obligation the happy path hides. `edit_lock`
+**creates** an entry unconditionally, so a host that closed between indexing and
+fan-in yields no live `SnapshotView` — and simply dropping the symbol would
+leave the lock entry behind forever. The miss path must call
+`remove_edit_lock_if_unshared`, exactly as the semantic token path does. Fan-in
+reaches this case routinely, because the index is built from documents that may
+close while other targets are still answering.
+
+A residual race remains and is **accepted**: a `didChange` landing between the
+ensure and the freshness check invalidates the geometry, and those entries are
+dropped like any other unresolvable ones. Closing it entirely would mean pinning
+a per-document snapshot across the whole fan-in and translating against the
+pinned text — which would answer with coordinates into text the client has
+already replaced. Dropping is the safer failure.
+
+The response is an **array**, never `null`: the spec assigns no distinct meaning
+to `null` here, so "no server was selected" and "servers answered nothing" both
+come back empty.
+
+**Total failure is the exception.** An empty array is a claim — "these servers
+searched and found nothing" — and making it while every server was unreachable
+is confidently wrong at exactly the moment the user is least able to tell. A
+client shown "no matches" during an outage concludes the symbol does not exist.
+
+So the outcome is decided on whether any server's answer was **informative**,
+tracked **across every phase**, not just the response phase. A target can be lost after
+selection and before dispatch too: its reopen barrier fails, its send cannot
+re-acquire `connections` within budget, or registration, the stale-handle
+re-check, or the enqueue fails. Counting only "dispatched targets that errored"
+would let a query whose every target died pre-dispatch report a confident empty
+answer, since zero dispatches looks the same as zero results.
+
+Every entry ends in exactly one of three states, and the outcome is derived from
+those rather than from whole responses:
+
+- **Translated** — it reached the client.
+- **Semantically rejected** — examined, and found not to describe a place in
+  this workspace: the region is *gone*, its language changed, or the indexed URI
+  is retired. The answer was processed; it yielded fewer symbols. These are the
+  silent drops points 5 and 7 already accept. The common thread is that the
+  *place* no longer exists — kakehashi looked and there was nothing there.
+- **Infrastructure-failed** — nothing was learned. This covers entries never
+  examined — including entries a downstream returned **without a range**, or
+  with a range that is reversed or escapes its region once content identity has
+  already passed. Those are matches the server reported and kakehashi could not
+  place: unusable output, not an absent place, which is the line between this
+  state and the one above. Also entries whose **content identity moved**: an
+  edit during
+  the request means the downstream answered about text that no longer exists, so
+  a symbol it did not mention may simply have shifted. The bridge learned
+  neither that the workspace has no match nor where the match now is, which is
+  the definition of uninformative — and it is why the same paragraph calls this a
+  false-negative window rather than a filter. A
+  candidate **that policy admitted and is known to be capable**, whose connection
+  was already `Failed`, `Closing`, or `Closed` at selection (point 3), starts
+  here rather than never existing; one the allowlist, the cap, or a recorded
+  lack of the capability excluded is simply not a candidate. Also: the
+  pass-0 host→virtual snapshot, the translation-time identity re-read, or a
+  host's `edit_lock` expiring; and, importantly, geometry that is *unsettled*
+  rather than gone — a host still parsing, a pass whose 200ms ensure timed out,
+  or a region cache left empty by a population that lost an epoch race and could
+  not commit. "The parse has not caught up" is not "the symbol is not there",
+  even though both surface as no current geometry.
+
+An answer is **informative** when it produced at least one translated entry, or
+when every one of its entries was semantically rejected — including an empty
+response, which is a server saying it searched and found nothing.
+
+With one qualification, and it is the reason identity is checked **per target**
+and not only per entry. If any document that target was dispatched against
+changed between dispatch and translation — a virtual document, or the **host**
+document for a `_self` target, whose sync state carries its own downstream
+version and fingerprint — then that target's **negative** evidence is void: an
+empty answer, or one whose entries were all semantically rejected, stops
+counting as informative. An empty answer over stale text says nothing about the
+current text, since the match it omitted may have been added or shifted by the
+very edit that invalidated it, and there is no returned entry for an
+entry-level rollup to mark.
+
+Its **positive** evidence survives, with one exclusion. A drifted target can
+still have translated a symbol from an unrelated real file, or from a region
+nothing touched, and those entries are as good as any — drift on one document is
+no reason to discard a correct result from another, and identity is tracked per
+connection across documents that change independently.
+
+The exclusion is the drifted document's **own** entries. A `_self` server is
+handed the host under its real URI, so its results come back as real-file
+entries and pass through untranslated — which means a symbol it reported for a
+host that has since drifted carries a range measured against text that no longer
+exists, and nothing downstream of here would catch it. Real-file entries whose
+URI names a drifted `_self` host are therefore rejected, while entries naming
+any other file survive.
+
+So a drifted target with at least one surviving translated entry remains
+informative; only one that produced none loses its vote. Anything stronger would
+let an unrelated keystroke turn a working search into a request error.
+
+Granularity matters here: `edit_lock` expiry is per *host*, while one response
+can carry real-file entries and virtual entries from several hosts. One
+contended host must not turn an answer whose other entries translated fine into
+a request error, so poisoning is decided per entry and rolled up, never per
+response.
+
+- Selection **completed** and found no candidates → `[]`. Nothing failed; there
+  was nothing to ask. "No candidates" covers admissions that named none, ones
+  still `Initializing`, and dead ones **known to be incapable** — but not dead
+  ones known to be capable, which are infrastructure failures and fall to the
+  error case below (point 3).
+- **At least one informative** answer → its results, or `[]` if they genuinely
+  contained nothing. Partial failure stays soft.
+- Candidates existed and **no answer was informative** — for any reason, at any
+  phase → **request error**.
+- Selection **did not complete** and nothing was informative → **request
+  error**.
+
+The last two cases are why the unit is the entry rather than the response.
+Selection can expire its tracker or `connections` acquisition, and `_self`
+discovery is incomplete whenever `host_documents` was contended, so "no
+candidates" and "we could not find out" are different states. And a fan-in
+failure counts: if servers returned symbols and every entry was lost to a lock
+that could not be acquired or a parse that had not settled, the client would
+otherwise be told the search found nothing — the same confident falsehood as
+reporting an outage that way, arrived at from the other end.
+
+A downstream `null` is an answer, not a failure. The method's result type is
+`Option<WorkspaceSymbolResponse>` precisely because `null` is valid, so it
+normalizes to a successful empty vector **before** either array form is parsed.
+Treating it as a parse failure would let a conformant "I found nothing" trip the
+total-failure rule — the exact inversion this rule exists to prevent.
+
+Entries are emitted as **`SymbolInformation[]`, always** —
+`WorkspaceSymbolResponse::Flat` in `ls-types`, whose variant names are a
+misnomer: **both** variants are flat arrays, and the choice is the element type,
+not hierarchy (there is no nested form for this method, and `containerName` is
+spec-documented as unusable for re-inferring one). No client capability is
+consulted to decide it.
+
+`WorkspaceSymbol` earns nothing here. Its one advantage over the older type is
+the location-without-range form, which this design cannot use — every entry must
+carry a full `Location` (point 5) — and its `data` field, which is dropped
+because `workspaceSymbol/resolve` is not supported. What it costs is a shape
+risk: LSP gates the `WorkspaceSymbol[]` result form on
+`workspace.symbol.resolveSupport`, not on tag support, so a client that declares
+tags but not `resolveSupport` could be handed a form it does not accept.
+
+Gating on `tagSupport` instead was drafted and is wrong for exactly that reason.
+It also solved a problem `SymbolInformation` does not have: that type carries
+**both** `tags` and the legacy `deprecated` flag, so a modern client reads the
+tag and an older one reads the field, from one payload, with no branch and
+nothing to reverse. The normalization in point 4 folds an incoming `deprecated`
+into `SymbolTag::DEPRECATED`; on the way out both are populated, and tags are
+filtered to what the client declared.
+
+The cost is using a type the spec marks deprecated. That is the honest trade:
+the deprecated type is the one that is universally accepted and loses no
+information this design produces.
+
+### 6. Every wait is bounded; the synchronous work between them is not
+
+Every target is awaited, so latency is max-over-targets. The bounds are:
+
+- `wait_for_response` wraps each request in a hardcoded **30-second** timeout and
+  removes the router entry when it fires.
+- The reader's **liveness timeout** can independently fail a connection that has
+  gone silent, transitioning it to `Failed`.
+- `$/cancelRequest` is forwarded to every in-flight target, but LSP explicitly
+  permits a downstream to ignore `$/` notifications, so it is best-effort and
+  cannot be the guarantee.
+
+Selection is not quite free, and the earlier claim that it "adds no wait" was
+too strong. It must take the pool's `connections` mutex, and other paths hold
+that mutex across `.await`s — eager `didOpen` holds it while opening documents,
+and respawn and config invalidation hold it across purges and transition-lock
+waits. None of those carries a deadline, and cancel forwarding acquires the same
+mutex before it can notify a subscribed handler, so early subscription cannot
+interrupt a stall behind it.
+
+That last part has a consequence **accepted rather than solved**: a cancellation
+issued while selection is queued behind the mutex may not reach the handler
+before selection's budget expires, because local notification happens only after
+cancel forwarding has itself acquired the mutex and captured its downstream
+targets. The handler can therefore answer a partial success for a request the
+client already cancelled. Fixing it properly means a local wake-up path
+independent of target capture — worth doing, but a change to the cancellation
+machinery rather than to this method. The observable cost is small: the client
+discards an answer it no longer wants, and the alternative failure — holding the
+query open behind an unrelated stall — is worse.
+
+Every phase that can block on that mutex therefore carries **its own budget**,
+and there are two — because the mutex is taken twice, not once. Selection takes
+it to read the connection map; then each send **re-acquires** it for the
+stale-handle check before enqueueing, which is the precedent's own discipline
+and can stall behind exactly the same holders, after selection's budget has
+already been spent.
+
+The rule is uniform: **every lock this path *awaits* carries a three-second
+budget, and failing to acquire it drops the affected target or host** rather
+than blocking the query. That is more than the `connections` mutex — selection
+also awaits the tracker snapshot, each send re-acquires `connections` before
+enqueue, and translation takes each host's `edit_lock`. (`host_documents` is not
+in that list: it is `try_lock`ed under `connections` and never awaited, so
+contention drops the `_self` candidates immediately rather than consuming a
+budget.) None of these is safe to assume fast: injection processing holds
+`edit_lock` across downstream close, change, and eager-spawn awaits, so a query
+arriving mid-processing would otherwise wait on unrelated work with no bound.
+
+- **Selection**: the tracker snapshot, then `connections` — three seconds each.
+  Nothing else is *awaited*: under `connections` the validator queries the
+  reverse index synchronously and `host_documents` with `try_lock`, so there is
+  no third acquisition to budget and no await while a lock is held. The budget
+  covers *acquiring* each lock, not the filtering between them — that walk is synchronous with no
+  await, so a timeout could not preempt it anyway, and bounding what cannot be
+  interrupted would promise something the runtime does not deliver.
+- **Each send**: the pre-enqueue re-acquisition of `connections` — three
+  seconds, per target, independently. The content-identity snapshot is
+  `try_lock`ed *inside* that section rather than awaited, so it adds no wait;
+  contention drops the target. Either failure counts as a failed target for the
+  outcome rule in point 5.
+- **Fan-in**: the pass-0 host→virtual snapshot, and the translation-time
+  identity re-read — three seconds each. These come *after* every downstream
+  response, so they are easy to overlook, and unbudgeted they would reintroduce
+  an unbounded wait at the very end of the query. Expiry marks the affected
+  entries **infrastructure-failed** (point 5), not semantically rejected:
+  entries never examined are not evidence that the search found nothing.
+- **Translation's `edit_lock`** per host: three seconds. A host whose lock
+  cannot be taken in time loses that query's entries — marked
+  infrastructure-failed, like unsettled geometry and unlike a region that is
+  genuinely gone (point 5).
+
+Separate budgets rather than one deadline spanning the whole dispatch, because a
+single outer deadline would silently consume the reopen barrier's two seconds
+(point 3) and cancel it in a way its own timeout never reports. Together with
+the 200ms bound on each parse ensure (point 5), these are the deadlines the
+design adds; every other bound it relies on already existed.
+
+Beyond those budgets, nothing new is introduced: every target is already
+`Ready` when chosen (point 3), so nothing waits for a handshake before the
+request goes out, and the reopen barrier in step 5 is itself bounded to two
+seconds. Because no target is ever cold-started (point 7), the practical case is
+bounded by servers that are already running and already answering other
+requests.
+
+### 7. Coverage is what is live, and a query never cold-starts a server
+
+A candidate with no live connection is **skipped**, not spawned. Coverage is
+therefore bounded by what the client has opened, and grows as it opens more.
+
+Stated precisely, it is **the servers currently holding an open document for
+this workspace** — not "every running server". The two differ, and the gap is
+user-visible: `didClose` removes kakehashi's document tracking but deliberately
+leaves the downstream connection running, so closing the last buffer for a
+language drops that server from selection even though it is still `Ready`. What
+that costs depends on the server: whether a downstream retains a usable
+workspace index after `didClose` is server-specific and not something kakehashi
+can know. Where it does, a query that would have been answered comes back
+empty — and if that server was the only one selected, the whole search does,
+with no failure anywhere.
+
+That follows from deriving the candidate axes from open documents, which is what
+makes them concrete (point 3) — the alternative derivations lose `_` handling or
+`["*"]` servers entirely. Closing it properly means letting a connection outlive
+the document that justified it — a change to what the pool remembers rather than
+to this method. Point 9 records it as a blocker, not a follow-up.
+
+This is not merely a cost trade. Cold-starting cannot deliver the coverage it
+appears to promise:
+
+- **Embedded-block symbols cannot be reached by spawning at all.** A virtual
+  document does not exist on disk, so a downstream learns of it only through
+  `didOpen`, and kakehashi opens virtual documents only for host documents the
+  *client* has opened. Reaching embedded code in unopened files would mean
+  parsing every candidate host file in the workspace and opening every region —
+  precisely the unbounded work this method must not do.
+- **Real-file coverage would be partial and hard to predict.** A server spawned
+  without a document hint lands on the single `ClientFallback` connection key.
+  That is not as limiting as one root, since the pool hands such a connection
+  the client root *and* the full upstream `workspaceFolders` snapshot, which
+  initialization forwards verbatim — a multi-root-capable server can index every
+  folder the client declared. What it misses is everything derived from root
+  markers: a monorepo's per-package roots become one undifferentiated workspace
+  instead of the per-root connections normal routing would have produced.
+- **Scoping by "does this language occur in the workspace?" would need a
+  mechanism that does not exist.** The LSP server is document-driven and holds
+  no workspace index; nothing walks the filesystem on the server path. Under the
+  live-only rule that question answers itself: a language with no open file has
+  no live server and is not queried.
+
+Coverage is not monotonic. `didClose` is forwarded downstream, a respawned
+connection starts with nothing open and regains virtual documents only via a
+best-effort re-open sweep, and a `Failed` connection is replaced lazily on next
+use — so a host document can stay open with its connection dead. Each of those
+shrinks coverage with no signal to the user.
+
+### 8. This is the first deliberate cross-block feature
+
+Every other bridged navigation path filters out results addressed to a region
+other than the request's own, because a cross-region offset is unsafe when only
+one region's offset is known. Workspace symbol search holds every region's
+geometry for the hosts it touches, so each entry is translated by its own
+region's offset rather than by a single borrowed one.
+
+Shipping this obliges edits in **both** user-facing docs, in four separate
+respects. They are listed here because more than one review round found the
+inventory incomplete.
+
+*The no-cross-block rule is stated as a blanket claim and must be amended, not
+appended to* — the wrong part is the framing sentence, while both files'
+itemized bodies are already correctly scoped to the goto/references/rename
+transforms and stay true:
+
+- `docs/language-features.md` — "Bridged features are also limited to embedded
+  code blocks in one respect: navigation and edits do not cross between blocks",
+  and separately "features that need to see across blocks do not work between
+  them".
+- `docs/README.md` — "**No cross-region results within the host document**".
+
+*The strategy set is described as closed* in two more places, both of which
+enumerate exactly `preferred`/`concatenated` and both of which additionally
+assert that every other method dispatches `preferred` regardless:
+
+- `docs/language-features.md` — the "When several servers handle one language"
+  table and its lead-in ("one of two strategies").
+- `docs/README.md` — the `strategy` row of the aggregation table.
+
+And `maxFanOut`'s description must record, in **all three** places that state
+its contract, that for `workspace/symbol` it selects names per pair and does
+**not** cap the query's total requests or connections:
+`docs/README.md`'s aggregation table, `docs/language-features.md`'s
+"`maxFanOut` limits how many servers are queried", and the doc-comment on the
+field in `src/config/settings.rs` — which is the source of the generated schema,
+and so the one users are most likely to read.
+
+*And the feature must move* out of `docs/language-features.md`'s "Not currently
+provided" list into a section of its own, and into `docs/README.md`'s
+bridge-backed request list — carrying the live-only coverage contract and the
+fact that coverage can shrink.
+
+One more site is a **related ADR**, and it is wrong rather than merely
+incomplete: language-server-bridge-request-strategies states universally that
+every other method dispatches `preferred`, and `workspace/symbol` is now a
+counterexample. Its per-method table gains no row — that part is only an
+omission — but the universal sentence must be corrected.
+
+`docs/README.md`'s cross-layer `layers.aggregation` `strategy` row belongs to
+the closed-set list above too: it will schema-accept an inert `union` while
+documenting only two values.
+
+### 9. Two gaps that must be closed before this ships
+
+These are **not** accepted limitations. Both were argued through in review and
+both survive as real defects of the design above; what this decision does *not*
+do is specify their mechanisms, for a reason given in Considered Options.
+
+- **Closing the last buffer for a language removes its server from search.**
+  Candidates are derived from open documents, but `didClose` removes kakehashi's
+  document tracking while deliberately leaving the downstream connection
+  running — so a `Ready` server that may still hold a usable real-file index
+  stops being asked, and if it was the only one selected the search goes empty
+  with no failure anywhere. The respawn purge window is the same defect seen
+  twice: a purged connection is invisible to selection until its documents are
+  replayed. The same derivation has a third face: a workspace whose servers
+  **all failed to start** answers `[]` rather than reporting an outage, because
+  coverage comes from successful document opens and there were none. A workspace
+  search that silently narrows when you close a file — or that reports "no
+  matches" when nothing ever started — is not one; whatever mechanism is chosen,
+  this must behave correctly at ship.
+- **`max_fan_out` does not bound this query.** It selects server *names* per
+  pair, one name reaches every root it is live on, and a connection one pair
+  excluded re-enters through another — so `max_fan_out = 1` can issue many
+  concurrent requests, against a setting documented as capping exactly that.
+  This is the widest fan-out kakehashi has and the one its only load control
+  stops bounding. Documentation cannot repair a guarantee the code stopped
+  providing.
+
+### 10. Deferred in this decision
+
+- `workspaceSymbol/resolve` — `resolveProvider` is advertised as `false`. Because
+  kakehashi keeps `resolveSupport` absent from the `workspace.symbol` capability
+  it declares downstream (point 5), an entry arriving without a range is a
+  downstream conformance bug; point 5 drops it.
+- `workDoneToken` / `partialResultToken` — neither is forwarded downstream, and
+  `workDoneProgress` is left unset on the advertised
+  `workspaceSymbolProvider`. The existing client-progress aggregator is keyed by
+  region and has no meaning for a request that has no region. Both tokens are
+  optional in LSP 3.18.
+- **Request coalescing.** A symbol picker typically fires one request per
+  keystroke, and this design has no single-flight, debounce, or supersession —
+  each keystroke fans out to every live connection. The repo has prior art for
+  exactly this failure mode in the semantic-token and diagnostic wire floods.
+  Nothing here prevents it; it is left for a follow-up once real traffic exists
+  to measure, and is the most likely first regression.
+
+## Considered Options
+
+**`preferred`, as everywhere else.** Rejected: `preferred` encodes "these are
+competing answers to one question", and — because a response cannot be
+attributed to a pair — kakehashi has no way to tell competing from
+complementary here. Every arbitration it could perform discards symbols on a
+basis it cannot compute.
+
+**Allow `preferred` within a single pair, union only across pairs.** Rejected:
+it sounds like a smaller change, but "within a pair" does not delimit a coherent
+set of results, since a server named by LANG_1's pair can return LANG_2 symbols.
+Rejecting it is what collapses the design: once no level arbitrates, the
+per-pair walk reduces to a candidate-set walk.
+
+**Attribute each returned symbol to a language by detecting its URI's language,
+then apply the owning pair's strategy.** Rejected: it would put language
+detection in the fan-in hot path, and it still cannot recover which pair owns a
+result — a file may be claimed by several — so it buys a fragile mechanism that
+does not answer the question it was built for.
+
+**Reuse `concatenated` instead of adding `union`.** Rejected: `concatenated`
+must not deduplicate (see the diagnostics and codeAction defaults), and a symbol
+search should. Overloading it would make the existing strategy's contract
+conditional on the method.
+
+**Cold-start every configured server so a query covers languages no open file
+uses.** Rejected, per point 7. It reads like the thorough option, but it buys no
+embedded-block coverage at all, and the real-file coverage it does buy comes
+from a single fallback connection that receives the client's declared folders
+but none of the marker-derived subroots normal routing would have produced. It also cannot answer "does this language even
+occur in the workspace?" without a workspace file walk the LSP server does not
+have.
+
+**Cold-start, and additionally `didOpen` the workspace's files so the spawned
+servers have something to index.** Rejected as unbounded: covering embedded code
+in unopened files means parsing every candidate host file in the workspace and
+opening every extracted region, on a request the user expects to be interactive.
+This is the option that shows the cold-start direction has no cheap stopping
+point — which is what makes live-only the right cut rather than merely the
+cheap one.
+
+**Reuse `transform_location_for_goto` with a synthetic "request virtual URI".**
+Rejected: its filter exists to *prevent* cross-region translation, so any
+synthetic value either drops everything or defeats the guard.
+
+**Resolve `priorities`/`max_fan_out` from the wildcard
+(`languages._._.aggregation["workspace/symbol"]`) entry only.** Rejected: it
+gives the feature exactly one knob, but it makes every per-language
+`bridge.<key>.aggregation` block a **silent no-op** for this method. Silently
+discarding valid configuration is worse than the complexity it avoids.
+
+**Merge every pair's `priorities` into one global ordered allowlist.** Rejected:
+a server configured under several pairs would hold several conflicting positions
+and several `max_fan_out` caps, with no principled merge. Under `union` the
+question dissolves — each pair contributes candidates independently, and the
+result set is order-free.
+
+**Specify the two shipping blockers' mechanisms in this ADR.** Attempted and
+abandoned. Point 9's gaps were pursued concretely — a pool-held admission
+registry keyed by `ConnectionKey` to outlive `didClose` and the respawn purge,
+and a new top-level `workspaceSymbolMaxFanOut` to restore the ceiling. Both are
+plausible directions and may well be the right ones. But specifying them here
+did not work: across four review rounds the findings against them grew rather
+than shrank (4 → 5 → 7 → 8), and nearly every new finding was an edge of those
+two mechanisms rather than of the design they were added to — invalidation that
+must distinguish a failure respawn from a reconfiguration, snapshots that can
+outlive the invalidation that cleared them, cap slots spent on connections that
+are replaced before enqueue, an early-return the disable case needs, a total
+order the truncation needs.
+
+Every one of those is a question about *runtime behaviour under concurrent
+lifecycle events*, which is the class of question a document cannot settle and a
+test can. Continuing would have kept trading a stated gap for an unvalidatable
+mechanism. So this decision names the gaps as blockers and leaves their design
+to the change that implements them, where each answer is checkable.
+
+**Honour an explicitly configured `preferred` instead of overriding it.**
+Rejected: overriding explicit configuration is a real cost, but silently losing
+symbols the user did not know they were excluding is worse, and the override is
+announced once at settings-apply time rather than hidden.
+
+**Include `container_name` in the dedup key.** Rejected: LSP documents it as a
+UI-only field that cannot be used to re-infer hierarchy, and imposes no format
+contract, so two servers describing the same symbol routinely disagree on it.
+Including it would defeat dedup on a field carrying no identity.
+
+## Consequences
+
+### Positive
+
+- Symbol search reaches both real project files (via the downstream servers'
+  own indexes) and symbols inside embedded code blocks, in one result set.
+- The global virtual→host translator is reusable by any future workspace-scoped
+  method (call hierarchy, type hierarchy) that faces the same fan-in problem.
+- Per-language `aggregation` blocks keep selecting servers for this method — a
+  workspace-scoped request does not force users into a separate configuration
+  dialect, and no existing block silently becomes a no-op.
+- No result is discarded on a basis kakehashi cannot compute. A server
+  configured under one language may return another language's symbols, and they
+  survive.
+- Because nothing arbitrates, there is no ordering dependency between targets —
+  the handler is a flat fan-out/translate/merge. This removes ordering state,
+  **not** storage: fan-in waits for every target before classifying anything
+  (point 5), so peak memory is the sum of all targets' complete responses, held
+  while the slowest target runs out its 30-second budget.
+- A query never spawns a process, so `Ctrl-T` in a fresh session cannot stampede
+  every configured language server.
+
+### Negative
+
+- A file opened from outside the client's workspace no longer contributes its
+  project's symbols here, though the connection it spawned still serves that
+  file's own bridged requests. Three leaks remain by design (point 3): a
+  `preferSharedInstance` server holding both an in-workspace and an external
+  root is indivisible; a server rooted *above* the workspace — the ordinary case
+  when `.git` sits above the opened folder — indexes its whole tree, so a search
+  returns sibling packages too; and a stray file with no marker above it lands
+  on the always-admitted `ClientFallback` connection.
+- Results depend on what is open, and coverage can shrink (close, respawn,
+  silent connection death). Closing the last buffer for a language removes its
+  server from search even though the process is still running and may still be
+  usefully indexed; the respawn window has the same cause, since a purged
+  connection is invisible to selection until its documents are replayed. Both
+  are **shipping blockers** (point 9), not costs this decision accepts. The same query answers differently at different
+  points in a session. LSP permits partial `workspace/symbol` results, but a
+  user expecting an indexed whole-project search will find this surprising.
+- Latency is max-over-live-targets, and every *wait* is bounded: the pool's 30s
+  request timeout and liveness timeout, a three-second budget on **every** lock
+  this path awaits (the candidate tracker snapshot, `connections`, each send's
+  `connections` re-acquisition, the pass-0 host→virtual snapshot, the
+  translation-time identity re-read, and each host's `edit_lock`), and the
+  reopen barrier's two seconds. Total latency is not bounded, because the synchronous
+  filtering between those waits cannot be preempted. Forwarded cancellation is
+  best-effort, since a downstream may ignore it.
+- One request per keystroke, un-coalesced (point 9).
+- Fan-in can wait on a parse: the distinct host documents a result addresses are
+  ensured before translation. Because they are ensured concurrently the pass
+  costs about one 200ms wait rather than one per document (point 5).
+- An edit landing between that ensure and the freshness check drops the affected
+  entries. The window is small but not closed, and the failure is silent.
+- A host whose region cache was left empty by a refused populate pass loses its
+  embedded symbols **until an unrelated edit forces a reparse** — not just for
+  one query (point 5). This is the one accepted failure here that is not
+  self-correcting, and it has no signal to the user.
+- `max_fan_out` no longer bounds a query's total fan-out — only each pair's
+  contribution — so nothing bounds how many connections one query touches. This
+  is a **shipping blocker**, not an accepted cost (point 9).
+- Adding the `Union` variant forces a `Union` arm at 7 exhaustive `match` sites
+  in methods that have no use for it.
+- A server still `Initializing` when the query arrives is skipped entirely, so
+  a search in the seconds after opening a file can miss it (point 3).
+- `_self` targets are dropped when `host_documents` is contended at validation
+  time, since it is `try_lock`ed rather than awaited (point 3). Host-bridged
+  symbols can therefore be absent from one query for a reason the user cannot
+  see.
+- Every lock this path *awaits* — the candidate tracker snapshot, `connections`,
+  each send's re-acquisition, the two fan-in tracker reads, each host's
+  `edit_lock` — is bounded only in its **acquisition** (`host_documents` and the
+  per-send identity snapshot are never awaited; they are `try_lock`ed under
+  `connections`, and contention drops the affected candidates), because
+  other paths hold these across unbounded async work (point 6); the filtering
+  between them is synchronous and cannot be preempted, so neither total
+  selection time nor cancellation blocking is capped. Expiring any of those
+  budgets answers from a partial target set — and a cancellation queued behind
+  the `connections` mutex may arrive too late to stop it, so a cancelled request
+  can still be answered.
+- The content-identity check proves a `didChange` was *enqueued*, not delivered:
+  notifications carry no acknowledgement and a failed write does not fail the
+  connection. The stale-result window is narrowed, not closed (point 5).
+- It also has a false-negative window in the other direction: `didChange`
+  releases `connections` before bumping its revision and recording its
+  fingerprint, so a change landing beside a dispatch can expose a pair no
+  snapshot matches, and those symbols are dropped from that query (point 4).
+- `max_fan_out` does not bound this method's total fan-out. It selects names
+  per pair, and a connection one pair excluded re-enters through another pair
+  that legitimately opened it. Its documented promise to cap concurrent server
+  requests does not hold here, which is why the documentation must say so.
+- The `kakehashi-virtual-uri-*` filename space is reserved: a real workspace
+  file named into it is invisible to symbol search (point 5).
+- No configuration can express "suppress B's duplicates, but fall back to B when
+  A fails" — `union` has no conditional and `priorities` is unconditional, so
+  users pick one or the other (point 2).
+- `strategy` becomes a knob that this one method ignores. A **method-specific**
+  entry warns; a `_` wildcard that happens to reach the method is overridden
+  silently, by design (point 2). Users
+  who reach for `preferred` to suppress a noisy server must instead leave it out
+  of `priorities` — in every pair that names it.
+- Dedup is exact-match, so two servers that disagree on a symbol's range both
+  survive. The redundant-server case is a config edit, not something the merge
+  resolves.
+- Whether a downstream includes kakehashi's virtual documents in its own symbol
+  index is server-specific — the virtual files do not exist on disk, and servers
+  that index only on-disk workspace contents will contribute real-file symbols
+  only.
+- Shipping this obliges documentation changes, not just additions: both
+  user-facing files state the no-cross-block rule as a blanket claim, both
+  describe the strategy set as a closed pair, and a related ADR states the
+  same closure as a universal rule (point 8).
+
+### Neutral
+
+- `Union` is a named strategy but is meaningful only for this method; elsewhere
+  it is normalized to that method's existing default before any handler runs, so
+  configuring it there changes nothing. `layers.aggregation["workspace/symbol"]
+  .strategy = "union"` is schema-valid and inert for the same reason this method
+  never reaches the cross-layer walk.
+- Exposing `union` in the serialized config and the generated schema is a
+  **one-way door**: it is public API from the first release that ships it, yet
+  it offers no choice anywhere — mandatory where it applies, inert everywhere
+  else, including every document-scoped method and every layer entry that will
+  now schema-accept it as a no-op. Keeping the merge internal would have left
+  that door open.
+
+  This was weighed and **settled**: a named, inspectable strategy value is the
+  maintainer's explicit preference over a hidden merge rule, on the grounds that
+  a user reading the config should be able to see what this method does. The
+  cost is recorded here so that a later reversal is a deliberate deprecation
+  rather than a surprise — and so that it is not re-litigated as an oversight.
+- Result ordering is deterministic but not relevance-ranked. LSP delegates
+  scoring to the client ("editors will apply their own highlighting and scoring
+  on the results"), so a client that re-sorts sees no change and one that does
+  not gets a stable order.
+- The fan-out and fan-in halves live in different modules
+  (`bridge/workspace/symbol.rs` and `lsp_impl/workspace/symbol.rs`) because of
+  the `pub(super)` boundaries between them, not because of a design preference.
