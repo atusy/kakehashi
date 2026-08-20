@@ -41,36 +41,126 @@ impl DeprecatedKeysSeen {
     }
 }
 
-/// User-facing text for the one-per-session `rootMarkers` deprecation notice,
-/// shared by every path that can surface it (initialize, didChangeConfiguration).
-pub(crate) const ROOT_MARKERS_DEPRECATION_NOTICE: &str = "kakehashi: the `rootMarkers` config key is deprecated; rename it to \
-     `workspaceMarkers`. `rootMarkers` still works for now but may be removed \
-     in a future release.";
+crate::deprecation::declare_deprecation_notice!(
+    /// User-facing text for the one-per-session `rootMarkers` deprecation notice,
+    /// shared by every path that can surface it (initialize, didChangeConfiguration).
+    pub(crate) const ROOT_MARKERS_DEPRECATION_NOTICE;
+    name = "languageServers.*.rootMarkers",
+    deprecated_in = 0,
+    remove_in = 2,
+    message = "kakehashi: the `rootMarkers` config key is deprecated; rename it to \
+         `workspaceMarkers`. `rootMarkers` still works for now but will be removed \
+         in kakehashi v"
+);
 
-/// User-facing text for runtime client-pushed configuration that still uses the
-/// old unwrapped/flat `workspace/didChangeConfiguration` shape.
-pub(crate) const UNWRAPPED_DIDCHANGE_CONFIGURATION_NOTICE: &str = "kakehashi: unwrapped `workspace/didChangeConfiguration` settings are deprecated; \
-     send runtime settings in the notification's `settings.kakehashi` object. \
-     Flat didChange settings still work for now but may be removed in a future release.";
+crate::deprecation::declare_deprecation_notice!(
+    /// User-facing text for runtime client-pushed configuration that still uses the
+    /// old unwrapped/flat `workspace/didChangeConfiguration` shape.
+    pub(crate) const UNWRAPPED_DIDCHANGE_CONFIGURATION_NOTICE;
+    name = "unwrapped workspace/didChangeConfiguration settings",
+    deprecated_in = 0,
+    remove_in = 2,
+    message = "kakehashi: unwrapped `workspace/didChangeConfiguration` settings are deprecated; \
+         send runtime settings in the notification's `settings.kakehashi` object. \
+         Flat didChange settings still work for now but will be removed in kakehashi v"
+);
 
-/// User-facing text for the one-per-session top-level `autoInstall` notice.
-///
-/// Dotted key paths, not TOML table syntax: this notice also fires for JSON
-/// runtime settings (`initializationOptions`, `didChangeConfiguration`), where
-/// `[languages._]` would name a shape the user cannot write.
-pub(crate) const AUTO_INSTALL_DEPRECATION_NOTICE: &str = "kakehashi: the top-level `autoInstall` config key is deprecated; move it to \
-     `languages._.autoInstall` (and override per language with \
-     `languages.<lang>.autoInstall`). A language with a self-referential \
-     `base` inherits nothing from `_`, so give those an explicit value. The \
-     top-level key still works for now but may be removed in a future release.";
+crate::deprecation::declare_deprecation_notice!(
+    /// User-facing text for the one-per-session top-level `autoInstall` notice.
+    ///
+    /// Dotted key paths, not TOML table syntax: this notice also fires for JSON
+    /// runtime settings (`initializationOptions`, `didChangeConfiguration`), where
+    /// `[languages._]` would name a shape the user cannot write.
+    pub(crate) const AUTO_INSTALL_DEPRECATION_NOTICE;
+    name = "top-level autoInstall",
+    deprecated_in = 0,
+    remove_in = 2,
+    message = "kakehashi: the top-level `autoInstall` config key is deprecated; move it to \
+         `languages._.autoInstall` (and override per language with \
+         `languages.<lang>.autoInstall`). A language with a self-referential \
+         `base` inherits nothing from `_`, so give those an explicit value. The \
+         top-level key still works for now but will be removed in kakehashi v"
+);
 
-/// User-facing text for the one-per-session top-level `captureMappings`
-/// notice. The dotted path is usable for both TOML and JSON configuration.
-pub(crate) const CAPTURE_MAPPINGS_DEPRECATION_NOTICE: &str = "kakehashi: the top-level `captureMappings` config key is deprecated; move highlight mappings to \
-     `features.\"textDocument/semanticTokens\".captureMappings` in TOML (or \
-     `features[\"textDocument/semanticTokens\"].captureMappings` in JSON) and remove the \
-     intermediate `highlights` key. The top-level key still works for now but \
-     may be removed in a future release.";
+crate::deprecation::declare_deprecation_notice!(
+    /// User-facing text for the one-per-session top-level `captureMappings`
+    /// notice. The dotted path is usable for both TOML and JSON configuration.
+    pub(crate) const CAPTURE_MAPPINGS_DEPRECATION_NOTICE;
+    name = "top-level captureMappings",
+    deprecated_in = 0,
+    remove_in = 2,
+    message = "kakehashi: the top-level `captureMappings` config key is deprecated; move highlight mappings to \
+         `features.\"textDocument/semanticTokens\".captureMappings` in TOML (or \
+         `features[\"textDocument/semanticTokens\"].captureMappings` in JSON) and remove the \
+         intermediate `highlights` key. The top-level key still works for now but \
+         will be removed in kakehashi v"
+);
+
+crate::deprecation::declare_deprecation!(
+    pub(crate) const ALIASES_DEPRECATION;
+    name = "languages.*.aliases",
+    deprecated_in = 0,
+    remove_in = 2,
+);
+pub(crate) fn aliases_deprecation_notice(language: &str, aliases: &[String]) -> String {
+    let aliases = aliases
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if aliases.is_empty() {
+        return format!(
+            "Language '{language}' uses an empty deprecated 'aliases' field. \
+             Remove the empty 'aliases' field. The 'aliases' field will be removed in \
+             kakehashi v{}.",
+            ALIASES_DEPRECATION.remove_in_major()
+        );
+    }
+    let has_reserved_alias = aliases.contains("_");
+    let has_self_alias = aliases.contains(language);
+    let aliases = aliases
+        .into_iter()
+        .filter(|alias| *alias != "_" && *alias != language)
+        .collect::<Vec<_>>();
+    let special_guidance = match (has_reserved_alias, has_self_alias) {
+        (true, true) => {
+            "The `_` alias is reserved and must not become a base entry. \
+             A self-alias needs no base entry.\n"
+        }
+        (true, false) => "The `_` alias is reserved and must not become a base entry.\n",
+        (false, true) => "A self-alias needs no base entry.\n",
+        (false, false) => "",
+    };
+    if aliases.is_empty() {
+        return format!(
+            "Language '{language}' uses deprecated 'aliases' field. Remove the 'aliases' field. \
+             {special_guidance}The 'aliases' field will be removed in kakehashi v{}.",
+            ALIASES_DEPRECATION.remove_in_major()
+        );
+    }
+    let language_toml = toml::Value::String(language.to_owned()).to_string();
+    let toml_examples = aliases
+        .iter()
+        .map(|alias| {
+            let alias = toml::Value::String((*alias).to_owned()).to_string();
+            format!("[languages.{alias}]\nbase = {language_toml}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut derived_languages = serde_json::Map::new();
+    for alias in aliases {
+        derived_languages.insert(alias.to_owned(), serde_json::json!({ "base": language }));
+    }
+    let json = serde_json::json!({ "languages": derived_languages });
+    format!(
+        "Language '{language}' uses deprecated 'aliases' field. \
+         Use 'base' on each derived language instead. Edit each existing language entry in \
+         place; do not add a duplicate table or object key.\n\
+         TOML:\n{toml_examples}\n\
+         JSON:\n{json}\n\
+         {special_guidance}The 'aliases' field will be removed in kakehashi v{}.",
+        ALIASES_DEPRECATION.remove_in_major()
+    )
+}
 
 /// Which deprecated keys the raw TOML text spells.
 ///
@@ -130,6 +220,15 @@ pub(crate) fn json_deprecated_keys(value: &JsonValue) -> DeprecatedKeysSeen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn v0_deprecation_notices() -> [&'static str; 4] {
+        [
+            ROOT_MARKERS_DEPRECATION_NOTICE,
+            UNWRAPPED_DIDCHANGE_CONFIGURATION_NOTICE,
+            AUTO_INSTALL_DEPRECATION_NOTICE,
+            CAPTURE_MAPPINGS_DEPRECATION_NOTICE,
+        ]
+    }
 
     #[test]
     fn merge_ors_flags_so_a_clean_later_layer_cannot_clear_them() {
@@ -255,6 +354,107 @@ rootMarkers = [".git"]
         assert!(
             CAPTURE_MAPPINGS_DEPRECATION_NOTICE
                 .contains("features[\"textDocument/semanticTokens\"].captureMappings")
+        );
+    }
+
+    #[test]
+    fn every_v0_notice_names_the_v2_removal() {
+        for notice in v0_deprecation_notices() {
+            assert!(
+                notice.contains("removed in kakehashi v2"),
+                "v0 deprecation notice must name its removal deadline: {notice}"
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_notice_gives_valid_toml_and_json_migrations_with_declared_deadline() {
+        let notice = aliases_deprecation_notice("markdown", &["rmd".to_owned()]);
+        let expected = format!(
+            "Language 'markdown' uses deprecated 'aliases' field. Use 'base' on each derived \
+             language instead. Edit each existing language entry in place; do not add a \
+             duplicate table or object key.\nTOML:\n[languages.\"rmd\"]\nbase = \"markdown\"\nJSON:\n\
+             {{\"languages\":{{\"rmd\":{{\"base\":\"markdown\"}}}}}}\n\
+             The 'aliases' field will be removed in kakehashi v{}.",
+            ALIASES_DEPRECATION.remove_in_major()
+        );
+        assert_eq!(notice, expected);
+    }
+
+    #[test]
+    fn aliases_notice_escapes_language_ids_in_both_migration_formats() {
+        let notice = aliases_deprecation_notice("mark\"down", &["r.md\"x".to_owned()]);
+        let toml_example = notice
+            .split_once("TOML:\n")
+            .and_then(|(_, examples)| examples.split_once("\nJSON:\n"))
+            .map(|(toml, _)| toml)
+            .expect("TOML migration example");
+        let parsed_toml: toml::Value = toml::from_str(toml_example).expect("valid TOML example");
+        assert_eq!(
+            parsed_toml["languages"]["r.md\"x"]["base"].as_str(),
+            Some("mark\"down")
+        );
+
+        let json_example = notice
+            .split_once("\nJSON:\n")
+            .and_then(|(_, rest)| rest.split_once("\nThe 'aliases' field"))
+            .map(|(json, _)| json)
+            .expect("JSON migration example");
+        let parsed_json: serde_json::Value =
+            serde_json::from_str(json_example).expect("valid JSON example");
+        assert_eq!(
+            parsed_json["languages"]["r.md\"x"]["base"].as_str(),
+            Some("mark\"down")
+        );
+    }
+
+    #[test]
+    fn empty_aliases_notice_only_requests_removing_the_field() {
+        let notice = aliases_deprecation_notice("markdown", &[]);
+        assert!(
+            notice.contains("Remove the empty 'aliases' field"),
+            "{notice}"
+        );
+        assert!(!notice.contains("<derived>"), "{notice}");
+        assert!(!notice.contains("TOML:"), "{notice}");
+        assert!(!notice.contains("JSON:"), "{notice}");
+    }
+
+    #[test]
+    fn aliases_notice_migrates_every_distinct_alias() {
+        let aliases = vec!["rmd".to_owned(), "qmd".to_owned(), "rmd".to_owned()];
+        let notice = aliases_deprecation_notice("markdown", &aliases);
+        assert_eq!(notice.matches("[languages.\"rmd\"]").count(), 1);
+        assert_eq!(notice.matches("[languages.\"qmd\"]").count(), 1);
+
+        let json_example = notice
+            .split_once("\nJSON:\n")
+            .and_then(|(_, rest)| rest.split_once("\nThe 'aliases' field"))
+            .map(|(json, _)| json)
+            .expect("JSON migration example");
+        let parsed_json: serde_json::Value =
+            serde_json::from_str(json_example).expect("valid JSON example");
+        assert_eq!(
+            parsed_json["languages"]["rmd"]["base"].as_str(),
+            Some("markdown")
+        );
+        assert_eq!(
+            parsed_json["languages"]["qmd"]["base"].as_str(),
+            Some("markdown")
+        );
+    }
+
+    #[test]
+    fn aliases_notice_does_not_migrate_reserved_or_self_aliases() {
+        let aliases = vec!["_".to_owned(), "markdown".to_owned(), "rmd".to_owned()];
+        let notice = aliases_deprecation_notice("markdown", &aliases);
+        assert!(notice.contains("[languages.\"rmd\"]"), "{notice}");
+        assert!(!notice.contains("[languages.\"_\"]"), "{notice}");
+        assert!(!notice.contains("[languages.\"markdown\"]"), "{notice}");
+        assert!(notice.contains("`_` alias is reserved"), "{notice}");
+        assert!(
+            notice.contains("self-alias needs no base entry"),
+            "{notice}"
         );
     }
 

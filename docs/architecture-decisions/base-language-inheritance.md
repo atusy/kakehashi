@@ -123,11 +123,19 @@ first-line normalization with base fallback. This keeps configured injection
 keys authoritative while still canonicalizing unconfigured aliases such as
 `py` -> `python` without requiring a parser to be loaded.
 
-### Removed: `aliases` Field
+### Removed behavior and staged removal: `aliases` Field
 
-The `aliases` field is removed from language configuration with a deprecation warning. When `aliases` is still present, the server emits a client-visible warning with migration guidance.
+Alias resolution is removed: retained `aliases` values no longer register
+alternative language IDs. The input field itself remains accepted and ignored
+through v1 so the server can emit a client-visible migration warning. It is
+removed from the configuration schema and parser in v2, in accordance with
+deprecation-removal-deadlines.
 
-**Migration**: Each `aliases = ["x", "y"]` on language `L` becomes:
+**Migration**: Each distinct alias other than the reserved `_` key or `L`
+itself becomes a derived language. Remove `_` and self-aliases without creating
+`base` entries. If the alias already has a language entry, add or update `base`
+in that entry rather than declaring the table or object key a second time. For
+example, `aliases = ["x", "y"]` on language `L` becomes:
 
 ```toml
 [languages.x]
@@ -206,6 +214,7 @@ base = "L"
 - [language-detection-fallback-chain](language-detection-fallback-chain.md): Language detection fallback chain (alias resolution replaced by base resolution)
 - [configuration-merging-strategy](configuration-merging-strategy.md): Cross-layer configuration merging (base chain operates after layer merging)
 - [wildcard-config-inheritance](wildcard-config-inheritance.md): Wildcard config inheritance (`base` generalizes `_` inheritance)
+- [deprecation-removal-deadlines](deprecation-removal-deadlines.md): Compile-time removal boundary for the retained `aliases` input field
 
 ## Appendix: Configuration Examples
 

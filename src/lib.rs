@@ -3,6 +3,7 @@ pub(crate) mod cancel;
 pub mod cli;
 pub(crate) mod compute_pool;
 pub mod config;
+pub(crate) mod deprecation;
 pub(crate) mod document;
 pub(crate) mod error;
 pub(crate) mod experimental;

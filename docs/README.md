@@ -108,7 +108,8 @@ Parsers are stored in `{data_dir}/parser/` and queries in `{data_dir}/queries/`.
 
 Configuration is provided via LSP `initializationOptions`. All options are optional.
 
-This section is a practical reference. For the exhaustive field list and types, see `kakehashi config schema`.
+This section is a practical reference. For the canonical field list and types,
+see `kakehashi config schema`.
 
 ### Configuration Options
 
@@ -191,6 +192,21 @@ default `info` forwards Error, Warning, and Info while suppressing LSP `Log` and
           "variable.builtin": "variable.defaultLibrary"
         }
       }
+    }
+  }
+}
+```
+
+### Live configuration updates
+
+When pushing configuration with `workspace/didChangeConfiguration`, put
+kakehashi's settings below `settings.kakehashi`:
+
+```json
+{
+  "settings": {
+    "kakehashi": {
+      "searchPaths": ["/path/to/kakehashi-data"]
     }
   }
 }
@@ -279,18 +295,6 @@ given an explicit path is loaded as-is, so an `; inherits:` line in it is inert
 absent. Inherit only from queries that follow the implicit layout, whose parent
 is itself resolved by language name and so must follow it too.
 
-#### `autoInstall` (deprecated)
-
-**Deprecated:** use [`languages[*].autoInstall`](#languagesautoinstall) instead.
-The top-level key still works — it answers whenever no per-language value is
-set — but kakehashi shows a one-time migration notice when it is present, and
-it may be removed in a future release.
-
-Move `autoInstall = true` to `[languages._] autoInstall = true` — equivalent in
-every case but one, see the migration caveat under
-[`languages[*].autoInstall`](#languagesautoinstall) — then override per language
-as needed.
-
 #### `languages`
 
 Per-language configuration. Usually not needed as kakehashi auto-detects languages.
@@ -302,7 +306,6 @@ Per-language configuration. Usually not needed as kakehashi auto-detects languag
 | `queries` | Array of query configurations with `path` and `kind` (highlights, bindings, injections) |
 | `bridge` | Per-injection-language bridge filter and aggregation settings |
 | `autoInstall` | Whether missing parsers/queries for this language may be auto-installed |
-| `aliases` | Deprecated alternative language IDs. Prefer `base` on the derived language instead. |
 
 ##### `languages[*].autoInstall`
 
@@ -310,11 +313,11 @@ Whether kakehashi may download and install a missing parser/queries for this
 language when a file is opened.
 
 Resolved most-specific-wins: the language's own value, then each entry in its
-`base` chain, then the `"_"` wildcard's, then the deprecated top-level
-`autoInstall`, defaulting to `true`. Unset is the default at every level, so a
-language inherits through `base` and `"_"` exactly like the other fields — for
-example `[languages.rmd] base = "markdown"` picks up markdown's `autoInstall`
-before `"_"` is consulted.
+`base` chain, then the `"_"` wildcard's, defaulting to `true`. Unset is the
+default at every documented level, so a language inherits through `base` and
+`"_"` exactly like the other fields — for example
+`[languages.rmd] base = "markdown"` picks up markdown's `autoInstall` before
+`"_"` is consulted.
 
 **Which name to use.** The key names the language kakehashi would *install*, not
 the token in your document. A host document uses the `languageId` your editor
@@ -351,23 +354,6 @@ points at the config that decided it. For a language with no entry of its own it
 names the exact key (`` `languages._.autoInstall` is false ``); for one that
 does have an entry it names the overriding key and the places the value may have
 come from, since `base`-chain and `_` inheritance are folded together by then.
-
-**Migration caveat:** moving the top-level key to `[languages._]` is
-equivalence-preserving for every language *except* one whose `base` chain
-terminates before reaching `"_"` — a self-referential `base`
-(`[languages.foo] base = "foo"`) or a cycle that never visits `"_"`. Such a
-language inherits nothing from `"_"` — by design, for every field — so it falls
-through to the top-level default instead. (A chain that *does* reach `"_"`,
-including one that gets there via an explicit `[languages._] base`, inherits
-normally.) Give those
-languages an explicit `autoInstall` when migrating.
-
-**Precedence note:** a `languages.*.autoInstall` value outranks the top-level
-`autoInstall` even when the top-level one is set at a higher-precedence source.
-That is deliberate — the top-level key is only a fallback for an unset
-per-language value — but it means moving the key to `[languages._]` in a
-low-precedence file will shadow a top-level `autoInstall` pushed via
-`initializationOptions`. Prefer setting one or the other, not both.
 
 ##### `languages[*].base`
 
@@ -461,20 +447,6 @@ Remap Tree-sitter capture names to LSP semantic token types. Use `_` as a wildca
 }
 ```
 
-The former top-level `captureMappings.<language>.highlights` shape remains
-accepted for migration, but is deprecated. If both spellings occur in one
-layer, the feature-scoped value wins for duplicate capture names; otherwise
-their entries are combined. In the legacy spelling, `captureMappings = {}`
-clears the inherited root and `highlights = {}` under a
-`[captureMappings.<language>]` table clears that language's inherited entry.
-The clear is applied before canonical entries in the same layer are added. The
-old `folds` table was unused and has no
-replacement. It is absent from the schema and has no effect. Like another
-unrecognized key, it is ignored where the configuration source tolerates
-unknown keys and causes a pushed runtime update to be rejected by that
-ingress's existing unknown-key policy; valid siblings such as `highlights` are
-not discarded merely because `folds` is present.
-
 ### Bridge Configuration
 
 #### `languageServers`
@@ -524,17 +496,10 @@ Configure language servers for bridging LSP requests in injection regions.
 | `cmd` | Command and arguments to start the language server |
 | `languages` | Languages this server handles. The element `"*"` means **any language**, for servers that are not tied to one (spell/grammar/typo checkers, AI completion) — see below. |
 | `initializationOptions` | Optional initialization options forwarded during the downstream server's `initialize` request |
-| `workspaceMarkers` | Marker files/directories locating the workspace root the server is initialized with, following Neovim's `vim.fs.root` `(string\|string[])[]` shape. (The pre-rename key `rootMarkers` is still accepted as a deprecated alias.) Entries are tried **in list order** (earlier = higher priority): each entry is searched up the triggering document's ancestors nearest-first before the next entry is tried, so a higher-priority marker in a far ancestor outranks a lower-priority one sitting next to the document. A **nested array** is one equal-priority group where the nearest ancestor containing any of its names wins — e.g. `[["stylua.toml", ".luarc.json"], ".git"]` means "nearest of stylua.toml/.luarc.json, otherwise .git". The first matching entry's directory becomes the server's `rootUri` and sole workspace folder. Default: `[".git"]`. No marker hit falls back to the client-supplied root; an explicit `[]` disables the search. The connection pool is keyed by `(server, resolved root)`, so in a multi-root monorepo documents under different marker roots get their own downstream process, each rooted correctly; documents sharing a root (or the no-marker fallback) share one process. Trade-off: process count grows with the number of distinct roots opened, and there is currently no idle-eviction — a long session touching many roots keeps one process per root alive until shutdown. Servers that operate purely on `workspaceFolders` can opt out of this growth with `preferSharedInstance` (below). |
+| `workspaceMarkers` | Marker files/directories locating the workspace root the server is initialized with, following Neovim's `vim.fs.root` `(string\|string[])[]` shape. Entries are tried **in list order** (earlier = higher priority): each entry is searched up the triggering document's ancestors nearest-first before the next entry is tried, so a higher-priority marker in a far ancestor outranks a lower-priority one sitting next to the document. A **nested array** is one equal-priority group where the nearest ancestor containing any of its names wins — e.g. `[["stylua.toml", ".luarc.json"], ".git"]` means "nearest of stylua.toml/.luarc.json, otherwise .git". The first matching entry's directory becomes the server's `rootUri` and sole workspace folder. Default: `[".git"]`. No marker hit falls back to the client-supplied root; an explicit `[]` disables the search. The connection pool is keyed by `(server, resolved root)`, so in a multi-root monorepo documents under different marker roots get their own downstream process, each rooted correctly; documents sharing a root (or the no-marker fallback) share one process. Trade-off: process count grows with the number of distinct roots opened, and there is currently no idle-eviction — a long session touching many roots keeps one process per root alive until shutdown. Servers that operate purely on `workspaceFolders` can opt out of this growth with `preferSharedInstance` (below). |
 | `onTypeFormattingTriggers` | Trigger characters for bridged `textDocument/onTypeFormatting` (e.g. `["}", ";"]`). kakehashi advertises the sorted union across all servers at initialize and forwards a request to a downstream server only when that server's own capabilities declare the typed character. Unset everywhere (default) → the capability is not advertised. |
 | `forceStart` | Start this server as soon as configuration is applied, instead of waiting for a document that routes to it. Default `false`. With no triggering document there is no marker root to walk, so the connection is keyed the way any document-less acquire is — the shared connection for a `preferSharedInstance` server, the client-root fallback otherwise. That is also the honest scope of the warm-up: documents under marker roots resolve *marker* keys and will not reuse it, so setting this on an ordinary per-root server pre-spawns a process most documents bypass. It earns its keep for `preferSharedInstance` servers, marker-less workspaces, and a server that no document would ever start (`languages = []`). Within a session the flag is one-way: a reload that flips it to `false` never stops an already-running server, and deleting the entry is what stops one. It also starts a server rather than supervising it — a warm-up that crashes stays down until configuration is applied again, since a server no document routes to has no request that would notice. |
 | `preferSharedInstance` | Prefer reusing **one** downstream process across every workspace root for this server instead of the default one-process-per-marker-root (above). Default `false`. It is a *preference*, honored only when the downstream server advertises `workspace.workspaceFolders.{supported, changeNotifications}`: when it does, kakehashi routes all roots to a single connection and announces each new root with `workspace/didChangeWorkspaceFolders`; when it does not, kakehashi logs once and silently falls back to the per-root-instance model for marker-rooted documents (marker-less documents — e.g. non-file URIs like an editor's `untitled:` scratch buffers — stay on the shared connection: they bring no marker root, so the missing capability never blocks them; on capable servers the client workspace is announced on their behalf). Because that fallback is universal, a blanket `languageServers._.preferSharedInstance = true` is safe across a mixed set of servers. Use it to bound process count and get cross-root navigation for servers that key purely off `workspaceFolders`; leave it `false` for servers needing per-root isolation (per-root virtualenv, conflicting tool/package versions) or that key behavior off the immutable `rootUri`. Note: removal/idle-eviction of folders is not modeled yet — the set only grows. |
-
-> **Migration note**: `workspaceMarkers` was previously named `rootMarkers`
-> (aligning with the LSP spec's `workspaceFolders`). The old `rootMarkers` key
-> still works as a deprecated alias, so existing configs need no change; new
-> configs should prefer `workspaceMarkers`. When a config still uses
-> `rootMarkers`, kakehashi shows a one-time deprecation notice per session as a
-> visible `window/showMessage` popup.
 
 A `languageServers._` wildcard entry supplies defaults that every server
 inherits field-by-field (wildcard-config-inheritance) — e.g. set

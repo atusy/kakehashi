@@ -3,6 +3,7 @@
 **Related Decisions**:
 - [configuration-merging-strategy](configuration-merging-strategy.md)
 - [wildcard-config-inheritance](wildcard-config-inheritance.md)
+- [deprecation-removal-deadlines](deprecation-removal-deadlines.md)
 
 ## Context
 
@@ -26,7 +27,8 @@ no intermediate `highlights` key.
 
 The former top-level `captureMappings.<language>.highlights` spelling remains
 accepted during migration and produces a deprecation warning at most once per
-session. The never-consumed `folds` field is removed from the schema without a
+session. It is accepted through v1 and removed in v2. The never-consumed
+`folds` field is removed from the schema without a
 replacement and has no effect. It follows the same source-specific unknown-key
 policy as any other unrecognized field: tolerant sources ignore it, while a
 pushed runtime update carrying it is rejected. Its presence does not turn an

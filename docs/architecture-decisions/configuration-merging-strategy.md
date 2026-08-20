@@ -193,6 +193,7 @@ normally per key, but the two keys are then read in specificity order, not sourc
 order. This is why `default_settings()` (merge layer 1) and the `config init`
 template both leave `languages._.autoInstall` unset: a built-in value there would
 silently shadow every user-supplied top-level opt-out.
+The top-level spelling is accepted through v1 and removed in v2.
 
 **Languages HashMap** (`languages`):
 - **Deep merge at language level**: Keys from later sources override same keys from earlier sources
@@ -487,3 +488,4 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 ## Related Decisions
 
 - [wildcard-config-inheritance](wildcard-config-inheritance.md): Wildcard inheritance within a single config layer
+- [deprecation-removal-deadlines](deprecation-removal-deadlines.md): Compile-time removal boundary for the top-level `autoInstall` compatibility path
