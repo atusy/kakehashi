@@ -157,7 +157,8 @@ expression: merged
   },
   "experimental": {
     "kakehashi": {
-      "bridgeRouting": true
+      "bridgeRouting": true,
+      "bridgePeer": true
     }
   }
 }

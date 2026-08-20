@@ -830,6 +830,34 @@ impl DocumentTracker {
             .is_some_and(|entry| entry.value().contains(connection_key))
     }
 
+    /// Connections that currently serve `uri` either as that exact downstream
+    /// document or as an injection belonging to that host document.
+    pub(in crate::lsp::bridge) async fn connections_serving_uri(
+        &self,
+        uri: &str,
+    ) -> Vec<ConnectionKey> {
+        let mut connections = self
+            .virtual_to_servers
+            .get(uri)
+            .map(|keys| keys.clone())
+            .unwrap_or_default();
+        if let Ok(host_uri) = Url::parse(uri) {
+            let host_to_virtual = self.host_to_virtual.lock().await;
+            if let Some(documents) = host_to_virtual.get(&host_uri) {
+                for document in documents {
+                    if self.is_virtual_doc_open_on_connection(
+                        &document.virtual_uri.to_uri_string(),
+                        &document.connection_key,
+                    ) && !connections.contains(&document.connection_key)
+                    {
+                        connections.push(document.connection_key.clone());
+                    }
+                }
+            }
+        }
+        connections
+    }
+
     /// Resolve a virtual-document URI string back to its `(host_url, region_id)`.
     ///
     /// Used by the inbound `window/showDocument` translation to recover which
@@ -920,6 +948,46 @@ mod tests {
         assert_eq!(
             virtual_docs[0].connection_key,
             ConnectionKey::for_server("lua")
+        );
+    }
+
+    #[tokio::test]
+    async fn connections_serving_uri_matches_virtual_uri_and_its_host() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "typescript", "ts-0");
+        let connection = ConnectionKey::for_server("denols");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &connection)
+            .await;
+
+        assert_eq!(
+            tracker.connections_serving_uri(host_uri.as_str()).await,
+            vec![connection.clone()]
+        );
+        assert_eq!(
+            tracker
+                .connections_serving_uri(&virtual_uri.to_uri_string())
+                .await,
+            vec![connection]
+        );
+    }
+
+    #[tokio::test]
+    async fn connections_serving_uri_ignores_pending_document_open() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "typescript", "ts-0");
+        let connection = ConnectionKey::for_server("denols");
+        tracker
+            .register_pending_document(&host_uri, &virtual_uri, &connection)
+            .await;
+
+        assert!(
+            tracker
+                .connections_serving_uri(host_uri.as_str())
+                .await
+                .is_empty()
         );
     }
 

@@ -25,7 +25,7 @@ use tower_lsp_server::jsonrpc;
 use tower_lsp_server::ls_types::MessageType;
 
 use super::super::connection::BridgeReader;
-use super::super::{client, telemetry, text_document, window};
+use super::super::{client, peer, telemetry, text_document, window};
 use super::OutboundMessage;
 use super::ResponseRouter;
 use super::response_router::{LivenessExpiry, RouteResult};
@@ -288,6 +288,8 @@ pub(crate) struct ServerRequestDeps {
     /// downstream-supplied `TextDocumentEdit.version`s against the version the
     /// bridge tracks for the virtual document on THIS connection.
     pub(crate) connection_key: ConnectionKey,
+    /// Live downstream slots available to `kakehashi/bridge/peer*` handlers.
+    pub(crate) peer_directory: Arc<peer::PeerDirectory>,
     pub(crate) response_tx: mpsc::Sender<OutboundMessage>,
     pub(crate) dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
     /// Loss-intolerant notifications (`DiagnosticRefresh` and work-done
@@ -302,10 +304,9 @@ pub(crate) struct ServerRequestDeps {
     /// capability). Unbounded: a dropped request would hang the downstream.
     /// See [`UpstreamRequest`].
     pub(crate) upstream_request_tx: mpsc::UnboundedSender<UpstreamRequest>,
-    /// Tracks in-flight forwarded requests so a downstream `$/cancelRequest`
-    /// (or connection death) can cancel the editor-bound request (#404).
-    /// (Capability-gated applyEdits are registered too, though answered
-    /// locally.)
+    /// Tracks in-flight downstream-originated forwarding so a downstream
+    /// `$/cancelRequest` (or connection death) can cancel either the
+    /// editor-bound request (#404) or a peer-bound bridge request.
     pub(crate) inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
     /// The folders this connection currently serves, used to answer downstream
     /// `workspace/workspaceFolders` pulls. Mutable: a `preferSharedInstance`
@@ -340,8 +341,8 @@ struct ProgressPurgeGuard {
     registry: Arc<crate::lsp::bridge::ProgressRegistry>,
     connection_id: crate::lsp::bridge::ProgressConnectionId,
     upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
-    /// Cancel any forwarded requests still in flight when this connection's
-    /// reader exits, so their editor dialogs don't linger (#404).
+    /// Cancel editor- and peer-bound forwarding when this connection exits;
+    /// editor dialogs are dismissed as part of that cleanup (#404).
     inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
 }
 
@@ -594,6 +595,7 @@ pub(crate) fn spawn_reader_task_with_liveness(
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -686,6 +688,7 @@ async fn reader_loop(
         settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         server_name: None,
         connection_key: ConnectionKey::for_server("test"),
+        peer_directory: Arc::new(peer::PeerDirectory::default()),
         response_tx,
         dynamic_capabilities,
         upstream_tx,
@@ -956,9 +959,9 @@ async fn handle_message(
 }
 
 /// Handle an inbound downstream `$/cancelRequest`: if it targets a forwarded
-/// request still in flight (`window/showMessageRequest`, `window/showDocument`,
-/// or a supported `workspace/applyEdit`),
-/// cancel the editor-bound request so its dialog is dismissed (#404). The id is
+/// request still in flight (an editor-bound `window/*`/`workspace/applyEdit`
+/// request or a peer-bound bridge request), cancel that forwarding operation.
+/// For editor requests this dismisses an open dialog (#404). The id is
 /// parsed as a [`jsonrpc::Id`] exactly as the original request's id was, so the
 /// registry key matches. Ids that aren't tracked (e.g. the bridge's own outbound
 /// requests *to* the downstream, which the downstream can't cancel this way) are
@@ -1037,6 +1040,10 @@ async fn handle_server_request(
             workspace::apply_edit::handle(&message, id, server_prefix, deps);
             return;
         }
+        "kakehashi/bridge/peer/request" => {
+            peer::request::handle(&message, id, server_prefix, deps).await;
+            return;
+        }
         _ => {}
     }
 
@@ -1056,6 +1063,9 @@ async fn handle_server_request(
         "workspace/workspaceFolders" => workspace::workspace_folders::handle(server_prefix, deps),
         "workspace/configuration" => {
             workspace::configuration::handle(&message, server_prefix, deps)
+        }
+        "kakehashi/bridge/peer" => {
+            peer::list_result(&deps.peer_directory, &deps.connection_key, &message).await
         }
         _ => {
             debug!(
@@ -1133,6 +1143,7 @@ pub(in crate::lsp::bridge) async fn send_server_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::bridge::ConnectionState;
     use crate::lsp::bridge::connection::AsyncBridgeConnection;
     use serde_json::json;
 
@@ -1306,6 +1317,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: server_name.map(String::from),
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
@@ -1443,6 +1455,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("mock-ls".to_string()),
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
@@ -1521,6 +1534,7 @@ mod tests {
                 settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 server_name: None,
                 connection_key: ConnectionKey::for_server("test"),
+                peer_directory: Arc::new(peer::PeerDirectory::default()),
                 response_tx,
                 dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
                 upstream_tx,
@@ -1976,6 +1990,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -2020,6 +2035,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_message_answers_peer_discovery_from_downstream_only() {
+        let router = ResponseRouter::new();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        let peer = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("oxfmt"),
+        )
+        .await;
+        deps.peer_directory.register(&peer);
+
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "kakehashi/bridge/peer",
+                "params": {}
+            }),
+            &router,
+            "[tsudoi] ",
+            &deps,
+        )
+        .await;
+
+        let OutboundMessage::Untracked(response) = response_rx.recv().await.unwrap() else {
+            panic!("server-request responses are untracked")
+        };
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["result"][0]["name"], "oxfmt");
+    }
+
+    #[tokio::test]
+    async fn handle_message_forwards_peer_request_and_wraps_its_response() {
+        let router = ResponseRouter::new();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        let peer = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("oxfmt"),
+        )
+        .await;
+        let peer_id = peer.key().peer_id();
+        deps.peer_directory.register(&peer);
+
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "kakehashi/bridge/peer/request",
+                "params": {
+                    "id": peer_id,
+                    "method": "textDocument/formatting",
+                    "params": { "textDocument": { "uri": "file:///repo/main.ts" } }
+                }
+            }),
+            &router,
+            "[tsudoi] ",
+            &deps,
+        )
+        .await;
+
+        for _ in 0..100 {
+            if peer.router().pending_count() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(peer.router().pending_count(), 1);
+        let downstream_id = peer.router().pending_ids()[0];
+        assert_ne!(downstream_id.as_i64(), 41);
+        assert_eq!(
+            peer.router().route(json!({
+                "jsonrpc": "2.0",
+                "id": downstream_id.as_i64(),
+                "result": [{ "newText": "formatted" }]
+            })),
+            RouteResult::Delivered
+        );
+
+        let OutboundMessage::Untracked(response) = response_rx.recv().await.unwrap() else {
+            panic!("server-request responses are untracked")
+        };
+        assert_eq!(response["id"], 41);
+        assert_eq!(
+            response["result"],
+            json!({ "result": [{ "newText": "formatted" }] })
+        );
+        assert_eq!(peer.router().pending_count(), 0);
+        assert!(
+            !deps
+                .inbound_request_registry
+                .is_registered(deps.progress_connection_id, &jsonrpc::Id::Number(41))
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_message_rejects_peer_request_when_origin_limit_is_full() {
+        let router = ResponseRouter::new();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        let peer = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("oxfmt"),
+        )
+        .await;
+        let peer_id = peer.key().peer_id();
+        deps.peer_directory.register(&peer);
+        let mut permits = Vec::new();
+        for n in 0..crate::lsp::bridge::inbound_request_registry::MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION
+        {
+            permits.push(
+                deps.inbound_request_registry
+                    .try_register_peer(
+                    deps.progress_connection_id,
+                    jsonrpc::Id::Number(n as i64),
+                )
+                    .expect("fill the per-origin allowance"),
+            );
+        }
+
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1000,
+                "method": "kakehashi/bridge/peer/request",
+                "params": {
+                    "id": peer_id,
+                    "method": "textDocument/formatting",
+                    "params": { "textDocument": { "uri": "file:///repo/main.ts" } }
+                }
+            }),
+            &router,
+            "[tsudoi] ",
+            &deps,
+        )
+        .await;
+
+        let OutboundMessage::Untracked(response) = response_rx.recv().await.unwrap() else {
+            panic!("server-request responses are untracked")
+        };
+        assert_eq!(response["id"], 1000);
+        assert_eq!(response["error"]["data"]["reason"], "tooManyRequests");
+        assert_eq!(
+            peer.router().pending_count(),
+            0,
+            "rejection happens before target router/task state is created"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_rejection_backpressures_reader_without_a_detached_task() {
+        let router = ResponseRouter::new();
+        let (deps, (mut response_rx, _upstream_rx, _window_rx)) =
+            dummy_server_request_deps_with_rx();
+        for n in 0..16 {
+            deps.response_tx
+                .try_send(OutboundMessage::Untracked(json!({ "occupied": n })))
+                .unwrap();
+        }
+
+        let mut dispatch = Box::pin(handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 77,
+                "method": "kakehashi/bridge/peer/request",
+                "params": { "id": "missing", "method": "custom/request" }
+            }),
+            &router,
+            "[tsudoi] ",
+            &deps,
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut dispatch => panic!("rejection must not escape into a detached task"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        for _ in 0..16 {
+            let _occupied = response_rx.recv().await.unwrap();
+        }
+        dispatch.await;
+        let OutboundMessage::Untracked(response) = response_rx.recv().await.unwrap() else {
+            panic!("server-request responses are untracked")
+        };
+        assert_eq!(response["id"], 77);
+        assert_eq!(response["error"]["data"]["reason"], "unknownPeer");
+    }
+
+    #[tokio::test]
     async fn handle_message_unregister_capability_updates_registry() {
         let router = ResponseRouter::new();
         let (response_tx, mut response_rx) = mpsc::channel(16);
@@ -2039,6 +2243,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -2102,6 +2307,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2192,6 +2398,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2253,6 +2460,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2312,6 +2520,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2372,6 +2581,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2441,6 +2651,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2528,6 +2739,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2586,6 +2798,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2672,6 +2885,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2713,6 +2927,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2770,6 +2985,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2816,6 +3032,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2862,6 +3079,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -2914,6 +3132,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("luals".to_string()),
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
             upstream_tx,
@@ -2974,6 +3193,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("lua_ls".to_string()),
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
             upstream_tx,
@@ -3027,6 +3247,7 @@ mod tests {
                 settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 server_name: Some("luals".to_string()),
                 connection_key: ConnectionKey::for_server("test"),
+                peer_directory: Arc::new(peer::PeerDirectory::default()),
                 response_tx,
                 dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
                 upstream_tx,
@@ -3110,6 +3331,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -3152,6 +3374,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -3209,6 +3432,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -3277,6 +3501,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx: response_tx.clone(),
             dynamic_capabilities,
             upstream_tx,
@@ -3340,6 +3565,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -3814,6 +4040,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: Some("mock-ls".to_string()),
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx,
             dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
             upstream_tx,
@@ -4266,6 +4493,7 @@ mod tests {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
             server_name: None,
             connection_key: ConnectionKey::for_server("test"),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,

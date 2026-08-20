@@ -167,6 +167,7 @@ fn build_baseline_capabilities(
         experimental: Some(serde_json::json!({
             "kakehashi": {
                 "bridgeRouting": true,
+                "bridgePeer": true,
             },
         })),
         ..Default::default()
@@ -461,6 +462,20 @@ mod tests {
     /// Snapshot suffixes predate the runtime opt-in (they matched the old
     /// "experimental" cargo feature); both variants now run in one process.
     const EXPERIMENTAL_VARIANTS: [(bool, &str); 2] = [(false, "default"), (true, "experimental")];
+
+    #[test]
+    fn downstream_initialize_advertises_bridge_peer_support() {
+        let capabilities = build_bridge_client_capabilities(None, false, false);
+        assert_eq!(
+            capabilities.experimental,
+            Some(serde_json::json!({
+                "kakehashi": {
+                    "bridgePeer": true,
+                    "bridgeRouting": true
+                }
+            }))
+        );
+    }
 
     #[test]
     fn bridge_client_capabilities_snapshot() {
