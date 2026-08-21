@@ -246,21 +246,73 @@ maxFanOut = 1
     session
         .client
         .send_notification("custom/capped", capped.clone());
+    // A second uncapped ping after the capped one. Each server's deliveries
+    // arrive in send order, so once mock-a shows this marker, a wrongly
+    // fanned-out capped ping would already be visible before it — "not
+    // arrived yet" cannot fake a pass.
+    let marker = json!({ "textDocument": { "uri": MARKDOWN_URI }, "n": 3 });
+    session
+        .client
+        .send_notification("custom/ping", marker.clone());
     let expected_capped = json!({ "method": "custom/capped", "params": capped });
-    // mock-b is first in priorities and the only one under maxFanOut = 1;
-    // once it has the capped ping, mock-a must still show only the first.
-    for _ in 0..300 {
-        let b = session.notifications_seen_by("custom/echoB");
-        if b.as_array().is_some_and(|n| n.len() >= 2) {
-            assert_eq!(b[1], expected_capped);
-            break;
+    let expected_marker = json!({ "method": "custom/ping", "params": marker });
+    let settled = |session: &mut Session, echo: &str| -> Value {
+        for _ in 0..300 {
+            let seen = session.notifications_seen_by(echo);
+            if seen
+                .as_array()
+                .is_some_and(|n| n.last() == Some(&expected_marker))
+            {
+                return seen;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+        panic!("{echo}: marker ping never arrived");
+    };
     assert_eq!(
-        session.notifications_seen_by("custom/echoA"),
-        expected_ping,
-        "maxFanOut = 1 must stop the notification at the first server"
+        settled(&mut session, "custom/echoB"),
+        json!([expected_ping[0], expected_capped, expected_marker]),
+        "mock-b is first in priorities: the one server under maxFanOut = 1"
+    );
+    assert_eq!(
+        settled(&mut session, "custom/echoA"),
+        json!([expected_ping[0], expected_marker]),
+        "maxFanOut = 1 must stop the capped notification at the first server"
+    );
+
+    session.shutdown();
+}
+
+#[test]
+fn e2e_empty_priorities_answer_null_without_forwarding() {
+    // The per-method kill switch: eligible, selects nobody. A request
+    // answers null (no error, no downstream traffic), as for typed methods.
+    let mut session = init_client(
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.bridge._self.aggregation."custom/echo"]
+priorities = ["mock-host"]
+
+[languages.markdown.bridge._self.aggregation."custom/nobody"]
+priorities = []
+"#,
+    );
+    session.echo_until_answered(
+        "custom/echo",
+        json!({ "textDocument": { "uri": MARKDOWN_URI } }),
+    );
+
+    let response = session.client.send_request(
+        "custom/nobody",
+        json!({ "textDocument": { "uri": MARKDOWN_URI } }),
+    );
+    assert!(response.get("error").is_none(), "got {response}");
+    assert_eq!(response["result"], Value::Null);
+    assert!(
+        !session.wire_methods().iter().any(|m| m == "custom/nobody"),
+        "an empty allowlist must reach no server"
     );
 
     session.shutdown();
