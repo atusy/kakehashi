@@ -354,13 +354,24 @@ impl LanguageServerPool {
                     // server would warn on every keystroke and flood the
                     // client log. An ADVERTISED method answered
                     // MethodNotFound is a genuine failure and stays one.
-                    if let Some(server) = server.filter(|_| declines_method(&response)) {
-                        log::debug!(
-                            target: "kakehashi::bridge",
-                            "[{server}] does not implement {method:?} (MethodNotFound); \
-                             treated as an empty answer"
-                        );
-                        return Ok(None);
+                    if let Some(server) = server.as_deref() {
+                        if declines_method(&response) {
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "[{server}] does not implement {method:?} (MethodNotFound); \
+                                 treated as an empty answer"
+                            );
+                            return Ok(None);
+                        }
+                        // The typed raw path tolerates a response with neither
+                        // member (long-standing leniency); an arbitrary
+                        // forwarded method gets JSON-RPC's strict reading —
+                        // that is a broken server, counted as a failure.
+                        if response.get("result").is_none() && response.get("error").is_none() {
+                            return Err(io::Error::other(format!(
+                                "[{server}] answered {method:?} with neither result nor error"
+                            )));
+                        }
                     }
                     parse_host_raw_response(response, method)
                 },
