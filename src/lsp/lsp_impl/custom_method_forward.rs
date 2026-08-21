@@ -142,25 +142,28 @@ impl Kakehashi {
         let language = self
             .document_language(&url)
             .ok_or(Rejection::NotForwardable("document is not open"))?;
-        let explicit = self
-            .settings_manager
-            .load_settings()
+        let settings = self.settings_manager.load_settings();
+        let Some(lang_settings) = settings
             .resolve_host_language_settings(&language)
-            .is_some_and(|settings| settings.has_explicit_host_aggregation(&params.method));
-        if !explicit {
+            .filter(|settings| settings.has_explicit_host_aggregation(&params.method))
+        else {
             return Err(Rejection::NotForwardable(
                 "no literal bridge._self.aggregation entry for the method",
             ));
+        };
+        // Only the entry's OWN strategy counts: an inherited `concatenated`
+        // from the `_` method wildcard is ignored here exactly as the typed
+        // verbatim host paths ignore it.
+        if let Some(strategy) = lang_settings
+            .explicit_host_aggregation_strategy(&params.method)
+            .filter(|strategy| *strategy != AggregationStrategy::Preferred)
+        {
+            return Err(Rejection::UnsupportedStrategy(strategy));
         }
-        let ctx = self
-            .resolve_host_bridge_context(&lsp_uri, &params.method)
+        self.resolve_host_bridge_context(&lsp_uri, &params.method)
             .ok_or(Rejection::NotForwardable(
-                "host bridging is not opted in for the document's language, or no server handles it",
-            ))?;
-        if ctx.strategy != AggregationStrategy::Preferred {
-            return Err(Rejection::UnsupportedStrategy(ctx.strategy));
-        }
-        Ok(ctx)
+                "host bridge context unavailable (see the preceding debug line)",
+            ))
     }
 
     /// `kakehashi/forward/request`: forward a request kakehashi does not

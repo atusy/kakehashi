@@ -634,7 +634,7 @@ checked — a server that does not implement the method answers
 enabled = true
 
 [languages.markdown.bridge._self.aggregation."textDocument/inlineCompletion"]
-priorities = ["copilot"]             # strategy must stay "preferred" (the default)
+priorities = ["copilot"]             # the entry's own strategy must be "preferred" (default)
 ```
 
 Limits: only the method's literal key opts in (the `_` method wildcard does

@@ -28,6 +28,12 @@ priorities = ["mock-host"]
 [languages.markdown.bridge._self.aggregation."custom/merged"]
 priorities = ["mock-host"]
 strategy = "concatenated"
+
+# Inherited by every method entry above that sets no strategy of its own.
+# The typed host methods ignore an inherited `concatenated`; so must the
+# forward, or this one line would break every forwarded method.
+[languages.markdown.bridge._self.aggregation._]
+strategy = "concatenated"
 "#;
 
 fn init_client(config_toml: &str) -> (LspClient, tempfile::TempDir) {

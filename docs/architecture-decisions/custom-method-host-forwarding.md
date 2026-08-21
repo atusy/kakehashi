@@ -82,10 +82,13 @@ priorities = ["copilot"]
   itself, which the fan-in counts as a failed (empty) contribution. Kakehashi
   likewise advertises nothing to the client for forwarded methods; a client
   that gates on `ServerCapabilities` must be told to send anyway.
-- **Strategy.** `preferred` only. An explicit `strategy = "concatenated"`
-  on a forwarded method is a configuration error: the request is answered
-  with `InvalidParams` naming the method, and a notification is dropped with
-  a warning.
+- **Strategy.** `preferred` only, judged on the entry's **own** `strategy`
+  field: a `concatenated` inherited from the `"_"` method wildcard is
+  ignored, as the typed verbatim host methods ignore it, so one wildcard
+  line written for diagnostics cannot break every forwarded method. An
+  entry that itself sets `strategy = "concatenated"` is a configuration
+  error: the request is answered with `InvalidParams` naming the method,
+  and a notification is dropped with a warning.
 - **Cancellation.** A forwarded request joins the upstream-id registry, so a
   client `$/cancelRequest` reaches the downstream servers exactly as it does
   for typed host methods.

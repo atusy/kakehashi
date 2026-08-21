@@ -1109,6 +1109,21 @@ impl LanguageSettings {
             .is_some_and(|aggregation| aggregation.contains_key(method))
     }
 
+    /// The `strategy` a literal `bridge._self.aggregation` entry for `method`
+    /// sets **itself** — not the one it would inherit from the `"_"` method
+    /// wildcard. A forwarded method can only run `preferred`; an inherited
+    /// `concatenated` (set once under `_` for the typed methods that honor
+    /// it) must not poison every forwarded method, just as the typed
+    /// verbatim paths ignore it (custom-method-host-forwarding).
+    pub(crate) fn explicit_host_aggregation_strategy(
+        &self,
+        method: &str,
+    ) -> Option<AggregationStrategy> {
+        self.explicit_host_aggregation()?
+            .get(method)
+            .and_then(|entry| entry.strategy)
+    }
+
     /// The literal method keys of the host bridge target's aggregation map
     /// (`bridge._self`, wildcard-merged from `bridge._`), `"_"` included —
     /// callers wanting forwardable methods filter it; see
@@ -3017,6 +3032,50 @@ kind = "locals""#;
         assert!(
             !LanguageSettings::default().has_explicit_host_aggregation("custom/unlisted"),
             "no bridge map at all: nothing is forwardable"
+        );
+    }
+
+    #[test]
+    fn explicit_host_strategy_ignores_the_method_wildcard() {
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                HOST_BRIDGE_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([
+                        ("custom/plain".to_string(), AggregationConfig::default()),
+                        (
+                            "custom/merged".to_string(),
+                            AggregationConfig {
+                                strategy: Some(AggregationStrategy::Concatenated),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "_".to_string(),
+                            AggregationConfig {
+                                strategy: Some(AggregationStrategy::Concatenated),
+                                ..Default::default()
+                            },
+                        ),
+                    ])),
+                },
+            )])),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings.explicit_host_aggregation_strategy("custom/plain"),
+            None,
+            "the `_` method wildcard's strategy is not the entry's own"
+        );
+        assert_eq!(
+            settings.explicit_host_aggregation_strategy("custom/merged"),
+            Some(AggregationStrategy::Concatenated)
+        );
+        assert_eq!(
+            settings.resolve_host_aggregation("custom/plain").strategy,
+            AggregationStrategy::Concatenated,
+            "contrast: the resolved strategy does inherit"
         );
     }
 
