@@ -41,13 +41,20 @@ strategy = "concatenated"
 strategy = "concatenated"
 "#;
 
-/// One `custom-echo` mock per name, all host candidates for markdown.
+/// One mock per name, all host candidates for markdown. Names containing
+/// `decline` run the `custom-decline` mode (answers every `custom/*` request
+/// with MethodNotFound); the rest run `custom-echo`.
 fn language_servers(names: &[&str]) -> Value {
     let mut servers = serde_json::Map::new();
     for name in names {
+        let mode = if name.contains("decline") {
+            "custom-decline"
+        } else {
+            "custom-echo"
+        };
         servers.insert(
             (*name).to_owned(),
-            json!({ "cmd": [mock_bin(), "custom-echo"], "languages": ["markdown"] }),
+            json!({ "cmd": [mock_bin(), mode], "languages": ["markdown"] }),
         );
     }
     Value::Object(servers)
@@ -279,6 +286,73 @@ maxFanOut = 1
             .as_array()
             .is_some_and(|n| n.contains(&expected_capped)),
         "mock-b is first in priorities: the one server under maxFanOut = 1"
+    );
+
+    session.shutdown();
+}
+
+#[test]
+fn e2e_request_falls_through_a_declining_server_to_the_next() {
+    // preferred fan-in over two servers: the higher-priority one declines
+    // (MethodNotFound), the lower one answers — the answer must win, and a
+    // decline must not turn into an error.
+    let mut session = init_session(
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.bridge._self.aggregation."custom/echo"]
+priorities = ["mock-decline", "mock-host"]
+
+[languages.markdown.bridge._self.aggregation."custom/nobody-implements"]
+priorities = ["mock-decline"]
+"#,
+        &["mock-decline", "mock-host"],
+    );
+
+    let params = json!({ "textDocument": { "uri": MARKDOWN_URI } });
+    // Warm the declining server first (a request fails fast while it
+    // initializes, which would let the echo win without a fall-through ever
+    // happening): a method only it is listed for, until it shows on the wire.
+    // Every selected server declining is null, never an error.
+    let declined = (0..300)
+        .find_map(|_| {
+            let response = session
+                .client
+                .send_request("custom/nobody-implements", params.clone());
+            assert!(response.get("error").is_none(), "got {response}");
+            assert_eq!(response["result"], Value::Null);
+            if session
+                .wire_methods()
+                .iter()
+                .any(|m| m == "custom/nobody-implements")
+            {
+                Some(())
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                None
+            }
+        })
+        .is_some();
+    assert!(declined, "the declining server never came up");
+
+    let echoes = |session: &Session| {
+        session
+            .wire_methods()
+            .iter()
+            .filter(|m| *m == "custom/echo")
+            .count()
+    };
+    let before = echoes(&session);
+    let result = session.echo_until_answered("custom/echo", params);
+    assert_eq!(
+        result["method"], "custom/echo",
+        "the lower-priority server's answer wins over the decline"
+    );
+    assert!(
+        echoes(&session) - before >= 2,
+        "both servers must have been asked (capability-blind); wire: {:?}",
+        session.wire_methods()
     );
 
     session.shutdown();

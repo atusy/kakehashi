@@ -177,6 +177,13 @@ fn main() {
         // was opened here first, and the notifications recorded so far. The
         // mode advertises NO capability for these methods: the bridge must
         // forward them blind.
+        // `custom-decline`: a server that implements none of the custom
+        // methods and says so the JSON-RPC way — the decline the forward's
+        // capability-blind fan-in must treat as an empty contribution.
+        if mode == "custom-decline" && method.starts_with("custom/") {
+            respond_error(&mut writer, id, -32601, "Method not found");
+            continue;
+        }
         if mode == "custom-echo" && method.starts_with("custom/") {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
             if id.is_some() {
@@ -212,7 +219,7 @@ fn main() {
                         "hoverProvider": true,
                         "textDocumentSync": 1
                     }),
-                    "custom-echo" => json!({ "textDocumentSync": 1 }),
+                    "custom-echo" | "custom-decline" => json!({ "textDocumentSync": 1 }),
                     "code-lens" => json!({
                         "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
