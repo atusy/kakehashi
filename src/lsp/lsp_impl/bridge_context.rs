@@ -1345,6 +1345,12 @@ impl Kakehashi {
                                 uri: &t.uri,
                                 language_id: &t.language_id,
                                 text: &t.text,
+                                // A forwarded method is bound to the document
+                                // it was resolved against: never resurrect a
+                                // closed one. The typed methods keep their
+                                // long-standing unbound behavior.
+                                incarnation: (gate == crate::lsp::bridge::CapabilityGate::Blind)
+                                    .then_some(t.incarnation),
                             },
                             &method,
                             params,

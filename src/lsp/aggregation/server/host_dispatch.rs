@@ -33,6 +33,8 @@ pub(crate) struct HostFanOutTask {
     pub(crate) language_id: String,
     pub(crate) text: Arc<str>,
     pub(crate) upstream_id: Option<UpstreamId>,
+    /// The document incarnation the context was resolved against.
+    pub(crate) incarnation: u64,
 }
 
 /// Host-bridge aggregation entry point using the preferred strategy.
@@ -127,6 +129,7 @@ where
             language_id: ctx.language_id.clone(),
             text: Arc::clone(&ctx.text),
             upstream_id: ctx.upstream_request_id.clone(),
+            incarnation: ctx.incarnation,
         };
         let fut = f(task);
         join_set.spawn(async move {

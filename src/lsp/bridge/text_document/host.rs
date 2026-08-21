@@ -61,6 +61,12 @@ pub(crate) struct HostDocument<'a> {
     pub(crate) uri: &'a Url,
     pub(crate) language_id: &'a str,
     pub(crate) text: &'a str,
+    /// The document incarnation the caller resolved against, when it wants
+    /// the send refused once that incarnation is gone (closed, or closed
+    /// and reopened): checked under the host lifecycle lock before the sync
+    /// (custom-method-host-forwarding). `None` keeps the typed host paths'
+    /// long-standing behavior of syncing whatever is there.
+    pub(crate) incarnation: Option<u64>,
 }
 
 /// A raw host-server response plus the very connection that answered it.
@@ -415,7 +421,6 @@ impl LanguageServerPool {
         server_config: &BridgeServerConfig,
         doc: &HostDocument<'_>,
         live_text_reader: Option<&HostTextReader>,
-        incarnation: u64,
         method: &str,
         mut params: serde_json::Value,
     ) -> io::Result<()> {
@@ -448,7 +453,9 @@ impl LanguageServerPool {
         // incarnation must still be the one the message was resolved
         // against, and the reader must still find a document. The snapshot
         // is never used as a fallback on this path.
-        if self.current_host_incarnation(doc.uri) != Some(incarnation)
+        if doc
+            .incarnation
+            .is_some_and(|expected| self.current_host_incarnation(doc.uri) != Some(expected))
             || live_text_reader.is_some_and(|reader| reader().is_none())
         {
             return Err(io::Error::new(
@@ -647,7 +654,25 @@ impl LanguageServerPool {
         let connection_key = handle.key();
         self.wait_for_host_routing(doc.uri).await;
         let lifecycle = self.host_lifecycle_lock(doc.uri);
+        // If the document is gone by the time we return, the lock entry this
+        // call may have re-created goes with it.
+        let _cleanup = super::did_open::LifecycleCleanup {
+            pool: self,
+            host_uri: doc.uri,
+            lifecycle: &lifecycle,
+        };
         let _lifecycle_guard = lifecycle.lock().await;
+        // A caller bound to an incarnation asked not to resurrect a document
+        // that closed (or closed and reopened) while it waited above; checked
+        // under the lifecycle lock the close path also takes.
+        if let Some(expected) = doc.incarnation
+            && self.current_host_incarnation(doc.uri) != Some(expected)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "host document closed while waiting for the server",
+            ));
+        }
         if self.is_host_routing_suppressed(doc.uri, connection_key) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -1205,6 +1230,7 @@ mod tests {
             uri,
             language_id: "markdown",
             text,
+            incarnation: None,
         }
     }
 

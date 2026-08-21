@@ -319,6 +319,7 @@ impl Kakehashi {
                 uri: &ctx.uri,
                 language_id: &ctx.language_id,
                 text: &ctx.text,
+                incarnation: Some(incarnation),
             };
             let deliveries = servers.iter().map(|server| {
                 let pool = std::sync::Arc::clone(&pool);
@@ -333,7 +334,6 @@ impl Kakehashi {
                             &server.config,
                             doc,
                             Some(live_text_reader),
-                            incarnation,
                             method,
                             payload,
                         )
