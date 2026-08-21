@@ -408,13 +408,14 @@ impl LanguageServerPool {
     /// sync runs; `live_text_reader` lets the sync send the document's
     /// current text instead of rolling the server back to the snapshot
     /// (the eager re-sync closes the same window the same way, #422).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_host_custom_notification(
         &self,
         server_name: &str,
         server_config: &BridgeServerConfig,
         doc: &HostDocument<'_>,
         live_text_reader: Option<&HostTextReader>,
-        incarnation: Option<u64>,
+        incarnation: u64,
         method: &str,
         mut params: serde_json::Value,
     ) -> io::Result<()> {
@@ -447,7 +448,7 @@ impl LanguageServerPool {
         // incarnation must still be the one the message was resolved
         // against, and the reader must still find a document. The snapshot
         // is never used as a fallback on this path.
-        if self.current_host_incarnation(doc.uri) != incarnation
+        if self.current_host_incarnation(doc.uri) != Some(incarnation)
             || live_text_reader.is_some_and(|reader| reader().is_none())
         {
             return Err(io::Error::new(

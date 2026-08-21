@@ -171,6 +171,7 @@ mod tests {
             strategy: AggregationStrategy::Preferred,
             max_fan_out,
             upstream_request_id: None,
+            incarnation: 0,
         }
     }
 

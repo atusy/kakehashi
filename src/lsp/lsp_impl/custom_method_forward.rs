@@ -270,13 +270,18 @@ impl Kakehashi {
         // per-server initialization wait (same lock-order reasoning as the
         // reader in `debounced_diagnostics`: read and dropped inside the
         // closure, never held across an await).
+        // Bound to the incarnation the context was read from: a
+        // close-and-reopen of the same URI while a delivery waits is a
+        // different document and reads as "gone".
         let documents = std::sync::Arc::clone(&self.documents);
         let reader_uri = ctx.uri.clone();
-        let live_text_reader: crate::lsp::bridge::HostTextReader =
-            std::sync::Arc::new(move || documents.get(&reader_uri).map(|doc| doc.text_arc()));
-        // The document this message was resolved against; a close-and-reopen
-        // of the same URI while a delivery waits must not receive it.
-        let incarnation = pool.current_host_incarnation(&ctx.uri);
+        let incarnation = ctx.incarnation;
+        let live_text_reader: crate::lsp::bridge::HostTextReader = std::sync::Arc::new(move || {
+            documents
+                .get(&reader_uri)
+                .filter(|doc| doc.incarnation() == incarnation)
+                .map(|doc| doc.text_arc())
+        });
         let servers = select_host_servers(&ctx);
         if servers.is_empty() {
             // The kill switch (`priorities = []`, `maxFanOut = 0`): nothing

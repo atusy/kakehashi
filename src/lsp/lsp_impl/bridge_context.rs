@@ -227,6 +227,10 @@ pub(crate) struct HostRequestContext {
     pub(crate) max_fan_out: Option<usize>,
     /// The upstream JSON-RPC request ID for cancel forwarding.
     pub(crate) upstream_request_id: Option<UpstreamId>,
+    /// The document incarnation `text` was read from: a later close-and-reopen
+    /// of the same URI is a different document, which a message resolved
+    /// against this one must not reach (custom-method-host-forwarding).
+    pub(crate) incarnation: u64,
 }
 
 /// Document context plus a cursor position.
@@ -1213,7 +1217,10 @@ impl Kakehashi {
         // request (hover / definition / formatting / will-save / diagnostics) would
         // bail to `None` for the whole reparse window after each edit, even though
         // it forwards the real URI + text verbatim and depends on no tree.
-        let text = self.documents.get(&uri)?.text_arc();
+        let (text, incarnation) = {
+            let document = self.documents.get(&uri)?;
+            (document.text_arc(), document.incarnation())
+        };
         let language_name = self.document_language(&uri)?;
 
         let settings = self.settings_manager.load_settings();
@@ -1250,6 +1257,7 @@ impl Kakehashi {
             strategy: agg.strategy,
             max_fan_out: agg.max_fan_out,
             upstream_request_id: current_upstream_id(),
+            incarnation,
         })
     }
 

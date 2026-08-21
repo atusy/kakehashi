@@ -919,6 +919,7 @@ print("hello")
                 strategy: AggregationStrategy::Concatenated,
                 max_fan_out: None,
                 upstream_request_id: None,
+                incarnation: 0,
             }),
             layer_cfg: ResolvedLayerConfig {
                 priorities: vec![LayerSource::Host],
@@ -1035,6 +1036,7 @@ print("hello")
                 strategy: AggregationStrategy::Concatenated,
                 max_fan_out: None,
                 upstream_request_id: None,
+                incarnation: 0,
             }),
             layer_cfg: ResolvedLayerConfig {
                 priorities: vec![LayerSource::Host],

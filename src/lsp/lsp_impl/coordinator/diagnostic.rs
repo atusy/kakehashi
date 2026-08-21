@@ -418,6 +418,7 @@ impl DiagnosticSnapshotPreparer {
                 strategy: agg.strategy,
                 max_fan_out: agg.max_fan_out,
                 upstream_request_id: None,
+                incarnation: snapshot.incarnation(),
             })
         });
 
