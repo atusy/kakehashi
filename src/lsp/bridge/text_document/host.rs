@@ -414,6 +414,7 @@ impl LanguageServerPool {
         server_config: &BridgeServerConfig,
         doc: &HostDocument<'_>,
         live_text_reader: Option<&HostTextReader>,
+        incarnation: Option<u64>,
         method: &str,
         mut params: serde_json::Value,
     ) -> io::Result<()> {
@@ -439,11 +440,16 @@ impl LanguageServerPool {
         let _lifecycle_guard = lifecycle.lock().await;
         // The waits above can outlive the document: once closed, a sync here
         // would re-open it downstream from the stale snapshot with nothing
-        // left to close it. Checked UNDER the lifecycle lock, which the
-        // downstream close also takes, so a close cannot slip between this
-        // check and the send; and the snapshot is never used as a fallback
-        // on this path — the reader answering `None` is the document gone.
-        if live_text_reader.is_some_and(|reader| reader().is_none()) {
+        // left to close it — and a close-then-reopen of the same URI would
+        // deliver a message meant for the old document into the new one.
+        // Checked UNDER the lifecycle lock, which the downstream close also
+        // takes, so neither can slip between this check and the send: the
+        // incarnation must still be the one the message was resolved
+        // against, and the reader must still find a document. The snapshot
+        // is never used as a fallback on this path.
+        if self.current_host_incarnation(doc.uri) != incarnation
+            || live_text_reader.is_some_and(|reader| reader().is_none())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "host document closed while waiting for the server",

@@ -83,7 +83,8 @@ priorities = ["copilot"]
   snapshotted at dispatch, as typed host methods do. A forwarded
   notification, which may wait through a server's initialization first,
   re-reads the document's current text at sync time, and is dropped if the
-  document was closed while it waited. That wait is not the client's:
+  document was closed while it waited — including a close followed by a
+  reopen of the same URI, which is a different document. That wait is not the client's:
   the notification's ingress handling completes once delivery is handed
   off, so a burst of forwarded notifications against a slow-starting
   server cannot stall the other messages behind it. Deliveries in flight

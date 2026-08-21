@@ -274,6 +274,9 @@ impl Kakehashi {
         let reader_uri = ctx.uri.clone();
         let live_text_reader: crate::lsp::bridge::HostTextReader =
             std::sync::Arc::new(move || documents.get(&reader_uri).map(|doc| doc.text_arc()));
+        // The document this message was resolved against; a close-and-reopen
+        // of the same URI while a delivery waits must not receive it.
+        let incarnation = pool.current_host_incarnation(&ctx.uri);
         let servers = select_host_servers(&ctx);
         if servers.is_empty() {
             // The kill switch (`priorities = []`, `maxFanOut = 0`): nothing
@@ -323,6 +326,7 @@ impl Kakehashi {
                             &server.config,
                             doc,
                             Some(live_text_reader),
+                            incarnation,
                             method,
                             payload,
                         )
