@@ -9,7 +9,7 @@
 
 ## Implementation Status
 
-Implemented. The fallback dispatch lives in `src/lsp/custom_method_forward.rs`
+Implemented. The fallback dispatch lives in `src/lsp/custom_method_forwarder.rs`
 (`CustomMethodForwarder`), the handlers in
 `src/lsp/lsp_impl/custom_method_forward.rs`, and the gate-free host sends in
 `src/lsp/bridge/text_document/host.rs`.

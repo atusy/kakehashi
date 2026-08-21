@@ -5,8 +5,8 @@
 //! notification kakehashi does not implement is issued as
 //! `kakehashi/forward/notification`. Both carry `{ "method", "params" }` and
 //! keep the original `id`, so the handler decides eligibility from
-//! configuration and the client sees either the forwarded answer or the
-//! router's original `MethodNotFound`.
+//! configuration and the client sees either the forwarded answer or a
+//! `MethodNotFound` (the handler's own, wire-equivalent to the router's).
 //!
 //! Built-in methods are never shadowed: requests are dispatched to the router
 //! first and only its own "no handler" answer triggers the forward; the
@@ -142,11 +142,14 @@ where
                     if !is_method_not_found(&response) {
                         return Ok(response);
                     }
-                    // No `poll_ready` here: the probe was admitted through the
-                    // normal `poll_ready`, and the service cannot have gone
-                    // back to initializing since, so calling directly is
-                    // sound — and the inner `poll_ready` registers no waker
-                    // while initializing, so awaiting it here could hang.
+                    // No `poll_ready` here — a deliberate bend of the tower
+                    // contract: the probe was admitted through the normal
+                    // `poll_ready`, and the service cannot have gone back to
+                    // initializing since, so calling directly is sound (after
+                    // `exit` the inner call answers with its exited error,
+                    // which propagates like any other). Awaiting the inner
+                    // `poll_ready` instead could hang: it registers no waker
+                    // while initializing.
                     let forward = lock(&inner).call(forwarded);
                     forward.await
                 })
