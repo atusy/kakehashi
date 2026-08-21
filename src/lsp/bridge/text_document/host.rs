@@ -356,12 +356,28 @@ impl LanguageServerPool {
         let handle = self
             .get_or_create_connection(server_name, server_config, Some(doc.uri))
             .await?;
+        let server = server_name.to_owned();
         self.execute_host_request(
             handle,
             doc,
             upstream_request_id,
             |request_id| JsonRpcRequest::new(request_id.as_i64(), method.to_owned(), params),
-            move |response| parse_host_raw_response(response, method),
+            move |response| {
+                // The contract's expected decline: nothing was advertised, the
+                // server does not implement the method, it says so. An empty
+                // contribution at debug, not a counted failure — otherwise a
+                // priorities list with one non-implementing server would warn
+                // on every keystroke and flood the client log.
+                if declines_method(&response) {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "[{server}] does not implement {method:?} (MethodNotFound); \
+                         treated as an empty answer"
+                    );
+                    return Ok(None);
+                }
+                parse_host_raw_response(response, method)
+            },
         )
         .await?
     }
@@ -720,6 +736,16 @@ fn host_url_to_lsp_uri(uri: &Url) -> io::Result<Uri> {
 /// Strip the JSON-RPC envelope: `Err` for an error response (a request
 /// failure), `Ok(None)` for a `null` or absent result, and `Ok(Some(result))`
 /// with the bare `result` value otherwise.
+/// Whether a downstream response is a JSON-RPC `MethodNotFound` (-32601):
+/// the server's own way of saying it does not implement the method.
+fn declines_method(response: &serde_json::Value) -> bool {
+    const METHOD_NOT_FOUND: i64 = -32601;
+    response
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|code| code == METHOD_NOT_FOUND)
+}
+
 fn parse_host_raw_response(
     mut response: serde_json::Value,
     method: &str,
@@ -1080,6 +1106,21 @@ mod tests {
             "result": { "kind": "full" }
         });
         assert!(parse_host_diagnostic_response(response, "textDocument/diagnostic").is_err());
+    }
+
+    #[test]
+    fn declines_method_matches_only_method_not_found() {
+        assert!(declines_method(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": { "code": -32601, "message": "Method not found" }
+        })));
+        assert!(!declines_method(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": { "code": -32603, "message": "boom" }
+        })));
+        assert!(!declines_method(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": null
+        })));
     }
 
     #[test]

@@ -79,9 +79,13 @@ priorities = ["copilot"]
 - **Capabilities are not consulted.** Unlike the typed host methods, the
   forward does not require the server to advertise anything. A server that
   does not implement the method is expected to answer `MethodNotFound`
-  itself, which the fan-in counts as a failed (empty) contribution. Kakehashi
-  likewise advertises nothing to the client for forwarded methods; a client
-  that gates on `ServerCapabilities` must be told to send anyway.
+  itself; that answer is an empty contribution (logged at debug, not a
+  counted failure — it is the contract's normal decline, and a counted
+  failure would warn the client on every keystroke). Any other downstream
+  error is a counted failure, surfaced once per request as a client
+  warning when no server answered. Kakehashi likewise advertises nothing to
+  the client for forwarded methods; a client that gates on
+  `ServerCapabilities` must be told to send anyway.
 - **Strategy.** `preferred` only, judged on the entry's **own** `strategy`
   field: a `concatenated` inherited from the `"_"` method wildcard is
   ignored, as the typed verbatim host methods ignore it, so one wildcard
