@@ -51,10 +51,12 @@ priorities = ["copilot"]
 
 ### Contract
 
-- **Eligibility.** Three conditions, all required: kakehashi has no handler
+- **Eligibility.** Four conditions, all required: kakehashi has no handler
   for the method; `params.textDocument.uri` names an open host document whose
-  language has `bridge._self.enabled = true`; and the method name appears as
-  a **literal key** of that language's `bridge._self.aggregation` map
+  language has `bridge._self.enabled = true`; some configured server lists
+  that language (the host layer exists at all — without one there is no
+  target to be eligible for); and the method name appears as a **literal
+  key** of that language's `bridge._self.aggregation` map
   (inherited through the `bridge._` wildcard like any other aggregation
   field — which means the shipped defaults and `languages._` contribute
   keys too; today those name only router-handled methods). The `"_"`
