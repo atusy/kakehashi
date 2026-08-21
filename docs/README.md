@@ -624,8 +624,9 @@ forwarded to the host servers when you name it explicitly under
 `_self.aggregation`. Whether it goes out as a request or a notification
 follows what the client sent; a request is answered with the first non-empty
 downstream result in `priorities` order, a notification reaches every
-listed server. Params travel verbatim (real URI), the result comes back
-untouched, and the downstream server's advertised capabilities are not
+listed server. Params travel verbatim (real URI; only the progress tokens
+are stripped, since kakehashi relays no downstream progress), the result
+comes back untouched, and the downstream server's advertised capabilities are not
 checked — a server that does not implement the method answers
 `MethodNotFound` itself.
 

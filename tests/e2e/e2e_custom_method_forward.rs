@@ -175,13 +175,23 @@ fn e2e_custom_request_is_forwarded_verbatim_to_the_host_server() {
     let params = json!({
         "textDocument": { "uri": MARKDOWN_URI },
         "position": { "line": 2, "character": 1 },
-        "extra": { "nested": [1, 2, 3] }
+        "extra": { "nested": [1, 2, 3] },
+        // The one exception to verbatim: progress tokens are stripped, since
+        // kakehashi relays no downstream progress.
+        "workDoneToken": "wd-1",
+        "partialResultToken": "pr-1"
     });
     let result = session.echo_until_answered("custom/echo", params.clone());
     assert_eq!(result["method"], "custom/echo");
+    let mut expected = params.clone();
+    expected.as_object_mut().unwrap().remove("workDoneToken");
+    expected
+        .as_object_mut()
+        .unwrap()
+        .remove("partialResultToken");
     assert_eq!(
-        result["params"], params,
-        "params must reach the server verbatim (real URI, no translation)"
+        result["params"], expected,
+        "params must reach the server verbatim (real URI, no translation) minus progress tokens"
     );
     assert_eq!(
         result["opened"], true,
