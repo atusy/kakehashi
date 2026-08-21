@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tower_lsp_server::jsonrpc::{Error, Result};
+use tower_lsp_server::jsonrpc::{Error, ErrorCode, Result};
 use tower_lsp_server::ls_types::Uri;
 
 use super::bridge_context::{HostRequestContext, UpstreamRegistrySweepGuard, is_empty_layer_value};
@@ -57,6 +57,20 @@ enum Rejection {
     Reserved,
 }
 
+/// LSP `RequestFailed` (3.17+): the request was well-formed but cannot be
+/// served — here, for a configuration or policy reason the client did not
+/// cause. tower-lsp-server 0.23 has no named variant. Distinct from
+/// `InvalidParams`, which would tell the client to fix its request.
+const REQUEST_FAILED: ErrorCode = ErrorCode::ServerError(-32803);
+
+fn request_failed(message: String) -> Error {
+    Error {
+        code: REQUEST_FAILED,
+        message: message.into(),
+        data: None,
+    }
+}
+
 impl Rejection {
     fn into_error(self, method: &str) -> Error {
         match self {
@@ -69,11 +83,11 @@ impl Rejection {
                 error.data = Some(Value::String(method.to_owned()));
                 error
             }
-            Self::UnsupportedStrategy(strategy) => Error::invalid_params(format!(
+            Self::UnsupportedStrategy(strategy) => request_failed(format!(
                 "{method}: bridge._self.aggregation strategy {strategy:?} is not supported for \
                  forwarded methods; only `preferred` can combine results of unknown shape"
             )),
-            Self::Reserved => Error::invalid_params(format!(
+            Self::Reserved => request_failed(format!(
                 "{method}: lifecycle and document-sync methods are owned by the bridge and \
                  are never forwarded"
             )),
@@ -305,7 +319,6 @@ mod tests {
 
     #[test]
     fn rejections_map_to_the_contracted_error_codes() {
-        use tower_lsp_server::jsonrpc::ErrorCode;
         assert_eq!(
             Rejection::NoTextDocument.into_error("custom/x").code,
             ErrorCode::InvalidParams
@@ -313,15 +326,17 @@ mod tests {
         let not_found = Rejection::NotForwardable("why").into_error("custom/x");
         assert_eq!(not_found.code, ErrorCode::MethodNotFound);
         assert_eq!(not_found.data, Some(Value::String("custom/x".into())));
+        // Config/policy refusals are RequestFailed: the client's request was
+        // well-formed, so InvalidParams would send it fixing the wrong side.
         assert_eq!(
             Rejection::UnsupportedStrategy(AggregationStrategy::Concatenated)
                 .into_error("custom/x")
                 .code,
-            ErrorCode::InvalidParams
+            ErrorCode::ServerError(-32803)
         );
         assert_eq!(
             Rejection::Reserved.into_error("shutdown").code,
-            ErrorCode::InvalidParams
+            ErrorCode::ServerError(-32803)
         );
     }
 }

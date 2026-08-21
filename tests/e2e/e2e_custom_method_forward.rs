@@ -82,6 +82,11 @@ fn shutdown(client: &mut LspClient) {
     client.send_notification("exit", json!(null));
 }
 
+const METHOD_NOT_FOUND: i64 = -32601;
+const INVALID_PARAMS: i64 = -32602;
+/// LSP `RequestFailed`: well-formed request, refused for a server-side reason.
+const REQUEST_FAILED: i64 = -32803;
+
 fn error_code(response: &Value) -> Option<i64> {
     response.pointer("/error/code").and_then(Value::as_i64)
 }
@@ -168,7 +173,7 @@ fn e2e_unlisted_custom_request_keeps_method_not_found() {
     );
     assert_eq!(
         error_code(&response),
-        Some(-32601),
+        Some(METHOD_NOT_FOUND),
         "a method without a literal aggregation entry is not forwarded; got {response}"
     );
 
@@ -190,7 +195,11 @@ priorities = ["mock-host"]
         "custom/echo",
         json!({ "textDocument": { "uri": MARKDOWN_URI } }),
     );
-    assert_eq!(error_code(&response), Some(-32601), "got {response}");
+    assert_eq!(
+        error_code(&response),
+        Some(METHOD_NOT_FOUND),
+        "got {response}"
+    );
 
     shutdown(&mut client);
 }
@@ -202,7 +211,7 @@ fn e2e_custom_request_without_text_document_is_invalid_params() {
     let response = client.send_request("custom/echo", json!({ "no": "document" }));
     assert_eq!(
         error_code(&response),
-        Some(-32602),
+        Some(INVALID_PARAMS),
         "a forwardable method needs textDocument.uri to pick a host; got {response}"
     );
 
@@ -210,7 +219,7 @@ fn e2e_custom_request_without_text_document_is_invalid_params() {
 }
 
 #[test]
-fn e2e_concatenated_strategy_on_a_forwarded_request_is_invalid_params() {
+fn e2e_concatenated_strategy_on_a_forwarded_request_is_request_failed() {
     let (mut client, _config_dir) = init_client(FORWARDING_CONFIG);
 
     let response = client.send_request(
@@ -219,7 +228,7 @@ fn e2e_concatenated_strategy_on_a_forwarded_request_is_invalid_params() {
     );
     assert_eq!(
         error_code(&response),
-        Some(-32602),
+        Some(REQUEST_FAILED),
         "only `preferred` can combine results of unknown shape; got {response}"
     );
 
