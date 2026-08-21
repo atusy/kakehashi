@@ -32,6 +32,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use tower::Service;
+
+use crate::error::LockResultExt;
 use tower_lsp_server::jsonrpc::{ErrorCode, Request, Response};
 
 use crate::lsp::lsp_impl::HANDLED_NOTIFICATIONS;
@@ -155,10 +157,9 @@ where
 
 fn lock<S>(inner: &Mutex<S>) -> std::sync::MutexGuard<'_, S> {
     // The guard is never held across an await, so a poisoned lock can only
-    // mean a panic inside `poll_ready`/`call` themselves; keep serving.
-    inner
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    // mean a panic inside `poll_ready`/`call` themselves; keep serving, but
+    // say so — that panic is exactly the event worth seeing in the log.
+    inner.lock().recover_poison("CustomMethodForwarder::inner")
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ use super::bridge_context::{HostRequestContext, UpstreamRegistrySweepGuard, is_e
 use super::uri_to_url;
 use super::{Kakehashi, is_reserved_method};
 use crate::config::settings::AggregationStrategy;
+use crate::error::LockResultExt;
 use crate::lsp::aggregation::server::{dispatch_host_preferred, select_host_servers};
 use crate::lsp::bridge::HostDocument;
 
@@ -150,9 +151,7 @@ impl Kakehashi {
         let cache = std::sync::Arc::new(std::sync::Mutex::new(None::<ForwardableMethods>));
         move |method: &str| {
             let snapshot = settings_manager.load_settings_pair();
-            let mut cache = cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut cache = cache.lock().recover_poison("custom_method_gate cache");
             let current = match cache.as_ref() {
                 Some(cached) if cached.generation == snapshot.generation => {
                     std::sync::Arc::clone(&cached.methods)
