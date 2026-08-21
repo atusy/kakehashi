@@ -1098,32 +1098,22 @@ impl LanguageSettings {
             .unwrap_or_else(ResolvedAggregationConfig::with_defaults)
     }
 
-    /// Whether `method` has a **literal** entry in the host bridge target's
-    /// aggregation map (`bridge._self`, wildcard-merged from `bridge._`).
-    ///
-    /// This is the opt-in for forwarding a method kakehashi does not
-    /// implement (custom-method-host-forwarding): only a method the user
-    /// named explicitly is forwarded, so the `"_"` METHOD wildcard — which
+    /// The literal `bridge._self.aggregation` entry for `method`, as written
+    /// (wildcard-merged from `bridge._` at the map level, but NOT field-merged
+    /// with the `"_"` method wildcard). Its `strategy` is therefore the one
+    /// the entry sets **itself**: a forwarded method can only run `preferred`,
+    /// and an inherited `concatenated` (set once under `_` for the typed
+    /// methods that honor it) must not poison every forwarded method, just
+    /// as the typed verbatim paths ignore it (custom-method-host-forwarding).
+    /// Presence is the opt-in for forwarding: only a method the user named
+    /// explicitly is forwarded, so the `"_"` METHOD wildcard — which
     /// legitimately sets `priorities` for every typed method — never turns
     /// an unknown or mistyped method into a downstream round trip.
-    pub(crate) fn has_explicit_host_aggregation(&self, method: &str) -> bool {
-        self.explicit_host_aggregation()
-            .is_some_and(|aggregation| aggregation.contains_key(method))
-    }
-
-    /// The `strategy` a literal `bridge._self.aggregation` entry for `method`
-    /// sets **itself** — not the one it would inherit from the `"_"` method
-    /// wildcard. A forwarded method can only run `preferred`; an inherited
-    /// `concatenated` (set once under `_` for the typed methods that honor
-    /// it) must not poison every forwarded method, just as the typed
-    /// verbatim paths ignore it (custom-method-host-forwarding).
-    pub(crate) fn explicit_host_aggregation_strategy(
+    pub(crate) fn explicit_host_aggregation_entry(
         &self,
         method: &str,
-    ) -> Option<AggregationStrategy> {
-        self.explicit_host_aggregation()?
-            .get(method)
-            .and_then(|entry| entry.strategy)
+    ) -> Option<AggregationConfig> {
+        self.explicit_host_aggregation()?.remove(method)
     }
 
     /// The literal method keys of the host bridge target's aggregation map
@@ -3027,17 +3017,27 @@ kind = "locals""#;
             ])),
             ..Default::default()
         };
-        assert!(settings.has_explicit_host_aggregation("textDocument/inlineCompletion"));
         assert!(
-            settings.has_explicit_host_aggregation("custom/fromWildcard"),
+            settings
+                .explicit_host_aggregation_entry("textDocument/inlineCompletion")
+                .is_some()
+        );
+        assert!(
+            settings
+                .explicit_host_aggregation_entry("custom/fromWildcard")
+                .is_some(),
             "bridge-key wildcard `_` contributes method entries to `_self`"
         );
         assert!(
-            !settings.has_explicit_host_aggregation("custom/unlisted"),
+            !settings
+                .explicit_host_aggregation_entry("custom/unlisted")
+                .is_some(),
             "the `_` METHOD wildcard must not make every method forwardable"
         );
         assert!(
-            !LanguageSettings::default().has_explicit_host_aggregation("custom/unlisted"),
+            !LanguageSettings::default()
+                .explicit_host_aggregation_entry("custom/unlisted")
+                .is_some(),
             "no bridge map at all: nothing is forwardable"
         );
     }
@@ -3071,12 +3071,16 @@ kind = "locals""#;
             ..Default::default()
         };
         assert_eq!(
-            settings.explicit_host_aggregation_strategy("custom/plain"),
+            settings
+                .explicit_host_aggregation_entry("custom/plain")
+                .and_then(|e| e.strategy),
             None,
             "the `_` method wildcard's strategy is not the entry's own"
         );
         assert_eq!(
-            settings.explicit_host_aggregation_strategy("custom/merged"),
+            settings
+                .explicit_host_aggregation_entry("custom/merged")
+                .and_then(|e| e.strategy),
             Some(AggregationStrategy::Concatenated)
         );
         assert_eq!(

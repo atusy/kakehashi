@@ -192,32 +192,34 @@ impl Kakehashi {
         if is_reserved_method(&params.method) {
             return Err(Rejection::Reserved);
         }
-        let (lsp_uri, url) = text_document_uri(&params.params)?;
-        let language = self
-            .document_language(&url)
-            .ok_or(Rejection::NotForwardable("document is not open"))?;
+        let (lsp_uri, _url) = text_document_uri(&params.params)?;
+        // One settings snapshot for both the eligibility decision and the
+        // routing, and the language taken from the resolved context itself:
+        // a settings reload or a close-and-reopen between two reads could
+        // otherwise authorize under one configuration and route under another.
         let settings = self.settings_manager.load_settings();
-        let Some(lang_settings) = settings
-            .resolve_host_language_settings(&language)
-            .filter(|settings| settings.has_explicit_host_aggregation(&params.method))
-        else {
-            return Err(Rejection::NotForwardable(
+        let ctx = self
+            .resolve_host_bridge_context_in(&settings, &lsp_uri, &params.method)
+            .ok_or(Rejection::NotForwardable(
+                "document not open, host bridging not opted in for its language, or no \
+                 host-capable server (see the preceding debug line)",
+            ))?;
+        let entry = settings
+            .resolve_host_language_settings(&ctx.language_id)
+            .and_then(|lang| lang.explicit_host_aggregation_entry(&params.method))
+            .ok_or(Rejection::NotForwardable(
                 "no literal bridge._self.aggregation entry for the method",
-            ));
-        };
+            ))?;
         // Only the entry's OWN strategy counts: an inherited `concatenated`
         // from the `_` method wildcard is ignored here exactly as the typed
         // verbatim host paths ignore it.
-        if let Some(strategy) = lang_settings
-            .explicit_host_aggregation_strategy(&params.method)
+        if let Some(strategy) = entry
+            .strategy
             .filter(|strategy| *strategy != AggregationStrategy::Preferred)
         {
             return Err(Rejection::UnsupportedStrategy(strategy));
         }
-        self.resolve_host_bridge_context(&lsp_uri, &params.method)
-            .ok_or(Rejection::NotForwardable(
-                "host bridge context unavailable (see the preceding debug line)",
-            ))
+        Ok(ctx)
     }
 
     /// `kakehashi/forward/request`: forward a request kakehashi does not

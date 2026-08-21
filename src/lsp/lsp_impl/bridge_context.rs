@@ -1209,6 +1209,19 @@ impl Kakehashi {
         lsp_uri: &Uri,
         method_name: &str,
     ) -> Option<HostRequestContext> {
+        let settings = self.settings_manager.load_settings();
+        self.resolve_host_bridge_context_in(&settings, lsp_uri, method_name)
+    }
+
+    /// [`Self::resolve_host_bridge_context`] against a settings snapshot the
+    /// caller already holds, so eligibility it decided from that snapshot
+    /// and the routing resolved here cannot straddle a settings reload.
+    pub(crate) fn resolve_host_bridge_context_in(
+        &self,
+        settings: &std::sync::Arc<crate::config::WorkspaceSettings>,
+        lsp_uri: &Uri,
+        method_name: &str,
+    ) -> Option<HostRequestContext> {
         let uri = uri_to_url(lsp_uri).ok()?;
         // Host tier needs only the text, never the parse tree
         // (parse-decoupled-document-lifecycle ADR): read `text_arc()` directly
@@ -1223,7 +1236,6 @@ impl Kakehashi {
         };
         let language_name = self.document_language(&uri)?;
 
-        let settings = self.settings_manager.load_settings();
         let lang_settings = settings.resolve_host_language_settings(&language_name)?;
         if !lang_settings.is_host_bridging_enabled() {
             log::debug!(
@@ -1236,7 +1248,7 @@ impl Kakehashi {
 
         let configs = self
             .bridge
-            .cached_host_configs_for_language(&settings, &language_name);
+            .cached_host_configs_for_language(settings, &language_name);
         if configs.is_empty() {
             log::debug!(
                 "{}: no host-capable server configured for {}",
