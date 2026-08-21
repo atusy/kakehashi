@@ -340,6 +340,14 @@ types.
 > `kakehashi/internal/*` methods are not part of this public surface and are not
 > documented here.
 
+Two further methods carry the forwarding of methods kakehashi does not
+implement (see "Forwarding methods kakehashi does not implement" in the
+configuration reference): `kakehashi/forward/request` and
+`kakehashi/forward/notification`, both with params `{ "method": "<name>",
+"params": <original params> }`. kakehashi issues them itself for an
+unhandled message; a client may also call them directly, under the same
+eligibility rules.
+
 ### `NodeInfo`
 
 ```typescript

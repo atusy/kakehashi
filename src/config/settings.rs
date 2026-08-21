@@ -126,6 +126,8 @@ pub struct BridgeLanguageConfig {
     /// Omit to inherit from wildcard (defaults to true).
     pub enabled: Option<bool>,
     /// Per-method aggregation config. Key = LSP method name or "_" for default.
+    /// Under `_self`, a key naming a method kakehashi does not implement
+    /// forwards that method to the host servers (custom-method-host-forwarding).
     pub aggregation: Option<HashMap<String, AggregationConfig>>,
 }
 

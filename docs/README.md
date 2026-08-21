@@ -639,10 +639,13 @@ priorities = ["copilot"]             # the entry's own strategy must be "preferr
 
 Limits: only the method's literal key opts in (the `_` method wildcard does
 not), `params.textDocument.uri` must name an open document (it picks the
-host), the host layer only (no injection regions), `"concatenated"` is
-rejected (results of unknown shape cannot be merged), and kakehashi
-advertises nothing for the method in its `ServerCapabilities` — a client that
-gates on them must be told to send anyway.
+host), the host layer only (no injection regions), `"concatenated"` on the
+entry itself is rejected (results of unknown shape cannot be merged), the
+bridge-owned lifecycle/sync methods (`shutdown`, `textDocument/didClose`, …)
+are never forwarded, and kakehashi advertises nothing for the method in its
+`ServerCapabilities` — a client that gates on them must be told to send
+anyway. A server answering `MethodNotFound` counts as an empty answer; any
+other downstream failure surfaces as one log warning per request.
 
 **Aggregation Configuration:**
 
