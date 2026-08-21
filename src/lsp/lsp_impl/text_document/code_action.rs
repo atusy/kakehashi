@@ -35,8 +35,9 @@ use crate::lsp::aggregation::server::{
     dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{
-    CodeActionEnvelope, HostDocument, RegionOffset, UpstreamCodeActionCaps, bridge_code_actions,
-    extract_code_action_envelope, parse_code_actions_leniently, region_host_end,
+    CapabilityGate, CodeActionEnvelope, HostDocument, RegionOffset, UpstreamCodeActionCaps,
+    bridge_code_actions, extract_code_action_envelope, parse_code_actions_leniently,
+    region_host_end,
 };
 
 const METHOD: &str = "textDocument/codeAction";
@@ -502,6 +503,7 @@ impl Kakehashi {
                         METHOD,
                         params,
                         t.upstream_id,
+                        CapabilityGate::Advertised,
                     )
                     .await?;
                 let Some(raw) = raw else {

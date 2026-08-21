@@ -1256,11 +1256,31 @@ impl Kakehashi {
     /// Dispatch a host bridge request over a resolved [`HostRequestContext`]:
     /// the upstream `params` are forwarded verbatim (real URI, real
     /// coordinates) and the raw `result` value comes back untranslated.
+    /// Servers that do not advertise the method are skipped.
     pub(crate) async fn host_layer_value_with_ctx(
         &self,
         ctx: &HostRequestContext,
         request_method: &str,
         params: serde_json::Value,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<serde_json::Value>> {
+        self.host_layer_value_gated(
+            ctx,
+            request_method,
+            params,
+            crate::lsp::bridge::CapabilityGate::Advertised,
+        )
+        .await
+    }
+
+    /// [`Self::host_layer_value_with_ctx`] with the capability gate chosen
+    /// by the caller: the forwarded methods
+    /// (custom-method-host-forwarding) ask every selected server blind.
+    pub(crate) async fn host_layer_value_gated(
+        &self,
+        ctx: &HostRequestContext,
+        request_method: &str,
+        params: serde_json::Value,
+        gate: crate::lsp::bridge::CapabilityGate,
     ) -> tower_lsp_server::jsonrpc::Result<Option<serde_json::Value>> {
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
@@ -1285,6 +1305,7 @@ impl Kakehashi {
                             &method,
                             params,
                             t.upstream_id,
+                            gate,
                         )
                         .await
                         // This generic raw walk relays the value verbatim; only

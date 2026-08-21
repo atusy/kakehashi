@@ -22,7 +22,7 @@ use super::super::Kakehashi;
 use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
-use crate::lsp::bridge::{HostDocument, bridge_host_completion_items};
+use crate::lsp::bridge::{CapabilityGate, HostDocument, bridge_host_completion_items};
 use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
 
 const METHOD: &str = "textDocument/completion";
@@ -91,6 +91,7 @@ impl Kakehashi {
                         METHOD,
                         params,
                         t.upstream_id,
+                        CapabilityGate::Advertised,
                     )
                     .await?;
                 let Some(raw) = raw else {

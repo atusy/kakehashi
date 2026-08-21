@@ -42,6 +42,19 @@ use super::super::protocol::{
 };
 use crate::config::settings::BridgeServerConfig;
 
+/// Whether a host raw request consults the server's advertised capabilities
+/// before it is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapabilityGate {
+    /// The typed host methods: a server that does not advertise the method
+    /// is skipped (`Ok(None)`), never asked.
+    Advertised,
+    /// Forwarded methods (custom-method-host-forwarding): kakehashi has no
+    /// capability to look up for them, so the server is asked regardless
+    /// and its own `MethodNotFound` is the decline.
+    Blind,
+}
+
 /// The host document a request operates on: real URI, host language id, and
 /// the current host text (verbatim).
 pub(crate) struct HostDocument<'a> {
@@ -296,6 +309,9 @@ impl LanguageServerPool {
     /// the next request gets it) — the policy every interactive host-bridged
     /// method wants. The diagnostic path, which must instead wait through
     /// initialization, uses the dedicated [`Self::send_host_diagnostic_request`].
+    ///
+    /// `gate` decides whether the server's advertised capabilities are
+    /// consulted first ([`CapabilityGate`]).
     pub(crate) async fn send_host_raw_request(
         &self,
         server_name: &str,
@@ -304,12 +320,13 @@ impl LanguageServerPool {
         method: &str,
         mut params: serde_json::Value,
         upstream_request_id: Option<UpstreamId>,
+        gate: CapabilityGate,
     ) -> io::Result<Option<HostRawResponse>> {
         strip_progress_tokens(&mut params);
         let handle = self
             .get_or_create_connection(server_name, server_config, Some(doc.uri))
             .await?;
-        if !handle.has_capability(method) {
+        if gate == CapabilityGate::Advertised && !handle.has_capability(method) {
             return Ok(None);
         }
         // Carried out with the response so a caller that must name this exact
@@ -318,13 +335,32 @@ impl LanguageServerPool {
         // that would repeat the marker filesystem walk on a request-frequency
         // path (execute-command-routing-token).
         let answering = Arc::clone(&handle);
+        let server = server_name.to_owned();
         let value = self
             .execute_host_request(
                 handle,
                 doc,
                 upstream_request_id,
                 |request_id| JsonRpcRequest::new(request_id.as_i64(), method.to_owned(), params),
-                move |response| parse_host_raw_response(response, method),
+                move |response| {
+                    // Under the blind gate, MethodNotFound is the contract's
+                    // expected decline: nothing was advertised, the server
+                    // does not implement the method, it says so. An empty
+                    // contribution at debug, not a counted failure —
+                    // otherwise a priorities list with one non-implementing
+                    // server would warn on every keystroke and flood the
+                    // client log. An ADVERTISED method answered
+                    // MethodNotFound is a genuine failure and stays one.
+                    if gate == CapabilityGate::Blind && declines_method(&response) {
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "[{server}] does not implement {method:?} (MethodNotFound); \
+                             treated as an empty answer"
+                        );
+                        return Ok(None);
+                    }
+                    parse_host_raw_response(response, method)
+                },
             )
             // Outer `?`: transport/protocol failure from `execute_host_request`.
             // Inner `Result` from the parser: a downstream JSON-RPC error
@@ -334,52 +370,6 @@ impl LanguageServerPool {
             value,
             handle: answering,
         }))
-    }
-
-    /// Send a request for a method kakehashi does not implement
-    /// (custom-method-host-forwarding). Identical to
-    /// [`Self::send_host_raw_request`] except that the server's advertised
-    /// capabilities are **not** consulted: the method is unknown to
-    /// kakehashi, so it has no capability to look up, and the contract is
-    /// that a server not implementing it answers `MethodNotFound` itself —
-    /// which surfaces here as the `Err` of a downstream error response.
-    pub(crate) async fn send_host_custom_request(
-        &self,
-        server_name: &str,
-        server_config: &BridgeServerConfig,
-        doc: &HostDocument<'_>,
-        method: &str,
-        mut params: serde_json::Value,
-        upstream_request_id: Option<UpstreamId>,
-    ) -> io::Result<Option<serde_json::Value>> {
-        strip_progress_tokens(&mut params);
-        let handle = self
-            .get_or_create_connection(server_name, server_config, Some(doc.uri))
-            .await?;
-        let server = server_name.to_owned();
-        self.execute_host_request(
-            handle,
-            doc,
-            upstream_request_id,
-            |request_id| JsonRpcRequest::new(request_id.as_i64(), method.to_owned(), params),
-            move |response| {
-                // The contract's expected decline: nothing was advertised, the
-                // server does not implement the method, it says so. An empty
-                // contribution at debug, not a counted failure — otherwise a
-                // priorities list with one non-implementing server would warn
-                // on every keystroke and flood the client log.
-                if declines_method(&response) {
-                    log::debug!(
-                        target: "kakehashi::bridge",
-                        "[{server}] does not implement {method:?} (MethodNotFound); \
-                         treated as an empty answer"
-                    );
-                    return Ok(None);
-                }
-                parse_host_raw_response(response, method)
-            },
-        )
-        .await?
     }
 
     /// Send a notification for a method kakehashi does not implement

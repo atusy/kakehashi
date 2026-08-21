@@ -16,13 +16,13 @@ use tower_lsp_server::jsonrpc::{Error, ErrorCode, Result};
 use tower_lsp_server::ls_types::Uri;
 use url::Url;
 
-use super::bridge_context::{HostRequestContext, UpstreamRegistrySweepGuard, is_empty_layer_value};
+use super::bridge_context::{HostRequestContext, UpstreamRegistrySweepGuard};
 use super::uri_to_url;
 use super::{Kakehashi, is_reserved_method};
 use crate::config::settings::AggregationStrategy;
 use crate::error::LockResultExt;
-use crate::lsp::aggregation::server::{dispatch_host_preferred, select_host_servers};
-use crate::lsp::bridge::HostDocument;
+use crate::lsp::aggregation::server::select_host_servers;
+use crate::lsp::bridge::{CapabilityGate, HostDocument};
 
 /// Wire name of the request-forwarding method.
 pub const FORWARD_REQUEST_METHOD: &str = "kakehashi/forward/request";
@@ -225,39 +225,8 @@ impl Kakehashi {
             self.bridge.pool_arc(),
             ctx.upstream_request_id.clone(),
         );
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
-        let pool = self.bridge.pool_arc();
-        let method: std::sync::Arc<str> = params.method.as_str().into();
-        let raw_params = params.params;
-        let result = dispatch_host_preferred(
-            &ctx,
-            pool.clone(),
-            move |t| {
-                let params = raw_params.clone();
-                let method = std::sync::Arc::clone(&method);
-                async move {
-                    t.pool
-                        .send_host_custom_request(
-                            &t.server_name,
-                            &t.server_config,
-                            &HostDocument {
-                                uri: &t.uri,
-                                language_id: &t.language_id,
-                                text: &t.text,
-                            },
-                            &method,
-                            params,
-                            t.upstream_id,
-                        )
-                        .await
-                }
-            },
-            |opt| matches!(opt, Some(v) if !is_empty_layer_value(v)),
-            cancel_rx,
-        )
-        .await;
         let value = self
-            .host_layer_result(result, &params.method, |value| value)
+            .host_layer_value_gated(&ctx, &params.method, params.params, CapabilityGate::Blind)
             .await?;
         Ok(value.unwrap_or(Value::Null))
     }
