@@ -1096,6 +1096,28 @@ impl LanguageSettings {
             .unwrap_or_else(ResolvedAggregationConfig::with_defaults)
     }
 
+    /// Whether `method` has a **literal** entry in the host bridge target's
+    /// aggregation map (`bridge._self`, wildcard-merged from `bridge._`).
+    ///
+    /// This is the opt-in for forwarding a method kakehashi does not
+    /// implement (custom-method-host-forwarding): only a method the user
+    /// named explicitly is forwarded, so the `"_"` METHOD wildcard — which
+    /// legitimately sets `priorities` for every typed method — never turns
+    /// an unknown or mistyped method into a downstream round trip.
+    pub(crate) fn has_explicit_host_aggregation(&self, method: &str) -> bool {
+        self.bridge
+            .as_ref()
+            .and_then(|map| {
+                crate::config::resolve_with_wildcard(
+                    map,
+                    HOST_BRIDGE_KEY,
+                    crate::config::merge_bridge_language_configs,
+                )
+            })
+            .and_then(|cfg| cfg.aggregation)
+            .is_some_and(|aggregation| aggregation.contains_key(method))
+    }
+
     /// Check if a language is allowed for bridging based on the bridge filter.
     ///
     /// Returns:
@@ -2919,6 +2941,59 @@ kind = "locals""#;
         };
         let agg = settings.resolve_host_aggregation("textDocument/definition");
         assert_eq!(agg.priorities, vec!["marksman".to_string()]);
+    }
+
+    #[test]
+    fn host_forwarding_requires_a_literal_method_entry() {
+        // custom-method-host-forwarding: a method is forwardable only when its
+        // name is a literal key of `_self.aggregation` — reachable through the
+        // bridge `_` wildcard, but never through the `"_"` METHOD wildcard.
+        let entry = |method: &str| {
+            HashMap::from([(
+                method.to_string(),
+                AggregationConfig {
+                    priorities: Some(vec!["copilot".to_string()]),
+                    ..Default::default()
+                },
+            )])
+        };
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([
+                (
+                    HOST_BRIDGE_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        aggregation: Some(entry("textDocument/inlineCompletion")),
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: None,
+                        aggregation: Some(
+                            entry("custom/fromWildcard")
+                                .into_iter()
+                                .chain(entry("_"))
+                                .collect(),
+                        ),
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        assert!(settings.has_explicit_host_aggregation("textDocument/inlineCompletion"));
+        assert!(
+            settings.has_explicit_host_aggregation("custom/fromWildcard"),
+            "bridge-key wildcard `_` contributes method entries to `_self`"
+        );
+        assert!(
+            !settings.has_explicit_host_aggregation("custom/unlisted"),
+            "the `_` METHOD wildcard must not make every method forwardable"
+        );
+        assert!(
+            !LanguageSettings::default().has_explicit_host_aggregation("custom/unlisted"),
+            "no bridge map at all: nothing is forwardable"
+        );
     }
 
     #[test]
