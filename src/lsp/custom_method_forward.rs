@@ -13,6 +13,12 @@
 //! notifications kakehashi implements are excluded by name
 //! ([`HANDLED_NOTIFICATIONS`]).
 //!
+//! A gate predicate (`Kakehashi::custom_method_gate`) answers "could this
+//! method be forwarded for some document under the current settings?" before
+//! anything is cloned: the forward envelope needs the params, which the
+//! router consumes, so without the gate every standard request would pay a
+//! deep params clone for a forward that never happens.
+//!
 //! The inner service is shared behind a `std::sync::Mutex` because the
 //! forward needs it again after the first answer arrives, inside the response
 //! future, where `&mut self` is gone. The lock is only ever held
@@ -34,14 +40,18 @@ use crate::lsp::lsp_impl::custom_method_forward::{
 };
 
 /// Re-issues unhandled requests and notifications as the forwarding methods.
-pub struct CustomMethodForwarder<S> {
+pub struct CustomMethodForwarder<S, G> {
     inner: Arc<Mutex<S>>,
+    /// "Could this method be forwarded for some document?" — a superset
+    /// filter; per-document eligibility is the handler's job.
+    is_forwardable: G,
 }
 
-impl<S> CustomMethodForwarder<S> {
-    pub fn new(inner: S) -> Self {
+impl<S, G> CustomMethodForwarder<S, G> {
+    pub fn new(inner: S, is_forwardable: G) -> Self {
         Self {
             inner: Arc::new(Mutex::new(inner)),
+            is_forwardable,
         }
     }
 }
@@ -60,11 +70,13 @@ enum Plan {
     ForwardNotification,
 }
 
-fn plan(req: &Request) -> Plan {
+fn plan(req: &Request, is_forwardable: impl Fn(&str) -> bool) -> Plan {
     let method = req.method();
     // `$/` is the protocol's own namespace (cancel, progress, trace) and
-    // `kakehashi/` is ours; neither is anyone's custom method.
-    if method.starts_with("$/") || method.starts_with("kakehashi/") {
+    // `kakehashi/` is ours; neither is anyone's custom method. A method no
+    // configuration names is not one either — and that check is what keeps
+    // the standard methods off the clone-then-probe path.
+    if method.starts_with("$/") || method.starts_with("kakehashi/") || !is_forwardable(method) {
         return Plan::PassThrough;
     }
     if req.id().is_some() {
@@ -97,11 +109,12 @@ fn is_method_not_found(response: &Option<Response>) -> bool {
         .is_some_and(|error| error.code == ErrorCode::MethodNotFound)
 }
 
-impl<S> Service<Request> for CustomMethodForwarder<S>
+impl<S, G> Service<Request> for CustomMethodForwarder<S, G>
 where
     S: Service<Request, Response = Option<Response>> + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
+    G: Fn(&str) -> bool,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -112,7 +125,7 @@ where
     }
 
     fn call(&mut self, req: Request) -> Self::Future {
-        match plan(&req) {
+        match plan(&req, &self.is_forwardable) {
             Plan::PassThrough => Box::pin(lock(&self.inner).call(req)),
             Plan::ForwardNotification => {
                 let forwarded = rewrite(&req, FORWARD_NOTIFICATION_METHOD);
@@ -203,8 +216,15 @@ mod tests {
             .finish()
     }
 
+    /// The configured forward methods in these tests: anything under
+    /// `custom/`, plus the handled/reserved names so the exclusion rules —
+    /// not the gate — are what the pass-through assertions exercise.
+    fn configured(method: &str) -> bool {
+        method.starts_with("custom/") || !method.starts_with("known/")
+    }
+
     async fn drive(router: &Router, req: Request) -> Option<Response> {
-        let mut svc = CustomMethodForwarder::new(router.clone());
+        let mut svc = CustomMethodForwarder::new(router.clone(), configured);
         std::future::poll_fn(|cx| svc.poll_ready(cx)).await.unwrap();
         svc.call(req).await.unwrap()
     }
@@ -286,6 +306,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unconfigured_methods_pass_through_without_a_forward() {
+        // The gate says no: the router's MethodNotFound stands and no second
+        // dispatch happens — the standard-method hot path.
+        let router = Router::default();
+        let mut svc = CustomMethodForwarder::new(router.clone(), |_: &str| false);
+        let response = svc.call(request("custom/echo", 1)).await.unwrap().unwrap();
+        assert_eq!(response.error().unwrap().code, ErrorCode::MethodNotFound);
+        assert_eq!(methods(&router), ["custom/echo"]);
+        assert!(
+            svc.call(notification("custom/ping"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(methods(&router), ["custom/echo", "custom/ping"]);
+    }
+
+    #[tokio::test]
     async fn forwarding_methods_called_directly_are_not_rewrapped() {
         let router = Router::default();
         let response = drive(&router, request(FORWARD_REQUEST_METHOD, 1))
@@ -317,7 +355,7 @@ mod tests {
                 })))
             }
         }
-        let mut svc = CustomMethodForwarder::new(Uninitialized);
+        let mut svc = CustomMethodForwarder::new(Uninitialized, configured);
         let response = svc.call(request("custom/echo", 1)).await.unwrap().unwrap();
         assert_eq!(
             response.error().unwrap().code,

@@ -1778,7 +1778,8 @@ async fn serve_lsp() {
     // no handler for (custom-method-host-forwarding). Sits inside
     // RequestIdCapture so the forwarded request keeps its upstream id and
     // cancel path.
-    let service = CustomMethodForwarder::new(service);
+    let custom_method_gate = service.inner().custom_method_gate();
+    let service = CustomMethodForwarder::new(service, custom_method_gate);
 
     // Wrap service with RequestIdCapture to:
     // 1. Capture upstream request IDs (for ls-bridge-server-pool-coordination bridge requests)

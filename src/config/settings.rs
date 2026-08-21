@@ -1105,6 +1105,15 @@ impl LanguageSettings {
     /// legitimately sets `priorities` for every typed method — never turns
     /// an unknown or mistyped method into a downstream round trip.
     pub(crate) fn has_explicit_host_aggregation(&self, method: &str) -> bool {
+        self.explicit_host_aggregation()
+            .is_some_and(|aggregation| aggregation.contains_key(method))
+    }
+
+    /// The literal method keys of the host bridge target's aggregation map
+    /// (`bridge._self`, wildcard-merged from `bridge._`), `"_"` included —
+    /// callers wanting forwardable methods filter it; see
+    /// [`Self::has_explicit_host_aggregation`].
+    fn explicit_host_aggregation(&self) -> Option<HashMap<String, AggregationConfig>> {
         self.bridge
             .as_ref()
             .and_then(|map| {
@@ -1115,7 +1124,6 @@ impl LanguageSettings {
                 )
             })
             .and_then(|cfg| cfg.aggregation)
-            .is_some_and(|aggregation| aggregation.contains_key(method))
     }
 
     /// Check if a language is allowed for bridging based on the bridge filter.
@@ -1153,6 +1161,22 @@ pub struct WorkspaceSettings {
     pub diagnostics_debounce_ms: u64,
     pub features: ResolvedFeatureSettings,
     pub language_servers: HashMap<String, BridgeServerConfig>,
+}
+
+impl WorkspaceSettings {
+    /// Every method some language names literally under
+    /// `bridge._self.aggregation` — the set of methods that could be
+    /// forwarded for SOME document (custom-method-host-forwarding). A
+    /// superset filter for the dispatch layer, which has no document in hand:
+    /// per-document eligibility is decided again at forward time.
+    pub(crate) fn host_forwardable_methods(&self) -> std::collections::HashSet<String> {
+        self.languages
+            .values()
+            .filter_map(LanguageSettings::explicit_host_aggregation)
+            .flat_map(|aggregation| aggregation.into_keys())
+            .filter(|method| method != crate::config::WILDCARD_KEY)
+            .collect()
+    }
 }
 
 impl Default for WorkspaceSettings {
@@ -2993,6 +3017,40 @@ kind = "locals""#;
         assert!(
             !LanguageSettings::default().has_explicit_host_aggregation("custom/unlisted"),
             "no bridge map at all: nothing is forwardable"
+        );
+    }
+
+    #[test]
+    fn host_forwardable_methods_unions_literal_entries_across_languages() {
+        let lang = |method: &str| LanguageSettings {
+            bridge: Some(HashMap::from([(
+                HOST_BRIDGE_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([
+                        (method.to_string(), AggregationConfig::default()),
+                        ("_".to_string(), AggregationConfig::default()),
+                    ])),
+                },
+            )])),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([
+                ("markdown".to_string(), lang("custom/a")),
+                ("python".to_string(), lang("custom/b")),
+                ("rust".to_string(), LanguageSettings::default()),
+            ]),
+            ..Default::default()
+        };
+        let methods = settings.host_forwardable_methods();
+        assert_eq!(
+            methods,
+            ["custom/a", "custom/b"]
+                .into_iter()
+                .map(String::from)
+                .collect::<std::collections::HashSet<_>>(),
+            "every language's literal entries, never the `_` method wildcard"
         );
     }
 

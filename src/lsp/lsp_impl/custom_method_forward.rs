@@ -82,7 +82,45 @@ fn text_document_uri(params: &Value) -> Option<Uri> {
         .and_then(|raw| raw.parse::<Uri>().ok())
 }
 
+/// Per-settings-generation cache behind [`Kakehashi::custom_method_gate`].
+struct ForwardableMethods {
+    generation: u64,
+    methods: std::sync::Arc<std::collections::HashSet<String>>,
+}
+
 impl Kakehashi {
+    /// A predicate for the dispatch layer: could `method` be forwarded for
+    /// SOME document under the current settings? The forwarder consults it
+    /// before cloning a request's params, so the standard methods — the hot
+    /// path — never pay for a forward that cannot happen. Recomputed only
+    /// when the settings generation moves; otherwise one atomic load, one
+    /// lock, one hash lookup.
+    pub fn custom_method_gate(&self) -> impl Fn(&str) -> bool + Send + Sync + Clone + 'static {
+        let settings_manager = std::sync::Arc::clone(&self.settings_manager);
+        let cache = std::sync::Arc::new(std::sync::Mutex::new(None::<ForwardableMethods>));
+        move |method: &str| {
+            let snapshot = settings_manager.load_settings_pair();
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current = match cache.as_ref() {
+                Some(cached) if cached.generation == snapshot.generation => {
+                    std::sync::Arc::clone(&cached.methods)
+                }
+                _ => {
+                    let methods = std::sync::Arc::new(snapshot.settings.host_forwardable_methods());
+                    *cache = Some(ForwardableMethods {
+                        generation: snapshot.generation,
+                        methods: std::sync::Arc::clone(&methods),
+                    });
+                    methods
+                }
+            };
+            drop(cache);
+            current.contains(method)
+        }
+    }
+
     /// Resolve the host servers a forwarded message goes to, or why it
     /// does not go anywhere.
     fn resolve_forward_target(
