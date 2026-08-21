@@ -814,7 +814,8 @@ fn declines_method(response: &serde_json::Value) -> bool {
     // A well-formed decline only: an error object with the code and its
     // required `message`, and no `result` beside it. Anything malformed
     // falls through to the strict parse and counts as a failure.
-    response.get("result").is_none()
+    response.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0")
+        && response.get("result").is_none()
         && response
             .pointer("/error/code")
             .and_then(serde_json::Value::as_i64)
@@ -1218,6 +1219,12 @@ mod tests {
         // Malformed declines are failures, not quiet empties.
         assert!(!declines_method(&serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "error": { "code": -32601 }
+        })));
+        assert!(!declines_method(&serde_json::json!({
+            "id": 1, "error": { "code": -32601, "message": "Method not found" }
+        })));
+        assert!(!declines_method(&serde_json::json!({
+            "jsonrpc": "1.0", "id": 1, "error": { "code": -32601, "message": "Method not found" }
         })));
         assert!(!declines_method(&serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "result": 1,
