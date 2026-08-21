@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::jsonrpc::{Error, ErrorCode, Result};
 use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 use super::bridge_context::{HostRequestContext, UpstreamRegistrySweepGuard, is_empty_layer_value};
 use super::uri_to_url;
@@ -44,6 +45,9 @@ enum Rejection {
     /// pick servers for. `InvalidParams` — the method IS forwardable, the
     /// call is malformed for it.
     NoTextDocument,
+    /// `textDocument.uri` is present but not an absolute URI kakehashi can
+    /// key a document by. `InvalidParams`, with the offending value.
+    InvalidTextDocumentUri(String),
     /// Not opted in: unknown document, host bridging off for its language,
     /// no literal aggregation entry, or no host-capable server. For a
     /// request this keeps the router's `MethodNotFound` — from the client's
@@ -72,35 +76,60 @@ fn request_failed(message: String) -> Error {
 }
 
 impl Rejection {
+    /// Human-readable reason, without the method (callers prefix it).
+    fn describe(&self) -> String {
+        match self {
+            Self::NoTextDocument => {
+                "forwarding needs params.textDocument.uri to pick a host document".to_owned()
+            }
+            Self::InvalidTextDocumentUri(raw) => {
+                format!("params.textDocument.uri {raw:?} is not an absolute URI")
+            }
+            Self::NotForwardable(reason) => (*reason).to_owned(),
+            Self::UnsupportedStrategy(strategy) => format!(
+                "bridge._self.aggregation strategy {strategy:?} is not supported for forwarded \
+                 methods; only `preferred` can combine results of unknown shape"
+            ),
+            Self::Reserved => {
+                "lifecycle and document-sync methods are owned by the bridge and are never \
+                 forwarded"
+                    .to_owned()
+            }
+        }
+    }
+
+    /// The JSON-RPC error a request gets. Pure: logging is the caller's.
     fn into_error(self, method: &str) -> Error {
         match self {
-            Self::NoTextDocument => Error::invalid_params(format!(
-                "{method}: forwarding needs params.textDocument.uri to pick a host document"
-            )),
-            Self::NotForwardable(reason) => {
-                log::debug!("{method}: not forwarded: {reason}");
+            Self::NoTextDocument | Self::InvalidTextDocumentUri(_) => {
+                Error::invalid_params(format!("{method}: {}", self.describe()))
+            }
+            Self::NotForwardable(_) => {
                 let mut error = Error::method_not_found();
                 error.data = Some(Value::String(method.to_owned()));
                 error
             }
-            Self::UnsupportedStrategy(strategy) => request_failed(format!(
-                "{method}: bridge._self.aggregation strategy {strategy:?} is not supported for \
-                 forwarded methods; only `preferred` can combine results of unknown shape"
-            )),
-            Self::Reserved => request_failed(format!(
-                "{method}: lifecycle and document-sync methods are owned by the bridge and \
-                 are never forwarded"
-            )),
+            Self::UnsupportedStrategy(_) | Self::Reserved => {
+                request_failed(format!("{method}: {}", self.describe()))
+            }
         }
     }
 }
 
-/// `params.textDocument.uri`, the one field the forward reads.
-fn text_document_uri(params: &Value) -> Option<Uri> {
-    params
+/// `params.textDocument.uri`, the one field the forward reads, as both the
+/// wire `Uri` (forwarded verbatim) and the `Url` the document store is keyed
+/// by. Absent and malformed are told apart so the client learns which.
+fn text_document_uri(params: &Value) -> std::result::Result<(Uri, Url), Rejection> {
+    let raw = params
         .pointer("/textDocument/uri")
         .and_then(Value::as_str)
-        .and_then(|raw| raw.parse::<Uri>().ok())
+        .ok_or(Rejection::NoTextDocument)?;
+    let lsp_uri = raw
+        .parse::<Uri>()
+        .map_err(|_| Rejection::InvalidTextDocumentUri(raw.to_owned()))?;
+    let url =
+        uri_to_url(&lsp_uri).map_err(|_| Rejection::InvalidTextDocumentUri(raw.to_owned()))?;
+    Ok((lsp_uri, url))
 }
 
 /// Per-settings-generation cache behind [`Kakehashi::custom_method_gate`].
@@ -151,8 +180,7 @@ impl Kakehashi {
         if is_reserved_method(&params.method) {
             return Err(Rejection::Reserved);
         }
-        let lsp_uri = text_document_uri(&params.params).ok_or(Rejection::NoTextDocument)?;
-        let url = uri_to_url(&lsp_uri).map_err(|_| Rejection::NoTextDocument)?;
+        let (lsp_uri, url) = text_document_uri(&params.params)?;
         let language = self
             .document_language(&url)
             .ok_or(Rejection::NotForwardable("document is not open"))?;
@@ -184,9 +212,12 @@ impl Kakehashi {
     /// implement to the host servers and answer with the first non-empty
     /// downstream result (`preferred`), or `null`.
     pub async fn forward_custom_request(&self, params: ForwardParams) -> Result<Value> {
-        let ctx = self
-            .resolve_forward_target(&params)
-            .map_err(|rejection| rejection.into_error(&params.method))?;
+        let ctx = self.resolve_forward_target(&params).map_err(|rejection| {
+            if let Rejection::NotForwardable(reason) = &rejection {
+                log::debug!("{:?}: not forwarded: {reason}", params.method);
+            }
+            rejection.into_error(&params.method)
+        })?;
 
         // Standalone host dispatch (no layer race): the RAII sweep clears
         // the upstream-registry entries an aborted per-server task may not
@@ -236,17 +267,19 @@ impl Kakehashi {
     /// does not implement to **every** selected host server, in priority
     /// order. Nothing comes back; failures are logged per server.
     pub async fn forward_custom_notification(&self, params: ForwardParams) {
+        // `{:?}` on the method: it is a client-controlled string going to a
+        // line-oriented log.
         let ctx = match self.resolve_forward_target(&params) {
             Ok(ctx) => ctx,
             Err(Rejection::NotForwardable(reason)) => {
-                log::debug!("{}: notification not forwarded: {reason}", params.method);
+                log::debug!("{:?}: notification not forwarded: {reason}", params.method);
                 return;
             }
             Err(rejection) => {
                 log::warn!(
-                    "{}: notification dropped: {}",
+                    "{:?}: notification dropped: {}",
                     params.method,
-                    rejection.into_error(&params.method).message
+                    rejection.describe()
                 );
                 return;
             }
@@ -269,7 +302,7 @@ impl Kakehashi {
                 .await
             {
                 log::warn!(
-                    "{}: notification not delivered to {}: {error}",
+                    "{:?}: notification not delivered to {}: {error}",
                     params.method,
                     server.server_name
                 );
@@ -294,10 +327,36 @@ mod tests {
     fn text_document_uri_reads_only_the_standard_location() {
         assert!(
             text_document_uri(&serde_json::json!({ "textDocument": { "uri": "file:///a.md" } }))
-                .is_some()
+                .is_ok()
         );
-        assert!(text_document_uri(&serde_json::json!({ "uri": "file:///a.md" })).is_none());
-        assert!(text_document_uri(&Value::Null).is_none());
+        for params in [
+            serde_json::json!({ "uri": "file:///a.md" }),
+            Value::Null,
+            serde_json::json!(5),
+            serde_json::json!([]),
+            serde_json::json!({ "textDocument": { "uri": 7 } }),
+        ] {
+            assert_eq!(
+                text_document_uri(&params).unwrap_err(),
+                Rejection::NoTextDocument,
+                "{params}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_text_document_uri_is_reported_as_such() {
+        let params = serde_json::json!({ "textDocument": { "uri": "not a uri" } });
+        assert_eq!(
+            text_document_uri(&params).unwrap_err(),
+            Rejection::InvalidTextDocumentUri("not a uri".to_owned())
+        );
+        assert_eq!(
+            Rejection::InvalidTextDocumentUri("x".into())
+                .into_error("custom/x")
+                .code,
+            ErrorCode::InvalidParams
+        );
     }
 
     #[test]
