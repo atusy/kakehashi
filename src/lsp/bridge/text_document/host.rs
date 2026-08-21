@@ -811,10 +811,17 @@ fn lacks_result_and_error(response: &serde_json::Value) -> bool {
 /// the server's own way of saying it does not implement the method.
 fn declines_method(response: &serde_json::Value) -> bool {
     const METHOD_NOT_FOUND: i64 = -32601;
-    response
-        .pointer("/error/code")
-        .and_then(serde_json::Value::as_i64)
-        .is_some_and(|code| code == METHOD_NOT_FOUND)
+    // A well-formed decline only: an error object with the code and its
+    // required `message`, and no `result` beside it. Anything malformed
+    // falls through to the strict parse and counts as a failure.
+    response.get("result").is_none()
+        && response
+            .pointer("/error/code")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|code| code == METHOD_NOT_FOUND)
+        && response
+            .pointer("/error/message")
+            .is_some_and(serde_json::Value::is_string)
 }
 
 fn parse_host_raw_response(
@@ -1207,6 +1214,14 @@ mod tests {
         })));
         assert!(!declines_method(&serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "result": null
+        })));
+        // Malformed declines are failures, not quiet empties.
+        assert!(!declines_method(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "error": { "code": -32601 }
+        })));
+        assert!(!declines_method(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": 1,
+            "error": { "code": -32601, "message": "Method not found" }
         })));
     }
 
