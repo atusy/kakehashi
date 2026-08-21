@@ -275,6 +275,12 @@ impl Kakehashi {
         let live_text_reader: crate::lsp::bridge::HostTextReader =
             std::sync::Arc::new(move || documents.get(&reader_uri).map(|doc| doc.text_arc()));
         let servers = select_host_servers(&ctx);
+        if servers.is_empty() {
+            // The kill switch (`priorities = []`, `maxFanOut = 0`): nothing
+            // to deliver, so no permit and no task — a burst of these must
+            // not crowd out notifications that do have servers.
+            return;
+        }
         let ForwardParams { method, params } = params;
         // Detached: a delivery may wait through a server's initialization,
         // and a notification handler that waited with it would hold one of
