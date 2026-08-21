@@ -68,7 +68,7 @@ use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
 /// `exit` by the `LspService` itself and `window/workDoneProgress/cancel`
 /// by `RequestIdCapture` (ls-bridge-work-done-progress routes it to the
 /// token's owner; a verbatim fan-out would deliver it twice).
-/// `handled_notifications_match_the_router` pins the trait part.
+/// `handled_notifications_match_the_language_server_impl` pins the trait part.
 pub(crate) const HANDLED_NOTIFICATIONS: &[&str] = &[
     "initialized",
     "exit",
