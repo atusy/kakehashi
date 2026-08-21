@@ -246,24 +246,28 @@ maxFanOut = 1
     session
         .client
         .send_notification("custom/capped", capped.clone());
-    // A second uncapped ping after the capped one. Each server's deliveries
-    // arrive in send order, so once mock-a shows this marker, a wrongly
-    // fanned-out capped ping would already be visible before it — "not
-    // arrived yet" cannot fake a pass.
+    // A second uncapped ping after the capped one. Forwarded notifications
+    // carry no ordering promise, so the marker is not a fence; it is a
+    // later-sent message whose arrival at mock-a makes a wrongly fanned-out
+    // capped ping — dispatched earlier, to the same server — overwhelmingly
+    // likely to have arrived too, which "not arrived yet" could otherwise
+    // hide. Arrival sets are compared, not sequences.
     let marker = json!({ "textDocument": { "uri": MARKDOWN_URI }, "n": 3 });
     session
         .client
         .send_notification("custom/ping", marker.clone());
     let expected_capped = json!({ "method": "custom/capped", "params": capped });
     let expected_marker = json!({ "method": "custom/ping", "params": marker });
-    let settled = |session: &mut Session, echo: &str| -> Value {
+    let sorted = |items: &[&Value]| -> Vec<String> {
+        let mut v: Vec<String> = items.iter().map(|i| i.to_string()).collect();
+        v.sort();
+        v
+    };
+    let settled = |session: &mut Session, echo: &str| -> Vec<String> {
         for _ in 0..300 {
             let seen = session.notifications_seen_by(echo);
-            if seen
-                .as_array()
-                .is_some_and(|n| n.last() == Some(&expected_marker))
-            {
-                return seen;
+            if let Some(items) = seen.as_array().filter(|n| n.contains(&expected_marker)) {
+                return sorted(&items.iter().collect::<Vec<_>>());
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -271,12 +275,12 @@ maxFanOut = 1
     };
     assert_eq!(
         settled(&mut session, "custom/echoB"),
-        json!([expected_ping[0], expected_capped, expected_marker]),
+        sorted(&[&expected_ping[0], &expected_capped, &expected_marker]),
         "mock-b is first in priorities: the one server under maxFanOut = 1"
     );
     assert_eq!(
         settled(&mut session, "custom/echoA"),
-        json!([expected_ping[0], expected_marker]),
+        sorted(&[&expected_ping[0], &expected_marker]),
         "maxFanOut = 1 must stop the capped notification at the first server"
     );
 
