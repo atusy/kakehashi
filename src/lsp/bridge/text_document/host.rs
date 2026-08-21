@@ -34,7 +34,7 @@ use url::Url;
 use super::super::actor::RouterCleanupGuard;
 use super::super::pool::{
     ConnectionHandle, ConnectionHandleSender, ConnectionKey, HostDocSyncState, LanguageServerPool,
-    MessageSender, NotificationSendResult, UpstreamId,
+    MessageSender, UpstreamId,
 };
 use super::super::protocol::{
     JsonRpcNotification, JsonRpcRequest, RequestId, jsonrpc_error_summary,
@@ -399,11 +399,17 @@ impl LanguageServerPool {
     /// request path it **waits through initialization** (Tier 0 bound,
     /// ls-bridge-timeout-hierarchy): a request that fails fast is retried
     /// by the next keystroke, but a dropped notification is gone.
+    ///
+    /// Because of that wait, `doc.text` can be seconds old by the time the
+    /// sync runs; `live_text_reader` lets the sync send the document's
+    /// current text instead of rolling the server back to the snapshot
+    /// (the eager re-sync closes the same window the same way, #422).
     pub(crate) async fn send_host_custom_notification(
         &self,
         server_name: &str,
         server_config: &BridgeServerConfig,
         doc: &HostDocument<'_>,
+        live_text_reader: Option<&HostTextReader>,
         method: &str,
         mut params: serde_json::Value,
     ) -> io::Result<()> {
@@ -447,13 +453,17 @@ impl LanguageServerPool {
         }
         let mut docs = self.host_documents().await;
         let mut sender = ConnectionHandleSender(&handle);
-        sync_host_document(&mut sender, &mut docs, doc, None, connection_key).await?;
-        match handle.send_notification(JsonRpcNotification::new(method.to_owned(), params)) {
-            NotificationSendResult::Queued => Ok(()),
-            other => Err(io::Error::other(format!(
-                "failed to queue {method} for {connection_key}: {other:?}"
-            ))),
-        }
+        sync_host_document(
+            &mut sender,
+            &mut docs,
+            doc,
+            live_text_reader.map(|reader| reader.as_ref()),
+            connection_key,
+        )
+        .await?;
+        sender
+            .send_notification(JsonRpcNotification::new(method.to_owned(), params))
+            .await
     }
 
     /// Send a host formatting request. Unlike [`Self::send_host_raw_request`],

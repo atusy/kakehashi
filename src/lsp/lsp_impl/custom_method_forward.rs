@@ -290,24 +290,42 @@ impl Kakehashi {
             language_id: &ctx.language_id,
             text: &ctx.text,
         };
-        for server in select_host_servers(&ctx) {
-            if let Err(error) = pool
-                .send_host_custom_notification(
-                    &server.server_name,
-                    &server.config,
-                    &doc,
-                    &params.method,
-                    params.params.clone(),
-                )
-                .await
-            {
-                log::warn!(
-                    "{:?}: notification not delivered to {}: {error}",
-                    params.method,
-                    server.server_name
-                );
+        // Current text at sync time, not the snapshot taken before the
+        // per-server initialization wait (same lock-order reasoning as the
+        // reader in `debounced_diagnostics`: read and dropped inside the
+        // closure, never held across an await).
+        let documents = std::sync::Arc::clone(&self.documents);
+        let reader_uri = ctx.uri.clone();
+        let live_text_reader: crate::lsp::bridge::HostTextReader =
+            std::sync::Arc::new(move || documents.get(&reader_uri).map(|doc| doc.text_arc()));
+        // Every selected server independently: one server's initialization
+        // wait must not hold back delivery to the others.
+        let deliveries = select_host_servers(&ctx).into_iter().map(|server| {
+            let pool = std::sync::Arc::clone(&pool);
+            let doc = &doc;
+            let method = &params.method;
+            let payload = params.params.clone();
+            let live_text_reader = &live_text_reader;
+            async move {
+                if let Err(error) = pool
+                    .send_host_custom_notification(
+                        &server.server_name,
+                        &server.config,
+                        doc,
+                        Some(live_text_reader),
+                        method,
+                        payload,
+                    )
+                    .await
+                {
+                    log::warn!(
+                        "{method:?}: notification not delivered to {}: {error}",
+                        server.server_name
+                    );
+                }
             }
-        }
+        });
+        futures::future::join_all(deliveries).await;
     }
 }
 
