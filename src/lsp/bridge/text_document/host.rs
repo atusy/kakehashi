@@ -42,12 +42,31 @@ use super::super::protocol::{
 };
 use crate::config::settings::BridgeServerConfig;
 
+/// Whether a host raw request consults the server's advertised capabilities
+/// before it is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapabilityGate {
+    /// The typed host methods: a server that does not advertise the method
+    /// is skipped (`Ok(None)`), never asked.
+    Advertised,
+    /// Forwarded methods (custom-method-host-forwarding): kakehashi has no
+    /// capability to look up for them, so the server is asked regardless
+    /// and its own `MethodNotFound` is the decline.
+    Blind,
+}
+
 /// The host document a request operates on: real URI, host language id, and
 /// the current host text (verbatim).
 pub(crate) struct HostDocument<'a> {
     pub(crate) uri: &'a Url,
     pub(crate) language_id: &'a str,
     pub(crate) text: &'a str,
+    /// The document incarnation the caller resolved against, when it wants
+    /// the send refused once that incarnation is gone (closed, or closed
+    /// and reopened): checked under the host lifecycle lock before the sync
+    /// (custom-method-host-forwarding). `None` keeps the typed host paths'
+    /// long-standing behavior of syncing whatever is there.
+    pub(crate) incarnation: Option<u64>,
 }
 
 /// A raw host-server response plus the very connection that answered it.
@@ -296,20 +315,25 @@ impl LanguageServerPool {
     /// the next request gets it) — the policy every interactive host-bridged
     /// method wants. The diagnostic path, which must instead wait through
     /// initialization, uses the dedicated [`Self::send_host_diagnostic_request`].
+    ///
+    /// `gate` decides whether the server's advertised capabilities are
+    /// consulted first ([`CapabilityGate`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_host_raw_request(
         &self,
         server_name: &str,
         server_config: &BridgeServerConfig,
         doc: &HostDocument<'_>,
-        method: &'static str,
+        method: &str,
         mut params: serde_json::Value,
         upstream_request_id: Option<UpstreamId>,
+        gate: CapabilityGate,
     ) -> io::Result<Option<HostRawResponse>> {
         strip_progress_tokens(&mut params);
         let handle = self
             .get_or_create_connection(server_name, server_config, Some(doc.uri))
             .await?;
-        if !handle.has_capability(method) {
+        if gate == CapabilityGate::Advertised && !handle.has_capability(method) {
             return Ok(None);
         }
         // Carried out with the response so a caller that must name this exact
@@ -318,13 +342,45 @@ impl LanguageServerPool {
         // that would repeat the marker filesystem walk on a request-frequency
         // path (execute-command-routing-token).
         let answering = Arc::clone(&handle);
+        // Only the blind decline log names the server; keep the typed hot
+        // path allocation-free.
+        let server = (gate == CapabilityGate::Blind).then(|| server_name.to_owned());
         let value = self
             .execute_host_request(
                 handle,
                 doc,
                 upstream_request_id,
-                |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
-                move |response| parse_host_raw_response(response, method),
+                |request_id| JsonRpcRequest::new(request_id.as_i64(), method.to_owned(), params),
+                move |response| {
+                    // Under the blind gate, MethodNotFound is the contract's
+                    // expected decline: nothing was advertised, the server
+                    // does not implement the method, it says so. An empty
+                    // contribution at debug, not a counted failure —
+                    // otherwise a priorities list with one non-implementing
+                    // server would warn on every keystroke and flood the
+                    // client log. An ADVERTISED method answered
+                    // MethodNotFound is a genuine failure and stays one.
+                    if let Some(server) = server.as_deref() {
+                        if declines_method(&response) {
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "[{server}] does not implement {method:?} (MethodNotFound); \
+                                 treated as an empty answer"
+                            );
+                            return Ok(None);
+                        }
+                        // The typed raw path tolerates a response with neither
+                        // member (long-standing leniency); an arbitrary
+                        // forwarded method gets JSON-RPC's strict reading —
+                        // that is a broken server, counted as a failure.
+                        if lacks_result_and_error(&response) {
+                            return Err(io::Error::other(format!(
+                                "[{server}] answered {method:?} with neither result nor error"
+                            )));
+                        }
+                    }
+                    parse_host_raw_response(response, method)
+                },
             )
             // Outer `?`: transport/protocol failure from `execute_host_request`.
             // Inner `Result` from the parser: a downstream JSON-RPC error
@@ -334,6 +390,117 @@ impl LanguageServerPool {
             value,
             handle: answering,
         }))
+    }
+
+    /// Send a notification for a method kakehashi does not implement
+    /// (custom-method-host-forwarding) with the upstream params forwarded
+    /// verbatim, after syncing the host document to the server.
+    ///
+    /// The sync is what distinguishes this from a bare
+    /// `handle.send_notification`: a notification about a document the
+    /// server never opened is a protocol nuisance at best. It therefore
+    /// follows the lock discipline of [`Self::execute_host_request`] —
+    /// routing wait, per-document lifecycle lock, suppression check, live
+    /// handle check, then sync and send under the `connections` →
+    /// `host_documents` order — minus the request bookkeeping a
+    /// notification has no use for. Unlike [`Self::notify_host_will_save`],
+    /// this may spawn the connection: the user asked for this method to
+    /// reach this server, exactly as a request would. And unlike the
+    /// request path it **waits through initialization** (Tier 0 bound,
+    /// ls-bridge-timeout-hierarchy): a request that fails fast is retried
+    /// by the next keystroke, but a dropped notification is gone.
+    ///
+    /// Because of that wait, `doc.text` can be seconds old by the time the
+    /// sync runs; `live_text_reader` lets the sync send the document's
+    /// current text instead of rolling the server back to the snapshot
+    /// (the eager re-sync closes the same window the same way, #422).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_host_custom_notification(
+        &self,
+        server_name: &str,
+        server_config: &BridgeServerConfig,
+        doc: &HostDocument<'_>,
+        live_text_reader: Option<&HostTextReader>,
+        method: &str,
+        mut params: serde_json::Value,
+    ) -> io::Result<()> {
+        strip_progress_tokens(&mut params);
+        let handle = self
+            .get_or_create_connection_wait_ready(
+                server_name,
+                server_config,
+                Some(doc.uri),
+                std::time::Duration::from_secs(super::super::pool::INIT_TIMEOUT_SECS),
+            )
+            .await?;
+        let connection_key = handle.key();
+        self.wait_for_host_routing(doc.uri).await;
+        let lifecycle = self.host_lifecycle_lock(doc.uri);
+        // Whatever path returns below: if the document is gone, the lock
+        // entry this call may just have re-created goes with it.
+        let _cleanup = super::did_open::LifecycleCleanup {
+            pool: self,
+            host_uri: doc.uri,
+            lifecycle: &lifecycle,
+        };
+        let _lifecycle_guard = lifecycle.lock().await;
+        // The waits above can outlive the document: once closed, a sync here
+        // would re-open it downstream from the stale snapshot with nothing
+        // left to close it — and a close-then-reopen of the same URI would
+        // deliver a message meant for the old document into the new one.
+        // Checked UNDER the lifecycle lock, which the downstream close also
+        // takes, so neither can slip between this check and the send: the
+        // incarnation must still be the one the message was resolved
+        // against, and the reader must still find a document. The snapshot
+        // is never used as a fallback on this path.
+        if doc
+            .incarnation
+            .is_some_and(|expected| self.current_host_incarnation(doc.uri) != Some(expected))
+            || live_text_reader.is_some_and(|reader| reader().is_none())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "host document closed while waiting for the server",
+            ));
+        }
+        if self.is_host_routing_suppressed(doc.uri, connection_key) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("host document routing disabled on {connection_key}"),
+            ));
+        }
+        self.apply_host_routing_workspace_folders(doc.uri, connection_key.server(), &handle)
+            .await
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to apply host routing workspace folders: {error}"),
+                )
+            })?;
+
+        let connections = self.connections().await;
+        if !connections
+            .get(connection_key)
+            .is_some_and(|current| Arc::ptr_eq(current, &handle))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("connection to {connection_key} was replaced during host sync"),
+            ));
+        }
+        let mut docs = self.host_documents().await;
+        let mut sender = ConnectionHandleSender(&handle);
+        sync_host_document(
+            &mut sender,
+            &mut docs,
+            doc,
+            live_text_reader.map(|reader| reader.as_ref()),
+            connection_key,
+        )
+        .await?;
+        sender
+            .send_notification(JsonRpcNotification::new(method.to_owned(), params))
+            .await
     }
 
     /// Send a host formatting request. Unlike [`Self::send_host_raw_request`],
@@ -487,7 +654,25 @@ impl LanguageServerPool {
         let connection_key = handle.key();
         self.wait_for_host_routing(doc.uri).await;
         let lifecycle = self.host_lifecycle_lock(doc.uri);
+        // If the document is gone by the time we return, the lock entry this
+        // call may have re-created goes with it.
+        let _cleanup = super::did_open::LifecycleCleanup {
+            pool: self,
+            host_uri: doc.uri,
+            lifecycle: &lifecycle,
+        };
         let _lifecycle_guard = lifecycle.lock().await;
+        // A caller bound to an incarnation asked not to resurrect a document
+        // that closed (or closed and reopened) while it waited above; checked
+        // under the lifecycle lock the close path also takes.
+        if let Some(expected) = doc.incarnation
+            && self.current_host_incarnation(doc.uri) != Some(expected)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "host document closed while waiting for the server",
+            ));
+        }
         if self.is_host_routing_suppressed(doc.uri, connection_key) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -616,9 +801,33 @@ fn host_url_to_lsp_uri(uri: &Url) -> io::Result<Uri> {
 /// Strip the JSON-RPC envelope: `Err` for an error response (a request
 /// failure), `Ok(None)` for a `null` or absent result, and `Ok(Some(result))`
 /// with the bare `result` value otherwise.
+/// A response with neither a `result` member nor a non-null `error` object:
+/// JSON-RPC requires one of the two, and `"error": null` is not an error.
+fn lacks_result_and_error(response: &serde_json::Value) -> bool {
+    response.get("result").is_none() && response.get("error").is_none_or(serde_json::Value::is_null)
+}
+
+/// Whether a downstream response is a JSON-RPC `MethodNotFound` (-32601):
+/// the server's own way of saying it does not implement the method.
+fn declines_method(response: &serde_json::Value) -> bool {
+    const METHOD_NOT_FOUND: i64 = -32601;
+    // A well-formed decline only: an error object with the code and its
+    // required `message`, and no `result` beside it. Anything malformed
+    // falls through to the strict parse and counts as a failure.
+    response.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0")
+        && response.get("result").is_none()
+        && response
+            .pointer("/error/code")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|code| code == METHOD_NOT_FOUND)
+        && response
+            .pointer("/error/message")
+            .is_some_and(serde_json::Value::is_string)
+}
+
 fn parse_host_raw_response(
     mut response: serde_json::Value,
-    method: &'static str,
+    method: &str,
 ) -> io::Result<Option<serde_json::Value>> {
     // A downstream JSON-RPC error response is a request failure, not "no
     // result" — propagate it as `Err` so a request-error sink can surface it
@@ -979,6 +1188,51 @@ mod tests {
     }
 
     #[test]
+    fn lacks_result_and_error_treats_null_error_as_absent() {
+        assert!(lacks_result_and_error(
+            &serde_json::json!({ "jsonrpc": "2.0", "id": 1 })
+        ));
+        assert!(lacks_result_and_error(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "error": null
+        })));
+        assert!(!lacks_result_and_error(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": null
+        })));
+        assert!(!lacks_result_and_error(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "error": { "code": -32603, "message": "x" }
+        })));
+    }
+
+    #[test]
+    fn declines_method_matches_only_method_not_found() {
+        assert!(declines_method(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": { "code": -32601, "message": "Method not found" }
+        })));
+        assert!(!declines_method(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": { "code": -32603, "message": "boom" }
+        })));
+        assert!(!declines_method(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": null
+        })));
+        // Malformed declines are failures, not quiet empties.
+        assert!(!declines_method(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "error": { "code": -32601 }
+        })));
+        assert!(!declines_method(&serde_json::json!({
+            "id": 1, "error": { "code": -32601, "message": "Method not found" }
+        })));
+        assert!(!declines_method(&serde_json::json!({
+            "jsonrpc": "1.0", "id": 1, "error": { "code": -32601, "message": "Method not found" }
+        })));
+        assert!(!declines_method(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": 1,
+            "error": { "code": -32601, "message": "Method not found" }
+        })));
+    }
+
+    #[test]
     fn strip_progress_tokens_removes_only_the_tokens() {
         let mut params = serde_json::json!({
             "textDocument": { "uri": "file:///doc.md" },
@@ -998,6 +1252,7 @@ mod tests {
             uri,
             language_id: "markdown",
             text,
+            incarnation: None,
         }
     }
 

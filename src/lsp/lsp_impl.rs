@@ -2,6 +2,7 @@ mod apply_edit_translation;
 pub(crate) mod bridge_context;
 mod cli;
 mod coordinator;
+pub(crate) mod custom_method_forward;
 pub(crate) use coordinator::DiagnosticPublisher;
 pub(crate) mod kakehashi;
 mod lifecycle;
@@ -54,6 +55,53 @@ use super::auto_install::{AutoInstallManager, InstallingLanguages};
 use super::cache::CacheCoordinator;
 use super::debounced_diagnostics::DebouncedDiagnosticsManager;
 use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
+
+/// The client notifications kakehashi handles itself.
+///
+/// custom-method-host-forwarding must never shadow a handler kakehashi has.
+/// Requests learn "no handler" from the router's own `MethodNotFound`
+/// answer; notifications get no answer (the router runs a logging default
+/// for standard ones it knows and drops the rest), so the handled ones are
+/// named here, next to the impl below, and the forwarder leaves them alone.
+/// Keep this in step with the `async fn` notifications in
+/// `impl LanguageServer for Kakehashi`, plus the two handled outside it:
+/// `exit` by the `LspService` itself and `window/workDoneProgress/cancel`
+/// by `RequestIdCapture` (ls-bridge-work-done-progress routes it to the
+/// token's owner; a verbatim fan-out would deliver it twice).
+/// `handled_notifications_match_the_language_server_impl` pins the trait part.
+pub(crate) const HANDLED_NOTIFICATIONS: &[&str] = &[
+    "initialized",
+    "exit",
+    "window/workDoneProgress/cancel",
+    "textDocument/didOpen",
+    "textDocument/didChange",
+    "textDocument/willSave",
+    "textDocument/didSave",
+    "textDocument/didClose",
+    "workspace/didChangeConfiguration",
+    "workspace/didChangeWorkspaceFolders",
+];
+
+/// Methods a forward must never carry, configured or not
+/// (custom-method-host-forwarding): the connection lifecycle, document
+/// sync, and command routing that the bridge owns. A forwarded `shutdown` would kill a shared
+/// server; a forwarded `textDocument/didClose` would desync the bridge's
+/// own record of what the server has open. The dispatch layer never
+/// rewrites these (built-ins answer for themselves, handled notifications
+/// are excluded by name), but `kakehashi/forward/*` can be called directly,
+/// so the handler refuses them too.
+pub(crate) fn is_reserved_method(method: &str) -> bool {
+    method.starts_with("$/")
+        || method.starts_with("kakehashi/")
+        // The notebook sync family is the same contract as textDocument/did*
+        // for a document kind the bridge never tracks: a forwarded open
+        // would never be re-synced or closed.
+        || method.starts_with("notebookDocument/")
+        // executeCommand routing decides WHICH server owns a command
+        // (execute-command-routing-token); a blind fan-out would defeat it.
+        || matches!(method, "initialize" | "shutdown" | "workspace/executeCommand")
+        || HANDLED_NOTIFICATIONS.contains(&method)
+}
 
 pub(super) fn uri_to_url(uri: &Uri) -> std::result::Result<Url, url::ParseError> {
     Url::parse(uri.as_str())
@@ -407,6 +455,13 @@ pub struct Kakehashi {
     /// cancels obsolete work. Entries are removed by a pointer-checked winner
     /// guard, so an old winner cannot erase its successor's marker.
     #[allow(clippy::type_complexity)]
+    /// In-flight forwarded-notification deliveries
+    /// (custom-method-host-forwarding): each may wait through a server's
+    /// initialization, so they run detached from the ingress handler but
+    /// under this bound — past it a notification is dropped (warned), never
+    /// queued: waiting for a slot would stall the ingress handler instead.
+    forward_delivery_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    #[allow(clippy::type_complexity)]
     captures_walk_inflight: dashmap::DashMap<
         (Url, String, bool),
         std::sync::Arc<kakehashi::captures::CapturesWalkFlight>,
@@ -512,6 +567,9 @@ impl Kakehashi {
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
             captures_cache: dashmap::DashMap::new(),
             captures_walk_cache: dashmap::DashMap::new(),
+            forward_delivery_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                custom_method_forward::MAX_IN_FLIGHT_DELIVERIES,
+            )),
             captures_walk_inflight: dashmap::DashMap::new(),
             captures_match_cache: std::sync::Arc::new(
                 kakehashi::captures_match_cache::CapturesMatchCache::new(),
@@ -1058,6 +1116,68 @@ impl LanguageServer for Kakehashi {
 
 #[cfg(test)]
 mod tests {
+    /// Pins [`super::HANDLED_NOTIFICATIONS`] to the notification handlers in
+    /// `impl LanguageServer for Kakehashi`: a handler added without a list
+    /// entry would be silently diverted to the forwarder, and a list entry
+    /// without a handler would shield a method nobody serves. Source-scanned
+    /// because tower-lsp registers a logging default for every standard
+    /// notification, so the router cannot tell "ours" from "default".
+    #[test]
+    fn handled_notifications_match_the_language_server_impl() {
+        const SOURCE: &str = include_str!("lsp_impl.rs");
+        let start = SOURCE
+            .find("impl LanguageServer for Kakehashi {")
+            .expect("the LanguageServer impl lives in this file");
+        let body = &SOURCE[start..];
+        let end = body.find("\n}\n").expect("impl block closes");
+        let body = &body[..end];
+        // A notification handler returns `()`: no `->` between `)` and `{`.
+        let re = regex::Regex::new(r"async fn (\w+)\s*\(([^)]*)\)\s*(->)?").unwrap();
+        let implemented: std::collections::BTreeSet<&str> = re
+            .captures_iter(body)
+            .filter(|caps| caps.get(3).is_none())
+            .map(|caps| caps.get(1).unwrap().as_str())
+            .collect();
+
+        // Handler name → wire method, for the entries the impl owns. `exit`
+        // (LspService) and `window/workDoneProgress/cancel` (RequestIdCapture)
+        // are handled outside the impl and are listed for that reason.
+        let owned_elsewhere = ["exit", "window/workDoneProgress/cancel"];
+        let table = [
+            ("initialized", "initialized"),
+            ("did_open", "textDocument/didOpen"),
+            ("did_change", "textDocument/didChange"),
+            ("will_save", "textDocument/willSave"),
+            ("did_save", "textDocument/didSave"),
+            ("did_close", "textDocument/didClose"),
+            (
+                "did_change_configuration",
+                "workspace/didChangeConfiguration",
+            ),
+            (
+                "did_change_workspace_folders",
+                "workspace/didChangeWorkspaceFolders",
+            ),
+        ];
+        let mapped: std::collections::BTreeSet<&str> = implemented
+            .iter()
+            .map(|name| {
+                table
+                    .iter()
+                    .find(|(handler, _)| handler == name)
+                    .map(|(_, method)| *method)
+                    .unwrap_or_else(|| {
+                        panic!("notification handler `{name}` has no HANDLED_NOTIFICATIONS entry")
+                    })
+            })
+            .collect();
+        let listed: std::collections::BTreeSet<&str> = super::HANDLED_NOTIFICATIONS
+            .iter()
+            .copied()
+            .filter(|method| !owned_elsewhere.contains(method))
+            .collect();
+        assert_eq!(mapped, listed);
+    }
     use super::*;
     use crate::lsp::auto_install::InstallingLanguagesExt;
 

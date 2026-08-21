@@ -126,6 +126,8 @@ pub struct BridgeLanguageConfig {
     /// Omit to inherit from wildcard (defaults to true).
     pub enabled: Option<bool>,
     /// Per-method aggregation config. Key = LSP method name or "_" for default.
+    /// Under `_self`, a key naming a method kakehashi does not implement
+    /// forwards that method to the host servers (custom-method-host-forwarding).
     pub aggregation: Option<HashMap<String, AggregationConfig>>,
 }
 
@@ -1096,6 +1098,60 @@ impl LanguageSettings {
             .unwrap_or_else(ResolvedAggregationConfig::with_defaults)
     }
 
+    /// The literal `bridge._self.aggregation` entry for `method`, as written
+    /// (wildcard-merged from `bridge._` at the map level, but NOT field-merged
+    /// with the `"_"` method wildcard). Its `strategy` is therefore the one
+    /// the entry sets **itself**: a forwarded method can only run `preferred`,
+    /// and an inherited `concatenated` (set once under `_` for the typed
+    /// methods that honor it) must not poison every forwarded method, just
+    /// as the typed verbatim paths ignore it (custom-method-host-forwarding).
+    /// Presence is the opt-in for forwarding: only a method the user named
+    /// explicitly is forwarded, so the `"_"` METHOD wildcard — which
+    /// legitimately sets `priorities` for every typed method — never turns
+    /// an unknown or mistyped method into a downstream round trip.
+    pub(crate) fn explicit_host_aggregation_entry(
+        &self,
+        method: &str,
+    ) -> Option<AggregationConfig> {
+        // Mirrors `merge_bridge_language_configs` for ONE key without cloning
+        // the whole map: `_self` over `_`, field-merged where both name the
+        // method, and an explicit empty `_self.aggregation = {}` clearing the
+        // inherited entries. This runs per eligible request.
+        let map = self.bridge.as_ref()?;
+        let aggregation_of = |key: &str| map.get(key).and_then(|cfg| cfg.aggregation.as_ref());
+        let own_map = aggregation_of(HOST_BRIDGE_KEY);
+        let inherited_map = aggregation_of(crate::config::WILDCARD_KEY);
+        if own_map.is_some_and(HashMap::is_empty) {
+            return None;
+        }
+        let own = own_map.and_then(|agg| agg.get(method));
+        let inherited = inherited_map.and_then(|agg| agg.get(method));
+        match (inherited, own) {
+            (None, None) => None,
+            (Some(base), Some(overlay)) => Some(crate::config::merge::merge_aggregation_configs(
+                base, overlay,
+            )),
+            (base, overlay) => overlay.or(base).cloned(),
+        }
+    }
+
+    /// The literal method keys of the host bridge target's aggregation map
+    /// (`bridge._self`, wildcard-merged from `bridge._`), `"_"` included —
+    /// callers wanting forwardable methods filter it; see
+    /// [`Self::has_explicit_host_aggregation`].
+    fn explicit_host_aggregation(&self) -> Option<HashMap<String, AggregationConfig>> {
+        self.bridge
+            .as_ref()
+            .and_then(|map| {
+                crate::config::resolve_with_wildcard(
+                    map,
+                    HOST_BRIDGE_KEY,
+                    crate::config::merge_bridge_language_configs,
+                )
+            })
+            .and_then(|cfg| cfg.aggregation)
+    }
+
     /// Check if a language is allowed for bridging based on the bridge filter.
     ///
     /// Returns:
@@ -1131,6 +1187,27 @@ pub struct WorkspaceSettings {
     pub diagnostics_debounce_ms: u64,
     pub features: ResolvedFeatureSettings,
     pub language_servers: HashMap<String, BridgeServerConfig>,
+}
+
+impl WorkspaceSettings {
+    /// Every method some language names literally under
+    /// `bridge._self.aggregation` — the set of methods that could be
+    /// forwarded for SOME document (custom-method-host-forwarding). A
+    /// superset filter for the dispatch layer, which has no document in hand:
+    /// per-document eligibility is decided again at forward time.
+    pub(crate) fn host_forwardable_methods(&self) -> std::collections::HashSet<String> {
+        self.languages
+            .values()
+            // Without the `_self.enabled = true` opt-in nothing forwards, and
+            // the opt-in is what keeps the shipped `bridge._` defaults
+            // (diagnostics, codeAction) from opening the gate for every
+            // language out of the box.
+            .filter(|language| language.is_host_bridging_enabled())
+            .filter_map(LanguageSettings::explicit_host_aggregation)
+            .flat_map(|aggregation| aggregation.into_keys())
+            .filter(|method| method != crate::config::WILDCARD_KEY)
+            .collect()
+    }
 }
 
 impl Default for WorkspaceSettings {
@@ -2919,6 +2996,280 @@ kind = "locals""#;
         };
         let agg = settings.resolve_host_aggregation("textDocument/definition");
         assert_eq!(agg.priorities, vec!["marksman".to_string()]);
+    }
+
+    #[test]
+    fn host_forwarding_requires_a_literal_method_entry() {
+        // custom-method-host-forwarding: a method is forwardable only when its
+        // name is a literal key of `_self.aggregation` — reachable through the
+        // bridge `_` wildcard, but never through the `"_"` METHOD wildcard.
+        let entry = |method: &str| {
+            HashMap::from([(
+                method.to_string(),
+                AggregationConfig {
+                    priorities: Some(vec!["copilot".to_string()]),
+                    ..Default::default()
+                },
+            )])
+        };
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([
+                (
+                    HOST_BRIDGE_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        aggregation: Some(entry("textDocument/inlineCompletion")),
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: None,
+                        aggregation: Some(
+                            entry("custom/fromWildcard")
+                                .into_iter()
+                                .chain(entry("_"))
+                                .collect(),
+                        ),
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        assert!(
+            settings
+                .explicit_host_aggregation_entry("textDocument/inlineCompletion")
+                .is_some()
+        );
+        assert!(
+            settings
+                .explicit_host_aggregation_entry("custom/fromWildcard")
+                .is_some(),
+            "bridge-key wildcard `_` contributes method entries to `_self`"
+        );
+        assert!(
+            !settings
+                .explicit_host_aggregation_entry("custom/unlisted")
+                .is_some(),
+            "the `_` METHOD wildcard must not make every method forwardable"
+        );
+        assert!(
+            !LanguageSettings::default()
+                .explicit_host_aggregation_entry("custom/unlisted")
+                .is_some(),
+            "no bridge map at all: nothing is forwardable"
+        );
+    }
+
+    #[test]
+    fn explicit_host_entry_mirrors_the_map_merge_for_one_key() {
+        let entry = |strategy: Option<AggregationStrategy>, priorities: Option<Vec<&str>>| {
+            AggregationConfig {
+                strategy,
+                priorities: priorities.map(|p| p.into_iter().map(String::from).collect()),
+                ..Default::default()
+            }
+        };
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([
+                (
+                    HOST_BRIDGE_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        aggregation: Some(HashMap::from([(
+                            "custom/both".to_string(),
+                            entry(None, Some(vec!["own"])),
+                        )])),
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: None,
+                        aggregation: Some(HashMap::from([
+                            (
+                                "custom/both".to_string(),
+                                entry(Some(AggregationStrategy::Concatenated), Some(vec!["inh"])),
+                            ),
+                            (
+                                "custom/inherited".to_string(),
+                                entry(None, Some(vec!["inh"])),
+                            ),
+                        ])),
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        let both = settings
+            .explicit_host_aggregation_entry("custom/both")
+            .unwrap();
+        assert_eq!(
+            both.priorities,
+            Some(vec!["own".to_string()]),
+            "own field wins"
+        );
+        assert_eq!(
+            both.strategy,
+            Some(AggregationStrategy::Concatenated),
+            "unset own field inherits from the bridge-key wildcard's entry"
+        );
+        assert!(
+            settings
+                .explicit_host_aggregation_entry("custom/inherited")
+                .is_some()
+        );
+        // Matches the full map merge exactly.
+        let merged = crate::config::resolve_with_wildcard(
+            settings.bridge.as_ref().unwrap(),
+            HOST_BRIDGE_KEY,
+            crate::config::merge_bridge_language_configs,
+        )
+        .and_then(|cfg| cfg.aggregation)
+        .unwrap();
+        assert_eq!(merged.get("custom/both"), Some(&both));
+
+        // An explicit empty `_self.aggregation = {}` clears inherited entries.
+        let cleared = LanguageSettings {
+            bridge: Some(HashMap::from([
+                (
+                    HOST_BRIDGE_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        aggregation: Some(HashMap::new()),
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: None,
+                        aggregation: Some(HashMap::from([(
+                            "custom/inherited".to_string(),
+                            entry(None, None),
+                        )])),
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        assert!(
+            cleared
+                .explicit_host_aggregation_entry("custom/inherited")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn explicit_host_strategy_ignores_the_method_wildcard() {
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                HOST_BRIDGE_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([
+                        ("custom/plain".to_string(), AggregationConfig::default()),
+                        (
+                            "custom/merged".to_string(),
+                            AggregationConfig {
+                                strategy: Some(AggregationStrategy::Concatenated),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "_".to_string(),
+                            AggregationConfig {
+                                strategy: Some(AggregationStrategy::Concatenated),
+                                ..Default::default()
+                            },
+                        ),
+                    ])),
+                },
+            )])),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings
+                .explicit_host_aggregation_entry("custom/plain")
+                .and_then(|e| e.strategy),
+            None,
+            "the `_` method wildcard's strategy is not the entry's own"
+        );
+        assert_eq!(
+            settings
+                .explicit_host_aggregation_entry("custom/merged")
+                .and_then(|e| e.strategy),
+            Some(AggregationStrategy::Concatenated)
+        );
+        assert_eq!(
+            settings.resolve_host_aggregation("custom/plain").strategy,
+            AggregationStrategy::Concatenated,
+            "contrast: the resolved strategy does inherit"
+        );
+    }
+
+    #[test]
+    fn host_forwardable_methods_is_empty_without_host_opt_in() {
+        // The shipped defaults name diagnostics/codeAction under `bridge._`;
+        // without `_self.enabled = true` they must not open the gate.
+        let shipped = crate::config::WorkspaceSettings::try_from_settings(
+            &crate::config::defaults::default_settings(),
+            None,
+            crate::config::expand::with_kakehashi_defaults(|_| None),
+        )
+        .expect("shipped defaults resolve");
+        assert!(shipped.host_forwardable_methods().is_empty());
+        let not_opted_in = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([(
+                        "custom/a".to_string(),
+                        AggregationConfig::default(),
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([("markdown".to_string(), not_opted_in)]),
+            ..Default::default()
+        };
+        assert!(settings.host_forwardable_methods().is_empty());
+    }
+
+    #[test]
+    fn host_forwardable_methods_unions_literal_entries_across_languages() {
+        let lang = |method: &str| LanguageSettings {
+            bridge: Some(HashMap::from([(
+                HOST_BRIDGE_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([
+                        (method.to_string(), AggregationConfig::default()),
+                        ("_".to_string(), AggregationConfig::default()),
+                    ])),
+                },
+            )])),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([
+                ("markdown".to_string(), lang("custom/a")),
+                ("python".to_string(), lang("custom/b")),
+                ("rust".to_string(), LanguageSettings::default()),
+            ]),
+            ..Default::default()
+        };
+        let methods = settings.host_forwardable_methods();
+        assert_eq!(
+            methods,
+            ["custom/a", "custom/b"]
+                .into_iter()
+                .map(String::from)
+                .collect::<std::collections::HashSet<_>>(),
+            "every language's literal entries, never the `_` method wildcard"
+        );
     }
 
     #[test]

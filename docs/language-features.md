@@ -340,6 +340,14 @@ types.
 > `kakehashi/internal/*` methods are not part of this public surface and are not
 > documented here.
 
+Two further methods carry the forwarding of methods kakehashi does not
+implement (see "Forwarding methods kakehashi does not implement" in the
+configuration reference): `kakehashi/forward/request` and
+`kakehashi/forward/notification`, both with params `{ "method": "<name>",
+"params": <original params> }`. kakehashi issues them itself for an
+unhandled message; a client may also call them directly, under the same
+eligibility rules.
+
 ### `NodeInfo`
 
 ```typescript
@@ -622,4 +630,7 @@ results pass through, while injection-layer code actions (and applyEdit
 requests that also touch a virtual document) constrain host-URI edits to
 the region.
 The surrounding host document can be bridged to the host language's own
-servers via `bridge._self` (host-document-bridge).
+servers via `bridge._self` (host-document-bridge). Methods kakehashi does not
+implement can still reach those host servers when named explicitly under
+`bridge._self.aggregation` — see "Forwarding methods kakehashi does not
+implement" in the configuration reference.

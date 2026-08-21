@@ -616,6 +616,38 @@ wildcard — a server listing the host language is a *capability*, not consent
 to use it. `_self.aggregation` (priorities/strategy/maxFanOut) inherits from
 `_` as usual.
 
+**Forwarding methods kakehashi does not implement:**
+
+A method kakehashi has no handler for (say `textDocument/inlineCompletion`
+for a Copilot server, or a vendor-specific request or notification) is
+forwarded to the host servers when you name it explicitly under
+`_self.aggregation`. Whether it goes out as a request or a notification
+follows what the client sent; a request is answered with the first non-empty
+downstream result in `priorities` order, a notification reaches every
+selected server (the `priorities` allowlist, capped by `maxFanOut`). Params travel verbatim (real URI; only the progress tokens
+are stripped, since kakehashi relays no downstream progress), the result
+comes back untouched, and the downstream server's advertised capabilities are not
+checked — a server that does not implement the method answers
+`MethodNotFound` itself.
+
+```toml
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.bridge._self.aggregation."textDocument/inlineCompletion"]
+priorities = ["copilot"]             # the entry's own strategy must be "preferred" (default)
+```
+
+Limits: only the method's literal key opts in (the `_` method wildcard does
+not), `params.textDocument.uri` must name an open document (it picks the
+host), the host layer only (no injection regions), `"concatenated"` on the
+entry itself is rejected (results of unknown shape cannot be merged), the
+bridge-owned lifecycle/sync methods (`shutdown`, `textDocument/didClose`, …)
+are never forwarded, and kakehashi advertises nothing for the method in its
+`ServerCapabilities` — a client that gates on them must be told to send
+anyway. A server answering `MethodNotFound` counts as an empty answer; any
+other downstream failure surfaces as one log warning per request.
+
 **Aggregation Configuration:**
 
 When multiple language servers can handle the same injection language, `aggregation` controls which server's response is preferred. Each entry contains:

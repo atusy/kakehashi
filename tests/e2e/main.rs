@@ -22,6 +22,7 @@ mod e2e_code_lens_resolve;
 mod e2e_concatenated_formatting;
 mod e2e_config_file;
 mod e2e_config_relative_paths;
+mod e2e_custom_method_forward;
 mod e2e_data_dir;
 mod e2e_deprecation_warning;
 mod e2e_didchange_forwarding;

@@ -1557,7 +1557,8 @@ fn run_lsp_server() {
 async fn serve_lsp() {
     use env_logger::Builder;
     use kakehashi::lsp::{
-        CancelForwarder, IngressOrderGate, Kakehashi, LanguageServerPool, RequestIdCapture,
+        CancelForwarder, CustomMethodForwarder, FORWARD_NOTIFICATION_METHOD,
+        FORWARD_REQUEST_METHOD, IngressOrderGate, Kakehashi, LanguageServerPool, RequestIdCapture,
         repair_inbound_frames,
     };
     use std::sync::Arc;
@@ -1755,6 +1756,13 @@ async fn serve_lsp() {
         "kakehashi/node/fieldNameForNamedChild",
         Kakehashi::kakehashi_node_field_name_for_named_child,
     )
+    // custom-method-host-forwarding: the explicit forwarding methods the
+    // CustomMethodForwarder below rewrites unhandled messages into.
+    .custom_method(FORWARD_REQUEST_METHOD, Kakehashi::forward_custom_request)
+    .custom_method(
+        FORWARD_NOTIFICATION_METHOD,
+        Kakehashi::forward_custom_notification,
+    )
     .finish();
 
     // Reap downstream servers when the editor terminates this process without
@@ -1763,6 +1771,15 @@ async fn serve_lsp() {
     // session indefinitely.
     #[cfg(unix)]
     service.inner().spawn_termination_cleanup();
+
+    // Innermost wrapper: re-issue requests the router answers MethodNotFound
+    // (and notifications kakehashi does not implement) as the forwarding
+    // methods, so a configured host server can answer methods kakehashi has
+    // no handler for (custom-method-host-forwarding). Sits inside
+    // RequestIdCapture so the forwarded request keeps its upstream id and
+    // cancel path.
+    let custom_method_gate = service.inner().custom_method_gate();
+    let service = CustomMethodForwarder::new(service, custom_method_gate);
 
     // Wrap service with RequestIdCapture to:
     // 1. Capture upstream request IDs (for ls-bridge-server-pool-coordination bridge requests)

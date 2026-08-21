@@ -227,6 +227,10 @@ pub(crate) struct HostRequestContext {
     pub(crate) max_fan_out: Option<usize>,
     /// The upstream JSON-RPC request ID for cancel forwarding.
     pub(crate) upstream_request_id: Option<UpstreamId>,
+    /// The document incarnation `text` was read from: a later close-and-reopen
+    /// of the same URI is a different document, which a message resolved
+    /// against this one must not reach (custom-method-host-forwarding).
+    pub(crate) incarnation: u64,
 }
 
 /// Document context plus a cursor position.
@@ -341,6 +345,30 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
         }
     }
     false
+}
+
+/// Emptiness for a forwarded method of unknown shape
+/// (custom-method-host-forwarding): `null`, `[]`, and an object that is
+/// nothing but a canonical empty-list envelope — list fields all empty and
+/// no other member (besides `isIncomplete`). Anything else is a result: the
+/// typed heuristics would read `{"items": [], "cursor": "abc"}` as empty and
+/// let a lower-priority server mask a real, metadata-bearing answer.
+pub(crate) fn is_empty_forwarded_value(value: &serde_json::Value) -> bool {
+    const LIST_KEYS: [&str; 3] = ["items", "signatures", "ranges"];
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Array(items) => items.is_empty(),
+        serde_json::Value::Object(object) => {
+            !object.is_empty()
+                && object.iter().all(|(key, member)| {
+                    (key == "isIncomplete" && member == &serde_json::Value::Bool(false))
+                        || (LIST_KEYS.contains(&key.as_str())
+                            && member.as_array().is_some_and(Vec::is_empty))
+                })
+                && object.keys().any(|key| LIST_KEYS.contains(&key.as_str()))
+        }
+        _ => false,
+    }
 }
 
 fn is_empty_host_layer_value(request_method: &str, value: &serde_json::Value) -> bool {
@@ -1205,6 +1233,19 @@ impl Kakehashi {
         lsp_uri: &Uri,
         method_name: &str,
     ) -> Option<HostRequestContext> {
+        let settings = self.settings_manager.load_settings();
+        self.resolve_host_bridge_context_in(&settings, lsp_uri, method_name)
+    }
+
+    /// [`Self::resolve_host_bridge_context`] against a settings snapshot the
+    /// caller already holds, so eligibility it decided from that snapshot
+    /// and the routing resolved here cannot straddle a settings reload.
+    pub(crate) fn resolve_host_bridge_context_in(
+        &self,
+        settings: &std::sync::Arc<crate::config::WorkspaceSettings>,
+        lsp_uri: &Uri,
+        method_name: &str,
+    ) -> Option<HostRequestContext> {
         let uri = uri_to_url(lsp_uri).ok()?;
         // Host tier needs only the text, never the parse tree
         // (parse-decoupled-document-lifecycle ADR): read `text_arc()` directly
@@ -1213,10 +1254,12 @@ impl Kakehashi {
         // request (hover / definition / formatting / will-save / diagnostics) would
         // bail to `None` for the whole reparse window after each edit, even though
         // it forwards the real URI + text verbatim and depends on no tree.
-        let text = self.documents.get(&uri)?.text_arc();
+        let (text, incarnation) = {
+            let document = self.documents.get(&uri)?;
+            (document.text_arc(), document.incarnation())
+        };
         let language_name = self.document_language(&uri)?;
 
-        let settings = self.settings_manager.load_settings();
         let lang_settings = settings.resolve_host_language_settings(&language_name)?;
         if !lang_settings.is_host_bridging_enabled() {
             log::debug!(
@@ -1229,7 +1272,7 @@ impl Kakehashi {
 
         let configs = self
             .bridge
-            .cached_host_configs_for_language(&settings, &language_name);
+            .cached_host_configs_for_language(settings, &language_name);
         if configs.is_empty() {
             log::debug!(
                 "{}: no host-capable server configured for {}",
@@ -1250,25 +1293,49 @@ impl Kakehashi {
             strategy: agg.strategy,
             max_fan_out: agg.max_fan_out,
             upstream_request_id: current_upstream_id(),
+            incarnation,
         })
     }
 
     /// Dispatch a host bridge request over a resolved [`HostRequestContext`]:
     /// the upstream `params` are forwarded verbatim (real URI, real
     /// coordinates) and the raw `result` value comes back untranslated.
+    /// Servers that do not advertise the method are skipped.
     pub(crate) async fn host_layer_value_with_ctx(
         &self,
         ctx: &HostRequestContext,
-        request_method: &'static str,
+        request_method: &str,
         params: serde_json::Value,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<serde_json::Value>> {
+        self.host_layer_value_gated(
+            ctx,
+            request_method,
+            params,
+            crate::lsp::bridge::CapabilityGate::Advertised,
+        )
+        .await
+    }
+
+    /// [`Self::host_layer_value_with_ctx`] with the capability gate chosen
+    /// by the caller: the forwarded methods
+    /// (custom-method-host-forwarding) ask every selected server blind.
+    pub(crate) async fn host_layer_value_gated(
+        &self,
+        ctx: &HostRequestContext,
+        request_method: &str,
+        params: serde_json::Value,
+        gate: crate::lsp::bridge::CapabilityGate,
     ) -> tower_lsp_server::jsonrpc::Result<Option<serde_json::Value>> {
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
+        // Shared across the per-server tasks, which must be `'static`.
+        let method: std::sync::Arc<str> = request_method.into();
         let result = crate::lsp::aggregation::server::dispatch_host_preferred(
             ctx,
             pool.clone(),
             move |t| {
                 let params = params.clone();
+                let method = std::sync::Arc::clone(&method);
                 async move {
                     t.pool
                         .send_host_raw_request(
@@ -1278,10 +1345,17 @@ impl Kakehashi {
                                 uri: &t.uri,
                                 language_id: &t.language_id,
                                 text: &t.text,
+                                // A forwarded method is bound to the document
+                                // it was resolved against: never resurrect a
+                                // closed one. The typed methods keep their
+                                // long-standing unbound behavior.
+                                incarnation: (gate == crate::lsp::bridge::CapabilityGate::Blind)
+                                    .then_some(t.incarnation),
                             },
-                            request_method,
+                            &method,
                             params,
                             t.upstream_id,
+                            gate,
                         )
                         .await
                         // This generic raw walk relays the value verbatim; only
@@ -1289,7 +1363,15 @@ impl Kakehashi {
                         .map(|raw| raw.map(|raw| raw.value))
                 }
             },
-            |opt| matches!(opt, Some(v) if !is_empty_host_layer_value(request_method, v)),
+            |opt| match (gate, opt) {
+                (_, None) => false,
+                (crate::lsp::bridge::CapabilityGate::Blind, Some(v)) => {
+                    !is_empty_forwarded_value(v)
+                }
+                (crate::lsp::bridge::CapabilityGate::Advertised, Some(v)) => {
+                    !is_empty_host_layer_value(request_method, v)
+                }
+            },
             cancel_rx,
         )
         .await;
@@ -2226,6 +2308,32 @@ mod tests {
                 "newUri": "file:///new.md"
             }]
         })));
+    }
+
+    #[test]
+    fn forwarded_emptiness_keeps_metadata_bearing_objects() {
+        use serde_json::json;
+        for empty in [
+            json!(null),
+            json!([]),
+            json!({ "items": [] }),
+            json!({ "items": [], "isIncomplete": false }),
+            json!({ "signatures": [], "ranges": [] }),
+        ] {
+            assert!(is_empty_forwarded_value(&empty), "{empty}");
+        }
+        for result in [
+            json!({}),
+            json!({ "items": [], "cursor": "abc" }),
+            json!({ "items": [], "isIncomplete": true }),
+            json!({ "items": [1] }),
+            json!({ "total": 0 }),
+            json!("text"),
+            json!(0),
+            json!(false),
+        ] {
+            assert!(!is_empty_forwarded_value(&result), "{result}");
+        }
     }
 
     #[test]

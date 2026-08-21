@@ -67,10 +67,14 @@ pub(crate) struct OpenExpectation<'a> {
     pub(crate) expected_connection: Option<ConnectionKey>,
 }
 
-struct LifecycleCleanup<'a> {
-    pool: &'a LanguageServerPool,
-    host_uri: &'a url::Url,
-    lifecycle: &'a Arc<tokio::sync::Mutex<()>>,
+/// Drops a lifecycle-lock entry this caller may have created for a document
+/// that turns out to be closed: `host_lifecycle_lock` inserts on demand, and
+/// a late caller racing `didClose` would otherwise leave an orphan entry
+/// behind for every closed URI it touched.
+pub(super) struct LifecycleCleanup<'a> {
+    pub(super) pool: &'a LanguageServerPool,
+    pub(super) host_uri: &'a url::Url,
+    pub(super) lifecycle: &'a Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Drop for LifecycleCleanup<'_> {
@@ -494,6 +498,7 @@ impl LanguageServerPool {
             uri: host_uri,
             language_id,
             text,
+            incarnation: None,
         };
         if let Err(e) = super::host::sync_host_document(
             &mut sender,

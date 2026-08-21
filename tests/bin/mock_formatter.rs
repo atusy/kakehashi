@@ -159,6 +159,10 @@ fn main() {
     // answered, the baseline demonstrably exists — a later baseline-less full
     // request means a pull LOST it and is re-fetching.
     let mut unchanged_answered = false;
+    // `custom-echo` mode: every `custom/*` notification received, in order,
+    // reported back by the next `custom/*` request so a test can prove a
+    // forwarded notification reached this server (custom-method-host-forwarding).
+    let mut custom_notifications: Vec<Value> = Vec::new();
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -167,6 +171,44 @@ fn main() {
             .unwrap_or_default();
         let id = message.get("id").cloned();
         append_wire_log(method, &message);
+
+        // `custom-echo`: answer any `custom/*` request with what arrived —
+        // the method, the params verbatim, whether the referenced document
+        // was opened here first, and the notifications recorded so far. The
+        // mode advertises NO capability for these methods: the bridge must
+        // forward them blind.
+        // `custom-decline`: a server that implements none of the custom
+        // methods and says so the JSON-RPC way — the decline the forward's
+        // capability-blind fan-in must treat as an empty contribution.
+        if mode == "custom-decline" && method.starts_with("custom/") {
+            // Logged under its own name so a test can tell this server's
+            // receipt from an echo server's in the shared wire log.
+            append_wire_log(&format!("custom-decline:{method}"), &message);
+            respond_error(&mut writer, id, -32601, "Method not found");
+            continue;
+        }
+        if mode == "custom-echo" && method.starts_with("custom/") {
+            let params = message.get("params").cloned().unwrap_or(Value::Null);
+            if id.is_some() {
+                let opened = params
+                    .pointer("/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .is_some_and(|uri| documents.contains_key(uri));
+                respond(
+                    &mut writer,
+                    id,
+                    json!({
+                        "method": method,
+                        "params": params,
+                        "opened": opened,
+                        "notifications": custom_notifications,
+                    }),
+                );
+            } else {
+                custom_notifications.push(json!({ "method": method, "params": params }));
+            }
+            continue;
+        }
 
         match method {
             "initialize" => {
@@ -180,6 +222,7 @@ fn main() {
                         "hoverProvider": true,
                         "textDocumentSync": 1
                     }),
+                    "custom-echo" | "custom-decline" => json!({ "textDocumentSync": 1 }),
                     "code-lens" => json!({
                         "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
