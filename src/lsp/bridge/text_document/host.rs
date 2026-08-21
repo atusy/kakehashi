@@ -312,6 +312,7 @@ impl LanguageServerPool {
     ///
     /// `gate` decides whether the server's advertised capabilities are
     /// consulted first ([`CapabilityGate`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_host_raw_request(
         &self,
         server_name: &str,
@@ -335,7 +336,9 @@ impl LanguageServerPool {
         // that would repeat the marker filesystem walk on a request-frequency
         // path (execute-command-routing-token).
         let answering = Arc::clone(&handle);
-        let server = server_name.to_owned();
+        // Only the blind decline log names the server; keep the typed hot
+        // path allocation-free.
+        let server = (gate == CapabilityGate::Blind).then(|| server_name.to_owned());
         let value = self
             .execute_host_request(
                 handle,
@@ -351,7 +354,7 @@ impl LanguageServerPool {
                     // server would warn on every keystroke and flood the
                     // client log. An ADVERTISED method answered
                     // MethodNotFound is a genuine failure and stays one.
-                    if gate == CapabilityGate::Blind && declines_method(&response) {
+                    if let Some(server) = server.filter(|_| declines_method(&response)) {
                         log::debug!(
                             target: "kakehashi::bridge",
                             "[{server}] does not implement {method:?} (MethodNotFound); \
