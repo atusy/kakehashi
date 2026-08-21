@@ -339,10 +339,21 @@ impl Kakehashi {
                         )
                         .await
                     {
-                        log::warn!(
-                            "{method:?}: notification not delivered to {}: {error}",
-                            server.server_name
-                        );
+                        // NotConnected is the expected race — the document
+                        // closed (or its routing was switched off) while the
+                        // delivery waited — not a broken server; keep it out
+                        // of the warning stream.
+                        if error.kind() == std::io::ErrorKind::NotConnected {
+                            log::debug!(
+                                "{method:?}: notification not delivered to {}: {error}",
+                                server.server_name
+                            );
+                        } else {
+                            log::warn!(
+                                "{method:?}: notification not delivered to {}: {error}",
+                                server.server_name
+                            );
+                        }
                     }
                 }
             });
