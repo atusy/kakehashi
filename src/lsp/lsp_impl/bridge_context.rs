@@ -347,6 +347,30 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
     false
 }
 
+/// Emptiness for a forwarded method of unknown shape
+/// (custom-method-host-forwarding): `null`, `[]`, and an object that is
+/// nothing but a canonical empty-list envelope — list fields all empty and
+/// no other member (besides `isIncomplete`). Anything else is a result: the
+/// typed heuristics would read `{"items": [], "cursor": "abc"}` as empty and
+/// let a lower-priority server mask a real, metadata-bearing answer.
+pub(crate) fn is_empty_forwarded_value(value: &serde_json::Value) -> bool {
+    const LIST_KEYS: [&str; 3] = ["items", "signatures", "ranges"];
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Array(items) => items.is_empty(),
+        serde_json::Value::Object(object) => {
+            !object.is_empty()
+                && object.iter().all(|(key, member)| {
+                    (key == "isIncomplete" && member == &serde_json::Value::Bool(false))
+                        || (LIST_KEYS.contains(&key.as_str())
+                            && member.as_array().is_some_and(Vec::is_empty))
+                })
+                && object.keys().any(|key| LIST_KEYS.contains(&key.as_str()))
+        }
+        _ => false,
+    }
+}
+
 fn is_empty_host_layer_value(request_method: &str, value: &serde_json::Value) -> bool {
     if request_method == "textDocument/rename" {
         // This is intentionally stricter than is_empty_layer_value: rename
@@ -1333,7 +1357,15 @@ impl Kakehashi {
                         .map(|raw| raw.map(|raw| raw.value))
                 }
             },
-            |opt| matches!(opt, Some(v) if !is_empty_host_layer_value(request_method, v)),
+            |opt| match (gate, opt) {
+                (_, None) => false,
+                (crate::lsp::bridge::CapabilityGate::Blind, Some(v)) => {
+                    !is_empty_forwarded_value(v)
+                }
+                (crate::lsp::bridge::CapabilityGate::Advertised, Some(v)) => {
+                    !is_empty_host_layer_value(request_method, v)
+                }
+            },
             cancel_rx,
         )
         .await;
@@ -2270,6 +2302,32 @@ mod tests {
                 "newUri": "file:///new.md"
             }]
         })));
+    }
+
+    #[test]
+    fn forwarded_emptiness_keeps_metadata_bearing_objects() {
+        use serde_json::json;
+        for empty in [
+            json!(null),
+            json!([]),
+            json!({ "items": [] }),
+            json!({ "items": [], "isIncomplete": false }),
+            json!({ "signatures": [], "ranges": [] }),
+        ] {
+            assert!(is_empty_forwarded_value(&empty), "{empty}");
+        }
+        for result in [
+            json!({}),
+            json!({ "items": [], "cursor": "abc" }),
+            json!({ "items": [], "isIncomplete": true }),
+            json!({ "items": [1] }),
+            json!({ "total": 0 }),
+            json!("text"),
+            json!(0),
+            json!(false),
+        ] {
+            assert!(!is_empty_forwarded_value(&result), "{result}");
+        }
     }
 
     #[test]

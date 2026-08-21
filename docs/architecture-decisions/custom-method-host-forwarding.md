@@ -75,8 +75,10 @@ priorities = ["copilot"]
 - **Request vs. notification follows the wire.** A message with an `id` is
   forwarded as a request and answered with the first non-empty downstream
   `result` in `priorities` order (`preferred`, with the host layer's
-  emptiness rule: `null`, `[]`, and the known empty-list envelopes such as
-  `{"items": []}` count as empty — a bare `{}` does not, it is a result);
+  emptiness rule for unknown shapes: `null`, `[]`, and an object that is
+  nothing but a canonical empty-list envelope such as `{"items": []}` count
+  as empty — a bare `{}` or an envelope carrying any other member, say
+  `{"items": [], "cursor": "…"}`, is a result);
   an all-empty or all-failed fan-out answers `null`. A response carrying
   neither `result` nor `error` is a failed contribution on this path. A message without an `id` is forwarded as a
   notification to **every** selected server, each delivered independently.
