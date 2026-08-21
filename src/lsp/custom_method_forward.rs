@@ -168,6 +168,9 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use tower_lsp_server::jsonrpc::{Error, Id};
 
+    /// LSP `ServerNotInitialized`; tower-lsp-server 0.23 has no named variant.
+    const SERVER_NOT_INITIALIZED: ErrorCode = ErrorCode::ServerError(-32002);
+
     /// Inner service that answers `known/method` and records every call;
     /// anything else gets the router's `MethodNotFound` (requests) or
     /// silence (notifications).
@@ -307,6 +310,68 @@ mod tests {
         assert_eq!(methods(&router), ["$/unknown"]);
     }
 
+    #[test]
+    fn plan_classifies_by_namespace_id_and_handled_set() {
+        let req = |method: &'static str| request(method, 1);
+        let note = |method: &'static str| notification(method);
+        assert_eq!(
+            plan(&req("custom/echo"), configured),
+            Plan::ProbeThenForward
+        );
+        assert_eq!(
+            plan(&note("custom/ping"), configured),
+            Plan::ForwardNotification
+        );
+        assert_eq!(
+            plan(&note("textDocument/didOpen"), configured),
+            Plan::PassThrough
+        );
+        assert_eq!(plan(&req("$/anything"), configured), Plan::PassThrough);
+        assert_eq!(plan(&req("kakehashi/node"), configured), Plan::PassThrough);
+        assert_eq!(
+            plan(&req("custom/echo"), |_: &str| false),
+            Plan::PassThrough
+        );
+        assert_eq!(
+            plan(&note("custom/ping"), |_: &str| false),
+            Plan::PassThrough
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_answering_method_not_found_is_not_forwarded_again() {
+        /// Router whose forward handler itself declines (the handler's
+        /// NotForwardable answer): exactly one forward, then the client
+        /// gets that MethodNotFound.
+        #[derive(Clone, Default)]
+        struct Declining {
+            calls: Arc<StdMutex<Vec<String>>>,
+        }
+        impl Service<Request> for Declining {
+            type Response = Option<Response>;
+            type Error = std::convert::Infallible;
+            type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+            fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, req: Request) -> Self::Future {
+                self.calls.lock().unwrap().push(req.method().to_owned());
+                let (_, id, _) = req.into_parts();
+                std::future::ready(Ok(
+                    id.map(|id| Response::from_error(id, Error::method_not_found()))
+                ))
+            }
+        }
+        let router = Declining::default();
+        let mut svc = CustomMethodForwarder::new(router.clone(), configured);
+        let response = svc.call(request("custom/echo", 1)).await.unwrap().unwrap();
+        assert_eq!(response.error().unwrap().code, ErrorCode::MethodNotFound);
+        assert_eq!(
+            *router.calls.lock().unwrap(),
+            ["custom/echo", FORWARD_REQUEST_METHOD]
+        );
+    }
+
     #[tokio::test]
     async fn unconfigured_methods_pass_through_without_a_forward() {
         // The gate says no: the router's MethodNotFound stands and no second
@@ -352,9 +417,9 @@ mod tests {
             }
             fn call(&mut self, req: Request) -> Self::Future {
                 let (_, id, _) = req.into_parts();
-                std::future::ready(Ok(id.map(|id| {
-                    Response::from_error(id, Error::new(ErrorCode::ServerError(-32002)))
-                })))
+                std::future::ready(Ok(
+                    id.map(|id| Response::from_error(id, Error::new(SERVER_NOT_INITIALIZED)))
+                ))
             }
         }
         let mut svc = CustomMethodForwarder::new(Uninitialized, configured);
