@@ -77,8 +77,11 @@ priorities = ["copilot"]
   fan-out answers `null`. A message without an `id` is forwarded as a
   notification to **every** selected server, each delivered independently.
 - **Ordering.** Forwarded requests are not sequenced behind pending
-  `didChange` tickets (the same as hover and definition); the host text
-  synced before the send is the document's current text at that moment.
+  `didChange` tickets (the same as hover and definition) and sync the text
+  snapshotted at dispatch, as typed host methods do. A forwarded
+  notification, which may wait through a server's initialization first,
+  re-reads the document's current text at sync time, and is dropped if the
+  document was closed while it waited.
 - **Startup.** A forwarded request follows the host-request policy and
   fails fast (empty) on a server still initializing — the next request gets
   it. A forwarded notification instead waits through initialization, within
