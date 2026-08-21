@@ -56,17 +56,23 @@ use super::cache::CacheCoordinator;
 use super::debounced_diagnostics::DebouncedDiagnosticsManager;
 use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
 
-/// The client notifications `Kakehashi`'s `LanguageServer` impl handles.
+/// The client notifications kakehashi handles itself.
 ///
 /// custom-method-host-forwarding must never shadow a handler kakehashi has.
 /// Requests learn "no handler" from the router's own `MethodNotFound`
-/// answer; notifications get no answer (the router drops unknown ones
-/// silently), so the implemented ones are named here, next to the impl
-/// below, and the forwarder leaves them alone. Keep this in step with the
-/// `async fn` notifications in `impl LanguageServer for Kakehashi`.
+/// answer; notifications get no answer (the router runs a logging default
+/// for standard ones it knows and drops the rest), so the handled ones are
+/// named here, next to the impl below, and the forwarder leaves them alone.
+/// Keep this in step with the `async fn` notifications in
+/// `impl LanguageServer for Kakehashi`, plus the two handled outside it:
+/// `exit` by the `LspService` itself and `window/workDoneProgress/cancel`
+/// by `RequestIdCapture` (ls-bridge-work-done-progress routes it to the
+/// token's owner; a verbatim fan-out would deliver it twice).
+/// `handled_notifications_match_the_router` pins the trait part.
 pub(crate) const HANDLED_NOTIFICATIONS: &[&str] = &[
     "initialized",
     "exit",
+    "window/workDoneProgress/cancel",
     "textDocument/didOpen",
     "textDocument/didChange",
     "textDocument/willSave",
@@ -75,6 +81,21 @@ pub(crate) const HANDLED_NOTIFICATIONS: &[&str] = &[
     "workspace/didChangeConfiguration",
     "workspace/didChangeWorkspaceFolders",
 ];
+
+/// Methods a forward must never carry, configured or not
+/// (custom-method-host-forwarding): the connection lifecycle and document
+/// sync that the bridge owns. A forwarded `shutdown` would kill a shared
+/// server; a forwarded `textDocument/didClose` would desync the bridge's
+/// own record of what the server has open. The dispatch layer never
+/// rewrites these (built-ins answer for themselves, handled notifications
+/// are excluded by name), but `kakehashi/forward/*` can be called directly,
+/// so the handler refuses them too.
+pub(crate) fn is_reserved_method(method: &str) -> bool {
+    method.starts_with("$/")
+        || method.starts_with("kakehashi/")
+        || matches!(method, "initialize" | "shutdown")
+        || HANDLED_NOTIFICATIONS.contains(&method)
+}
 
 pub(super) fn uri_to_url(uri: &Uri) -> std::result::Result<Url, url::ParseError> {
     Url::parse(uri.as_str())

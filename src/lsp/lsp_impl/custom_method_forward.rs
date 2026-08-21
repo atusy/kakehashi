@@ -15,9 +15,9 @@ use serde_json::Value;
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::Uri;
 
-use super::Kakehashi;
 use super::bridge_context::{HostRequestContext, UpstreamRegistrySweepGuard, is_empty_layer_value};
 use super::uri_to_url;
+use super::{Kakehashi, is_reserved_method};
 use crate::config::settings::AggregationStrategy;
 use crate::lsp::aggregation::server::{dispatch_host_preferred, select_host_servers};
 use crate::lsp::bridge::HostDocument;
@@ -52,6 +52,9 @@ enum Rejection {
     /// A strategy other than `preferred`: results of unknown shape cannot
     /// be merged, so the entry is a configuration error.
     UnsupportedStrategy(AggregationStrategy),
+    /// Lifecycle or sync method the bridge owns ([`is_reserved_method`]);
+    /// refused even when configured.
+    Reserved,
 }
 
 impl Rejection {
@@ -69,6 +72,10 @@ impl Rejection {
             Self::UnsupportedStrategy(strategy) => Error::invalid_params(format!(
                 "{method}: bridge._self.aggregation strategy {strategy:?} is not supported for \
                  forwarded methods; only `preferred` can combine results of unknown shape"
+            )),
+            Self::Reserved => Error::invalid_params(format!(
+                "{method}: lifecycle and document-sync methods are owned by the bridge and \
+                 are never forwarded"
             )),
         }
     }
@@ -127,6 +134,9 @@ impl Kakehashi {
         &self,
         params: &ForwardParams,
     ) -> std::result::Result<HostRequestContext, Rejection> {
+        if is_reserved_method(&params.method) {
+            return Err(Rejection::Reserved);
+        }
         let lsp_uri = text_document_uri(&params.params).ok_or(Rejection::NoTextDocument)?;
         let url = uri_to_url(&lsp_uri).map_err(|_| Rejection::NoTextDocument)?;
         let language = self
@@ -274,6 +284,23 @@ mod tests {
     }
 
     #[test]
+    fn reserved_methods_cover_lifecycle_sync_and_namespaces() {
+        for method in [
+            "initialize",
+            "shutdown",
+            "exit",
+            "textDocument/didClose",
+            "window/workDoneProgress/cancel",
+            "$/cancelRequest",
+            "kakehashi/forward/request",
+        ] {
+            assert!(is_reserved_method(method), "{method} must be reserved");
+        }
+        assert!(!is_reserved_method("textDocument/inlineCompletion"));
+        assert!(!is_reserved_method("custom/ping"));
+    }
+
+    #[test]
     fn rejections_map_to_the_contracted_error_codes() {
         use tower_lsp_server::jsonrpc::ErrorCode;
         assert_eq!(
@@ -287,6 +314,10 @@ mod tests {
             Rejection::UnsupportedStrategy(AggregationStrategy::Concatenated)
                 .into_error("custom/x")
                 .code,
+            ErrorCode::InvalidParams
+        );
+        assert_eq!(
+            Rejection::Reserved.into_error("shutdown").code,
             ErrorCode::InvalidParams
         );
     }

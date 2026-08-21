@@ -286,6 +286,7 @@ mod tests {
         for method in [
             "textDocument/didOpen",
             "exit",
+            "window/workDoneProgress/cancel",
             "$/cancelRequest",
             "$/setTrace",
             "kakehashi/captures",
