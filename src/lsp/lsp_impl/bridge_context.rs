@@ -1259,16 +1259,19 @@ impl Kakehashi {
     pub(crate) async fn host_layer_value_with_ctx(
         &self,
         ctx: &HostRequestContext,
-        request_method: &'static str,
+        request_method: &str,
         params: serde_json::Value,
     ) -> tower_lsp_server::jsonrpc::Result<Option<serde_json::Value>> {
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
+        // Shared across the per-server tasks, which must be `'static`.
+        let method: std::sync::Arc<str> = request_method.into();
         let result = crate::lsp::aggregation::server::dispatch_host_preferred(
             ctx,
             pool.clone(),
             move |t| {
                 let params = params.clone();
+                let method = std::sync::Arc::clone(&method);
                 async move {
                     t.pool
                         .send_host_raw_request(
@@ -1279,7 +1282,7 @@ impl Kakehashi {
                                 language_id: &t.language_id,
                                 text: &t.text,
                             },
-                            request_method,
+                            &method,
                             params,
                             t.upstream_id,
                         )

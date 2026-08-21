@@ -301,7 +301,7 @@ impl LanguageServerPool {
         server_name: &str,
         server_config: &BridgeServerConfig,
         doc: &HostDocument<'_>,
-        method: &'static str,
+        method: &str,
         mut params: serde_json::Value,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<HostRawResponse>> {
@@ -323,7 +323,7 @@ impl LanguageServerPool {
                 handle,
                 doc,
                 upstream_request_id,
-                |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
+                |request_id| JsonRpcRequest::new(request_id.as_i64(), method.to_owned(), params),
                 move |response| parse_host_raw_response(response, method),
             )
             // Outer `?`: transport/protocol failure from `execute_host_request`.
@@ -618,7 +618,7 @@ fn host_url_to_lsp_uri(uri: &Url) -> io::Result<Uri> {
 /// with the bare `result` value otherwise.
 fn parse_host_raw_response(
     mut response: serde_json::Value,
-    method: &'static str,
+    method: &str,
 ) -> io::Result<Option<serde_json::Value>> {
     // A downstream JSON-RPC error response is a request failure, not "no
     // result" — propagate it as `Err` so a request-error sink can surface it

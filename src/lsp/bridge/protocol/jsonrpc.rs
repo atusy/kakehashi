@@ -5,6 +5,7 @@
 
 use log::warn;
 use serde::Serialize;
+use std::borrow::Cow;
 
 /// Detect a JSON-RPC error response so transformers can short-circuit.
 ///
@@ -57,16 +58,16 @@ pub(crate) fn jsonrpc_error_summary(response: &serde_json::Value) -> String {
 pub(crate) struct JsonRpcRequest<P> {
     jsonrpc: &'static str,
     id: i64,
-    method: &'static str,
+    method: Cow<'static, str>,
     params: P,
 }
 
 impl<P> JsonRpcRequest<P> {
-    pub(crate) fn new(id: i64, method: &'static str, params: P) -> Self {
+    pub(crate) fn new(id: i64, method: impl Into<Cow<'static, str>>, params: P) -> Self {
         Self {
             jsonrpc: "2.0",
             id,
-            method,
+            method: method.into(),
             params,
         }
     }
@@ -76,15 +77,15 @@ impl<P> JsonRpcRequest<P> {
 #[derive(Debug, Serialize)]
 pub(crate) struct JsonRpcNotification<P> {
     jsonrpc: &'static str,
-    method: &'static str,
+    method: Cow<'static, str>,
     params: P,
 }
 
 impl<P> JsonRpcNotification<P> {
-    pub(crate) fn new(method: &'static str, params: P) -> Self {
+    pub(crate) fn new(method: impl Into<Cow<'static, str>>, params: P) -> Self {
         Self {
             jsonrpc: "2.0",
-            method,
+            method: method.into(),
             params,
         }
     }
