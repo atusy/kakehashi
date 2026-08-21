@@ -283,15 +283,18 @@ impl Kakehashi {
         // handler returns once the work is handed off; each delivery logs
         // its own failure. Every selected server runs independently, so one
         // server's wait never holds back delivery to the others. Deliveries
-        // are bounded by `MAX_IN_FLIGHT_DELIVERIES`; past that the handler
-        // waits for a slot — backpressure rather than unbounded tasks.
+        // are bounded by `MAX_IN_FLIGHT_DELIVERIES`; past that the
+        // notification is dropped with a warning. Awaiting a slot here would
+        // move the stall back into the ingress handler (every slot held by a
+        // handler waiting on a delivery), so overflow must not block.
         // Ordering across notifications is not preserved: handlers already
         // run concurrently, so none was promised (ADR: Ordering).
-        let Ok(permit) = std::sync::Arc::clone(&self.forward_delivery_slots)
-            .acquire_owned()
-            .await
+        let Ok(permit) = std::sync::Arc::clone(&self.forward_delivery_slots).try_acquire_owned()
         else {
-            // Only a closed semaphore fails, and this one is never closed.
+            log::warn!(
+                "{method:?}: notification dropped: {MAX_IN_FLIGHT_DELIVERIES} forwarded \
+                 notifications are already waiting on their servers"
+            );
             return;
         };
         tokio::spawn(async move {

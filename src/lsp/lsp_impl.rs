@@ -458,8 +458,8 @@ pub struct Kakehashi {
     /// In-flight forwarded-notification deliveries
     /// (custom-method-host-forwarding): each may wait through a server's
     /// initialization, so they run detached from the ingress handler but
-    /// under this bound — past it the handler waits for a slot instead of
-    /// piling up unbounded tasks.
+    /// under this bound — past it a notification is dropped (warned), never
+    /// queued: waiting for a slot would stall the ingress handler instead.
     forward_delivery_slots: std::sync::Arc<tokio::sync::Semaphore>,
     #[allow(clippy::type_complexity)]
     captures_walk_inflight: dashmap::DashMap<

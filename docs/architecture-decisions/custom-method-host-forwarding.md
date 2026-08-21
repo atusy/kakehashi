@@ -85,9 +85,11 @@ priorities = ["copilot"]
   re-reads the document's current text at sync time, and is dropped if the
   document was closed while it waited. That wait is not the client's:
   the notification's ingress handling completes once delivery is handed
-  off (under a bound on deliveries in flight; past it the handler waits
-  for a slot), so a burst of forwarded notifications against a
-  slow-starting server cannot stall the other messages behind it. No
+  off, so a burst of forwarded notifications against a slow-starting
+  server cannot stall the other messages behind it. Deliveries in flight
+  are bounded; past the bound a notification is dropped with a warning
+  rather than queued — waiting for a slot would move the stall back into
+  the handler. No
   order is promised between forwarded notifications, even to one server:
   their handlers already run concurrently, as every non-sync message's do.
 - **Startup.** A forwarded request follows the host-request policy and
