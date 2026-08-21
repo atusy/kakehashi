@@ -1100,6 +1100,68 @@ impl LanguageServer for Kakehashi {
 
 #[cfg(test)]
 mod tests {
+    /// Pins [`super::HANDLED_NOTIFICATIONS`] to the notification handlers in
+    /// `impl LanguageServer for Kakehashi`: a handler added without a list
+    /// entry would be silently diverted to the forwarder, and a list entry
+    /// without a handler would shield a method nobody serves. Source-scanned
+    /// because tower-lsp registers a logging default for every standard
+    /// notification, so the router cannot tell "ours" from "default".
+    #[test]
+    fn handled_notifications_match_the_language_server_impl() {
+        const SOURCE: &str = include_str!("lsp_impl.rs");
+        let start = SOURCE
+            .find("impl LanguageServer for Kakehashi {")
+            .expect("the LanguageServer impl lives in this file");
+        let body = &SOURCE[start..];
+        let end = body.find("\n}\n").expect("impl block closes");
+        let body = &body[..end];
+        // A notification handler returns `()`: no `->` between `)` and `{`.
+        let re = regex::Regex::new(r"async fn (\w+)\s*\(([^)]*)\)\s*(->)?").unwrap();
+        let implemented: std::collections::BTreeSet<&str> = re
+            .captures_iter(body)
+            .filter(|caps| caps.get(3).is_none())
+            .map(|caps| caps.get(1).unwrap().as_str())
+            .collect();
+
+        // Handler name → wire method, for the entries the impl owns. `exit`
+        // (LspService) and `window/workDoneProgress/cancel` (RequestIdCapture)
+        // are handled outside the impl and are listed for that reason.
+        let owned_elsewhere = ["exit", "window/workDoneProgress/cancel"];
+        let table = [
+            ("initialized", "initialized"),
+            ("did_open", "textDocument/didOpen"),
+            ("did_change", "textDocument/didChange"),
+            ("will_save", "textDocument/willSave"),
+            ("did_save", "textDocument/didSave"),
+            ("did_close", "textDocument/didClose"),
+            (
+                "did_change_configuration",
+                "workspace/didChangeConfiguration",
+            ),
+            (
+                "did_change_workspace_folders",
+                "workspace/didChangeWorkspaceFolders",
+            ),
+        ];
+        let mapped: std::collections::BTreeSet<&str> = implemented
+            .iter()
+            .map(|name| {
+                table
+                    .iter()
+                    .find(|(handler, _)| handler == name)
+                    .map(|(_, method)| *method)
+                    .unwrap_or_else(|| {
+                        panic!("notification handler `{name}` has no HANDLED_NOTIFICATIONS entry")
+                    })
+            })
+            .collect();
+        let listed: std::collections::BTreeSet<&str> = super::HANDLED_NOTIFICATIONS
+            .iter()
+            .copied()
+            .filter(|method| !owned_elsewhere.contains(method))
+            .collect();
+        assert_eq!(mapped, listed);
+    }
     use super::*;
     use crate::lsp::auto_install::InstallingLanguagesExt;
 
