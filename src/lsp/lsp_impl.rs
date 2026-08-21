@@ -455,6 +455,13 @@ pub struct Kakehashi {
     /// cancels obsolete work. Entries are removed by a pointer-checked winner
     /// guard, so an old winner cannot erase its successor's marker.
     #[allow(clippy::type_complexity)]
+    /// In-flight forwarded-notification deliveries
+    /// (custom-method-host-forwarding): each may wait through a server's
+    /// initialization, so they run detached from the ingress handler but
+    /// under this bound — past it the handler waits for a slot instead of
+    /// piling up unbounded tasks.
+    forward_delivery_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    #[allow(clippy::type_complexity)]
     captures_walk_inflight: dashmap::DashMap<
         (Url, String, bool),
         std::sync::Arc<kakehashi::captures::CapturesWalkFlight>,
@@ -560,6 +567,9 @@ impl Kakehashi {
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
             captures_cache: dashmap::DashMap::new(),
             captures_walk_cache: dashmap::DashMap::new(),
+            forward_delivery_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                custom_method_forward::MAX_IN_FLIGHT_DELIVERIES,
+            )),
             captures_walk_inflight: dashmap::DashMap::new(),
             captures_match_cache: std::sync::Arc::new(
                 kakehashi::captures_match_cache::CapturesMatchCache::new(),
