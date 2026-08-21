@@ -108,13 +108,18 @@ priorities = ["copilot"]
   error: the request is answered with `RequestFailed` (-32803; the request
   was well-formed, the server cannot serve it) naming the method, and a
   notification is dropped with a warning.
-- **Reserved methods.** The bridge-owned lifecycle and sync methods
-  (`initialize`, `shutdown`, `exit`, the `textDocument/did*` sync family,
-  the other notifications kakehashi handles itself) and the `$/` and
-  `kakehashi/` namespaces are never forwarded, even when an entry names
-  them: a request is answered `RequestFailed`, a notification is dropped
-  with a warning. The forwarding methods can be called directly, so this
-  holds in the handler, not only in the fallback dispatch.
+- **Reserved methods.** The bridge-owned lifecycle, sync, and routing
+  methods (`initialize`, `shutdown`, `exit`, the `textDocument/did*` and
+  `notebookDocument/*` sync families, `workspace/executeCommand`, the other
+  notifications kakehashi handles itself) and the `$/` and `kakehashi/`
+  namespaces are never forwarded, even when an entry names them: a request
+  is answered `RequestFailed`, a notification is dropped with a warning.
+  The forwarding methods can be called directly, so this holds in the
+  handler, not only in the fallback dispatch. A direct call may still name
+  a typed method kakehashi implements (say `textDocument/hover` with an
+  entry written to tune its priorities); it is then sent blind to the host
+  layer alone — the caller asked for exactly that, and the set of typed
+  methods is what this decision refuses to enumerate.
 - **Cancellation.** A forwarded request joins the upstream-id registry, so a
   client `$/cancelRequest` reaches the downstream servers exactly as it does
   for typed host methods.

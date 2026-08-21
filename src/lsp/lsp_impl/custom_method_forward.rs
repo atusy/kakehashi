@@ -354,6 +354,8 @@ mod tests {
             "exit",
             "textDocument/didClose",
             "window/workDoneProgress/cancel",
+            "notebookDocument/didOpen",
+            "workspace/executeCommand",
             "$/cancelRequest",
             "kakehashi/forward/request",
         ] {

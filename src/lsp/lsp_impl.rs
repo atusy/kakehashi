@@ -83,8 +83,8 @@ pub(crate) const HANDLED_NOTIFICATIONS: &[&str] = &[
 ];
 
 /// Methods a forward must never carry, configured or not
-/// (custom-method-host-forwarding): the connection lifecycle and document
-/// sync that the bridge owns. A forwarded `shutdown` would kill a shared
+/// (custom-method-host-forwarding): the connection lifecycle, document
+/// sync, and command routing that the bridge owns. A forwarded `shutdown` would kill a shared
 /// server; a forwarded `textDocument/didClose` would desync the bridge's
 /// own record of what the server has open. The dispatch layer never
 /// rewrites these (built-ins answer for themselves, handled notifications
@@ -93,7 +93,13 @@ pub(crate) const HANDLED_NOTIFICATIONS: &[&str] = &[
 pub(crate) fn is_reserved_method(method: &str) -> bool {
     method.starts_with("$/")
         || method.starts_with("kakehashi/")
-        || matches!(method, "initialize" | "shutdown")
+        // The notebook sync family is the same contract as textDocument/did*
+        // for a document kind the bridge never tracks: a forwarded open
+        // would never be re-synced or closed.
+        || method.starts_with("notebookDocument/")
+        // executeCommand routing decides WHICH server owns a command
+        // (execute-command-routing-token); a blind fan-out would defeat it.
+        || matches!(method, "initialize" | "shutdown" | "workspace/executeCommand")
         || HANDLED_NOTIFICATIONS.contains(&method)
 }
 
