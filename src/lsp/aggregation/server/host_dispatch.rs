@@ -138,3 +138,67 @@ where
     }
     (join_set, entries)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::AggregationStrategy;
+
+    fn config(name: &str) -> ResolvedServerConfig {
+        ResolvedServerConfig {
+            server_name: name.to_string(),
+            config: Arc::new(BridgeServerConfig {
+                cmd: Some(vec![name.to_string()]),
+                languages: None,
+                initialization_options: None,
+                workspace_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+                force_start: None,
+                enabled: None,
+                settings: None,
+            }),
+        }
+    }
+
+    fn ctx(priorities: &[&str], max_fan_out: Option<usize>) -> HostRequestContext {
+        HostRequestContext {
+            uri: url::Url::parse("file:///doc.md").unwrap(),
+            language_id: "markdown".to_string(),
+            text: Arc::from("# doc"),
+            configs: vec![config("a"), config("b"), config("c")],
+            priorities: priorities.iter().map(|p| (*p).to_string()).collect(),
+            strategy: AggregationStrategy::Preferred,
+            max_fan_out,
+            upstream_request_id: None,
+        }
+    }
+
+    fn names(selected: &[ResolvedServerConfig]) -> Vec<&str> {
+        selected.iter().map(|c| c.server_name.as_str()).collect()
+    }
+
+    /// The delivery plan a forwarded notification follows
+    /// (custom-method-host-forwarding): walk order, `"*"` expansion, the
+    /// `maxFanOut` cap, and the `[]` kill switch — pinned here because the
+    /// e2e can only observe arrivals, never a delivery that did NOT happen.
+    #[test]
+    fn select_host_servers_follows_priorities_cap_and_kill_switch() {
+        assert_eq!(
+            names(&select_host_servers(&ctx(&["b", "a"], None))),
+            ["b", "a"]
+        );
+        assert_eq!(
+            names(&select_host_servers(&ctx(&["b", "a"], Some(1)))),
+            ["b"],
+            "maxFanOut = 1 keeps only the first in priority order"
+        );
+        assert_eq!(
+            names(&select_host_servers(&ctx(&["c", "*"], None))),
+            ["c", "a", "b"],
+            "`*` expands to the unlisted rest"
+        );
+        assert!(select_host_servers(&ctx(&[], None)).is_empty());
+        assert!(select_host_servers(&ctx(&["b", "a"], Some(0))).is_empty());
+    }
+}
