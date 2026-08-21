@@ -367,7 +367,7 @@ impl LanguageServerPool {
                         // member (long-standing leniency); an arbitrary
                         // forwarded method gets JSON-RPC's strict reading —
                         // that is a broken server, counted as a failure.
-                        if response.get("result").is_none() && response.get("error").is_none() {
+                        if lacks_result_and_error(&response) {
                             return Err(io::Error::other(format!(
                                 "[{server}] answered {method:?} with neither result nor error"
                             )));
@@ -776,6 +776,12 @@ fn host_url_to_lsp_uri(uri: &Url) -> io::Result<Uri> {
 /// Strip the JSON-RPC envelope: `Err` for an error response (a request
 /// failure), `Ok(None)` for a `null` or absent result, and `Ok(Some(result))`
 /// with the bare `result` value otherwise.
+/// A response with neither a `result` member nor a non-null `error` object:
+/// JSON-RPC requires one of the two, and `"error": null` is not an error.
+fn lacks_result_and_error(response: &serde_json::Value) -> bool {
+    response.get("result").is_none() && response.get("error").is_none_or(serde_json::Value::is_null)
+}
+
 /// Whether a downstream response is a JSON-RPC `MethodNotFound` (-32601):
 /// the server's own way of saying it does not implement the method.
 fn declines_method(response: &serde_json::Value) -> bool {
@@ -1146,6 +1152,22 @@ mod tests {
             "result": { "kind": "full" }
         });
         assert!(parse_host_diagnostic_response(response, "textDocument/diagnostic").is_err());
+    }
+
+    #[test]
+    fn lacks_result_and_error_treats_null_error_as_absent() {
+        assert!(lacks_result_and_error(
+            &serde_json::json!({ "jsonrpc": "2.0", "id": 1 })
+        ));
+        assert!(lacks_result_and_error(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "error": null
+        })));
+        assert!(!lacks_result_and_error(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": null
+        })));
+        assert!(!lacks_result_and_error(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "error": { "code": -32603, "message": "x" }
+        })));
     }
 
     #[test]
