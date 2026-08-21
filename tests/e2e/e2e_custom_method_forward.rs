@@ -336,8 +336,10 @@ priorities = ["mock-decline"]
         .is_some();
     assert!(declined, "the declining server never came up");
 
-    // The declining mock logs its receipts under its own name, so each
-    // server's receipt is told apart in the shared wire log.
+    // The declining mock logs its receipts under its own name (in addition
+    // to the generic line every mock writes), so each server's receipt is
+    // told apart in the shared wire log: echo receipts = generic lines minus
+    // the decline server's own.
     let count = |session: &Session, entry: &str| {
         session
             .wire_methods()
@@ -345,19 +347,24 @@ priorities = ["mock-decline"]
             .filter(|m| *m == entry)
             .count()
     };
-    let (echo_before, decline_before) = (
-        count(&session, "custom/echo"),
-        count(&session, "custom-decline:custom/echo"),
-    );
-    let result = session.echo_until_answered("custom/echo", params);
+    let receipts = |session: &Session| {
+        let declined = count(session, "custom-decline:custom/echo");
+        (count(session, "custom/echo") - declined, declined)
+    };
+    // Warm the echo server too, so the probe below is a single request
+    // against two ready servers — one upstream request, two receipts.
+    session.echo_until_answered("custom/echo", params.clone());
+    let (echo_before, decline_before) = receipts(&session);
+    let response = session.client.send_request("custom/echo", params);
     assert_eq!(
-        result["method"], "custom/echo",
-        "the lower-priority server's answer wins over the decline"
+        response["result"]["method"], "custom/echo",
+        "the lower-priority server's answer wins over the decline; got {response}"
     );
-    assert!(
-        count(&session, "custom/echo") > echo_before
-            && count(&session, "custom-decline:custom/echo") > decline_before,
-        "both servers must have been asked (capability-blind); wire: {:?}",
+    let (echo_after, decline_after) = receipts(&session);
+    assert_eq!(
+        (echo_after - echo_before, decline_after - decline_before),
+        (1, 1),
+        "one request must reach both servers (capability-blind fan-out); wire: {:?}",
         session.wire_methods()
     );
 
