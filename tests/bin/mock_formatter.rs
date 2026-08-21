@@ -159,6 +159,10 @@ fn main() {
     // answered, the baseline demonstrably exists — a later baseline-less full
     // request means a pull LOST it and is re-fetching.
     let mut unchanged_answered = false;
+    // `custom-echo` mode: every `custom/*` notification received, in order,
+    // reported back by the next `custom/*` request so a test can prove a
+    // forwarded notification reached this server (custom-method-host-forwarding).
+    let mut custom_notifications: Vec<Value> = Vec::new();
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -167,6 +171,34 @@ fn main() {
             .unwrap_or_default();
         let id = message.get("id").cloned();
         append_wire_log(method, &message);
+
+        // `custom-echo`: answer any `custom/*` request with what arrived —
+        // the method, the params verbatim, whether the referenced document
+        // was opened here first, and the notifications recorded so far. The
+        // mode advertises NO capability for these methods: the bridge must
+        // forward them blind.
+        if mode == "custom-echo" && method.starts_with("custom/") {
+            let params = message.get("params").cloned().unwrap_or(Value::Null);
+            if id.is_some() {
+                let opened = params
+                    .pointer("/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .is_some_and(|uri| documents.contains_key(uri));
+                respond(
+                    &mut writer,
+                    id,
+                    json!({
+                        "method": method,
+                        "params": params,
+                        "opened": opened,
+                        "notifications": custom_notifications,
+                    }),
+                );
+            } else {
+                custom_notifications.push(json!({ "method": method, "params": params }));
+            }
+            continue;
+        }
 
         match method {
             "initialize" => {
@@ -180,6 +212,7 @@ fn main() {
                         "hoverProvider": true,
                         "textDocumentSync": 1
                     }),
+                    "custom-echo" => json!({ "textDocumentSync": 1 }),
                     "code-lens" => json!({
                         "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1

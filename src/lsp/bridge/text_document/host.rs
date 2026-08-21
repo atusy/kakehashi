@@ -34,7 +34,7 @@ use url::Url;
 use super::super::actor::RouterCleanupGuard;
 use super::super::pool::{
     ConnectionHandle, ConnectionHandleSender, ConnectionKey, HostDocSyncState, LanguageServerPool,
-    MessageSender, UpstreamId,
+    MessageSender, NotificationSendResult, UpstreamId,
 };
 use super::super::protocol::{
     JsonRpcNotification, JsonRpcRequest, RequestId, jsonrpc_error_summary,
@@ -334,6 +334,110 @@ impl LanguageServerPool {
             value,
             handle: answering,
         }))
+    }
+
+    /// Send a request for a method kakehashi does not implement
+    /// (custom-method-host-forwarding). Identical to
+    /// [`Self::send_host_raw_request`] except that the server's advertised
+    /// capabilities are **not** consulted: the method is unknown to
+    /// kakehashi, so it has no capability to look up, and the contract is
+    /// that a server not implementing it answers `MethodNotFound` itself —
+    /// which surfaces here as the `Err` of a downstream error response.
+    pub(crate) async fn send_host_custom_request(
+        &self,
+        server_name: &str,
+        server_config: &BridgeServerConfig,
+        doc: &HostDocument<'_>,
+        method: &str,
+        mut params: serde_json::Value,
+        upstream_request_id: Option<UpstreamId>,
+    ) -> io::Result<Option<serde_json::Value>> {
+        strip_progress_tokens(&mut params);
+        let handle = self
+            .get_or_create_connection(server_name, server_config, Some(doc.uri))
+            .await?;
+        self.execute_host_request(
+            handle,
+            doc,
+            upstream_request_id,
+            |request_id| JsonRpcRequest::new(request_id.as_i64(), method.to_owned(), params),
+            move |response| parse_host_raw_response(response, method),
+        )
+        .await?
+    }
+
+    /// Send a notification for a method kakehashi does not implement
+    /// (custom-method-host-forwarding) with the upstream params forwarded
+    /// verbatim, after syncing the host document to the server.
+    ///
+    /// The sync is what distinguishes this from a bare
+    /// `handle.send_notification`: a notification about a document the
+    /// server never opened is a protocol nuisance at best. It therefore
+    /// follows the lock discipline of [`Self::execute_host_request`] —
+    /// routing wait, per-document lifecycle lock, suppression check, live
+    /// handle check, then sync and send under the `connections` →
+    /// `host_documents` order — minus the request bookkeeping a
+    /// notification has no use for. Unlike [`Self::notify_host_will_save`],
+    /// this may spawn the connection: the user asked for this method to
+    /// reach this server, exactly as a request would. And unlike the
+    /// request path it **waits through initialization** (Tier 0 bound,
+    /// ls-bridge-timeout-hierarchy): a request that fails fast is retried
+    /// by the next keystroke, but a dropped notification is gone.
+    pub(crate) async fn send_host_custom_notification(
+        &self,
+        server_name: &str,
+        server_config: &BridgeServerConfig,
+        doc: &HostDocument<'_>,
+        method: &str,
+        mut params: serde_json::Value,
+    ) -> io::Result<()> {
+        strip_progress_tokens(&mut params);
+        let handle = self
+            .get_or_create_connection_wait_ready(
+                server_name,
+                server_config,
+                Some(doc.uri),
+                std::time::Duration::from_secs(super::super::pool::INIT_TIMEOUT_SECS),
+            )
+            .await?;
+        let connection_key = handle.key();
+        self.wait_for_host_routing(doc.uri).await;
+        let lifecycle = self.host_lifecycle_lock(doc.uri);
+        let _lifecycle_guard = lifecycle.lock().await;
+        if self.is_host_routing_suppressed(doc.uri, connection_key) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("host document routing disabled on {connection_key}"),
+            ));
+        }
+        self.apply_host_routing_workspace_folders(doc.uri, connection_key.server(), &handle)
+            .await
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to apply host routing workspace folders: {error}"),
+                )
+            })?;
+
+        let connections = self.connections().await;
+        if !connections
+            .get(connection_key)
+            .is_some_and(|current| Arc::ptr_eq(current, &handle))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("connection to {connection_key} was replaced during host sync"),
+            ));
+        }
+        let mut docs = self.host_documents().await;
+        let mut sender = ConnectionHandleSender(&handle);
+        sync_host_document(&mut sender, &mut docs, doc, None, connection_key).await?;
+        match handle.send_notification(JsonRpcNotification::new(method.to_owned(), params)) {
+            NotificationSendResult::Queued => Ok(()),
+            other => Err(io::Error::other(format!(
+                "failed to queue {method} for {connection_key}: {other:?}"
+            ))),
+        }
     }
 
     /// Send a host formatting request. Unlike [`Self::send_host_raw_request`],

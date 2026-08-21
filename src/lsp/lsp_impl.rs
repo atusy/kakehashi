@@ -2,6 +2,7 @@ mod apply_edit_translation;
 pub(crate) mod bridge_context;
 mod cli;
 mod coordinator;
+pub(crate) mod custom_method_forward;
 pub(crate) use coordinator::DiagnosticPublisher;
 pub(crate) mod kakehashi;
 mod lifecycle;
@@ -54,6 +55,26 @@ use super::auto_install::{AutoInstallManager, InstallingLanguages};
 use super::cache::CacheCoordinator;
 use super::debounced_diagnostics::DebouncedDiagnosticsManager;
 use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
+
+/// The client notifications `Kakehashi`'s `LanguageServer` impl handles.
+///
+/// custom-method-host-forwarding must never shadow a handler kakehashi has.
+/// Requests learn "no handler" from the router's own `MethodNotFound`
+/// answer; notifications get no answer (the router drops unknown ones
+/// silently), so the implemented ones are named here, next to the impl
+/// below, and the forwarder leaves them alone. Keep this in step with the
+/// `async fn` notifications in `impl LanguageServer for Kakehashi`.
+pub(crate) const HANDLED_NOTIFICATIONS: &[&str] = &[
+    "initialized",
+    "exit",
+    "textDocument/didOpen",
+    "textDocument/didChange",
+    "textDocument/willSave",
+    "textDocument/didSave",
+    "textDocument/didClose",
+    "workspace/didChangeConfiguration",
+    "workspace/didChangeWorkspaceFolders",
+];
 
 pub(super) fn uri_to_url(uri: &Uri) -> std::result::Result<Url, url::ParseError> {
     Url::parse(uri.as_str())

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 
 use crate::config::settings::BridgeServerConfig;
-use crate::lsp::bridge::{LanguageServerPool, UpstreamId};
+use crate::lsp::bridge::{LanguageServerPool, ResolvedServerConfig, UpstreamId};
 use crate::lsp::lsp_impl::bridge_context::HostRequestContext;
 use crate::lsp::request_id::CancelReceiver;
 
@@ -78,6 +78,21 @@ where
     let (mut join_set, entries) = host_fan_out(ctx, pool, f);
     let ordering = entry_names(&entries);
     concatenated::concatenated(&mut join_set, &ordering, cancel_rx, log_target, panic_sink).await
+}
+
+/// The host servers a request over `ctx` fans out to: allowlist + `"*"`
+/// expansion against `ctx.configs`, `max_fan_out`-truncated, in walk order
+/// (aggregation-priorities-wildcard).
+///
+/// Exposed for senders that have no fan-in — a forwarded notification
+/// (custom-method-host-forwarding) goes to every selected server and
+/// collects nothing — so they select exactly the servers a request would.
+pub(crate) fn select_host_servers(ctx: &HostRequestContext) -> Vec<ResolvedServerConfig> {
+    let entries = truncate_entries(
+        expand_priorities(&ctx.priorities, &ctx.configs),
+        ctx.max_fan_out,
+    );
+    super::fan_out::select_servers(&ctx.configs, &entries)
 }
 
 /// Shared host fan-out: allowlist + `"*"` expansion against `ctx.configs`,

@@ -13,6 +13,6 @@ pub(crate) use dispatch::{
 pub(crate) use fan_in::FanInResult;
 pub(crate) use fan_out::FanOutTask;
 pub(crate) use host_dispatch::{
-    HostFanOutTask, dispatch_host_concatenated, dispatch_host_preferred,
+    HostFanOutTask, dispatch_host_concatenated, dispatch_host_preferred, select_host_servers,
 };
 pub(crate) use priority::{expand_priorities, truncate_entries};

@@ -65,6 +65,11 @@ priorities = ["copilot"]
   `result` in `priorities` order (`preferred`); an all-empty or all-failed
   fan-out answers `null`. A message without an `id` is forwarded as a
   notification to **every** selected server, in priority order.
+- **Startup.** A forwarded request follows the host-request policy and
+  fails fast (empty) on a server still initializing — the next request gets
+  it. A forwarded notification instead waits through initialization, within
+  the initialization bound (ls-bridge-timeout-hierarchy Tier 0): a request
+  is naturally retried, a dropped notification is gone.
 - **Verbatim params, verbatim result.** Host-layer rules apply unchanged:
   real URI, real coordinates, no translation either way, progress tokens
   stripped (the bridge does not relay downstream progress).

@@ -12,6 +12,7 @@ mod text_sync;
 mod wire_repair;
 
 mod aggregation;
+mod custom_method_forward;
 mod ingress_order;
 mod lsp_impl;
 mod progress;
@@ -20,9 +21,13 @@ mod semantic_request_tracker;
 mod settings;
 
 pub use bridge::LanguageServerPool;
+pub use custom_method_forward::CustomMethodForwarder;
 pub use ingress_order::IngressOrderGate;
 pub(crate) use ingress_order::current_writer_ticket;
 pub use lsp_impl::Kakehashi;
+pub use lsp_impl::custom_method_forward::{
+    FORWARD_NOTIFICATION_METHOD, FORWARD_REQUEST_METHOD, ForwardParams,
+};
 pub(crate) use request_id::current_upstream_id;
 pub use request_id::{CancelForwarder, RequestIdCapture};
 pub(crate) use settings::{
