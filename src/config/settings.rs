@@ -1189,6 +1189,11 @@ impl WorkspaceSettings {
     pub(crate) fn host_forwardable_methods(&self) -> std::collections::HashSet<String> {
         self.languages
             .values()
+            // Without the `_self.enabled = true` opt-in nothing forwards, and
+            // the opt-in is what keeps the shipped `bridge._` defaults
+            // (diagnostics, codeAction) from opening the gate for every
+            // language out of the box.
+            .filter(|language| language.is_host_bridging_enabled())
             .filter_map(LanguageSettings::explicit_host_aggregation)
             .flat_map(|aggregation| aggregation.into_keys())
             .filter(|method| method != crate::config::WILDCARD_KEY)
@@ -3079,6 +3084,37 @@ kind = "locals""#;
             AggregationStrategy::Concatenated,
             "contrast: the resolved strategy does inherit"
         );
+    }
+
+    #[test]
+    fn host_forwardable_methods_is_empty_without_host_opt_in() {
+        // The shipped defaults name diagnostics/codeAction under `bridge._`;
+        // without `_self.enabled = true` they must not open the gate.
+        let shipped = crate::config::WorkspaceSettings::try_from_settings(
+            &crate::config::defaults::default_settings(),
+            None,
+            crate::config::expand::with_kakehashi_defaults(|_| None),
+        )
+        .expect("shipped defaults resolve");
+        assert!(shipped.host_forwardable_methods().is_empty());
+        let not_opted_in = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([(
+                        "custom/a".to_string(),
+                        AggregationConfig::default(),
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([("markdown".to_string(), not_opted_in)]),
+            ..Default::default()
+        };
+        assert!(settings.host_forwardable_methods().is_empty());
     }
 
     #[test]

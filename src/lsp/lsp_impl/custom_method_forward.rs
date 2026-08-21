@@ -136,7 +136,7 @@ fn text_document_uri(params: &Value) -> std::result::Result<(Uri, Url), Rejectio
 /// Per-settings-generation cache behind [`Kakehashi::custom_method_gate`].
 struct ForwardableMethods {
     generation: u64,
-    methods: std::sync::Arc<std::collections::HashSet<String>>,
+    methods: std::collections::HashSet<String>,
 }
 
 impl Kakehashi {
@@ -150,23 +150,24 @@ impl Kakehashi {
         let settings_manager = std::sync::Arc::clone(&self.settings_manager);
         let cache = std::sync::Arc::new(std::sync::Mutex::new(None::<ForwardableMethods>));
         move |method: &str| {
-            let snapshot = settings_manager.load_settings_pair();
+            // Generation first (one atomic load, no Arc clone); the full
+            // snapshot is loaded only on a miss. A store between the two
+            // loads just recomputes once more on the next message.
+            let generation = settings_manager.settings_generation();
             let mut cache = cache.lock().recover_poison("custom_method_gate cache");
-            let current = match cache.as_ref() {
-                Some(cached) if cached.generation == snapshot.generation => {
-                    std::sync::Arc::clone(&cached.methods)
-                }
+            // The lookup itself runs under the guard: a set probe is cheaper
+            // than the Arc round trip that releasing first would cost.
+            match cache.as_ref() {
+                Some(cached) if cached.generation == generation => cached.methods.contains(method),
                 _ => {
-                    let methods = std::sync::Arc::new(snapshot.settings.host_forwardable_methods());
-                    *cache = Some(ForwardableMethods {
+                    let snapshot = settings_manager.load_settings_pair();
+                    let fresh = cache.insert(ForwardableMethods {
                         generation: snapshot.generation,
-                        methods: std::sync::Arc::clone(&methods),
+                        methods: snapshot.settings.host_forwardable_methods(),
                     });
-                    methods
+                    fresh.methods.contains(method)
                 }
-            };
-            drop(cache);
-            current.contains(method)
+            }
         }
     }
 
