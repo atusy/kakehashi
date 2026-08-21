@@ -416,19 +416,21 @@ impl LanguageServerPool {
             )
             .await?;
         let connection_key = handle.key();
-        // The wait above can outlive the document: once closed, a sync here
+        self.wait_for_host_routing(doc.uri).await;
+        let lifecycle = self.host_lifecycle_lock(doc.uri);
+        let _lifecycle_guard = lifecycle.lock().await;
+        // The waits above can outlive the document: once closed, a sync here
         // would re-open it downstream from the stale snapshot with nothing
-        // left to close it. The reader answering `None` is that signal
-        // (narrows the window; the sync itself keeps the snapshot fallback).
+        // left to close it. Checked UNDER the lifecycle lock, which the
+        // downstream close also takes, so a close cannot slip between this
+        // check and the send; and the snapshot is never used as a fallback
+        // on this path — the reader answering `None` is the document gone.
         if live_text_reader.is_some_and(|reader| reader().is_none()) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "host document closed while waiting for the server",
             ));
         }
-        self.wait_for_host_routing(doc.uri).await;
-        let lifecycle = self.host_lifecycle_lock(doc.uri);
-        let _lifecycle_guard = lifecycle.lock().await;
         if self.is_host_routing_suppressed(doc.uri, connection_key) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
