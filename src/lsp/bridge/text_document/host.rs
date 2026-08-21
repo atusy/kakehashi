@@ -429,6 +429,13 @@ impl LanguageServerPool {
         let connection_key = handle.key();
         self.wait_for_host_routing(doc.uri).await;
         let lifecycle = self.host_lifecycle_lock(doc.uri);
+        // Whatever path returns below: if the document is gone, the lock
+        // entry this call may just have re-created goes with it.
+        let _cleanup = super::did_open::LifecycleCleanup {
+            pool: self,
+            host_uri: doc.uri,
+            lifecycle: &lifecycle,
+        };
         let _lifecycle_guard = lifecycle.lock().await;
         // The waits above can outlive the document: once closed, a sync here
         // would re-open it downstream from the stale snapshot with nothing
