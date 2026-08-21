@@ -325,7 +325,7 @@ priorities = ["mock-decline"]
             if session
                 .wire_methods()
                 .iter()
-                .any(|m| m == "custom/nobody-implements")
+                .any(|m| m == "custom-decline:custom/nobody-implements")
             {
                 Some(())
             } else {
@@ -336,21 +336,27 @@ priorities = ["mock-decline"]
         .is_some();
     assert!(declined, "the declining server never came up");
 
-    let echoes = |session: &Session| {
+    // The declining mock logs its receipts under its own name, so each
+    // server's receipt is told apart in the shared wire log.
+    let count = |session: &Session, entry: &str| {
         session
             .wire_methods()
             .iter()
-            .filter(|m| *m == "custom/echo")
+            .filter(|m| *m == entry)
             .count()
     };
-    let before = echoes(&session);
+    let (echo_before, decline_before) = (
+        count(&session, "custom/echo"),
+        count(&session, "custom-decline:custom/echo"),
+    );
     let result = session.echo_until_answered("custom/echo", params);
     assert_eq!(
         result["method"], "custom/echo",
         "the lower-priority server's answer wins over the decline"
     );
     assert!(
-        echoes(&session) - before >= 2,
+        count(&session, "custom/echo") > echo_before
+            && count(&session, "custom-decline:custom/echo") > decline_before,
         "both servers must have been asked (capability-blind); wire: {:?}",
         session.wire_methods()
     );

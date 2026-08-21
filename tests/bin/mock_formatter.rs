@@ -181,6 +181,9 @@ fn main() {
         // methods and says so the JSON-RPC way — the decline the forward's
         // capability-blind fan-in must treat as an empty contribution.
         if mode == "custom-decline" && method.starts_with("custom/") {
+            // Logged under its own name so a test can tell this server's
+            // receipt from an echo server's in the shared wire log.
+            append_wire_log(&format!("custom-decline:{method}"), &message);
             respond_error(&mut writer, id, -32601, "Method not found");
             continue;
         }
