@@ -60,8 +60,9 @@ priorities = ["copilot"]
   keys too; today those name only router-handled methods). The `"_"`
   method wildcard does not make a method eligible — it would turn every
   typo into a downstream round trip. An ineligible request keeps today's
-  `MethodNotFound`; an ineligible notification is not forwarded (logged at
-  debug; a malformed or misconfigured one at warn).
+  `MethodNotFound`; an ineligible notification is not forwarded — silently
+  when no configuration names the method at all, otherwise logged at debug
+  (a malformed or misconfigured one at warn).
 - **Eligible but empty.** An eligible entry with `priorities = []` or
   `maxFanOut = 0` selects no server: a request answers `null`, a
   notification goes nowhere — the per-method kill switch
