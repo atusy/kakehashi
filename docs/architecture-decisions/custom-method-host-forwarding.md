@@ -56,15 +56,29 @@ priorities = ["copilot"]
   language has `bridge._self.enabled = true`; and the method name appears as
   a **literal key** of that language's `bridge._self.aggregation` map
   (inherited through the `bridge._` wildcard like any other aggregation
-  field). The `"_"` method wildcard does not make a method eligible — it
-  would turn every typo into a downstream round trip. An ineligible request
-  keeps today's `MethodNotFound`; an ineligible notification is dropped
-  silently, as the router already does.
+  field — which means the shipped defaults and `languages._` contribute
+  keys too; today those name only router-handled methods). The `"_"`
+  method wildcard does not make a method eligible — it would turn every
+  typo into a downstream round trip. An ineligible request keeps today's
+  `MethodNotFound`; an ineligible notification is not forwarded (logged at
+  debug; a malformed or misconfigured one at warn).
+- **Eligible but empty.** An eligible entry with `priorities = []` or
+  `maxFanOut = 0` selects no server: a request answers `null`, a
+  notification goes nowhere — the per-method kill switch
+  (aggregation-priorities-wildcard) behaves as it does for typed methods.
+- **Routing key, not a restriction.** `params.textDocument.uri` is read to
+  pick the host document; the params are otherwise not inspected, so a
+  client can route any params shape by including that member.
 - **Request vs. notification follows the wire.** A message with an `id` is
   forwarded as a request and answered with the first non-empty downstream
-  `result` in `priorities` order (`preferred`); an all-empty or all-failed
+  `result` in `priorities` order (`preferred`, with the host layer's
+  emptiness rule: `null`, `[]`, `{}`, and the known empty-list envelopes
+  such as `{"items": []}` count as empty); an all-empty or all-failed
   fan-out answers `null`. A message without an `id` is forwarded as a
-  notification to **every** selected server, in priority order.
+  notification to **every** selected server, each delivered independently.
+- **Ordering.** Forwarded requests are not sequenced behind pending
+  `didChange` tickets (the same as hover and definition); the host text
+  synced before the send is the document's current text at that moment.
 - **Startup.** A forwarded request follows the host-request policy and
   fails fast (empty) on a server still initializing — the next request gets
   it. A forwarded notification instead waits through initialization, within
@@ -105,22 +119,27 @@ priorities = ["copilot"]
   client `$/cancelRequest` reaches the downstream servers exactly as it does
   for typed host methods.
 
-### Invariants
+## Invariants
 
-- Forwarding must never shadow a handler kakehashi has. The dispatch learns
-  "no handler" from the router's own `MethodNotFound` answer for requests,
-  so the set of built-in request names is never duplicated in a list that
-  could drift. Notifications get no such answer (the router drops unknown
-  ones silently), so the notifications kakehashi **implements** are named
-  once, next to the implementation, and excluded; an unimplemented standard
-  notification is as forwardable as a custom one.
-- A forwarded message must see the host document already synced on the
-  receiving server: the send happens under the same per-document host
-  lifecycle lock and after the same `didOpen`/`didChange` reconciliation as
-  every typed host request, or the downstream server answers about a
-  document it never opened.
-- The upstream id is bound to the downstream request under the same registry
-  the cancel path reads; the forward adds no second bookkeeping.
+> The invariants below are normative; the mechanisms that satisfy them are
+> deliberately unspecified.
+
+- Forwarding never shadows a handler kakehashi has. For requests the
+  router's own answer is the authority on "no handler", so no list of
+  built-in request names exists to drift; notifications get no such answer,
+  so the ones kakehashi handles are named exactly once, beside their
+  implementation. An unimplemented standard notification is as forwardable
+  as a custom one.
+- A forwarded message reaches a server only after that server has the host
+  document open at the text kakehashi considers current, under the same
+  ordering guarantees as every typed host request; otherwise the server
+  answers about a document it never opened, or about rolled-back text.
+- A forwarded request is cancellable by the client's `$/cancelRequest`
+  through the same path as a typed host request; no second bookkeeping.
+- The misconfiguration surface is the request: `concatenated` or a reserved
+  method fails the request that hits it rather than a settings-apply
+  warning, because the set of built-in methods the warning would have to
+  exclude is exactly what this decision refuses to enumerate.
 
 ## Consequences
 
@@ -146,6 +165,9 @@ priorities = ["copilot"]
 - A request whose params carry no `textDocument.uri` cannot be routed and is
   answered `InvalidParams` — the forward is intentionally limited to the
   document-scoped family rather than inventing a default target.
+- When every selected server fails for a reason other than declining the
+  method, the client sees `null` plus one `window/logMessage` warning per
+  request, not the downstream error.
 
 ### Neutral
 
