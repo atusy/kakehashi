@@ -125,11 +125,17 @@ fn text_document_uri(params: &Value) -> std::result::Result<(Uri, Url), Rejectio
         .pointer("/textDocument/uri")
         .and_then(Value::as_str)
         .ok_or(Rejection::NoTextDocument)?;
-    let lsp_uri = raw
-        .parse::<Uri>()
-        .map_err(|_| Rejection::InvalidTextDocumentUri(raw.to_owned()))?;
-    let url =
-        uri_to_url(&lsp_uri).map_err(|_| Rejection::InvalidTextDocumentUri(raw.to_owned()))?;
+    // Echoed back in the error message: bound it, the sender has the value.
+    let quoted = || {
+        const ECHO_LIMIT: usize = 128;
+        let mut shown: String = raw.chars().take(ECHO_LIMIT).collect();
+        if raw.chars().nth(ECHO_LIMIT).is_some() {
+            shown.push('…');
+        }
+        Rejection::InvalidTextDocumentUri(shown)
+    };
+    let lsp_uri = raw.parse::<Uri>().map_err(|_| quoted())?;
+    let url = uri_to_url(&lsp_uri).map_err(|_| quoted())?;
     Ok((lsp_uri, url))
 }
 
@@ -337,6 +343,16 @@ mod tests {
         assert_eq!(
             text_document_uri(&params).unwrap_err(),
             Rejection::InvalidTextDocumentUri("not a uri".to_owned())
+        );
+        let huge = format!("not a uri {}", "x".repeat(10_000));
+        let params = serde_json::json!({ "textDocument": { "uri": huge } });
+        let Rejection::InvalidTextDocumentUri(shown) = text_document_uri(&params).unwrap_err()
+        else {
+            panic!("malformed");
+        };
+        assert!(
+            shown.chars().count() <= 129 && shown.ends_with('…'),
+            "{shown}"
         );
         assert_eq!(
             Rejection::InvalidTextDocumentUri("x".into())
