@@ -1113,7 +1113,26 @@ impl LanguageSettings {
         &self,
         method: &str,
     ) -> Option<AggregationConfig> {
-        self.explicit_host_aggregation()?.remove(method)
+        // Mirrors `merge_bridge_language_configs` for ONE key without cloning
+        // the whole map: `_self` over `_`, field-merged where both name the
+        // method, and an explicit empty `_self.aggregation = {}` clearing the
+        // inherited entries. This runs per eligible request.
+        let map = self.bridge.as_ref()?;
+        let aggregation_of = |key: &str| map.get(key).and_then(|cfg| cfg.aggregation.as_ref());
+        let own_map = aggregation_of(HOST_BRIDGE_KEY);
+        let inherited_map = aggregation_of(crate::config::WILDCARD_KEY);
+        if own_map.is_some_and(HashMap::is_empty) {
+            return None;
+        }
+        let own = own_map.and_then(|agg| agg.get(method));
+        let inherited = inherited_map.and_then(|agg| agg.get(method));
+        match (inherited, own) {
+            (None, None) => None,
+            (Some(base), Some(overlay)) => Some(crate::config::merge::merge_aggregation_configs(
+                base, overlay,
+            )),
+            (base, overlay) => overlay.or(base).cloned(),
+        }
     }
 
     /// The literal method keys of the host bridge target's aggregation map
@@ -3039,6 +3058,104 @@ kind = "locals""#;
                 .explicit_host_aggregation_entry("custom/unlisted")
                 .is_some(),
             "no bridge map at all: nothing is forwardable"
+        );
+    }
+
+    #[test]
+    fn explicit_host_entry_mirrors_the_map_merge_for_one_key() {
+        let entry = |strategy: Option<AggregationStrategy>, priorities: Option<Vec<&str>>| {
+            AggregationConfig {
+                strategy,
+                priorities: priorities.map(|p| p.into_iter().map(String::from).collect()),
+                ..Default::default()
+            }
+        };
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([
+                (
+                    HOST_BRIDGE_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        aggregation: Some(HashMap::from([(
+                            "custom/both".to_string(),
+                            entry(None, Some(vec!["own"])),
+                        )])),
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: None,
+                        aggregation: Some(HashMap::from([
+                            (
+                                "custom/both".to_string(),
+                                entry(Some(AggregationStrategy::Concatenated), Some(vec!["inh"])),
+                            ),
+                            (
+                                "custom/inherited".to_string(),
+                                entry(None, Some(vec!["inh"])),
+                            ),
+                        ])),
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        let both = settings
+            .explicit_host_aggregation_entry("custom/both")
+            .unwrap();
+        assert_eq!(
+            both.priorities,
+            Some(vec!["own".to_string()]),
+            "own field wins"
+        );
+        assert_eq!(
+            both.strategy,
+            Some(AggregationStrategy::Concatenated),
+            "unset own field inherits from the bridge-key wildcard's entry"
+        );
+        assert!(
+            settings
+                .explicit_host_aggregation_entry("custom/inherited")
+                .is_some()
+        );
+        // Matches the full map merge exactly.
+        let merged = crate::config::resolve_with_wildcard(
+            settings.bridge.as_ref().unwrap(),
+            HOST_BRIDGE_KEY,
+            crate::config::merge_bridge_language_configs,
+        )
+        .and_then(|cfg| cfg.aggregation)
+        .unwrap();
+        assert_eq!(merged.get("custom/both"), Some(&both));
+
+        // An explicit empty `_self.aggregation = {}` clears inherited entries.
+        let cleared = LanguageSettings {
+            bridge: Some(HashMap::from([
+                (
+                    HOST_BRIDGE_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        aggregation: Some(HashMap::new()),
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: None,
+                        aggregation: Some(HashMap::from([(
+                            "custom/inherited".to_string(),
+                            entry(None, None),
+                        )])),
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        assert!(
+            cleared
+                .explicit_host_aggregation_entry("custom/inherited")
+                .is_none()
         );
     }
 
