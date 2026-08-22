@@ -1408,6 +1408,73 @@ mod tests {
         assert_implicit_nested_base_is_skipped("baseConfigFiles = []");
     }
 
+    #[test]
+    #[serial(xdg_env)]
+    fn implicit_base_is_read_again_on_settings_reload() {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        let base = project.path().join("base.toml");
+        std::fs::write(&base, "diagnosticsDebounceMs = 111\n").unwrap();
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = [\"base.toml\"]\n",
+        )
+        .unwrap();
+
+        let initial = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+        assert_eq!(initial.settings.unwrap().diagnostics_debounce_ms, 111);
+
+        std::fs::write(&base, "diagnosticsDebounceMs = 222\n").unwrap();
+        let reloaded = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+        assert_eq!(reloaded.settings.unwrap().diagnostics_debounce_ms, 222);
+    }
+
+    #[test]
+    fn explicit_base_replay_keeps_the_initial_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base.toml");
+        let entry = dir.path().join("entry.toml");
+        std::fs::write(&base, "diagnosticsDebounceMs = 111\n").unwrap();
+        std::fs::write(&entry, "baseConfigFiles = [\"base.toml\"]\n").unwrap();
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+        assert!(explicit.fatal_error.is_none());
+
+        std::fs::write(&base, "diagnosticsDebounceMs = 222\n").unwrap();
+        let replayed = load_settings(
+            None,
+            None,
+            None,
+            crate::config::make_env(&[]),
+            Some(explicit.for_replay()),
+        );
+
+        assert_eq!(replayed.settings.unwrap().diagnostics_debounce_ms, 111);
+        assert!(
+            replayed.events.is_empty(),
+            "replay must not pretend the retained files were loaded again"
+        );
+    }
+
     /// A `--config-file` given as a bare filename anchors to the working
     /// directory, and one with no parent at all is an error rather than a base
     /// of "nowhere" — otherwise an unanchored layer would be indistinguishable
