@@ -251,6 +251,13 @@ fn resolve_base_config_path(
             entry_path.display()
         ));
     }
+    if expanded.starts_with('~') {
+        return Err(format!(
+            "Failed to resolve baseConfigFiles entry {configured:?} in {}: ~username is not \
+             supported; use ~ for the current user or an absolute path",
+            entry_path.display()
+        ));
+    }
     let path = PathBuf::from(expanded);
     Ok(if path.has_root() || path.is_absolute() {
         path
@@ -1363,7 +1370,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             project.path().join("kakehashi.toml"),
-            "baseConfigFiles = [\"valid.toml\", \"$MISSING_KAKEHASHI_TEST_VAR/base.toml\"]\ndiagnosticsDebounceMs = 777\n",
+            "baseConfigFiles = [\"valid.toml\", \"$MISSING_KAKEHASHI_TEST_VAR/base.toml\", \"~bob/base.toml\"]\ndiagnosticsDebounceMs = 777\n",
         )
         .unwrap();
 
@@ -1397,6 +1404,15 @@ mod tests {
                     && event.message.contains("MISSING_KAKEHASHI_TEST_VAR")
             }),
             "the skipped base must remain visible: {:?}",
+            outcome.events
+        );
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::Warning
+                    && event.message.contains("~username is not supported")
+                    && event.message.contains("~bob/base.toml")
+            }),
+            "an unsupported named home must be skipped without literal rebasing: {:?}",
             outcome.events
         );
     }
@@ -2660,6 +2676,25 @@ mod tests {
             explicit.layers[0].as_ref().unwrap().auto_install,
             Some(false)
         );
+    }
+
+    #[test]
+    fn explicit_base_config_files_reject_unsupported_named_tilde() {
+        let dir = TempDir::new().unwrap();
+        let entry = dir.path().join("kakehashi.toml");
+        std::fs::write(&entry, "baseConfigFiles = [\"~bob/base.toml\"]\n").unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        let message = explicit
+            .fatal_error
+            .expect("named-home expansion is unsupported and must not be rebased literally");
+        assert!(message.contains("~username is not supported"), "{message}");
+        assert!(message.contains("~bob/base.toml"), "{message}");
     }
 
     #[test]

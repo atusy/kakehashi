@@ -233,7 +233,9 @@ Path fields support environment variable expansion and tilde (`~`) expansion, ma
 uses a separate file-loader pipeline: kakehashi expands the value first, then
 anchors the expanded result to the entry file's directory if it is relative.
 It leaves `.` and `..` for the operating system to resolve when the file is
-opened, rather than folding them lexically as setting paths do.
+opened, rather than folding them lexically as setting paths do. Named-home
+syntax such as `~alice/base.toml` is not supported; use `~` for the current
+user or give an absolute path.
 
 **Relative paths** resolve against the configuration source that supplied them, rather than against the directory the server process was launched from:
 
