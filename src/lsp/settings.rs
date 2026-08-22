@@ -1,8 +1,8 @@
 use crate::config::deprecation::DeprecatedKeysSeen;
 use crate::config::paths::anchor_settings_paths;
 use crate::config::{
-    ConfigFileSettings, RawWorkspaceSettings, WorkspaceSettings, defaults::default_settings,
-    load_user_config, merge_workspace_settings,
+    ConfigFileSettings, MAX_BASE_CONFIG_FILES_PER_ENTRY, RawWorkspaceSettings, WorkspaceSettings,
+    defaults::default_settings, load_user_config, merge_workspace_settings,
 };
 use serde_json::Value;
 use std::fs;
@@ -340,6 +340,17 @@ fn read_explicit_layers(
             continue;
         };
         let configured_bases = entry.base_config_files.as_deref().unwrap_or_default();
+        if configured_bases.len() > MAX_BASE_CONFIG_FILES_PER_ENTRY {
+            let message = format!(
+                "{} lists {} baseConfigFiles entries; at most {} are allowed per entry",
+                entry_path.display(),
+                configured_bases.len(),
+                MAX_BASE_CONFIG_FILES_PER_ENTRY
+            );
+            events.push(SettingsEvent::error(message.clone()));
+            fatal_error = Some(message);
+            break;
+        }
         let entry_base = if configured_bases.is_empty() {
             None
         } else {
@@ -711,6 +722,18 @@ fn expand_implicit_file_entry(
     deprecated_keys: &mut DeprecatedKeysSeen,
 ) -> Vec<Option<RawWorkspaceSettings>> {
     let configured_bases = entry.base_config_files.as_deref().unwrap_or_default();
+    let configured_bases = if configured_bases.len() > MAX_BASE_CONFIG_FILES_PER_ENTRY {
+        events.push(SettingsEvent::warning(format!(
+            "{} lists {} baseConfigFiles entries; at most {} are loaded per entry; skipping the \
+             remainder",
+            entry_path.display(),
+            configured_bases.len(),
+            MAX_BASE_CONFIG_FILES_PER_ENTRY
+        )));
+        &configured_bases[..MAX_BASE_CONFIG_FILES_PER_ENTRY]
+    } else {
+        configured_bases
+    };
     let entry_base = match config_file_base(entry_path) {
         Ok(base) => Some(base),
         Err(message) => {
@@ -1458,6 +1481,54 @@ mod tests {
                     && event.message.contains(&invalid.display().to_string())
             }),
             "the actual parse failure remains visible: {:?}",
+            outcome.events
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn implicit_entry_skips_base_files_beyond_the_limit() {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        std::fs::write(
+            project.path().join("base.toml"),
+            "diagnosticsDebounceMs = 777\n",
+        )
+        .unwrap();
+        let mut configured = vec!["\"base.toml\"".to_string()];
+        configured.extend((1..=64).map(|index| format!("\"missing-{index}.toml\"")));
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            format!("baseConfigFiles = [{}]\n", configured.join(", ")),
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        assert_eq!(outcome.settings.unwrap().diagnostics_debounce_ms, 777);
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::Warning
+                    && event.message.contains("65")
+                    && event.message.contains("at most 64")
+            }),
+            "overflow must produce one actionable warning: {:?}",
+            outcome.events
+        );
+        assert!(
+            outcome
+                .events
+                .iter()
+                .all(|event| !event.message.contains("missing-64.toml")),
+            "the 65th base must not be touched: {:?}",
             outcome.events
         );
     }
@@ -2558,6 +2629,34 @@ mod tests {
         assert!(
             !message.contains("MISSING_KAKEHASHI_TEST_VAR"),
             "a later path error must not mask the first base failure: {message}"
+        );
+    }
+
+    #[test]
+    fn explicit_entry_rejects_too_many_base_files() {
+        let dir = TempDir::new().unwrap();
+        let entry = dir.path().join("entry.toml");
+        let configured = std::iter::repeat_n("\"missing.toml\"", 65)
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(&entry, format!("baseConfigFiles = [{configured}]\n")).unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        let message = explicit.fatal_error.expect("the list exceeds its bound");
+        assert!(message.contains("65"), "{message}");
+        assert!(message.contains("at most 64"), "{message}");
+        assert!(
+            explicit
+                .events
+                .iter()
+                .all(|event| !event.message.contains("Config file not found")),
+            "the invalid entry must fail before reading any base: {:?}",
+            explicit.events
         );
     }
 

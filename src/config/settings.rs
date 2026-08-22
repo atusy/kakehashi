@@ -801,6 +801,11 @@ pub struct RawWorkspaceSettings {
 ///
 /// Live LSP settings deserialize as [`RawWorkspaceSettings`] directly, so
 /// clients cannot use `baseConfigFiles` to make the server read local files.
+///
+/// At 8 MiB per file, 64 bases cap one entry's retained explicit input at
+/// 512 MiB while leaving ample room for ordinary hand-written composition.
+pub(crate) const MAX_BASE_CONFIG_FILES_PER_ENTRY: usize = 64;
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConfigFileSettings {
@@ -811,6 +816,7 @@ pub(crate) struct ConfigFileSettings {
     // `default` alone would emit; this input-only envelope is never serialized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<String>")]
+    #[schemars(length(max = MAX_BASE_CONFIG_FILES_PER_ENTRY))]
     pub(crate) base_config_files: Option<Vec<String>>,
     #[serde(flatten)]
     pub(crate) settings: RawWorkspaceSettings,
@@ -1348,6 +1354,7 @@ mod tests {
         assert!(!field.is_null(), "file schema must expose baseConfigFiles");
         assert_eq!(field["type"], "array");
         assert_eq!(field["items"]["type"], "string");
+        assert_eq!(field["maxItems"], 64);
         assert!(
             field.get("default").is_none(),
             "an optional array must not advertise null as a schema-invalid default: {field}"
