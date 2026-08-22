@@ -249,28 +249,38 @@ fn resolve_base_config_paths(
     base_config_files
         .iter()
         .map(|configured| {
-            let expanded =
-                crate::config::expand::expand_path(configured, home, &env_fn).map_err(|error| {
-                    format!(
-                        "Failed to expand baseConfigFiles entry in {}: {error}",
-                        entry_path.display()
-                    )
-                })?;
-            if crate::config::paths::is_drive_relative(&expanded) {
-                return Err(format!(
-                    "Failed to resolve baseConfigFiles entry {configured:?} in {}: path names a \
-                     drive but no root; give the path in full",
-                    entry_path.display()
-                ));
-            }
-            let path = PathBuf::from(expanded);
-            Ok(if path.has_root() || path.is_absolute() {
-                path
-            } else {
-                entry_base.join(path)
-            })
+            resolve_base_config_path(entry_path, &entry_base, configured, home, &env_fn)
         })
         .collect()
+}
+
+fn resolve_base_config_path(
+    entry_path: &Path,
+    entry_base: &Path,
+    configured: &str,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> Result<PathBuf, String> {
+    let expanded =
+        crate::config::expand::expand_path(configured, home, env_fn).map_err(|error| {
+            format!(
+                "Failed to expand baseConfigFiles entry in {}: {error}",
+                entry_path.display()
+            )
+        })?;
+    if crate::config::paths::is_drive_relative(&expanded) {
+        return Err(format!(
+            "Failed to resolve baseConfigFiles entry {configured:?} in {}: path names a drive \
+             but no root; give the path in full",
+            entry_path.display()
+        ));
+    }
+    let path = PathBuf::from(expanded);
+    Ok(if path.has_root() || path.is_absolute() {
+        path
+    } else {
+        entry_base.join(path)
+    })
 }
 
 fn validate_and_anchor_explicit_layer(
@@ -708,20 +718,32 @@ fn expand_implicit_file_entry(
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
 ) -> Vec<Option<RawWorkspaceSettings>> {
-    let base_paths = match resolve_base_config_paths(
-        entry_path,
-        entry.base_config_files.as_deref().unwrap_or_default(),
-        home,
-        &env_fn,
-    ) {
-        Ok(paths) => paths,
+    let configured_bases = entry.base_config_files.as_deref().unwrap_or_default();
+    let entry_base = match config_file_base(entry_path) {
+        Ok(base) => Some(base),
         Err(message) => {
-            events.push(SettingsEvent::warning(message));
-            Vec::new()
+            if !configured_bases.is_empty() {
+                events.push(SettingsEvent::warning(format!(
+                    "Failed to resolve the directory of {}: {message}",
+                    entry_path.display()
+                )));
+            }
+            None
         }
     };
-    let mut layers = Vec::with_capacity(base_paths.len() + 1);
-    for base_path in base_paths {
+    let mut layers = Vec::with_capacity(configured_bases.len() + 1);
+    for configured in configured_bases {
+        let Some(entry_base) = entry_base.as_deref() else {
+            break;
+        };
+        let base_path =
+            match resolve_base_config_path(entry_path, entry_base, configured, home, &env_fn) {
+                Ok(path) => path,
+                Err(message) => {
+                    events.push(SettingsEvent::warning(message));
+                    continue;
+                }
+            };
         let base = match load_toml_file(&base_path, events, deprecated_keys) {
             Ok(base) => base,
             Err(message) => {
@@ -1276,6 +1298,56 @@ mod tests {
                     .to_string_lossy()
                     .into_owned()
             ]
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn project_entry_skips_only_an_unexpandable_base_config_path() {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        std::fs::write(
+            project.path().join("valid.toml"),
+            "searchPaths = [\"./parsers\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = [\"valid.toml\", \"$MISSING_KAKEHASHI_TEST_VAR/base.toml\"]\ndiagnosticsDebounceMs = 777\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        let settings = outcome.settings.expect("the entry remains valid");
+        assert_eq!(settings.diagnostics_debounce_ms, 777);
+        assert_eq!(
+            settings.search_paths,
+            vec![
+                project
+                    .path()
+                    .join("parsers")
+                    .to_string_lossy()
+                    .into_owned()
+            ],
+            "an unusable optional base must not discard valid sibling bases"
+        );
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::Warning
+                    && event.message.contains("Failed to expand baseConfigFiles")
+                    && event.message.contains("MISSING_KAKEHASHI_TEST_VAR")
+            }),
+            "the skipped base must remain visible: {:?}",
+            outcome.events
         );
     }
 
