@@ -160,8 +160,7 @@ fn append_unknown_config_key_warnings(
     config_path: &Path,
     events: &mut Vec<SettingsEvent>,
 ) {
-    let mut keys = crate::config::unknown_keys::unknown_toml_workspace_setting_keys(contents);
-    keys.retain(|key| key != "baseConfigFiles");
+    let keys = crate::config::unknown_keys::unknown_toml_config_file_keys(contents);
     append_unknown_key_warnings(&keys, config_path, events);
 }
 

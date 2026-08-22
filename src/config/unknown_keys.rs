@@ -87,6 +87,12 @@ pub(crate) fn unknown_toml_workspace_setting_keys(contents: &str) -> Vec<String>
     keys
 }
 
+pub(crate) fn unknown_toml_config_file_keys(contents: &str) -> Vec<String> {
+    let mut keys = unknown_toml_workspace_setting_keys(contents);
+    keys.retain(|key| key != "baseConfigFiles");
+    keys
+}
+
 fn unknown_object_keys(path: &str, value: &Value, known_keys: &[&str]) -> Vec<String> {
     let Some(object) = value.as_object() else {
         return Vec::new();

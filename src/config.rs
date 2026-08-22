@@ -17,10 +17,9 @@ pub(crate) use merge::{
     is_server_spawnable, merge_bridge_language_configs, merge_bridge_server_configs,
     merge_layer_aggregation_configs, merge_workspace_settings, resolve_with_wildcard,
 };
-pub(crate) use settings::{CaptureMappings, DEFAULT_DEBOUNCE_MS};
+pub(crate) use settings::{CaptureMappings, ConfigFileSettings, DEFAULT_DEBOUNCE_MS};
 // Raw and effective settings share this type, so converting between them no
 // longer names it; only the tests that build fixtures do.
-pub(crate) use settings::ConfigFileSettings;
 #[cfg(test)]
 pub(crate) use settings::QueryTypeMappings;
 pub use settings::{LanguageSettings, RawWorkspaceSettings, WorkspaceSettings, json_schema};

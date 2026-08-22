@@ -157,9 +157,7 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
     };
 
     let deprecated_keys = crate::config::deprecation::toml_deprecated_keys(&contents);
-    let mut unknown_keys =
-        crate::config::unknown_keys::unknown_toml_workspace_setting_keys(&contents);
-    unknown_keys.retain(|key| key != "baseConfigFiles");
+    let unknown_keys = crate::config::unknown_keys::unknown_toml_config_file_keys(&contents);
     let document = toml::from_str::<ConfigFileSettings>(&contents).map_err(|e| {
         UserConfigError::ParseError {
             path: path.clone(),
