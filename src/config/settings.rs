@@ -807,7 +807,8 @@ pub(crate) struct ConfigFileSettings {
     /// Lower-precedence TOML files loaded before this directly selected entry.
     /// A base file cannot declare further base files.
     #[serde(default)]
-    pub(crate) base_config_files: Vec<String>,
+    #[schemars(with = "Vec<String>")]
+    pub(crate) base_config_files: Option<Vec<String>>,
     #[serde(flatten)]
     pub(crate) settings: RawWorkspaceSettings,
 }
@@ -1344,6 +1345,12 @@ mod tests {
         assert!(!field.is_null(), "file schema must expose baseConfigFiles");
         assert_eq!(field["type"], "array");
         assert_eq!(field["items"]["type"], "string");
+        assert!(
+            value["required"]
+                .as_array()
+                .is_none_or(|required| !required.iter().any(|key| key == "baseConfigFiles")),
+            "baseConfigFiles is optional on entry files"
+        );
     }
 
     #[test]

@@ -354,15 +354,19 @@ fn read_explicit_layers(
             layers.push(None);
             continue;
         };
-        let base_paths =
-            match resolve_base_config_paths(entry_path, &entry.base_config_files, home, &env_fn) {
-                Ok(paths) => paths,
-                Err(message) => {
-                    events.push(SettingsEvent::error(message.clone()));
-                    fatal_error = Some(message);
-                    break;
-                }
-            };
+        let base_paths = match resolve_base_config_paths(
+            entry_path,
+            entry.base_config_files.as_deref().unwrap_or_default(),
+            home,
+            &env_fn,
+        ) {
+            Ok(paths) => paths,
+            Err(message) => {
+                events.push(SettingsEvent::error(message.clone()));
+                fatal_error = Some(message);
+                break;
+            }
+        };
 
         for base_path in base_paths {
             let base = match load_toml_file(&base_path, &mut events, &mut deprecated_keys) {
@@ -374,7 +378,7 @@ fn read_explicit_layers(
                 }
             };
             if let Some(base) = base.as_ref()
-                && !base.base_config_files.is_empty()
+                && base.base_config_files.is_some()
             {
                 let message = format!(
                     "baseConfigFiles is only allowed in an entry config file; {} was included \
@@ -705,14 +709,18 @@ fn expand_implicit_file_entry(
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
 ) -> Vec<Option<RawWorkspaceSettings>> {
-    let base_paths =
-        match resolve_base_config_paths(entry_path, &entry.base_config_files, home, &env_fn) {
-            Ok(paths) => paths,
-            Err(message) => {
-                events.push(SettingsEvent::warning(message));
-                Vec::new()
-            }
-        };
+    let base_paths = match resolve_base_config_paths(
+        entry_path,
+        entry.base_config_files.as_deref().unwrap_or_default(),
+        home,
+        &env_fn,
+    ) {
+        Ok(paths) => paths,
+        Err(message) => {
+            events.push(SettingsEvent::warning(message));
+            Vec::new()
+        }
+    };
     let mut layers = Vec::with_capacity(base_paths.len() + 1);
     for base_path in base_paths {
         let base = match load_toml_file(&base_path, events, deprecated_keys) {
@@ -726,7 +734,7 @@ fn expand_implicit_file_entry(
             layers.push(None);
             continue;
         };
-        if !base.base_config_files.is_empty() {
+        if base.base_config_files.is_some() {
             events.push(SettingsEvent::warning(format!(
                 "baseConfigFiles is only allowed in an entry config file; {} was included from {}",
                 base_path.display(),
@@ -2149,6 +2157,26 @@ mod tests {
         assert!(message.contains("baseConfigFiles"), "{message}");
         assert!(message.contains(&base.display().to_string()), "{message}");
         assert!(message.contains(&entry.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn explicit_base_config_file_cannot_declare_an_empty_base_list() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base.toml");
+        let entry = dir.path().join("kakehashi.toml");
+        std::fs::write(&base, "baseConfigFiles = []\n").unwrap();
+        std::fs::write(&entry, "baseConfigFiles = [\"base.toml\"]\n").unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        assert!(
+            explicit.fatal_error.is_some(),
+            "declaring the field is forbidden in a base file, even when it is empty"
+        );
     }
 
     #[test]

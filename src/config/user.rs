@@ -68,7 +68,7 @@ impl std::error::Error for UserConfigError {
 #[derive(Debug)]
 pub(crate) struct UserConfig {
     pub(crate) settings: RawWorkspaceSettings,
-    pub(crate) base_config_files: Vec<String>,
+    pub(crate) base_config_files: Option<Vec<String>>,
     pub(crate) deprecated_keys: crate::config::deprecation::DeprecatedKeysSeen,
     /// Unknown keys detected from the same bytes used to parse `settings`.
     pub(crate) unknown_keys: Vec<String>,
