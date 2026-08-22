@@ -1527,6 +1527,14 @@ mod tests {
             outcome
                 .events
                 .iter()
+                .any(|event| event.message.contains("missing-63.toml")),
+            "the 64th base must still be attempted: {:?}",
+            outcome.events
+        );
+        assert!(
+            outcome
+                .events
+                .iter()
                 .all(|event| !event.message.contains("missing-64.toml")),
             "the 65th base must not be touched: {:?}",
             outcome.events
@@ -2657,6 +2665,39 @@ mod tests {
                 .all(|event| !event.message.contains("Config file not found")),
             "the invalid entry must fail before reading any base: {:?}",
             explicit.events
+        );
+    }
+
+    #[test]
+    fn explicit_entry_accepts_exactly_the_base_file_limit() {
+        let dir = TempDir::new().unwrap();
+        let entry = dir.path().join("entry.toml");
+        let configured = std::iter::repeat_n("\"missing.toml\"", 64)
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            &entry,
+            format!("baseConfigFiles = [{configured}]\ndiagnosticsDebounceMs = 777\n"),
+        )
+        .unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        assert!(explicit.fatal_error.is_none(), "{:?}", explicit.fatal_error);
+        assert_eq!(explicit.layers.len(), 65, "64 bases followed by the entry");
+        assert_eq!(
+            explicit
+                .layers
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .diagnostics_debounce_ms,
+            Some(777)
         );
     }
 
