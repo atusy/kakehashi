@@ -315,8 +315,10 @@ The top-level spelling is accepted through v1 and removed in v2.
 
 ### File Loading Behavior
 
-Strictness follows *how the path was chosen*, not what went wrong with it. A
-path the user typed carries intent; a path kakehashi went looking for does not.
+Strictness is owned by the directly selected entry. A `--config-file` entry and
+the base files it names are strict; an implicitly discovered user or project
+entry and its base files are tolerant. The spelling of a base path does not
+change that policy.
 
 1. **Implicitly discovered files degrade quietly**
    - User config doesn't exist: proceed with empty user config
