@@ -1,10 +1,9 @@
 use crate::config::deprecation::DeprecatedKeysSeen;
 use crate::config::paths::anchor_settings_paths;
 use crate::config::{
-    RawWorkspaceSettings, WorkspaceSettings, defaults::default_settings, load_user_config,
-    merge_workspace_settings,
+    ConfigFileSettings, RawWorkspaceSettings, WorkspaceSettings, defaults::default_settings,
+    load_user_config, merge_workspace_settings,
 };
-use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -108,21 +107,6 @@ fn fold_layers(
 /// endless source — `/dev/zero`, most obviously — would allocate until the
 /// process died rather than reporting a bad path.
 const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
-
-/// A file-backed configuration entry.
-///
-/// `baseConfigFiles` belongs to the file loader, not to live workspace
-/// settings. Keeping it outside [`RawWorkspaceSettings`] prevents clients from
-/// trying to add filesystem layers through `initializationOptions` or
-/// `workspace/didChangeConfiguration`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ConfigFileDocument {
-    #[serde(default)]
-    base_config_files: Vec<String>,
-    #[serde(flatten)]
-    settings: RawWorkspaceSettings,
-}
 
 /// The `--config-file` inputs, read and judged exactly once.
 ///
@@ -769,7 +753,7 @@ fn load_toml_file(
     path: &Path,
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
-) -> Result<Option<ConfigFileDocument>, String> {
+) -> Result<Option<ConfigFileSettings>, String> {
     // Classify by opening, not by probing first: a separate `exists` check
     // would answer for a different moment than the open, and would have to
     // decide what "no" means without the kernel's reason for it. `NotFound` is
@@ -851,7 +835,7 @@ fn load_toml_file(
     let contents = String::from_utf8(bytes)
         .map_err(|err| format!("Failed to read {}: {}", path.display(), err))?;
     deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
-    let settings = toml::from_str::<ConfigFileDocument>(&contents)
+    let settings = toml::from_str::<ConfigFileSettings>(&contents)
         .map_err(|err| format!("Failed to parse {}: {}", path.display(), err))?;
 
     // Serde drops an unrecognised field silently, so `autoInstal = false` reads

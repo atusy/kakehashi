@@ -797,6 +797,19 @@ pub struct RawWorkspaceSettings {
     pub language_servers: Option<HashMap<String, BridgeServerConfig>>,
 }
 
+/// Settings and composition metadata accepted only from a TOML config file.
+///
+/// Live LSP settings deserialize as [`RawWorkspaceSettings`] directly, so
+/// clients cannot use `baseConfigFiles` to make the server read local files.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfigFileSettings {
+    #[serde(default)]
+    pub(crate) base_config_files: Vec<String>,
+    #[serde(flatten)]
+    pub(crate) settings: RawWorkspaceSettings,
+}
+
 pub const DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS: u64 = 100;
 pub const DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_MAX_WAIT_MS: u64 = 1000;
 pub const DEFAULT_PUBLISH_DIAGNOSTICS_DEBOUNCE_MS: u64 = 100;
