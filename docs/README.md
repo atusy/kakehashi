@@ -772,6 +772,46 @@ kakehashi --config-file /path/to/base.toml --config-file /path/to/overrides.toml
 kakehashi --config-file /path/to/empty.toml
 ```
 
+Each file selected directly — the discovered user file, the discovered project
+file, and every `--config-file` argument — is a configuration **entry**. An
+entry can prepend lower-precedence files with `baseConfigFiles`:
+
+```toml
+# kakehashi.toml
+baseConfigFiles = [
+  "$HOME/.config/kakehashi/languages.toml",
+  "$HOME/.config/kakehashi/servers.toml",
+]
+
+# Settings in this file override both base files.
+diagnosticsDebounceMs = 250
+```
+
+This entry is merged as if the base files had appeared immediately before it:
+
+```bash
+kakehashi \
+  --config-file "$HOME/.config/kakehashi/languages.toml" \
+  --config-file "$HOME/.config/kakehashi/servers.toml" \
+  --config-file ./kakehashi.toml
+```
+
+The comparison describes the local layer order. Implicit discovery still
+loads both ordinary entries, so the complete order is programmed defaults →
+user base files → user file → project base files → project file → client
+settings. `baseConfigFiles` values expand `$VAR`, `${VAR}`, and `~`; a relative
+value resolves against the entry file's directory. Each base file's own
+relative setting paths resolve against that base file's directory.
+
+Composition is intentionally one level deep: a base file cannot contain
+`baseConfigFiles`. For an explicit `--config-file` entry that mistake rejects
+startup; for an implicitly discovered user or project entry it is warned about
+and that base file is skipped, following the owning entry's existing strict or
+tolerant loading policy. A missing base file is an optional layer and is
+skipped with a warning. Files are re-read only when their entry normally is:
+an explicit stack is retained for the session, while implicit user/project
+entries and their bases are reloaded after a workspace-root change.
+
 When `--config-file` is specified:
 - Default user config (`~/.config/kakehashi/kakehashi.toml`) is **skipped**
 - Default project config (`./kakehashi.toml`) is **skipped**

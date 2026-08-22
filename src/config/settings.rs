@@ -804,6 +804,8 @@ pub struct RawWorkspaceSettings {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConfigFileSettings {
+    /// Lower-precedence TOML files loaded before this directly selected entry.
+    /// A base file cannot declare further base files.
     #[serde(default)]
     pub(crate) base_config_files: Vec<String>,
     #[serde(flatten)]
