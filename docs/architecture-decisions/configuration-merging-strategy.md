@@ -458,8 +458,6 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 
 ## Implementation Phases
 
-**Overall Progress**: Phases 1-3 completed. Core configuration loading infrastructure is in place. Remaining work: CLI options and end-to-end testing.
-
 ### Phase 1: Query Configuration Schema (Completed - Sprint 118, PBI-151)
 - [x] Add `QueryItem` struct with `path` (required) and `kind` (optional) fields
 - [x] Add `queries: Option<Vec<QueryItem>>` field to `LanguageSettings`
