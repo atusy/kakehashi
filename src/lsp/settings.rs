@@ -175,12 +175,9 @@ fn append_unknown_config_key_warnings(
     contents: &str,
     config_path: &Path,
     events: &mut Vec<SettingsEvent>,
-    allow_base_config_files: bool,
 ) {
     let mut keys = crate::config::unknown_keys::unknown_toml_workspace_setting_keys(contents);
-    if allow_base_config_files {
-        keys.retain(|key| key != "baseConfigFiles");
-    }
+    keys.retain(|key| key != "baseConfigFiles");
     append_unknown_key_warnings(&keys, config_path, events);
 }
 
@@ -384,7 +381,7 @@ fn read_explicit_layers(
             };
 
         for base_path in base_paths {
-            let base = match load_base_toml_file(&base_path, &mut events, &mut deprecated_keys) {
+            let base = match load_toml_file(&base_path, &mut events, &mut deprecated_keys) {
                 Ok(base) => base,
                 Err(message) => {
                     events.push(SettingsEvent::error(message.clone()));
@@ -392,6 +389,19 @@ fn read_explicit_layers(
                     break;
                 }
             };
+            if let Some(base) = base.as_ref()
+                && !base.base_config_files.is_empty()
+            {
+                let message = format!(
+                    "baseConfigFiles is only allowed in an entry config file; {} was included \
+                     from {}",
+                    base_path.display(),
+                    entry_path.display()
+                );
+                events.push(SettingsEvent::error(message.clone()));
+                fatal_error = Some(message);
+                break;
+            }
             let mut layer = base.map(|document| document.settings);
             if let Err(message) =
                 validate_and_anchor_explicit_layer(&mut layer, &base_path, home, &env_fn)
@@ -760,23 +770,6 @@ fn load_toml_file(
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
 ) -> Result<Option<ConfigFileDocument>, String> {
-    load_toml_file_impl(path, events, deprecated_keys, true)
-}
-
-fn load_base_toml_file(
-    path: &Path,
-    events: &mut Vec<SettingsEvent>,
-    deprecated_keys: &mut DeprecatedKeysSeen,
-) -> Result<Option<ConfigFileDocument>, String> {
-    load_toml_file_impl(path, events, deprecated_keys, false)
-}
-
-fn load_toml_file_impl(
-    path: &Path,
-    events: &mut Vec<SettingsEvent>,
-    deprecated_keys: &mut DeprecatedKeysSeen,
-    allow_base_config_files: bool,
-) -> Result<Option<ConfigFileDocument>, String> {
     // Classify by opening, not by probing first: a separate `exists` check
     // would answer for a different moment than the open, and would have to
     // decide what "no" means without the kernel's reason for it. `NotFound` is
@@ -866,7 +859,7 @@ fn load_toml_file_impl(
     // Warn rather than reject: a key kakehashi does not recognise may be a
     // typo, but it may equally be one this version has not learned yet, and
     // refusing to start over it would make the file version-locked.
-    append_unknown_config_key_warnings(&contents, path, events, allow_base_config_files);
+    append_unknown_config_key_warnings(&contents, path, events);
 
     events.push(SettingsEvent::info(format!(
         "Successfully loaded {}",
@@ -932,7 +925,7 @@ fn load_toml_settings(
     )));
 
     deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
-    append_unknown_config_key_warnings(&contents, &config_path, events, false);
+    append_unknown_config_key_warnings(&contents, &config_path, events);
     match toml::from_str::<RawWorkspaceSettings>(&contents) {
         Ok(settings) => {
             events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
@@ -2025,6 +2018,30 @@ mod tests {
             explicit.layers[1].as_ref().unwrap().auto_install,
             Some(true)
         );
+    }
+
+    #[test]
+    fn explicit_base_config_file_cannot_name_more_base_files() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("nested.toml");
+        let base = dir.path().join("base.toml");
+        let entry = dir.path().join("kakehashi.toml");
+        std::fs::write(&nested, "autoInstall = false\n").unwrap();
+        std::fs::write(&base, "baseConfigFiles = [\"nested.toml\"]\n").unwrap();
+        std::fs::write(&entry, "baseConfigFiles = [\"base.toml\"]\n").unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        let message = explicit
+            .fatal_error
+            .expect("baseConfigFiles in a base file must be rejected");
+        assert!(message.contains("baseConfigFiles"), "{message}");
+        assert!(message.contains(&base.display().to_string()), "{message}");
+        assert!(message.contains(&entry.display().to_string()), "{message}");
     }
 
     /// A typo is reported rather than silently read as "not specified", which
