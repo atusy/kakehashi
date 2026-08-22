@@ -107,14 +107,16 @@ not get a separate merge algorithm.
 `baseConfigFiles` is file-loader metadata, not workspace settings. It appears
 in the generated TOML schema but is not accepted as a live filesystem-loading
 directive from `initializationOptions` or
-`workspace/didChangeConfiguration`. Values use the same `$VAR`, `${VAR}`, and
-`~` expansion syntax as setting paths, then relative values anchor to the entry
-file's directory. Settings inside each base still anchor to that base file's
-own directory before the merge.
+`workspace/didChangeConfiguration`. Values use the same `$VAR`, `${VAR}`, `~`,
+and `$$` literal-dollar expansion syntax as setting paths, then relative values
+anchor to the entry file's directory. Settings inside each base still anchor
+to that base file's own directory before the merge.
 
 Base files cannot name more base files in this first version. An explicit entry
 rejects that mistake; an implicit user/project entry warns and skips the
 offending base, preserving the strictness of the source that owns the entry.
+An entry may name at most 64 bases: explicit overflow rejects the entry, while
+implicit overflow warns once and loads the first 64.
 This leaves a backward-compatible route to recursive composition later without
 requiring cycle identity, depth, or duplicate-traversal rules now.
 
