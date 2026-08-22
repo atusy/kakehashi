@@ -983,9 +983,9 @@ impl FeatureSettings {
     }
 }
 
-/// Generate JSON Schema for the workspace configuration.
+/// Generate JSON Schema for a TOML configuration file.
 pub fn json_schema() -> schemars::Schema {
-    schemars::schema_for!(RawWorkspaceSettings)
+    schemars::schema_for!(ConfigFileSettings)
 }
 
 // Domain types - used throughout the application and also exposed in JSON Schema
@@ -1332,6 +1332,16 @@ mod tests {
                 "missing $defs entry: {expected}"
             );
         }
+    }
+
+    #[test]
+    fn config_file_schema_advertises_base_config_files() {
+        let value = serde_json::to_value(json_schema()).expect("schema JSON");
+        let field = &value["properties"]["baseConfigFiles"];
+
+        assert!(!field.is_null(), "file schema must expose baseConfigFiles");
+        assert_eq!(field["type"], "array");
+        assert_eq!(field["items"]["type"], "string");
     }
 
     #[test]
