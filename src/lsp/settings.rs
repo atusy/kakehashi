@@ -124,14 +124,6 @@ struct ConfigFileDocument {
     settings: RawWorkspaceSettings,
 }
 
-impl std::ops::Deref for ConfigFileDocument {
-    type Target = RawWorkspaceSettings;
-
-    fn deref(&self) -> &Self::Target {
-        &self.settings
-    }
-}
-
 /// The `--config-file` inputs, read and judged exactly once.
 ///
 /// Read *once* is a contract, not an optimisation. A file replaced between two
@@ -1877,6 +1869,7 @@ mod tests {
         assert_eq!(
             settings
                 .expect("present file should yield a layer")
+                .settings
                 .auto_install,
             Some(false)
         );
