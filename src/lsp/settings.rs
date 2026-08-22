@@ -518,14 +518,19 @@ fn load_settings_impl(
         let mut layers =
             load_user_config_with_events(home, &env_fn, &mut events, &mut deprecated_keys);
         // Layer 3: Project config from root_path/kakehashi.toml
-        layers.push(
-            load_toml_settings(root_path, &mut events, &mut deprecated_keys).map(|mut settings| {
-                // `load_toml_settings` reads `root_path/kakehashi.toml`, so the
-                // file's directory is `root_path` itself.
-                let _ = anchor_settings_paths(&mut settings, root_path);
-                settings
-            }),
-        );
+        if let Some(project) = load_toml_settings(root_path, &mut events, &mut deprecated_keys) {
+            let entry_path = root_path
+                .expect("a loaded project config has a root")
+                .join("kakehashi.toml");
+            layers.extend(expand_implicit_file_entry(
+                project,
+                &entry_path,
+                home,
+                &env_fn,
+                &mut events,
+                &mut deprecated_keys,
+            ));
+        }
         layers
     };
 
@@ -943,7 +948,7 @@ fn load_toml_settings(
     root_path: Option<&Path>,
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
-) -> Option<RawWorkspaceSettings> {
+) -> Option<ConfigFileSettings> {
     let root = root_path?;
     let config_path = root.join("kakehashi.toml");
     let contents = read_workspace_toml_contents(&config_path, events)?;
@@ -954,7 +959,7 @@ fn load_toml_settings(
 
     deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
     append_unknown_config_key_warnings(&contents, &config_path, events);
-    match toml::from_str::<RawWorkspaceSettings>(&contents) {
+    match toml::from_str::<ConfigFileSettings>(&contents) {
         Ok(settings) => {
             events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
             Some(settings)
@@ -1219,6 +1224,51 @@ mod tests {
         assert_eq!(
             settings.search_paths,
             vec![user_dir.join("parsers").to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn project_entry_prepends_its_base_config_files_after_user_config() {
+        let config_home = TempDir::new().expect("config home");
+        write_user_config(config_home.path(), "diagnosticsDebounceMs = 250\n");
+        let project = TempDir::new().expect("project");
+        std::fs::write(
+            project.path().join("base.toml"),
+            "autoInstall = false\nsearchPaths = [\"./parsers\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = [\"base.toml\"]\nautoInstall = true\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        let settings = outcome.settings.expect("valid composed project config");
+        assert!(
+            settings.auto_install,
+            "the project entry must override its base"
+        );
+        assert_eq!(settings.diagnostics_debounce_ms, 250, "user layer survives");
+        assert_eq!(
+            settings.search_paths,
+            vec![
+                project
+                    .path()
+                    .join("parsers")
+                    .to_string_lossy()
+                    .into_owned()
+            ]
         );
     }
 
@@ -2515,7 +2565,8 @@ mod tests {
         let mut events = Vec::new();
         let mut deprecated_keys = DeprecatedKeysSeen::default();
         let settings = load_toml_settings(Some(dir.path()), &mut events, &mut deprecated_keys)
-            .expect("an unknown feature key should not reject a workspace config");
+            .expect("an unknown feature key should not reject a workspace config")
+            .settings;
 
         assert!(
             events
