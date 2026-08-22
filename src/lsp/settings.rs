@@ -381,9 +381,13 @@ fn read_explicit_layers(
                         break;
                     }
                 };
-            let base = match load_toml_file(&base_path, &mut events, &mut deprecated_keys) {
+            let mut base_events = Vec::new();
+            let mut base_deprecated_keys = DeprecatedKeysSeen::default();
+            let base = match load_toml_file(&base_path, &mut base_events, &mut base_deprecated_keys)
+            {
                 Ok(base) => base,
                 Err(message) => {
+                    events.extend(base_events);
                     events.push(SettingsEvent::error(message.clone()));
                     fatal_error = Some(message);
                     break;
@@ -410,6 +414,8 @@ fn read_explicit_layers(
                 fatal_error = Some(message);
                 break;
             }
+            events.extend(base_events);
+            deprecated_keys.merge(base_deprecated_keys);
             layers.push(layer);
         }
         if fatal_error.is_some() {
@@ -2578,7 +2584,11 @@ mod tests {
         let base = dir.path().join("base.toml");
         let entry = dir.path().join("kakehashi.toml");
         std::fs::write(&nested, "autoInstall = false\n").unwrap();
-        std::fs::write(&base, "baseConfigFiles = [\"nested.toml\"]\n").unwrap();
+        std::fs::write(
+            &base,
+            "baseConfigFiles = [\"nested.toml\"]\nautoInstall = false\nunknownTypo = true\n",
+        )
+        .unwrap();
         std::fs::write(&entry, "baseConfigFiles = [\"base.toml\"]\n").unwrap();
 
         let explicit = read_explicit_layers(
@@ -2593,6 +2603,19 @@ mod tests {
         assert!(message.contains("baseConfigFiles"), "{message}");
         assert!(message.contains(&base.display().to_string()), "{message}");
         assert!(message.contains(&entry.display().to_string()), "{message}");
+        assert!(
+            !explicit.deprecated_keys.auto_install,
+            "a rejected base must not trigger migration notices"
+        );
+        assert!(
+            explicit.events.iter().all(|event| {
+                !event.message.contains("unknownTypo")
+                    && (!event.message.starts_with("Successfully loaded")
+                        || !event.message.contains(&base.display().to_string()))
+            }),
+            "a rejected base must not leak parse side effects: {:?}",
+            explicit.events
+        );
     }
 
     #[test]
