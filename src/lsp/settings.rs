@@ -230,30 +230,6 @@ fn config_file_base(path: &Path) -> std::io::Result<PathBuf> {
     })
 }
 
-fn resolve_base_config_paths(
-    entry_path: &Path,
-    base_config_files: &[String],
-    home: Option<&str>,
-    env_fn: impl Fn(&str) -> Option<String>,
-) -> Result<Vec<PathBuf>, String> {
-    if base_config_files.is_empty() {
-        return Ok(Vec::new());
-    }
-    let entry_base = config_file_base(entry_path).map_err(|error| {
-        format!(
-            "Failed to resolve the directory of {}: {error}",
-            entry_path.display()
-        )
-    })?;
-
-    base_config_files
-        .iter()
-        .map(|configured| {
-            resolve_base_config_path(entry_path, &entry_base, configured, home, &env_fn)
-        })
-        .collect()
-}
-
 fn resolve_base_config_path(
     entry_path: &Path,
     entry_base: &Path,
@@ -363,21 +339,37 @@ fn read_explicit_layers(
             layers.push(None);
             continue;
         };
-        let base_paths = match resolve_base_config_paths(
-            entry_path,
-            entry.base_config_files.as_deref().unwrap_or_default(),
-            home,
-            &env_fn,
-        ) {
-            Ok(paths) => paths,
-            Err(message) => {
-                events.push(SettingsEvent::error(message.clone()));
-                fatal_error = Some(message);
-                break;
+        let configured_bases = entry.base_config_files.as_deref().unwrap_or_default();
+        let entry_base = if configured_bases.is_empty() {
+            None
+        } else {
+            match config_file_base(entry_path) {
+                Ok(base) => Some(base),
+                Err(error) => {
+                    let message = format!(
+                        "Failed to resolve the directory of {}: {error}",
+                        entry_path.display()
+                    );
+                    events.push(SettingsEvent::error(message.clone()));
+                    fatal_error = Some(message);
+                    break;
+                }
             }
         };
 
-        for base_path in base_paths {
+        for configured in configured_bases {
+            let entry_base = entry_base
+                .as_deref()
+                .expect("a non-empty base list has a resolved entry directory");
+            let base_path =
+                match resolve_base_config_path(entry_path, entry_base, configured, home, &env_fn) {
+                    Ok(path) => path,
+                    Err(message) => {
+                        events.push(SettingsEvent::error(message.clone()));
+                        fatal_error = Some(message);
+                        break;
+                    }
+                };
             let base = match load_toml_file(&base_path, &mut events, &mut deprecated_keys) {
                 Ok(base) => base,
                 Err(message) => {
@@ -2307,6 +2299,36 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(values, vec![Some(101), Some(102), Some(201), Some(202)]);
+    }
+
+    #[test]
+    fn explicit_base_files_report_the_first_failure_in_listed_order() {
+        let dir = TempDir::new().unwrap();
+        let malformed = dir.path().join("malformed.toml");
+        let entry = dir.path().join("entry.toml");
+        std::fs::write(&malformed, "not valid TOML = [\n").unwrap();
+        std::fs::write(
+            &entry,
+            "baseConfigFiles = [\"malformed.toml\", \"$MISSING_KAKEHASHI_TEST_VAR/later.toml\"]\n",
+        )
+        .unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        let message = explicit.fatal_error.expect("the first base is malformed");
+        assert!(
+            message.contains(&malformed.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("Failed to parse"), "{message}");
+        assert!(
+            !message.contains("MISSING_KAKEHASHI_TEST_VAR"),
+            "a later path error must not mask the first base failure: {message}"
+        );
     }
 
     /// A typo is reported rather than silently read as "not specified", which
