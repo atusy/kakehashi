@@ -1006,10 +1006,10 @@ fn load_toml_settings(
         config_path.display()
     )));
 
-    deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
-    append_unknown_config_key_warnings(&contents, &config_path, events);
     match toml::from_str::<ConfigFileSettings>(&contents) {
         Ok(settings) => {
+            deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
+            append_unknown_config_key_warnings(&contents, &config_path, events);
             events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
             Some(settings)
         }
@@ -1479,6 +1479,46 @@ mod tests {
                 event.kind == SettingsEventKind::Warning
                     && event.message.contains("Failed to parse")
                     && event.message.contains(&invalid.display().to_string())
+            }),
+            "the actual parse failure remains visible: {:?}",
+            outcome.events
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn invalid_implicit_project_entry_does_not_leak_parse_side_effects() {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = 42\nautoInstall = false\nunknownTypo = true\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        assert!(!outcome.deprecated_keys.auto_install);
+        assert!(
+            outcome.events.iter().all(|event| {
+                !event.message.contains("Unknown configuration key")
+                    && !event.message.contains("Successfully loaded")
+            }),
+            "a discarded entry must emit only its parse failure: {:?}",
+            outcome.events
+        );
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::Warning
+                    && event.message.contains("Failed to parse kakehashi.toml")
             }),
             "the actual parse failure remains visible: {:?}",
             outcome.events
