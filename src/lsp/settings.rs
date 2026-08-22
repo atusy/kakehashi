@@ -1958,7 +1958,11 @@ mod tests {
         let config_home = TempDir::new().expect("config home");
         let files = TempDir::new().expect("config files");
         let base = files.path().join("base.toml");
-        std::fs::write(&base, "diagnosticsDebounceMs = 777\n").unwrap();
+        std::fs::write(
+            &base,
+            "diagnosticsDebounceMs = 777\nsearchPaths = [\"/must-not-load\"]\n",
+        )
+        .unwrap();
 
         let outcome = with_xdg_config_home(config_home.path(), || {
             load_settings(
@@ -1976,12 +1980,18 @@ mod tests {
             )
         });
 
+        let settings = outcome
+            .settings
+            .expect("ordinary initialization options remain valid");
         assert_eq!(
-            outcome
-                .settings
-                .expect("ordinary initialization options remain valid")
-                .diagnostics_debounce_ms,
-            333,
+            settings.diagnostics_debounce_ms, 333,
+            "ordinary live settings must still apply"
+        );
+        assert!(
+            settings
+                .search_paths
+                .iter()
+                .all(|path| path != "/must-not-load"),
             "live LSP settings must not initiate local file loading"
         );
     }
