@@ -1355,7 +1355,10 @@ mod tests {
         assert!(!field.is_null(), "file schema must expose baseConfigFiles");
         assert_eq!(field["type"], "array");
         assert_eq!(field["items"]["type"], "string");
-        assert_eq!(field["maxItems"], 64);
+        assert_eq!(
+            field["maxItems"].as_u64(),
+            Some(MAX_BASE_CONFIG_FILES_PER_ENTRY as u64)
+        );
         assert!(
             field.get("default").is_none(),
             "an optional array must not advertise null as a schema-invalid default: {field}"
