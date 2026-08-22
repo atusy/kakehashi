@@ -221,11 +221,16 @@ Path fields support environment variable expansion and tilde (`~`) expansion, ma
 - `~` — expands to the user's home directory
 - `$$` — produces a literal `$` (escape mechanism)
 
-**Supported fields:**
+**Supported settings-path fields:**
 - `searchPaths[*]`
 - `languages[*].parser`
 - `languages[*].queries[*].path`
-- `baseConfigFiles[*]` (TOML entry files only)
+
+`baseConfigFiles[*]` in a TOML entry accepts the same expansion syntax, but it
+uses a separate file-loader pipeline: kakehashi expands the value first, then
+anchors the expanded result to the entry file's directory if it is relative.
+It leaves `.` and `..` for the operating system to resolve when the file is
+opened, rather than folding them lexically as setting paths do.
 
 **Relative paths** resolve against the configuration source that supplied them, rather than against the directory the server process was launched from:
 
@@ -241,7 +246,9 @@ The **workspace root** is the first `workspaceFolders` entry, or the deprecated 
 
 The root is re-selected the same way whenever the client sends `workspace/didChangeWorkspaceFolders`, and the project `kakehashi.toml` is re-read at the new root. One rung differs there: a folder change never falls back to the working directory. Removing the last folder falls back to `rootUri`, then the deprecated `rootPath`, and otherwise leaves the session with no project layer — closing a folder must not silently adopt the configuration of whichever directory the server happens to have been launched from. A `--config-file` session keeps its config-file stack regardless, since those files are read exactly once.
 
-Resolution is two steps: a relative value is rebased onto its source directory, and then **every** value — rebased or not — goes through the variable and tilde expansion described above.
+Resolution for these setting paths is two steps: a relative value is rebased
+onto its source directory, and then **every** value — rebased or not — goes
+through the variable and tilde expansion described above.
 
 A value beginning with `/`, `~`, or `$` skips the *rebasing* step only; it already says where it lives, and it is still expanded afterwards. On Windows a rooted path is likewise not rebased, whether it names a drive (`C:\parsers`) or not (`\parsers`, which means the current drive). This covers three cases worth calling out:
 
