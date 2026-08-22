@@ -225,6 +225,7 @@ Path fields support environment variable expansion and tilde (`~`) expansion, ma
 - `searchPaths[*]`
 - `languages[*].parser`
 - `languages[*].queries[*].path`
+- `baseConfigFiles[*]` (TOML entry files only)
 
 **Relative paths** resolve against the configuration source that supplied them, rather than against the directory the server process was launched from:
 
@@ -799,9 +800,10 @@ kakehashi \
 The comparison describes the local layer order. Implicit discovery still
 loads both ordinary entries, so the complete order is programmed defaults →
 user base files → user file → project base files → project file → client
-settings. `baseConfigFiles` values expand `$VAR`, `${VAR}`, and `~`; a relative
-value resolves against the entry file's directory. Each base file's own
-relative setting paths resolve against that base file's directory.
+settings. `baseConfigFiles` values use the same expansion syntax described
+above, including `$$` for a literal dollar sign; a relative value resolves
+against the entry file's directory. Each base file's own relative setting
+paths resolve against that base file's directory.
 
 Composition is intentionally one level deep: a base file cannot contain
 `baseConfigFiles`. For an explicit `--config-file` entry that mistake rejects
