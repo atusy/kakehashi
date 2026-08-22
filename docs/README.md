@@ -874,7 +874,8 @@ When `--config-file` is specified:
 Implicitly discovered configuration is deliberately laxer. A
 `~/.config/kakehashi/kakehashi.toml` or `./kakehashi.toml` that fails to parse
 is reported as a warning and skipped, so a stray file cannot stop the server
-from starting. Only paths you name explicitly are strict.
+from starting. Only directly selected `--config-file` entries and the bases
+they name use the strict policy.
 
 ## CLI Commands
 
