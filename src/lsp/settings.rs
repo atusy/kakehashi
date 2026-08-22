@@ -858,7 +858,7 @@ fn load_toml_file(
     // the only answer that can mean the optional-overlay case; everything else
     // — a denied ancestor directory, a path that is a directory — is a file the
     // user named and cannot use.
-    let file = match fs::File::open(path) {
+    let file = match open_config_file(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             // Opening follows symlinks, so a link whose target is gone also
@@ -909,6 +909,16 @@ fn load_toml_file(
         }
     };
 
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("Failed to inspect {}: {}", path.display(), err))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "Failed to read {}: not a regular file",
+            path.display()
+        ));
+    }
+
     events.push(SettingsEvent::info(format!(
         "Loading config file: {}",
         path.display()
@@ -948,6 +958,20 @@ fn load_toml_file(
         path.display()
     )));
     Ok(Some(settings))
+}
+
+fn open_config_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        // Opening a FIFO for reading normally waits for a writer before the
+        // file type can be inspected. O_NONBLOCK makes that open immediate;
+        // regular files retain their ordinary read semantics.
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    options.open(path)
 }
 
 fn read_workspace_toml_contents(
@@ -3033,6 +3057,46 @@ mod tests {
         assert!(
             message.contains("configuration limit"),
             "size must outrank the encoding error the cutoff invented: {message}"
+        );
+    }
+
+    /// Device nodes, pipes, and sockets are not configuration files. Rejecting
+    /// them also prevents a workspace-controlled FIFO from blocking an LSP
+    /// settings reload indefinitely.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_toml_file_rejects_non_regular_files() {
+        let path = Path::new("/dev/null");
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+
+        let result = load_toml_file(path, &mut events, &mut ignored_deprecation);
+
+        let message = result.expect_err("a device node must not be parsed as a config file");
+        assert!(
+            message.contains("not a regular file") && message.contains("/dev/null"),
+            "the path and reason must be reported: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_toml_file_rejects_fifo_without_waiting_for_a_writer() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("blocking.toml");
+        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        let message = result.expect_err("a FIFO must not be read as a config file");
+        assert!(
+            message.contains("not a regular file") && message.contains(&path.display().to_string()),
+            "the path and reason must be reported: {message}"
         );
     }
 
