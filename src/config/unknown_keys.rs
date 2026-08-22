@@ -400,6 +400,20 @@ mod tests {
     }
 
     #[test]
+    fn config_file_keys_accept_base_config_files_but_still_flag_typos() {
+        assert!(unknown_toml_config_file_keys("baseConfigFiles = [\"base.toml\"]\n").is_empty());
+        assert_eq!(
+            unknown_toml_config_file_keys("baseConfigFile = \"base.toml\"\n"),
+            ["baseConfigFile"]
+        );
+        assert_eq!(
+            unknown_toml_workspace_setting_keys("baseConfigFiles = [\"base.toml\"]\n"),
+            ["baseConfigFiles"],
+            "the exemption must remain limited to file validation"
+        );
+    }
+
+    #[test]
     fn known_feature_setting_keys_match_schema_properties() {
         assert_known_keys_match_schema::<FeatureSettings>(KNOWN_FEATURE_SETTING_KEYS, &[]);
     }
