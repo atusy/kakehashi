@@ -1343,6 +1343,71 @@ mod tests {
         );
     }
 
+    fn assert_implicit_nested_base_is_skipped(nested_declaration: &str) {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        std::fs::write(
+            project.path().join("valid.toml"),
+            "diagnosticsDebounceMs = 444\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("nested.toml"),
+            format!("{nested_declaration}\ndiagnosticsDebounceMs = 555\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = [\"valid.toml\", \"nested.toml\"]\nsearchPaths = [\"./entry\"]\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        let settings = outcome.settings.expect("valid sibling and entry survive");
+        assert_eq!(
+            settings.diagnostics_debounce_ms, 444,
+            "the nested base must not override its valid sibling"
+        );
+        assert_eq!(
+            settings.search_paths,
+            vec![project.path().join("entry").to_string_lossy().into_owned()],
+            "the owning entry must still apply"
+        );
+        let nested = project.path().join("nested.toml");
+        let entry = project.path().join("kakehashi.toml");
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::Warning
+                    && event.message.contains("baseConfigFiles")
+                    && event.message.contains(&nested.display().to_string())
+                    && event.message.contains(&entry.display().to_string())
+            }),
+            "the skipped nested declaration must name both files: {:?}",
+            outcome.events
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn implicit_base_cannot_name_more_base_files() {
+        assert_implicit_nested_base_is_skipped("baseConfigFiles = [\"deeper.toml\"]");
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn implicit_base_cannot_declare_an_empty_base_list() {
+        assert_implicit_nested_base_is_skipped("baseConfigFiles = []");
+    }
+
     /// A `--config-file` given as a bare filename anchors to the working
     /// directory, and one with no parent at all is an error rather than a base
     /// of "nowhere" — otherwise an unanchored layer would be indistinguishable
