@@ -106,10 +106,13 @@ Parsers are stored in `{data_dir}/parser/` and queries in `{data_dir}/queries/`.
 
 ## Configuration
 
-Configuration is provided via LSP `initializationOptions`. All options are optional.
+Configuration can be provided through TOML entry files or LSP
+`initializationOptions`. All workspace-setting fields are optional.
 
-This section is a practical reference. For the canonical field list and types,
-see `kakehashi config schema`.
+This section is a practical reference. `kakehashi config schema` emits the
+canonical TOML entry-file field list and types; it additionally includes
+file-loader metadata such as `baseConfigFiles`, which is not accepted as a
+live LSP setting.
 
 ### Configuration Options
 
