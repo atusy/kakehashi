@@ -515,31 +515,18 @@ fn load_settings_impl(
         deprecated_keys.merge(explicit.deprecated_keys);
         explicit.layers
     } else {
-        vec![
-            // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
-            //
-            // A base that cannot be represented leaves values as written, which
-            // is the pre-#732 meaning. Deliberately not fatal here: an implicit
-            // layer's contract is to degrade rather than take the session down,
-            // and `anchor_settings_paths` warns about what it skipped. Same for
-            // a `parent()` of `None`, which the explicit layer treats as fatal —
-            // `user_config_path` always answers an absolute path ending
-            // `kakehashi/kakehashi.toml`, so the two rules cannot actually
-            // disagree about any real path.
-            load_user_config_with_events(&mut events, &mut deprecated_keys).map(
-                |(mut settings, path)| {
-                    let _ = anchor_settings_paths(&mut settings, path.parent());
-                    settings
-                },
-            ),
-            // Layer 3: Project config from root_path/kakehashi.toml
+        let mut layers =
+            load_user_config_with_events(home, &env_fn, &mut events, &mut deprecated_keys);
+        // Layer 3: Project config from root_path/kakehashi.toml
+        layers.push(
             load_toml_settings(root_path, &mut events, &mut deprecated_keys).map(|mut settings| {
                 // `load_toml_settings` reads `root_path/kakehashi.toml`, so the
                 // file's directory is `root_path` itself.
                 let _ = anchor_settings_paths(&mut settings, root_path);
                 settings
             }),
-        ]
+        );
+        layers
     };
 
     // Layers 4+: Override settings from initialization options or client configuration.
@@ -705,14 +692,61 @@ fn expand_merged_settings(
     })
 }
 
-/// Load user config and add appropriate events to the events vector.
-///
-/// Reports the file it was read from alongside the settings, so the caller can
-/// anchor the layer's relative paths to that file's directory.
-fn load_user_config_with_events(
+fn expand_implicit_file_entry(
+    entry: ConfigFileSettings,
+    entry_path: &Path,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
-) -> Option<(RawWorkspaceSettings, PathBuf)> {
+) -> Vec<Option<RawWorkspaceSettings>> {
+    let base_paths =
+        match resolve_base_config_paths(entry_path, &entry.base_config_files, home, &env_fn) {
+            Ok(paths) => paths,
+            Err(message) => {
+                events.push(SettingsEvent::warning(message));
+                Vec::new()
+            }
+        };
+    let mut layers = Vec::with_capacity(base_paths.len() + 1);
+    for base_path in base_paths {
+        let base = match load_toml_file(&base_path, events, deprecated_keys) {
+            Ok(base) => base,
+            Err(message) => {
+                events.push(SettingsEvent::warning(message));
+                continue;
+            }
+        };
+        let Some(base) = base else {
+            layers.push(None);
+            continue;
+        };
+        if !base.base_config_files.is_empty() {
+            events.push(SettingsEvent::warning(format!(
+                "baseConfigFiles is only allowed in an entry config file; {} was included from {}",
+                base_path.display(),
+                entry_path.display()
+            )));
+            continue;
+        }
+        let mut settings = base.settings;
+        let _ = anchor_settings_paths(&mut settings, base_path.parent());
+        layers.push(Some(settings));
+    }
+
+    let mut settings = entry.settings;
+    let _ = anchor_settings_paths(&mut settings, entry_path.parent());
+    layers.push(Some(settings));
+    layers
+}
+
+/// Load the user entry and expand its file-local base layers.
+fn load_user_config_with_events(
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+    events: &mut Vec<SettingsEvent>,
+    deprecated_keys: &mut DeprecatedKeysSeen,
+) -> Vec<Option<RawWorkspaceSettings>> {
     match load_user_config() {
         Ok(Some(config)) => {
             events.push(SettingsEvent::info(
@@ -720,18 +754,28 @@ fn load_user_config_with_events(
             ));
             append_unknown_key_warnings(&config.unknown_keys, &config.path, events);
             deprecated_keys.merge(config.deprecated_keys);
-            Some((config.settings, config.path))
+            expand_implicit_file_entry(
+                ConfigFileSettings {
+                    base_config_files: config.base_config_files,
+                    settings: config.settings,
+                },
+                &config.path,
+                home,
+                env_fn,
+                events,
+                deprecated_keys,
+            )
         }
         Ok(None) => {
             // No user config file exists - this is fine (zero-config experience)
-            None
+            Vec::new()
         }
         Err(err) => {
             events.push(SettingsEvent::warning(format!(
                 "Failed to load user config: {}",
                 err
             )));
-            None
+            Vec::new()
         }
     }
 }
@@ -1147,6 +1191,35 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("failed to create user config dir");
         std::fs::write(dir.join("kakehashi.toml"), contents).expect("failed to write user config");
         dir
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn user_entry_prepends_its_base_config_files() {
+        let config_home = TempDir::new().expect("config home");
+        let user_dir = write_user_config(
+            config_home.path(),
+            "baseConfigFiles = [\"base.toml\"]\nautoInstall = true\n",
+        );
+        std::fs::write(
+            user_dir.join("base.toml"),
+            "autoInstall = false\nsearchPaths = [\"./parsers\"]\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(None, None, None, crate::config::make_env(&[]), None)
+        });
+
+        let settings = outcome.settings.expect("valid composed user config");
+        assert!(
+            settings.auto_install,
+            "the user entry must override its base"
+        );
+        assert_eq!(
+            settings.search_paths,
+            vec![user_dir.join("parsers").to_string_lossy().into_owned()]
+        );
     }
 
     /// A `--config-file` given as a bare filename anchors to the working
@@ -2483,7 +2556,12 @@ mod tests {
 
         let mut events = Vec::new();
         let mut deprecated_keys = DeprecatedKeysSeen::default();
-        let loaded = load_user_config_with_events(&mut events, &mut deprecated_keys);
+        let loaded = load_user_config_with_events(
+            None,
+            crate::config::make_env(&[]),
+            &mut events,
+            &mut deprecated_keys,
+        );
 
         // SAFETY: serial(xdg_env) prevents concurrent mutation in this test module.
         unsafe {
@@ -2493,7 +2571,7 @@ mod tests {
             }
         }
 
-        let settings = loaded.expect("user config").0;
+        let settings = loaded.into_iter().flatten().next().expect("user config");
         assert!(
             events
                 .iter()
