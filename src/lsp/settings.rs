@@ -2151,6 +2151,65 @@ mod tests {
         assert!(message.contains(&entry.display().to_string()), "{message}");
     }
 
+    #[test]
+    fn explicit_base_config_files_expand_environment_paths() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base.toml");
+        let entry_dir = TempDir::new().unwrap();
+        let entry = entry_dir.path().join("kakehashi.toml");
+        std::fs::write(&base, "autoInstall = false\n").unwrap();
+        std::fs::write(&entry, "baseConfigFiles = [\"$HOME/base.toml\"]\n").unwrap();
+        let home = dir.path().to_string_lossy().into_owned();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            Some(&home),
+            crate::config::make_env(&[("HOME", &home)]),
+        );
+
+        assert!(explicit.fatal_error.is_none(), "{:?}", explicit.fatal_error);
+        assert_eq!(explicit.layers.len(), 2);
+        assert_eq!(
+            explicit.layers[0].as_ref().unwrap().auto_install,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn explicit_entries_expand_bases_in_argument_order() {
+        let dir = TempDir::new().unwrap();
+        let base_a = dir.path().join("base-a.toml");
+        let entry_a = dir.path().join("entry-a.toml");
+        let base_b = dir.path().join("base-b.toml");
+        let entry_b = dir.path().join("entry-b.toml");
+        std::fs::write(&base_a, "diagnosticsDebounceMs = 101\n").unwrap();
+        std::fs::write(
+            &entry_a,
+            "baseConfigFiles = [\"base-a.toml\"]\ndiagnosticsDebounceMs = 102\n",
+        )
+        .unwrap();
+        std::fs::write(&base_b, "diagnosticsDebounceMs = 201\n").unwrap();
+        std::fs::write(
+            &entry_b,
+            "baseConfigFiles = [\"base-b.toml\"]\ndiagnosticsDebounceMs = 202\n",
+        )
+        .unwrap();
+
+        let explicit =
+            read_explicit_layers(&[entry_a, entry_b], None, crate::config::make_env(&[]));
+
+        let values = explicit
+            .layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .as_ref()
+                    .and_then(|layer| layer.diagnostics_debounce_ms)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![Some(101), Some(102), Some(201), Some(202)]);
+    }
+
     /// A typo is reported rather than silently read as "not specified", which
     /// is what serde does with an unrecognised field. It stays a warning: an
     /// unrecognised key may be a mistake, or may be one a newer kakehashi
