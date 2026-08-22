@@ -1885,6 +1885,40 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial(xdg_env)]
+    fn initialization_options_cannot_load_base_config_files() {
+        let config_home = TempDir::new().expect("config home");
+        let files = TempDir::new().expect("config files");
+        let base = files.path().join("base.toml");
+        std::fs::write(&base, "diagnosticsDebounceMs = 777\n").unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                None,
+                Some((
+                    SettingsSource::InitializationOptions,
+                    serde_json::json!({
+                        "baseConfigFiles": [base],
+                        "diagnosticsDebounceMs": 333,
+                    }),
+                )),
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        assert_eq!(
+            outcome
+                .settings
+                .expect("ordinary initialization options remain valid")
+                .diagnostics_debounce_ms,
+            333,
+            "live LSP settings must not initiate local file loading"
+        );
+    }
+
     /// User config loading logs appropriate events.
     #[test]
     #[serial(xdg_env)]
