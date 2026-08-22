@@ -802,9 +802,9 @@ pub struct RawWorkspaceSettings {
 /// Live LSP settings deserialize as [`RawWorkspaceSettings`] directly, so
 /// clients cannot use `baseConfigFiles` to make the server read local files.
 ///
-/// At 8 MiB per file, 64 bases cap base-file input read per entry at 512 MiB
-/// (520 MiB including the entry) while leaving ample room for ordinary
-/// hand-written composition.
+/// With at most 8 MiB of accepted content per base, 64 bases cap accepted base
+/// content per entry at 512 MiB while leaving ample room for ordinary
+/// hand-written composition. Parsed allocations can be larger.
 pub(crate) const MAX_BASE_CONFIG_FILES_PER_ENTRY: usize = 64;
 
 #[derive(Debug, Deserialize, JsonSchema)]
