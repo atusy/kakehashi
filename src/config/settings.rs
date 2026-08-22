@@ -806,7 +806,10 @@ pub struct RawWorkspaceSettings {
 pub(crate) struct ConfigFileSettings {
     /// Lower-precedence TOML files loaded before this directly selected entry.
     /// A base file cannot declare further base files.
-    #[serde(default)]
+    // `with = Vec<_>` makes schemars lose Option's optionality. This serde pair
+    // restores it without advertising the schema-invalid `default: null` that
+    // `default` alone would emit; this input-only envelope is never serialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Vec<String>")]
     pub(crate) base_config_files: Option<Vec<String>>,
     #[serde(flatten)]
@@ -1345,6 +1348,10 @@ mod tests {
         assert!(!field.is_null(), "file schema must expose baseConfigFiles");
         assert_eq!(field["type"], "array");
         assert_eq!(field["items"]["type"], "string");
+        assert!(
+            field.get("default").is_none(),
+            "an optional array must not advertise null as a schema-invalid default: {field}"
+        );
         assert!(
             value["required"]
                 .as_array()
