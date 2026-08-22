@@ -4,6 +4,7 @@ use crate::config::{
     RawWorkspaceSettings, WorkspaceSettings, defaults::default_settings, load_user_config,
     merge_workspace_settings,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -108,6 +109,29 @@ fn fold_layers(
 /// process died rather than reporting a bad path.
 const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// A file-backed configuration entry.
+///
+/// `baseConfigFiles` belongs to the file loader, not to live workspace
+/// settings. Keeping it outside [`RawWorkspaceSettings`] prevents clients from
+/// trying to add filesystem layers through `initializationOptions` or
+/// `workspace/didChangeConfiguration`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigFileDocument {
+    #[serde(default)]
+    base_config_files: Vec<String>,
+    #[serde(flatten)]
+    settings: RawWorkspaceSettings,
+}
+
+impl std::ops::Deref for ConfigFileDocument {
+    type Target = RawWorkspaceSettings;
+
+    fn deref(&self) -> &Self::Target {
+        &self.settings
+    }
+}
+
 /// The `--config-file` inputs, read and judged exactly once.
 ///
 /// Read *once* is a contract, not an optimisation. A file replaced between two
@@ -159,8 +183,12 @@ fn append_unknown_config_key_warnings(
     contents: &str,
     config_path: &Path,
     events: &mut Vec<SettingsEvent>,
+    allow_base_config_files: bool,
 ) {
-    let keys = crate::config::unknown_keys::unknown_toml_workspace_setting_keys(contents);
+    let mut keys = crate::config::unknown_keys::unknown_toml_workspace_setting_keys(contents);
+    if allow_base_config_files {
+        keys.retain(|key| key != "baseConfigFiles");
+    }
     append_unknown_key_warnings(&keys, config_path, events);
 }
 
@@ -230,6 +258,93 @@ fn config_file_base(path: &Path) -> std::io::Result<PathBuf> {
     })
 }
 
+fn resolve_base_config_paths(
+    entry_path: &Path,
+    base_config_files: &[String],
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<PathBuf>, String> {
+    if base_config_files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let entry_base = config_file_base(entry_path).map_err(|error| {
+        format!(
+            "Failed to resolve the directory of {}: {error}",
+            entry_path.display()
+        )
+    })?;
+
+    base_config_files
+        .iter()
+        .map(|configured| {
+            let expanded =
+                crate::config::expand::expand_path(configured, home, &env_fn).map_err(|error| {
+                    format!(
+                        "Failed to expand baseConfigFiles entry in {}: {error}",
+                        entry_path.display()
+                    )
+                })?;
+            if crate::config::paths::is_drive_relative(&expanded) {
+                return Err(format!(
+                    "Failed to resolve baseConfigFiles entry {configured:?} in {}: path names a \
+                     drive but no root; give the path in full",
+                    entry_path.display()
+                ));
+            }
+            let path = PathBuf::from(expanded);
+            Ok(if path.has_root() || path.is_absolute() {
+                path
+            } else {
+                entry_base.join(path)
+            })
+        })
+        .collect()
+}
+
+fn validate_and_anchor_explicit_layer(
+    layer: &mut Option<RawWorkspaceSettings>,
+    path: &Path,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    let Some(raw_settings) = layer.as_mut() else {
+        return Ok(());
+    };
+
+    if let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
+        && let Some(details) = errs.path_error_summary()
+    {
+        return Err(format!(
+            "Path expansion failed in {}: {details}",
+            path.display()
+        ));
+    }
+
+    let base = config_file_base(path).map_err(|error| {
+        format!(
+            "Failed to resolve the directory of {}: {error}",
+            path.display()
+        )
+    })?;
+    let unanchored = anchor_settings_paths(raw_settings, Some(&base));
+    if unanchored.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Cannot resolve {} in {} against that file's directory, so {} would silently resolve \
+         against the working directory instead. Either the directory's name is not valid UTF-8, \
+         or the path names a drive without a root (`C:lib`); write the path in full to fix it.",
+        if unanchored.len() == 1 {
+            "a path".to_string()
+        } else {
+            format!("{} paths", unanchored.len())
+        },
+        path.display(),
+        unanchored.join(", ")
+    ))
+}
+
 /// The body of [`load_explicit_config`], taking the paths directly so it can be
 /// exercised without the process-global `--config-file` override.
 fn read_explicit_layers(
@@ -246,7 +361,7 @@ fn read_explicit_layers(
     let mut fatal_error = None;
     let mut layers = Vec::with_capacity(files.len());
 
-    for path in files {
+    for entry_path in files {
         // The verdict cannot change once a layer has failed, and reading on is
         // not free: a later path could be a FIFO that blocks forever, so an
         // already-doomed session would hang instead of reporting the failure it
@@ -254,90 +369,57 @@ fn read_explicit_layers(
         if fatal_error.is_some() {
             break;
         }
-        let mut layer = match load_toml_file(path, &mut events, &mut deprecated_keys) {
-            Ok(layer) => layer,
+        let entry = match load_toml_file(entry_path, &mut events, &mut deprecated_keys) {
+            Ok(entry) => entry,
             Err(message) => {
                 events.push(SettingsEvent::error(message.clone()));
                 fatal_error.get_or_insert(message);
-                None
+                break;
             }
         };
-        // Judging a layer in isolation also resolves its language `base`
-        // chains, so a cycle an overlay later removes is still warned about
-        // once here. Accepted: the alternative is threading a "stay quiet"
-        // flag through base resolution to silence a warning that names a
-        // real cycle in a file the user wrote.
-        //
-        // Judge each layer's *paths* on its own so a later layer cannot
-        // mask an earlier one's undefined variable: path fields are
-        // replaced wholesale by the overlay, so the merged result would
-        // never mention the mistake. Cross-field invariants are excluded
-        // here (see `ExpandErrors::path_error_summary`) — their operands
-        // merge independently, so they are only meaningful once every
-        // layer has been folded together, and `expand_merged_settings`
-        // catches them there.
-        //
-        // Judged *before* anchoring, so the value the error quotes is the one
-        // the user can find in their file. The verdict is the same either way:
-        // anchoring cannot introduce an expansion error, since it prepends an
-        // absolute base whose own `$` it escapes, and cannot remove one, since
-        // it declines to fold a value carrying a variable. So this costs
-        // nothing and reads better.
-        if let Some(raw_settings) = layer.as_ref()
-            && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
-            && let Some(details) = errs.path_error_summary()
-        {
-            let message = format!("Path expansion failed in {}: {details}", path.display());
-            events.push(SettingsEvent::error(message.clone()));
-            fatal_error.get_or_insert(message);
-        }
-        // Anchor each file's relative paths to that file's own directory, so
-        // `--config-file base.toml --config-file team/overrides.toml` reads
-        // `./queries` as relative to whichever file wrote it.
-        //
-        // Failing to anchor is fatal rather than skipped, both when the
-        // directory cannot be resolved and when it cannot be represented in a
-        // `String` path field: falling through would silently resolve that
-        // layer's paths against the working directory, which is the
-        // launch-directory dependence this anchoring exists to remove. The
-        // layers that degrade instead of failing are the implicit ones, whose
-        // contract has always been to fall back rather than abort.
-        //
-        // An unusable directory is only reported when the layer actually has
-        // something to anchor. A file naming only absolute paths does not care
-        // where it lives, and rejecting the session over it would be a failure
-        // the user cannot act on.
-        if let Some(raw_settings) = layer.as_mut() {
-            match config_file_base(path) {
-                Ok(base) => {
-                    let unanchored = anchor_settings_paths(raw_settings, Some(&base));
-                    if !unanchored.is_empty() {
-                        let message = format!(
-                            "Cannot resolve {} in {} against that file's directory, so {} would \
-                             silently resolve against the working directory instead. Either the \
-                             directory's name is not valid UTF-8, or the path names a drive \
-                             without a root (`C:lib`); write the path in full to fix it.",
-                            if unanchored.len() == 1 {
-                                "a path".to_string()
-                            } else {
-                                format!("{} paths", unanchored.len())
-                            },
-                            path.display(),
-                            unanchored.join(", ")
-                        );
-                        events.push(SettingsEvent::error(message.clone()));
-                        fatal_error.get_or_insert(message);
-                    }
-                }
-                Err(error) => {
-                    let message = format!(
-                        "Failed to resolve the directory of {}: {error}",
-                        path.display()
-                    );
+        let Some(entry) = entry else {
+            layers.push(None);
+            continue;
+        };
+        let base_paths =
+            match resolve_base_config_paths(entry_path, &entry.base_config_files, home, &env_fn) {
+                Ok(paths) => paths,
+                Err(message) => {
                     events.push(SettingsEvent::error(message.clone()));
-                    fatal_error.get_or_insert(message);
+                    fatal_error = Some(message);
+                    break;
                 }
+            };
+
+        for base_path in base_paths {
+            let base = match load_base_toml_file(&base_path, &mut events, &mut deprecated_keys) {
+                Ok(base) => base,
+                Err(message) => {
+                    events.push(SettingsEvent::error(message.clone()));
+                    fatal_error = Some(message);
+                    break;
+                }
+            };
+            let mut layer = base.map(|document| document.settings);
+            if let Err(message) =
+                validate_and_anchor_explicit_layer(&mut layer, &base_path, home, &env_fn)
+            {
+                events.push(SettingsEvent::error(message.clone()));
+                fatal_error = Some(message);
+                break;
             }
+            layers.push(layer);
+        }
+        if fatal_error.is_some() {
+            break;
+        }
+
+        let mut layer = Some(entry.settings);
+        if let Err(message) =
+            validate_and_anchor_explicit_layer(&mut layer, entry_path, home, &env_fn)
+        {
+            events.push(SettingsEvent::error(message.clone()));
+            fatal_error = Some(message);
         }
         layers.push(layer);
     }
@@ -685,7 +767,24 @@ fn load_toml_file(
     path: &Path,
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
-) -> Result<Option<RawWorkspaceSettings>, String> {
+) -> Result<Option<ConfigFileDocument>, String> {
+    load_toml_file_impl(path, events, deprecated_keys, true)
+}
+
+fn load_base_toml_file(
+    path: &Path,
+    events: &mut Vec<SettingsEvent>,
+    deprecated_keys: &mut DeprecatedKeysSeen,
+) -> Result<Option<ConfigFileDocument>, String> {
+    load_toml_file_impl(path, events, deprecated_keys, false)
+}
+
+fn load_toml_file_impl(
+    path: &Path,
+    events: &mut Vec<SettingsEvent>,
+    deprecated_keys: &mut DeprecatedKeysSeen,
+    allow_base_config_files: bool,
+) -> Result<Option<ConfigFileDocument>, String> {
     // Classify by opening, not by probing first: a separate `exists` check
     // would answer for a different moment than the open, and would have to
     // decide what "no" means without the kernel's reason for it. `NotFound` is
@@ -767,7 +866,7 @@ fn load_toml_file(
     let contents = String::from_utf8(bytes)
         .map_err(|err| format!("Failed to read {}: {}", path.display(), err))?;
     deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
-    let settings = toml::from_str::<RawWorkspaceSettings>(&contents)
+    let settings = toml::from_str::<ConfigFileDocument>(&contents)
         .map_err(|err| format!("Failed to parse {}: {}", path.display(), err))?;
 
     // Serde drops an unrecognised field silently, so `autoInstal = false` reads
@@ -775,7 +874,7 @@ fn load_toml_file(
     // Warn rather than reject: a key kakehashi does not recognise may be a
     // typo, but it may equally be one this version has not learned yet, and
     // refusing to start over it would make the file version-locked.
-    append_unknown_config_key_warnings(&contents, path, events);
+    append_unknown_config_key_warnings(&contents, path, events, allow_base_config_files);
 
     events.push(SettingsEvent::info(format!(
         "Successfully loaded {}",
@@ -841,7 +940,7 @@ fn load_toml_settings(
     )));
 
     deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
-    append_unknown_config_key_warnings(&contents, &config_path, events);
+    append_unknown_config_key_warnings(&contents, &config_path, events, false);
     match toml::from_str::<RawWorkspaceSettings>(&contents) {
         Ok(settings) => {
             events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
@@ -1901,6 +2000,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_entry_prepends_its_base_config_files() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base.toml");
+        let entry = dir.path().join("kakehashi.toml");
+        std::fs::write(&base, "autoInstall = false\n").unwrap();
+        std::fs::write(
+            &entry,
+            "baseConfigFiles = [\"base.toml\"]\nautoInstall = true\n",
+        )
+        .unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        assert!(
+            explicit.fatal_error.is_none(),
+            "the entry and its base are valid: {:?}",
+            explicit.fatal_error
+        );
+        assert_eq!(explicit.layers.len(), 2, "base then entry");
+        assert_eq!(
+            explicit.layers[0].as_ref().unwrap().auto_install,
+            Some(false)
+        );
+        assert_eq!(
+            explicit.layers[1].as_ref().unwrap().auto_install,
+            Some(true)
+        );
+    }
+
     /// A typo is reported rather than silently read as "not specified", which
     /// is what serde does with an unrecognised field. It stays a warning: an
     /// unrecognised key may be a mistake, or may be one a newer kakehashi
@@ -1949,7 +2082,8 @@ mod tests {
         let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let settings = load_toml_file(&path, &mut events, &mut ignored_deprecation)
             .expect("an unknown key should not reject an explicit config file")
-            .expect("settings");
+            .expect("settings")
+            .settings;
 
         assert!(
             events
@@ -1981,7 +2115,8 @@ mod tests {
         let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let settings = load_toml_file(&path, &mut events, &mut ignored_deprecation)
             .expect("an unknown feature key should use the common file policy")
-            .expect("settings");
+            .expect("settings")
+            .settings;
 
         assert!(
             events
