@@ -87,7 +87,7 @@ the discovered project file, or one `--config-file` argument. An entry may name
 `baseConfigFiles`, which are expanded immediately before that entry in listed
 order. Consequently the implicit order is:
 
-```
+```text
 defaults
 < user bases < user entry
 < project bases < project entry
@@ -96,7 +96,7 @@ defaults
 
 For multiple explicit arguments, each entry expands in place:
 
-```
+```text
 bases(a) < a < bases(b) < b
 ```
 
