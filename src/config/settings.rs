@@ -797,6 +797,32 @@ pub struct RawWorkspaceSettings {
     pub language_servers: Option<HashMap<String, BridgeServerConfig>>,
 }
 
+/// Settings and composition metadata accepted only from a TOML config file.
+///
+/// Live LSP settings deserialize as [`RawWorkspaceSettings`] directly, so
+/// clients cannot use `baseConfigFiles` to make the server read local files.
+///
+/// With at most 8 MiB of accepted content per base, 64 bases cap accepted base
+/// content per entry at 512 MiB while leaving ample room for ordinary
+/// hand-written composition. Parsed allocations can be larger.
+pub(crate) const MAX_BASE_CONFIG_FILES_PER_ENTRY: usize = 64;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfigFileSettings {
+    /// Lower-precedence TOML files loaded before this directly selected entry.
+    /// A base file cannot declare further base files.
+    // `with = Vec<_>` makes schemars lose Option's optionality. This serde pair
+    // restores it without advertising the schema-invalid `default: null` that
+    // `default` alone would emit; this input-only envelope is never serialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<String>")]
+    #[schemars(length(max = MAX_BASE_CONFIG_FILES_PER_ENTRY))]
+    pub(crate) base_config_files: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub(crate) settings: RawWorkspaceSettings,
+}
+
 pub const DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS: u64 = 100;
 pub const DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_MAX_WAIT_MS: u64 = 1000;
 pub const DEFAULT_PUBLISH_DIAGNOSTICS_DEBOUNCE_MS: u64 = 100;
@@ -970,9 +996,9 @@ impl FeatureSettings {
     }
 }
 
-/// Generate JSON Schema for the workspace configuration.
+/// Generate JSON Schema for a TOML configuration file.
 pub fn json_schema() -> schemars::Schema {
-    schemars::schema_for!(RawWorkspaceSettings)
+    schemars::schema_for!(ConfigFileSettings)
 }
 
 // Domain types - used throughout the application and also exposed in JSON Schema
@@ -1319,6 +1345,30 @@ mod tests {
                 "missing $defs entry: {expected}"
             );
         }
+    }
+
+    #[test]
+    fn config_file_schema_advertises_base_config_files() {
+        let value = serde_json::to_value(json_schema()).expect("schema JSON");
+        let field = &value["properties"]["baseConfigFiles"];
+
+        assert!(!field.is_null(), "file schema must expose baseConfigFiles");
+        assert_eq!(field["type"], "array");
+        assert_eq!(field["items"]["type"], "string");
+        assert_eq!(
+            field["maxItems"].as_u64(),
+            Some(MAX_BASE_CONFIG_FILES_PER_ENTRY as u64)
+        );
+        assert!(
+            field.get("default").is_none(),
+            "an optional array must not advertise null as a schema-invalid default: {field}"
+        );
+        assert!(
+            value["required"]
+                .as_array()
+                .is_none_or(|required| !required.iter().any(|key| key == "baseConfigFiles")),
+            "baseConfigFiles is optional on entry files"
+        );
     }
 
     #[test]
