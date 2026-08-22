@@ -736,7 +736,9 @@ fn expand_implicit_file_entry(
                     continue;
                 }
             };
-        let base = match load_toml_file(&base_path, events, deprecated_keys) {
+        let mut base_events = Vec::new();
+        let mut base_deprecated_keys = DeprecatedKeysSeen::default();
+        let base = match load_toml_file(&base_path, &mut base_events, &mut base_deprecated_keys) {
             Ok(base) => base,
             Err(message) => {
                 events.push(SettingsEvent::warning(message));
@@ -744,6 +746,7 @@ fn expand_implicit_file_entry(
             }
         };
         let Some(base) = base else {
+            events.extend(base_events);
             layers.push(None);
             continue;
         };
@@ -755,6 +758,8 @@ fn expand_implicit_file_entry(
             )));
             continue;
         }
+        events.extend(base_events);
+        deprecated_keys.merge(base_deprecated_keys);
         let mut settings = base.settings;
         let _ = anchor_settings_paths(&mut settings, base_path.parent());
         layers.push(Some(settings));
@@ -1353,7 +1358,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             project.path().join("nested.toml"),
-            format!("{nested_declaration}\ndiagnosticsDebounceMs = 555\n"),
+            format!("{nested_declaration}\nautoInstall = false\ndiagnosticsDebounceMs = 555\n"),
         )
         .unwrap();
         std::fs::write(
@@ -1394,6 +1399,19 @@ mod tests {
             "the skipped nested declaration must name both files: {:?}",
             outcome.events
         );
+        assert!(
+            !outcome.deprecated_keys.auto_install,
+            "a skipped base must not trigger migration notices"
+        );
+        assert!(
+            outcome.events.iter().all(|event| {
+                event.kind != SettingsEventKind::Info
+                    || !event.message.starts_with("Successfully loaded")
+                    || !event.message.contains(&nested.display().to_string())
+            }),
+            "a skipped base must not be reported as successfully loaded: {:?}",
+            outcome.events
+        );
     }
 
     #[test]
@@ -1406,6 +1424,42 @@ mod tests {
     #[serial(xdg_env)]
     fn implicit_base_cannot_declare_an_empty_base_list() {
         assert_implicit_nested_base_is_skipped("baseConfigFiles = []");
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn invalid_implicit_base_does_not_leak_deprecation_state() {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        let invalid = project.path().join("invalid.toml");
+        std::fs::write(&invalid, "baseConfigFiles = 42\nautoInstall = false\n").unwrap();
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = [\"invalid.toml\"]\ndiagnosticsDebounceMs = 777\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        assert_eq!(outcome.settings.unwrap().diagnostics_debounce_ms, 777);
+        assert!(!outcome.deprecated_keys.auto_install);
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::Warning
+                    && event.message.contains("Failed to parse")
+                    && event.message.contains(&invalid.display().to_string())
+            }),
+            "the actual parse failure remains visible: {:?}",
+            outcome.events
+        );
     }
 
     #[test]
