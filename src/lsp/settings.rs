@@ -794,10 +794,19 @@ fn expand_implicit_file_entry(
             )));
             continue;
         }
-        events.extend(base_events);
-        deprecated_keys.merge(base_deprecated_keys);
         let mut settings = base.settings;
         let _ = anchor_settings_paths(&mut settings, base_path.parent());
+        if let Err(errs) = WorkspaceSettings::try_from_settings(&settings, home, &env_fn)
+            && let Some(details) = errs.path_error_summary()
+        {
+            events.push(SettingsEvent::warning(format!(
+                "Path expansion failed in {}: {details}; skipping base file",
+                base_path.display()
+            )));
+            continue;
+        }
+        events.extend(base_events);
+        deprecated_keys.merge(base_deprecated_keys);
         layers.push(Some(settings));
     }
 
@@ -1413,6 +1422,51 @@ mod tests {
                     && event.message.contains("~bob/base.toml")
             }),
             "an unsupported named home must be skipped without literal rebasing: {:?}",
+            outcome.events
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn project_entry_skips_a_base_with_an_unexpandable_setting_path() {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        let base = project.path().join("base.toml");
+        std::fs::write(
+            &base,
+            "searchPaths = [\"$MISSING_KAKEHASHI_TEST_VAR/parsers\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = [\"base.toml\"]\ndiagnosticsDebounceMs = 777\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        assert_eq!(
+            outcome
+                .settings
+                .expect("an invalid base must not discard the owning entry")
+                .diagnostics_debounce_ms,
+            777
+        );
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::Warning
+                    && event.message.contains(&base.display().to_string())
+                    && event.message.contains("MISSING_KAKEHASHI_TEST_VAR")
+            }),
+            "the skipped base and its path error must be visible: {:?}",
             outcome.events
         );
     }
