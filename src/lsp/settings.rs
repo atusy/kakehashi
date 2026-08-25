@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 pub enum SettingsEventKind {
     Info,
     Warning,
+    /// Actionable non-fatal issue surfaced via `window/showMessage`.
+    ShowWarning,
     /// Hard error normally surfaced via `window/showMessage`.
     ///
     /// Fatal explicit-config errors instead reject initialization before
@@ -37,6 +39,13 @@ impl SettingsEvent {
     pub fn warning(message: impl Into<String>) -> Self {
         Self {
             kind: SettingsEventKind::Warning,
+            message: message.into(),
+        }
+    }
+
+    pub fn show_warning(message: impl Into<String>) -> Self {
+        Self {
+            kind: SettingsEventKind::ShowWarning,
             message: message.into(),
         }
     }
@@ -736,7 +745,7 @@ fn expand_implicit_file_entry(
 ) -> Vec<Option<RawWorkspaceSettings>> {
     let configured_bases = entry.base_config_files.as_deref().unwrap_or_default();
     let configured_bases = if configured_bases.len() > MAX_BASE_CONFIG_FILES_PER_ENTRY {
-        events.push(SettingsEvent::warning(format!(
+        events.push(SettingsEvent::show_warning(format!(
             "{} lists {} baseConfigFiles entries; at most {} are loaded per entry; skipping the \
              remainder",
             entry_path.display(),
@@ -751,7 +760,7 @@ fn expand_implicit_file_entry(
         Ok(base) => Some(base),
         Err(message) => {
             if !configured_bases.is_empty() {
-                events.push(SettingsEvent::warning(format!(
+                events.push(SettingsEvent::show_warning(format!(
                     "Failed to resolve the directory of {}: {message}",
                     entry_path.display()
                 )));
@@ -768,7 +777,7 @@ fn expand_implicit_file_entry(
             match resolve_base_config_path(entry_path, entry_base, configured, home, &env_fn) {
                 Ok(path) => path,
                 Err(message) => {
-                    events.push(SettingsEvent::warning(message));
+                    events.push(SettingsEvent::show_warning(message));
                     continue;
                 }
             };
@@ -777,7 +786,7 @@ fn expand_implicit_file_entry(
         let base = match load_toml_file(&base_path, &mut base_events, &mut base_deprecated_keys) {
             Ok(base) => base,
             Err(message) => {
-                events.push(SettingsEvent::warning(message));
+                events.push(SettingsEvent::show_warning(message));
                 continue;
             }
         };
@@ -787,7 +796,7 @@ fn expand_implicit_file_entry(
             continue;
         };
         if base.base_config_files.is_some() {
-            events.push(SettingsEvent::warning(format!(
+            events.push(SettingsEvent::show_warning(format!(
                 "baseConfigFiles is only allowed in an entry config file; {} was included from {}",
                 base_path.display(),
                 entry_path.display()
@@ -799,7 +808,7 @@ fn expand_implicit_file_entry(
         if let Err(errs) = WorkspaceSettings::try_from_settings(&settings, home, &env_fn)
             && let Some(details) = errs.path_error_summary()
         {
-            events.push(SettingsEvent::warning(format!(
+            events.push(SettingsEvent::show_warning(format!(
                 "Path expansion failed in {}: {details}; skipping base file",
                 base_path.display()
             )));
@@ -1408,7 +1417,7 @@ mod tests {
         );
         assert!(
             outcome.events.iter().any(|event| {
-                event.kind == SettingsEventKind::Warning
+                event.kind == SettingsEventKind::ShowWarning
                     && event.message.contains("Failed to expand baseConfigFiles")
                     && event.message.contains("MISSING_KAKEHASHI_TEST_VAR")
             }),
@@ -1417,7 +1426,7 @@ mod tests {
         );
         assert!(
             outcome.events.iter().any(|event| {
-                event.kind == SettingsEventKind::Warning
+                event.kind == SettingsEventKind::ShowWarning
                     && event.message.contains("~username is not supported")
                     && event.message.contains("~bob/base.toml")
             }),
@@ -1462,7 +1471,7 @@ mod tests {
         );
         assert!(
             outcome.events.iter().any(|event| {
-                event.kind == SettingsEventKind::Warning
+                event.kind == SettingsEventKind::ShowWarning
                     && event.message.contains(&base.display().to_string())
                     && event.message.contains("MISSING_KAKEHASHI_TEST_VAR")
             }),
@@ -1514,7 +1523,7 @@ mod tests {
         let entry = project.path().join("kakehashi.toml");
         assert!(
             outcome.events.iter().any(|event| {
-                event.kind == SettingsEventKind::Warning
+                event.kind == SettingsEventKind::ShowWarning
                     && event.message.contains("baseConfigFiles")
                     && event.message.contains(&nested.display().to_string())
                     && event.message.contains(&entry.display().to_string())
@@ -1576,7 +1585,7 @@ mod tests {
         assert!(!outcome.deprecated_keys.auto_install);
         assert!(
             outcome.events.iter().any(|event| {
-                event.kind == SettingsEventKind::Warning
+                event.kind == SettingsEventKind::ShowWarning
                     && event.message.contains("Failed to parse")
                     && event.message.contains(&invalid.display().to_string())
             }),
@@ -1656,7 +1665,7 @@ mod tests {
         assert_eq!(outcome.settings.unwrap().diagnostics_debounce_ms, 777);
         assert!(
             outcome.events.iter().any(|event| {
-                event.kind == SettingsEventKind::Warning
+                event.kind == SettingsEventKind::ShowWarning
                     && event.message.contains("65")
                     && event.message.contains("at most 64")
             }),
