@@ -632,6 +632,45 @@ fn test_implicit_base_path_failure_is_shown_as_a_warning() {
     assert_eq!(report.1["type"], json!(2), "report: {report:?}");
 }
 
+#[test]
+fn test_implicit_missing_base_is_shown_as_a_warning() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("missing.toml");
+    std::fs::write(
+        dir.path().join("kakehashi.toml"),
+        "baseConfigFiles = [\"missing.toml\"]\nautoInstall = false\n",
+    )
+    .unwrap();
+    let mut client = LspClient::builder()
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let initialize_id = client.send_request_async(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": format!("file://{}", dir.path().display()),
+            "capabilities": {}
+        }),
+    );
+    let (response, watched) = client.receive_response_for_id_watching_notifications(
+        initialize_id,
+        &["window/showMessage", "window/logMessage"],
+    );
+
+    assert!(response.get("result").is_some(), "initialize: {response}");
+    let report = watched
+        .iter()
+        .find(|(_, params)| {
+            params["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(&missing.display().to_string()))
+        })
+        .expect("the missing base must be reported");
+    assert_eq!(report.0, "window/showMessage", "report: {report:?}");
+    assert_eq!(report.1["type"], json!(2), "report: {report:?}");
+}
+
 /// The initialize error is the *only* client-facing report of a fatal config
 /// failure. Without this the early return in `initialize_impl` could drift back
 /// below `log_settings_events` and the user would get a `window/showMessage`

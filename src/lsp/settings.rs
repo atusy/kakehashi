@@ -409,9 +409,16 @@ fn read_explicit_layers(
                     break;
                 }
             };
-            if let Some(base) = base.as_ref()
-                && base.base_config_files.is_some()
-            {
+            let Some(base) = base else {
+                events.extend(
+                    base_events
+                        .into_iter()
+                        .map(|event| SettingsEvent::show_warning(event.message)),
+                );
+                layers.push(None);
+                continue;
+            };
+            if base.base_config_files.is_some() {
                 let message = format!(
                     "baseConfigFiles is only allowed in an entry config file; {} was included \
                      from {}",
@@ -422,7 +429,7 @@ fn read_explicit_layers(
                 fatal_error = Some(message);
                 break;
             }
-            let mut layer = base.map(|document| document.settings);
+            let mut layer = Some(base.settings);
             if let Err(message) =
                 validate_and_anchor_explicit_layer(&mut layer, &base_path, home, &env_fn)
             {
@@ -791,7 +798,11 @@ fn expand_implicit_file_entry(
             }
         };
         let Some(base) = base else {
-            events.extend(base_events);
+            events.extend(
+                base_events
+                    .into_iter()
+                    .map(|event| SettingsEvent::show_warning(event.message)),
+            );
             layers.push(None);
             continue;
         };
@@ -1413,7 +1424,7 @@ mod tests {
                     .to_string_lossy()
                     .into_owned()
             ],
-            "an unusable optional base must not discard valid sibling bases"
+            "an unusable base must not discard valid sibling bases"
         );
         assert!(
             outcome.events.iter().any(|event| {

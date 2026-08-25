@@ -823,8 +823,9 @@ startup; for an implicitly discovered user or project entry it is warned about
 and that base file is skipped, following the owning entry's existing strict or
 tolerant loading policy. An entry can name at most 64 base files; an explicit
 entry above the limit rejects startup, while an implicit entry warns and loads
-only the first 64. A missing base file is an optional layer and is skipped with
-a warning. Files are re-read only when their entry normally is:
+only the first 64. A missing base file is skipped without aborting startup, but
+the skip is surfaced as a visible warning. Files are re-read only when their
+entry normally is:
 an explicit stack is retained for the session, while implicit user/project
 entries and their bases are reloaded after a workspace-root change.
 
