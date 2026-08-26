@@ -815,7 +815,15 @@ fn expand_implicit_file_entry(
             continue;
         }
         let mut settings = base.settings;
-        let _ = anchor_settings_paths(&mut settings, base_path.parent());
+        let unanchored = anchor_settings_paths(&mut settings, base_path.parent());
+        if !unanchored.is_empty() {
+            events.push(SettingsEvent::show_warning(format!(
+                "Cannot resolve paths in {} against that file's directory: {}; skipping base file",
+                base_path.display(),
+                unanchored.join(", ")
+            )));
+            continue;
+        }
         if let Err(errs) = WorkspaceSettings::try_from_settings(&settings, home, &env_fn)
             && let Some(details) = errs.path_error_summary()
         {
@@ -1442,6 +1450,59 @@ mod tests {
                     && event.message.contains("~bob/base.toml")
             }),
             "an unsupported named home must be skipped without literal rebasing: {:?}",
+            outcome.events
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial(xdg_env)]
+    fn project_entry_skips_base_under_non_unicode_directory() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let config_home = TempDir::new().expect("config home");
+        let parent = TempDir::new().expect("project parent");
+        let project = parent.path().join(OsStr::from_bytes(b"project-\xFF"));
+        if std::fs::create_dir(&project).is_err() {
+            eprintln!(
+                "skipping: this filesystem rejects non-UTF-8 directory names, so the case under \
+                 test cannot be constructed here"
+            );
+            return;
+        }
+        let base = project.join("base.toml");
+        std::fs::write(&base, "searchPaths = [\"./parsers\"]\n").unwrap();
+        std::fs::write(
+            project.join("kakehashi.toml"),
+            "baseConfigFiles = [\"base.toml\"]\ndiagnosticsDebounceMs = 777\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(&project),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        let settings = outcome.settings.expect("the entry remains valid");
+        assert_eq!(settings.diagnostics_debounce_ms, 777);
+        assert!(
+            !settings.search_paths.iter().any(|path| path == "./parsers"),
+            "the unanchorable base must be skipped: {:?}",
+            settings.search_paths
+        );
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::ShowWarning
+                    && event.message.contains(&base.display().to_string())
+                    && event.message.contains("./parsers")
+            }),
+            "the skipped base must remain visible: {:?}",
             outcome.events
         );
     }
