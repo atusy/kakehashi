@@ -669,6 +669,15 @@ fn test_implicit_missing_base_is_shown_as_a_warning() {
         .expect("the missing base must be reported");
     assert_eq!(report.0, "window/showMessage", "report: {report:?}");
     assert_eq!(report.1["type"], json!(2), "report: {report:?}");
+    assert_eq!(
+        report.1["message"],
+        json!(format!(
+            "Base config file not found; skipping {} (referenced from {})",
+            missing.display(),
+            dir.path().join("kakehashi.toml").display()
+        )),
+        "report: {report:?}"
+    );
 }
 
 /// The initialize error is the *only* client-facing report of a fatal config

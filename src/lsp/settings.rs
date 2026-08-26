@@ -319,6 +319,14 @@ fn validate_and_anchor_explicit_layer(
     ))
 }
 
+fn missing_base_config_warning(base_path: &Path, entry_path: &Path) -> SettingsEvent {
+    SettingsEvent::show_warning(format!(
+        "Base config file not found; skipping {} (referenced from {})",
+        base_path.display(),
+        entry_path.display()
+    ))
+}
+
 /// The body of [`load_explicit_config`], taking the paths directly so it can be
 /// exercised without the process-global `--config-file` override.
 fn read_explicit_layers(
@@ -410,11 +418,7 @@ fn read_explicit_layers(
                 }
             };
             let Some(base) = base else {
-                events.extend(
-                    base_events
-                        .into_iter()
-                        .map(|event| SettingsEvent::show_warning(event.message)),
-                );
+                events.push(missing_base_config_warning(&base_path, entry_path));
                 layers.push(None);
                 continue;
             };
@@ -798,11 +802,7 @@ fn expand_implicit_file_entry(
             }
         };
         let Some(base) = base else {
-            events.extend(
-                base_events
-                    .into_iter()
-                    .map(|event| SettingsEvent::show_warning(event.message)),
-            );
+            events.push(missing_base_config_warning(&base_path, entry_path));
             layers.push(None);
             continue;
         };
