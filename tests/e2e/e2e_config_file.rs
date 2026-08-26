@@ -157,6 +157,39 @@ fn test_config_file_two_files_merge_in_order() {
     );
 }
 
+#[test]
+fn test_config_file_entry_loads_base_config_files() {
+    let dir = TempDir::new().unwrap();
+    let base = dir.path().join("base.toml");
+    let entry = dir.path().join("kakehashi.toml");
+    std::fs::write(
+        &base,
+        "autoInstall = false\nsearchPaths = [\"./parsers\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &entry,
+        "baseConfigFiles = [\"$HOME/base.toml\"]\nautoInstall = true\n",
+    )
+    .unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(entry.to_str().unwrap())
+        .env("HOME", dir.path().to_string_lossy())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+
+    assert_eq!(settings["autoInstall"], json!(true), "entry overrides base");
+    assert_eq!(
+        settings["searchPaths"],
+        json!([dir.path().join("parsers").to_string_lossy()]),
+        "the base layer keeps its own relative-path anchor"
+    );
+}
+
 /// An absent explicit config file is an optional layer, not a startup failure:
 /// layered invocations rely on the overlay being allowed to not exist, and a
 /// relative path resolves against the editor's working directory.
@@ -551,6 +584,99 @@ fn test_implicit_project_config_parse_failure_is_not_fatal() {
     assert!(
         response.get("result").is_some(),
         "a malformed implicit project config must not reject initialize: {response}"
+    );
+}
+
+#[test]
+fn test_implicit_base_path_failure_is_shown_as_a_warning() {
+    let dir = TempDir::new().unwrap();
+    let base = dir.path().join("base.toml");
+    std::fs::write(
+        &base,
+        "searchPaths = [\"$MISSING_KAKEHASHI_TEST_VAR/parsers\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("kakehashi.toml"),
+        "baseConfigFiles = [\"base.toml\"]\nautoInstall = false\n",
+    )
+    .unwrap();
+    let mut client = LspClient::builder()
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .env_remove("MISSING_KAKEHASHI_TEST_VAR")
+        .build();
+
+    let initialize_id = client.send_request_async(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": format!("file://{}", dir.path().display()),
+            "capabilities": {}
+        }),
+    );
+    let (response, watched) = client.receive_response_for_id_watching_notifications(
+        initialize_id,
+        &["window/showMessage", "window/logMessage"],
+    );
+
+    assert!(response.get("result").is_some(), "initialize: {response}");
+    let report = watched
+        .iter()
+        .find(|(_, params)| {
+            params["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("MISSING_KAKEHASHI_TEST_VAR"))
+        })
+        .expect("the skipped base must be reported");
+    assert_eq!(report.0, "window/showMessage", "report: {report:?}");
+    assert_eq!(report.1["type"], json!(2), "report: {report:?}");
+}
+
+#[test]
+fn test_implicit_missing_base_is_shown_as_a_warning() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("missing.toml");
+    std::fs::write(
+        dir.path().join("kakehashi.toml"),
+        "baseConfigFiles = [\"missing.toml\"]\nautoInstall = false\n",
+    )
+    .unwrap();
+    let mut client = LspClient::builder()
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let initialize_id = client.send_request_async(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": format!("file://{}", dir.path().display()),
+            "capabilities": {}
+        }),
+    );
+    let (response, watched) = client.receive_response_for_id_watching_notifications(
+        initialize_id,
+        &["window/showMessage", "window/logMessage"],
+    );
+
+    assert!(response.get("result").is_some(), "initialize: {response}");
+    let report = watched
+        .iter()
+        .find(|(_, params)| {
+            params["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(&missing.display().to_string()))
+        })
+        .expect("the missing base must be reported");
+    assert_eq!(report.0, "window/showMessage", "report: {report:?}");
+    assert_eq!(report.1["type"], json!(2), "report: {report:?}");
+    assert_eq!(
+        report.1["message"],
+        json!(format!(
+            "Base config file not found; skipping {} (referenced from {})",
+            missing.display(),
+            dir.path().join("kakehashi.toml").display()
+        )),
+        "report: {report:?}"
     );
 }
 

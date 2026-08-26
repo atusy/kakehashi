@@ -80,6 +80,46 @@ queries = [
    - Purpose: Per-session overrides from the editor/client configuration
    - Note: Runtime changes via `didChangeConfiguration` re-trigger the merge process
 
+### File Entry Composition
+
+Every directly selected TOML file is an **entry**: the discovered user file,
+the discovered project file, or one `--config-file` argument. An entry may name
+`baseConfigFiles`, which are expanded immediately before that entry in listed
+order. Consequently the implicit order is:
+
+```text
+defaults
+< user bases < user entry
+< project bases < project entry
+< client layers
+```
+
+For multiple explicit arguments, each entry expands in place:
+
+```text
+bases(a) < a < bases(b) < b
+```
+
+This is the same ordered layer sequence repeated `--config-file` arguments
+would produce. It deliberately reuses the existing left fold; base settings do
+not get a separate merge algorithm.
+
+`baseConfigFiles` is file-loader metadata, not workspace settings. It appears
+in the generated TOML schema but is not accepted as a live filesystem-loading
+directive from `initializationOptions` or
+`workspace/didChangeConfiguration`. Values use the same `$VAR`, `${VAR}`, `~`,
+and `$$` literal-dollar expansion syntax as setting paths, then relative values
+anchor to the entry file's directory. Settings inside each base still anchor
+to that base file's own directory before the merge.
+
+Base files cannot name more base files in this first version. An explicit entry
+rejects that mistake; an implicit user/project entry warns and skips the
+offending base, preserving the strictness of the source that owns the entry.
+An entry may name at most 64 bases: explicit overflow rejects the entry, while
+implicit overflow warns once and loads the first 64.
+This leaves a backward-compatible route to recursive composition later without
+requiring cycle identity, depth, or duplicate-traversal rules now.
+
 ### Path Anchoring Precedes the Merge
 
 Relative path fields (`searchPaths`, `languages[*].parser`,
@@ -277,8 +317,10 @@ The top-level spelling is accepted through v1 and removed in v2.
 
 ### File Loading Behavior
 
-Strictness follows *how the path was chosen*, not what went wrong with it. A
-path the user typed carries intent; a path kakehashi went looking for does not.
+Strictness is owned by the directly selected entry. A `--config-file` entry and
+the base files it names are strict; an implicitly discovered user or project
+entry and its base files are tolerant. The spelling of a base path does not
+change that policy.
 
 1. **Implicitly discovered files degrade quietly**
    - User config doesn't exist: proceed with empty user config
@@ -406,7 +448,7 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 - **Complexity increase**: Four config sources to understand and debug
 - **Arrays replace, not merge**: `queries` arrays are replaced entirely, not concatenated; overriding one query type requires repeating all
 - **No "unset" mechanism for scalars**: a later layer can override a scalar but not return it to unset. Map- and list-valued settings do have one — an explicit empty container clears the layer below (see the merge algorithm above).
-- **File I/O at startup**: Reading the config files adds latency (minimal in practice) — two implicit files, or however many `--config-file` arguments were given
+- **File I/O at startup**: Reading the config files adds latency (minimal in practice) — two implicit entries plus their base files, or however many explicit entries and base files were given
 - **Relative paths changed meaning**: a relative value in an existing config file now resolves against that file's directory rather than wherever the server happened to be launched. Intended (it is the point of the change), but it silently relocates a user config written to be per-project — most visibly a `searchPaths` entry, whose misses are logged at debug level rather than as an error
 - **Infrastructure-integration gap**: Phases 1-3 (Sprints 118-120) built infrastructure (schema, merging, user config loading) but delivered ZERO user value until Sprint 124 wired APIs into application. Lesson: infrastructure sprints must be followed by integration sprints within 1-2 sprints to realize value.
 
@@ -417,8 +459,6 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 - **Future extensibility**: Additional layers (e.g., workspace-level) could be added with same merge rules
 
 ## Implementation Phases
-
-**Overall Progress**: Phases 1-3 completed. Core configuration loading infrastructure is in place. Remaining work: CLI options and end-to-end testing.
 
 ### Phase 1: Query Configuration Schema (Completed - Sprint 118, PBI-151)
 - [x] Add `QueryItem` struct with `path` (required) and `kind` (optional) fields
@@ -449,6 +489,13 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 - [ ] Integration tests loading actual files from XDG and project paths
 - [ ] E2E Neovim tests verifying InitializationOptions override file-based config
 
+### Phase 6: File Composition (Completed)
+- [x] Let user, project, and explicit entries prepend `baseConfigFiles`
+- [x] Preserve each base file's own relative-path anchor
+- [x] Keep composition non-recursive and reject or skip nested declarations
+- [x] Advertise the file-only field in `config schema`
+- [x] Cover explicit composition through an LSP-process E2E test
+
 ## Alternatives Considered
 
 ### 1. Shallow merge for `languages` HashMap (current implementation)
@@ -465,8 +512,13 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 
 ### 3. Single config file with includes
 - Pro: Simpler loading logic
-- Con: Requires inventing include syntax; less conventional
-- Decision: Rejected; layered files are standard in the ecosystem
+- Pro: Lets an editor launch kakehashi normally without repeating a shared
+  `--config-file` list in client configuration
+- Con: Recursive includes would require cycle, depth, and duplicate-read rules
+- Decision: **Accepted as one-level `baseConfigFiles` composition** after
+  repeated `--config-file` established the layer semantics. Each directly
+  selected entry expands its bases in place and then uses the existing ordered
+  merge; base files cannot include more files.
 
 ### 4. Environment variable overrides
 - Pro: Easy CI/CD integration

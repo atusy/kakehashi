@@ -106,10 +106,13 @@ Parsers are stored in `{data_dir}/parser/` and queries in `{data_dir}/queries/`.
 
 ## Configuration
 
-Configuration is provided via LSP `initializationOptions`. All options are optional.
+Configuration can be provided through TOML entry files or LSP
+`initializationOptions`. All workspace-setting fields are optional.
 
-This section is a practical reference. For the canonical field list and types,
-see `kakehashi config schema`.
+This section is a practical reference. `kakehashi config schema` emits the
+canonical TOML entry-file field list and types; it additionally includes
+file-loader metadata such as `baseConfigFiles`, which is not accepted as a
+live LSP setting.
 
 ### Configuration Options
 
@@ -221,10 +224,18 @@ Path fields support environment variable expansion and tilde (`~`) expansion, ma
 - `~` — expands to the user's home directory
 - `$$` — produces a literal `$` (escape mechanism)
 
-**Supported fields:**
+**Supported settings-path fields:**
 - `searchPaths[*]`
 - `languages[*].parser`
 - `languages[*].queries[*].path`
+
+`baseConfigFiles[*]` in a TOML entry accepts the same expansion syntax, but it
+uses a separate file-loader pipeline: kakehashi expands the value first, then
+anchors the expanded result to the entry file's directory if it is relative.
+It leaves `.` and `..` for the operating system to resolve when the file is
+opened, rather than folding them lexically as setting paths do. Named-home
+syntax such as `~alice/base.toml` is not supported; use `~` for the current
+user or give an absolute path.
 
 **Relative paths** resolve against the configuration source that supplied them, rather than against the directory the server process was launched from:
 
@@ -240,7 +251,9 @@ The **workspace root** is the first `workspaceFolders` entry, or the deprecated 
 
 The root is re-selected the same way whenever the client sends `workspace/didChangeWorkspaceFolders`, and the project `kakehashi.toml` is re-read at the new root. One rung differs there: a folder change never falls back to the working directory. Removing the last folder falls back to `rootUri`, then the deprecated `rootPath`, and otherwise leaves the session with no project layer — closing a folder must not silently adopt the configuration of whichever directory the server happens to have been launched from. A `--config-file` session keeps its config-file stack regardless, since those files are read exactly once.
 
-Resolution is two steps: a relative value is rebased onto its source directory, and then **every** value — rebased or not — goes through the variable and tilde expansion described above.
+Resolution for these setting paths is two steps: a relative value is rebased
+onto its source directory, and then **every** value — rebased or not — goes
+through the variable and tilde expansion described above.
 
 A value beginning with `/`, `~`, or `$` skips the *rebasing* step only; it already says where it lives, and it is still expanded afterwards. On Windows a rooted path is likewise not rebased, whether it names a drive (`C:\parsers`) or not (`\parsers`, which means the current drive). This covers three cases worth calling out:
 
@@ -772,6 +785,50 @@ kakehashi --config-file /path/to/base.toml --config-file /path/to/overrides.toml
 kakehashi --config-file /path/to/empty.toml
 ```
 
+Each file selected directly — the discovered user file, the discovered project
+file, and every `--config-file` argument — is a configuration **entry**. An
+entry can prepend lower-precedence files with `baseConfigFiles`:
+
+```toml
+# kakehashi.toml
+baseConfigFiles = [
+  "$HOME/.config/kakehashi/languages.toml",
+  "$HOME/.config/kakehashi/servers.toml",
+]
+
+# Settings in this file override both base files.
+diagnosticsDebounceMs = 250
+```
+
+This entry is merged as if the base files had appeared immediately before it:
+
+```bash
+kakehashi \
+  --config-file "$HOME/.config/kakehashi/languages.toml" \
+  --config-file "$HOME/.config/kakehashi/servers.toml" \
+  --config-file ./kakehashi.toml
+```
+
+The comparison describes the local layer order. Implicit discovery still
+loads both ordinary entries, so the complete order is programmed defaults →
+user base files → user file → project base files → project file → client
+settings. `baseConfigFiles` values use the same expansion syntax described
+above, including `$$` for a literal dollar sign; a relative value resolves
+against the entry file's directory. Each base file's own relative setting
+paths resolve against that base file's directory.
+
+Composition is intentionally one level deep: a base file cannot contain
+`baseConfigFiles`. For an explicit `--config-file` entry that mistake rejects
+startup; for an implicitly discovered user or project entry it is warned about
+and that base file is skipped, following the owning entry's existing strict or
+tolerant loading policy. An entry can name at most 64 base files; an explicit
+entry above the limit rejects startup, while an implicit entry warns and loads
+only the first 64. A missing base file is skipped without aborting startup, but
+the skip is surfaced as a visible warning. Files are re-read only when their
+entry normally is:
+an explicit stack is retained for the session, while implicit user/project
+entries and their bases are reloaded after a workspace-root change.
+
 When `--config-file` is specified:
 - Default user config (`~/.config/kakehashi/kakehashi.toml`) is **skipped**
 - Default project config (`./kakehashi.toml`) is **skipped**
@@ -823,7 +880,8 @@ When `--config-file` is specified:
 Implicitly discovered configuration is deliberately laxer. A
 `~/.config/kakehashi/kakehashi.toml` or `./kakehashi.toml` that fails to parse
 is reported as a warning and skipped, so a stray file cannot stop the server
-from starting. Only paths you name explicitly are strict.
+from starting. Only directly selected `--config-file` entries and the bases
+they name use the strict policy.
 
 ## CLI Commands
 

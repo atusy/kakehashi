@@ -87,6 +87,12 @@ pub(crate) fn unknown_toml_workspace_setting_keys(contents: &str) -> Vec<String>
     keys
 }
 
+pub(crate) fn unknown_toml_config_file_keys(contents: &str) -> Vec<String> {
+    let mut keys = unknown_toml_workspace_setting_keys(contents);
+    keys.retain(|key| key != "baseConfigFiles");
+    keys
+}
+
 fn unknown_object_keys(path: &str, value: &Value, known_keys: &[&str]) -> Vec<String> {
     let Some(object) = value.as_object() else {
         return Vec::new();
@@ -390,6 +396,20 @@ mod tests {
         assert_known_keys_match_schema::<RawWorkspaceSettings>(
             KNOWN_WORKSPACE_SETTING_KEYS,
             &["autoInstall", "captureMappings"],
+        );
+    }
+
+    #[test]
+    fn config_file_keys_accept_base_config_files_but_still_flag_typos() {
+        assert!(unknown_toml_config_file_keys("baseConfigFiles = [\"base.toml\"]\n").is_empty());
+        assert_eq!(
+            unknown_toml_config_file_keys("baseConfigFile = \"base.toml\"\n"),
+            ["baseConfigFile"]
+        );
+        assert_eq!(
+            unknown_toml_workspace_setting_keys("baseConfigFiles = [\"base.toml\"]\n"),
+            ["baseConfigFiles"],
+            "the exemption must remain limited to file validation"
         );
     }
 

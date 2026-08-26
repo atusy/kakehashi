@@ -4,7 +4,7 @@
 //! User config location: $XDG_CONFIG_HOME/kakehashi/kakehashi.toml
 //! Fallback: ~/.config/kakehashi/kakehashi.toml
 
-use crate::config::RawWorkspaceSettings;
+use crate::config::{ConfigFileSettings, RawWorkspaceSettings};
 use log::warn;
 use std::path::PathBuf;
 
@@ -68,6 +68,7 @@ impl std::error::Error for UserConfigError {
 #[derive(Debug)]
 pub(crate) struct UserConfig {
     pub(crate) settings: RawWorkspaceSettings,
+    pub(crate) base_config_files: Option<Vec<String>>,
     pub(crate) deprecated_keys: crate::config::deprecation::DeprecatedKeysSeen,
     /// Unknown keys detected from the same bytes used to parse `settings`.
     pub(crate) unknown_keys: Vec<String>,
@@ -156,8 +157,8 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
     };
 
     let deprecated_keys = crate::config::deprecation::toml_deprecated_keys(&contents);
-    let unknown_keys = crate::config::unknown_keys::unknown_toml_workspace_setting_keys(&contents);
-    let settings = toml::from_str::<RawWorkspaceSettings>(&contents).map_err(|e| {
+    let unknown_keys = crate::config::unknown_keys::unknown_toml_config_file_keys(&contents);
+    let document = toml::from_str::<ConfigFileSettings>(&contents).map_err(|e| {
         UserConfigError::ParseError {
             path: path.clone(),
             source: e,
@@ -165,7 +166,8 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
     })?;
 
     Ok(Some(UserConfig {
-        settings,
+        settings: document.settings,
+        base_config_files: document.base_config_files,
         deprecated_keys,
         unknown_keys,
         path,

@@ -1,8 +1,8 @@
 use crate::config::deprecation::DeprecatedKeysSeen;
 use crate::config::paths::anchor_settings_paths;
 use crate::config::{
-    RawWorkspaceSettings, WorkspaceSettings, defaults::default_settings, load_user_config,
-    merge_workspace_settings,
+    ConfigFileSettings, MAX_BASE_CONFIG_FILES_PER_ENTRY, RawWorkspaceSettings, WorkspaceSettings,
+    defaults::default_settings, load_user_config, merge_workspace_settings,
 };
 use serde_json::Value;
 use std::fs;
@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 pub enum SettingsEventKind {
     Info,
     Warning,
+    /// Actionable non-fatal issue surfaced via `window/showMessage`.
+    ShowWarning,
     /// Hard error normally surfaced via `window/showMessage`.
     ///
     /// Fatal explicit-config errors instead reject initialization before
@@ -37,6 +39,13 @@ impl SettingsEvent {
     pub fn warning(message: impl Into<String>) -> Self {
         Self {
             kind: SettingsEventKind::Warning,
+            message: message.into(),
+        }
+    }
+
+    pub fn show_warning(message: impl Into<String>) -> Self {
+        Self {
+            kind: SettingsEventKind::ShowWarning,
             message: message.into(),
         }
     }
@@ -160,7 +169,7 @@ fn append_unknown_config_key_warnings(
     config_path: &Path,
     events: &mut Vec<SettingsEvent>,
 ) {
-    let keys = crate::config::unknown_keys::unknown_toml_workspace_setting_keys(contents);
+    let keys = crate::config::unknown_keys::unknown_toml_config_file_keys(contents);
     append_unknown_key_warnings(&keys, config_path, events);
 }
 
@@ -230,6 +239,94 @@ fn config_file_base(path: &Path) -> std::io::Result<PathBuf> {
     })
 }
 
+fn resolve_base_config_path(
+    entry_path: &Path,
+    entry_base: &Path,
+    configured: &str,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> Result<PathBuf, String> {
+    let expanded =
+        crate::config::expand::expand_path(configured, home, env_fn).map_err(|error| {
+            format!(
+                "Failed to expand baseConfigFiles entry in {}: {error}",
+                entry_path.display()
+            )
+        })?;
+    if crate::config::paths::is_drive_relative(&expanded) {
+        return Err(format!(
+            "Failed to resolve baseConfigFiles entry {configured:?} in {}: path names a drive \
+             but no root; give the path in full",
+            entry_path.display()
+        ));
+    }
+    if expanded.starts_with('~') {
+        return Err(format!(
+            "Failed to resolve baseConfigFiles entry {configured:?} in {}: ~username is not \
+             supported; use ~ for the current user or an absolute path",
+            entry_path.display()
+        ));
+    }
+    let path = PathBuf::from(expanded);
+    Ok(if path.has_root() || path.is_absolute() {
+        path
+    } else {
+        entry_base.join(path)
+    })
+}
+
+fn validate_and_anchor_explicit_layer(
+    layer: &mut Option<RawWorkspaceSettings>,
+    path: &Path,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    let Some(raw_settings) = layer.as_mut() else {
+        return Ok(());
+    };
+
+    if let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
+        && let Some(details) = errs.path_error_summary()
+    {
+        return Err(format!(
+            "Path expansion failed in {}: {details}",
+            path.display()
+        ));
+    }
+
+    let base = config_file_base(path).map_err(|error| {
+        format!(
+            "Failed to resolve the directory of {}: {error}",
+            path.display()
+        )
+    })?;
+    let unanchored = anchor_settings_paths(raw_settings, Some(&base));
+    if unanchored.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Cannot resolve {} in {} against that file's directory, so {} would silently resolve \
+         against the working directory instead. Either the directory's name is not valid UTF-8, \
+         or the path names a drive without a root (`C:lib`); write the path in full to fix it.",
+        if unanchored.len() == 1 {
+            "a path".to_string()
+        } else {
+            format!("{} paths", unanchored.len())
+        },
+        path.display(),
+        unanchored.join(", ")
+    ))
+}
+
+fn missing_base_config_warning(base_path: &Path, entry_path: &Path) -> SettingsEvent {
+    SettingsEvent::show_warning(format!(
+        "Base config file not found; skipping {} (referenced from {})",
+        base_path.display(),
+        entry_path.display()
+    ))
+}
+
 /// The body of [`load_explicit_config`], taking the paths directly so it can be
 /// exercised without the process-global `--config-file` override.
 fn read_explicit_layers(
@@ -246,7 +343,7 @@ fn read_explicit_layers(
     let mut fatal_error = None;
     let mut layers = Vec::with_capacity(files.len());
 
-    for path in files {
+    for entry_path in files {
         // The verdict cannot change once a layer has failed, and reading on is
         // not free: a later path could be a FIFO that blocks forever, so an
         // already-doomed session would hang instead of reporting the failure it
@@ -254,90 +351,110 @@ fn read_explicit_layers(
         if fatal_error.is_some() {
             break;
         }
-        let mut layer = match load_toml_file(path, &mut events, &mut deprecated_keys) {
-            Ok(layer) => layer,
+        let entry = match load_toml_file(entry_path, &mut events, &mut deprecated_keys) {
+            Ok(entry) => entry,
             Err(message) => {
                 events.push(SettingsEvent::error(message.clone()));
                 fatal_error.get_or_insert(message);
-                None
+                break;
             }
         };
-        // Judging a layer in isolation also resolves its language `base`
-        // chains, so a cycle an overlay later removes is still warned about
-        // once here. Accepted: the alternative is threading a "stay quiet"
-        // flag through base resolution to silence a warning that names a
-        // real cycle in a file the user wrote.
-        //
-        // Judge each layer's *paths* on its own so a later layer cannot
-        // mask an earlier one's undefined variable: path fields are
-        // replaced wholesale by the overlay, so the merged result would
-        // never mention the mistake. Cross-field invariants are excluded
-        // here (see `ExpandErrors::path_error_summary`) — their operands
-        // merge independently, so they are only meaningful once every
-        // layer has been folded together, and `expand_merged_settings`
-        // catches them there.
-        //
-        // Judged *before* anchoring, so the value the error quotes is the one
-        // the user can find in their file. The verdict is the same either way:
-        // anchoring cannot introduce an expansion error, since it prepends an
-        // absolute base whose own `$` it escapes, and cannot remove one, since
-        // it declines to fold a value carrying a variable. So this costs
-        // nothing and reads better.
-        if let Some(raw_settings) = layer.as_ref()
-            && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
-            && let Some(details) = errs.path_error_summary()
-        {
-            let message = format!("Path expansion failed in {}: {details}", path.display());
+        let Some(entry) = entry else {
+            layers.push(None);
+            continue;
+        };
+        let configured_bases = entry.base_config_files.as_deref().unwrap_or_default();
+        if configured_bases.len() > MAX_BASE_CONFIG_FILES_PER_ENTRY {
+            let message = format!(
+                "{} lists {} baseConfigFiles entries; at most {} are allowed per entry",
+                entry_path.display(),
+                configured_bases.len(),
+                MAX_BASE_CONFIG_FILES_PER_ENTRY
+            );
             events.push(SettingsEvent::error(message.clone()));
-            fatal_error.get_or_insert(message);
+            fatal_error = Some(message);
+            break;
         }
-        // Anchor each file's relative paths to that file's own directory, so
-        // `--config-file base.toml --config-file team/overrides.toml` reads
-        // `./queries` as relative to whichever file wrote it.
-        //
-        // Failing to anchor is fatal rather than skipped, both when the
-        // directory cannot be resolved and when it cannot be represented in a
-        // `String` path field: falling through would silently resolve that
-        // layer's paths against the working directory, which is the
-        // launch-directory dependence this anchoring exists to remove. The
-        // layers that degrade instead of failing are the implicit ones, whose
-        // contract has always been to fall back rather than abort.
-        //
-        // An unusable directory is only reported when the layer actually has
-        // something to anchor. A file naming only absolute paths does not care
-        // where it lives, and rejecting the session over it would be a failure
-        // the user cannot act on.
-        if let Some(raw_settings) = layer.as_mut() {
-            match config_file_base(path) {
-                Ok(base) => {
-                    let unanchored = anchor_settings_paths(raw_settings, Some(&base));
-                    if !unanchored.is_empty() {
-                        let message = format!(
-                            "Cannot resolve {} in {} against that file's directory, so {} would \
-                             silently resolve against the working directory instead. Either the \
-                             directory's name is not valid UTF-8, or the path names a drive \
-                             without a root (`C:lib`); write the path in full to fix it.",
-                            if unanchored.len() == 1 {
-                                "a path".to_string()
-                            } else {
-                                format!("{} paths", unanchored.len())
-                            },
-                            path.display(),
-                            unanchored.join(", ")
-                        );
-                        events.push(SettingsEvent::error(message.clone()));
-                        fatal_error.get_or_insert(message);
-                    }
-                }
+        let entry_base = if configured_bases.is_empty() {
+            None
+        } else {
+            match config_file_base(entry_path) {
+                Ok(base) => Some(base),
                 Err(error) => {
                     let message = format!(
                         "Failed to resolve the directory of {}: {error}",
-                        path.display()
+                        entry_path.display()
                     );
                     events.push(SettingsEvent::error(message.clone()));
-                    fatal_error.get_or_insert(message);
+                    fatal_error = Some(message);
+                    break;
                 }
             }
+        };
+
+        for configured in configured_bases {
+            let entry_base = entry_base
+                .as_deref()
+                .expect("a non-empty base list has a resolved entry directory");
+            let base_path =
+                match resolve_base_config_path(entry_path, entry_base, configured, home, &env_fn) {
+                    Ok(path) => path,
+                    Err(message) => {
+                        events.push(SettingsEvent::error(message.clone()));
+                        fatal_error = Some(message);
+                        break;
+                    }
+                };
+            let mut base_events = Vec::new();
+            let mut base_deprecated_keys = DeprecatedKeysSeen::default();
+            let base = match load_toml_file(&base_path, &mut base_events, &mut base_deprecated_keys)
+            {
+                Ok(base) => base,
+                Err(message) => {
+                    events.extend(base_events);
+                    events.push(SettingsEvent::error(message.clone()));
+                    fatal_error = Some(message);
+                    break;
+                }
+            };
+            let Some(base) = base else {
+                events.push(missing_base_config_warning(&base_path, entry_path));
+                layers.push(None);
+                continue;
+            };
+            if base.base_config_files.is_some() {
+                let message = format!(
+                    "baseConfigFiles is only allowed in an entry config file; {} was included \
+                     from {}",
+                    base_path.display(),
+                    entry_path.display()
+                );
+                events.push(SettingsEvent::error(message.clone()));
+                fatal_error = Some(message);
+                break;
+            }
+            let mut layer = Some(base.settings);
+            if let Err(message) =
+                validate_and_anchor_explicit_layer(&mut layer, &base_path, home, &env_fn)
+            {
+                events.push(SettingsEvent::error(message.clone()));
+                fatal_error = Some(message);
+                break;
+            }
+            events.extend(base_events);
+            deprecated_keys.merge(base_deprecated_keys);
+            layers.push(layer);
+        }
+        if fatal_error.is_some() {
+            break;
+        }
+
+        let mut layer = Some(entry.settings);
+        if let Err(message) =
+            validate_and_anchor_explicit_layer(&mut layer, entry_path, home, &env_fn)
+        {
+            events.push(SettingsEvent::error(message.clone()));
+            fatal_error = Some(message);
         }
         layers.push(layer);
     }
@@ -447,31 +564,23 @@ fn load_settings_impl(
         deprecated_keys.merge(explicit.deprecated_keys);
         explicit.layers
     } else {
-        vec![
-            // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
-            //
-            // A base that cannot be represented leaves values as written, which
-            // is the pre-#732 meaning. Deliberately not fatal here: an implicit
-            // layer's contract is to degrade rather than take the session down,
-            // and `anchor_settings_paths` warns about what it skipped. Same for
-            // a `parent()` of `None`, which the explicit layer treats as fatal —
-            // `user_config_path` always answers an absolute path ending
-            // `kakehashi/kakehashi.toml`, so the two rules cannot actually
-            // disagree about any real path.
-            load_user_config_with_events(&mut events, &mut deprecated_keys).map(
-                |(mut settings, path)| {
-                    let _ = anchor_settings_paths(&mut settings, path.parent());
-                    settings
-                },
-            ),
-            // Layer 3: Project config from root_path/kakehashi.toml
-            load_toml_settings(root_path, &mut events, &mut deprecated_keys).map(|mut settings| {
-                // `load_toml_settings` reads `root_path/kakehashi.toml`, so the
-                // file's directory is `root_path` itself.
-                let _ = anchor_settings_paths(&mut settings, root_path);
-                settings
-            }),
-        ]
+        let mut layers =
+            load_user_config_with_events(home, &env_fn, &mut events, &mut deprecated_keys);
+        // Layer 3: Project config from root_path/kakehashi.toml
+        if let Some(project) = load_toml_settings(root_path, &mut events, &mut deprecated_keys) {
+            let entry_path = root_path
+                .expect("a loaded project config has a root")
+                .join("kakehashi.toml");
+            layers.extend(expand_implicit_file_entry(
+                project,
+                &entry_path,
+                home,
+                &env_fn,
+                &mut events,
+                &mut deprecated_keys,
+            ));
+        }
+        layers
     };
 
     // Layers 4+: Override settings from initialization options or client configuration.
@@ -637,14 +746,111 @@ fn expand_merged_settings(
     })
 }
 
-/// Load user config and add appropriate events to the events vector.
-///
-/// Reports the file it was read from alongside the settings, so the caller can
-/// anchor the layer's relative paths to that file's directory.
-fn load_user_config_with_events(
+fn expand_implicit_file_entry(
+    entry: ConfigFileSettings,
+    entry_path: &Path,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
-) -> Option<(RawWorkspaceSettings, PathBuf)> {
+) -> Vec<Option<RawWorkspaceSettings>> {
+    let configured_bases = entry.base_config_files.as_deref().unwrap_or_default();
+    let configured_bases = if configured_bases.len() > MAX_BASE_CONFIG_FILES_PER_ENTRY {
+        events.push(SettingsEvent::show_warning(format!(
+            "{} lists {} baseConfigFiles entries; at most {} are loaded per entry; skipping the \
+             remainder",
+            entry_path.display(),
+            configured_bases.len(),
+            MAX_BASE_CONFIG_FILES_PER_ENTRY
+        )));
+        &configured_bases[..MAX_BASE_CONFIG_FILES_PER_ENTRY]
+    } else {
+        configured_bases
+    };
+    let entry_base = match config_file_base(entry_path) {
+        Ok(base) => Some(base),
+        Err(message) => {
+            if !configured_bases.is_empty() {
+                events.push(SettingsEvent::show_warning(format!(
+                    "Failed to resolve the directory of {}: {message}",
+                    entry_path.display()
+                )));
+            }
+            None
+        }
+    };
+    let mut layers = Vec::with_capacity(configured_bases.len() + 1);
+    for configured in configured_bases {
+        let Some(entry_base) = entry_base.as_deref() else {
+            break;
+        };
+        let base_path =
+            match resolve_base_config_path(entry_path, entry_base, configured, home, &env_fn) {
+                Ok(path) => path,
+                Err(message) => {
+                    events.push(SettingsEvent::show_warning(message));
+                    continue;
+                }
+            };
+        let mut base_events = Vec::new();
+        let mut base_deprecated_keys = DeprecatedKeysSeen::default();
+        let base = match load_toml_file(&base_path, &mut base_events, &mut base_deprecated_keys) {
+            Ok(base) => base,
+            Err(message) => {
+                events.push(SettingsEvent::show_warning(message));
+                continue;
+            }
+        };
+        let Some(base) = base else {
+            events.push(missing_base_config_warning(&base_path, entry_path));
+            layers.push(None);
+            continue;
+        };
+        if base.base_config_files.is_some() {
+            events.push(SettingsEvent::show_warning(format!(
+                "baseConfigFiles is only allowed in an entry config file; {} was included from {}",
+                base_path.display(),
+                entry_path.display()
+            )));
+            continue;
+        }
+        let mut settings = base.settings;
+        let unanchored = anchor_settings_paths(&mut settings, base_path.parent());
+        if !unanchored.is_empty() {
+            events.push(SettingsEvent::show_warning(format!(
+                "Cannot resolve paths in {} against that file's directory: {}; skipping base file",
+                base_path.display(),
+                unanchored.join(", ")
+            )));
+            continue;
+        }
+        if let Err(errs) = WorkspaceSettings::try_from_settings(&settings, home, &env_fn)
+            && let Some(details) = errs.path_error_summary()
+        {
+            events.push(SettingsEvent::show_warning(format!(
+                "Path expansion failed in {}: {details}; skipping base file",
+                base_path.display()
+            )));
+            continue;
+        }
+        events.extend(base_events);
+        deprecated_keys.merge(base_deprecated_keys);
+        layers.push(Some(settings));
+    }
+
+    let mut settings = entry.settings;
+    let _ = anchor_settings_paths(&mut settings, entry_path.parent());
+    layers.push(Some(settings));
+    layers
+}
+
+/// Load the user entry and expand its file-local base layers.
+fn load_user_config_with_events(
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+    events: &mut Vec<SettingsEvent>,
+    deprecated_keys: &mut DeprecatedKeysSeen,
+) -> Vec<Option<RawWorkspaceSettings>> {
     match load_user_config() {
         Ok(Some(config)) => {
             events.push(SettingsEvent::info(
@@ -652,18 +858,28 @@ fn load_user_config_with_events(
             ));
             append_unknown_key_warnings(&config.unknown_keys, &config.path, events);
             deprecated_keys.merge(config.deprecated_keys);
-            Some((config.settings, config.path))
+            expand_implicit_file_entry(
+                ConfigFileSettings {
+                    base_config_files: config.base_config_files,
+                    settings: config.settings,
+                },
+                &config.path,
+                home,
+                env_fn,
+                events,
+                deprecated_keys,
+            )
         }
         Ok(None) => {
             // No user config file exists - this is fine (zero-config experience)
-            None
+            Vec::new()
         }
         Err(err) => {
             events.push(SettingsEvent::warning(format!(
                 "Failed to load user config: {}",
                 err
             )));
-            None
+            Vec::new()
         }
     }
 }
@@ -685,14 +901,14 @@ fn load_toml_file(
     path: &Path,
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
-) -> Result<Option<RawWorkspaceSettings>, String> {
+) -> Result<Option<ConfigFileSettings>, String> {
     // Classify by opening, not by probing first: a separate `exists` check
     // would answer for a different moment than the open, and would have to
     // decide what "no" means without the kernel's reason for it. `NotFound` is
     // the only answer that can mean the optional-overlay case; everything else
     // — a denied ancestor directory, a path that is a directory — is a file the
     // user named and cannot use.
-    let file = match fs::File::open(path) {
+    let file = match open_config_file(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             // Opening follows symlinks, so a link whose target is gone also
@@ -743,6 +959,16 @@ fn load_toml_file(
         }
     };
 
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("Failed to inspect {}: {}", path.display(), err))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "Failed to read {}: not a regular file",
+            path.display()
+        ));
+    }
+
     events.push(SettingsEvent::info(format!(
         "Loading config file: {}",
         path.display()
@@ -767,7 +993,7 @@ fn load_toml_file(
     let contents = String::from_utf8(bytes)
         .map_err(|err| format!("Failed to read {}: {}", path.display(), err))?;
     deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
-    let settings = toml::from_str::<RawWorkspaceSettings>(&contents)
+    let settings = toml::from_str::<ConfigFileSettings>(&contents)
         .map_err(|err| format!("Failed to parse {}: {}", path.display(), err))?;
 
     // Serde drops an unrecognised field silently, so `autoInstal = false` reads
@@ -782,6 +1008,20 @@ fn load_toml_file(
         path.display()
     )));
     Ok(Some(settings))
+}
+
+fn open_config_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        // Opening a FIFO for reading normally waits for a writer before the
+        // file type can be inspected. O_NONBLOCK makes that open immediate;
+        // regular files retain their ordinary read semantics.
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    options.open(path)
 }
 
 fn read_workspace_toml_contents(
@@ -831,7 +1071,7 @@ fn load_toml_settings(
     root_path: Option<&Path>,
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
-) -> Option<RawWorkspaceSettings> {
+) -> Option<ConfigFileSettings> {
     let root = root_path?;
     let config_path = root.join("kakehashi.toml");
     let contents = read_workspace_toml_contents(&config_path, events)?;
@@ -840,10 +1080,10 @@ fn load_toml_settings(
         config_path.display()
     )));
 
-    deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
-    append_unknown_config_key_warnings(&contents, &config_path, events);
-    match toml::from_str::<RawWorkspaceSettings>(&contents) {
+    match toml::from_str::<ConfigFileSettings>(&contents) {
         Ok(settings) => {
+            deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
+            append_unknown_config_key_warnings(&contents, &config_path, events);
             events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
             Some(settings)
         }
@@ -1079,6 +1319,514 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("failed to create user config dir");
         std::fs::write(dir.join("kakehashi.toml"), contents).expect("failed to write user config");
         dir
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn user_entry_prepends_its_base_config_files() {
+        let config_home = TempDir::new().expect("config home");
+        let user_dir = write_user_config(
+            config_home.path(),
+            "baseConfigFiles = [\"base.toml\"]\nautoInstall = true\n",
+        );
+        std::fs::write(
+            user_dir.join("base.toml"),
+            "autoInstall = false\nsearchPaths = [\"./parsers\"]\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(None, None, None, crate::config::make_env(&[]), None)
+        });
+
+        let settings = outcome.settings.expect("valid composed user config");
+        assert!(
+            settings.auto_install,
+            "the user entry must override its base"
+        );
+        assert_eq!(
+            settings.search_paths,
+            vec![user_dir.join("parsers").to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn project_entry_prepends_its_base_config_files_after_user_config() {
+        let config_home = TempDir::new().expect("config home");
+        write_user_config(config_home.path(), "diagnosticsDebounceMs = 250\n");
+        let project = TempDir::new().expect("project");
+        std::fs::write(
+            project.path().join("base.toml"),
+            "autoInstall = false\nsearchPaths = [\"./parsers\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = [\"base.toml\"]\nautoInstall = true\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        let settings = outcome.settings.expect("valid composed project config");
+        assert!(
+            settings.auto_install,
+            "the project entry must override its base"
+        );
+        assert_eq!(settings.diagnostics_debounce_ms, 250, "user layer survives");
+        assert_eq!(
+            settings.search_paths,
+            vec![
+                project
+                    .path()
+                    .join("parsers")
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn project_entry_skips_only_an_unexpandable_base_config_path() {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        std::fs::write(
+            project.path().join("valid.toml"),
+            "searchPaths = [\"./parsers\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = [\"valid.toml\", \"$MISSING_KAKEHASHI_TEST_VAR/base.toml\", \"~bob/base.toml\"]\ndiagnosticsDebounceMs = 777\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        let settings = outcome.settings.expect("the entry remains valid");
+        assert_eq!(settings.diagnostics_debounce_ms, 777);
+        assert_eq!(
+            settings.search_paths,
+            vec![
+                project
+                    .path()
+                    .join("parsers")
+                    .to_string_lossy()
+                    .into_owned()
+            ],
+            "an unusable base must not discard valid sibling bases"
+        );
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::ShowWarning
+                    && event.message.contains("Failed to expand baseConfigFiles")
+                    && event.message.contains("MISSING_KAKEHASHI_TEST_VAR")
+            }),
+            "the skipped base must remain visible: {:?}",
+            outcome.events
+        );
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::ShowWarning
+                    && event.message.contains("~username is not supported")
+                    && event.message.contains("~bob/base.toml")
+            }),
+            "an unsupported named home must be skipped without literal rebasing: {:?}",
+            outcome.events
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial(xdg_env)]
+    fn project_entry_skips_base_under_non_unicode_directory() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let config_home = TempDir::new().expect("config home");
+        let parent = TempDir::new().expect("project parent");
+        let project = parent.path().join(OsStr::from_bytes(b"project-\xFF"));
+        if std::fs::create_dir(&project).is_err() {
+            eprintln!(
+                "skipping: this filesystem rejects non-UTF-8 directory names, so the case under \
+                 test cannot be constructed here"
+            );
+            return;
+        }
+        let base = project.join("base.toml");
+        std::fs::write(&base, "searchPaths = [\"./parsers\"]\n").unwrap();
+        std::fs::write(
+            project.join("kakehashi.toml"),
+            "baseConfigFiles = [\"base.toml\"]\ndiagnosticsDebounceMs = 777\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(&project),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        let settings = outcome.settings.expect("the entry remains valid");
+        assert_eq!(settings.diagnostics_debounce_ms, 777);
+        assert!(
+            !settings.search_paths.iter().any(|path| path == "./parsers"),
+            "the unanchorable base must be skipped: {:?}",
+            settings.search_paths
+        );
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::ShowWarning
+                    && event.message.contains(&base.display().to_string())
+                    && event.message.contains("./parsers")
+            }),
+            "the skipped base must remain visible: {:?}",
+            outcome.events
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn project_entry_skips_a_base_with_an_unexpandable_setting_path() {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        let base = project.path().join("base.toml");
+        std::fs::write(
+            &base,
+            "searchPaths = [\"$MISSING_KAKEHASHI_TEST_VAR/parsers\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = [\"base.toml\"]\ndiagnosticsDebounceMs = 777\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        assert_eq!(
+            outcome
+                .settings
+                .expect("an invalid base must not discard the owning entry")
+                .diagnostics_debounce_ms,
+            777
+        );
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::ShowWarning
+                    && event.message.contains(&base.display().to_string())
+                    && event.message.contains("MISSING_KAKEHASHI_TEST_VAR")
+            }),
+            "the skipped base and its path error must be visible: {:?}",
+            outcome.events
+        );
+    }
+
+    fn assert_implicit_nested_base_is_skipped(nested_declaration: &str) {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        std::fs::write(
+            project.path().join("valid.toml"),
+            "diagnosticsDebounceMs = 444\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("nested.toml"),
+            format!("{nested_declaration}\nautoInstall = false\ndiagnosticsDebounceMs = 555\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = [\"valid.toml\", \"nested.toml\"]\nsearchPaths = [\"./entry\"]\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        let settings = outcome.settings.expect("valid sibling and entry survive");
+        assert_eq!(
+            settings.diagnostics_debounce_ms, 444,
+            "the nested base must not override its valid sibling"
+        );
+        assert_eq!(
+            settings.search_paths,
+            vec![project.path().join("entry").to_string_lossy().into_owned()],
+            "the owning entry must still apply"
+        );
+        let nested = project.path().join("nested.toml");
+        let entry = project.path().join("kakehashi.toml");
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::ShowWarning
+                    && event.message.contains("baseConfigFiles")
+                    && event.message.contains(&nested.display().to_string())
+                    && event.message.contains(&entry.display().to_string())
+            }),
+            "the skipped nested declaration must name both files: {:?}",
+            outcome.events
+        );
+        assert!(
+            !outcome.deprecated_keys.auto_install,
+            "a skipped base must not trigger migration notices"
+        );
+        assert!(
+            outcome.events.iter().all(|event| {
+                event.kind != SettingsEventKind::Info
+                    || !event.message.starts_with("Successfully loaded")
+                    || !event.message.contains(&nested.display().to_string())
+            }),
+            "a skipped base must not be reported as successfully loaded: {:?}",
+            outcome.events
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn implicit_base_cannot_name_more_base_files() {
+        assert_implicit_nested_base_is_skipped("baseConfigFiles = [\"deeper.toml\"]");
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn implicit_base_cannot_declare_an_empty_base_list() {
+        assert_implicit_nested_base_is_skipped("baseConfigFiles = []");
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn invalid_implicit_base_does_not_leak_deprecation_state() {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        let invalid = project.path().join("invalid.toml");
+        std::fs::write(&invalid, "baseConfigFiles = 42\nautoInstall = false\n").unwrap();
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = [\"invalid.toml\"]\ndiagnosticsDebounceMs = 777\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        assert_eq!(outcome.settings.unwrap().diagnostics_debounce_ms, 777);
+        assert!(!outcome.deprecated_keys.auto_install);
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::ShowWarning
+                    && event.message.contains("Failed to parse")
+                    && event.message.contains(&invalid.display().to_string())
+            }),
+            "the actual parse failure remains visible: {:?}",
+            outcome.events
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn invalid_implicit_project_entry_does_not_leak_parse_side_effects() {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = 42\nautoInstall = false\nunknownTypo = true\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        assert!(!outcome.deprecated_keys.auto_install);
+        assert!(
+            outcome.events.iter().all(|event| {
+                !event.message.contains("Unknown configuration key")
+                    && !event.message.contains("Successfully loaded")
+            }),
+            "a discarded entry must emit only its parse failure: {:?}",
+            outcome.events
+        );
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::Warning
+                    && event.message.contains("Failed to parse kakehashi.toml")
+            }),
+            "the actual parse failure remains visible: {:?}",
+            outcome.events
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn implicit_entry_skips_base_files_beyond_the_limit() {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        std::fs::write(
+            project.path().join("base.toml"),
+            "diagnosticsDebounceMs = 777\n",
+        )
+        .unwrap();
+        let mut configured = vec!["\"base.toml\"".to_string()];
+        configured.extend((1..=64).map(|index| format!("\"missing-{index}.toml\"")));
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            format!("baseConfigFiles = [{}]\n", configured.join(", ")),
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        assert_eq!(outcome.settings.unwrap().diagnostics_debounce_ms, 777);
+        assert!(
+            outcome.events.iter().any(|event| {
+                event.kind == SettingsEventKind::ShowWarning
+                    && event.message.contains("65")
+                    && event.message.contains("at most 64")
+            }),
+            "overflow must produce one actionable warning: {:?}",
+            outcome.events
+        );
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|event| event.message.contains("missing-63.toml")),
+            "the 64th base must still be attempted: {:?}",
+            outcome.events
+        );
+        assert!(
+            outcome
+                .events
+                .iter()
+                .all(|event| !event.message.contains("missing-64.toml")),
+            "the 65th base must not be touched: {:?}",
+            outcome.events
+        );
+    }
+
+    #[test]
+    #[serial(xdg_env)]
+    fn implicit_base_is_read_again_on_settings_reload() {
+        let config_home = TempDir::new().expect("config home");
+        let project = TempDir::new().expect("project");
+        let base = project.path().join("base.toml");
+        std::fs::write(&base, "diagnosticsDebounceMs = 111\n").unwrap();
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "baseConfigFiles = [\"base.toml\"]\n",
+        )
+        .unwrap();
+
+        let initial = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+        assert_eq!(initial.settings.unwrap().diagnostics_debounce_ms, 111);
+
+        std::fs::write(&base, "diagnosticsDebounceMs = 222\n").unwrap();
+        let reloaded = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                None,
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+        assert_eq!(reloaded.settings.unwrap().diagnostics_debounce_ms, 222);
+    }
+
+    #[test]
+    fn explicit_base_replay_keeps_the_initial_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base.toml");
+        let entry = dir.path().join("entry.toml");
+        std::fs::write(&base, "diagnosticsDebounceMs = 111\n").unwrap();
+        std::fs::write(&entry, "baseConfigFiles = [\"base.toml\"]\n").unwrap();
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+        assert!(explicit.fatal_error.is_none());
+
+        std::fs::write(&base, "diagnosticsDebounceMs = 222\n").unwrap();
+        let replayed = load_settings(
+            None,
+            None,
+            None,
+            crate::config::make_env(&[]),
+            Some(explicit.for_replay()),
+        );
+
+        assert_eq!(replayed.settings.unwrap().diagnostics_debounce_ms, 111);
+        assert!(
+            replayed.events.is_empty(),
+            "replay must not pretend the retained files were loaded again"
+        );
     }
 
     /// A `--config-file` given as a bare filename anchors to the working
@@ -1558,6 +2306,50 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial(xdg_env)]
+    fn initialization_options_cannot_load_base_config_files() {
+        let config_home = TempDir::new().expect("config home");
+        let files = TempDir::new().expect("config files");
+        let base = files.path().join("base.toml");
+        std::fs::write(
+            &base,
+            "diagnosticsDebounceMs = 777\nsearchPaths = [\"/must-not-load\"]\n",
+        )
+        .unwrap();
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                None,
+                Some((
+                    SettingsSource::InitializationOptions,
+                    serde_json::json!({
+                        "baseConfigFiles": [base],
+                        "diagnosticsDebounceMs": 333,
+                    }),
+                )),
+                None,
+                crate::config::make_env(&[]),
+                None,
+            )
+        });
+
+        let settings = outcome
+            .settings
+            .expect("ordinary initialization options remain valid");
+        assert_eq!(
+            settings.diagnostics_debounce_ms, 333,
+            "ordinary live settings must still apply"
+        );
+        assert!(
+            settings
+                .search_paths
+                .iter()
+                .all(|path| path != "/must-not-load"),
+            "live LSP settings must not initiate local file loading"
+        );
+    }
+
     /// User config loading logs appropriate events.
     #[test]
     #[serial(xdg_env)]
@@ -1778,6 +2570,7 @@ mod tests {
         assert_eq!(
             settings
                 .expect("present file should yield a layer")
+                .settings
                 .auto_install,
             Some(false)
         );
@@ -1901,6 +2694,270 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_entry_prepends_its_base_config_files() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base.toml");
+        let entry = dir.path().join("kakehashi.toml");
+        std::fs::write(&base, "autoInstall = false\n").unwrap();
+        std::fs::write(
+            &entry,
+            "baseConfigFiles = [\"base.toml\"]\nautoInstall = true\n",
+        )
+        .unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        assert!(
+            explicit.fatal_error.is_none(),
+            "the entry and its base are valid: {:?}",
+            explicit.fatal_error
+        );
+        assert_eq!(explicit.layers.len(), 2, "base then entry");
+        assert_eq!(
+            explicit.layers[0].as_ref().unwrap().auto_install,
+            Some(false)
+        );
+        assert_eq!(
+            explicit.layers[1].as_ref().unwrap().auto_install,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn explicit_base_config_file_cannot_name_more_base_files() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("nested.toml");
+        let base = dir.path().join("base.toml");
+        let entry = dir.path().join("kakehashi.toml");
+        std::fs::write(&nested, "autoInstall = false\n").unwrap();
+        std::fs::write(
+            &base,
+            "baseConfigFiles = [\"nested.toml\"]\nautoInstall = false\nunknownTypo = true\n",
+        )
+        .unwrap();
+        std::fs::write(&entry, "baseConfigFiles = [\"base.toml\"]\n").unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        let message = explicit
+            .fatal_error
+            .expect("baseConfigFiles in a base file must be rejected");
+        assert!(message.contains("baseConfigFiles"), "{message}");
+        assert!(message.contains(&base.display().to_string()), "{message}");
+        assert!(message.contains(&entry.display().to_string()), "{message}");
+        assert!(
+            !explicit.deprecated_keys.auto_install,
+            "a rejected base must not trigger migration notices"
+        );
+        assert!(
+            explicit.events.iter().all(|event| {
+                !event.message.contains("unknownTypo")
+                    && (!event.message.starts_with("Successfully loaded")
+                        || !event.message.contains(&base.display().to_string()))
+            }),
+            "a rejected base must not leak parse side effects: {:?}",
+            explicit.events
+        );
+    }
+
+    #[test]
+    fn explicit_base_config_file_cannot_declare_an_empty_base_list() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base.toml");
+        let entry = dir.path().join("kakehashi.toml");
+        std::fs::write(&base, "baseConfigFiles = []\n").unwrap();
+        std::fs::write(&entry, "baseConfigFiles = [\"base.toml\"]\n").unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        assert!(
+            explicit.fatal_error.is_some(),
+            "declaring the field is forbidden in a base file, even when it is empty"
+        );
+    }
+
+    #[test]
+    fn explicit_base_config_files_expand_environment_paths() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("base.toml");
+        let entry_dir = TempDir::new().unwrap();
+        let entry = entry_dir.path().join("kakehashi.toml");
+        std::fs::write(&base, "autoInstall = false\n").unwrap();
+        std::fs::write(&entry, "baseConfigFiles = [\"$HOME/base.toml\"]\n").unwrap();
+        let home = dir.path().to_string_lossy().into_owned();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            Some(&home),
+            crate::config::make_env(&[("HOME", &home)]),
+        );
+
+        assert!(explicit.fatal_error.is_none(), "{:?}", explicit.fatal_error);
+        assert_eq!(explicit.layers.len(), 2);
+        assert_eq!(
+            explicit.layers[0].as_ref().unwrap().auto_install,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn explicit_base_config_files_reject_unsupported_named_tilde() {
+        let dir = TempDir::new().unwrap();
+        let entry = dir.path().join("kakehashi.toml");
+        std::fs::write(&entry, "baseConfigFiles = [\"~bob/base.toml\"]\n").unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        let message = explicit
+            .fatal_error
+            .expect("named-home expansion is unsupported and must not be rebased literally");
+        assert!(message.contains("~username is not supported"), "{message}");
+        assert!(message.contains("~bob/base.toml"), "{message}");
+    }
+
+    #[test]
+    fn explicit_entries_expand_bases_in_argument_order() {
+        let dir = TempDir::new().unwrap();
+        let base_a = dir.path().join("base-a.toml");
+        let entry_a = dir.path().join("entry-a.toml");
+        let base_b = dir.path().join("base-b.toml");
+        let entry_b = dir.path().join("entry-b.toml");
+        std::fs::write(&base_a, "diagnosticsDebounceMs = 101\n").unwrap();
+        std::fs::write(
+            &entry_a,
+            "baseConfigFiles = [\"base-a.toml\"]\ndiagnosticsDebounceMs = 102\n",
+        )
+        .unwrap();
+        std::fs::write(&base_b, "diagnosticsDebounceMs = 201\n").unwrap();
+        std::fs::write(
+            &entry_b,
+            "baseConfigFiles = [\"base-b.toml\"]\ndiagnosticsDebounceMs = 202\n",
+        )
+        .unwrap();
+
+        let explicit =
+            read_explicit_layers(&[entry_a, entry_b], None, crate::config::make_env(&[]));
+
+        let values = explicit
+            .layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .as_ref()
+                    .and_then(|layer| layer.diagnostics_debounce_ms)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![Some(101), Some(102), Some(201), Some(202)]);
+    }
+
+    #[test]
+    fn explicit_base_files_report_the_first_failure_in_listed_order() {
+        let dir = TempDir::new().unwrap();
+        let malformed = dir.path().join("malformed.toml");
+        let entry = dir.path().join("entry.toml");
+        std::fs::write(&malformed, "not valid TOML = [\n").unwrap();
+        std::fs::write(
+            &entry,
+            "baseConfigFiles = [\"malformed.toml\", \"$MISSING_KAKEHASHI_TEST_VAR/later.toml\"]\n",
+        )
+        .unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        let message = explicit.fatal_error.expect("the first base is malformed");
+        assert!(
+            message.contains(&malformed.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("Failed to parse"), "{message}");
+        assert!(
+            !message.contains("MISSING_KAKEHASHI_TEST_VAR"),
+            "a later path error must not mask the first base failure: {message}"
+        );
+    }
+
+    #[test]
+    fn explicit_entry_rejects_too_many_base_files() {
+        let dir = TempDir::new().unwrap();
+        let entry = dir.path().join("entry.toml");
+        let configured = std::iter::repeat_n("\"missing.toml\"", 65)
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(&entry, format!("baseConfigFiles = [{configured}]\n")).unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        let message = explicit.fatal_error.expect("the list exceeds its bound");
+        assert!(message.contains("65"), "{message}");
+        assert!(message.contains("at most 64"), "{message}");
+        assert!(
+            explicit
+                .events
+                .iter()
+                .all(|event| !event.message.contains("Config file not found")),
+            "the invalid entry must fail before reading any base: {:?}",
+            explicit.events
+        );
+    }
+
+    #[test]
+    fn explicit_entry_accepts_exactly_the_base_file_limit() {
+        let dir = TempDir::new().unwrap();
+        let entry = dir.path().join("entry.toml");
+        let configured = std::iter::repeat_n("\"missing.toml\"", 64)
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            &entry,
+            format!("baseConfigFiles = [{configured}]\ndiagnosticsDebounceMs = 777\n"),
+        )
+        .unwrap();
+
+        let explicit = read_explicit_layers(
+            std::slice::from_ref(&entry),
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        assert!(explicit.fatal_error.is_none(), "{:?}", explicit.fatal_error);
+        assert_eq!(explicit.layers.len(), 65, "64 bases followed by the entry");
+        assert_eq!(
+            explicit
+                .layers
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .diagnostics_debounce_ms,
+            Some(777)
+        );
+    }
+
     /// A typo is reported rather than silently read as "not specified", which
     /// is what serde does with an unrecognised field. It stays a warning: an
     /// unrecognised key may be a mistake, or may be one a newer kakehashi
@@ -1949,7 +3006,8 @@ mod tests {
         let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let settings = load_toml_file(&path, &mut events, &mut ignored_deprecation)
             .expect("an unknown key should not reject an explicit config file")
-            .expect("settings");
+            .expect("settings")
+            .settings;
 
         assert!(
             events
@@ -1981,7 +3039,8 @@ mod tests {
         let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let settings = load_toml_file(&path, &mut events, &mut ignored_deprecation)
             .expect("an unknown feature key should use the common file policy")
-            .expect("settings");
+            .expect("settings")
+            .settings;
 
         assert!(
             events
@@ -2194,6 +3253,46 @@ mod tests {
         );
     }
 
+    /// Device nodes, pipes, and sockets are not configuration files. Rejecting
+    /// them also prevents a workspace-controlled FIFO from blocking an LSP
+    /// settings reload indefinitely.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_toml_file_rejects_non_regular_files() {
+        let path = Path::new("/dev/null");
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+
+        let result = load_toml_file(path, &mut events, &mut ignored_deprecation);
+
+        let message = result.expect_err("a device node must not be parsed as a config file");
+        assert!(
+            message.contains("not a regular file") && message.contains("/dev/null"),
+            "the path and reason must be reported: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_toml_file_rejects_fifo_without_waiting_for_a_writer() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("blocking.toml");
+        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        let message = result.expect_err("a FIFO must not be read as a config file");
+        assert!(
+            message.contains("not a regular file") && message.contains(&path.display().to_string()),
+            "the path and reason must be reported: {message}"
+        );
+    }
+
     /// load_toml_file: a symlink whose target is gone is present-but-unusable,
     /// not absent. `try_exists` follows the link and reports the *target*, so
     /// the two cases look identical without an explicit check.
@@ -2313,7 +3412,8 @@ mod tests {
         let mut events = Vec::new();
         let mut deprecated_keys = DeprecatedKeysSeen::default();
         let settings = load_toml_settings(Some(dir.path()), &mut events, &mut deprecated_keys)
-            .expect("an unknown feature key should not reject a workspace config");
+            .expect("an unknown feature key should not reject a workspace config")
+            .settings;
 
         assert!(
             events
@@ -2354,7 +3454,12 @@ mod tests {
 
         let mut events = Vec::new();
         let mut deprecated_keys = DeprecatedKeysSeen::default();
-        let loaded = load_user_config_with_events(&mut events, &mut deprecated_keys);
+        let loaded = load_user_config_with_events(
+            None,
+            crate::config::make_env(&[]),
+            &mut events,
+            &mut deprecated_keys,
+        );
 
         // SAFETY: serial(xdg_env) prevents concurrent mutation in this test module.
         unsafe {
@@ -2364,7 +3469,7 @@ mod tests {
             }
         }
 
-        let settings = loaded.expect("user config").0;
+        let settings = loaded.into_iter().flatten().next().expect("user config");
         assert!(
             events
                 .iter()

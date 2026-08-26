@@ -124,7 +124,7 @@ impl std::error::Error for ExpandErrors {}
 ///
 /// `home` is the pre-computed home directory (from `dirs::home_dir()`),
 /// passed in so the caller computes it once for all paths.
-pub(super) fn expand_path(
+pub(crate) fn expand_path(
     input: &str,
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
