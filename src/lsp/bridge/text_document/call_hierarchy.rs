@@ -302,14 +302,6 @@ impl LanguageServerPool {
         });
 
         let connection_key = handle.key();
-        // Snapshot the exact producer's issued virtual URI namespace before
-        // enqueue. A sibling virtual document may close while this request is
-        // in flight; response classification must not then leak its synthetic
-        // URI upstream as if it were a real external file.
-        let mut known_virtual_uris = self.virtual_uris_for_connection(connection_key).await;
-        if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
-            known_virtual_uris.insert(uri);
-        }
         if let Some(ref id) = upstream_id {
             self.register_upstream_request_for_handle(id.clone(), &handle);
         }
@@ -334,7 +326,7 @@ impl LanguageServerPool {
         let request =
             JsonRpcRequest::new(request_id.as_i64(), "callHierarchy/incomingCalls", params);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
-        let send_result = {
+        let (send_result, mut known_virtual_uris): (io::Result<()>, HashSet<String>) = {
             let connections = self.connections().await;
             let producer_is_live = connections
                 .get(connection_key)
@@ -342,12 +334,25 @@ impl LanguageServerPool {
             let generation_matches = self.document_connection_generation(connection_key)
                 == envelope.connection_generation;
             if !producer_is_live || !generation_matches {
-                Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "producer connection was replaced before incomingCalls send",
-                ))
+                (
+                    Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "producer connection was replaced before incomingCalls send",
+                    )),
+                    HashSet::new(),
+                )
             } else {
-                handle.send_request(request, request_id).map_err(Into::into)
+                // Snapshot the exact producer's virtual namespace in the same
+                // admission critical section as enqueue. This gives the set
+                // the producer has seen before this request in FIFO order.
+                let mut known = self.virtual_uris_for_connection(connection_key).await;
+                if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
+                    known.insert(uri);
+                }
+                (
+                    handle.send_request(request, request_id).map_err(Into::into),
+                    known,
+                )
             }
         };
         if let Err(error) = send_result {
@@ -370,6 +375,10 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, connection_key);
         }
         let response = response.ok()?;
+        // Keep admission-time tombstones for siblings closed in flight, and
+        // add siblings that became live while the request was running. The
+        // producer fence below follows this final await.
+        known_virtual_uris.extend(self.virtual_uris_for_connection(connection_key).await);
         if !self
             .call_hierarchy_producer_is_live(
                 connection_key,
@@ -960,5 +969,92 @@ mod tests {
             request.await.unwrap().is_none(),
             "the full response path must discard an admitted old-producer response"
         );
+    }
+
+    #[tokio::test]
+    async fn incoming_response_classifies_sibling_opened_while_request_is_in_flight() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua-ls");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_uri = url::Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let generation = pool.document_connection_generation(&key);
+        let envelope = CallHierarchyEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            content_version: 1,
+            connection_generation: generation,
+            connection_key: key.clone(),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            inner: Some(json!({ "token": 9 })),
+            host_layer: true,
+            projected_from_virtual: false,
+        };
+        let params = CallHierarchyIncomingCallsParams {
+            item: call_item(host_uri.as_str(), json!({ "token": 9 })),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let upstream_id = UpstreamId::Number(79);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_call_hierarchy_incoming_request(
+                    &BridgeServerConfig::default(),
+                    params,
+                    envelope,
+                    Some(upstream_id),
+                )
+                .await
+            })
+        };
+        let downstream_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = handle
+                    .router()
+                    .lookup_downstream_ids(&upstream_id)
+                    .into_iter()
+                    .next()
+                {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("incoming request must be admitted");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !handle.router().is_sent(downstream_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("incoming request must be sent");
+
+        let sibling_host = url::Url::parse("file:///sibling.md").unwrap();
+        let sibling_host_lsp: Uri = sibling_host.as_str().parse().unwrap();
+        let sibling_virtual = VirtualDocumentUri::new(&sibling_host_lsp, "lua", "sibling");
+        pool.register_opened_document(&sibling_host, &sibling_virtual, &key)
+            .await;
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": [{
+                "from": {
+                    "name": "sibling", "kind": 12,
+                    "uri": sibling_virtual.to_uri_string(),
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                    "selectionRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }
+                },
+                "fromRanges": []
+            }]
+        }));
+
+        assert_eq!(request.await.unwrap(), Some(Vec::new()));
     }
 }
