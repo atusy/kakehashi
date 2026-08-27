@@ -481,6 +481,33 @@ mod tests {
         assert_eq!(pool.document_connection_generation(&key), generation);
     }
 
+    #[tokio::test]
+    async fn cancelled_close_recovery_still_retires_the_failed_process() {
+        use futures::FutureExt;
+
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua_ls");
+        let failed = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&failed)).await;
+        failed.cancel_writer_for_test().await;
+        let host_documents = pool.host_documents().await;
+        let mut invalidation =
+            std::pin::pin!(pool.invalidate_connection_after_didclose_failure(&key, &failed));
+
+        assert!(invalidation.as_mut().now_or_never().is_none());
+        assert_eq!(failed.state(), ConnectionState::Failed);
+        drop(invalidation);
+        drop(host_documents);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while failed.state() != ConnectionState::Closed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached teardown must close the failed handle after cleanup cancellation");
+    }
+
     /// A scratch URI is distinct from the canonical region URI, so an
     /// already-open canonical document does NOT suppress the scratch `didOpen`.
     ///
