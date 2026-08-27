@@ -463,6 +463,49 @@ mod tests {
     }
 
     #[test]
+    fn prepare_response_filters_an_issued_sibling_virtual_uri() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("lua-ls");
+        let offset = RegionOffset::new(3, 2);
+        let request_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-a");
+        let sibling_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-b");
+        let response = serde_json::json!({ "result": [{
+            "name": "Sibling", "kind": 5, "uri": sibling_uri.to_uri_string(),
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 7 } },
+            "selectionRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 7 } }
+        }]});
+        let known_virtual_uris =
+            HashSet::from([request_uri.to_uri_string(), sibling_uri.to_uri_string()]);
+
+        let items = transform_type_hierarchy_prepare_response_to_host(
+            response,
+            &request_uri.to_uri_string(),
+            &host_uri,
+            &offset,
+            &known_virtual_uris,
+            &TypeHierarchyEnvelopeContext {
+                server_name: "lua-ls",
+                host_uri: host_uri.as_str(),
+                region_id: "region-a",
+                injection_language: "lua",
+                revision: TypeHierarchyDocumentRevision {
+                    incarnation: Some(2),
+                    content_version: 3,
+                },
+                connection_generation: 4,
+                connection_key: &key,
+                offset: &offset,
+                host_layer: false,
+                projected_from_virtual: false,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(items.is_empty());
+    }
+
+    #[test]
     fn prepare_response_accepts_protocol_array_tags() {
         let value = serde_json::json!([{
             "name": "Deprecated", "kind": 5, "tags": [1], "uri": "file:///type.lua",
