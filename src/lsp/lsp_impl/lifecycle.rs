@@ -687,7 +687,7 @@ impl Kakehashi {
                         work_done_progress_options: WorkDoneProgressOptions {
                             work_done_progress: Some(true),
                         },
-                        resolve_provider: None,
+                        resolve_provider: Some(true),
                     },
                 ))),
                 linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(
