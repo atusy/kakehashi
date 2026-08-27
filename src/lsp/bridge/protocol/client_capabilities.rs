@@ -473,6 +473,19 @@ mod tests {
     }
 
     #[test]
+    fn bridge_advertises_static_did_save_support() {
+        let capabilities = build_bridge_client_capabilities(None, true, false);
+        let synchronization = capabilities
+            .text_document
+            .as_ref()
+            .and_then(|text_document| text_document.synchronization.as_ref())
+            .expect("the bridge must advertise text-document synchronization");
+
+        assert_eq!(synchronization.dynamic_registration, Some(false));
+        assert_eq!(synchronization.did_save, Some(true));
+    }
+
+    #[test]
     fn merge_mirrors_workspace_edit_capability_without_annotations() {
         use tower_lsp_server::ls_types::{
             ChangeAnnotationWorkspaceEditClientCapabilities, FailureHandlingKind,
