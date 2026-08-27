@@ -294,12 +294,12 @@ impl DocumentTracker {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
         let generation = self.connection_generation(connection_key);
-        if !VirtualDocumentUri::is_scratch_uri(&uri_string) {
-            self.issued_virtual_uris
-                .entry((connection_key.clone(), generation))
-                .or_default()
-                .insert(uri_string.clone());
-        }
+        let issued_uri = VirtualDocumentUri::canonical_uri_for_scratch(&uri_string)
+            .unwrap_or_else(|| uri_string.clone());
+        self.issued_virtual_uris
+            .entry((connection_key.clone(), generation))
+            .or_default()
+            .insert(issued_uri);
         for observer in self.virtual_uri_observers.iter() {
             if observer.connection_key == *connection_key && observer.generation == generation {
                 observer
@@ -2294,6 +2294,9 @@ mod tests {
             .observe_virtual_uris_for_connection(&key, generation)
             .await;
         assert!(!observer.snapshot().contains(&before.to_uri_string()));
+        assert!(observer.snapshot().contains(
+            &VirtualDocumentUri::canonical_uri_for_scratch(&before.to_uri_string()).unwrap()
+        ));
         assert!(observer.snapshot().contains(&open.to_uri_string()));
 
         let during = VirtualDocumentUri::new(

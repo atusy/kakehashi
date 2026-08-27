@@ -1074,7 +1074,7 @@ mod tests {
         });
         let shaped_real_item = json!({
             "name": "shaped-real", "kind": 12,
-            "uri": "file:///external/kakehashi-virtual-uri-other.lua",
+            "uri": "file:///kakehashi-virtual-uri-region-kakehashi-scratch-01-2.lua",
             "range": { "start": { "line": 9, "character": 0 }, "end": { "line": 9, "character": 3 } },
             "selectionRange": { "start": { "line": 9, "character": 0 }, "end": { "line": 9, "character": 1 } }
         });
@@ -1114,7 +1114,7 @@ mod tests {
         assert_eq!(calls[1].from_ranges[0].start, Position::new(8, 1));
         assert_eq!(
             calls[2].from.uri.as_str(),
-            "file:///external/kakehashi-virtual-uri-other.lua"
+            "file:///kakehashi-virtual-uri-region-kakehashi-scratch-01-2.lua"
         );
         assert_eq!(
             extract_call_hierarchy_envelope(&calls[1].from)
@@ -1143,7 +1143,7 @@ mod tests {
             "data": { "callee": "virtual" }
         });
         let external_item = json!({
-            "name": "external", "kind": 12, "uri": "file:///external/kakehashi-virtual-uri-foo-kakehashi-scratch-1.lua",
+            "name": "external", "kind": 12, "uri": "file:///kakehashi-virtual-uri-region-kakehashi-scratch-01-2.lua",
             "range": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 3 } },
             "selectionRange": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 1 } },
             "data": { "callee": "external" }
@@ -1178,7 +1178,7 @@ mod tests {
         assert_eq!(calls[0].from_ranges[0].start, Position::new(3, 3));
         assert_eq!(
             calls[1].to.uri.as_str(),
-            "file:///external/kakehashi-virtual-uri-foo-kakehashi-scratch-1.lua"
+            "file:///kakehashi-virtual-uri-region-kakehashi-scratch-01-2.lua"
         );
         assert_eq!(calls[1].to.range.start, Position::new(8, 0));
         assert_eq!(calls[1].from_ranges[0].start, Position::new(3, 4));
@@ -1518,14 +1518,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outgoing_response_classifies_sibling_closed_before_request() {
+    async fn outgoing_response_classifies_scratch_only_sibling_closed_before_request() {
         let pool = Arc::new(LanguageServerPool::new());
         let key = ConnectionKey::for_server("lua-ls");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
         pool.insert_connection(Arc::clone(&handle)).await;
         let sibling_host = url::Url::parse("file:///sibling.md").unwrap();
         let sibling_host_lsp: Uri = sibling_host.as_str().parse().unwrap();
-        let sibling_virtual = VirtualDocumentUri::new(&sibling_host_lsp, "lua", "sibling");
+        let sibling_virtual = VirtualDocumentUri::new(
+            &sibling_host_lsp,
+            "lua",
+            &format!("sibling{}0-1", VirtualDocumentUri::SCRATCH_ID_MARKER),
+        );
         pool.register_opened_document(&sibling_host, &sibling_virtual, &key)
             .await;
         pool.untrack_document(&sibling_virtual, &key).await;

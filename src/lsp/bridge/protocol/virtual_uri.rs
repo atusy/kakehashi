@@ -182,8 +182,11 @@ impl VirtualDocumentUri {
         let suffix = &uri[marker + Self::SCRATCH_ID_MARKER.len()..];
         let extension = suffix.rfind('.')?;
         let (run, step) = suffix[..extension].split_once('-')?;
-        run.parse::<usize>().ok()?;
-        step.parse::<usize>().ok()?;
+        let run_number = run.parse::<usize>().ok()?;
+        let step_number = step.parse::<usize>().ok()?;
+        if run_number.to_string() != run || step_number.to_string() != step {
+            return None;
+        }
         Some(format!("{}{}", &uri[..marker], &suffix[extension..]))
     }
 
@@ -340,6 +343,12 @@ mod tests {
         assert!(
             VirtualDocumentUri::canonical_uri_for_scratch(
                 "file:///project/kakehashi-virtual-uri-region-kakehashi-scratch-run-step.py"
+            )
+            .is_none()
+        );
+        assert!(
+            VirtualDocumentUri::canonical_uri_for_scratch(
+                "file:///project/kakehashi-virtual-uri-region-kakehashi-scratch-01-2.py"
             )
             .is_none()
         );
