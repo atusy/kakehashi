@@ -705,7 +705,7 @@ fn transform_call_hierarchy_outgoing_response_to_host(
 }
 
 fn is_known_scratch_uri(uri: &str, known_virtual_uris: &HashSet<String>) -> bool {
-    VirtualDocumentUri::is_scratch_uri(uri) && known_virtual_uris.contains(uri)
+    VirtualDocumentUri::canonical_uri_for_scratch(uri).is_some() && known_virtual_uris.contains(uri)
 }
 
 fn build_call_hierarchy_prepare_request(
@@ -1186,6 +1186,42 @@ mod tests {
             extract_call_hierarchy_envelope(&calls[1].to).unwrap().inner,
             Some(json!({ "callee": "external" }))
         );
+    }
+
+    #[test]
+    fn marker_bearing_language_canonical_items_are_projected_not_scratch() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("custom-ls");
+        let envelope = incoming_test_envelope(&host_uri, &key);
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "foo-kakehashi-scratch-bar", "region");
+        let item = json!({
+            "name": "canonical", "kind": 12, "uri": virtual_uri.to_uri_string(),
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 3 } },
+            "selectionRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }
+        });
+        let known = HashSet::from([virtual_uri.to_uri_string()]);
+
+        let incoming = transform_call_hierarchy_incoming_response_to_host(
+            json!({ "result": [{ "from": item.clone(), "fromRanges": [] }] }),
+            Some(virtual_uri.to_uri_string()),
+            &host_uri,
+            &envelope,
+            &known,
+        )
+        .unwrap()
+        .unwrap();
+        let outgoing = transform_call_hierarchy_outgoing_response_to_host(
+            json!({ "result": [{ "to": item, "fromRanges": [] }] }),
+            Some(virtual_uri.to_uri_string()),
+            &host_uri,
+            &envelope,
+            &known,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(incoming[0].from.uri, host_uri);
+        assert_eq!(outgoing[0].to.uri, host_uri);
     }
 
     #[test]
