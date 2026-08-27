@@ -80,6 +80,11 @@ impl LanguageServerPool {
             let connection_keys = self.connections_opening_or_opened(&virtual_uri);
 
             for connection_key in connection_keys {
+                // Keep the current-generation map guard through transition,
+                // tracker validation, and both enqueues. Replacement purges
+                // tracker state while holding this same guard; releasing it
+                // early would make an unregistered target look unchanged and
+                // could send didSave to the invalidated process.
                 let connections = self.connections().await;
                 let Some(handle) = connections
                     .get(&connection_key)
@@ -93,7 +98,6 @@ impl LanguageServerPool {
                 };
                 let transition = self.open_transition_lock(&virtual_uri, &connection_key);
                 let transition_guard = transition.lock().await;
-                drop(connections);
                 if !self.is_document_opened_on_connection(&virtual_uri, &connection_key) {
                     drop(transition_guard);
                     self.remove_open_transition_lock_if_unshared(
@@ -140,6 +144,7 @@ impl LanguageServerPool {
                     handle.send_notification(notification)
                 });
                 drop(transition_guard);
+                drop(connections);
             }
         }
     }
@@ -211,8 +216,11 @@ impl LanguageServerPool {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::sync::Arc;
 
     use super::*;
+    use crate::lsp::bridge::coordinator::BridgeInjection;
+    use crate::lsp::bridge::pool::{ConnectionKey, test_helpers};
 
     #[test]
     fn queue_full_did_change_suppresses_textless_did_save() {
@@ -227,6 +235,63 @@ mod tests {
         assert!(
             !did_save_enqueued.get(),
             "didSave must not be attempted after its prerequisite didChange was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_save_holds_connection_generation_through_transition() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("save");
+        let handle = test_helpers::create_handle_accepting_textless_did_save(key.clone()).await;
+        pool.insert_connection(handle).await;
+
+        let host_uri = Url::parse("file:///test/save.md").unwrap();
+        let injection = BridgeInjection {
+            language: "lua".to_string(),
+            region_id: ulid::Ulid::generate().to_string(),
+            content: "print(1)".to_string(),
+        };
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap();
+        let virtual_uri =
+            VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        pool.record_sent_content_fingerprint(&virtual_uri, &key, &injection.content)
+            .await;
+
+        let transition = pool.open_transition_lock(&virtual_uri, &key);
+        let transition_guard = transition.lock().await;
+        let task_pool = Arc::clone(&pool);
+        let task_injection = injection.clone();
+        let task_uri = host_uri.clone();
+        let task = tokio::spawn(async move {
+            task_pool
+                .sync_and_forward_did_save_to_virtual_docs(&task_uri, 1, &[task_injection])
+                .await;
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if tokio::time::timeout(std::time::Duration::from_millis(10), pool.connections())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "save task never acquired the connection-generation guard"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        drop(transition_guard);
+        task.await.expect("save task must finish");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), pool.connections())
+                .await
+                .is_ok(),
+            "connection guard must release after the combined save transition"
         );
     }
 }

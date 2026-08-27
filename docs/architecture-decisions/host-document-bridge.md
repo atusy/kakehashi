@@ -93,7 +93,8 @@ Partially implemented:
     before `didSave` under the virtual document's transition lock. If the 200ms
     settle expires, the document advances, or the `didChange` enqueue fails, it
     drops the virtual `didSave` instead of running a save hook on stale or later
-    unsaved fragment text.
+    unsaved fragment text. At ingress, `didSave` is a per-document writer fence,
+    so a later wire-order `didChange` cannot overtake save-time version capture.
 
   Each recipient is **gated per-server** on the relevant capability —
   `willSave` on `textDocumentSync.willSave`, `didSave` on `textDocumentSync.save`

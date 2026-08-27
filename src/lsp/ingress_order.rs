@@ -12,9 +12,11 @@
 //! *before* buffering the returned futures, so this middleware can assign
 //! per-URI sequence tickets at `call` time:
 //!
-//! - **Writers** (`didOpen` / `didChange` / `didClose`) take the next ticket
+//! - **Writers** (`didOpen` / `didChange` / `didSave` / `didClose`) take the next ticket
 //!   and run only after the previous writer for the same document finished,
-//!   so opens, edits, and closes apply in strict wire order. Gating `didOpen`
+//!   so opens, edits, saves, and closes apply in strict wire order. Treating
+//!   `didSave` as an ordering fence keeps a later unsaved edit from overtaking
+//!   the save-time host/virtual synchronization. Gating `didOpen`
 //!   (#374) closes the two residual first-poll-order races: a `didChange`
 //!   first-polled before `didOpen` no longer misses the document and discards
 //!   its edit (open→edit), and a reopen no longer inserts ahead of a gated
@@ -33,8 +35,8 @@
 //!   (#480) is therefore a liveness fix, not just a latency one; until then
 //!   the exposure is one-time, first open of an uninstalled parser.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
-//!   triple, the edit-producing formatting/rename requests, pull
-//!   diagnostics, and `didSave`'s diagnostic snapshot) snapshot the current
+//!   triple, the edit-producing formatting/rename requests, and pull
+//!   diagnostics) snapshot the current
 //!   tail ticket at `call` time and run only once that ticket is done, so a
 //!   request observes every edit that preceded it on the wire — without
 //!   serializing its computation against later edits or other documents.
@@ -285,8 +287,7 @@ enum Role {
 /// the `kakehashi/captures` triple, which mirrors it, the edit-producing
 /// requests (formatting, rename — their edits are applied by the client to
 /// its current text, so edits computed against a stale snapshot corrupt the
-/// document), pull diagnostics, and `didSave` (its synthetic-diagnostic task
-/// snapshots the document, which must reflect every edit before the save).
+/// document), and pull diagnostics.
 /// `textDocument/codeAction` is in the same class: its
 /// `context.diagnostics` and returned edits are computed against the
 /// document snapshot (#568). `codeLens/resolve` and `codeAction/resolve` are
@@ -302,7 +303,10 @@ enum Role {
 fn classify(req: &Request) -> Option<Role> {
     let method = req.method();
     match method {
-        "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didClose" => {
+        "textDocument/didOpen"
+        | "textDocument/didChange"
+        | "textDocument/didSave"
+        | "textDocument/didClose" => {
             let uri = text_document_uri(req)?;
             Some(Role::Writer {
                 uri,
@@ -318,7 +322,6 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/prepareRename"
         | "textDocument/codeAction"
         | "textDocument/diagnostic"
-        | "textDocument/didSave"
         | "kakehashi/captures/full"
         | "kakehashi/captures/full/delta"
         | "kakehashi/captures/range" => {
@@ -641,6 +644,12 @@ mod tests {
             "didOpen must be a non-close writer"
         );
 
+        let save = classify(&notification("textDocument/didSave", URI));
+        assert!(
+            matches!(save, Some(Role::Writer { close: false, .. })),
+            "didSave must fence later didChange writers"
+        );
+
         for method in [
             "textDocument/semanticTokens/full",
             "textDocument/semanticTokens/full/delta",
@@ -651,7 +660,6 @@ mod tests {
             "textDocument/prepareRename",
             "textDocument/codeAction",
             "textDocument/diagnostic",
-            "textDocument/didSave",
             "kakehashi/captures/full",
             "kakehashi/captures/full/delta",
             "kakehashi/captures/range",
