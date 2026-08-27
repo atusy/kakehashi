@@ -178,8 +178,10 @@ impl VirtualDocumentUri {
         if !Self::is_scratch_uri(uri) {
             return None;
         }
-        let mut url = url::Url::parse(uri).ok()?;
-        let filename = url.path_segments()?.next_back()?.to_string();
+        let url = url::Url::parse(uri).ok()?;
+        let path = url.path();
+        let filename_start = path.rfind('/').map_or(0, |slash| slash + 1);
+        let filename = &path[filename_start..];
         let marker = filename.rfind(Self::SCRATCH_ID_MARKER)?;
         let suffix = &filename[marker + Self::SCRATCH_ID_MARKER.len()..];
         let extension = suffix.find('.')?;
@@ -189,12 +191,18 @@ impl VirtualDocumentUri {
         if run_number.to_string() != run || step_number.to_string() != step {
             return None;
         }
-        let canonical_filename = format!("{}{}", &filename[..marker], &suffix[extension..]);
-        url.path_segments_mut()
-            .ok()?
-            .pop()
-            .push(&canonical_filename);
-        Some(url.to_string())
+        let canonical_path = format!(
+            "{}{}{}",
+            &path[..filename_start],
+            &filename[..marker],
+            &suffix[extension..]
+        );
+        Some(format!(
+            "{}{}{}",
+            &url[..url::Position::BeforePath],
+            canonical_path,
+            &url[url::Position::AfterPath..]
+        ))
     }
 
     /// Format: `{scheme}:///{host_dir}/kakehashi-virtual-uri-{region_id}.{ext}`,
@@ -371,20 +379,28 @@ mod tests {
             Some(canonical_with_suffix.to_string())
         );
 
-        for host_uri in [
-            url_to_uri(&Url::parse("file:///project/doc.md").unwrap()),
-            "untitled:test".parse().unwrap(),
-        ] {
-            let canonical = VirtualDocumentUri::new(&host_uri, "foo.bar", "region");
-            let scratch = VirtualDocumentUri::new(
-                &host_uri,
-                "foo.bar",
-                &format!("region{}3-4", VirtualDocumentUri::SCRATCH_ID_MARKER),
-            );
-            assert_eq!(
-                VirtualDocumentUri::canonical_uri_for_scratch(&scratch.to_uri_string()),
-                Some(canonical.to_uri_string())
-            );
+        for language in ["foo.bar", "foo bar"] {
+            for host_uri in [
+                url_to_uri(&Url::parse("file:///project/doc.md").unwrap()),
+                "untitled:test".parse().unwrap(),
+            ] {
+                let canonical = VirtualDocumentUri::new(&host_uri, language, "region");
+                let scratch = VirtualDocumentUri::new(
+                    &host_uri,
+                    language,
+                    &format!("region{}3-4", VirtualDocumentUri::SCRATCH_ID_MARKER),
+                );
+                let mut scratch_url = Url::parse(&scratch.to_uri_string()).unwrap();
+                scratch_url.set_query(Some("version=1.2"));
+                scratch_url.set_fragment(Some("part.3"));
+                let mut canonical_url = Url::parse(&canonical.to_uri_string()).unwrap();
+                canonical_url.set_query(scratch_url.query());
+                canonical_url.set_fragment(scratch_url.fragment());
+                assert_eq!(
+                    VirtualDocumentUri::canonical_uri_for_scratch(scratch_url.as_str()),
+                    Some(canonical_url.to_string())
+                );
+            }
         }
     }
 
