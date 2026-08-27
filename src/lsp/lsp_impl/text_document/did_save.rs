@@ -47,8 +47,8 @@ impl Kakehashi {
         );
 
         // Serialize the host save with document edits and snapshot the latest
-        // text. Host didSave is textless, so every recipient must first receive
-        // any pending full-text didChange on the same downstream queue.
+        // text. Every recipient must first receive any pending full-text
+        // didChange on the same downstream queue.
         let edit_lock = self.documents.edit_lock(&uri);
         let edit_guard = edit_lock.lock().await;
         let saved_document = self.documents.get(&uri).map(|document| {
@@ -60,17 +60,20 @@ impl Kakehashi {
         });
 
         // Forward didSave to both bridge layers, in host-before-virt order.
-        // Each path only touches an already-open document and excludes servers
-        // that require save text, which kakehashi does not advertise upstream
-        // (#357).
+        // Each path only touches an already-open document. The downstream
+        // notification includes this tracked saved text when requested (#357).
         let pool = self.bridge.pool_arc();
         if let Some((host_text, _, _)) = &saved_document {
             pool.sync_and_notify_host_did_save(&uri, host_text).await;
         }
         drop(edit_guard);
+        if saved_document.is_none() {
+            self.documents
+                .remove_edit_lock_if_unshared(&uri, &edit_lock);
+        }
 
         // A didChange reparses and refreshes virtual documents off-ingress.
-        // Settle that pipeline explicitly before the textless virtual didSave;
+        // Settle that pipeline explicitly before the virtual didSave;
         // otherwise an immediate save can overtake its projected didChange and
         // run the downstream save hook against stale fragment text. If the
         // bounded settle fails, omit didSave rather than violate that contract.
@@ -172,5 +175,22 @@ mod tests {
             started.elapsed() <= VIRTUAL_SAVE_SETTLE_BUDGET * 2,
             "both save-time waits must remain hard-bounded"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_document_did_save_reclaims_its_edit_lock() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = url::Url::parse("file:///test/missing-save.md").unwrap();
+        let params = DidSaveTextDocumentParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+            },
+            text: None,
+        };
+
+        server.did_save_impl(params).await;
+
+        assert!(!server.documents.has_edit_lock(&uri));
     }
 }

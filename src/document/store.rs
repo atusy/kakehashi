@@ -657,6 +657,11 @@ impl DocumentStore {
         self.edit_locks.remove(uri);
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_edit_lock(&self, uri: &Url) -> bool {
+        self.edit_locks.contains_key(uri)
+    }
+
     /// Remove the edit-lock entry, but only while the map
     /// still holds the exact `Arc` the caller acquired AND nobody else
     /// holds a clone — for miss paths that probe liveness some time after

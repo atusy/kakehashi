@@ -1032,7 +1032,7 @@ fn assert_host_did_save_is_skipped(mode: &str) {
         let state = host_save_hover(&mut client).expect("hover must answer");
         assert_eq!(
             state["did"], 0,
-            "textless didSave must not reach includeText=true server: {state}"
+            "didSave must not reach an incapable server: {state}"
         );
     }
 
@@ -1040,8 +1040,39 @@ fn assert_host_did_save_is_skipped(mode: &str) {
 }
 
 #[test]
-fn e2e_host_did_save_skips_server_requiring_text() {
-    assert_host_did_save_is_skipped("will-save-include-text");
+fn e2e_host_did_save_includes_saved_text_when_requested() {
+    let (mut client, _config_dir, _init) = init_will_save_client_with_mode(
+        "[languages.markdown.bridge._self]\nenabled = true\n",
+        "will-save-include-text",
+    );
+
+    for _ in 0..300 {
+        if host_save_hover(&mut client).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": SAVE_URI } }),
+    );
+
+    let mut seen = None;
+    for _ in 0..300 {
+        if let Some(state) = host_save_hover(&mut client)
+            && state["did"] != 0
+        {
+            seen = Some(state);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = seen.expect("includeText=true server must receive didSave");
+    assert_eq!(state["didHadText"], true);
+    assert_eq!(state["didDocumentText"], MARKDOWN);
+
+    shutdown(&mut client);
 }
 
 #[test]
@@ -1276,6 +1307,43 @@ fn e2e_virt_did_save_observes_the_latest_virtual_text() {
         !saved_text.contains("print(1)"),
         "stale virtual text remained"
     );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_virt_did_save_includes_projected_text_when_requested() {
+    let (mut client, _config_dir) = init_virt_save_client_with_mode("will-save-include-text");
+
+    for _ in 0..300 {
+        if virt_save_hover(&mut client).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": VIRT_SAVE_URI } }),
+    );
+
+    let mut seen = None;
+    for _ in 0..300 {
+        if let Some(state) = virt_save_hover(&mut client)
+            && state["did"] != 0
+        {
+            seen = Some(state);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = seen.expect("includeText=true virtual server must receive didSave");
+    assert_eq!(state["didHadText"], true);
+    let text = state["didDocumentText"]
+        .as_str()
+        .expect("didSave must include projected virtual text");
+    assert!(text.contains("print(1)"));
+    assert!(!text.contains("# Title"));
 
     shutdown(&mut client);
 }

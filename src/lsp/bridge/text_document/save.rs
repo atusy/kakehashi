@@ -53,10 +53,10 @@ impl LanguageServerPool {
     }
 
     /// Bring every eligible open virtual document to `injections`' current
-    /// content and enqueue its textless didSave under the same per-document
-    /// transition. A failed didChange enqueue suppresses didSave for that
-    /// target, so a queue becoming writable between the two cannot expose a
-    /// stale save hook.
+    /// content and enqueue its didSave under the same per-document transition,
+    /// attaching the projected text when the server requests it. A failed
+    /// didChange enqueue suppresses didSave for that target, so a queue becoming
+    /// writable between the two cannot expose a stale save hook.
     pub(crate) async fn sync_and_forward_did_save_to_virtual_docs(
         &self,
         host_uri: &Url,
@@ -88,12 +88,12 @@ impl LanguageServerPool {
                 let connections = self.connections().await;
                 let Some(handle) = connections
                     .get(&connection_key)
-                    .filter(|handle| {
-                        handle.state() == ConnectionState::Ready
-                            && handle.accepts_textless_did_save()
-                    })
+                    .filter(|handle| handle.state() == ConnectionState::Ready)
                     .cloned()
                 else {
+                    continue;
+                };
+                let Some(include_text) = handle.did_save_include_text() else {
                     continue;
                 };
                 let transition = self.open_transition_lock(&virtual_uri, &connection_key);
@@ -136,10 +136,15 @@ impl LanguageServerPool {
                 };
 
                 let virtual_uri = virtual_uri.to_uri_string();
-                let notification = JsonRpcNotification::new(
-                    "textDocument/didSave",
-                    serde_json::json!({ "textDocument": { "uri": virtual_uri } }),
-                );
+                let params = if include_text {
+                    serde_json::json!({
+                        "textDocument": { "uri": virtual_uri },
+                        "text": injection.content,
+                    })
+                } else {
+                    serde_json::json!({ "textDocument": { "uri": virtual_uri } })
+                };
+                let notification = JsonRpcNotification::new("textDocument/didSave", params);
                 let _ = enqueue_did_save_if_content_synced(did_change, || {
                     handle.send_notification(notification)
                 });

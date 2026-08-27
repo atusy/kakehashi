@@ -84,8 +84,8 @@ Partially implemented:
     one, reason verbatim);
   - **`didSave`** goes to host servers that already have the real document open
     and to every open virtual document (URI rewritten for the latter). Before
-    an eligible host server receives the textless notification, kakehashi
-    queues any pending full-text `didChange` and `didSave` under the same
+    an eligible host server receives the notification, kakehashi queues any
+    pending full-text `didChange` and `didSave` under the same
     connection/document lock, so save hooks observe the editor's latest text.
     Virtual forwarding binds the parse snapshot and projected content to the
     exact incarnation/content version observed at save time, revalidates that
@@ -100,13 +100,11 @@ Partially implemented:
   `willSave` on `textDocumentSync.willSave`, `didSave` on `textDocumentSync.save`
   — which is also the safety valve: a virt server only hears about a fragment
   "save" if it opted into save hooks; one that didn't never sees it. The
-  `didSave` gate on both layers additionally **excludes servers that demand
-  `save.includeText = true`**: kakehashi advertises `includeText = false`
-  upstream and so never receives the editor's saved bytes, so rather than send a
-  contract-violating textless didSave it declines. That gate reads **static** capabilities only — a
-  *dynamic* didSave registration is not honored for forwarding, since the
-  method-name-only dynamic registry cannot carry `includeText` and could
-  otherwise smuggle an `includeText = true` server past the filter. Both are
+  `didSave` reads the server's **static** `save.includeText` preference. When it
+  is true, kakehashi attaches the tracked host text or the exact projected
+  virtual text bound to that save; otherwise it sends a textless notification.
+  A *dynamic-only* didSave registration is not honored for forwarding, since
+  the method-name-only dynamic registry cannot retain `includeText`. Both are
   fire-and-forget (no lazy spawn). Host recipients receive the real URI
   verbatim; virtual recipients receive their projected URI. `willSave` is advertised whenever a runnable
   bridge server (host or virt) is configured; `didSave` is always advertised to
