@@ -103,9 +103,9 @@ Partially implemented:
   from a virtual document. Expansion reverses only projected items, strips
   progress and partial-result tokens that the bridge cannot transform, and
   re-envelopes returned callers/callees for recursive expansion. Outgoing
-  `fromRanges` are caller-relative, so virtual-layer results translate them
-  with the request item's region offset even when the callee is a real external
-  document. Expansion rejects stale
+  `fromRanges` are caller-relative, so results translate them with the request
+  item's region offset only when that caller was projected from a virtual
+  document, regardless of whether the callee is virtual or real. Expansion rejects stale
   content, reopen incarnations, moved/non-contiguous regions, and replaced
   producers before dispatch, then rechecks content and producer identity after
   the response; cancellation targets the exact downstream request. With both
