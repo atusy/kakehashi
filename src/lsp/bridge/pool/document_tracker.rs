@@ -191,7 +191,7 @@ impl DocumentTracker {
     /// Initializes the document version and a waiter-visible claim, but does not
     /// expose the URI as opened until `mark_open_sent` runs after FIFO enqueue.
     ///
-    /// On send failure, call `unclaim_document()` to roll back.
+    /// On send failure, call `rollback_open_claim_if()` to roll back.
     pub(super) async fn try_claim_for_open(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -300,38 +300,6 @@ impl DocumentTracker {
         }
         notify.notify_waiters();
         true
-    }
-
-    /// Roll back a claim made by `try_claim_for_open()`.
-    ///
-    /// Called when the didOpen send fails, so the document can be
-    /// claimed again on a future attempt. Removes both the version
-    /// entry initialized by `try_claim_for_open()`. Pre-send claims are not in
-    /// the opened refcount or reverse index, so rollback must not touch either.
-    pub(super) async fn unclaim_document(
-        &self,
-        virtual_uri: &VirtualDocumentUri,
-        connection_key: &ConnectionKey,
-    ) {
-        let uri_string = virtual_uri.to_uri_string();
-        // Remove version first (mirrors claim order)
-        {
-            let mut versions = self.document_versions.lock().await;
-            if let Some(docs) = versions.get_mut(connection_key) {
-                docs.remove(&uri_string);
-            }
-        }
-        // Drop any fingerprint symmetrically with the version (#422) — benign today
-        // (unclaim runs right after a failed didOpen, before any didChange recorded a
-        // fingerprint) but keeps the two maps consistent if that ever changes.
-        if let Some(docs) = self
-            .document_fingerprints
-            .lock()
-            .recover_poison("DocumentTracker::document_fingerprints")
-            .get_mut(connection_key)
-        {
-            docs.remove(&uri_string);
-        }
     }
 
     /// Test helper: record the host→virtual mapping, opened ref-count, and version.
@@ -650,7 +618,7 @@ impl DocumentTracker {
     ///
     /// Used to roll back registration when didOpen send fails after
     /// register-before-send. Only removes from `host_to_virtual`; the
-    /// caller must also call `unclaim_document()` to roll back the claim.
+    /// caller must also call `rollback_open_claim_if()` to roll back the claim.
     pub(super) async fn unregister_virtual_doc(
         &self,
         host_uri: &Url,
@@ -697,6 +665,10 @@ impl DocumentTracker {
         expected_claim: &Arc<tokio::sync::Notify>,
     ) -> bool {
         let uri_string = virtual_uri.to_uri_string();
+        // Keep version deletion and claim removal atomic from an observer's
+        // perspective. The versions → claims order matches claim creation, so
+        // an observer can never see a never-enqueued version without its claim.
+        let mut versions = self.document_versions.lock().await;
         let Some((_, notify)) = self
             .open_claims
             .remove_if(&(connection_key.clone(), uri_string.clone()), |_, claim| {
@@ -705,7 +677,18 @@ impl DocumentTracker {
         else {
             return false;
         };
-        self.unclaim_document(virtual_uri, connection_key).await;
+        if let Some(docs) = versions.get_mut(connection_key) {
+            docs.remove(&uri_string);
+        }
+        drop(versions);
+        if let Some(docs) = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::rollback_open_claim_if")
+            .get_mut(connection_key)
+        {
+            docs.remove(&uri_string);
+        }
         let mut host_map = self.host_to_virtual.lock().await;
         if let Some(docs) = host_map.get_mut(host_uri) {
             docs.retain(|doc| {
@@ -2246,6 +2229,43 @@ mod tests {
             .await;
 
         assert!(!observer.snapshot().contains(&virtual_uri.to_uri_string()));
-        tracker.unclaim_document(&virtual_uri, &key).await;
+        let claim = tracker
+            .open_claim_waiter(&virtual_uri, &key)
+            .expect("claim should exist");
+        assert!(
+            tracker
+                .rollback_open_claim_if(&host_uri, &virtual_uri, &key, &claim)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_keeps_claim_visible_until_version_is_removed() {
+        use futures::FutureExt;
+
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "pending");
+        let key = ConnectionKey::for_server("lua");
+        assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
+        let claim = tracker
+            .open_claim_waiter(&virtual_uri, &key)
+            .expect("claim should exist");
+        let versions = tracker.document_versions.lock().await;
+        let mut rollback =
+            std::pin::pin!(tracker.rollback_open_claim_if(&host_uri, &virtual_uri, &key, &claim,));
+
+        assert!(
+            rollback.as_mut().now_or_never().is_none(),
+            "rollback should wait for the version lock"
+        );
+        assert!(
+            tracker.open_claim_waiter(&virtual_uri, &key).is_some(),
+            "claim must exclude the pending version until both are removed"
+        );
+
+        drop(versions);
+        assert!(rollback.await);
+        assert!(tracker.open_claim_waiter(&virtual_uri, &key).is_none());
     }
 }
