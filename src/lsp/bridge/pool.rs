@@ -656,6 +656,11 @@ impl LanguageServerPool {
             .get(key)
             .filter(|handle| handle.state() == ConnectionState::Ready)
             .filter(|handle| config.is_none_or(|config| handle.matches_launch_config(config)))
+            .filter(|_| {
+                !self
+                    .document_tracker
+                    .virtual_uri_provenance_limit_reached(key)
+            })
             .map(Arc::clone)
     }
 
@@ -2022,8 +2027,23 @@ impl LanguageServerPool {
         virtual_content: &str,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
+        let connection_generation = self.document_tracker.connection_generation(connection_key);
         let transition = self.open_transition_lock(virtual_uri, connection_key);
         let transition_guard = transition.lock().await;
+        if !self
+            .document_tracker
+            .is_document_opened_on_connection(virtual_uri, connection_key)
+            && self
+                .document_tracker
+                .virtual_uri_provenance_limit_reached(connection_key)
+        {
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("bridge: virtual URI provenance for {connection_key} requires recycling"),
+            ));
+        }
         let claim = if self
             .document_tracker
             .try_claim_for_open(virtual_uri, connection_key)
@@ -2106,10 +2126,12 @@ impl LanguageServerPool {
             self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
             return Err(e);
         }
-        if !self
-            .document_tracker
-            .mark_open_sent(virtual_uri, connection_key, &claim)
-        {
+        if !self.document_tracker.mark_open_sent(
+            virtual_uri,
+            connection_key,
+            connection_generation,
+            &claim,
+        ) {
             claim_guard.disarm();
             drop(claim_guard);
             drop(transition_guard);
@@ -3143,7 +3165,15 @@ impl LanguageServerPool {
                         .then(|| existing.cloned())
                         .flatten();
                     if let Some(handle) = &invalidated_handle {
-                        handle.begin_shutdown();
+                        if provenance_limit_reached {
+                            handle.set_state(ConnectionState::Failed);
+                            shutdown_invalidated_connection(
+                                connection_key.clone(),
+                                Arc::clone(handle),
+                            );
+                        } else {
+                            handle.begin_shutdown();
+                        }
                     }
                     // Drop the dead connection's document state with it: the
                     // replacement process has nothing open, so the lazy host
@@ -3170,7 +3200,7 @@ impl LanguageServerPool {
                     // entry remains and the next acquire retries the idempotent
                     // purge instead of spawning over partial document state.
                     connections.remove(&connection_key);
-                    if let Some(handle) = invalidated_handle {
+                    if let Some(handle) = invalidated_handle.filter(|_| !provenance_limit_reached) {
                         shutdown_invalidated_connection(connection_key.clone(), handle);
                     }
                 }
@@ -6619,6 +6649,80 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn saturated_provenance_rejects_fast_paths_and_recycles_the_generation() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::shared("lua");
+        let config = test_helpers::devnull_config_for_language("lua");
+        let old = test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        old.record_launch_config(&config);
+        pool.connections
+            .lock()
+            .await
+            .insert(key.clone(), Arc::clone(&old));
+        pool.document_tracker.saturate_virtual_uri_provenance(&key);
+
+        assert!(
+            pool.ready_connection_by_key_for_config(&key, Some(&config))
+                .await
+                .is_none(),
+            "exact-producer fast paths must not admit a saturated generation"
+        );
+
+        let _ = pool
+            .get_or_create_connection_resolved(
+                "lua",
+                &config,
+                key.clone(),
+                None,
+                Duration::from_millis(100),
+                true,
+                None,
+            )
+            .await;
+
+        let replacement = pool
+            .connections
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("recycle must install a replacement handle");
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        assert_eq!(pool.document_tracker.connection_generation(&key), 1);
+        assert!(
+            !pool
+                .document_tracker
+                .virtual_uri_provenance_limit_reached(&key),
+            "replacement generation starts with empty provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_provenance_rejects_a_new_didopen_before_enqueue() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua");
+        pool.document_tracker.saturate_virtual_uri_provenance(&key);
+        let host_uri = Url::parse("file:///test/saturated.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+
+        let error = pool
+            .ensure_document_opened(
+                &mut sender,
+                &host_uri,
+                &virtual_uri,
+                "print('bounded')",
+                &key,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert!(rx.try_recv().is_err(), "didOpen must not be enqueued");
+        assert!(!pool.is_document_opened(&virtual_uri));
+    }
+
     /// A connection mid-handshake is LIVE, and for a shared-instance key it is
     /// the only way to reach the instance at all — the revive path cannot
     /// re-root one without a document. Dropping it would fail soft on a
@@ -8739,10 +8843,12 @@ mod tests {
             "didChange must serialize behind the pending didOpen"
         );
 
-        assert!(
-            pool.document_tracker
-                .mark_open_sent(&virtual_uri, &connection_key, &claim)
-        );
+        assert!(pool.document_tracker.mark_open_sent(
+            &virtual_uri,
+            &connection_key,
+            pool.document_tracker.connection_generation(&connection_key),
+            &claim,
+        ));
         drop(transition_guard);
         forwarding.await.unwrap();
         assert_eq!(
