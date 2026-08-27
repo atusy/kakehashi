@@ -40,7 +40,7 @@ Partially implemented:
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
   inlayHint, documentSymbol, documentLink, documentColor, colorPresentation,
   foldingRange, codeLens, prepareCallHierarchy, incomingCalls, outgoingCalls,
-  prepareTypeHierarchy, supertypes, subtypes,
+  prepareTypeHierarchy, supertypes, subtypes, inlineValue,
   formatting, and rangeFormatting (which shares the formatting layer key).
   Diagnostics are covered with real cross-layer `concatenated` (the
   cross-layer-aggregation diagnostics phase): pull and synthetic push both
