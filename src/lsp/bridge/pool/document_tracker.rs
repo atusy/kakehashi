@@ -682,6 +682,18 @@ impl DocumentTracker {
             .unwrap_or_default()
     }
 
+    pub(super) async fn virtual_uris_for_connection(
+        &self,
+        connection_key: &ConnectionKey,
+    ) -> std::collections::HashSet<String> {
+        self.document_versions
+            .lock()
+            .await
+            .get(connection_key)
+            .map(|documents| documents.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Remove and return all virtual documents for a host URI.
     ///
     /// Used by did_close module for cleanup.
