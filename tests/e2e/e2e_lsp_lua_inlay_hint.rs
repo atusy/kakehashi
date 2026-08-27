@@ -212,6 +212,16 @@ fn e2e_inlay_hint_resolve_round_trips_to_virtual_origin() {
     let hint = inlay_hints_with_retry(&mut client, uri, 3, 5).remove(0);
     assert_eq!(hint["position"], json!({ "line": 3, "character": 1 }));
     assert_eq!(hint["data"]["kakehashi"]["origin"], "mock-inlay-hint");
+    assert_eq!(
+        hint["textEdits"][0]["range"]["start"],
+        json!({ "line": 3, "character": 0 })
+    );
+    assert_eq!(hint["label"][0]["location"]["uri"], uri);
+    assert_eq!(
+        hint["label"][0]["location"]["range"]["start"],
+        json!({ "line": 3, "character": 0 })
+    );
+    assert_ne!(hint["label"][0]["command"]["command"], "mock.hint");
 
     let response = client.send_request("inlayHint/resolve", hint.clone());
     assert!(response.get("error").is_none(), "{response}");
@@ -223,9 +233,32 @@ fn e2e_inlay_hint_resolve_round_trips_to_virtual_origin() {
         json!({ "line": 0, "character": 1 })
     );
     assert_eq!(
+        resolved["data"]["kakehashi"]["inner"]["receivedTextEdit"]["start"],
+        json!({ "line": 0, "character": 0 })
+    );
+    assert!(
+        resolved["data"]["kakehashi"]["inner"]["receivedLocation"]["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.contains("kakehashi-virtual-uri-"))
+    );
+    assert_eq!(
+        resolved["data"]["kakehashi"]["inner"]["receivedLocation"]["range"]["start"],
+        json!({ "line": 0, "character": 0 })
+    );
+    assert_eq!(
+        resolved["data"]["kakehashi"]["inner"]["receivedCommand"],
+        "mock.hint"
+    );
+    assert_eq!(
         resolved["textEdits"][0]["range"]["start"],
         json!({ "line": 3, "character": 0 })
     );
+    assert_eq!(resolved["label"][0]["location"]["uri"], uri);
+    assert_eq!(
+        resolved["label"][0]["location"]["range"]["start"],
+        json!({ "line": 3, "character": 0 })
+    );
+    assert_ne!(resolved["label"][0]["command"]["command"], "mock.resolved");
 
     client.send_notification(
         "textDocument/didChange",
@@ -306,12 +339,23 @@ fn e2e_inlay_hint_resolve_round_trips_to_host_origin() {
         response["result"]["data"]["kakehashi"]["inner"]["receivedPosition"],
         hint["position"]
     );
+    assert_eq!(
+        response["result"]["data"]["kakehashi"]["inner"]["receivedTextEdit"],
+        hint["textEdits"][0]["range"]
+    );
+    assert_eq!(
+        response["result"]["data"]["kakehashi"]["inner"]["receivedLocation"],
+        hint["label"][0]["location"]
+    );
+    assert_eq!(
+        response["result"]["data"]["kakehashi"]["inner"]["receivedCommand"],
+        "mock.hint"
+    );
 
     shutdown_client(&mut client);
 }
 
-#[test]
-fn e2e_virtual_inlay_hint_from_replaced_producer_stays_unresolved() {
+fn assert_virtual_inlay_hint_replacement_fails_soft(change_pool_key: bool) {
     let (mut client, _config_dir) =
         init_mock_inlay_hint_client("inlay-hint-resolve", "lua", false, None);
     let uri = "file:///test_inlay_hint_replacement.md";
@@ -329,13 +373,17 @@ fn e2e_virtual_inlay_hint_from_replaced_producer_stays_unresolved() {
     open(&mut client);
     let old_hint = inlay_hints_with_retry(&mut client, uri, 3, 5).remove(0);
 
+    let mut server = json!({
+        "cmd": [mock_formatter_bin(), "inlay-hint-resolve-replacement"],
+        "languages": ["lua"]
+    });
+    if change_pool_key {
+        server["preferSharedInstance"] = json!(true);
+    }
     client.send_notification(
         "workspace/didChangeConfiguration",
         json!({ "settings": { "languageServers": {
-            "mock-inlay-hint": {
-                "cmd": [mock_formatter_bin(), "inlay-hint-resolve-replacement"],
-                "languages": ["lua"]
-            }
+            "mock-inlay-hint": server
         }}}),
     );
     client.send_notification(
@@ -344,14 +392,110 @@ fn e2e_virtual_inlay_hint_from_replaced_producer_stays_unresolved() {
     );
     open(&mut client);
     let replacement_hint = inlay_hints_with_retry(&mut client, uri, 3, 5).remove(0);
+    let old_envelope = &old_hint["data"]["kakehashi"];
+    let replacement_envelope = &replacement_hint["data"]["kakehashi"];
+    if change_pool_key {
+        assert_ne!(
+            old_envelope["connection_key"],
+            replacement_envelope["connection_key"]
+        );
+        assert_eq!(
+            old_envelope["connection_generation"],
+            replacement_envelope["connection_generation"]
+        );
+    } else {
+        assert_eq!(
+            old_envelope["connection_key"],
+            replacement_envelope["connection_key"]
+        );
+        assert_ne!(
+            old_envelope["connection_generation"],
+            replacement_envelope["connection_generation"]
+        );
+    }
+    let replacement = client.send_request("inlayHint/resolve", replacement_hint.clone());
     assert_eq!(
-        old_hint["data"]["kakehashi"]["connection_key"],
-        replacement_hint["data"]["kakehashi"]["connection_key"]
+        replacement["result"]["tooltip"],
+        "replacement resolved:hint-1"
     );
-    assert_ne!(
-        old_hint["data"]["kakehashi"]["connection_generation"],
-        replacement_hint["data"]["kakehashi"]["connection_generation"]
+
+    // Keep CURRENT incarnation + region geometry, replacing only producer
+    // identity. This isolates the key/generation gates from freshness checks.
+    let mut stale_hint = replacement_hint;
+    stale_hint["data"]["kakehashi"]["connection_key"] = old_envelope["connection_key"].clone();
+    stale_hint["data"]["kakehashi"]["connection_generation"] =
+        old_envelope["connection_generation"].clone();
+    stale_hint["data"]["kakehashi"]["inner"] = old_envelope["inner"].clone();
+    let stale_data = stale_hint["data"].clone();
+    let stale = client.send_request("inlayHint/resolve", stale_hint);
+    assert!(stale.get("error").is_none(), "{stale}");
+    assert!(stale["result"].get("tooltip").is_none());
+    assert_eq!(stale["result"]["data"], stale_data);
+
+    shutdown_client(&mut client);
+}
+
+#[test]
+fn e2e_virtual_inlay_hint_from_same_key_replacement_stays_unresolved() {
+    assert_virtual_inlay_hint_replacement_fails_soft(false);
+}
+
+#[test]
+fn e2e_virtual_inlay_hint_from_different_key_replacement_stays_unresolved() {
+    assert_virtual_inlay_hint_replacement_fails_soft(true);
+}
+
+fn assert_host_inlay_hint_replacement_fails_soft(change_pool_key: bool) {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-resolve", "lua", true, None);
+    let uri = "file:///test_host_inlay_hint_replacement.lua";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "lua",
+            "version": 1,
+            "text": "local x = 1\n"
+        }}),
     );
+    let old_hint = inlay_hints_with_retry(&mut client, uri, 0, 1).remove(0);
+
+    let mut server = json!({
+        "cmd": [mock_formatter_bin(), "inlay-hint-resolve-replacement"],
+        "languages": ["lua"]
+    });
+    if change_pool_key {
+        server["preferSharedInstance"] = json!(true);
+    }
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": {
+            "languageServers": { "mock-inlay-hint": server },
+            "languages": { "lua": { "bridge": { "_self": { "enabled": true } } } }
+        }}),
+    );
+    let replacement_hint = inlay_hints_with_retry(&mut client, uri, 0, 1).remove(0);
+    let old_envelope = &old_hint["data"]["kakehashi"];
+    let replacement_envelope = &replacement_hint["data"]["kakehashi"];
+    if change_pool_key {
+        assert_ne!(
+            old_envelope["connection_key"],
+            replacement_envelope["connection_key"]
+        );
+        assert_eq!(
+            old_envelope["connection_generation"],
+            replacement_envelope["connection_generation"]
+        );
+    } else {
+        assert_eq!(
+            old_envelope["connection_key"],
+            replacement_envelope["connection_key"]
+        );
+        assert_ne!(
+            old_envelope["connection_generation"],
+            replacement_envelope["connection_generation"]
+        );
+    }
     let replacement = client.send_request("inlayHint/resolve", replacement_hint);
     assert_eq!(
         replacement["result"]["tooltip"],
@@ -363,8 +507,78 @@ fn e2e_virtual_inlay_hint_from_replaced_producer_stays_unresolved() {
     assert!(stale.get("error").is_none(), "{stale}");
     assert!(stale["result"].get("tooltip").is_none());
     assert_eq!(stale["result"]["data"], old_data);
-
     shutdown_client(&mut client);
+}
+
+#[test]
+fn e2e_host_inlay_hint_from_same_key_replacement_stays_unresolved() {
+    assert_host_inlay_hint_replacement_fails_soft(false);
+}
+
+#[test]
+fn e2e_host_inlay_hint_from_different_key_replacement_stays_unresolved() {
+    assert_host_inlay_hint_replacement_fails_soft(true);
+}
+
+#[test]
+fn e2e_inlay_hint_without_resolver_keeps_ordinary_data_bare_on_both_layers() {
+    for host in [false, true] {
+        let (mut client, _config_dir) =
+            init_mock_inlay_hint_client("inlay-hint-no-resolve", "lua", host, None);
+        let uri = if host {
+            "file:///test_bare_host_inlay_hint.lua"
+        } else {
+            "file:///test_bare_virtual_inlay_hint.md"
+        };
+        let (language_id, text, start, end) = if host {
+            ("lua", "local x = 1\n", 0, 1)
+        } else {
+            ("markdown", "```lua\nlocal x = 1\n```\n", 1, 3)
+        };
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({ "textDocument": {
+                "uri": uri, "languageId": language_id, "version": 1, "text": text
+            }}),
+        );
+        let hint = inlay_hints_with_retry(&mut client, uri, start, end).remove(0);
+        assert_eq!(hint["data"]["mock"], "hint-1");
+        assert!(hint["data"].get("kakehashi").is_none());
+        shutdown_client(&mut client);
+    }
+}
+
+#[test]
+fn e2e_inlay_hint_reserved_data_collision_round_trips_on_both_layers() {
+    for host in [false, true] {
+        let (mut client, _config_dir) =
+            init_mock_inlay_hint_client("inlay-hint-no-resolve-reserved-data", "lua", host, None);
+        let uri = if host {
+            "file:///test_collision_host_inlay_hint.lua"
+        } else {
+            "file:///test_collision_virtual_inlay_hint.md"
+        };
+        let (language_id, text, start, end) = if host {
+            ("lua", "local x = 1\n", 0, 1)
+        } else {
+            ("markdown", "```lua\nlocal x = 1\n```\n", 1, 3)
+        };
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({ "textDocument": {
+                "uri": uri, "languageId": language_id, "version": 1, "text": text
+            }}),
+        );
+        let hint = inlay_hints_with_retry(&mut client, uri, start, end).remove(0);
+        assert_eq!(
+            hint["data"]["kakehashi"]["inner"],
+            json!({ "kakehashi": { "origin": "downstream" } })
+        );
+        let response = client.send_request("inlayHint/resolve", hint.clone());
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"], hint);
+        shutdown_client(&mut client);
+    }
 }
 
 #[test]

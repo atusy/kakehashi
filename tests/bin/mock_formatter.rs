@@ -1478,7 +1478,24 @@ fn main() {
                         };
                         json!([{
                             "position": { "line": 0, "character": 1 },
-                            "label": ": number",
+                            "label": [{
+                                "value": ": number",
+                                "location": {
+                                    "uri": uri,
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 1 }
+                                    }
+                                },
+                                "command": { "title": "Hint", "command": "mock.hint" }
+                            }],
+                            "textEdits": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 0 }
+                                },
+                                "newText": "existing "
+                            }],
                             "data": data
                         }])
                     })
@@ -1504,12 +1521,34 @@ fn main() {
                     .pointer("/params/position")
                     .cloned()
                     .unwrap_or(Value::Null);
+                data["receivedTextEdit"] = message
+                    .pointer("/params/textEdits/0/range")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                data["receivedLocation"] = message
+                    .pointer("/params/label/0/location")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                data["receivedCommand"] = message
+                    .pointer("/params/label/0/command/command")
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 respond(
                     &mut writer,
                     id,
                     json!({
                         "position": { "line": 9, "character": 9 },
-                        "label": ": number",
+                        "label": [{
+                            "value": ": number",
+                            "location": {
+                                "uri": data["uri"],
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 1 }
+                                }
+                            },
+                            "command": { "title": "Resolved hint", "command": "mock.resolved" }
+                        }],
                         "tooltip": format!(
                             "{} resolved:{}",
                             if mode == "inlay-hint-resolve-replacement" {
