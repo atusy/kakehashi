@@ -51,6 +51,8 @@ pub(crate) struct InlayHintEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) incarnation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) content_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) connection_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) connection_key: Option<ConnectionKey>,
@@ -70,12 +72,18 @@ impl InlayHintEnvelope {
     }
 }
 
+pub(crate) struct InlayHintDocumentRevision {
+    pub(crate) incarnation: Option<u64>,
+    pub(crate) content_version: u64,
+}
+
 struct InlayHintEnvelopeContext<'a> {
     server_name: &'a str,
     host_uri: &'a str,
     region_id: &'a str,
     injection_language: &'a str,
     incarnation: Option<u64>,
+    content_version: Option<u64>,
     connection_generation: u64,
     connection_key: &'a ConnectionKey,
     offset: &'a RegionOffset,
@@ -90,6 +98,7 @@ fn envelope_hint_data(hint: &mut InlayHint, ctx: &InlayHintEnvelopeContext<'_>) 
         region_id: ctx.region_id.to_string(),
         injection_language: ctx.injection_language.to_string(),
         incarnation: ctx.incarnation,
+        content_version: ctx.content_version,
         connection_generation: Some(ctx.connection_generation),
         connection_key: Some(ctx.connection_key.clone()),
         offset: EnvelopeOffset::from(ctx.offset),
@@ -119,7 +128,7 @@ pub(crate) fn envelope_host_inlay_hints(
     hints: &mut [InlayHint],
     server_name: &str,
     host_uri: &str,
-    incarnation: Option<u64>,
+    revision: InlayHintDocumentRevision,
     connection_generation: u64,
     connection_key: &ConnectionKey,
     server_resolves: bool,
@@ -130,7 +139,8 @@ pub(crate) fn envelope_host_inlay_hints(
         host_uri,
         region_id: "",
         injection_language: "",
-        incarnation,
+        incarnation: revision.incarnation,
+        content_version: Some(revision.content_version),
         connection_generation,
         connection_key,
         offset: &offset,
@@ -167,6 +177,7 @@ impl LanguageServerPool {
         region_id: &str,
         offset: RegionOffset,
         virtual_content: &str,
+        content_version: u64,
         upstream_request_id: Option<UpstreamId>,
         client_progress_token: Option<NumberOrString>,
     ) -> io::Result<Option<Vec<InlayHint>>> {
@@ -216,6 +227,7 @@ impl LanguageServerPool {
                         region_id,
                         injection_language,
                         incarnation: host_incarnation,
+                        content_version: Some(content_version),
                         connection_generation,
                         connection_key: &connection_key,
                         offset: ctx.offset,
@@ -455,14 +467,43 @@ impl LanguageServerPool {
         } else {
             encode_inlay_hint_commands(&mut resolved, connection_key);
         }
-        // Position identifies the original hint and is not a lazy field.
-        resolved.position = hint.position;
-        if resolved.data.is_none() {
-            resolved.data = hint.data.take();
-        }
+        let mut resolved = merge_resolved_inlay_hint(hint, resolved);
         re_envelope_hint(&mut resolved, &envelope);
         resolved
     }
+}
+
+/// Merge only fields that the LSP permits an inlay-hint resolver to fill lazily.
+///
+/// A resolver may return a partial-looking hint in practice. Keep the eager
+/// identity fields from the original response and retain existing lazy values
+/// when the resolver omits them.
+fn merge_resolved_inlay_hint(mut original: InlayHint, mut resolved: InlayHint) -> InlayHint {
+    original.tooltip = resolved.tooltip.take().or(original.tooltip);
+    original.text_edits = resolved.text_edits.take().or(original.text_edits);
+    original.data = resolved.data.take().or(original.data);
+
+    if let (InlayHintLabel::LabelParts(original_parts), InlayHintLabel::LabelParts(resolved_parts)) =
+        (&mut original.label, resolved.label)
+        && original_parts.len() == resolved_parts.len()
+    {
+        for (original_part, mut resolved_part) in original_parts.iter_mut().zip(resolved_parts) {
+            original_part.tooltip = resolved_part
+                .tooltip
+                .take()
+                .or(original_part.tooltip.take());
+            original_part.location = resolved_part
+                .location
+                .take()
+                .or(original_part.location.take());
+            original_part.command = resolved_part
+                .command
+                .take()
+                .or(original_part.command.take());
+        }
+    }
+
+    original
 }
 
 fn build_inlay_hint_resolve_request(
@@ -644,6 +685,7 @@ fn transform_inlay_hint_response_to_host(
             region_id: "test-region",
             injection_language: "test",
             incarnation: Some(1),
+            content_version: Some(1),
             connection_generation: 1,
             connection_key: &key,
             offset,
@@ -693,6 +735,7 @@ mod tests {
                 region_id: "region",
                 injection_language: "lua",
                 incarnation: Some(2),
+                content_version: Some(3),
                 connection_generation: 5,
                 connection_key: &key,
                 offset: &offset,
@@ -727,7 +770,10 @@ mod tests {
             &mut resolvable,
             "lua-ls",
             "file:///test.lua",
-            Some(2),
+            InlayHintDocumentRevision {
+                incarnation: Some(2),
+                content_version: 3,
+            },
             5,
             &key,
             true,
@@ -746,7 +792,10 @@ mod tests {
             &mut bare,
             "lua-ls",
             "file:///test.lua",
-            Some(2),
+            InlayHintDocumentRevision {
+                incarnation: Some(2),
+                content_version: 3,
+            },
             5,
             &ConnectionKey::shared("lua-ls"),
             false,
@@ -763,7 +812,10 @@ mod tests {
             &mut collision,
             "lua-ls",
             "file:///test.lua",
-            Some(2),
+            InlayHintDocumentRevision {
+                incarnation: Some(2),
+                content_version: 3,
+            },
             5,
             &ConnectionKey::shared("lua-ls"),
             false,
@@ -786,6 +838,52 @@ mod tests {
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["method"], "inlayHint/resolve");
         assert_eq!(value["params"]["data"], json!({ "token": 9 }));
+    }
+
+    #[test]
+    fn resolved_inlay_hint_updates_only_lazy_fields() {
+        let original: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 4, "character": 2 },
+            "label": [{
+                "value": ": original",
+                "tooltip": "eager part tooltip",
+                "command": { "title": "eager", "command": "eager.command" }
+            }],
+            "kind": 1,
+            "tooltip": "eager tooltip",
+            "paddingLeft": true,
+            "paddingRight": false,
+            "data": { "token": 7 }
+        }))
+        .unwrap();
+        let resolved: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 99, "character": 99 },
+            "label": [{
+                "value": ": replacement",
+                "tooltip": "resolved part tooltip"
+            }],
+            "tooltip": "resolved tooltip",
+            "textEdits": [{
+                "range": {
+                    "start": { "line": 4, "character": 0 },
+                    "end": { "line": 4, "character": 0 }
+                },
+                "newText": "resolved"
+            }]
+        }))
+        .unwrap();
+
+        let merged = serde_json::to_value(merge_resolved_inlay_hint(original, resolved)).unwrap();
+        assert_eq!(merged["position"], json!({ "line": 4, "character": 2 }));
+        assert_eq!(merged["label"][0]["value"], ": original");
+        assert_eq!(merged["label"][0]["tooltip"], "resolved part tooltip");
+        assert_eq!(merged["label"][0]["command"]["command"], "eager.command");
+        assert_eq!(merged["kind"], 1);
+        assert_eq!(merged["paddingLeft"], true);
+        assert_eq!(merged["paddingRight"], false);
+        assert_eq!(merged["tooltip"], "resolved tooltip");
+        assert_eq!(merged["textEdits"][0]["newText"], "resolved");
+        assert_eq!(merged["data"], json!({ "token": 7 }));
     }
 
     #[test]

@@ -15,7 +15,8 @@ use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{
-    HostDocument, InlayHintEnvelope, envelope_host_inlay_hints, extract_inlay_hint_envelope,
+    HostDocument, InlayHintDocumentRevision, InlayHintEnvelope, envelope_host_inlay_hints,
+    extract_inlay_hint_envelope,
 };
 use crate::lsp::current_upstream_id;
 use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
@@ -32,9 +33,15 @@ impl Kakehashi {
         let work_done_token = params.work_done_progress_params.work_done_token;
         let lsp_uri = params.text_document.uri;
         let range = params.range;
+        let Some(content_version) = url::Url::parse(lsp_uri.as_str())
+            .ok()
+            .and_then(|uri| self.documents.get(&uri).map(|doc| doc.content_version()))
+        else {
+            return Ok(None);
+        };
 
-        let virt = self.inlay_hint_virt_layer(&lsp_uri, range, work_done_token);
-        let host = self.inlay_hint_host_layer(&lsp_uri, raw_params);
+        let virt = self.inlay_hint_virt_layer(&lsp_uri, range, work_done_token, content_version);
+        let host = self.inlay_hint_host_layer(&lsp_uri, raw_params, content_version);
         self.walk_layer_futures(
             &lsp_uri,
             METHOD,
@@ -51,6 +58,7 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         raw_params: serde_json::Value,
+        content_version: u64,
     ) -> Result<Option<Vec<InlayHint>>> {
         let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
             return Ok(None);
@@ -89,6 +97,7 @@ impl Kakehashi {
                         server_name: t.server_name,
                         host_uri: t.uri.to_string(),
                         incarnation: Some(raw.incarnation),
+                        content_version,
                         connection_generation: raw.connection_generation,
                         server_resolves: raw.handle.has_capability("inlayHint/resolve"),
                         connection_key: raw.handle.key().clone(),
@@ -111,6 +120,7 @@ impl Kakehashi {
         lsp_uri: &Uri,
         range: Range,
         client_progress_token: Option<NumberOrString>,
+        content_version: u64,
     ) -> Result<Option<Vec<InlayHint>>> {
         let Some(mut ctx) = self
             .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
@@ -141,6 +151,7 @@ impl Kakehashi {
                         &t.region_id,
                         t.offset,
                         &t.virtual_content,
+                        content_version,
                         t.upstream_id,
                         t.client_progress_token,
                     )
@@ -161,6 +172,9 @@ impl Kakehashi {
             return Ok(hint);
         };
         let unresolved = hint.clone();
+        if !self.inlay_hint_content_is_fresh(&envelope) {
+            return Ok(hint);
+        }
         let region_geometry = if envelope.is_host_layer() {
             None
         } else {
@@ -168,7 +182,7 @@ impl Kakehashi {
             else {
                 return Ok(hint);
             };
-            if offset != crate::lsp::bridge::RegionOffset::from(&envelope.offset) {
+            if !inlay_hint_region_is_resolvable(&envelope, &offset, contiguous) {
                 return Ok(hint);
             }
             Some((region_end, contiguous))
@@ -212,6 +226,9 @@ impl Kakehashi {
         let Ok(uri) = url::Url::parse(&envelope.host_uri) else {
             return false;
         };
+        if !self.inlay_hint_content_is_fresh(envelope) {
+            return false;
+        }
         if envelope
             .incarnation
             .is_none_or(|expected| pool.current_host_incarnation(&uri) != Some(expected))
@@ -225,6 +242,17 @@ impl Kakehashi {
                         && expected_region_geometry == Some((region_end, contiguous))
                 },
             )
+    }
+
+    fn inlay_hint_content_is_fresh(&self, envelope: &InlayHintEnvelope) -> bool {
+        let Ok(uri) = url::Url::parse(&envelope.host_uri) else {
+            return false;
+        };
+        envelope.content_version.is_some_and(|expected| {
+            self.documents
+                .get(&uri)
+                .is_some_and(|document| document.content_version() == expected)
+        })
     }
 
     fn inlay_hint_region_geometry(
@@ -246,11 +274,20 @@ impl Kakehashi {
     }
 }
 
+fn inlay_hint_region_is_resolvable(
+    envelope: &InlayHintEnvelope,
+    offset: &crate::lsp::bridge::RegionOffset,
+    contiguous: bool,
+) -> bool {
+    contiguous && *offset == crate::lsp::bridge::RegionOffset::from(&envelope.offset)
+}
+
 struct HostInlayHints {
     hints: Vec<InlayHint>,
     server_name: String,
     host_uri: String,
     incarnation: Option<u64>,
+    content_version: u64,
     connection_generation: u64,
     server_resolves: bool,
     connection_key: crate::lsp::bridge::ConnectionKey,
@@ -262,11 +299,43 @@ impl HostInlayHints {
             &mut self.hints,
             &self.server_name,
             &self.host_uri,
-            self.incarnation,
+            InlayHintDocumentRevision {
+                incarnation: self.incarnation,
+                content_version: self.content_version,
+            },
             self.connection_generation,
             &self.connection_key,
             self.server_resolves,
         );
         self.hints
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn envelope() -> InlayHintEnvelope {
+        serde_json::from_value(serde_json::json!({
+            "origin": "test",
+            "host_uri": "file:///test.md",
+            "region_id": "region",
+            "injection_language": "lua",
+            "incarnation": 1,
+            "content_version": 1,
+            "connection_generation": 1,
+            "offset": { "line": 3, "column": 2 },
+            "inner": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn inlay_hint_resolve_rejects_non_contiguous_region() {
+        let envelope = envelope();
+        let offset = crate::lsp::bridge::RegionOffset::new(3, 2);
+
+        assert!(inlay_hint_region_is_resolvable(&envelope, &offset, true));
+        assert!(!inlay_hint_region_is_resolvable(&envelope, &offset, false));
     }
 }

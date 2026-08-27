@@ -38,7 +38,8 @@ mod hover;
 mod implementation;
 mod inlay_hint;
 pub(crate) use inlay_hint::{
-    InlayHintEnvelope, envelope_host_inlay_hints, extract_inlay_hint_envelope,
+    InlayHintDocumentRevision, InlayHintEnvelope, envelope_host_inlay_hints,
+    extract_inlay_hint_envelope,
 };
 mod linked_editing_range;
 mod moniker;
