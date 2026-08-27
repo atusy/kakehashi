@@ -1,16 +1,18 @@
 //! Type-hierarchy requests for host and virtual bridge layers.
 
+use std::collections::HashSet;
 use std::io;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
-    NumberOrString, Position, TextDocumentIdentifier, TextDocumentPositionParams,
-    TypeHierarchyItem, TypeHierarchyPrepareParams, Uri, WorkDoneProgressParams,
+    NumberOrString, Position, Range, SymbolKind, SymbolTag, TextDocumentIdentifier,
+    TextDocumentPositionParams, TypeHierarchyItem, TypeHierarchyPrepareParams, Uri,
+    WorkDoneProgressParams,
 };
 
 use super::super::pool::ConnectionKey;
-use super::super::pool::{LanguageServerPool, UpstreamId};
+use super::super::pool::{LanguageServerPool, UpstreamId, VirtualUriObserver};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
     translate_host_position_to_virtual, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
@@ -50,6 +52,8 @@ impl LanguageServerPool {
         }
         let connection_key = handle.key().clone();
         let connection_generation = self.document_connection_generation(&connection_key);
+        let virtual_uri_observer =
+            self.observe_virtual_uris_for_connection(&connection_key, connection_generation);
         self.execute_position_bridge_request_with_handle_for_incarnation(
             handle,
             host_uri,
@@ -77,6 +81,7 @@ impl LanguageServerPool {
                     &ctx.virtual_uri_string,
                     ctx.host_uri_lsp,
                     ctx.offset,
+                    &virtual_uri_observer,
                     &TypeHierarchyEnvelopeContext {
                         server_name,
                         host_uri: host_uri.as_str(),
@@ -213,6 +218,7 @@ fn transform_type_hierarchy_prepare_response_to_host(
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
+    known_virtual_uris: &impl KnownVirtualUris,
     envelope_ctx: &TypeHierarchyEnvelopeContext<'_>,
 ) -> io::Result<Option<Vec<TypeHierarchyItem>>> {
     const METHOD: &str = "textDocument/prepareTypeHierarchy";
@@ -227,7 +233,7 @@ fn transform_type_hierarchy_prepare_response_to_host(
     if result.is_null() {
         return Ok(None);
     }
-    let items: Vec<TypeHierarchyItem> = serde_json::from_value(result).map_err(|error| {
+    let items = parse_type_hierarchy_items(result).map_err(|error| {
         io::Error::other(format!(
             "malformed {METHOD} result from downstream server: {error}"
         ))
@@ -235,7 +241,7 @@ fn transform_type_hierarchy_prepare_response_to_host(
     let items = items
         .into_iter()
         .filter_map(|mut item| {
-            let projected_from_virtual = if VirtualDocumentUri::is_virtual_uri(item.uri.as_str()) {
+            let projected_from_virtual = if known_virtual_uris.contains_uri(item.uri.as_str()) {
                 if item.uri.as_str() != request_virtual_uri {
                     return None;
                 }
@@ -268,6 +274,57 @@ fn transform_type_hierarchy_prepare_response_to_host(
         })
         .collect();
     Ok(Some(items))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireTypeHierarchyItem {
+    name: String,
+    kind: SymbolKind,
+    tags: Option<Vec<SymbolTag>>,
+    detail: Option<String>,
+    uri: Uri,
+    range: Range,
+    selection_range: Range,
+    data: Option<Value>,
+}
+
+pub(crate) fn parse_type_hierarchy_items(
+    value: Value,
+) -> serde_json::Result<Vec<TypeHierarchyItem>> {
+    serde_json::from_value::<Vec<WireTypeHierarchyItem>>(value).map(|items| {
+        items
+            .into_iter()
+            .map(|item| TypeHierarchyItem {
+                name: item.name,
+                kind: item.kind,
+                // LSP currently defines only `Deprecated`, so the incorrect
+                // scalar field in ls-types can retain every known semantic bit.
+                tags: item.tags.and_then(|tags| tags.into_iter().next()),
+                detail: item.detail,
+                uri: item.uri,
+                range: item.range,
+                selection_range: item.selection_range,
+                data: item.data,
+            })
+            .collect()
+    })
+}
+
+trait KnownVirtualUris {
+    fn contains_uri(&self, uri: &str) -> bool;
+}
+
+impl KnownVirtualUris for HashSet<String> {
+    fn contains_uri(&self, uri: &str) -> bool {
+        self.contains(uri)
+    }
+}
+
+impl KnownVirtualUris for VirtualUriObserver {
+    fn contains_uri(&self, uri: &str) -> bool {
+        self.contains(uri)
+    }
 }
 
 #[cfg(test)]
@@ -319,11 +376,13 @@ mod tests {
             },
             "data": { "token": 9 }
         }]});
+        let known_virtual_uris = HashSet::from([virtual_uri.to_uri_string()]);
         let items = transform_type_hierarchy_prepare_response_to_host(
             response,
             &virtual_uri.to_uri_string(),
             &host_uri,
             &offset,
+            &known_virtual_uris,
             &TypeHierarchyEnvelopeContext {
                 server_name: "lua-ls",
                 host_uri: host_uri.as_str(),
@@ -354,5 +413,65 @@ mod tests {
             items[0].data.as_ref().unwrap()["kakehashi"]["projected_from_virtual"],
             true
         );
+    }
+
+    #[test]
+    fn prepare_response_preserves_unissued_virtual_shaped_real_uri() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("lua-ls");
+        let offset = RegionOffset::new(3, 2);
+        let request_uri = VirtualDocumentUri::new(&host_uri, "lua", "region");
+        let shaped_real_uri = "file:///external/kakehashi-virtual-uri-real.lua";
+        let response = serde_json::json!({ "result": [{
+            "name": "External", "kind": 5, "uri": shaped_real_uri,
+            "range": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 8 } },
+            "selectionRange": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 8 } }
+        }]});
+        let known_virtual_uris = HashSet::from([request_uri.to_uri_string()]);
+
+        let items = transform_type_hierarchy_prepare_response_to_host(
+            response,
+            &request_uri.to_uri_string(),
+            &host_uri,
+            &offset,
+            &known_virtual_uris,
+            &TypeHierarchyEnvelopeContext {
+                server_name: "lua-ls",
+                host_uri: host_uri.as_str(),
+                region_id: "region",
+                injection_language: "lua",
+                revision: TypeHierarchyDocumentRevision {
+                    incarnation: Some(2),
+                    content_version: 3,
+                },
+                connection_generation: 4,
+                connection_key: &key,
+                offset: &offset,
+                host_layer: false,
+                projected_from_virtual: false,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(items[0].uri.as_str(), shaped_real_uri);
+        assert_eq!(items[0].range.start, Position::new(8, 0));
+        assert_eq!(
+            items[0].data.as_ref().unwrap()["kakehashi"]["projected_from_virtual"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn prepare_response_accepts_protocol_array_tags() {
+        let value = serde_json::json!([{
+            "name": "Deprecated", "kind": 5, "tags": [1], "uri": "file:///type.lua",
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 4 } },
+            "selectionRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 4 } }
+        }]);
+
+        let items = parse_type_hierarchy_items(value).unwrap();
+
+        assert_eq!(items[0].tags, Some(SymbolTag::DEPRECATED));
     }
 }
