@@ -3,6 +3,7 @@
 use tower_lsp_server::ls_types::DidSaveTextDocumentParams;
 
 use super::super::{Kakehashi, uri_to_url};
+use crate::lsp::lsp_impl::snapshot_read::SnapshotWait;
 
 impl Kakehashi {
     /// Handle textDocument/didSave notification.
@@ -40,7 +41,23 @@ impl Kakehashi {
             pool.sync_and_notify_host_did_save(&uri, &host_text).await;
         }
         drop(edit_guard);
-        pool.forward_did_save_to_virtual_docs(&uri).await;
+
+        // A didChange reparses and refreshes virtual documents off-ingress.
+        // Settle that pipeline explicitly before the textless virtual didSave;
+        // otherwise an immediate save can overtake its projected didChange and
+        // run the downstream save hook against stale fragment text. If the
+        // bounded settle fails, omit didSave rather than violate that contract.
+        let virtual_documents_are_current = matches!(
+            self.wait_for_current_snapshot(&uri, std::time::Duration::from_millis(200))
+                .await,
+            SnapshotWait::Current(_)
+        );
+        if virtual_documents_are_current {
+            self.injection_coordinator()
+                .process_injections(&uri, true)
+                .await;
+            pool.forward_did_save_to_virtual_docs(&uri).await;
+        }
 
         // Ensure a fresh tree before the synthetic task snapshots it: a save
         // batched right after an edit (autosave / format-on-save) races the
