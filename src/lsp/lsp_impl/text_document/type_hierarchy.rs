@@ -1,4 +1,4 @@
-//! Type-hierarchy preparation across virtual and host bridge layers.
+//! Type-hierarchy preparation and supertype expansion across virtual and host bridge layers.
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{

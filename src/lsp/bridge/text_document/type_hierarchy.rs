@@ -147,6 +147,9 @@ impl LanguageServerPool {
         let handle = self
             .ready_connection_by_key_for_config(&envelope.connection_key, Some(server_config))
             .await?;
+        if !handle.has_capability("textDocument/prepareTypeHierarchy") {
+            return None;
+        }
         let host_lifecycle = self
             .request_host_lifecycle_for_incarnation(&host_uri, expected_incarnation)
             .await
@@ -622,6 +625,7 @@ mod tests {
     use crate::lsp::bridge::protocol::{RegionOffset, RequestId, VirtualDocumentUri};
     use crate::lsp::bridge::test_helpers::create_handle_with_key;
     use tower_lsp_server::ls_types::{NumberOrString, Position};
+    use tower_lsp_server::ls_types::{Registration, Unregistration};
 
     fn test_envelope(host_uri: &Uri, key: &ConnectionKey) -> TypeHierarchyEnvelope {
         TypeHierarchyEnvelope {
@@ -648,6 +652,14 @@ mod tests {
             "data": data
         }))
         .unwrap()
+    }
+
+    fn advertise_type_hierarchy(handle: &super::super::super::pool::ConnectionHandle) {
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "type-hierarchy".into(),
+            method: "textDocument/prepareTypeHierarchy".into(),
+            register_options: None,
+        }]);
     }
 
     #[test]
@@ -959,6 +971,7 @@ mod tests {
         let pool = Arc::new(LanguageServerPool::new());
         let key = ConnectionKey::for_server("lua-ls");
         let admitted = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        advertise_type_hierarchy(&admitted);
         pool.insert_connection(Arc::clone(&admitted)).await;
         let host_uri = url::Url::parse("file:///test.lua").unwrap();
         pool.open_host_incarnation(&host_uri, 1).await;
@@ -1042,6 +1055,7 @@ mod tests {
         let pool = Arc::new(LanguageServerPool::new());
         let key = ConnectionKey::for_server("lua-ls");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        advertise_type_hierarchy(&handle);
         pool.insert_connection(Arc::clone(&handle)).await;
         let host_uri = url::Url::parse("file:///test.lua").unwrap();
         pool.open_host_incarnation(&host_uri, 1).await;
@@ -1119,6 +1133,58 @@ mod tests {
         }));
 
         assert_eq!(request.await.unwrap(), Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn supertype_request_stops_after_dynamic_provider_unregistration() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua-ls");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        advertise_type_hierarchy(&handle);
+        handle
+            .dynamic_capabilities()
+            .unregister(vec![Unregistration {
+                id: "type-hierarchy".into(),
+                method: "textDocument/prepareTypeHierarchy".into(),
+            }]);
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_uri = url::Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let envelope = TypeHierarchyEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            content_version: 1,
+            connection_generation: pool.document_connection_generation(&key),
+            connection_key: key,
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            inner: Some(serde_json::json!({ "token": 9 })),
+            host_layer: true,
+            projected_from_virtual: false,
+        };
+        let params: TypeHierarchySupertypesParams = serde_json::from_value(serde_json::json!({
+            "item": type_item(host_uri.as_str(), serde_json::json!({ "token": 9 }))
+        }))
+        .unwrap();
+
+        let result = pool
+            .send_type_hierarchy_supertypes_request(
+                &BridgeServerConfig::default(),
+                params,
+                envelope,
+                None,
+            )
+            .await;
+
+        assert!(result.is_none());
+        assert!(
+            handle
+                .router()
+                .lookup_downstream_ids(&UpstreamId::Number(1))
+                .is_empty()
+        );
     }
 
     #[test]
