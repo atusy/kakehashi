@@ -361,11 +361,20 @@ fn assert_replaced_connection_lens_stays_unresolved(change_pool_key: bool) {
         "precondition: the replacement process must be active"
     );
 
+    let old_data = old_lens["data"].clone();
     let response = client.send_request("codeLens/resolve", old_lens);
+    assert!(
+        response.get("error").is_none(),
+        "stale producer data must fail soft, not as JSON-RPC error: {response}"
+    );
     assert_eq!(
         response["result"].get("command"),
         None,
         "opaque lens data must not be sent to a replacement process"
+    );
+    assert_eq!(
+        response["result"]["data"], old_data,
+        "fail-soft resolve must preserve the original routing envelope"
     );
 
     shutdown(&mut client);
