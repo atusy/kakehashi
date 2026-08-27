@@ -25,20 +25,8 @@ impl Kakehashi {
         let lsp_uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let work_done_token = params.work_done_progress_params.work_done_token;
-        let Some(content_version) = url::Url::parse(lsp_uri.as_str())
-            .ok()
-            .and_then(|uri| self.documents.get(&uri).map(|doc| doc.content_version()))
-        else {
-            return Ok(None);
-        };
-
-        let virt = self.call_hierarchy_prepare_virt_layer(
-            &lsp_uri,
-            position,
-            work_done_token,
-            content_version,
-        );
-        let host = self.call_hierarchy_prepare_host_layer(&lsp_uri, raw_params, content_version);
+        let virt = self.call_hierarchy_prepare_virt_layer(&lsp_uri, position, work_done_token);
+        let host = self.call_hierarchy_prepare_host_layer(&lsp_uri, raw_params);
         self.walk_layer_futures(
             &lsp_uri,
             METHOD,
@@ -55,11 +43,12 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         raw_params: serde_json::Value,
-        content_version: u64,
     ) -> Result<Option<Vec<CallHierarchyItem>>> {
         let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
             return Ok(None);
         };
+        let incarnation = ctx.incarnation;
+        let content_version = ctx.content_version;
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
         let fan_in = dispatch_host_preferred(
@@ -70,7 +59,7 @@ impl Kakehashi {
                 async move {
                     let raw = t
                         .pool
-                        .send_host_raw_request(
+                        .send_host_raw_request_for_incarnation(
                             &t.server_name,
                             &t.server_config,
                             &HostDocument {
@@ -81,6 +70,7 @@ impl Kakehashi {
                             METHOD,
                             params,
                             t.upstream_id,
+                            incarnation,
                         )
                         .await?;
                     let Some(raw) = raw else {
@@ -118,7 +108,6 @@ impl Kakehashi {
         lsp_uri: &Uri,
         position: Position,
         work_done_token: Option<NumberOrString>,
-        content_version: u64,
     ) -> Result<Option<Vec<CallHierarchyItem>>> {
         let Some(ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
@@ -130,6 +119,8 @@ impl Kakehashi {
             self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
+        let incarnation = ctx.incarnation;
+        let content_version = ctx.content_version;
         let result = dispatch_preferred(
             &ctx.document,
             pool,
@@ -147,6 +138,7 @@ impl Kakehashi {
                             &t.region_id,
                             t.offset,
                             &t.virtual_content,
+                            incarnation,
                             content_version,
                             t.upstream_id,
                             work_done_token,

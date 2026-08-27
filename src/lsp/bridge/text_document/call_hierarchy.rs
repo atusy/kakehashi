@@ -113,11 +113,11 @@ impl LanguageServerPool {
         region_id: &str,
         offset: RegionOffset,
         virtual_content: &str,
+        incarnation: u64,
         content_version: u64,
         upstream_request_id: Option<UpstreamId>,
         work_done_token: Option<NumberOrString>,
     ) -> io::Result<Option<Vec<CallHierarchyItem>>> {
-        let incarnation = self.current_host_incarnation(host_uri);
         let handle = self
             .get_or_create_virtual_connection(
                 server_name,
@@ -132,7 +132,7 @@ impl LanguageServerPool {
         }
         let connection_key = handle.key().clone();
         let connection_generation = self.document_connection_generation(&connection_key);
-        self.execute_position_bridge_request_with_handle(
+        self.execute_position_bridge_request_with_handle_for_incarnation(
             handle,
             host_uri,
             injection_language,
@@ -140,6 +140,7 @@ impl LanguageServerPool {
             &offset,
             virtual_content,
             upstream_request_id,
+            incarnation,
             host_position,
             region_end,
             "textDocument/prepareCallHierarchy",
@@ -164,7 +165,7 @@ impl LanguageServerPool {
                         region_id,
                         injection_language,
                         revision: CallHierarchyDocumentRevision {
-                            incarnation,
+                            incarnation: Some(incarnation),
                             content_version,
                         },
                         connection_generation,
@@ -254,7 +255,7 @@ mod tests {
     fn prepare_request_uses_virtual_position_and_progress_token() {
         let request = build_call_hierarchy_prepare_request(
             &VirtualDocumentUri::new(&test_host_uri(), "lua", "region"),
-            Position::new(5, 4),
+            Position::new(3, 4),
             &RegionOffset::new(3, 2),
             RequestId::new(7),
             Some(NumberOrString::String("progress".into())),
@@ -267,7 +268,7 @@ mod tests {
         );
         assert_eq!(
             value["params"]["position"],
-            json!({ "line": 2, "character": 4 })
+            json!({ "line": 0, "character": 2 })
         );
         assert_eq!(value["params"]["workDoneToken"], "progress");
     }

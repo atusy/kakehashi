@@ -592,11 +592,11 @@ impl DiagnosticSnapshotPreparer {
                 narrower_than_editor_pull = true;
             }
             Some(HostRequestContext {
-                incarnation: 1,
-                content_version: 0,
                 uri: uri.clone(),
                 language_id: language_name.clone(),
                 text: snapshot.text_arc(),
+                incarnation: snapshot.incarnation(),
+                content_version: snapshot.content_version(),
                 configs,
                 priorities: agg.priorities,
                 strategy: agg.strategy,
