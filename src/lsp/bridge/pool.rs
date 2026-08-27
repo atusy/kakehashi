@@ -2126,12 +2126,14 @@ impl LanguageServerPool {
             self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
             return Err(e);
         }
-        if !self.document_tracker.mark_open_sent(
-            virtual_uri,
-            connection_key,
-            connection_generation,
-            &claim,
-        ) {
+        if !self
+            .document_tracker
+            .mark_open_sent(virtual_uri, connection_key, connection_generation, &claim)
+            .await
+        {
+            self.document_tracker
+                .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
+                .await;
             claim_guard.disarm();
             drop(claim_guard);
             drop(transition_guard);
@@ -8843,12 +8845,16 @@ mod tests {
             "didChange must serialize behind the pending didOpen"
         );
 
-        assert!(pool.document_tracker.mark_open_sent(
-            &virtual_uri,
-            &connection_key,
-            pool.document_tracker.connection_generation(&connection_key),
-            &claim,
-        ));
+        assert!(
+            pool.document_tracker
+                .mark_open_sent(
+                    &virtual_uri,
+                    &connection_key,
+                    pool.document_tracker.connection_generation(&connection_key),
+                    &claim,
+                )
+                .await
+        );
         drop(transition_guard);
         forwarding.await.unwrap();
         assert_eq!(
