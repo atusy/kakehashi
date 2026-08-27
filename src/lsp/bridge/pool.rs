@@ -1760,6 +1760,43 @@ impl LanguageServerPool {
         }
     }
 
+    /// Retire the exact connection whose didClose could not be enqueued.
+    ///
+    /// A dropped close makes that process's document namespace unknowable: the
+    /// downstream may still have the URI open while local callers need it gone.
+    /// Purging the generation and arming a reopen restores one coherent state on
+    /// the next acquisition. The identity check must happen under `connections`
+    /// so a delayed cleanup cannot evict a replacement process.
+    pub(super) async fn invalidate_connection_after_didclose_failure(
+        &self,
+        connection_key: &ConnectionKey,
+        failed_handle: &Arc<ConnectionHandle>,
+    ) -> bool {
+        let mut connections = self.connections.lock().await;
+        let Some(current) = connections.get(connection_key) else {
+            return false;
+        };
+        if !Arc::ptr_eq(current, failed_handle) {
+            return false;
+        }
+        failed_handle.begin_shutdown();
+        self.host_documents
+            .lock()
+            .await
+            .retain(|(_, key), _| key != connection_key);
+        self.clear_host_routing_for_connection(connection_key);
+        self.document_tracker.purge_connection(connection_key).await;
+        self.pending_reopen.arm(connection_key);
+        self.invalidate_diagnostic_connections(std::slice::from_ref(connection_key));
+        self.purge_open_transition_locks(connection_key).await;
+        let removed = connections.remove(connection_key);
+        drop(connections);
+        if let Some(handle) = removed {
+            shutdown_invalidated_connection(connection_key.clone(), handle);
+        }
+        true
+    }
+
     /// Wait for an in-flight virtual-document re-open on `key` before sending on
     /// that connection (execute-command-routing-token). Bounded; a no-op when
     /// none is in flight.
