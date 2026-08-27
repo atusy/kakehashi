@@ -19,6 +19,7 @@ use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 
 use super::super::pool::{
     ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId,
+    VirtualUriObserver,
 };
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
@@ -375,15 +376,13 @@ impl LanguageServerPool {
                     None,
                 )
             } else {
-                // Observe the exact producer's virtual namespace in the same
-                // admission critical section as enqueue. The request-scoped
-                // observer retains sibling URIs opened then closed in flight.
-                let observer = self
-                    .observe_virtual_uris_for_connection(
-                        connection_key,
-                        envelope.connection_generation,
-                    )
-                    .await;
+                // Bind a shared view of the exact producer generation in the
+                // same admission critical section as enqueue. Generation
+                // history retains sibling URIs opened then closed in flight.
+                let observer = self.observe_virtual_uris_for_connection(
+                    connection_key,
+                    envelope.connection_generation,
+                );
                 if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
                     observer.insert(uri);
                 }
@@ -424,13 +423,12 @@ impl LanguageServerPool {
         {
             return None;
         }
-        let known_virtual_uris = virtual_uri_observer.snapshot();
         transform_call_hierarchy_incoming_response_to_host(
             response,
             virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string),
             &host_uri_lsp,
             &envelope,
-            &known_virtual_uris,
+            &virtual_uri_observer,
         )
         .ok()?
     }
@@ -511,12 +509,10 @@ impl LanguageServerPool {
                     None,
                 )
             } else {
-                let observer = self
-                    .observe_virtual_uris_for_connection(
-                        connection_key,
-                        envelope.connection_generation,
-                    )
-                    .await;
+                let observer = self.observe_virtual_uris_for_connection(
+                    connection_key,
+                    envelope.connection_generation,
+                );
                 if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
                     observer.insert(uri);
                 }
@@ -555,13 +551,12 @@ impl LanguageServerPool {
         {
             return None;
         }
-        let known_virtual_uris = virtual_uri_observer.snapshot();
         transform_call_hierarchy_outgoing_response_to_host(
             response,
             virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string),
             &host_uri_lsp,
             &envelope,
-            &known_virtual_uris,
+            &virtual_uri_observer,
         )
         .ok()?
     }
@@ -596,12 +591,28 @@ fn call_hierarchy_item_to_downstream(
     item
 }
 
+trait KnownVirtualUris {
+    fn contains_uri(&self, uri: &str) -> bool;
+}
+
+impl KnownVirtualUris for HashSet<String> {
+    fn contains_uri(&self, uri: &str) -> bool {
+        self.contains(uri)
+    }
+}
+
+impl KnownVirtualUris for VirtualUriObserver {
+    fn contains_uri(&self, uri: &str) -> bool {
+        self.contains(uri)
+    }
+}
+
 fn transform_call_hierarchy_incoming_response_to_host(
     mut response: Value,
     request_virtual_uri: Option<String>,
     host_uri: &Uri,
     envelope: &CallHierarchyEnvelope,
-    known_virtual_uris: &HashSet<String>,
+    known_virtual_uris: &impl KnownVirtualUris,
 ) -> io::Result<Option<Vec<CallHierarchyIncomingCall>>> {
     const METHOD: &str = "callHierarchy/incomingCalls";
     if response_has_jsonrpc_error(&response, METHOD) {
@@ -628,7 +639,8 @@ fn transform_call_hierarchy_incoming_response_to_host(
             if is_known_scratch_uri(call.from.uri.as_str(), known_virtual_uris) {
                 return None;
             }
-            let projected_from_virtual = if known_virtual_uris.contains(call.from.uri.as_str()) {
+            let projected_from_virtual = if known_virtual_uris.contains_uri(call.from.uri.as_str())
+            {
                 if request_virtual_uri.as_deref() != Some(call.from.uri.as_str()) {
                     return None;
                 }
@@ -654,7 +666,7 @@ fn transform_call_hierarchy_outgoing_response_to_host(
     request_virtual_uri: Option<String>,
     host_uri: &Uri,
     envelope: &CallHierarchyEnvelope,
-    known_virtual_uris: &HashSet<String>,
+    known_virtual_uris: &impl KnownVirtualUris,
 ) -> io::Result<Option<Vec<CallHierarchyOutgoingCall>>> {
     const METHOD: &str = "callHierarchy/outgoingCalls";
     if response_has_jsonrpc_error(&response, METHOD) {
@@ -686,7 +698,7 @@ fn transform_call_hierarchy_outgoing_response_to_host(
             if is_known_scratch_uri(call.to.uri.as_str(), known_virtual_uris) {
                 return None;
             }
-            let projected_from_virtual = if known_virtual_uris.contains(call.to.uri.as_str()) {
+            let projected_from_virtual = if known_virtual_uris.contains_uri(call.to.uri.as_str()) {
                 if request_virtual_uri.as_deref() != Some(call.to.uri.as_str()) {
                     return None;
                 }
@@ -704,8 +716,9 @@ fn transform_call_hierarchy_outgoing_response_to_host(
     Ok(Some(calls))
 }
 
-fn is_known_scratch_uri(uri: &str, known_virtual_uris: &HashSet<String>) -> bool {
-    VirtualDocumentUri::canonical_uri_for_scratch(uri).is_some() && known_virtual_uris.contains(uri)
+fn is_known_scratch_uri(uri: &str, known_virtual_uris: &impl KnownVirtualUris) -> bool {
+    VirtualDocumentUri::canonical_uri_for_scratch(uri).is_some()
+        && known_virtual_uris.contains_uri(uri)
 }
 
 fn build_call_hierarchy_prepare_request(
@@ -1264,10 +1277,7 @@ mod tests {
             .await;
         let shaped_real_uri = "file:///external/kakehashi-virtual-uri-other.lua";
         let generation = pool.document_connection_generation(&key);
-        let observer = pool
-            .observe_virtual_uris_for_connection(&key, generation)
-            .await;
-        let known = observer.snapshot();
+        let known = pool.observe_virtual_uris_for_connection(&key, generation);
 
         assert!(known.contains(&virtual_uri.to_uri_string()));
         assert!(!known.contains(shaped_real_uri));

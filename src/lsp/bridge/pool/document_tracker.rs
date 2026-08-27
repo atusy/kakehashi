@@ -8,7 +8,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use tokio::sync::Mutex;
@@ -19,12 +18,6 @@ use url::Url;
 
 use super::ConnectionKey;
 use crate::lsp::bridge::protocol::VirtualDocumentUri;
-
-struct VirtualUriObserverState {
-    connection_key: ConnectionKey,
-    generation: u64,
-    uris: Arc<std::sync::Mutex<HashSet<String>>>,
-}
 
 #[derive(Default)]
 struct ScratchUriHistory {
@@ -43,30 +36,38 @@ impl ScratchUriHistory {
 }
 
 pub(crate) struct VirtualUriObserver {
-    id: u64,
-    observers: Arc<DashMap<u64, VirtualUriObserverState>>,
-    uris: Arc<std::sync::Mutex<HashSet<String>>>,
+    connection_key: ConnectionKey,
+    generation: u64,
+    issued_virtual_uris: Arc<DashMap<(ConnectionKey, u64), HashSet<String>>>,
+    scratch_uri_history: Arc<DashMap<(ConnectionKey, u64), ScratchUriHistory>>,
+    explicit_uris: std::sync::Mutex<HashSet<String>>,
 }
 
 impl VirtualUriObserver {
     pub(crate) fn insert(&self, uri: String) {
-        self.uris
+        self.explicit_uris
             .lock()
-            .recover_poison("VirtualUriObserver::uris")
+            .recover_poison("VirtualUriObserver::explicit_uris")
             .insert(uri);
     }
 
-    pub(crate) fn snapshot(&self) -> HashSet<String> {
-        self.uris
+    pub(crate) fn contains(&self, uri: &str) -> bool {
+        if self
+            .explicit_uris
             .lock()
-            .recover_poison("VirtualUriObserver::uris")
-            .clone()
-    }
-}
-
-impl Drop for VirtualUriObserver {
-    fn drop(&mut self) {
-        self.observers.remove(&self.id);
+            .recover_poison("VirtualUriObserver::explicit_uris")
+            .contains(uri)
+        {
+            return true;
+        }
+        let key = (self.connection_key.clone(), self.generation);
+        self.issued_virtual_uris
+            .get(&key)
+            .is_some_and(|uris| uris.contains(uri))
+            || self
+                .scratch_uri_history
+                .get(&key)
+                .is_some_and(|history| history.uris.contains(uri))
     }
 }
 
@@ -156,16 +157,12 @@ pub(crate) struct DocumentTracker {
     /// Every virtual URI whose didOpen reached a connection generation.
     /// Downstream indexes may return a URI after didClose, so provenance must
     /// survive until the producing process is purged.
-    issued_virtual_uris: DashMap<(ConnectionKey, u64), HashSet<String>>,
+    issued_virtual_uris: Arc<DashMap<(ConnectionKey, u64), HashSet<String>>>,
     /// Exact aliases for scratch documents. Exact provenance avoids classifying
     /// a real file with a valid scratch-shaped name as virtual. Like canonical
     /// issued URI history, aliases live until the producing generation is
     /// purged because downstream indexes may return them after didClose.
-    scratch_uri_history: DashMap<(ConnectionKey, u64), ScratchUriHistory>,
-    /// Active request-scoped observers of virtual URIs issued by a connection.
-    /// They extend the generation snapshot atomically across in-flight opens.
-    virtual_uri_observers: Arc<DashMap<u64, VirtualUriObserverState>>,
-    next_virtual_uri_observer_id: AtomicU64,
+    scratch_uri_history: Arc<DashMap<(ConnectionKey, u64), ScratchUriHistory>>,
     /// Pre-send claims keyed by exact connection. Waiters park until the owner
     /// promotes the claim after enqueue or finishes rollback.
     open_claims: DashMap<(ConnectionKey, String), Arc<tokio::sync::Notify>>,
@@ -185,10 +182,8 @@ impl DocumentTracker {
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
-            issued_virtual_uris: DashMap::new(),
-            scratch_uri_history: DashMap::new(),
-            virtual_uri_observers: Arc::new(DashMap::new()),
-            next_virtual_uri_observer_id: AtomicU64::new(0),
+            issued_virtual_uris: Arc::new(DashMap::new()),
+            scratch_uri_history: Arc::new(DashMap::new()),
             open_claims: DashMap::new(),
             connection_generations: DashMap::new(),
         }
@@ -232,6 +227,13 @@ impl DocumentTracker {
                 .map(|index| format!("file:///virtual-{index}.lua"))
                 .collect(),
         );
+    }
+
+    #[cfg(test)]
+    pub(super) async fn lock_document_versions_for_test(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<ConnectionKey, HashMap<String, i32>>> {
+        self.document_versions.lock().await
     }
 
     /// Check if a virtual document is opened on a downstream server.
@@ -374,15 +376,6 @@ impl DocumentTracker {
         drop(servers);
         if newly_opened {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
-        }
-        for observer in self.virtual_uri_observers.iter() {
-            if observer.connection_key == *connection_key && observer.generation == generation {
-                observer
-                    .uris
-                    .lock()
-                    .recover_poison("VirtualUriObserverState::uris")
-                    .insert(uri_string.clone());
-            }
         }
         drop(versions);
         notify.notify_waiters();
@@ -811,68 +804,24 @@ impl DocumentTracker {
             .unwrap_or_default()
     }
 
-    /// Observe confirmed virtual URIs for an in-flight request.
+    /// View confirmed virtual URIs for one producer generation.
     ///
-    /// Callers that need an enqueue-consistent namespace hold the pool's
-    /// `connections` admission guard across this registration and request
-    /// enqueue. Observer insertion happens only after the single seed await, so
-    /// cancellation cannot strand an entry.
-    pub(super) async fn observe_virtual_uris_for_connection(
+    /// The generation histories are shared instead of cloned per request. They
+    /// retain URIs through didClose and are purged only with the producer, so an
+    /// in-flight response can classify exact provenance without multiplying the
+    /// bounded history by the number of concurrent requests.
+    pub(super) fn observe_virtual_uris_for_connection(
         &self,
         connection_key: &ConnectionKey,
         generation: u64,
     ) -> VirtualUriObserver {
-        let id = self
-            .next_virtual_uri_observer_id
-            .fetch_add(1, Ordering::Relaxed);
-        let uris = Arc::new(std::sync::Mutex::new(HashSet::new()));
-        if self.connection_generation(connection_key) == generation
-            && let Some(issued) = self
-                .issued_virtual_uris
-                .get(&(connection_key.clone(), generation))
-        {
-            uris.lock()
-                .recover_poison("VirtualUriObserver::seed")
-                .extend(issued.iter().cloned());
+        VirtualUriObserver {
+            connection_key: connection_key.clone(),
+            generation,
+            issued_virtual_uris: Arc::clone(&self.issued_virtual_uris),
+            scratch_uri_history: Arc::clone(&self.scratch_uri_history),
+            explicit_uris: std::sync::Mutex::new(HashSet::new()),
         }
-        if self.connection_generation(connection_key) == generation
-            && let Some(scratch) = self
-                .scratch_uri_history
-                .get(&(connection_key.clone(), generation))
-        {
-            uris.lock()
-                .recover_poison("VirtualUriObserver::scratch_seed")
-                .extend(scratch.uris.iter().cloned());
-        }
-        if self.connection_generation(connection_key) == generation {
-            let versions = self.document_versions.lock().await;
-            let confirmed = versions
-                .get(connection_key)
-                .into_iter()
-                .flat_map(HashMap::keys)
-                .filter(|uri| {
-                    !self
-                        .open_claims
-                        .contains_key(&(connection_key.clone(), (*uri).clone()))
-                });
-            uris.lock()
-                .recover_poison("VirtualUriObserver::open_seed")
-                .extend(confirmed.cloned());
-        }
-        let observer = VirtualUriObserver {
-            id,
-            observers: Arc::clone(&self.virtual_uri_observers),
-            uris: Arc::clone(&uris),
-        };
-        self.virtual_uri_observers.insert(
-            id,
-            VirtualUriObserverState {
-                connection_key: connection_key.clone(),
-                generation,
-                uris,
-            },
-        );
-        observer
     }
 
     /// Remove and return all virtual documents for a host URI.
@@ -2320,15 +2269,10 @@ mod tests {
         tracker
             .register_opened_document(&host_uri, &virtual_uri, &key)
             .await;
-        let observer = tracker
-            .observe_virtual_uris_for_connection(&key, generation)
-            .await;
+        let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
         tracker.untrack_document(&virtual_uri, &key).await;
 
-        assert!(observer.snapshot().contains(&virtual_uri.to_uri_string()));
-
-        drop(observer);
-        assert!(tracker.virtual_uri_observers.is_empty());
+        assert!(observer.contains(&virtual_uri.to_uri_string()));
     }
 
     #[tokio::test]
@@ -2343,17 +2287,13 @@ mod tests {
             .await;
         tracker.untrack_document(&virtual_uri, &key).await;
 
-        let observer = tracker
-            .observe_virtual_uris_for_connection(&key, generation)
-            .await;
-        assert!(observer.snapshot().contains(&virtual_uri.to_uri_string()));
+        let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
+        assert!(observer.contains(&virtual_uri.to_uri_string()));
         drop(observer);
 
         tracker.purge_connection(&key).await;
-        let observer = tracker
-            .observe_virtual_uris_for_connection(&key, generation)
-            .await;
-        assert!(observer.snapshot().is_empty());
+        let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
+        assert!(!observer.contains(&virtual_uri.to_uri_string()));
     }
 
     #[tokio::test]
@@ -2381,14 +2321,12 @@ mod tests {
             .register_opened_document(&host_uri, &open, &key)
             .await;
 
-        let observer = tracker
-            .observe_virtual_uris_for_connection(&key, generation)
-            .await;
-        assert!(observer.snapshot().contains(&before.to_uri_string()));
-        assert!(!observer.snapshot().contains(
+        let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
+        assert!(observer.contains(&before.to_uri_string()));
+        assert!(!observer.contains(
             &VirtualDocumentUri::canonical_uri_for_scratch(&before.to_uri_string()).unwrap()
         ));
-        assert!(observer.snapshot().contains(&open.to_uri_string()));
+        assert!(observer.contains(&open.to_uri_string()));
 
         let during = VirtualDocumentUri::new(
             &url_to_uri(&host_uri),
@@ -2398,7 +2336,7 @@ mod tests {
         tracker
             .register_opened_document(&host_uri, &during, &key)
             .await;
-        assert!(observer.snapshot().contains(&during.to_uri_string()));
+        assert!(observer.contains(&during.to_uri_string()));
     }
 
     #[tokio::test]
@@ -2424,22 +2362,19 @@ mod tests {
             tracker.untrack_document(&uri, &key).await;
         }
 
-        let observer = tracker
-            .observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key))
-            .await;
-        let snapshot = observer.snapshot();
-        assert!(snapshot.contains(oldest.as_ref().unwrap()));
-        assert!(snapshot.contains(newest.as_ref().unwrap()));
-        assert!(!snapshot.contains(
+        let observer =
+            tracker.observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key));
+        assert!(observer.contains(oldest.as_ref().unwrap()));
+        assert!(observer.contains(newest.as_ref().unwrap()));
+        assert!(!observer.contains(
             &VirtualDocumentUri::canonical_uri_for_scratch(newest.as_ref().unwrap()).unwrap()
         ));
 
         drop(observer);
         tracker.purge_connection(&key).await;
-        let observer = tracker
-            .observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key))
-            .await;
-        assert!(observer.snapshot().is_empty());
+        let observer =
+            tracker.observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key));
+        assert!(!observer.contains(oldest.as_ref().unwrap()));
     }
 
     #[tokio::test]
@@ -2548,11 +2483,10 @@ mod tests {
         let key = ConnectionKey::for_server("lua");
         assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
 
-        let observer = tracker
-            .observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key))
-            .await;
+        let observer =
+            tracker.observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key));
 
-        assert!(!observer.snapshot().contains(&virtual_uri.to_uri_string()));
+        assert!(!observer.contains(&virtual_uri.to_uri_string()));
         let claim = tracker
             .open_claim_waiter(&virtual_uri, &key)
             .expect("claim should exist");

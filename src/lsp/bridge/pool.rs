@@ -35,7 +35,7 @@ pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
 use document_tracker::DocumentTracker;
-pub(crate) use document_tracker::OpenedVirtualDoc;
+pub(crate) use document_tracker::{OpenedVirtualDoc, VirtualUriObserver};
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
 use pending_reopen::PendingReopenRegistry;
@@ -106,7 +106,14 @@ fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHan
     tokio::spawn(async move {
         const RELOAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
         let shutdown_handle = Arc::clone(&handle);
-        let shutdown_task = tokio::spawn(async move { shutdown_handle.graceful_shutdown().await });
+        let preserve_failed = shutdown_handle.state() == ConnectionState::Failed;
+        let shutdown_task = tokio::spawn(async move {
+            if preserve_failed {
+                shutdown_handle.graceful_shutdown_preserving_failed().await
+            } else {
+                shutdown_handle.graceful_shutdown().await
+            }
+        });
         let abort = shutdown_task.abort_handle();
         match tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, shutdown_task).await {
             Ok(Ok(_)) => {}
@@ -1250,14 +1257,13 @@ impl LanguageServerPool {
         self.document_tracker.host_virtual_docs(host_uri).await
     }
 
-    pub(super) async fn observe_virtual_uris_for_connection(
+    pub(super) fn observe_virtual_uris_for_connection(
         &self,
         connection_key: &ConnectionKey,
         generation: u64,
-    ) -> document_tracker::VirtualUriObserver {
+    ) -> VirtualUriObserver {
         self.document_tracker
             .observe_virtual_uris_for_connection(connection_key, generation)
-            .await
     }
 
     /// Remove and return all virtual documents for a host URI.
@@ -2029,7 +2035,7 @@ impl LanguageServerPool {
     ) -> io::Result<()> {
         let connection_generation = self.document_tracker.connection_generation(connection_key);
         let transition = self.open_transition_lock(virtual_uri, connection_key);
-        let transition_guard = transition.lock().await;
+        let transition_guard = Arc::clone(&transition).lock_owned().await;
         if !self
             .document_tracker
             .is_document_opened_on_connection(virtual_uri, connection_key)
@@ -2126,23 +2132,52 @@ impl LanguageServerPool {
             self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
             return Err(e);
         }
-        if !self
-            .document_tracker
-            .mark_open_sent(virtual_uri, connection_key, connection_generation, &claim)
-            .await
-        {
-            self.document_tracker
-                .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
+        // Once didOpen has entered the FIFO, promotion must outlive cancellation
+        // of this request. Otherwise dropping the caller while the version map is
+        // contended rolls the local claim back without a matching didClose and a
+        // retry can enqueue a duplicate didOpen to the same producer.
+        let tracker = Arc::clone(&self.document_tracker);
+        let promotion_host_uri = host_uri.clone();
+        let promotion_virtual_uri = virtual_uri.clone();
+        let promotion_connection_key = connection_key.clone();
+        let promotion_claim = Arc::clone(&claim);
+        let transition_locks = Arc::clone(&self.open_transition_locks);
+        let promotion = tokio::spawn(async move {
+            let promoted = tracker
+                .mark_open_sent(
+                    &promotion_virtual_uri,
+                    &promotion_connection_key,
+                    connection_generation,
+                    &promotion_claim,
+                )
                 .await;
+            if !promoted {
+                tracker
+                    .rollback_open_claim_if(
+                        &promotion_host_uri,
+                        &promotion_virtual_uri,
+                        &promotion_connection_key,
+                        &promotion_claim,
+                    )
+                    .await;
+            }
             claim_guard.disarm();
             drop(claim_guard);
             drop(transition_guard);
-            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
+            let transition_key = (
+                promotion_connection_key,
+                promotion_virtual_uri.to_uri_string(),
+            );
+            transition_locks.remove_if(&transition_key, |_, current| {
+                Arc::ptr_eq(current, &transition) && Arc::strong_count(current) == 2
+            });
+            promoted
+        });
+        if !promotion.await.unwrap_or(false) {
             return Err(io::Error::other(
                 "bridge: didOpen claim invalidated during enqueue",
             ));
         }
-        claim_guard.disarm();
         // The didOpen was confirmed enqueued (the `MessageSender` maps `Queued` →
         // `Ok`), so seed the content fingerprint with the opened content. Without
         // this, the FIRST position-only host edit — which leaves this region's
@@ -6867,6 +6902,101 @@ mod tests {
             pool.document_tracker
                 .is_document_opened_on_connection(&virtual_uri, &connection_key),
             "the aborted owner's delayed rollback must not erase the successor claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_document_opened_finishes_promotion_after_enqueue_when_caller_is_aborted() {
+        struct GatedSender {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            sent: Arc<tokio::sync::Notify>,
+        }
+
+        impl message_sender::MessageSender for GatedSender {
+            async fn send_notification<P: serde::Serialize + Send>(
+                &mut self,
+                _notification: JsonRpcNotification<P>,
+            ) -> io::Result<()> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                self.sent.notify_one();
+                Ok(())
+            }
+        }
+
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/abort-after-enqueue.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let sent = Arc::new(tokio::sync::Notify::new());
+        let task = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            let virtual_uri = virtual_uri.clone();
+            let connection_key = connection_key.clone();
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let sent = Arc::clone(&sent);
+            tokio::spawn(async move {
+                let mut sender = GatedSender {
+                    entered,
+                    release,
+                    sent,
+                };
+                pool.ensure_document_opened(
+                    &mut sender,
+                    &host_uri,
+                    &virtual_uri,
+                    "print('sent')",
+                    &connection_key,
+                )
+                .await
+            })
+        };
+
+        entered.notified().await;
+        let versions = pool
+            .document_tracker
+            .lock_document_versions_for_test()
+            .await;
+        release.notify_one();
+        sent.notified().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "promotion should be waiting for the contended version map"
+        );
+        task.abort();
+        let _ = task.await;
+        drop(versions);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !pool
+                .document_tracker
+                .is_document_opened_on_connection(&virtual_uri, &connection_key)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached promotion should finish after caller cancellation");
+
+        let (mut retry_sender, mut retry_rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened(
+            &mut retry_sender,
+            &host_uri,
+            &virtual_uri,
+            "print('sent')",
+            &connection_key,
+        )
+        .await
+        .expect("the confirmed local open should be reusable");
+        assert!(
+            retry_rx.try_recv().is_err(),
+            "retry must not enqueue a duplicate didOpen"
         );
     }
 
