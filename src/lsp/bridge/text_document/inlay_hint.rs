@@ -409,6 +409,9 @@ impl LanguageServerPool {
             return hint;
         }
 
+        // FIFO admission is complete once the request is queued. Do not hold
+        // didClose/reopen behind a slow downstream response wait.
+        drop(_host_lifecycle);
         let response = handle.wait_for_response(request_id, response_rx).await;
         router_guard.disarm();
         if let Some(ref id) = upstream_id {
@@ -418,6 +421,17 @@ impl LanguageServerPool {
             re_envelope_hint(&mut hint, &envelope);
             return hint;
         };
+        let producer_is_still_live = {
+            let connections = self.connections().await;
+            connections
+                .get(connection_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+                && self.document_connection_generation(connection_key) == expected_generation
+        };
+        if !producer_is_still_live {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        }
         let Some(mut resolved) = parse_inlay_hint_resolve_response(response) else {
             re_envelope_hint(&mut hint, &envelope);
             return hint;

@@ -160,6 +160,7 @@ impl Kakehashi {
         let Some(envelope) = extract_inlay_hint_envelope(&hint) else {
             return Ok(hint);
         };
+        let unresolved = hint.clone();
         let region_end = if envelope.is_host_layer() {
             None
         } else {
@@ -182,14 +183,44 @@ impl Kakehashi {
             std::sync::Arc::clone(&pool),
             sweep_id,
         );
-        match cancel_rx {
+        let resolved = match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
                 _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
                 hint = dispatch => Ok(hint),
             },
             None => Ok(dispatch.await),
+        }?;
+
+        // A later didChange/didClose is allowed to proceed once the resolve was
+        // enqueued. Revalidate after the response so old lazy edits/locations
+        // are never surfaced into a moved region or reopened document.
+        if !self.inlay_hint_envelope_is_fresh(&envelope, &pool) {
+            return Ok(unresolved);
         }
+        Ok(resolved)
+    }
+
+    fn inlay_hint_envelope_is_fresh(
+        &self,
+        envelope: &InlayHintEnvelope,
+        pool: &crate::lsp::bridge::LanguageServerPool,
+    ) -> bool {
+        let Ok(uri) = url::Url::parse(&envelope.host_uri) else {
+            return false;
+        };
+        if envelope
+            .incarnation
+            .is_none_or(|expected| pool.current_host_incarnation(&uri) != Some(expected))
+        {
+            return false;
+        }
+        envelope.is_host_layer()
+            || self
+                .inlay_hint_region_geometry(envelope)
+                .is_some_and(|(offset, _, _)| {
+                    offset == crate::lsp::bridge::RegionOffset::from(&envelope.offset)
+                })
     }
 
     fn inlay_hint_region_geometry(
