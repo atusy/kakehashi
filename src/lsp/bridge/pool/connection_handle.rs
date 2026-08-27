@@ -1001,8 +1001,26 @@ impl ConnectionHandle {
     /// No internal timeout (ls-bridge-timeout-hierarchy): the caller (`shutdown_all_with_timeout`) enforces the
     /// global budget so a slow server can use leftover time without N×timeout multiplication.
     pub(crate) async fn graceful_shutdown(&self) -> io::Result<()> {
-        // 1. Transition to Closing state
-        self.begin_shutdown();
+        self.graceful_shutdown_inner(true).await
+    }
+
+    /// Tear down an invalidated handle while keeping it retryable in the pool.
+    ///
+    /// Cleanup that can be cancelled leaves the handle mapped as `Failed`, so a
+    /// following acquisition repeats the purge. Moving it to `Closing` here
+    /// would instead make that acquisition fail fast until teardown completes.
+    pub(super) async fn graceful_shutdown_preserving_failed(&self) -> io::Result<()> {
+        self.graceful_shutdown_inner(false).await
+    }
+
+    async fn graceful_shutdown_inner(&self, transition_to_closing: bool) -> io::Result<()> {
+        // 1. Transition healthy handles to Closing. Invalidated handles stay
+        // Failed until terminal Closed so a still-mapped entry remains retryable.
+        if transition_to_closing {
+            self.begin_shutdown();
+        } else {
+            self.reader_handle.stop_liveness_timer();
+        }
 
         // 2. Stop writer task and reclaim the writer via 3-phase protocol
         // This ensures no concurrent writes to stdin during shutdown
@@ -1463,6 +1481,29 @@ mod tests {
             ConnectionState::Closing,
             "State should be Closing, not Failed - liveness timer should have been cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn invalidated_shutdown_keeps_failed_state_while_handshake_is_pending() {
+        let handle = crate::lsp::bridge::pool::test_helpers::create_handle_with_state(
+            ConnectionState::Failed,
+        )
+        .await;
+        let shutdown = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.graceful_shutdown_preserving_failed().await })
+        };
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            handle.state(),
+            ConnectionState::Failed,
+            "a still-mapped invalidated handle must remain retryable"
+        );
+
+        shutdown.abort();
+        let _ = shutdown.await;
+        handle.complete_shutdown();
     }
 
     /// Test that liveness timer does not start in Closing state (ls-bridge-timeout-hierarchy Phase 4).
