@@ -29,12 +29,12 @@ Partially implemented:
   no per-method request builders or response transformers. Handlers run the
   layer walk (`Kakehashi::walk_layers`, cross-layer-aggregation,
   `preferred` semantics): layers are tried lazily in `priorities` — by default
-  virt first, host as fallback. Four methods consume per-server identity in
+  virt first, host as fallback. Five methods consume per-server identity in
   the host arm: codeAction for the `"{title} — {server}"` suffix, completion
-  for its resolve-routing envelope, and codeLens and documentLink for the
-  winning server's resolve capability and envelope. CodeAction and completion
-  build their own host arms; codeLens and documentLink use the shared
-  whole-document winner hook. Covered: definition, hover, declaration,
+  and inlayHint for their resolve-routing envelopes, and codeLens and
+  documentLink for the winning server's resolve capability and envelope.
+  CodeAction, completion, and inlayHint build their own host arms; codeLens
+  and documentLink use the shared whole-document winner hook. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
   inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
