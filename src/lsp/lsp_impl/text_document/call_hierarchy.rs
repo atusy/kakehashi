@@ -2,16 +2,20 @@
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    CallHierarchyItem, CallHierarchyPrepareParams, NumberOrString, Position, Uri,
+    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+    CallHierarchyPrepareParams, NumberOrString, Position, Uri,
 };
 
 use super::super::Kakehashi;
+use super::super::region_offset::resolve_region_offset;
 use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{
-    CallHierarchyDocumentRevision, HostDocument, envelope_host_call_hierarchy_items,
+    CallHierarchyDocumentRevision, CallHierarchyEnvelope, HostDocument,
+    envelope_host_call_hierarchy_items, extract_call_hierarchy_envelope,
 };
+use crate::lsp::current_upstream_id;
 use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
 
 const METHOD: &str = "textDocument/prepareCallHierarchy";
@@ -37,6 +41,74 @@ impl Kakehashi {
             |items: &Vec<CallHierarchyItem>| !items.is_empty(),
         )
         .await
+    }
+
+    pub(crate) async fn call_hierarchy_incoming_impl(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        let Some(envelope) = extract_call_hierarchy_envelope(&params.item) else {
+            return Ok(None);
+        };
+        let pool = self.bridge.pool_arc();
+        if !self.call_hierarchy_envelope_is_fresh(&envelope, &pool) {
+            return Ok(None);
+        }
+
+        let settings = self.settings_manager.load_settings();
+        let upstream_id = current_upstream_id();
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let sweep_id = upstream_id.clone();
+        let dispatch = pool.dispatch_call_hierarchy_incoming(params, &settings, upstream_id);
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            std::sync::Arc::clone(&pool),
+            sweep_id,
+        );
+        let calls = match cancel_rx {
+            Some(rx) => tokio::select! {
+                biased;
+                _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                calls = dispatch => Ok(calls),
+            },
+            None => Ok(dispatch.await),
+        }?;
+
+        if !self.call_hierarchy_envelope_is_fresh(&envelope, &pool) {
+            return Ok(None);
+        }
+        Ok(calls)
+    }
+
+    fn call_hierarchy_envelope_is_fresh(
+        &self,
+        envelope: &CallHierarchyEnvelope,
+        pool: &crate::lsp::bridge::LanguageServerPool,
+    ) -> bool {
+        let Ok(uri) = url::Url::parse(&envelope.host_uri) else {
+            return false;
+        };
+        let Some(document) = self.documents.get(&uri) else {
+            return false;
+        };
+        if document.content_version() != envelope.content_version
+            || envelope.incarnation.is_none_or(|expected| {
+                document.incarnation() != expected
+                    || pool.current_host_incarnation(&uri) != Some(expected)
+            })
+        {
+            return false;
+        }
+        envelope.is_host_layer()
+            || resolve_region_offset(
+                &self.documents,
+                &self.language,
+                &self.bridge,
+                &uri,
+                &envelope.region_id,
+            )
+            .is_some_and(|(offset, _, contiguous)| {
+                contiguous && offset == crate::lsp::bridge::RegionOffset::from(&envelope.offset)
+            })
     }
 
     async fn call_hierarchy_prepare_host_layer(

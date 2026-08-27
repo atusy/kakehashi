@@ -1,23 +1,28 @@
 //! Call-hierarchy preparation for host and virtual bridge layers.
 
 use std::io;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
-    CallHierarchyItem, CallHierarchyPrepareParams, NumberOrString, Position,
-    TextDocumentIdentifier, TextDocumentPositionParams, Uri, WorkDoneProgressParams,
+    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+    CallHierarchyPrepareParams, NumberOrString, Position, TextDocumentIdentifier,
+    TextDocumentPositionParams, Uri, WorkDoneProgressParams,
 };
 use url::Url;
 
 use crate::config::settings::BridgeServerConfig;
+use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 
 use super::super::pool::{ConnectionKey, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
-    translate_host_position_to_virtual, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    translate_host_position_to_virtual, translate_host_range_to_virtual,
+    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 use super::completion::EnvelopeOffset;
+use crate::lsp::bridge::actor::RouterCleanupGuard;
 
 const ENVELOPE_KEY: &str = "kakehashi";
 
@@ -39,6 +44,45 @@ pub(crate) struct CallHierarchyEnvelope {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+impl CallHierarchyEnvelope {
+    pub(crate) fn is_host_layer(&self) -> bool {
+        self.host_layer && self.region_id.is_empty()
+    }
+}
+
+pub(crate) fn extract_call_hierarchy_envelope(
+    item: &CallHierarchyItem,
+) -> Option<CallHierarchyEnvelope> {
+    serde_json::from_value(item.data.as_ref()?.get(ENVELOPE_KEY)?.clone()).ok()
+}
+
+fn strip_call_hierarchy_envelope(item: &mut CallHierarchyItem) -> Option<CallHierarchyEnvelope> {
+    let mut envelope = extract_call_hierarchy_envelope(item)?;
+    item.data = envelope.inner.take();
+    Some(envelope)
+}
+
+fn re_envelope_item(item: &mut CallHierarchyItem, envelope: &CallHierarchyEnvelope) {
+    let offset = RegionOffset::from(&envelope.offset);
+    envelope_item_data(
+        item,
+        &CallHierarchyEnvelopeContext {
+            server_name: &envelope.origin,
+            host_uri: &envelope.host_uri,
+            region_id: &envelope.region_id,
+            injection_language: &envelope.injection_language,
+            revision: CallHierarchyDocumentRevision {
+                incarnation: envelope.incarnation,
+                content_version: envelope.content_version,
+            },
+            connection_generation: envelope.connection_generation,
+            connection_key: &envelope.connection_key,
+            offset: &offset,
+            host_layer: envelope.host_layer,
+        },
+    );
 }
 
 pub(crate) struct CallHierarchyDocumentRevision {
@@ -178,6 +222,203 @@ impl LanguageServerPool {
         )
         .await?
     }
+
+    pub(crate) async fn dispatch_call_hierarchy_incoming(
+        &self,
+        mut params: CallHierarchyIncomingCallsParams,
+        settings: &crate::config::settings::WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<Vec<CallHierarchyIncomingCall>> {
+        let envelope = strip_call_hierarchy_envelope(&mut params.item)?;
+        if !crate::config::is_server_spawnable(&settings.language_servers, &envelope.origin) {
+            return None;
+        }
+        let config = resolve_with_wildcard(
+            &settings.language_servers,
+            &envelope.origin,
+            merge_bridge_server_configs,
+        )?;
+        self.send_call_hierarchy_incoming_request(&config, params, envelope, upstream_id)
+            .await
+    }
+
+    async fn send_call_hierarchy_incoming_request(
+        &self,
+        server_config: &BridgeServerConfig,
+        mut params: CallHierarchyIncomingCallsParams,
+        envelope: CallHierarchyEnvelope,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<Vec<CallHierarchyIncomingCall>> {
+        let server_name = &envelope.origin;
+        let host_uri = Url::parse(&envelope.host_uri).ok()?;
+        let expected_incarnation = envelope.incarnation?;
+        if self.current_host_incarnation(&host_uri) != Some(expected_incarnation) {
+            return None;
+        }
+        if envelope.connection_key.server() != server_name
+            || self.document_connection_generation(&envelope.connection_key)
+                != envelope.connection_generation
+        {
+            return None;
+        }
+        let handle = self
+            .ready_connection_by_key_for_config(&envelope.connection_key, Some(server_config))
+            .await?;
+        let _host_lifecycle = self
+            .request_host_lifecycle_for_incarnation(&host_uri, expected_incarnation)
+            .await
+            .ok()?;
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).ok()?;
+        let virtual_uri = (!envelope.is_host_layer()).then(|| {
+            VirtualDocumentUri::new(
+                &host_uri_lsp,
+                &envelope.injection_language,
+                &envelope.region_id,
+            )
+        });
+
+        let connection_key = handle.key();
+        if let Some(ref id) = upstream_id {
+            self.register_upstream_request_for_handle(id.clone(), &handle);
+        }
+        let (request_id, response_rx) = match handle
+            .register_request_with_upstream(upstream_id.clone())
+        {
+            Ok(pair) => pair,
+            Err(error) => {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "callHierarchy/incomingCalls: failed to register request for {server_name}: {error}"
+                );
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return None;
+            }
+        };
+
+        params.item =
+            call_hierarchy_item_to_downstream(params.item, &envelope, virtual_uri.as_ref());
+        let request =
+            JsonRpcRequest::new(request_id.as_i64(), "callHierarchy/incomingCalls", params);
+        let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
+        let send_result = {
+            let connections = self.connections().await;
+            let producer_is_live = connections
+                .get(connection_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle));
+            let generation_matches = self.document_connection_generation(connection_key)
+                == envelope.connection_generation;
+            if !producer_is_live || !generation_matches {
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "producer connection was replaced before incomingCalls send",
+                ))
+            } else {
+                handle.send_request(request, request_id).map_err(Into::into)
+            }
+        };
+        if let Err(error) = send_result {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "callHierarchy/incomingCalls: failed to send request for {server_name}: {error}"
+            );
+            if let Some(ref id) = upstream_id {
+                self.unregister_upstream_request(id, connection_key);
+            }
+            return None;
+        }
+
+        // Admission is complete once the request is queued. A slow language
+        // server must not hold didClose/reopen behind its response.
+        drop(_host_lifecycle);
+        let response = handle.wait_for_response(request_id, response_rx).await;
+        router_guard.disarm();
+        if let Some(ref id) = upstream_id {
+            self.unregister_upstream_request(id, connection_key);
+        }
+        let response = response.ok()?;
+        let producer_is_still_live = {
+            let connections = self.connections().await;
+            connections
+                .get(connection_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+                && self.document_connection_generation(connection_key)
+                    == envelope.connection_generation
+        };
+        if !producer_is_still_live {
+            return None;
+        }
+        transform_call_hierarchy_incoming_response_to_host(
+            response,
+            virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string),
+            &host_uri_lsp,
+            &envelope,
+        )
+        .ok()?
+    }
+}
+
+fn call_hierarchy_item_to_downstream(
+    mut item: CallHierarchyItem,
+    envelope: &CallHierarchyEnvelope,
+    virtual_uri: Option<&VirtualDocumentUri>,
+) -> CallHierarchyItem {
+    if let Some(virtual_uri) = virtual_uri
+        && item.uri.as_str() == envelope.host_uri
+    {
+        item.uri = virtual_uri_to_lsp_uri(virtual_uri);
+        let offset = RegionOffset::from(&envelope.offset);
+        translate_host_range_to_virtual(&mut item.range, &offset);
+        translate_host_range_to_virtual(&mut item.selection_range, &offset);
+    }
+    item
+}
+
+fn transform_call_hierarchy_incoming_response_to_host(
+    mut response: Value,
+    request_virtual_uri: Option<String>,
+    host_uri: &Uri,
+    envelope: &CallHierarchyEnvelope,
+) -> io::Result<Option<Vec<CallHierarchyIncomingCall>>> {
+    const METHOD: &str = "callHierarchy/incomingCalls";
+    if response_has_jsonrpc_error(&response, METHOD) {
+        return Ok(None);
+    }
+    let Some(result) = response.get_mut("result").map(Value::take) else {
+        return Err(io::Error::other(
+            "callHierarchy/incomingCalls response carries neither result nor error (protocol violation)",
+        ));
+    };
+    if result.is_null() {
+        return Ok(None);
+    }
+    let calls: Vec<CallHierarchyIncomingCall> =
+        serde_json::from_value(result).map_err(|error| {
+            io::Error::other(format!(
+                "malformed callHierarchy/incomingCalls result from downstream server: {error}"
+            ))
+        })?;
+    let offset = RegionOffset::from(&envelope.offset);
+    let calls = calls
+        .into_iter()
+        .filter_map(|mut call| {
+            if VirtualDocumentUri::is_virtual_uri(call.from.uri.as_str()) {
+                if request_virtual_uri.as_deref() != Some(call.from.uri.as_str()) {
+                    return None;
+                }
+                call.from.uri = host_uri.clone();
+                translate_virtual_range_to_host(&mut call.from.range, &offset);
+                translate_virtual_range_to_host(&mut call.from.selection_range, &offset);
+                for range in &mut call.from_ranges {
+                    translate_virtual_range_to_host(range, &offset);
+                }
+            }
+            re_envelope_item(&mut call.from, envelope);
+            Some(call)
+        })
+        .collect();
+    Ok(Some(calls))
 }
 
 fn build_call_hierarchy_prepare_request(
@@ -250,6 +491,40 @@ mod tests {
     use super::super::test_helpers::*;
     use super::*;
     use serde_json::json;
+
+    fn incoming_test_envelope(host_uri: &Uri, key: &ConnectionKey) -> CallHierarchyEnvelope {
+        CallHierarchyEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: host_uri.to_string(),
+            region_id: "region".into(),
+            injection_language: "lua".into(),
+            incarnation: Some(2),
+            content_version: 3,
+            connection_generation: 4,
+            connection_key: key.clone(),
+            offset: EnvelopeOffset::from(&RegionOffset::new(3, 2)),
+            inner: Some(json!({ "token": 9 })),
+            host_layer: false,
+        }
+    }
+
+    fn call_item(uri: &str, data: Value) -> CallHierarchyItem {
+        serde_json::from_value(json!({
+            "name": "f",
+            "kind": 12,
+            "uri": uri,
+            "range": {
+                "start": { "line": 3, "character": 2 },
+                "end": { "line": 3, "character": 5 }
+            },
+            "selectionRange": {
+                "start": { "line": 3, "character": 2 },
+                "end": { "line": 3, "character": 3 }
+            },
+            "data": data
+        }))
+        .unwrap()
+    }
 
     #[test]
     fn prepare_request_uses_virtual_position_and_progress_token() {
@@ -364,5 +639,72 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn incoming_request_restores_virtual_item_and_inner_data() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("lua-ls");
+        let envelope = incoming_test_envelope(&host_uri, &key);
+        let mut item = call_item(host_uri.as_str(), json!({ "kakehashi": envelope.clone() }));
+        let stripped = strip_call_hierarchy_envelope(&mut item).unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region");
+        let outgoing = call_hierarchy_item_to_downstream(item, &stripped, Some(&virtual_uri));
+
+        assert_eq!(outgoing.uri.as_str(), virtual_uri.to_uri_string());
+        assert_eq!(outgoing.range.start, Position::new(0, 0));
+        assert_eq!(outgoing.selection_range.end, Position::new(0, 1));
+        assert_eq!(outgoing.data, Some(json!({ "token": 9 })));
+    }
+
+    #[test]
+    fn incoming_response_translates_same_virtual_and_preserves_real_callers() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("lua-ls");
+        let envelope = incoming_test_envelope(&host_uri, &key);
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region");
+        let other_virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "other");
+        let virtual_item = json!({
+            "name": "virtual", "kind": 12, "uri": virtual_uri.to_uri_string(),
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 3 } },
+            "selectionRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+            "data": { "caller": "virtual" }
+        });
+        let external_item = json!({
+            "name": "external", "kind": 12, "uri": "file:///external.lua",
+            "range": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 3 } },
+            "selectionRange": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 1 } },
+            "data": { "caller": "external" }
+        });
+        let mut cross_item = virtual_item.clone();
+        cross_item["uri"] = json!(other_virtual_uri.to_uri_string());
+        let response = json!({ "result": [
+            { "from": virtual_item, "fromRanges": [{ "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 2 } }] },
+            { "from": external_item, "fromRanges": [{ "start": { "line": 8, "character": 1 }, "end": { "line": 8, "character": 2 } }] },
+            { "from": cross_item, "fromRanges": [] }
+        ]});
+
+        let calls = transform_call_hierarchy_incoming_response_to_host(
+            response,
+            Some(virtual_uri.to_uri_string()),
+            &host_uri,
+            &envelope,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].from.uri, host_uri);
+        assert_eq!(calls[0].from.range.start, Position::new(3, 2));
+        assert_eq!(calls[0].from_ranges[0].start, Position::new(3, 3));
+        assert_eq!(calls[1].from.uri.as_str(), "file:///external.lua");
+        assert_eq!(calls[1].from.range.start, Position::new(8, 0));
+        assert_eq!(calls[1].from_ranges[0].start, Position::new(8, 1));
+        assert_eq!(
+            extract_call_hierarchy_envelope(&calls[1].from)
+                .unwrap()
+                .inner,
+            Some(json!({ "caller": "external" }))
+        );
     }
 }
