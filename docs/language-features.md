@@ -347,6 +347,14 @@ non-contiguous, or the producing downstream connection was replaced. Returned
 callers and callees carry fresh routing data so clients can expand the tree
 recursively.
 
+### Type hierarchy
+
+Type hierarchy preparation and both expansion directions are bridged for
+embedded virtual documents and host-language bridge layers. Returned items
+remember their exact producing server and region, so recursive supertype and
+subtype requests return to that producer. Stale items from changed, reopened,
+moved, or reconfigured documents fail softly with `null`.
+
 ### Document color (experimental)
 
 [`textDocument/documentColor`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentColor)
@@ -633,7 +641,6 @@ type CapturesDelta = {
 
 kakehashi does not yet provide these LSP features:
 
-- Type hierarchy
 - Workspace symbol search (`workspace/symbol`)
 
 (The static code-action and execute-command providers are advertised only to
