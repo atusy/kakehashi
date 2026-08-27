@@ -656,7 +656,7 @@ fn transform_call_hierarchy_outgoing_response_to_host(
     let calls = calls
         .into_iter()
         .filter_map(|mut call| {
-            if request_virtual_uri.is_some() {
+            if envelope.projected_from_virtual {
                 for range in &mut call.from_ranges {
                     translate_virtual_range_to_host(range, &offset);
                 }
@@ -1135,6 +1135,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn outgoing_response_preserves_ranges_for_real_caller_from_virtual_producer() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("lua-ls");
+        let mut envelope = incoming_test_envelope(&host_uri, &key);
+        envelope.projected_from_virtual = false;
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region");
+        let response = json!({ "result": [{
+            "to": {
+                "name": "external-callee", "kind": 12, "uri": "file:///callee.lua",
+                "range": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 3 } },
+                "selectionRange": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 1 } }
+            },
+            "fromRanges": [{ "start": { "line": 20, "character": 1 }, "end": { "line": 20, "character": 2 } }]
+        }]});
+
+        let calls = transform_call_hierarchy_outgoing_response_to_host(
+            response,
+            Some(virtual_uri.to_uri_string()),
+            &host_uri,
+            &envelope,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(calls[0].from_ranges[0].start, Position::new(20, 1));
+    }
+
     #[tokio::test]
     async fn virtual_uri_snapshot_uses_producer_tracking_not_filename_shape() {
         let pool = LanguageServerPool::new();
@@ -1346,5 +1374,92 @@ mod tests {
         }));
 
         assert_eq!(request.await.unwrap(), Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn outgoing_response_rejects_a_replaced_producer_after_admission() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua-ls");
+        let admitted = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&admitted)).await;
+        let host_uri = url::Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let admitted_generation = pool.document_connection_generation(&key);
+        let host_uri_lsp: Uri = host_uri.as_str().parse().unwrap();
+        let envelope = CallHierarchyEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            content_version: 1,
+            connection_generation: admitted_generation,
+            connection_key: key.clone(),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            inner: Some(json!({ "token": 9 })),
+            host_layer: true,
+            projected_from_virtual: false,
+        };
+        let params = CallHierarchyOutgoingCallsParams {
+            item: call_item(host_uri.as_str(), json!({ "token": 9 })),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let upstream_id = UpstreamId::Number(78);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_call_hierarchy_outgoing_request(
+                    &BridgeServerConfig::default(),
+                    params,
+                    envelope,
+                    Some(upstream_id),
+                )
+                .await
+            })
+        };
+        let downstream_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = admitted
+                    .router()
+                    .lookup_downstream_ids(&upstream_id)
+                    .into_iter()
+                    .next()
+                {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("outgoing request must be admitted");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !admitted.router().is_sent(downstream_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("outgoing request must be sent before replacement");
+
+        let replacement = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(replacement).await;
+        let _ = admitted.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": [{
+                "to": {
+                    "name": "old-producer", "kind": 12, "uri": host_uri_lsp,
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                    "selectionRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }
+                },
+                "fromRanges": []
+            }]
+        }));
+
+        assert!(
+            request.await.unwrap().is_none(),
+            "the full outgoing response path must discard an admitted old-producer response"
+        );
     }
 }
