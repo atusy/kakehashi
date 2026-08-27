@@ -753,6 +753,21 @@ impl DocumentTracker {
                 .recover_poison("VirtualUriObserver::seed")
                 .extend(issued.iter().cloned());
         }
+        if self.connection_generation(connection_key) == generation {
+            let versions = self.document_versions.lock().await;
+            let confirmed = versions
+                .get(connection_key)
+                .into_iter()
+                .flat_map(HashMap::keys)
+                .filter(|uri| {
+                    !self
+                        .open_claims
+                        .contains_key(&(connection_key.clone(), (*uri).clone()))
+                });
+            uris.lock()
+                .recover_poison("VirtualUriObserver::open_seed")
+                .extend(confirmed.cloned());
+        }
         let observer = VirtualUriObserver {
             id,
             observers: Arc::clone(&self.virtual_uri_observers),
@@ -2266,10 +2281,20 @@ mod tests {
             .await;
         tracker.untrack_document(&before, &key).await;
 
+        let open = VirtualDocumentUri::new(
+            &url_to_uri(&host_uri),
+            "lua",
+            &format!("region{}0-open", VirtualDocumentUri::SCRATCH_ID_MARKER),
+        );
+        tracker
+            .register_opened_document(&host_uri, &open, &key)
+            .await;
+
         let observer = tracker
             .observe_virtual_uris_for_connection(&key, generation)
             .await;
         assert!(!observer.snapshot().contains(&before.to_uri_string()));
+        assert!(observer.snapshot().contains(&open.to_uri_string()));
 
         let during = VirtualDocumentUri::new(
             &url_to_uri(&host_uri),

@@ -625,7 +625,9 @@ fn transform_call_hierarchy_incoming_response_to_host(
     let calls = calls
         .into_iter()
         .filter_map(|mut call| {
-            if VirtualDocumentUri::is_scratch_uri(call.from.uri.as_str()) {
+            if known_virtual_uris.contains(call.from.uri.as_str())
+                && VirtualDocumentUri::is_scratch_uri(call.from.uri.as_str())
+            {
                 return None;
             }
             let projected_from_virtual = if known_virtual_uris.contains(call.from.uri.as_str()) {
@@ -683,7 +685,9 @@ fn transform_call_hierarchy_outgoing_response_to_host(
                     translate_virtual_range_to_host(range, &offset);
                 }
             }
-            if VirtualDocumentUri::is_scratch_uri(call.to.uri.as_str()) {
+            if known_virtual_uris.contains(call.to.uri.as_str())
+                && VirtualDocumentUri::is_scratch_uri(call.to.uri.as_str())
+            {
                 return None;
             }
             let projected_from_virtual = if known_virtual_uris.contains(call.to.uri.as_str()) {
@@ -1138,7 +1142,7 @@ mod tests {
             "data": { "callee": "virtual" }
         });
         let external_item = json!({
-            "name": "external", "kind": 12, "uri": "file:///external/kakehashi-virtual-uri-other.lua",
+            "name": "external", "kind": 12, "uri": "file:///external/kakehashi-virtual-uri-foo-kakehashi-scratch-1.lua",
             "range": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 3 } },
             "selectionRange": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 1 } },
             "data": { "callee": "external" }
@@ -1174,7 +1178,7 @@ mod tests {
         assert_eq!(calls[0].from_ranges[0].start, Position::new(3, 3));
         assert_eq!(
             calls[1].to.uri.as_str(),
-            "file:///external/kakehashi-virtual-uri-other.lua"
+            "file:///external/kakehashi-virtual-uri-foo-kakehashi-scratch-1.lua"
         );
         assert_eq!(calls[1].to.range.start, Position::new(8, 0));
         assert_eq!(calls[1].from_ranges[0].start, Position::new(3, 4));
