@@ -647,6 +647,9 @@ fn transform_code_lens_response_to_host(
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
+    use crate::lsp::bridge::test_helpers::{
+        create_handle_advertising_resolve_methods, wait_for_sent_request,
+    };
     use rstest::rstest;
     use serde_json::json;
 
@@ -729,6 +732,62 @@ mod tests {
             offset,
             host_layer: false,
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_response_rejects_a_retired_producer_after_send() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua-ls");
+        let handle = create_handle_advertising_resolve_methods(key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_uri = Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let generation = pool.document_connection_generation(&key);
+        let lens = CodeLens {
+            range: Default::default(),
+            command: None,
+            data: Some(json!({ "token": 1 })),
+        };
+        let envelope = CodeLensEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            connection_generation: Some(generation),
+            connection_key: Some(key),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            inner: Some(json!({ "token": 1 })),
+            host_layer: true,
+        };
+        let upstream_id = UpstreamId::Number(77);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_code_lens_resolve_request(
+                    &BridgeServerConfig::default(),
+                    lens,
+                    envelope,
+                    Some(upstream_id),
+                )
+                .await
+            })
+        };
+        let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+        handle.begin_shutdown();
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": {
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                "command": { "title": "stale", "command": "stale" }
+            }
+        }));
+
+        let result = request.await.unwrap();
+        assert!(result.command.is_none());
+        assert!(extract_code_lens_envelope(&result).is_some());
     }
 
     // ==========================================================================
