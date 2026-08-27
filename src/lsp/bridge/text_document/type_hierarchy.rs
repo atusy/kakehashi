@@ -129,7 +129,7 @@ impl LanguageServerPool {
     async fn send_type_hierarchy_supertypes_request(
         &self,
         server_config: &BridgeServerConfig,
-        mut params: TypeHierarchySupertypesParams,
+        mut params: TypeHierarchyExpansionParams,
         envelope: TypeHierarchyEnvelope,
         upstream_id: Option<UpstreamId>,
     ) -> Option<Vec<TypeHierarchyItem>> {
@@ -323,12 +323,32 @@ fn strip_type_hierarchy_envelope(item: &mut TypeHierarchyItem) -> Option<TypeHie
 }
 
 fn prepare_supertypes_params(
-    mut params: TypeHierarchySupertypesParams,
-) -> Option<(TypeHierarchySupertypesParams, TypeHierarchyEnvelope)> {
+    params: TypeHierarchySupertypesParams,
+) -> Option<(TypeHierarchyExpansionParams, TypeHierarchyEnvelope)> {
+    let mut params = TypeHierarchyExpansionParams::from(params);
     let envelope = strip_type_hierarchy_envelope(&mut params.item)?;
     params.work_done_progress_params = WorkDoneProgressParams::default();
     params.partial_result_params = PartialResultParams::default();
     Some((params, envelope))
+}
+
+#[derive(Serialize)]
+struct TypeHierarchyExpansionParams {
+    item: TypeHierarchyItem,
+    #[serde(flatten)]
+    work_done_progress_params: WorkDoneProgressParams,
+    #[serde(flatten)]
+    partial_result_params: PartialResultParams,
+}
+
+impl From<TypeHierarchySupertypesParams> for TypeHierarchyExpansionParams {
+    fn from(params: TypeHierarchySupertypesParams) -> Self {
+        Self {
+            item: params.item,
+            work_done_progress_params: params.work_done_progress_params,
+            partial_result_params: params.partial_result_params,
+        }
+    }
 }
 
 fn type_hierarchy_item_to_downstream(
@@ -462,7 +482,7 @@ fn build_type_hierarchy_prepare_request(
 fn build_type_hierarchy_expansion_request(
     request_id: RequestId,
     method: &'static str,
-    params: TypeHierarchySupertypesParams,
+    params: TypeHierarchyExpansionParams,
 ) -> JsonRpcRequest<Value> {
     let mut params = serde_json::to_value(params).unwrap_or(Value::Null);
     if let Some(tags) = params.pointer_mut("/item/tags")
@@ -1017,7 +1037,7 @@ mod tests {
             tokio::spawn(async move {
                 pool.send_type_hierarchy_supertypes_request(
                     &BridgeServerConfig::default(),
-                    params,
+                    params.into(),
                     envelope,
                     Some(upstream_id),
                 )
@@ -1100,7 +1120,7 @@ mod tests {
             tokio::spawn(async move {
                 pool.send_type_hierarchy_supertypes_request(
                     &BridgeServerConfig::default(),
-                    params,
+                    params.into(),
                     envelope,
                     Some(upstream_id),
                 )
@@ -1189,7 +1209,7 @@ mod tests {
             std::time::Duration::from_secs(1),
             pool.send_type_hierarchy_supertypes_request(
                 &BridgeServerConfig::default(),
-                params,
+                params.into(),
                 envelope,
                 Some(upstream_id.clone()),
             ),
