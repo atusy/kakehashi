@@ -15,7 +15,7 @@ use url::Url;
 use crate::config::settings::BridgeServerConfig;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 
-use super::super::pool::{ConnectionKey, LanguageServerPool, UpstreamId};
+use super::super::pool::{ConnectionHandle, ConnectionKey, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
     translate_host_position_to_virtual, translate_host_range_to_virtual,
@@ -361,14 +361,13 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, connection_key);
         }
         let response = response.ok()?;
-        let producer_is_still_live = {
-            let connections = self.connections().await;
-            connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle))
-                && self.document_connection_generation(connection_key)
-                    == envelope.connection_generation
-        };
+        let producer_is_still_live = self
+            .call_hierarchy_producer_is_live(
+                connection_key,
+                &handle,
+                envelope.connection_generation,
+            )
+            .await;
         if !producer_is_still_live {
             return None;
         }
@@ -379,6 +378,19 @@ impl LanguageServerPool {
             &envelope,
         )
         .ok()?
+    }
+
+    async fn call_hierarchy_producer_is_live(
+        &self,
+        connection_key: &ConnectionKey,
+        handle: &Arc<ConnectionHandle>,
+        expected_generation: u64,
+    ) -> bool {
+        let connections = self.connections().await;
+        connections
+            .get(connection_key)
+            .is_some_and(|current| Arc::ptr_eq(current, handle))
+            && self.document_connection_generation(connection_key) == expected_generation
     }
 }
 
@@ -536,6 +548,8 @@ fn transform_call_hierarchy_prepare_response_to_host(
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
+    use crate::lsp::bridge::ConnectionState;
+    use crate::lsp::bridge::test_helpers::create_handle_with_key;
     use serde_json::json;
 
     fn incoming_test_envelope(host_uri: &Uri, key: &ConnectionKey) -> CallHierarchyEnvelope {
@@ -815,6 +829,28 @@ mod tests {
                 .unwrap()
                 .inner,
             Some(json!({ "caller": "external" }))
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_response_rejects_a_replaced_producer_after_admission() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua-ls");
+        let admitted = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&admitted)).await;
+        let admitted_generation = pool.document_connection_generation(&key);
+        assert!(
+            pool.call_hierarchy_producer_is_live(&key, &admitted, admitted_generation)
+                .await
+        );
+
+        let replacement = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(replacement).await;
+        assert!(
+            !pool
+                .call_hierarchy_producer_is_live(&key, &admitted, admitted_generation)
+                .await,
+            "an old producer response must be discarded after same-key replacement"
         );
     }
 }
