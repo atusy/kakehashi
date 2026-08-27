@@ -512,12 +512,15 @@ priorities = ["host"]
     )
     .expect("write config");
 
-    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let barrier_dir = tempfile::TempDir::new().expect("barrier dir");
     let mut client = LspClient::builder()
         .arg("--config-file")
         .arg(config_path.to_str().expect("temp path should be UTF-8"))
         .env("KAKEHASHI_EXPERIMENTAL", "true")
-        .env("MOCK_LSP_CANCEL_DIR", event_dir.path().to_string_lossy())
+        .env(
+            "KAKEHASHI_E2E_WHOLE_DOCUMENT_HOST_BARRIER_DIR",
+            barrier_dir.path().to_string_lossy(),
+        )
         .build();
     let _init = client.send_request(
         "initialize",
@@ -529,7 +532,7 @@ priorities = ["host"]
             "initializationOptions": {
                 "languageServers": {
                     "mock-host-color": {
-                        "cmd": [mock_bin(), "document-color-slow-initialize"],
+                        "cmd": [mock_bin(), "document-color-host"],
                         "languages": ["markdown"]
                     }
                 }
@@ -555,19 +558,17 @@ priorities = ["host"]
         json!({ "textDocument": { "uri": uri } }),
     );
 
-    let initialize_request = event_dir
-        .path()
-        .join("document-color-slow-initialize.request.json");
+    let captured = barrier_dir.path().join("captured");
     assert!(
         (0..60).any(|_| {
-            if initialize_request.exists() {
+            if captured.exists() {
                 true
             } else {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 false
             }
         }),
-        "host connection initialization should start after the old snapshot is captured"
+        "the old host context should be captured before dispatch admission"
     );
 
     client.send_notification(
@@ -585,7 +586,17 @@ priorities = ["host"]
             }
         }),
     );
-    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let reopen_barrier = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(
+        reopen_barrier.get("error").is_none(),
+        "the post-reopen reader barrier should complete: {reopen_barrier:?}"
+    );
+    std::fs::write(barrier_dir.path().join("release"), b"release")
+        .expect("release host request admission");
 
     let response = client.receive_response_for_id_public(request_id);
     assert_eq!(

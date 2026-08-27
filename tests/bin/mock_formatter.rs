@@ -286,8 +286,7 @@ fn main() {
                     | "document-color-host"
                     | "document-color-virt"
                     | "document-color-empty-presentation"
-                    | "document-color-slow-presentation"
-                    | "document-color-slow-initialize" => json!({
+                    | "document-color-slow-presentation" => json!({
                         "colorProvider": true,
                         "textDocumentSync": 1
                     }),
@@ -451,10 +450,6 @@ fn main() {
                             workspace_folders.push(uri.to_string());
                         }
                     }
-                }
-                if mode == "document-color-slow-initialize" {
-                    record_mock_event(&mode, "request", &message);
-                    std::thread::sleep(std::time::Duration::from_secs(3));
                 }
                 respond(&mut writer, id, json!({ "capabilities": capabilities }));
                 if mode == "notify" {
