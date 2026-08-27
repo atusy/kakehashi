@@ -29,17 +29,18 @@ Partially implemented:
   no per-method request builders or response transformers. Handlers run the
   layer walk (`Kakehashi::walk_layers`, cross-layer-aggregation,
   `preferred` semantics): layers are tried lazily in `priorities` — by default
-  virt first, host as fallback. Six method families consume per-server identity in
+  virt first, host as fallback. Seven method families consume per-server identity in
   the host arm: codeAction for the `"{title} — {server}"` suffix, completion
   and inlayHint for their resolve-routing envelopes, codeLens and
   documentLink for the winning server's resolve capability and envelope, and
-  call hierarchy for follow-up routing.
+  call hierarchy and type hierarchy for follow-up routing.
   CodeAction, completion, and inlayHint build custom host arms; codeLens and
   documentLink use the shared whole-document winner hook. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
   inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
-  prepareCallHierarchy, incomingCalls, outgoingCalls,
+  prepareCallHierarchy, incomingCalls, outgoingCalls, prepareTypeHierarchy,
+  supertypes, subtypes,
   formatting, and rangeFormatting (which shares the formatting layer key).
   Diagnostics are covered with real cross-layer `concatenated` (the
   cross-layer-aggregation diagnostics phase): pull and synthetic push both
