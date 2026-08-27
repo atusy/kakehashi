@@ -32,6 +32,7 @@ impl Kakehashi {
                     )
                     .await
             },
+            |won| Some(won.items),
         )
         .await
     }

@@ -68,6 +68,20 @@ pub(crate) struct CodeLensEnvelope {
     pub(crate) offset: EnvelopeOffset,
     /// The downstream server's original `data` value (preserved verbatim).
     pub(crate) inner: Option<Value>,
+    /// Host-layer lens: coordinates and URI already name the real document,
+    /// so resolve forwards the item verbatim without region translation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) host_layer: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl CodeLensEnvelope {
+    pub(crate) fn is_host_layer(&self) -> bool {
+        self.host_layer && self.region_id.is_empty()
+    }
 }
 
 /// Context needed to create envelopes during code lens response processing.
@@ -78,6 +92,7 @@ struct CodeLensEnvelopeContext<'a> {
     injection_language: &'a str,
     incarnation: Option<u64>,
     offset: &'a RegionOffset,
+    host_layer: bool,
 }
 
 /// Wrap `lens.data` in a Kakehashi envelope for origin tracking.
@@ -91,6 +106,7 @@ fn envelope_lens_data(lens: &mut CodeLens, ctx: &CodeLensEnvelopeContext) {
         incarnation: ctx.incarnation,
         offset: EnvelopeOffset::from(ctx.offset),
         inner,
+        host_layer: ctx.host_layer,
     };
     lens.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
 }
@@ -123,8 +139,30 @@ fn re_envelope_lens(lens: &mut CodeLens, envelope: &CodeLensEnvelope) {
         injection_language: &envelope.injection_language,
         incarnation: envelope.incarnation,
         offset: &RegionOffset::from(&envelope.offset),
+        host_layer: envelope.host_layer,
     };
     envelope_lens_data(lens, &ctx);
+}
+
+pub(crate) fn envelope_host_code_lenses(
+    lenses: &mut [CodeLens],
+    server_name: &str,
+    host_uri: &str,
+    incarnation: Option<u64>,
+) {
+    let offset = RegionOffset::new(0, 0);
+    let ctx = CodeLensEnvelopeContext {
+        server_name,
+        host_uri,
+        region_id: "",
+        injection_language: "",
+        incarnation,
+        offset: &offset,
+        host_layer: true,
+    };
+    for lens in lenses {
+        envelope_lens_data(lens, &ctx);
+    }
 }
 
 impl LanguageServerPool {
@@ -179,6 +217,7 @@ impl LanguageServerPool {
                     injection_language,
                     incarnation: host_incarnation,
                     offset: ctx.offset,
+                    host_layer: false,
                 };
                 transform_code_lens_response_to_host(response, ctx.offset, &envelope_ctx)
             },
@@ -247,8 +286,11 @@ impl LanguageServerPool {
             re_envelope_lens(&mut lens, &envelope);
             return lens;
         }
-        let handle = match self
-            .get_or_create_virtual_connection(
+        let handle_result = if envelope.is_host_layer() {
+            self.get_or_create_connection(server_name, server_config, Some(&host_uri))
+                .await
+        } else {
+            self.get_or_create_virtual_connection(
                 server_name,
                 server_config,
                 &host_uri,
@@ -256,7 +298,8 @@ impl LanguageServerPool {
                 &envelope.region_id,
             )
             .await
-        {
+        };
+        let handle = match handle_result {
             Ok(h) => h,
             Err(e) => {
                 warn!(
@@ -302,9 +345,11 @@ impl LanguageServerPool {
         // The downstream produced this lens in VIRTUAL coordinates; translate
         // the (host) range back before sending. `lens.data` already carries the
         // downstream's original value (the caller stripped the envelope).
-        let offset = RegionOffset::from(&envelope.offset);
         let mut outgoing = lens.clone();
-        translate_host_range_to_virtual(&mut outgoing.range, &offset);
+        if !envelope.is_host_layer() {
+            let offset = RegionOffset::from(&envelope.offset);
+            translate_host_range_to_virtual(&mut outgoing.range, &offset);
+        }
         let request = build_code_lens_resolve_request(&outgoing, request_id);
 
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
@@ -455,6 +500,7 @@ mod tests {
             injection_language: "lua",
             incarnation: Some(1),
             offset,
+            host_layer: false,
         }
     }
 

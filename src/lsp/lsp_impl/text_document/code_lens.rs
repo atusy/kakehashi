@@ -7,7 +7,7 @@ use ulid::Ulid;
 use url::Url;
 
 use super::super::Kakehashi;
-use crate::lsp::bridge::{CodeLensEnvelope, extract_code_lens_envelope};
+use crate::lsp::bridge::{CodeLensEnvelope, envelope_host_code_lenses, extract_code_lens_envelope};
 use crate::text::PositionMapper;
 
 impl Kakehashi {
@@ -37,6 +37,17 @@ impl Kakehashi {
                     )
                     .await
             },
+            |mut won| {
+                if won.resolves {
+                    envelope_host_code_lenses(
+                        &mut won.items,
+                        &won.server_name,
+                        won.host_uri.as_str(),
+                        won.incarnation,
+                    );
+                }
+                Some(won.items)
+            },
         )
         .await
     }
@@ -56,7 +67,7 @@ impl Kakehashi {
         // Fail-soft staleness gate: resolving against a moved or invalidated
         // region would translate coordinates with a stale offset and bind the
         // lens to content the user has since edited.
-        if !self.code_lens_region_is_fresh(&envelope) {
+        if !envelope.is_host_layer() && !self.code_lens_region_is_fresh(&envelope) {
             log::debug!(
                 target: "kakehashi::bridge",
                 "codeLens/resolve: region {} is stale; returning lens unresolved",

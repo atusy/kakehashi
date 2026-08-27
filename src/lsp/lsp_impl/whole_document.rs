@@ -22,13 +22,21 @@ use tower_lsp_server::ls_types::{NumberOrString, Uri};
 
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
-    FanInResult, FanOutTask, dispatch_preferred, dispatch_preferred_with_tokens,
-    mint_region_progress_source,
+    FanInResult, FanOutTask, dispatch_host_preferred, dispatch_preferred,
+    dispatch_preferred_with_tokens, mint_region_progress_source,
 };
-use crate::lsp::bridge::{ClientProgressAggregator, ClientProgressDeregisterGuard};
+use crate::lsp::bridge::{ClientProgressAggregator, ClientProgressDeregisterGuard, HostDocument};
 
 use super::bridge_context::{DocumentRequestContext, parse_host_verbatim};
 use super::{Kakehashi, uri_to_url};
+
+pub(super) struct HostWholeDocumentResponse<T> {
+    pub(super) items: Vec<T>,
+    pub(super) server_name: String,
+    pub(super) host_uri: url::Url,
+    pub(super) incarnation: Option<u64>,
+    pub(super) resolves: bool,
+}
 
 impl Kakehashi {
     /// Fan out a whole-document bridged request to all injection regions.
@@ -45,18 +53,20 @@ impl Kakehashi {
     /// `Some`, one shared aggregator relays the first region to begin as a single
     /// `Begin → … → End` on that token (ls-bridge-client-progress); `None` (the
     /// fast methods that don't advertise `workDoneProgress`) keeps prior behavior.
-    pub(super) async fn whole_document_fan_out<T, F, Fut>(
+    pub(super) async fn whole_document_fan_out<T, F, Fut, H>(
         &self,
         lsp_uri: &Uri,
         method_name: &'static str,
         raw_params: serde_json::Value,
         client_progress_token: Option<NumberOrString>,
         send: F,
+        on_host_winner: H,
     ) -> Result<Option<Vec<T>>>
     where
         T: Send + 'static + serde::de::DeserializeOwned,
         F: Fn(FanOutTask) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = io::Result<Option<Vec<T>>>> + Send + 'static,
+        H: FnOnce(HostWholeDocumentResponse<T>) -> Option<Vec<T>> + Send,
     {
         let virt = async {
             // Convert ls_types::Uri to url::Url for internal use
@@ -265,13 +275,56 @@ impl Kakehashi {
         };
 
         let host = async {
-            match self.resolve_host_bridge_context(lsp_uri, method_name) {
-                Some(ctx) => Ok(self
-                    .host_layer_value_with_ctx(&ctx, method_name, raw_params)
-                    .await?
-                    .and_then(parse_host_verbatim::<Vec<T>>)),
-                None => Ok(None),
-            }
+            let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, method_name) else {
+                return Ok(None);
+            };
+            let (cancel_rx, _cancel_guard) =
+                self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+            let pool = self.bridge.pool_arc();
+            let fan_in = dispatch_host_preferred(
+                &ctx,
+                pool.clone(),
+                move |t| {
+                    let params = raw_params.clone();
+                    async move {
+                        let incarnation = t.pool.current_host_incarnation(&t.uri);
+                        let raw = t
+                            .pool
+                            .send_host_raw_request(
+                                &t.server_name,
+                                &t.server_config,
+                                &HostDocument {
+                                    uri: &t.uri,
+                                    language_id: &t.language_id,
+                                    text: &t.text,
+                                },
+                                method_name,
+                                params,
+                                t.upstream_id,
+                            )
+                            .await?;
+                        let Some(raw) = raw else {
+                            return Ok(None);
+                        };
+                        let resolves = raw.handle.has_capability("codeLens/resolve");
+                        let Some(items) = parse_host_verbatim::<Vec<T>>(raw.value) else {
+                            return Ok(None);
+                        };
+                        Ok(Some(HostWholeDocumentResponse {
+                            items,
+                            server_name: t.server_name,
+                            host_uri: t.uri,
+                            incarnation,
+                            resolves,
+                        }))
+                    }
+                },
+                |opt| matches!(opt, Some(v) if !v.items.is_empty()),
+                cancel_rx,
+            )
+            .await;
+            self.host_layer_result(fan_in, method_name, |won| won.and_then(on_host_winner))
+                .await
         };
 
         let result = self

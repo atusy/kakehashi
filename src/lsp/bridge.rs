@@ -83,7 +83,8 @@ pub(crate) use protocol::workspace_edit_within_region;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};
 pub(crate) use text_document::{
     CodeActionEnvelope, CodeLensEnvelope, UpstreamCodeActionCaps, bridge_code_actions,
-    extract_code_action_envelope, extract_code_lens_envelope, parse_code_actions_leniently,
+    envelope_host_code_lenses, extract_code_action_envelope, extract_code_lens_envelope,
+    parse_code_actions_leniently,
 };
 pub(crate) use text_document::{KakehashiEnvelope, bridge_host_completion_items, extract_envelope};
 pub(crate) use text_document::{OpenExpectation, OpenOutcome};

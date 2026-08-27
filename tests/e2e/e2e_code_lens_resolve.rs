@@ -52,6 +52,48 @@ fn init_client() -> (LspClient, tempfile::TempDir) {
     (client, config_dir)
 }
 
+fn init_host_client() -> (LspClient, tempfile::TempDir) {
+    let bin = mock_formatter_bin();
+    let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
+    let config_path = config_dir.path().join("host_code_lens_resolve.toml");
+    std::fs::write(&config_path, "").expect("Failed to write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+
+    let init_response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-codelens": {
+                        "cmd": [bin, "code-lens"],
+                        "languages": ["markdown"]
+                    }
+                },
+                "languages": {
+                    "markdown": {
+                        "bridge": { "_self": { "enabled": true } }
+                    }
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        init_response["result"]["capabilities"]["codeLensProvider"]["resolveProvider"],
+        json!(true),
+        "codeLens resolveProvider must cover host-layer lenses"
+    );
+    client.send_notification("initialized", json!({}));
+    (client, config_dir)
+}
+
 /// Markdown host: the lua fence content sits on host line 3.
 const MARKDOWN: &str = "# Test\n\n```lua\nlocal x = 1\n```\n";
 const MARKDOWN_URI: &str = "file:///test_code_lens_resolve.md";
@@ -175,6 +217,44 @@ fn e2e_code_lens_resolve_round_trips_to_origin_server() {
         stale["data"]["kakehashi"]["origin"], "mock-codelens",
         "fail-soft must return the lens with its routing envelope intact; got: {stale:?}"
     );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_code_lens_resolve_round_trips_verbatim() {
+    let (mut client, _config_dir) = init_host_client();
+    open_markdown(&mut client);
+
+    let lenses = code_lens_with_retry(&mut client);
+    assert_eq!(lenses.len(), 1);
+    let lens = &lenses[0];
+    assert_eq!(lens["range"]["start"]["line"], 0);
+    assert_eq!(
+        lens["data"]["kakehashi"]["origin"], "mock-codelens",
+        "a resolvable host lens must carry its origin server: {lens}"
+    );
+    assert_eq!(
+        lens["data"]["kakehashi"]["host_layer"], true,
+        "the resolve path must distinguish verbatim host coordinates: {lens}"
+    );
+
+    let response = client.send_request("codeLens/resolve", lens.clone());
+    assert!(
+        response.get("error").is_none(),
+        "unexpected host codeLens/resolve error: {:?}",
+        response.get("error")
+    );
+    let resolved = &response["result"];
+    assert_eq!(
+        resolved["command"]["title"], "mock resolved:lens-1",
+        "resolve must reach the host origin with its original data: {resolved}"
+    );
+    assert_eq!(
+        resolved["range"]["start"]["line"], 0,
+        "host coordinates must pass through without virtual translation"
+    );
+    assert_eq!(resolved["data"]["kakehashi"]["host_layer"], true);
 
     shutdown(&mut client);
 }
