@@ -6,7 +6,7 @@
 //! - Host-to-virtual mappings (for didClose propagation)
 //! - Opened state (for LSP spec compliance - ls-bridge-message-ordering)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,6 +24,28 @@ struct VirtualUriObserverState {
     connection_key: ConnectionKey,
     generation: u64,
     uris: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+const SCRATCH_URI_HISTORY_CAPACITY: usize = 1024;
+
+#[derive(Default)]
+struct ScratchUriHistory {
+    order: VecDeque<String>,
+    uris: HashSet<String>,
+}
+
+impl ScratchUriHistory {
+    fn insert(&mut self, uri: String) {
+        if !self.uris.insert(uri.clone()) {
+            return;
+        }
+        self.order.push_back(uri);
+        if self.order.len() > SCRATCH_URI_HISTORY_CAPACITY
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.uris.remove(&evicted);
+        }
+    }
 }
 
 pub(crate) struct VirtualUriObserver {
@@ -141,6 +163,9 @@ pub(crate) struct DocumentTracker {
     /// Downstream indexes may return a URI after didClose, so provenance must
     /// survive until the producing process is purged.
     issued_virtual_uris: DashMap<(ConnectionKey, u64), HashSet<String>>,
+    /// Bounded exact aliases for scratch documents. Exact provenance avoids
+    /// classifying a real file with a valid scratch-shaped name as virtual.
+    scratch_uri_history: DashMap<(ConnectionKey, u64), ScratchUriHistory>,
     /// Active request-scoped observers of virtual URIs issued by a connection.
     /// They extend the generation snapshot atomically across in-flight opens.
     virtual_uri_observers: Arc<DashMap<u64, VirtualUriObserverState>>,
@@ -165,6 +190,7 @@ impl DocumentTracker {
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
             issued_virtual_uris: DashMap::new(),
+            scratch_uri_history: DashMap::new(),
             virtual_uri_observers: Arc::new(DashMap::new()),
             next_virtual_uri_observer_id: AtomicU64::new(0),
             open_claims: DashMap::new(),
@@ -294,12 +320,21 @@ impl DocumentTracker {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
         let generation = self.connection_generation(connection_key);
-        let issued_uri = VirtualDocumentUri::canonical_uri_for_scratch(&uri_string)
+        let canonical_uri = VirtualDocumentUri::canonical_uri_for_scratch(&uri_string);
+        let issued_uri = canonical_uri
+            .as_ref()
+            .cloned()
             .unwrap_or_else(|| uri_string.clone());
         self.issued_virtual_uris
             .entry((connection_key.clone(), generation))
             .or_default()
             .insert(issued_uri);
+        if canonical_uri.is_some() {
+            self.scratch_uri_history
+                .entry((connection_key.clone(), generation))
+                .or_default()
+                .insert(uri_string.clone());
+        }
         for observer in self.virtual_uri_observers.iter() {
             if observer.connection_key == *connection_key && observer.generation == generation {
                 observer
@@ -588,6 +623,8 @@ impl DocumentTracker {
         drop(generation);
         self.issued_virtual_uris
             .retain(|(key, _), _| key != connection_key);
+        self.scratch_uri_history
+            .retain(|(key, _), _| key != connection_key);
         // Take this connection's version map; its keys are the virtual URIs it
         // had open. Done first so the per-URI refcount/reverse-index cleanup
         // below mirrors `untrack_document` exactly, once per opened document.
@@ -752,6 +789,15 @@ impl DocumentTracker {
             uris.lock()
                 .recover_poison("VirtualUriObserver::seed")
                 .extend(issued.iter().cloned());
+        }
+        if self.connection_generation(connection_key) == generation
+            && let Some(scratch) = self
+                .scratch_uri_history
+                .get(&(connection_key.clone(), generation))
+        {
+            uris.lock()
+                .recover_poison("VirtualUriObserver::scratch_seed")
+                .extend(scratch.uris.iter().cloned());
         }
         if self.connection_generation(connection_key) == generation {
             let versions = self.document_versions.lock().await;
@@ -2266,7 +2312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scratch_uri_is_observed_in_flight_but_not_retained_in_generation_history() {
+    async fn scratch_uri_history_retains_exact_provenance_within_its_bound() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
         let key = ConnectionKey::for_server("formatter");
@@ -2293,7 +2339,7 @@ mod tests {
         let observer = tracker
             .observe_virtual_uris_for_connection(&key, generation)
             .await;
-        assert!(!observer.snapshot().contains(&before.to_uri_string()));
+        assert!(observer.snapshot().contains(&before.to_uri_string()));
         assert!(observer.snapshot().contains(
             &VirtualDocumentUri::canonical_uri_for_scratch(&before.to_uri_string()).unwrap()
         ));
@@ -2308,6 +2354,40 @@ mod tests {
             .register_opened_document(&host_uri, &during, &key)
             .await;
         assert!(observer.snapshot().contains(&during.to_uri_string()));
+    }
+
+    #[tokio::test]
+    async fn scratch_uri_history_evicts_the_oldest_exact_alias() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let key = ConnectionKey::for_server("formatter");
+        let host_lsp_uri = url_to_uri(&host_uri);
+        let mut oldest = None;
+        let mut newest = None;
+
+        for step in 0..=SCRATCH_URI_HISTORY_CAPACITY {
+            let uri = VirtualDocumentUri::new(
+                &host_lsp_uri,
+                "lua",
+                &format!("region{}0-{step}", VirtualDocumentUri::SCRATCH_ID_MARKER),
+            );
+            oldest.get_or_insert_with(|| uri.to_uri_string());
+            newest = Some(uri.to_uri_string());
+            tracker
+                .register_opened_document(&host_uri, &uri, &key)
+                .await;
+            tracker.untrack_document(&uri, &key).await;
+        }
+
+        let observer = tracker
+            .observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key))
+            .await;
+        let snapshot = observer.snapshot();
+        assert!(!snapshot.contains(oldest.as_ref().unwrap()));
+        assert!(snapshot.contains(newest.as_ref().unwrap()));
+        assert!(snapshot.contains(
+            &VirtualDocumentUri::canonical_uri_for_scratch(newest.as_ref().unwrap()).unwrap()
+        ));
     }
 
     #[tokio::test]
