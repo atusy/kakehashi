@@ -38,7 +38,7 @@ use serde_json::Value;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Position, Range, Uri};
 use url::Url;
 
-use super::super::pool::{ConnectionKey, LanguageServerPool, UpstreamId};
+use super::super::pool::{ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId};
 use tower_lsp_server::ls_types::{
     InlayHintParams, NumberOrString, TextDocumentIdentifier, WorkDoneProgressParams,
 };
@@ -478,9 +478,9 @@ impl LanguageServerPool {
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
         let send_result = {
             let connections = self.connections().await;
-            let producer_is_live = connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle));
+            let producer_is_live = connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+            });
             let generation_matches =
                 self.document_connection_generation(connection_key) == expected_generation;
             if !producer_is_live || !generation_matches {

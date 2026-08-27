@@ -20,7 +20,7 @@ use serde_json::Value;
 use tower_lsp_server::ls_types::DocumentLink;
 use url::Url;
 
-use super::super::pool::{ConnectionKey, LanguageServerPool, UpstreamId};
+use super::super::pool::{ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     DocumentParams, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     build_whole_document_request, response_has_jsonrpc_error,
@@ -383,9 +383,9 @@ impl LanguageServerPool {
 
         let send_result = {
             let connections = self.connections().await;
-            let producer_is_live = connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle));
+            let producer_is_live = connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+            });
             let generation_matches = envelope.connection_generation.is_some_and(|expected| {
                 self.document_connection_generation(connection_key) == expected
             });
@@ -427,6 +427,19 @@ impl LanguageServerPool {
                 return link;
             }
         };
+
+        let producer_is_still_live = {
+            let connections = self.connections().await;
+            connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle)
+                    && current.state() == ConnectionState::Ready
+                    && self.document_connection_generation(connection_key) == expected_generation
+            })
+        };
+        if !producer_is_still_live {
+            re_envelope_link(&mut link, &envelope);
+            return link;
+        }
 
         match parse_document_link_resolve_response(response) {
             Some(mut resolved) => {
