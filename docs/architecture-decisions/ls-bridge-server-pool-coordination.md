@@ -47,11 +47,11 @@ The `ConnectionKey` is stored on each connection handle, so the request,
 `didChange`, host, and cancel paths route per-connection state via
 `handle.key()` without re-resolving the root.
 
-`completionItem/resolve`, `codeAction/resolve`, `codeLens/resolve`, and
-`documentLink/resolve` carry
+`completionItem/resolve`, `codeAction/resolve`, `codeLens/resolve`,
+`documentLink/resolve`, and `inlayHint/resolve` carry
 no `textDocument`, so the originating host URI is stashed in their routing
 envelopes (`KakehashiEnvelope` / `CodeActionEnvelope` / `CodeLensEnvelope` /
-`DocumentLinkEnvelope`)
+`DocumentLinkEnvelope` / `InlayHintEnvelope`)
 and used to re-resolve the same `(server, root)` connection that produced the
 item. (A legacy **completion** envelope without that field falls back to
 the client-root connection — the pre-#382 rule, and still the shipped

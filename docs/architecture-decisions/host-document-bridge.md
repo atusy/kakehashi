@@ -79,6 +79,13 @@ Partially implemented:
   returns the original unresolved link. Both layers bind opaque link data to
   the exact producing process: resolve never respawns or selects a replacement
   connection after a restart, configuration reroute, or pool-key change.
+  `inlayHint/resolve` follows the same exact-producer and cancellation contract.
+  The host layer forwards coordinates verbatim; the virtual layer reverses the
+  hint position, existing accept edits, and same-document label locations for
+  the request, then translates lazily materialized edits and locations back to
+  the host. Resolve keeps the original hint position and applies the same
+  all-or-nothing edit safety guard as initial hint retrieval. Runtime-adjusted
+  region geometry (`#offset!` / `#trim!`) participates in the freshness check.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one

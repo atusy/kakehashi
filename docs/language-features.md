@@ -233,7 +233,11 @@ selection, and always combined with `preferred` — the sequential
 Shows inline hints (types, parameter names) for the embedded block overlapping the
 requested range. A hint whose accept-time text edits would corrupt the host
 document around the embedded block is served without them (the edits drop as
-one atomic set). Default combine strategy: `preferred`.
+one atomic set). Lazy hints can be completed through `inlayHint/resolve`; the
+request returns to the exact downstream process that produced the hint, and a
+moved, invalidated, reopened, or process-stale hint remains unresolved. Runtime
+query offsets such as frontmatter `#offset!` are included in the freshness and
+coordinate checks. Default combine strategy: `preferred`.
 
 ### Moniker
 
