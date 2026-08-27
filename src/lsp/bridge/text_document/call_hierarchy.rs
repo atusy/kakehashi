@@ -834,23 +834,88 @@ mod tests {
 
     #[tokio::test]
     async fn incoming_response_rejects_a_replaced_producer_after_admission() {
-        let pool = LanguageServerPool::new();
+        let pool = Arc::new(LanguageServerPool::new());
         let key = ConnectionKey::for_server("lua-ls");
         let admitted = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
         pool.insert_connection(Arc::clone(&admitted)).await;
+        let host_uri = url::Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
         let admitted_generation = pool.document_connection_generation(&key);
-        assert!(
-            pool.call_hierarchy_producer_is_live(&key, &admitted, admitted_generation)
+        let host_uri_lsp: Uri = host_uri.as_str().parse().unwrap();
+        let envelope = CallHierarchyEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            content_version: 1,
+            connection_generation: admitted_generation,
+            connection_key: key.clone(),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            inner: Some(json!({ "token": 9 })),
+            host_layer: true,
+            projected_from_virtual: false,
+        };
+        let params = CallHierarchyIncomingCallsParams {
+            item: call_item(host_uri.as_str(), json!({ "token": 9 })),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let upstream_id = UpstreamId::Number(77);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_call_hierarchy_incoming_request(
+                    &BridgeServerConfig::default(),
+                    params,
+                    envelope,
+                    Some(upstream_id),
+                )
                 .await
-        );
+            })
+        };
+        let downstream_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = admitted
+                    .router()
+                    .lookup_downstream_ids(&upstream_id)
+                    .into_iter()
+                    .next()
+                {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("incoming request must be admitted");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !admitted.router().is_sent(downstream_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("incoming request must be sent before replacement");
 
         let replacement = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
         pool.insert_connection(replacement).await;
+        let _ = admitted.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": [{
+                "from": {
+                    "name": "old-producer", "kind": 12, "uri": host_uri_lsp,
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                    "selectionRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }
+                },
+                "fromRanges": []
+            }]
+        }));
+
         assert!(
-            !pool
-                .call_hierarchy_producer_is_live(&key, &admitted, admitted_generation)
-                .await,
-            "an old producer response must be discarded after same-key replacement"
+            request.await.unwrap().is_none(),
+            "the full response path must discard an admitted old-producer response"
         );
     }
 }
