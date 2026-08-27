@@ -6482,22 +6482,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn respawn_purge_reclaims_successful_open_transition_locks() {
+    async fn respawn_purge_reclaims_retained_open_transition_locks() {
         let pool = LanguageServerPool::new();
         let host_uri = Url::parse("file:///test/purged.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let connection_key = ConnectionKey::for_server("lua");
-        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
-        pool.ensure_document_opened(
-            &mut sender,
-            &host_uri,
-            &virtual_uri,
-            "print('opened')",
-            &connection_key,
-        )
-        .await
-        .unwrap();
-        assert!(rx.try_recv().is_ok());
+        // Seed the kind of idle map entry a cancelled/older implementation may
+        // leave behind. Successful opens now reclaim this entry eagerly, so the
+        // purge contract must be tested without relying on a leak first.
+        drop(pool.open_transition_lock(&virtual_uri, &connection_key));
         assert!(
             pool.open_transition_locks
                 .contains_key(&(connection_key.clone(), virtual_uri.to_uri_string()))
