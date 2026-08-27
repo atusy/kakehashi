@@ -317,8 +317,9 @@ enum Role {
 /// state, so they must observe every `didChange` that preceded them on the
 /// wire — but their params carry no `textDocument`, so the URI comes from the
 /// routing envelope (`params.data` for resolve methods and `params.item.data`
-/// for call hierarchy) (unenveloped items
-/// pass through ungated; their handlers return them unchanged anyway). The
+/// for call hierarchy). Unenveloped items pass through ungated; resolve
+/// handlers return their inputs unchanged, while `incomingCalls` returns
+/// `null` because it has no producer to expand. The
 /// full `kakehashi/node` family is gated too (#698). Its tracker and
 /// incarnation checks catch staleness only after a lifecycle writer has run;
 /// without this barrier a following node request can overtake a wire-order

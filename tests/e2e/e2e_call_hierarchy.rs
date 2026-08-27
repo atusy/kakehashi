@@ -89,6 +89,26 @@ fn incoming_calls(client: &mut LspClient, item: Value) -> Vec<Value> {
         .expect("incoming call array")
 }
 
+#[test]
+fn incoming_calls_without_a_routing_envelope_return_null() {
+    let (mut client, _config_dir) = init_client(false);
+    let response = client.send_request(
+        "callHierarchy/incomingCalls",
+        json!({ "item": {
+            "name": "foreign",
+            "kind": 12,
+            "uri": "file:///foreign.lua",
+            "range": { "start": { "line": 0, "character": 0 },
+                       "end": { "line": 0, "character": 1 } },
+            "selectionRange": { "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 1 } }
+        }}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
 fn shutdown(client: &mut LspClient) {
     let _ = client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));

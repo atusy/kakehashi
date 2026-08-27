@@ -57,8 +57,9 @@ and used to re-resolve the same `(server, root)` connection that produced the
 item. (A legacy **completion** envelope without that field falls back to
 the client-root connection — the pre-#382 rule, and still the shipped
 behavior today, via the field's serde default; the code-action, code-lens,
-document-link, inlay-hint, and call-hierarchy envelopes *require* the field, so a stamp-less one fails to
-deserialize and the item is returned unresolved. The fail-soft rule
+document-link, inlay-hint, and call-hierarchy envelopes *require* the field. A
+stamp-less resolve item fails to deserialize and is returned unresolved;
+stamp-less `incomingCalls` returns `null` because no producer can expand it. The fail-soft rule
 below is target state that lands with bridge-routing-protocol's
 implementation.) Amended with
 bridge-routing-protocol:
