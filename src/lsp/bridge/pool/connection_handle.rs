@@ -185,7 +185,7 @@ pub(crate) struct ConnectionHandle {
 }
 
 impl ConnectionHandle {
-    /// Stop the writer and wait until its outbound receiver is gone.
+    /// Stop the writer while preserving a Ready handle for send-failure tests.
     #[cfg(test)]
     pub(crate) async fn cancel_writer_for_test(&self) {
         if let Some(handle) = self
@@ -199,6 +199,7 @@ impl ConnectionHandle {
         tokio::time::timeout(std::time::Duration::from_secs(1), self.tx.closed())
             .await
             .expect("writer receiver should close after cancellation");
+        self.set_state(ConnectionState::Ready);
     }
 
     /// Create a new ConnectionHandle in Ready state (test helper).
