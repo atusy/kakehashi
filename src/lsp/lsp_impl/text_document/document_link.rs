@@ -2,15 +2,14 @@
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams};
-use ulid::Ulid;
 use url::Url;
 
 use super::super::Kakehashi;
+use super::super::region_offset::resolve_region_offset;
 use crate::lsp::bridge::{
     DocumentLinkEnvelope, envelope_host_document_links, extract_document_link_envelope,
 };
 use crate::lsp::current_upstream_id;
-use crate::text::PositionMapper;
 
 impl Kakehashi {
     pub(crate) async fn document_link_impl(
@@ -91,24 +90,15 @@ impl Kakehashi {
         let Ok(uri) = Url::parse(&envelope.host_uri) else {
             return false;
         };
-        let Ok(ulid) = envelope.region_id.parse::<Ulid>() else {
-            return false;
-        };
-        let Some((start_byte, _end, _kind, tracked_incarnation)) =
-            self.bridge.node_tracker().lookup_position(&uri, &ulid)
-        else {
-            return false;
-        };
-        let Some(doc) = self.documents.get(&uri) else {
-            return false;
-        };
-        if doc.incarnation() != tracked_incarnation {
-            return false;
-        }
-        let mapper = PositionMapper::new(doc.text());
-        let Some(position) = mapper.byte_to_position(start_byte) else {
-            return false;
-        };
-        position.line == envelope.offset.line && position.character == envelope.offset.column
+        resolve_region_offset(
+            &self.documents,
+            &self.language,
+            &self.bridge,
+            &uri,
+            &envelope.region_id,
+        )
+        .is_some_and(|(offset, _, _)| {
+            offset == crate::lsp::bridge::RegionOffset::from(&envelope.offset)
+        })
     }
 }

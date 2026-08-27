@@ -176,6 +176,35 @@ fn e2e_document_link_resolve_round_trips_to_virtual_origin() {
     shutdown_client(&mut client);
 }
 
+#[test]
+fn e2e_document_link_resolve_accepts_offset_frontmatter_region() {
+    let (mut client, _config_dir) =
+        init_mock_document_link_client("document-link-resolve", "yaml", false, None);
+    let uri = "file:///test_document_link_resolve_frontmatter.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "---\ntitle: test\n---\n"
+        }}),
+    );
+
+    let link = document_links_with_retry(&mut client, uri).remove(0);
+    assert_eq!(link["range"]["start"], json!({ "line": 1, "character": 0 }));
+    let response = client.send_request("documentLink/resolve", link.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["tooltip"], "mock resolved:link-1");
+    assert_eq!(response["result"]["range"], link["range"]);
+    assert_eq!(
+        response["result"]["data"]["kakehashi"]["inner"]["receivedRange"]["start"],
+        json!({ "line": 0, "character": 0 })
+    );
+
+    shutdown_client(&mut client);
+}
+
 fn assert_virtual_document_link_replacement_fails_soft(change_pool_key: bool) {
     let (mut client, _config_dir) =
         init_mock_document_link_client("document-link-resolve", "lua", false, None);
