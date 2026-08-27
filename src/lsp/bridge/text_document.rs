@@ -29,6 +29,9 @@ pub(crate) use did_open::{OpenExpectation, OpenOutcome};
 mod document_color;
 mod document_highlight;
 mod document_link;
+pub(crate) use document_link::{
+    DocumentLinkEnvelope, envelope_host_document_links, extract_document_link_envelope,
+};
 mod document_symbol;
 mod folding_range;
 mod formatting;

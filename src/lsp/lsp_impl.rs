@@ -959,6 +959,10 @@ impl LanguageServer for Kakehashi {
         self.document_link_impl(params).await
     }
 
+    async fn document_link_resolve(&self, params: DocumentLink) -> Result<DocumentLink> {
+        self.document_link_resolve_impl(params).await
+    }
+
     async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
         self.code_lens_impl(params).await
     }
