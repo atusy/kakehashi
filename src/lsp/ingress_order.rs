@@ -308,7 +308,7 @@ enum Role {
 /// `textDocument/codeAction` is in the same class: its
 /// `context.diagnostics` and returned edits are computed against the
 /// document snapshot (#568). `codeLens/resolve`, `codeAction/resolve`, and
-/// `documentLink/resolve` are readers too (#355, #568): their freshness gates read tracker/document
+/// `documentLink/resolve` and `inlayHint/resolve` are readers too (#355, #568): their freshness gates read tracker/document
 /// state, so they must observe every `didChange` that preceded them on the
 /// wire — but their params carry no `textDocument`, so the URI comes from the
 /// routing envelope in `params.data.kakehashi.host_uri` (unenveloped items
@@ -359,7 +359,10 @@ fn classify(req: &Request) -> Option<Role> {
             let uri = text_document_uri(req)?;
             Some(Role::Reader { uri })
         }
-        "codeLens/resolve" | "codeAction/resolve" | "documentLink/resolve" => {
+        "codeLens/resolve"
+        | "codeAction/resolve"
+        | "documentLink/resolve"
+        | "inlayHint/resolve" => {
             let raw = req.params()?["data"][ENVELOPE_KEY]["host_uri"].as_str()?;
             Some(Role::Reader {
                 uri: normalize_uri(raw),
@@ -846,6 +849,18 @@ mod tests {
         assert!(
             matches!(classify(&enveloped_link), Some(Role::Reader { ref uri }) if uri == URI),
             "enveloped documentLink/resolve must be keyed by the envelope's host_uri"
+        );
+
+        let enveloped_hint = Request::build("inlayHint/resolve")
+            .params(serde_json::json!({
+                "position": { "line": 0, "character": 1 },
+                "label": ": number",
+                "data": { "kakehashi": { "host_uri": URI } }
+            }))
+            .finish();
+        assert!(
+            matches!(classify(&enveloped_hint), Some(Role::Reader { ref uri }) if uri == URI),
+            "enveloped inlayHint/resolve must be keyed by the envelope's host_uri"
         );
 
         // codeAction/resolve is classified the same way (#568): the URI comes

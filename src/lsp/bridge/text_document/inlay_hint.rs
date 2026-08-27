@@ -16,21 +16,136 @@
 //! writer task, ensuring FIFO ordering with other messages.
 
 use std::io;
+use std::sync::Arc;
 
 use crate::config::settings::BridgeServerConfig;
+use log::warn;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Position, Range, Uri};
 use url::Url;
 
-use super::super::pool::{LanguageServerPool, UpstreamId};
+use super::super::pool::{ConnectionKey, LanguageServerPool, UpstreamId};
 use tower_lsp_server::ls_types::{
     InlayHintParams, NumberOrString, TextDocumentIdentifier, WorkDoneProgressParams,
 };
 
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
-    text_edit_safe_in_region, translate_host_range_to_virtual, translate_virtual_position_to_host,
-    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    text_edit_safe_in_region, translate_host_position_to_virtual, translate_host_range_to_virtual,
+    translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
+use super::completion::EnvelopeOffset;
+use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
+use crate::lsp::bridge::actor::RouterCleanupGuard;
+
+const ENVELOPE_KEY: &str = "kakehashi";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct InlayHintEnvelope {
+    pub(crate) origin: String,
+    pub(crate) host_uri: String,
+    pub(crate) region_id: String,
+    pub(crate) injection_language: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) incarnation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) connection_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) connection_key: Option<ConnectionKey>,
+    pub(crate) offset: EnvelopeOffset,
+    pub(crate) inner: Option<Value>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) host_layer: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl InlayHintEnvelope {
+    pub(crate) fn is_host_layer(&self) -> bool {
+        self.host_layer && self.region_id.is_empty()
+    }
+}
+
+struct InlayHintEnvelopeContext<'a> {
+    server_name: &'a str,
+    host_uri: &'a str,
+    region_id: &'a str,
+    injection_language: &'a str,
+    incarnation: Option<u64>,
+    connection_generation: u64,
+    connection_key: &'a ConnectionKey,
+    offset: &'a RegionOffset,
+    host_layer: bool,
+}
+
+fn envelope_hint_data(hint: &mut InlayHint, ctx: &InlayHintEnvelopeContext<'_>) {
+    let inner = hint.data.take();
+    let envelope = InlayHintEnvelope {
+        origin: ctx.server_name.to_string(),
+        host_uri: ctx.host_uri.to_string(),
+        region_id: ctx.region_id.to_string(),
+        injection_language: ctx.injection_language.to_string(),
+        incarnation: ctx.incarnation,
+        connection_generation: Some(ctx.connection_generation),
+        connection_key: Some(ctx.connection_key.clone()),
+        offset: EnvelopeOffset::from(ctx.offset),
+        inner,
+        host_layer: ctx.host_layer,
+    };
+    hint.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
+}
+
+pub(crate) fn extract_inlay_hint_envelope(hint: &InlayHint) -> Option<InlayHintEnvelope> {
+    serde_json::from_value(hint.data.as_ref()?.get(ENVELOPE_KEY)?.clone()).ok()
+}
+
+fn strip_inlay_hint_envelope(hint: &mut InlayHint) -> Option<InlayHintEnvelope> {
+    let mut envelope = extract_inlay_hint_envelope(hint)?;
+    hint.data = envelope.inner.take();
+    Some(envelope)
+}
+
+fn re_envelope_hint(hint: &mut InlayHint, envelope: &InlayHintEnvelope) {
+    let mut restored = envelope.clone();
+    restored.inner = hint.data.take();
+    hint.data = Some(serde_json::json!({ ENVELOPE_KEY: restored }));
+}
+
+pub(crate) fn envelope_host_inlay_hints(
+    hints: &mut [InlayHint],
+    server_name: &str,
+    host_uri: &str,
+    incarnation: Option<u64>,
+    connection_generation: u64,
+    connection_key: &ConnectionKey,
+    server_resolves: bool,
+) {
+    let offset = RegionOffset::new(0, 0);
+    let ctx = InlayHintEnvelopeContext {
+        server_name,
+        host_uri,
+        region_id: "",
+        injection_language: "",
+        incarnation,
+        connection_generation,
+        connection_key,
+        offset: &offset,
+        host_layer: true,
+    };
+    for hint in hints {
+        if server_resolves
+            || hint
+                .data
+                .as_ref()
+                .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
+        {
+            envelope_hint_data(hint, &ctx);
+        }
+    }
+}
 
 impl LanguageServerPool {
     /// Send an inlay hint request and wait for the response.
@@ -53,6 +168,7 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
         client_progress_token: Option<NumberOrString>,
     ) -> io::Result<Option<Vec<InlayHint>>> {
+        let host_incarnation = self.current_host_incarnation(host_uri);
         let handle = self
             .get_or_create_virtual_connection(
                 server_name,
@@ -65,6 +181,9 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/inlayHint") {
             return Ok(None);
         }
+        let server_resolves = handle.has_capability("inlayHint/resolve");
+        let connection_key = handle.key().clone();
+        let connection_generation = self.document_connection_generation(&connection_key);
         self.execute_bridge_request_with_handle(
             handle,
             host_uri,
@@ -83,17 +202,255 @@ impl LanguageServerPool {
                 )
             },
             |response, ctx| {
-                transform_inlay_hint_response_to_host(
+                transform_inlay_hint_response_to_host_and_envelope(
                     response,
                     &ctx.virtual_uri_string,
                     ctx.host_uri_lsp,
                     ctx.offset,
                     region_end,
+                    &InlayHintEnvelopeContext {
+                        server_name,
+                        host_uri: host_uri.as_str(),
+                        region_id,
+                        injection_language,
+                        incarnation: host_incarnation,
+                        connection_generation,
+                        connection_key: &connection_key,
+                        offset: ctx.offset,
+                        host_layer: false,
+                    },
+                    server_resolves,
                 )
             },
         )
         .await
     }
+
+    pub(crate) async fn dispatch_inlay_hint_resolve(
+        &self,
+        mut hint: InlayHint,
+        settings: &crate::config::settings::WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+        region_end: Option<Position>,
+    ) -> InlayHint {
+        let Some(envelope) = strip_inlay_hint_envelope(&mut hint) else {
+            return hint;
+        };
+        if !crate::config::is_server_spawnable(&settings.language_servers, &envelope.origin) {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        }
+        let Some(config) = resolve_with_wildcard(
+            &settings.language_servers,
+            &envelope.origin,
+            merge_bridge_server_configs,
+        ) else {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        };
+        self.send_inlay_hint_resolve_request(&config, hint, envelope, upstream_id, region_end)
+            .await
+    }
+
+    async fn send_inlay_hint_resolve_request(
+        &self,
+        server_config: &BridgeServerConfig,
+        mut hint: InlayHint,
+        envelope: InlayHintEnvelope,
+        upstream_id: Option<UpstreamId>,
+        region_end: Option<Position>,
+    ) -> InlayHint {
+        let server_name = &envelope.origin;
+        let Ok(host_uri) = Url::parse(&envelope.host_uri) else {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        };
+        if envelope
+            .incarnation
+            .is_some_and(|expected| self.current_host_incarnation(&host_uri) != Some(expected))
+        {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        }
+        let Some(expected_generation) = envelope.connection_generation else {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        };
+        let Some(connection_key) = envelope
+            .connection_key
+            .as_ref()
+            .filter(|key| key.server() == server_name)
+        else {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        };
+        if self.document_connection_generation(connection_key) != expected_generation {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        }
+        let handle = match self
+            .ready_connection_by_key_for_config(connection_key, Some(server_config))
+            .await
+        {
+            Some(handle) => handle,
+            None => {
+                re_envelope_hint(&mut hint, &envelope);
+                return hint;
+            }
+        };
+        if !handle.has_capability("inlayHint/resolve") {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        }
+
+        let _host_lifecycle = if envelope.is_host_layer() {
+            let Some(expected_incarnation) = envelope.incarnation else {
+                re_envelope_hint(&mut hint, &envelope);
+                return hint;
+            };
+            match self
+                .request_host_lifecycle_for_incarnation(&host_uri, expected_incarnation)
+                .await
+            {
+                Ok(lifecycle) => Some(lifecycle),
+                Err(_) => {
+                    re_envelope_hint(&mut hint, &envelope);
+                    return hint;
+                }
+            }
+        } else {
+            None
+        };
+
+        let connection_key = handle.key();
+        if let Some(ref id) = upstream_id {
+            self.register_upstream_request_for_handle(id.clone(), &handle);
+        }
+        let (request_id, response_rx) = match handle
+            .register_request_with_upstream(upstream_id.clone())
+        {
+            Ok(pair) => pair,
+            Err(error) => {
+                warn!(target: "kakehashi::bridge", "inlayHint/resolve: failed to register request for {server_name}: {error}");
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                re_envelope_hint(&mut hint, &envelope);
+                return hint;
+            }
+        };
+
+        let mut outgoing = hint.clone();
+        let virtual_uri = if envelope.is_host_layer() {
+            None
+        } else {
+            let offset = RegionOffset::from(&envelope.offset);
+            translate_host_position_to_virtual(&mut outgoing.position, &offset);
+            if let Some(edits) = &mut outgoing.text_edits {
+                for edit in edits {
+                    translate_host_range_to_virtual(&mut edit.range, &offset);
+                }
+            }
+            let host_lsp_uri: Uri = envelope.host_uri.parse().expect("validated host URI");
+            let virtual_uri = VirtualDocumentUri::new(
+                &host_lsp_uri,
+                &envelope.injection_language,
+                &envelope.region_id,
+            );
+            let virtual_lsp_uri = virtual_uri_to_lsp_uri(&virtual_uri);
+            if let InlayHintLabel::LabelParts(parts) = &mut outgoing.label {
+                for part in parts {
+                    if let Some(location) = &mut part.location
+                        && location.uri.as_str() == envelope.host_uri
+                    {
+                        location.uri = virtual_lsp_uri.clone();
+                        translate_host_range_to_virtual(&mut location.range, &offset);
+                    }
+                }
+            }
+            Some(virtual_uri.to_uri_string())
+        };
+        let request = build_inlay_hint_resolve_request(&outgoing, request_id);
+        let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
+        let send_result = {
+            let connections = self.connections().await;
+            let producer_is_live = connections
+                .get(connection_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle));
+            let generation_matches =
+                self.document_connection_generation(connection_key) == expected_generation;
+            if !producer_is_live || !generation_matches {
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "producer connection was replaced before resolve send",
+                ))
+            } else {
+                handle.send_request(request, request_id).map_err(Into::into)
+            }
+        };
+        if let Err(error) = send_result {
+            warn!(target: "kakehashi::bridge", "inlayHint/resolve: failed to send request for {server_name}: {error}");
+            if let Some(ref id) = upstream_id {
+                self.unregister_upstream_request(id, connection_key);
+            }
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        }
+
+        let response = handle.wait_for_response(request_id, response_rx).await;
+        router_guard.disarm();
+        if let Some(ref id) = upstream_id {
+            self.unregister_upstream_request(id, connection_key);
+        }
+        let Ok(response) = response else {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        };
+        let Some(mut resolved) = parse_inlay_hint_resolve_response(response) else {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        };
+        if !envelope.is_host_layer() {
+            let Some(region_end) = region_end else {
+                re_envelope_hint(&mut hint, &envelope);
+                return hint;
+            };
+            let offset = RegionOffset::from(&envelope.offset);
+            let request_virtual_uri = virtual_uri.as_deref().unwrap_or_default();
+            let host_lsp_uri: Uri = envelope.host_uri.parse().expect("validated host URI");
+            transform_inlay_hint_to_host(
+                &mut resolved,
+                request_virtual_uri,
+                &host_lsp_uri,
+                &offset,
+                region_end,
+            );
+        }
+        // Position identifies the original hint and is not a lazy field.
+        resolved.position = hint.position;
+        if resolved.data.is_none() {
+            resolved.data = hint.data.take();
+        }
+        re_envelope_hint(&mut resolved, &envelope);
+        resolved
+    }
+}
+
+fn build_inlay_hint_resolve_request(
+    hint: &InlayHint,
+    request_id: RequestId,
+) -> JsonRpcRequest<&InlayHint> {
+    JsonRpcRequest::new(request_id.as_i64(), "inlayHint/resolve", hint)
+}
+
+fn parse_inlay_hint_resolve_response(mut response: serde_json::Value) -> Option<InlayHint> {
+    if response_has_jsonrpc_error(&response, "inlayHint/resolve") {
+        return None;
+    }
+    let result = response.get_mut("result").map(serde_json::Value::take)?;
+    (!result.is_null())
+        .then(|| serde_json::from_value(result).ok())
+        .flatten()
 }
 
 /// Build a JSON-RPC inlay hint request for a downstream language server.
@@ -132,12 +489,14 @@ fn build_inlay_hint_request(
 /// labels, each part's `location` is rewritten with the same URI filter as
 /// other handlers — keep real files, translate same-virtual-URI matches and
 /// swap to the host URI, drop cross-region virtual URIs.
-fn transform_inlay_hint_response_to_host(
+fn transform_inlay_hint_response_to_host_and_envelope(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
     region_end: Position,
+    envelope_ctx: &InlayHintEnvelopeContext<'_>,
+    server_resolves: bool,
 ) -> Option<Vec<InlayHint>> {
     if response_has_jsonrpc_error(&response, "textDocument/inlayHint") {
         return None;
@@ -152,60 +511,94 @@ fn transform_inlay_hint_response_to_host(
     let mut hints: Vec<InlayHint> = serde_json::from_value(result).ok()?;
 
     for hint in &mut hints {
-        // Transform position to host coordinates
-        translate_virtual_position_to_host(&mut hint.position, offset);
+        transform_inlay_hint_to_host(hint, request_virtual_uri, host_uri, offset, region_end);
 
-        // Transform textEdits ranges. If ANY edit is unsafe for the injection
-        // region (escapes it, breaks `> ` prefixes, or merges content into
-        // the closing fence) when applied verbatim, strip them ALL: the
-        // client applies the whole array on accept (LSP 3.18), so a partial
-        // set could apply half of an interdependent pair. The hint itself
-        // stays useful without its accept edits (textEdits optional).
-        if let Some(text_edits) = &mut hint.text_edits {
-            for edit in text_edits.iter_mut() {
-                translate_virtual_range_to_host(&mut edit.range, offset);
-            }
-            if !text_edits
-                .iter()
-                .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
-            {
-                log::warn!(
-                    target: "kakehashi::bridge",
-                    "inlayHint: dropped a hint's textEdits ({}): an edit is unsafe for the injection region (escapes it, breaks line prefixes, or merges content into the closing fence)",
-                    text_edits.len()
-                );
-                hint.text_edits = None;
-            }
-        }
-
-        // Transform label parts if label is an array (InlayHintLabelPart[])
-        if let InlayHintLabel::LabelParts(parts) = &mut hint.label {
-            parts.retain_mut(|part| {
-                let Some(location) = &mut part.location else {
-                    return true; // Parts without location are always kept
-                };
-
-                let uri_str = location.uri.as_str();
-
-                // Case 1: Real file URI (not virtual) → keep as-is
-                if !VirtualDocumentUri::is_virtual_uri(uri_str) {
-                    return true;
-                }
-
-                // Case 2: Same virtual URI → transform to host coordinates
-                if uri_str == request_virtual_uri {
-                    location.uri = host_uri.clone();
-                    translate_virtual_range_to_host(&mut location.range, offset);
-                    return true;
-                }
-
-                // Case 3: Different virtual URI (cross-region) → filter out
-                false
-            });
+        if server_resolves
+            || hint
+                .data
+                .as_ref()
+                .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
+        {
+            envelope_hint_data(hint, envelope_ctx);
         }
     }
 
     Some(hints)
+}
+
+fn transform_inlay_hint_to_host(
+    hint: &mut InlayHint,
+    request_virtual_uri: &str,
+    host_uri: &Uri,
+    offset: &RegionOffset,
+    region_end: Position,
+) {
+    translate_virtual_position_to_host(&mut hint.position, offset);
+
+    if let Some(text_edits) = &mut hint.text_edits {
+        for edit in text_edits.iter_mut() {
+            translate_virtual_range_to_host(&mut edit.range, offset);
+        }
+        if !text_edits
+            .iter()
+            .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "inlayHint: dropped a hint's textEdits ({}): an edit is unsafe for the injection region (escapes it, breaks line prefixes, or merges content into the closing fence)",
+                text_edits.len()
+            );
+            hint.text_edits = None;
+        }
+    }
+
+    if let InlayHintLabel::LabelParts(parts) = &mut hint.label {
+        parts.retain_mut(|part| {
+            let Some(location) = &mut part.location else {
+                return true;
+            };
+            let uri_str = location.uri.as_str();
+            if !VirtualDocumentUri::is_virtual_uri(uri_str) {
+                return true;
+            }
+            if uri_str == request_virtual_uri {
+                location.uri = host_uri.clone();
+                translate_virtual_range_to_host(&mut location.range, offset);
+                return true;
+            }
+            false
+        });
+    }
+}
+
+#[cfg(test)]
+fn transform_inlay_hint_response_to_host(
+    response: serde_json::Value,
+    request_virtual_uri: &str,
+    host_uri: &Uri,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> Option<Vec<InlayHint>> {
+    let key = ConnectionKey::shared("test");
+    transform_inlay_hint_response_to_host_and_envelope(
+        response,
+        request_virtual_uri,
+        host_uri,
+        offset,
+        region_end,
+        &InlayHintEnvelopeContext {
+            server_name: "test",
+            host_uri: host_uri.as_str(),
+            region_id: "test-region",
+            injection_language: "test",
+            incarnation: Some(1),
+            connection_generation: 1,
+            connection_key: &key,
+            offset,
+            host_layer: false,
+        },
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -218,6 +611,130 @@ mod tests {
     // ==========================================================================
     // Inlay hint request builder tests
     // ==========================================================================
+
+    #[test]
+    fn inlay_hint_response_wraps_downstream_data_for_resolve_routing() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let offset = RegionOffset::new(3, 2);
+        let key = ConnectionKey::shared("lua-ls");
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [{
+                "position": { "line": 0, "character": 1 },
+                "label": ": number",
+                "data": { "token": 7 }
+            }]
+        });
+        let hints = transform_inlay_hint_response_to_host_and_envelope(
+            response,
+            "file:///kakehashi-virtual-uri-region.lua",
+            &host_uri,
+            &offset,
+            Position {
+                line: 4,
+                character: 0,
+            },
+            &InlayHintEnvelopeContext {
+                server_name: "lua-ls",
+                host_uri: host_uri.as_str(),
+                region_id: "region",
+                injection_language: "lua",
+                incarnation: Some(2),
+                connection_generation: 5,
+                connection_key: &key,
+                offset: &offset,
+                host_layer: false,
+            },
+            true,
+        )
+        .unwrap();
+        let envelope = extract_inlay_hint_envelope(&hints[0]).unwrap();
+        assert_eq!(envelope.inner, Some(json!({ "token": 7 })));
+        assert_eq!(envelope.connection_key, Some(key));
+        assert_eq!(envelope.connection_generation, Some(5));
+        assert_eq!(
+            hints[0].position,
+            Position {
+                line: 3,
+                character: 3
+            }
+        );
+    }
+
+    #[test]
+    fn host_inlay_hints_are_enveloped_only_for_resolvers_or_key_collisions() {
+        let key = ConnectionKey::shared("lua-ls");
+        let mut resolvable: Vec<InlayHint> = serde_json::from_value(json!([{
+            "position": { "line": 0, "character": 1 },
+            "label": ": number",
+            "data": { "token": 1 }
+        }]))
+        .unwrap();
+        envelope_host_inlay_hints(
+            &mut resolvable,
+            "lua-ls",
+            "file:///test.lua",
+            Some(2),
+            5,
+            &key,
+            true,
+        );
+        let envelope = extract_inlay_hint_envelope(&resolvable[0]).unwrap();
+        assert!(envelope.is_host_layer());
+        assert_eq!(envelope.inner, Some(json!({ "token": 1 })));
+
+        let mut bare: Vec<InlayHint> = serde_json::from_value(json!([{
+            "position": { "line": 0, "character": 1 },
+            "label": ": number",
+            "data": { "token": 2 }
+        }]))
+        .unwrap();
+        envelope_host_inlay_hints(
+            &mut bare,
+            "lua-ls",
+            "file:///test.lua",
+            Some(2),
+            5,
+            &ConnectionKey::shared("lua-ls"),
+            false,
+        );
+        assert_eq!(bare[0].data, Some(json!({ "token": 2 })));
+
+        let mut collision: Vec<InlayHint> = serde_json::from_value(json!([{
+            "position": { "line": 0, "character": 1 },
+            "label": ": number",
+            "data": { "kakehashi": { "ownedBy": "downstream" } }
+        }]))
+        .unwrap();
+        envelope_host_inlay_hints(
+            &mut collision,
+            "lua-ls",
+            "file:///test.lua",
+            Some(2),
+            5,
+            &ConnectionKey::shared("lua-ls"),
+            false,
+        );
+        assert_eq!(
+            extract_inlay_hint_envelope(&collision[0]).unwrap().inner,
+            Some(json!({ "kakehashi": { "ownedBy": "downstream" } }))
+        );
+    }
+
+    #[test]
+    fn inlay_hint_resolve_request_carries_original_data() {
+        let hint: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 1, "character": 2 },
+            "label": ": number",
+            "data": { "token": 9 }
+        }))
+        .unwrap();
+        let request = build_inlay_hint_resolve_request(&hint, RequestId::new(4));
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["method"], "inlayHint/resolve");
+        assert_eq!(value["params"]["data"], json!({ "token": 9 }));
+    }
 
     #[test]
     fn inlay_hint_request_uses_virtual_uri() {

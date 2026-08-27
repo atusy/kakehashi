@@ -1030,6 +1030,10 @@ impl LanguageServer for Kakehashi {
         self.inlay_hint_impl(params).await
     }
 
+    async fn inlay_hint_resolve(&self, params: InlayHint) -> Result<InlayHint> {
+        self.inlay_hint_resolve_impl(params).await
+    }
+
     async fn linked_editing_range(
         &self,
         params: LinkedEditingRangeParams,
