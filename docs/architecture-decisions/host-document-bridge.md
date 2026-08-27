@@ -114,8 +114,12 @@ Partially implemented:
   Exact virtual-URI provenance survives `didClose` because downstream indexes
   may still return closed documents. To keep this generation history bounded,
   the pool retires and recreates a producer before admitting another request
-  once 65,536 canonical and scratch aliases have been issued; retiring the
-  process clears both its index and the matching provenance atomically.
+  once 65,536 canonical, scratch, or reserved aliases have been admitted.
+  A URI becomes exact provenance synchronously when `didOpen` enters the FIFO,
+  before its opened-state promotion can await. Retiring the process clears its
+  index and removes the matching generation from the registry; request-scoped
+  `Arc` leases retain that generation's provenance only until their in-flight
+  responses finish, so replacement cannot change URI classification mid-response.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one

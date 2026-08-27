@@ -214,21 +214,12 @@ impl DocumentTracker {
             .map(|state| Arc::clone(state.value()));
         let issued = provenance.as_ref().map_or(0, |state| state.issued.len());
         let scratch = provenance.as_ref().map_or(0, |state| state.scratch.len());
-        let queued = provenance.as_ref().map_or(0, |state| state.queued.len());
         let pending = self
             .open_claims
             .iter()
             .filter(|claim| &claim.key().0 == connection_key)
-            .filter(|claim| {
-                provenance
-                    .as_ref()
-                    .is_none_or(|state| !state.queued.contains(&claim.key().1))
-            })
             .count();
-        issued
-            .saturating_add(scratch)
-            .saturating_add(queued)
-            .saturating_add(pending)
+        issued.saturating_add(scratch).saturating_add(pending)
             >= MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION
     }
 
@@ -386,6 +377,21 @@ impl DocumentTracker {
         if self.connection_generation(connection_key) != expected_generation {
             return false;
         }
+        let Some(claim) = self
+            .open_claims
+            .get(&(connection_key.clone(), uri_string.clone()))
+        else {
+            return false;
+        };
+        if !Arc::ptr_eq(&claim, expected_claim) {
+            return false;
+        }
+        let provenance = self.provenance_for_generation(connection_key, expected_generation);
+        // Insert confirmed history before releasing the claim reservation. The
+        // versions lock serializes this transfer with claim admission, while
+        // the ordering also keeps lock-free capacity readers from seeing a gap.
+        provenance.insert_issued(uri_string.clone());
+        drop(claim);
         let Some((_, notify)) = self
             .open_claims
             .remove_if(&(connection_key.clone(), uri_string.clone()), |_, claim| {
@@ -394,10 +400,6 @@ impl DocumentTracker {
         else {
             return false;
         };
-        let provenance = self.provenance_for_generation(connection_key, expected_generation);
-        // Insert confirmed history before removing queued visibility so observers
-        // never see a gap between FIFO admission and local promotion.
-        provenance.insert_issued(uri_string.clone());
         provenance.queued.remove(&uri_string);
         let mut servers = self
             .virtual_to_servers
@@ -2482,6 +2484,32 @@ mod tests {
         assert!(promoted);
         assert!(!rejected, "promotion must not expose a temporary free slot");
         assert!(tracker.virtual_uri_provenance_limit_reached(&key));
+    }
+
+    #[tokio::test]
+    async fn queued_provenance_keeps_the_last_claim_slot_reserved() {
+        let tracker = DocumentTracker::new();
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        tracker.saturate_virtual_uri_provenance(&key);
+        tracker
+            .provenance_for_generation(&key, generation)
+            .issued
+            .remove("file:///virtual-0.lua");
+        let host_uri = url_to_uri(&Url::parse("file:///host.md").unwrap());
+        let queued = VirtualDocumentUri::new(&host_uri, "lua", "queued");
+        let rejected = VirtualDocumentUri::new(&host_uri, "lua", "rejected");
+        assert!(tracker.try_claim_for_open(&queued, &key).await);
+        let claim = tracker
+            .open_claim_waiter(&queued, &key)
+            .expect("last slot is reserved");
+
+        assert!(tracker.mark_open_queued(&queued, &key, generation, &claim));
+        assert!(tracker.virtual_uri_provenance_limit_reached(&key));
+        assert!(
+            !tracker.try_claim_for_open(&rejected, &key).await,
+            "queued publication must not release its claim reservation"
+        );
     }
 
     #[tokio::test]
