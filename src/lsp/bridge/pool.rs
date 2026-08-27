@@ -1245,14 +1245,13 @@ impl LanguageServerPool {
         self.document_tracker.host_virtual_docs(host_uri).await
     }
 
-    pub(super) async fn observe_virtual_uris_for_connection(
+    pub(super) fn observe_virtual_uris_for_connection(
         &self,
         connection_key: &ConnectionKey,
         generation: u64,
     ) -> document_tracker::VirtualUriObserver {
         self.document_tracker
             .observe_virtual_uris_for_connection(connection_key, generation)
-            .await
     }
 
     /// Remove and return all virtual documents for a host URI.
