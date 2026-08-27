@@ -44,9 +44,10 @@
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
 //!   Used by `tests/e2e/e2e_code_lens_resolve.rs` (#355).
-//! - `document-link` — advertises `documentLinkProvider`; answers
+//! - `document-link` / `document-link-resolve` — advertise `documentLinkProvider`; answers
 //!   `textDocument/documentLink` with one link whose tooltip identifies the
-//!   requested URI.
+//!   requested URI. The resolve mode initially returns data only and materializes
+//!   target/tooltip on `documentLink/resolve`.
 //! - `document-link-slow-host` / `document-link-slow-virt` — like
 //!   `document-link`, but sleeps before answering and records request-start
 //!   and downstream `$/cancelRequest` markers under `MOCK_LSP_CANCEL_DIR`.
@@ -195,6 +196,10 @@ fn main() {
                     }),
                     "code-lens-no-resolve" | "code-lens-no-resolve-reserved-data" => json!({
                         "codeLensProvider": { "resolveProvider": false },
+                        "textDocumentSync": 1
+                    }),
+                    "document-link-resolve" => json!({
+                        "documentLinkProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
                     "document-link" | "document-link-slow-host" | "document-link-slow-virt" => {
@@ -1369,17 +1374,45 @@ fn main() {
                     .and_then(Value::as_str)
                     .filter(|uri| documents.contains_key(*uri))
                     .map(|uri| {
-                        json!([{
+                        let mut link = json!({
                             "range": {
                                 "start": { "line": 0, "character": 0 },
                                 "end": { "line": 0, "character": 1 }
                             },
-                            "tooltip": format!("mock-link:{uri}"),
-                            "target": uri
-                        }])
+                        });
+                        if mode == "document-link-resolve" {
+                            link["data"] = json!({ "mock": "link-1", "uri": uri });
+                        } else {
+                            link["tooltip"] = json!(format!("mock-link:{uri}"));
+                            link["target"] = json!(uri);
+                        }
+                        json!([link])
                     })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
+            }
+            "documentLink/resolve" => {
+                let data = message
+                    .pointer("/params/data")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let range = message
+                    .pointer("/params/range")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                respond(
+                    &mut writer,
+                    id,
+                    json!({
+                        "range": range,
+                        "target": data["uri"],
+                        "tooltip": format!(
+                            "mock resolved:{}",
+                            data["mock"].as_str().unwrap_or("?")
+                        ),
+                        "data": data
+                    }),
+                );
             }
             "textDocument/onTypeFormatting" => {
                 // Answer with the whole-document transformation REGARDLESS of
