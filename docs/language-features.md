@@ -210,7 +210,8 @@ configured, the default `preferred` strategy uses the first server in
 the servers named in `priorities` format the block one after another, each
 seeing the previous formatter's output (e.g. `black` then `isort`). The
 pipeline requires explicitly named servers — `"*"` is ignored there, since a
-reproducible pipeline needs a deterministic order.
+reproducible pipeline needs a deterministic order. It runs at most 64 named
+servers per region; `maxFanOut` can set a lower limit.
 
 A response whose edits would corrupt the host document around the embedded
 block (escape the region, break blockquote `> ` prefixes, or merge content

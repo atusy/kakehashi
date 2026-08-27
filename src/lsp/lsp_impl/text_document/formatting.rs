@@ -697,9 +697,11 @@ pub(super) fn plan_region_format(
     if effective.is_empty() {
         return RegionFormatPlan::Skip;
     }
-    if let Some(cap) = max_fan_out {
-        effective.truncate(cap);
-    }
+    effective.truncate(
+        max_fan_out
+            .unwrap_or(MAX_CONCATENATED_FORMATTING_STEPS)
+            .min(MAX_CONCATENATED_FORMATTING_STEPS),
+    );
     RegionFormatPlan::Concatenated(effective)
 }
 
@@ -969,10 +971,11 @@ async fn dispatch_concatenated_formatting(
     // scratch id unique; scratch documents are `didClose`d solely by
     // `ScratchCleanupGuard`'s Drop, not per step, so a cancel can't leak one.
     let step_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    // Per-run sequence so scratch ids don't collide with a concurrent
-    // concatenated-formatting request for the same region (which would also start
-    // at step 0).
-    let run_seq = SCRATCH_RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // A bounded run slot keeps concurrent requests distinct while allowing
+    // completed scratch URI namespaces to be reused. The lease remains held
+    // through the detached didClose sweep below.
+    let scratch_run_slot = ScratchRunSlot::acquire().await;
+    let run_seq = scratch_run_slot.id;
     // Convert the host URL to the bridge protocol's `Uri` once, for the per-step
     // didClose. This conversion is effectively infallible for a valid host URL;
     // if it ever failed, `send_formatting_request` (which performs the same
@@ -1000,8 +1003,12 @@ async fn dispatch_concatenated_formatting(
     // ordering is safe — there is no cancellable awaited sweep that could be
     // interrupted mid-didClose and orphan a downstream doc. Kept alive across the
     // whole pipeline below.
-    let _scratch_guard =
-        ScratchCleanupGuard::new(Arc::clone(&pool), uri.clone(), Arc::clone(&open_scratch));
+    let _scratch_guard = ScratchCleanupGuard::new(
+        Arc::clone(&pool),
+        uri.clone(),
+        Arc::clone(&open_scratch),
+        scratch_run_slot,
+    );
 
     // Start of the whole-pipeline budget window (ADR Decision point 6): every
     // step's deadline is measured against this single origin, so serial
@@ -1388,6 +1395,7 @@ struct ScratchCleanupGuard {
     pool: Arc<crate::lsp::bridge::LanguageServerPool>,
     host_uri: url::Url,
     open: Arc<std::sync::Mutex<Vec<OpenScratchDoc>>>,
+    run_slot: Option<ScratchRunSlot>,
 }
 
 impl ScratchCleanupGuard {
@@ -1395,11 +1403,13 @@ impl ScratchCleanupGuard {
         pool: Arc<crate::lsp::bridge::LanguageServerPool>,
         host_uri: url::Url,
         open: Arc<std::sync::Mutex<Vec<OpenScratchDoc>>>,
+        run_slot: ScratchRunSlot,
     ) -> Self {
         Self {
             pool,
             host_uri,
             open,
+            run_slot: Some(run_slot),
         }
     }
 }
@@ -1412,6 +1422,7 @@ impl Drop for ScratchCleanupGuard {
         // here. Nothing else drains it, so there is no double-close to guard
         // against.
         let remaining = drain_open_scratch(&self.open);
+        let run_slot = self.run_slot.take().expect("scratch run slot is owned");
         if remaining.is_empty() {
             return;
         }
@@ -1426,19 +1437,20 @@ impl Drop for ScratchCleanupGuard {
         // drops (shutdown / a synchronous context), where we log and rely on the
         // host document's own close to reap the scratch docs rather than panicking.
         let count = remaining.len();
-        let pool = Arc::clone(&self.pool);
-        let host_uri = self.host_uri.clone();
-        let cleanup = async move {
-            for doc in remaining {
-                pool.close_scratch_document(&host_uri, &doc.uri, &doc.connection_key)
-                    .await;
-            }
-        };
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(cleanup);
+                let pool = Arc::clone(&self.pool);
+                let host_uri = self.host_uri.clone();
+                handle.spawn(async move {
+                    for doc in remaining {
+                        pool.close_scratch_document(&host_uri, &doc.uri, &doc.connection_key)
+                            .await;
+                    }
+                    drop(run_slot);
+                });
             }
             Err(_) => {
+                std::mem::forget(run_slot);
                 log::warn!(
                     target: "kakehashi::formatting",
                     "ScratchCleanupGuard dropped outside a Tokio runtime; {count} scratch document(s) left for host-close cleanup"
@@ -1495,15 +1507,46 @@ fn lock_open_scratch(
 /// `kakehashi-virtual-uri-` filename marker and preserves the host directory
 /// and language extension required for downstream config and parser
 /// discovery.
-/// Process-global, monotonically increasing pipeline-run sequence. The per-step
-/// counter alone only makes scratch ids unique *within* a single pipeline run;
-/// two concatenated-formatting requests for the same host region overlapping in
-/// time (concurrent LSP requests, or a cancel+restart race) would otherwise both
-/// start at step 0 and collide on the same scratch virtual URI. Mixing in this
-/// run sequence makes scratch ids unique across concurrent runs in the process.
-// `AtomicUsize` (not `AtomicU64`) so the build stays portable to targets without
-// native 64-bit atomics; a pointer-width counter is more than enough for run ids.
-static SCRATCH_RUN_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_CONCATENATED_FORMATTING_STEPS: usize = 64;
+const SCRATCH_RUN_SLOT_COUNT: usize = 256;
+
+static SCRATCH_RUN_SLOT_SEMAPHORE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(SCRATCH_RUN_SLOT_COUNT)));
+static SCRATCH_RUN_SLOT_IDS: std::sync::LazyLock<std::sync::Mutex<Vec<usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new((0..SCRATCH_RUN_SLOT_COUNT).rev().collect()));
+
+struct ScratchRunSlot {
+    id: usize,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl ScratchRunSlot {
+    async fn acquire() -> Self {
+        let permit = Arc::clone(&SCRATCH_RUN_SLOT_SEMAPHORE)
+            .acquire_owned()
+            .await
+            .expect("scratch run semaphore is never closed");
+        let id = SCRATCH_RUN_SLOT_IDS
+            .lock()
+            .recover_poison("SCRATCH_RUN_SLOT_IDS")
+            .pop()
+            .expect("a semaphore permit reserves one scratch run slot");
+        Self {
+            id,
+            permit: Some(permit),
+        }
+    }
+}
+
+impl Drop for ScratchRunSlot {
+    fn drop(&mut self) {
+        SCRATCH_RUN_SLOT_IDS
+            .lock()
+            .recover_poison("SCRATCH_RUN_SLOT_IDS")
+            .push(self.id);
+        drop(self.permit.take());
+    }
+}
 
 fn scratch_region_id(region_id: &str, run: usize, step: usize) -> String {
     let marker = VirtualDocumentUri::SCRATCH_ID_MARKER;
@@ -2106,6 +2149,19 @@ mod tests {
     }
 
     #[test]
+    fn plan_concatenated_has_an_internal_step_ceiling() {
+        let names: Vec<String> = (0..=MAX_CONCATENATED_FORMATTING_STEPS)
+            .map(|index| format!("formatter-{index}"))
+            .collect();
+        let configs: Vec<_> = names.iter().map(|name| config(name)).collect();
+
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Concatenated, &names, &configs, None),
+            RegionFormatPlan::Concatenated(names[..MAX_CONCATENATED_FORMATTING_STEPS].to_vec())
+        );
+    }
+
+    #[test]
     fn plan_concatenated_with_only_unconfigured_priorities_skips() {
         // ADR point 2 (allowlist): a NON-empty `priorities` naming only
         // servers that aren't configured for the region resolves to an empty
@@ -2325,7 +2381,12 @@ mod tests {
 
         let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::new());
         let host = url::Url::parse("file:///d.md").unwrap();
-        let guard = ScratchCleanupGuard::new(Arc::clone(&pool), host, Arc::clone(&open));
+        let guard = ScratchCleanupGuard::new(
+            Arc::clone(&pool),
+            host,
+            Arc::clone(&open),
+            ScratchRunSlot::acquire().await,
+        );
 
         drop(guard);
 
