@@ -205,8 +205,9 @@ impl LanguageServerPool {
 
     /// Close all virtual documents associated with a host document, returning them.
     ///
-    /// The connection to downstream language servers remains open — only the
-    /// virtual documents are closed.
+    /// Successful didClose enqueues leave downstream connections open for other
+    /// documents. An enqueue failure instead retires the affected connection so
+    /// its next acquisition can reopen a coherent document namespace.
     pub(crate) async fn close_host_document(&self, host_uri: &Url) -> Vec<OpenedVirtualDoc> {
         // Fence even a first pull that snapshotted before its downstream
         // didOpen became visible in the tracker.
