@@ -2063,6 +2063,12 @@ impl LanguageServerPool {
                 .document_tracker
                 .is_document_opened_on_connection(virtual_uri, connection_key)
             {
+                drop(transition_guard);
+                self.remove_open_transition_lock_if_unshared(
+                    virtual_uri,
+                    connection_key,
+                    &transition,
+                );
                 return Ok(());
             }
             // We own the transition lock, so a remaining pre-send claim has no
@@ -7002,6 +7008,16 @@ mod tests {
             retry_rx.try_recv().is_err(),
             "retry must not enqueue a duplicate didOpen"
         );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool
+                .open_transition_locks
+                .contains_key(&(connection_key.clone(), virtual_uri.to_uri_string()))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful reuse must reclaim its transition lock entry");
     }
 
     #[tokio::test]
