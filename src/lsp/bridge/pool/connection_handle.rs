@@ -791,6 +791,13 @@ impl ConnectionHandle {
                     Some(OneOf::Left(true) | OneOf::Right(_))
                 )
             }
+            "textDocument/prepareCallHierarchy" => matches!(
+                caps.call_hierarchy_provider,
+                Some(
+                    tower_lsp_server::ls_types::CallHierarchyServerCapability::Simple(true)
+                        | tower_lsp_server::ls_types::CallHierarchyServerCapability::Options(_)
+                )
+            ),
             "inlayHint/resolve" => match caps.inlay_hint_provider.as_ref() {
                 Some(OneOf::Right(
                     tower_lsp_server::ls_types::InlayHintServerCapabilities::Options(options),
@@ -2254,12 +2261,12 @@ mod tests {
     #[tokio::test]
     async fn has_capability_returns_true_for_enabled_providers() {
         use tower_lsp_server::ls_types::{
-            ColorProviderCapability, ColorProviderOptions, CompletionOptions,
-            DeclarationCapability, DeclarationOptions, DeclarationRegistrationOptions,
-            DocumentLinkOptions, HoverProviderCapability, ImplementationProviderCapability, OneOf,
-            SignatureHelpOptions, StaticTextDocumentColorProviderOptions,
-            TextDocumentRegistrationOptions, TextDocumentSyncCapability, TextDocumentSyncOptions,
-            TypeDefinitionProviderCapability,
+            CallHierarchyServerCapability, ColorProviderCapability, ColorProviderOptions,
+            CompletionOptions, DeclarationCapability, DeclarationOptions,
+            DeclarationRegistrationOptions, DocumentLinkOptions, HoverProviderCapability,
+            ImplementationProviderCapability, OneOf, SignatureHelpOptions,
+            StaticTextDocumentColorProviderOptions, TextDocumentRegistrationOptions,
+            TextDocumentSyncCapability, TextDocumentSyncOptions, TypeDefinitionProviderCapability,
         };
 
         type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
@@ -2360,6 +2367,12 @@ mod tests {
                 "textDocument/inlayHint",
                 Box::new(|c| {
                     c.inlay_hint_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/prepareCallHierarchy",
+                Box::new(|c| {
+                    c.call_hierarchy_provider = Some(CallHierarchyServerCapability::Simple(true));
                 }),
             ),
             (
@@ -2491,8 +2504,9 @@ mod tests {
     #[tokio::test]
     async fn has_capability_returns_false_for_explicitly_disabled() {
         use tower_lsp_server::ls_types::{
-            ColorProviderCapability, DeclarationCapability, HoverProviderCapability,
-            ImplementationProviderCapability, OneOf, TypeDefinitionProviderCapability,
+            CallHierarchyServerCapability, ColorProviderCapability, DeclarationCapability,
+            HoverProviderCapability, ImplementationProviderCapability, OneOf,
+            TypeDefinitionProviderCapability,
         };
 
         type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
@@ -2573,6 +2587,12 @@ mod tests {
                 }),
             ),
             (
+                "textDocument/prepareCallHierarchy",
+                Box::new(|c| {
+                    c.call_hierarchy_provider = Some(CallHierarchyServerCapability::Simple(false));
+                }),
+            ),
+            (
                 "textDocument/documentSymbol",
                 Box::new(|c| {
                     c.document_symbol_provider = Some(OneOf::Left(false));
@@ -2620,6 +2640,7 @@ mod tests {
             "textDocument/prepareRename",
             "textDocument/moniker",
             "textDocument/inlayHint",
+            "textDocument/prepareCallHierarchy",
             "textDocument/documentColor",
             "textDocument/colorPresentation",
             "textDocument/codeAction",
