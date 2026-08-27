@@ -1490,11 +1490,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outgoing_response_classifies_sibling_opened_then_closed_in_flight() {
+    async fn outgoing_response_classifies_sibling_closed_before_request() {
         let pool = Arc::new(LanguageServerPool::new());
         let key = ConnectionKey::for_server("lua-ls");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
         pool.insert_connection(Arc::clone(&handle)).await;
+        let sibling_host = url::Url::parse("file:///sibling.md").unwrap();
+        let sibling_host_lsp: Uri = sibling_host.as_str().parse().unwrap();
+        let sibling_virtual = VirtualDocumentUri::new(&sibling_host_lsp, "lua", "sibling");
+        pool.register_opened_document(&sibling_host, &sibling_virtual, &key)
+            .await;
+        pool.untrack_document(&sibling_virtual, &key).await;
         let host_uri = url::Url::parse("file:///test.lua").unwrap();
         pool.open_host_incarnation(&host_uri, 1).await;
         let generation = pool.document_connection_generation(&key);
@@ -1554,12 +1560,6 @@ mod tests {
         .await
         .expect("outgoing request must be sent");
 
-        let sibling_host = url::Url::parse("file:///sibling.md").unwrap();
-        let sibling_host_lsp: Uri = sibling_host.as_str().parse().unwrap();
-        let sibling_virtual = VirtualDocumentUri::new(&sibling_host_lsp, "lua", "sibling");
-        pool.register_opened_document(&sibling_host, &sibling_virtual, &key)
-            .await;
-        pool.untrack_document(&sibling_virtual, &key).await;
         let _ = handle.router().route(json!({
             "jsonrpc": "2.0",
             "id": downstream_id.as_i64(),
