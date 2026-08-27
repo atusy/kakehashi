@@ -24,7 +24,8 @@ fn build_baseline_capabilities(
         DocumentSymbolClientCapabilities, DynamicRegistrationClientCapabilities,
         GeneralClientCapabilities, GotoCapability, HoverClientCapabilities,
         InlayHintClientCapabilities, PositionEncodingKind, SignatureHelpClientCapabilities,
-        TextDocumentClientCapabilities, WorkspaceClientCapabilities,
+        TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities,
+        WorkspaceClientCapabilities,
     };
 
     let goto_link = Some(GotoCapability {
@@ -33,6 +34,11 @@ fn build_baseline_capabilities(
     });
 
     let mut text_document = TextDocumentClientCapabilities {
+        synchronization: Some(TextDocumentSyncClientCapabilities {
+            dynamic_registration: Some(false),
+            did_save: Some(true),
+            ..Default::default()
+        }),
         hover: Some(HoverClientCapabilities {
             dynamic_registration: Some(false),
             ..Default::default()

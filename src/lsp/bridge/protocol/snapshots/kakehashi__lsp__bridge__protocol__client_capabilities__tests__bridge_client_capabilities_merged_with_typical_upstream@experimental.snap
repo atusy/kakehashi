@@ -22,6 +22,10 @@ expression: merged
     }
   },
   "textDocument": {
+    "synchronization": {
+      "dynamicRegistration": false,
+      "didSave": true
+    },
     "completion": {
       "dynamicRegistration": false,
       "completionItem": {
