@@ -53,15 +53,26 @@ fn init_client() -> (LspClient, tempfile::TempDir) {
 }
 
 fn init_host_client_with_mode(mode: &str) -> (LspClient, tempfile::TempDir) {
+    init_host_client_with_mode_and_cancel_dir(mode, None)
+}
+
+fn init_host_client_with_mode_and_cancel_dir(
+    mode: &str,
+    cancel_dir: Option<&std::path::Path>,
+) -> (LspClient, tempfile::TempDir) {
     let bin = mock_formatter_bin();
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("host_code_lens_resolve.toml");
     std::fs::write(&config_path, "").expect("Failed to write config");
 
-    let mut client = LspClient::builder()
+    let builder = LspClient::builder()
         .arg("--config-file")
-        .arg(config_path.to_str().expect("temp path should be UTF-8"))
-        .build();
+        .arg(config_path.to_str().expect("temp path should be UTF-8"));
+    let builder = match cancel_dir {
+        Some(cancel_dir) => builder.env("MOCK_LSP_CANCEL_DIR", cancel_dir.to_string_lossy()),
+        None => builder,
+    };
+    let mut client = builder.build();
 
     let init_response = client.send_request(
         "initialize",
@@ -276,6 +287,67 @@ fn e2e_host_code_lens_without_resolve_keeps_original_data_bare() {
 }
 
 #[test]
+fn e2e_host_code_lens_reserved_data_cannot_impersonate_bridge_envelope() {
+    let (mut client, _config_dir) =
+        init_host_client_with_mode("code-lens-no-resolve-reserved-data");
+    open_markdown(&mut client);
+
+    let lens = code_lens_with_retry(&mut client).remove(0);
+    assert_eq!(
+        lens["data"]["kakehashi"]["inner"]["kakehashi"]["origin"], "forged",
+        "foreign data using the reserved key must be nested under a bridge-owned envelope"
+    );
+    assert_eq!(lens["data"]["kakehashi"]["origin"], "mock-codelens");
+
+    let response = client.send_request("codeLens/resolve", lens);
+    assert_eq!(response["result"].get("command"), None);
+    assert_eq!(
+        response["result"]["data"]["kakehashi"]["inner"]["kakehashi"]["origin"],
+        "forged"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_code_lens_from_replaced_connection_stays_unresolved() {
+    let bin = mock_formatter_bin();
+    let (mut client, _config_dir) = init_host_client();
+    open_markdown(&mut client);
+    let old_lens = code_lens_with_retry(&mut client).remove(0);
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": {
+            "languageServers": {
+                "mock-codelens": {
+                    "cmd": [bin, "code-lens-replacement"],
+                    "languages": ["markdown"]
+                }
+            },
+            "languages": {
+                "markdown": { "bridge": { "_self": { "enabled": true } } }
+            }
+        }}),
+    );
+    let replacement_lens = code_lens_with_retry(&mut client).remove(0);
+    let replacement = client.send_request("codeLens/resolve", replacement_lens);
+    assert_eq!(
+        replacement["result"]["command"]["title"], "replacement resolved:lens-1",
+        "precondition: the replacement process must be active"
+    );
+
+    let response = client.send_request("codeLens/resolve", old_lens);
+    assert_eq!(
+        response["result"].get("command"),
+        None,
+        "opaque lens data must not be sent to a replacement process"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_host_code_lens_from_closed_incarnation_stays_unresolved() {
     let (mut client, _config_dir) = init_host_client();
     open_markdown(&mut client);
@@ -286,6 +358,8 @@ fn e2e_host_code_lens_from_closed_incarnation_stays_unresolved() {
         json!({ "textDocument": { "uri": MARKDOWN_URI } }),
     );
     open_markdown(&mut client);
+    let replacement_lenses = code_lens_with_retry(&mut client);
+    assert_eq!(replacement_lenses.len(), 1);
 
     let response = client.send_request("codeLens/resolve", lens);
     assert_eq!(response["result"].get("command"), None);
@@ -296,7 +370,12 @@ fn e2e_host_code_lens_from_closed_incarnation_stays_unresolved() {
 
 #[test]
 fn e2e_host_code_lens_resolve_cancel_returns_request_cancelled() {
-    let (mut client, _config_dir) = init_host_client_with_mode("code-lens-slow-resolve");
+    let cancel_dir = tempfile::TempDir::new().expect("cancel dir");
+    let cancel_file = cancel_dir.path().join("code-lens-slow-resolve.cancel.json");
+    let (mut client, _config_dir) = init_host_client_with_mode_and_cancel_dir(
+        "code-lens-slow-resolve",
+        Some(cancel_dir.path()),
+    );
     open_markdown(&mut client);
     let lens = code_lens_with_retry(&mut client).remove(0);
 
@@ -305,6 +384,18 @@ fn e2e_host_code_lens_resolve_cancel_returns_request_cancelled() {
     client.send_notification("$/cancelRequest", json!({ "id": request_id }));
     let response = client.receive_response_for_id_public(request_id);
     assert_eq!(response["error"]["code"], -32800, "{response}");
+    let forwarded = (0..100).any(|_| {
+        if cancel_file.exists() {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+            false
+        }
+    });
+    assert!(
+        forwarded,
+        "cancel must be forwarded to the downstream server"
+    );
 
     shutdown(&mut client);
 }
