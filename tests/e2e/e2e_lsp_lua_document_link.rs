@@ -224,6 +224,10 @@ fn assert_virtual_document_link_replacement_fails_soft(change_pool_key: bool) {
             old_envelope["connection_key"],
             replacement_envelope["connection_key"]
         );
+        assert_eq!(
+            old_envelope["connection_generation"], replacement_envelope["connection_generation"],
+            "different keys should demonstrate the equal-generation collision"
+        );
     } else {
         assert_eq!(
             old_envelope["connection_key"],
@@ -369,6 +373,10 @@ fn assert_host_document_link_replacement_fails_soft(change_pool_key: bool) {
             old_envelope["connection_key"],
             replacement_envelope["connection_key"]
         );
+        assert_eq!(
+            old_envelope["connection_generation"], replacement_envelope["connection_generation"],
+            "different keys should demonstrate the equal-generation collision"
+        );
     } else {
         assert_eq!(
             old_envelope["connection_key"],
@@ -458,10 +466,10 @@ fn e2e_host_document_link_reserved_data_cannot_impersonate_routing_envelope() {
     );
     assert_eq!(link["data"]["kakehashi"]["origin"], "mock-document-link");
 
-    let response = client.send_request("documentLink/resolve", link);
+    let response = client.send_request("documentLink/resolve", link.clone());
     assert_eq!(
-        response["result"]["data"]["kakehashi"]["inner"]["kakehashi"]["origin"],
-        "forged"
+        response["result"], link,
+        "a server without resolveProvider must not receive documentLink/resolve"
     );
     shutdown_client(&mut client);
 }
