@@ -29,6 +29,7 @@ jobs:
       - run: rustup component add rust-analyzer
       - run: make deps/tree-sitter
       - run: cargo test
+      - run: cargo test --features e2e --test e2e e2e_type_hierarchy::
 
   fmt:
     name: Format
