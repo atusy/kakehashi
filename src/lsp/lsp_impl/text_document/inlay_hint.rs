@@ -161,17 +161,19 @@ impl Kakehashi {
             return Ok(hint);
         };
         let unresolved = hint.clone();
-        let region_end = if envelope.is_host_layer() {
+        let region_geometry = if envelope.is_host_layer() {
             None
         } else {
-            let Some((offset, region_end, _)) = self.inlay_hint_region_geometry(&envelope) else {
+            let Some((offset, region_end, contiguous)) = self.inlay_hint_region_geometry(&envelope)
+            else {
                 return Ok(hint);
             };
             if offset != crate::lsp::bridge::RegionOffset::from(&envelope.offset) {
                 return Ok(hint);
             }
-            Some(region_end)
+            Some((region_end, contiguous))
         };
+        let region_end = region_geometry.map(|(end, _)| end);
 
         let settings = self.settings_manager.load_settings();
         let pool = self.bridge.pool_arc();
@@ -195,7 +197,7 @@ impl Kakehashi {
         // A later didChange/didClose is allowed to proceed once the resolve was
         // enqueued. Revalidate after the response so old lazy edits/locations
         // are never surfaced into a moved region or reopened document.
-        if !self.inlay_hint_envelope_is_fresh(&envelope, &pool) {
+        if !self.inlay_hint_envelope_is_fresh(&envelope, &pool, region_geometry) {
             return Ok(unresolved);
         }
         Ok(resolved)
@@ -205,6 +207,7 @@ impl Kakehashi {
         &self,
         envelope: &InlayHintEnvelope,
         pool: &crate::lsp::bridge::LanguageServerPool,
+        expected_region_geometry: Option<(tower_lsp_server::ls_types::Position, bool)>,
     ) -> bool {
         let Ok(uri) = url::Url::parse(&envelope.host_uri) else {
             return false;
@@ -216,11 +219,12 @@ impl Kakehashi {
             return false;
         }
         envelope.is_host_layer()
-            || self
-                .inlay_hint_region_geometry(envelope)
-                .is_some_and(|(offset, _, _)| {
+            || self.inlay_hint_region_geometry(envelope).is_some_and(
+                |(offset, region_end, contiguous)| {
                     offset == crate::lsp::bridge::RegionOffset::from(&envelope.offset)
-                })
+                        && expected_region_geometry == Some((region_end, contiguous))
+                },
+            )
     }
 
     fn inlay_hint_region_geometry(
