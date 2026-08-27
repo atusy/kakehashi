@@ -159,6 +159,7 @@ fn main() {
     let mut last_will_save_uri: Option<String> = None;
     let mut did_save_count: usize = 0;
     let mut last_did_save_uri: Option<String> = None;
+    let mut last_did_save_had_text = false;
     let mut diagnostic_generation: u64 = 0;
     // `diagnostics-refresh-prefetch-unchanged`: once ANY unchanged report was
     // answered, the baseline demonstrably exists — a later baseline-less full
@@ -494,6 +495,7 @@ fn main() {
                 // (#357). didSave carries no text (includeText:false), so just
                 // accepting it is the property under test.
                 did_save_count += 1;
+                last_did_save_had_text = message.pointer("/params/text").is_some();
                 last_did_save_uri = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
@@ -554,6 +556,7 @@ fn main() {
                         "willUri": last_will_save_uri,
                         "did": did_save_count,
                         "didUri": last_did_save_uri,
+                        "didHadText": last_did_save_had_text,
                     });
                     json!({ "contents": state.to_string() })
                 } else if mode.starts_with("workspace-folders") {

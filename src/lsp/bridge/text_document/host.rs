@@ -33,8 +33,8 @@ use url::Url;
 
 use super::super::actor::RouterCleanupGuard;
 use super::super::pool::{
-    ConnectionHandle, ConnectionHandleSender, ConnectionKey, HostDocSyncState, LanguageServerPool,
-    MessageSender, UpstreamId,
+    ConnectionHandle, ConnectionHandleSender, ConnectionKey, ConnectionState, HostDocSyncState,
+    LanguageServerPool, MessageSender, UpstreamId,
 };
 use super::super::protocol::{
     JsonRpcNotification, JsonRpcRequest, RequestId, jsonrpc_error_summary,
@@ -67,6 +67,13 @@ pub(crate) struct HostRawResponse {
     pub(crate) handle: Arc<ConnectionHandle>,
     pub(crate) incarnation: u64,
     pub(crate) connection_generation: u64,
+}
+
+fn can_notify_host_document(
+    handle: &ConnectionHandle,
+    supports: &impl Fn(&ConnectionHandle) -> bool,
+) -> bool {
+    handle.state() == ConnectionState::Ready && supports(handle)
 }
 
 fn fingerprint(text: &str) -> u64 {
@@ -301,10 +308,10 @@ impl LanguageServerPool {
         let connections = self.connections().await;
         let docs = self.host_documents().await;
         for (connection_key, handle) in connections.iter() {
-            if !docs.contains_key(&(uri_string.clone(), connection_key.clone())) {
+            if !can_notify_host_document(handle, &supports) {
                 continue;
             }
-            if !supports(handle) {
+            if !docs.contains_key(&(uri_string.clone(), connection_key.clone())) {
                 continue;
             }
             let notification = JsonRpcNotification::new(method, params);
@@ -799,6 +806,19 @@ pub(crate) fn normalize_host_goto_result(result: serde_json::Value) -> Option<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn host_save_notification_skips_failed_current_handle() {
+        let handle = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
+            ConnectionState::Failed,
+            ConnectionKey::for_server("save"),
+        )
+        .await;
+        assert!(
+            !can_notify_host_document(&handle, &|_| true),
+            "a mapped but failed handle is not a live notification target"
+        );
+    }
 
     #[test]
     fn raw_response_strips_envelope_and_passes_result_verbatim() {

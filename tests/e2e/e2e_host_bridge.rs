@@ -955,15 +955,18 @@ fn e2e_host_did_save_notification_reaches_host() {
     let state = seen.expect("the forwarded didSave must reach the host server");
     assert_eq!(state["did"], 1);
     assert_eq!(state["didUri"], SAVE_URI, "host URI must remain verbatim");
+    assert_eq!(
+        state["didHadText"], false,
+        "host didSave must omit the text field"
+    );
 
     shutdown(&mut client);
 }
 
-#[test]
-fn e2e_host_did_save_skips_server_requiring_text() {
+fn assert_host_did_save_is_skipped(mode: &str) {
     let (mut client, _config_dir, _init) = init_will_save_client_with_mode(
         "[languages.markdown.bridge._self]\nenabled = true\n",
-        "will-save-include-text",
+        mode,
     );
 
     let mut warmed = false;
@@ -990,6 +993,16 @@ fn e2e_host_did_save_skips_server_requiring_text() {
     }
 
     shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_did_save_skips_server_requiring_text() {
+    assert_host_did_save_is_skipped("will-save-include-text");
+}
+
+#[test]
+fn e2e_host_did_save_skips_server_without_save_capability() {
+    assert_host_did_save_is_skipped("will-save-incapable");
 }
 
 #[test]

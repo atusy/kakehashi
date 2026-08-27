@@ -2666,8 +2666,8 @@ mod tests {
     #[tokio::test]
     async fn accepts_textless_did_save_false_cases() {
         use tower_lsp_server::ls_types::{
-            SaveOptions, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-            TextDocumentSyncSaveOptions,
+            Registration, SaveOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
+            TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
         };
 
         // No capabilities at all.
@@ -2696,6 +2696,18 @@ mod tests {
             });
             assert!(!handle.accepts_textless_did_save());
         }
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "save-1".to_string(),
+            method: "textDocument/didSave".to_string(),
+            register_options: Some(serde_json::json!({ "includeText": false })),
+        }]);
+        assert!(
+            !handle.accepts_textless_did_save(),
+            "dynamic-only didSave must not bypass the static includeText-aware gate"
+        );
     }
 
     /// The bare `Kind` form of `textDocumentSync` (a sync-kind number) carries
