@@ -198,6 +198,10 @@ enabled = true
 [languages.markdown.layers.aggregation."textDocument/documentColor"]
 strategy = "concatenated"
 priorities = ["virt", "host"]
+
+[languages.markdown.layers.aggregation."textDocument/colorPresentation"]
+strategy = "concatenated"
+priorities = ["virt", "host"]
 "#,
     )
     .expect("write config");
@@ -217,11 +221,11 @@ priorities = ["virt", "host"]
             "initializationOptions": {
                 "languageServers": {
                     "mock-host-color": {
-                        "cmd": [mock_bin(), "document-color"],
+                        "cmd": [mock_bin(), "document-color-host"],
                         "languages": ["markdown"]
                     },
                     "mock-virt-color": {
-                        "cmd": [mock_bin(), "document-color"],
+                        "cmd": [mock_bin(), "document-color-virt"],
                         "languages": ["lua"]
                     }
                 }
@@ -303,7 +307,7 @@ priorities = ["virt", "host"]
     assert_eq!(
         presentation.pointer("/result/0"),
         Some(&json!({
-            "label": "#ff0000",
+            "label": "host-color",
             "textEdit": {
                 "range": {
                     "start": { "line": 0, "character": 0 },
@@ -313,6 +317,46 @@ priorities = ["virt", "host"]
             }
         })),
         "a host document color should present through its host server: {presentation:?}"
+    );
+
+    let virtual_presentation = client.send_request(
+        "textDocument/colorPresentation",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 3, "character": 2 },
+                "end": { "line": 3, "character": 6 }
+            },
+            "color": { "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 }
+        }),
+    );
+    assert_eq!(
+        virtual_presentation.pointer("/result/0"),
+        Some(&json!({
+            "label": "virt-color",
+            "textEdit": {
+                "range": {
+                    "start": { "line": 3, "character": 2 },
+                    "end": { "line": 3, "character": 6 }
+                },
+                "newText": "#00ff00"
+            }
+        })),
+        "an injected color should use the virtual server and translate its edit: {virtual_presentation:?}"
+    );
+    assert_eq!(
+        virtual_presentation.pointer("/result/1"),
+        Some(&json!({
+            "label": "host-color",
+            "textEdit": {
+                "range": {
+                    "start": { "line": 3, "character": 2 },
+                    "end": { "line": 3, "character": 6 }
+                },
+                "newText": "#ff0000"
+            }
+        })),
+        "concatenated colorPresentation should retain the host answer after virt: {virtual_presentation:?}"
     );
 
     shutdown(&mut client);
@@ -447,6 +491,107 @@ priorities = ["virt", "host"]
             }
         }),
         "cancellation should reach the host server after the virt arm settles"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_document_color_rejects_host_reopen_during_connection_admission() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("document_color_reopen.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.layers.aggregation."textDocument/documentColor"]
+priorities = ["host"]
+"#,
+    )
+    .expect("write config");
+
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .env("MOCK_LSP_CANCEL_DIR", event_dir.path().to_string_lossy())
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-color": {
+                        "cmd": [mock_bin(), "document-color-slow-initialize"],
+                        "languages": ["markdown"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_document_color_reopen.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "old lifetime"
+            }
+        }),
+    );
+    let request_id = client.send_request_async(
+        "textDocument/documentColor",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+
+    let initialize_request = event_dir
+        .path()
+        .join("document-color-slow-initialize.request.json");
+    assert!(
+        (0..60).any(|_| {
+            if initialize_request.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "host connection initialization should start after the old snapshot is captured"
+    );
+
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "new lifetime"
+            }
+        }),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response["result"],
+        json!([]),
+        "a request carrying the closed incarnation must not answer from the reopened document: {response:?}"
     );
 
     shutdown(&mut client);

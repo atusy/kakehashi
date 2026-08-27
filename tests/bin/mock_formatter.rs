@@ -283,8 +283,11 @@ fn main() {
                         "textDocumentSync": 1
                     }),
                     "document-color"
+                    | "document-color-host"
+                    | "document-color-virt"
                     | "document-color-empty-presentation"
-                    | "document-color-slow-presentation" => json!({
+                    | "document-color-slow-presentation"
+                    | "document-color-slow-initialize" => json!({
                         "colorProvider": true,
                         "textDocumentSync": 1
                     }),
@@ -448,6 +451,10 @@ fn main() {
                             workspace_folders.push(uri.to_string());
                         }
                     }
+                }
+                if mode == "document-color-slow-initialize" {
+                    record_mock_event(&mode, "request", &message);
+                    std::thread::sleep(std::time::Duration::from_secs(3));
                 }
                 respond(&mut writer, id, json!({ "capabilities": capabilities }));
                 if mode == "notify" {
@@ -1564,6 +1571,11 @@ fn main() {
                 let result = if mode == "document-color-empty-presentation" {
                     json!([])
                 } else {
+                    let (label, new_text) = if mode == "document-color-virt" {
+                        ("virt-color", "#00ff00")
+                    } else {
+                        ("host-color", "#ff0000")
+                    };
                     message
                         .pointer("/params/textDocument/uri")
                         .and_then(Value::as_str)
@@ -1571,8 +1583,8 @@ fn main() {
                         .and(range)
                         .map(|range| {
                             json!([{
-                                "label": "#ff0000",
-                                "textEdit": { "range": range, "newText": "#ff0000" }
+                                "label": label,
+                                "textEdit": { "range": range, "newText": new_text }
                             }])
                         })
                         .unwrap_or(Value::Null)
