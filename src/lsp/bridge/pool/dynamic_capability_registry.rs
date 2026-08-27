@@ -161,46 +161,17 @@ mod tests {
 
     #[test]
     fn registration_read_lease_orders_unregistration_after_admission() {
-        use std::sync::{Arc, Barrier, mpsc};
-        use std::time::Duration;
-
-        let registry = Arc::new(DynamicCapabilityRegistry::new());
+        let registry = DynamicCapabilityRegistry::new();
         registry.register(vec![make_registration("1", "textDocument/completion")]);
-        let admitted = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        let lease = {
-            let registry = Arc::clone(&registry);
-            let admitted = Arc::clone(&admitted);
-            let release = Arc::clone(&release);
-            std::thread::spawn(move || {
-                registry.with_registration("textDocument/completion", || {
-                    admitted.wait();
-                    release.wait();
-                })
-            })
-        };
-        admitted.wait();
-        let (unregistered_tx, unregistered_rx) = mpsc::channel();
-        let unregister = {
-            let registry = Arc::clone(&registry);
-            std::thread::spawn(move || {
-                registry.unregister(vec![make_unregistration("1", "textDocument/completion")]);
-                unregistered_tx.send(()).unwrap();
-            })
-        };
-
-        assert!(
-            unregistered_rx
-                .recv_timeout(Duration::from_millis(50))
-                .is_err(),
-            "unregistration must wait until admitted send releases its read lease"
+        let write_is_excluded = registry.with_registration("textDocument/completion", || {
+            registry.registrations.try_write().is_err()
+        });
+        assert_eq!(
+            write_is_excluded,
+            Some(true),
+            "admission callback must execute while the unregister write lock is excluded"
         );
-        release.wait();
-        lease.join().unwrap();
-        unregister.join().unwrap();
-        unregistered_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        registry.unregister(vec![make_unregistration("1", "textDocument/completion")]);
         assert!(!registry.has_registration("textDocument/completion"));
     }
 
