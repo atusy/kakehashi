@@ -1245,13 +1245,13 @@ impl LanguageServerPool {
         self.document_tracker.host_virtual_docs(host_uri).await
     }
 
-    pub(super) async fn virtual_uris_for_connection(
+    pub(super) fn issued_virtual_uris_for_connection(
         &self,
         connection_key: &ConnectionKey,
+        generation: u64,
     ) -> std::collections::HashSet<String> {
         self.document_tracker
-            .virtual_uris_for_connection(connection_key)
-            .await
+            .issued_virtual_uris_for_connection(connection_key, generation)
     }
 
     /// Remove and return all virtual documents for a host URI.

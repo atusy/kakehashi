@@ -345,7 +345,10 @@ impl LanguageServerPool {
                 // Snapshot the exact producer's virtual namespace in the same
                 // admission critical section as enqueue. This gives the set
                 // the producer has seen before this request in FIFO order.
-                let mut known = self.virtual_uris_for_connection(connection_key).await;
+                let mut known = self.issued_virtual_uris_for_connection(
+                    connection_key,
+                    envelope.connection_generation,
+                );
                 if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
                     known.insert(uri);
                 }
@@ -378,7 +381,9 @@ impl LanguageServerPool {
         // Keep admission-time tombstones for siblings closed in flight, and
         // add siblings that became live while the request was running. The
         // producer fence below follows this final await.
-        known_virtual_uris.extend(self.virtual_uris_for_connection(connection_key).await);
+        known_virtual_uris.extend(
+            self.issued_virtual_uris_for_connection(connection_key, envelope.connection_generation),
+        );
         if !self
             .call_hierarchy_producer_is_live(
                 connection_key,
@@ -878,7 +883,8 @@ mod tests {
         pool.register_opened_document(&host_uri, &virtual_uri, &key)
             .await;
         let shaped_real_uri = "file:///external/kakehashi-virtual-uri-other.lua";
-        let known = pool.virtual_uris_for_connection(&key).await;
+        let generation = pool.document_connection_generation(&key);
+        let known = pool.issued_virtual_uris_for_connection(&key, generation);
 
         assert!(known.contains(&virtual_uri.to_uri_string()));
         assert!(!known.contains(shaped_real_uri));
@@ -972,7 +978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incoming_response_classifies_sibling_opened_while_request_is_in_flight() {
+    async fn incoming_response_classifies_sibling_opened_then_closed_in_flight() {
         let pool = Arc::new(LanguageServerPool::new());
         let key = ConnectionKey::for_server("lua-ls");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
@@ -1041,6 +1047,8 @@ mod tests {
         let sibling_virtual = VirtualDocumentUri::new(&sibling_host_lsp, "lua", "sibling");
         pool.register_opened_document(&sibling_host, &sibling_virtual, &key)
             .await;
+        pool.untrack_document(&sibling_virtual, &key).await;
+        assert!(!pool.is_document_opened_on_connection(&sibling_virtual, &key));
         let _ = handle.router().route(json!({
             "jsonrpc": "2.0",
             "id": downstream_id.as_i64(),
