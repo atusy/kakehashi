@@ -105,7 +105,11 @@ impl Kakehashi {
         // off-ingress reparse, and `prepare_diagnostic_snapshot` returns `None`
         // without a tree — making the synthetic diagnostic a no-op for the virt
         // layer.
-        self.ensure_document_parsed(&uri).await;
+        let _ = tokio::time::timeout(
+            VIRTUAL_SAVE_SETTLE_BUDGET,
+            self.ensure_document_parsed(&uri),
+        )
+        .await;
 
         // Spawn background task for synthetic diagnostic collection
         self.diagnostic_scheduler()
@@ -142,5 +146,31 @@ mod tests {
             "an unparsed document cannot vouch for virtual save content"
         );
         assert_eq!(started.elapsed(), VIRTUAL_SAVE_SETTLE_BUDGET);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unparsed_did_save_handler_has_a_bounded_total_settle_time() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = url::Url::parse("file:///test/unparsed-handler-save.md").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "# unparsed".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let params = DidSaveTextDocumentParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+            },
+            text: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        server.did_save_impl(params).await;
+        assert!(
+            started.elapsed() <= VIRTUAL_SAVE_SETTLE_BUDGET * 2,
+            "both save-time waits must remain hard-bounded"
+        );
     }
 }
