@@ -31,9 +31,10 @@ use tower_lsp_server::ls_types::{
 };
 
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
-    text_edit_safe_in_region, translate_host_position_to_virtual, translate_host_range_to_virtual,
-    translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, decode_command, encode_command,
+    response_has_jsonrpc_error, text_edit_safe_in_region, translate_host_position_to_virtual,
+    translate_host_range_to_virtual, translate_virtual_position_to_host,
+    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 use super::completion::EnvelopeOffset;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
@@ -136,6 +137,7 @@ pub(crate) fn envelope_host_inlay_hints(
         host_layer: true,
     };
     for hint in hints {
+        encode_inlay_hint_commands(hint, connection_key);
         if server_resolves
             || hint
                 .data
@@ -303,23 +305,23 @@ impl LanguageServerPool {
             return hint;
         }
 
-        let _host_lifecycle = if envelope.is_host_layer() {
-            let Some(expected_incarnation) = envelope.incarnation else {
+        // Hold the host lifecycle through enqueue for BOTH layers. A virtual
+        // connection can remain live across a host close/reopen, so pointer +
+        // connection generation alone do not prevent a stale resolve from
+        // being queued after the virtual document's didClose.
+        let Some(expected_incarnation) = envelope.incarnation else {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        };
+        let _host_lifecycle = match self
+            .request_host_lifecycle_for_incarnation(&host_uri, expected_incarnation)
+            .await
+        {
+            Ok(lifecycle) => lifecycle,
+            Err(_) => {
                 re_envelope_hint(&mut hint, &envelope);
                 return hint;
-            };
-            match self
-                .request_host_lifecycle_for_incarnation(&host_uri, expected_incarnation)
-                .await
-            {
-                Ok(lifecycle) => Some(lifecycle),
-                Err(_) => {
-                    re_envelope_hint(&mut hint, &envelope);
-                    return hint;
-                }
             }
-        } else {
-            None
         };
 
         let connection_key = handle.key();
@@ -341,6 +343,16 @@ impl LanguageServerPool {
         };
 
         let mut outgoing = hint.clone();
+        if let InlayHintLabel::LabelParts(parts) = &mut outgoing.label {
+            for part in parts {
+                if let Some(command) = &mut part.command
+                    && let Some(route) = decode_command(&command.command)
+                    && &route.key == connection_key
+                {
+                    command.command = route.command.to_string();
+                }
+            }
+        }
         let virtual_uri = if envelope.is_host_layer() {
             None
         } else {
@@ -424,7 +436,10 @@ impl LanguageServerPool {
                 &host_lsp_uri,
                 &offset,
                 region_end,
+                connection_key,
             );
+        } else {
+            encode_inlay_hint_commands(&mut resolved, connection_key);
         }
         // Position identifies the original hint and is not a lazy field.
         resolved.position = hint.position;
@@ -511,7 +526,14 @@ fn transform_inlay_hint_response_to_host_and_envelope(
     let mut hints: Vec<InlayHint> = serde_json::from_value(result).ok()?;
 
     for hint in &mut hints {
-        transform_inlay_hint_to_host(hint, request_virtual_uri, host_uri, offset, region_end);
+        transform_inlay_hint_to_host(
+            hint,
+            request_virtual_uri,
+            host_uri,
+            offset,
+            region_end,
+            envelope_ctx.connection_key,
+        );
 
         if server_resolves
             || hint
@@ -532,6 +554,7 @@ fn transform_inlay_hint_to_host(
     host_uri: &Uri,
     offset: &RegionOffset,
     region_end: Position,
+    connection_key: &ConnectionKey,
 ) {
     translate_virtual_position_to_host(&mut hint.position, offset);
 
@@ -553,21 +576,36 @@ fn transform_inlay_hint_to_host(
     }
 
     if let InlayHintLabel::LabelParts(parts) = &mut hint.label {
-        parts.retain_mut(|part| {
+        for part in parts {
+            if let Some(command) = &mut part.command {
+                command.command = encode_command(connection_key, &command.command);
+            }
             let Some(location) = &mut part.location else {
-                return true;
+                continue;
             };
             let uri_str = location.uri.as_str();
             if !VirtualDocumentUri::is_virtual_uri(uri_str) {
-                return true;
+                continue;
             }
             if uri_str == request_virtual_uri {
                 location.uri = host_uri.clone();
                 translate_virtual_range_to_host(&mut location.range, offset);
-                return true;
+            } else {
+                // The value is display text; only the unrepresentable routing
+                // target is discarded for a different virtual region.
+                part.location = None;
             }
-            false
-        });
+        }
+    }
+}
+
+fn encode_inlay_hint_commands(hint: &mut InlayHint, connection_key: &ConnectionKey) {
+    if let InlayHintLabel::LabelParts(parts) = &mut hint.label {
+        for part in parts {
+            if let Some(command) = &mut part.command {
+                command.command = encode_command(connection_key, &command.command);
+            }
+        }
     }
 }
 
@@ -1073,6 +1111,10 @@ mod tests {
                 "label": [
                     {
                         "value": "SomeType",
+                        "command": {
+                            "title": "Open",
+                            "command": "mock.open"
+                        },
                         "location": {
                             "uri": virtual_uri,
                             "range": {
@@ -1104,6 +1146,10 @@ mod tests {
             // Range transformed: line 5 + 10 = 15
             assert_eq!(loc.range.start.line, 15);
             assert_eq!(loc.range.end.line, 15);
+            let command = parts[0].command.as_ref().unwrap();
+            let route = decode_command(&command.command).expect("routed command");
+            assert_eq!(route.key, ConnectionKey::shared("test"));
+            assert_eq!(route.command, "mock.open");
         } else {
             panic!("Expected LabelParts variant");
         }
@@ -1157,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn inlay_hint_label_parts_cross_region_filtered_out() {
+    fn inlay_hint_label_parts_cross_region_drops_only_location() {
         let virtual_uri = make_virtual_uri_string();
         let host_uri = make_host_uri();
         // Different region — build from the same host but different region_id
@@ -1204,11 +1250,13 @@ mod tests {
         .unwrap();
 
         if let InlayHintLabel::LabelParts(parts) = &hints[0].label {
-            assert_eq!(parts.len(), 1, "Cross-region part should be filtered out");
+            assert_eq!(parts.len(), 2, "display label parts must be preserved");
             assert_eq!(parts[0].value, "SameRegion");
             let loc = parts[0].location.as_ref().unwrap();
             assert_eq!(loc.uri, host_uri);
             assert_eq!(loc.range.start.line, 12); // 2 + 10
+            assert_eq!(parts[1].value, "CrossRegion");
+            assert!(parts[1].location.is_none());
         } else {
             panic!("Expected LabelParts variant");
         }
