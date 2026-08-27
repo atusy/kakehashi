@@ -311,17 +311,13 @@ impl DocumentTracker {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
         let generation = self.connection_generation(connection_key);
-        let canonical_uri = VirtualDocumentUri::canonical_uri_for_scratch(&uri_string);
-        let issued_uri = canonical_uri
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| uri_string.clone());
-        self.issued_virtual_uris
-            .entry((connection_key.clone(), generation))
-            .or_default()
-            .insert(issued_uri);
-        if canonical_uri.is_some() {
+        if VirtualDocumentUri::canonical_uri_for_scratch(&uri_string).is_some() {
             self.scratch_uri_history
+                .entry((connection_key.clone(), generation))
+                .or_default()
+                .insert(uri_string.clone());
+        } else {
+            self.issued_virtual_uris
                 .entry((connection_key.clone(), generation))
                 .or_default()
                 .insert(uri_string.clone());
@@ -2331,7 +2327,7 @@ mod tests {
             .observe_virtual_uris_for_connection(&key, generation)
             .await;
         assert!(observer.snapshot().contains(&before.to_uri_string()));
-        assert!(observer.snapshot().contains(
+        assert!(!observer.snapshot().contains(
             &VirtualDocumentUri::canonical_uri_for_scratch(&before.to_uri_string()).unwrap()
         ));
         assert!(observer.snapshot().contains(&open.to_uri_string()));
@@ -2376,7 +2372,7 @@ mod tests {
         let snapshot = observer.snapshot();
         assert!(snapshot.contains(oldest.as_ref().unwrap()));
         assert!(snapshot.contains(newest.as_ref().unwrap()));
-        assert!(snapshot.contains(
+        assert!(!snapshot.contains(
             &VirtualDocumentUri::canonical_uri_for_scratch(newest.as_ref().unwrap()).unwrap()
         ));
 
