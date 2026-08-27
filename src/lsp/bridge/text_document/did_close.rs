@@ -82,9 +82,9 @@ impl LanguageServerPool {
     /// Used by the concatenated formatting pipeline, which opens a throwaway
     /// scratch virtual document per step (a unique URI carrying the accumulated
     /// text). The handler closes these from a single cancel-safe cleanup guard
-    /// (a `Drop` that runs on a detached task) rather than per step — deferring
-    /// keeps cancellation leak-free — so they never orphan tracking state,
-    /// accumulate downstream documents, or leak diagnostics for the throwaway URI
+    /// (a `Drop` that runs on a detached task) rather than per step. A queued
+    /// close removes tracking; an enqueue failure retains it so a later host
+    /// close or connection purge can preserve downstream/provenance consistency
     /// (concatenated-formatting-pipeline
     /// Decision point 7).
     ///
@@ -132,6 +132,9 @@ impl LanguageServerPool {
                 "Failed to send didClose for scratch document {}: {}",
                 scratch_uri.to_uri_string(), e
             );
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(scratch_uri, connection_key, &transition);
+            return;
         }
         // `untrack_document` does not touch `host_to_virtual`, so remove the
         // registration added by `ensure_document_opened` explicitly.
@@ -144,8 +147,9 @@ impl LanguageServerPool {
     /// Close a single virtual document: send didClose and remove from tracking.
     ///
     /// This is the core cleanup operation used by both `close_host_document`
-    /// and `close_invalidated_docs`. Errors are logged but do not prevent
-    /// cleanup of the document_versions tracking.
+    /// and `close_invalidated_docs`. Enqueue failures retain tracking until
+    /// connection purge so request admission cannot forget a URI the downstream
+    /// process still has open.
     pub(crate) async fn close_single_virtual_doc(&self, doc: &OpenedVirtualDoc) {
         if let Ok(uri) = url::Url::parse(&doc.virtual_uri.to_uri_string()) {
             self.clear_host_routing_suppression(&uri);
@@ -168,6 +172,13 @@ impl LanguageServerPool {
                 "Failed to send didClose for {}: {}",
                 doc.virtual_uri.to_uri_string(), e
             );
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(
+                &doc.virtual_uri,
+                &doc.connection_key,
+                &transition,
+            );
+            return;
         }
         // Use the connection key from OpenedVirtualDoc for per-connection tracking
         self.untrack_document(&doc.virtual_uri, &doc.connection_key)
@@ -259,7 +270,7 @@ impl LanguageServerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsp::bridge::pool::test_helpers::url_to_uri;
+    use crate::lsp::bridge::pool::test_helpers::{create_handle_with_key, url_to_uri};
 
     /// `close_scratch_document` untracks a directly-addressed scratch virtual
     /// document.
@@ -344,6 +355,59 @@ mod tests {
                 .iter()
                 .all(|d| d.virtual_uri.to_uri_string() != scratch_uri.to_uri_string()),
             "scratch doc must not linger in host_to_virtual after close_scratch_document"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_scratch_document_retains_provenance_when_enqueue_fails() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let scratch_uri =
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", "REGION-scratch-0");
+        let key = ConnectionKey::for_server("black");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        pool.register_opened_document(&host_uri, &scratch_uri, &key)
+            .await;
+        handle.cancel_writer_for_test().await;
+
+        pool.close_scratch_document(&host_uri, &scratch_uri, &key)
+            .await;
+
+        assert!(
+            pool.is_document_opened(&scratch_uri),
+            "a dropped didClose must retain URI provenance"
+        );
+        assert_eq!(
+            pool.get_all_connections_for_virtual_uri(&scratch_uri),
+            vec![key],
+            "host-close cleanup must retain a path to retry the close"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_virtual_document_retains_provenance_when_enqueue_fails() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "REGION");
+        let key = ConnectionKey::for_server("lua_ls");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        let doc = pool
+            .host_virtual_docs(&host_uri)
+            .await
+            .into_iter()
+            .next()
+            .expect("registered document should be available for close");
+        handle.cancel_writer_for_test().await;
+
+        pool.close_single_virtual_doc(&doc).await;
+
+        assert!(
+            pool.is_document_opened(&virtual_uri),
+            "a dropped didClose must retain ordinary URI provenance"
         );
     }
 
