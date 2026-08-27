@@ -52,9 +52,9 @@ fn init_client_with_mode(
             "initializationOptions": initialization_options
         }),
     );
-    assert!(
-        initialized["result"]["capabilities"]["callHierarchyProvider"].is_null(),
-        "capability stays hidden until incomingCalls and outgoingCalls are implemented"
+    assert_eq!(
+        initialized["result"]["capabilities"]["callHierarchyProvider"], true,
+        "the complete call-hierarchy surface is advertised"
     );
     client.send_notification("initialized", json!({}));
     (client, config_dir)
@@ -89,11 +89,40 @@ fn incoming_calls(client: &mut LspClient, item: Value) -> Vec<Value> {
         .expect("incoming call array")
 }
 
+fn outgoing_calls(client: &mut LspClient, item: Value) -> Vec<Value> {
+    let response = client.send_request("callHierarchy/outgoingCalls", json!({ "item": item }));
+    assert!(response.get("error").is_none(), "{response}");
+    response["result"]
+        .as_array()
+        .cloned()
+        .expect("outgoing call array")
+}
+
 #[test]
 fn incoming_calls_without_a_routing_envelope_return_null() {
     let (mut client, _config_dir) = init_client(false);
     let response = client.send_request(
         "callHierarchy/incomingCalls",
+        json!({ "item": {
+            "name": "foreign",
+            "kind": 12,
+            "uri": "file:///foreign.lua",
+            "range": { "start": { "line": 0, "character": 0 },
+                       "end": { "line": 0, "character": 1 } },
+            "selectionRange": { "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 1 } }
+        }}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
+#[test]
+fn outgoing_calls_without_a_routing_envelope_return_null() {
+    let (mut client, _config_dir) = init_client(false);
+    let response = client.send_request(
+        "callHierarchy/outgoingCalls",
         json!({ "item": {
             "name": "foreign",
             "kind": 12,
@@ -269,6 +298,102 @@ fn incoming_calls_preserve_host_item_coordinates() {
     );
     let observation: Value =
         serde_json::from_str(caller["detail"].as_str().expect("mock observation")).unwrap();
+    assert_eq!(observation["receivedUri"], uri);
+    assert_eq!(observation["receivedData"], json!({ "mock": "call-item" }));
+    shutdown(&mut client);
+}
+
+#[test]
+fn outgoing_calls_restore_virtual_item_and_translate_caller_ranges_to_host() {
+    let (mut client, _config_dir) = init_client(false);
+    let uri = "file:///test_outgoing_calls.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "> ```lua\n> call()\n> ```\n"
+        }}),
+    );
+
+    let item = prepare_with_retry(&mut client, uri, 1, 3).remove(0);
+    let calls = outgoing_calls(&mut client, item);
+    assert_eq!(calls.len(), 2);
+    let callee = &calls[0]["to"];
+    assert_eq!(callee["uri"], uri);
+    assert_eq!(
+        callee["range"]["start"],
+        json!({ "line": 1, "character": 2 })
+    );
+    assert_eq!(
+        calls[0]["fromRanges"][0],
+        json!({
+            "start": { "line": 1, "character": 3 },
+            "end": { "line": 1, "character": 4 }
+        })
+    );
+    assert_eq!(
+        callee["data"]["kakehashi"]["inner"],
+        json!({ "mock": "outgoing-callee" })
+    );
+    let observation: Value =
+        serde_json::from_str(callee["detail"].as_str().expect("mock observation")).unwrap();
+    assert!(
+        observation["receivedUri"]
+            .as_str()
+            .is_some_and(|uri| uri.contains("kakehashi-virtual-uri-"))
+    );
+    assert_eq!(
+        observation["receivedRange"]["start"],
+        json!({ "line": 0, "character": 0 })
+    );
+    assert_eq!(observation["receivedData"], json!({ "mock": "call-item" }));
+
+    let external = &calls[1];
+    assert_eq!(external["to"]["uri"], "file:///external.lua");
+    assert_eq!(
+        external["to"]["range"]["start"],
+        json!({ "line": 8, "character": 0 })
+    );
+    assert_eq!(
+        external["fromRanges"][0]["start"],
+        json!({ "line": 1, "character": 4 })
+    );
+    assert_eq!(
+        external["to"]["data"]["kakehashi"]["inner"],
+        json!({ "mock": "external-callee" })
+    );
+    shutdown(&mut client);
+}
+
+#[test]
+fn outgoing_calls_preserve_host_item_and_caller_coordinates() {
+    let (mut client, _config_dir) = init_client(true);
+    let uri = "file:///test_outgoing_calls.lua";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "lua",
+            "version": 1,
+            "text": "call()\n"
+        }}),
+    );
+
+    let item = prepare_with_retry(&mut client, uri, 0, 1).remove(0);
+    let calls = outgoing_calls(&mut client, item);
+    assert_eq!(calls[0]["to"]["uri"], uri);
+    assert_eq!(
+        calls[0]["to"]["range"]["start"],
+        json!({ "line": 0, "character": 0 })
+    );
+    assert_eq!(
+        calls[0]["fromRanges"][0]["start"],
+        json!({ "line": 0, "character": 1 })
+    );
+    let observation: Value =
+        serde_json::from_str(calls[0]["to"]["detail"].as_str().expect("mock observation")).unwrap();
     assert_eq!(observation["receivedUri"], uri);
     assert_eq!(observation["receivedData"], json!({ "mock": "call-item" }));
     shutdown(&mut client);
