@@ -1613,25 +1613,19 @@ print("hello")
     async fn cli_mode_did_open_does_not_schedule_synthetic_diagnostic_task() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
-        server
-            .language
-            .language_registry_for_parallel()
-            .register("markdown".to_string(), tree_sitter_md::LANGUAGE.into());
-        server.settings_manager.apply_settings(WorkspaceSettings {
-            auto_install: false,
-            ..Default::default()
-        });
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
         server.mark_cli_mode();
 
-        let uri = Url::parse("file:///test/cli_no_synthetic.md").unwrap();
+        let uri = Url::parse("file:///test/cli_no_synthetic.rs").unwrap();
         let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
         server
             .did_open_impl(DidOpenTextDocumentParams {
                 text_document: TextDocumentItem {
                     uri: lsp_uri,
-                    language_id: "markdown".to_string(),
+                    language_id: "rust".to_string(),
                     version: 1,
-                    text: "# hi\n".to_string(),
+                    text: "fn main() {}\n".to_string(),
                 },
             })
             .await;
