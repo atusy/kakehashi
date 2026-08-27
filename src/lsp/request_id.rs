@@ -486,19 +486,30 @@ where
             // observes the client notification. Polling the inner future first can
             // abort the request handler, whose guards remove the registry/router
             // state needed to translate the upstream request ID.
-            if let Some((forwarder, upstream_id, generation)) = cancel_request
-                && let Err(e) = forwarder
+            if let Some((forwarder, upstream_id, generation)) = cancel_request {
+                if let Err(e) = forwarder
                     .forward_cancel_for_generation(upstream_id.clone(), Some(generation))
                     .await
-            {
-                // Cancellation is best-effort: an unavailable downstream must
-                // not prevent tower-lsp from handling the client notification.
-                log::debug!(
-                    target: "kakehashi::cancel",
-                    "Failed to forward cancel for request {}: {}",
-                    upstream_id,
-                    e
-                );
+                {
+                    // Cancellation is best-effort: an unavailable downstream must
+                    // not prevent tower-lsp from handling the client notification.
+                    log::debug!(
+                        target: "kakehashi::cancel",
+                        "Failed to forward cancel for request {}: {}",
+                        upstream_id,
+                        e
+                    );
+                }
+                // The pool lookup above may have waited while the old request
+                // completed and the client reused its raw JSON-RPC ID. In that
+                // case the generation-aware forwarder correctly ignored the stale
+                // cancel; do not then let tower-lsp apply that same raw ID to the
+                // replacement request. With no await between this check and the
+                // inner future's first poll, a still-current cancel reaches tower
+                // before another task can reuse the ID.
+                if forwarder.request_generation(&upstream_id) != Some(generation) {
+                    return Ok(None);
+                }
             }
             // Set the task-local request ID and await the inner future
             CURRENT_REQUEST_ID.scope(request_id, inner_fut).await
@@ -897,6 +908,44 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(matches!(
+            new_request_cancel.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        drop(new_request);
+    }
+
+    #[tokio::test]
+    async fn middleware_delayed_cancel_does_not_reach_tower_for_reused_id() {
+        let mock = MockService::new();
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+        let mut service = RequestIdCapture::with_cancel_forwarder(mock.clone(), forwarder.clone());
+        let upstream_id = UpstreamId::Number(123);
+        let request = || {
+            Request::build("textDocument/hover")
+                .params(serde_json::json!({}))
+                .id(123i64)
+                .finish()
+        };
+
+        let old_request = service.call(request());
+        let delayed_cancel = service.call(
+            Request::build("$/cancelRequest")
+                .params(serde_json::json!({ "id": 123 }))
+                .finish(),
+        );
+        drop(old_request);
+
+        let new_request = service.call(request());
+        let mut new_request_cancel = forwarder.subscribe(upstream_id).unwrap();
+        delayed_cancel.await.unwrap();
+
+        assert_eq!(
+            mock.get_captured_id().await,
+            None,
+            "stale cancel must not poll tower-lsp's raw-ID cancellation future"
+        );
         assert!(matches!(
             new_request_cancel.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
