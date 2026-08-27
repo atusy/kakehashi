@@ -2131,10 +2131,13 @@ impl LanguageServerPool {
             self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
             return Err(e);
         }
-        if !self
-            .document_tracker
-            .mark_open_sent(virtual_uri, connection_key, &claim)
-        {
+        let retain_scratch_provenance = sender.retains_scratch_call_hierarchy_provenance();
+        if !self.document_tracker.mark_open_sent(
+            virtual_uri,
+            connection_key,
+            &claim,
+            retain_scratch_provenance,
+        ) {
             claim_guard.disarm();
             drop(claim_guard);
             drop(transition_guard);
@@ -8793,7 +8796,7 @@ mod tests {
 
         assert!(
             pool.document_tracker
-                .mark_open_sent(&virtual_uri, &connection_key, &claim)
+                .mark_open_sent(&virtual_uri, &connection_key, &claim, false)
         );
         drop(transition_guard);
         forwarding.await.unwrap();
