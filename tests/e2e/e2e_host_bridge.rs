@@ -1272,7 +1272,10 @@ fn e2e_virt_did_save_observes_the_latest_virtual_text() {
         saved_text.contains("print(2)"),
         "virtual didChange must precede didSave; got {saved_text:?}"
     );
-    assert!(!saved_text.contains("print(1)"), "stale virtual text remained");
+    assert!(
+        !saved_text.contains("print(1)"),
+        "stale virtual text remained"
+    );
 
     shutdown(&mut client);
 }
