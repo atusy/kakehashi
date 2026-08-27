@@ -171,6 +171,22 @@ impl VirtualDocumentUri {
         uri.contains(Self::SCRATCH_ID_MARKER) && Self::is_virtual_uri(uri)
     }
 
+    /// Recover the canonical virtual URI whose region a formatting scratch
+    /// URI belongs to. The scratch suffix is `{marker}{run}-{step}` immediately
+    /// before the language extension.
+    pub(crate) fn canonical_uri_for_scratch(uri: &str) -> Option<String> {
+        if !Self::is_scratch_uri(uri) {
+            return None;
+        }
+        let marker = uri.rfind(Self::SCRATCH_ID_MARKER)?;
+        let suffix = &uri[marker + Self::SCRATCH_ID_MARKER.len()..];
+        let extension = suffix.rfind('.')?;
+        let (run, step) = suffix[..extension].split_once('-')?;
+        run.parse::<usize>().ok()?;
+        step.parse::<usize>().ok()?;
+        Some(format!("{}{}", &uri[..marker], &suffix[extension..]))
+    }
+
     /// Format: `{scheme}:///{host_dir}/kakehashi-virtual-uri-{region_id}.{ext}`,
     /// preserving the host URI's scheme (file://, https://, …) and directory so
     /// downstream servers can resolve relative imports and discover project
@@ -306,6 +322,26 @@ mod tests {
         assert!(
             VirtualDocumentUri::is_scratch_uri(&uri),
             "scratch virtual URI must be detected: {uri}"
+        );
+    }
+
+    #[test]
+    fn canonical_uri_for_scratch_removes_only_numeric_run_step_suffix() {
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let canonical = VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", "01ARZ3NDEKTSV4");
+        let scratch_id = format!("01ARZ3NDEKTSV4{}7-2", VirtualDocumentUri::SCRATCH_ID_MARKER);
+        let scratch =
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", &scratch_id).to_uri_string();
+
+        assert_eq!(
+            VirtualDocumentUri::canonical_uri_for_scratch(&scratch),
+            Some(canonical.to_uri_string())
+        );
+        assert!(
+            VirtualDocumentUri::canonical_uri_for_scratch(
+                "file:///project/kakehashi-virtual-uri-region-kakehashi-scratch-run-step.py"
+            )
+            .is_none()
         );
     }
 

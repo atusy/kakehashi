@@ -625,9 +625,7 @@ fn transform_call_hierarchy_incoming_response_to_host(
     let calls = calls
         .into_iter()
         .filter_map(|mut call| {
-            if known_virtual_uris.contains(call.from.uri.as_str())
-                && VirtualDocumentUri::is_scratch_uri(call.from.uri.as_str())
-            {
+            if is_known_scratch_uri(call.from.uri.as_str(), known_virtual_uris) {
                 return None;
             }
             let projected_from_virtual = if known_virtual_uris.contains(call.from.uri.as_str()) {
@@ -685,9 +683,7 @@ fn transform_call_hierarchy_outgoing_response_to_host(
                     translate_virtual_range_to_host(range, &offset);
                 }
             }
-            if known_virtual_uris.contains(call.to.uri.as_str())
-                && VirtualDocumentUri::is_scratch_uri(call.to.uri.as_str())
-            {
+            if is_known_scratch_uri(call.to.uri.as_str(), known_virtual_uris) {
                 return None;
             }
             let projected_from_virtual = if known_virtual_uris.contains(call.to.uri.as_str()) {
@@ -706,6 +702,12 @@ fn transform_call_hierarchy_outgoing_response_to_host(
         })
         .collect();
     Ok(Some(calls))
+}
+
+fn is_known_scratch_uri(uri: &str, known_virtual_uris: &HashSet<String>) -> bool {
+    VirtualDocumentUri::canonical_uri_for_scratch(uri).is_some_and(|canonical| {
+        known_virtual_uris.contains(uri) || known_virtual_uris.contains(&canonical)
+    })
 }
 
 fn build_call_hierarchy_prepare_request(
@@ -1091,7 +1093,6 @@ mod tests {
         let known_virtual_uris = HashSet::from([
             virtual_uri.to_uri_string(),
             other_virtual_uri.to_uri_string(),
-            scratch_uri.to_uri_string(),
         ]);
 
         let calls = transform_call_hierarchy_incoming_response_to_host(
@@ -1166,7 +1167,6 @@ mod tests {
             &HashSet::from([
                 virtual_uri.to_uri_string(),
                 other_virtual_uri.to_uri_string(),
-                scratch_uri.to_uri_string(),
             ]),
         )
         .unwrap()
