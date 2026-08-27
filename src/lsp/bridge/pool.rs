@@ -2137,20 +2137,23 @@ impl LanguageServerPool {
         // contended rolls the local claim back without a matching didClose and a
         // retry can enqueue a duplicate didOpen to the same producer.
         let tracker = Arc::clone(&self.document_tracker);
+        let queued =
+            tracker.mark_open_queued(virtual_uri, connection_key, connection_generation, &claim);
         let promotion_host_uri = host_uri.clone();
         let promotion_virtual_uri = virtual_uri.clone();
         let promotion_connection_key = connection_key.clone();
         let promotion_claim = Arc::clone(&claim);
         let transition_locks = Arc::clone(&self.open_transition_locks);
         let promotion = tokio::spawn(async move {
-            let promoted = tracker
-                .mark_open_sent(
-                    &promotion_virtual_uri,
-                    &promotion_connection_key,
-                    connection_generation,
-                    &promotion_claim,
-                )
-                .await;
+            let promoted = queued
+                && tracker
+                    .mark_open_sent(
+                        &promotion_virtual_uri,
+                        &promotion_connection_key,
+                        connection_generation,
+                        &promotion_claim,
+                    )
+                    .await;
             if !promoted {
                 tracker
                     .rollback_open_claim_if(
@@ -6965,6 +6968,14 @@ mod tests {
         release.notify_one();
         sent.notified().await;
         tokio::task::yield_now().await;
+        let provenance = pool.observe_virtual_uris_for_connection(
+            &connection_key,
+            pool.document_connection_generation(&connection_key),
+        );
+        assert!(
+            provenance.contains(&virtual_uri.to_uri_string()),
+            "a queued didOpen must be visible before detached promotion acquires the version map"
+        );
         assert!(
             !task.is_finished(),
             "promotion should be waiting for the contended version map"
