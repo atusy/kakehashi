@@ -37,6 +37,7 @@ impl Kakehashi {
         // Convert ls_types::Uri to url::Url for internal use
         let Ok(uri) = uri_to_url(&lsp_uri) else {
             log::warn!("Invalid URI in didSave: {}", lsp_uri.as_str());
+            crate::lsp::reclaim_current_writer_sequence();
             return;
         };
 

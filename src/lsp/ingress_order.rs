@@ -319,15 +319,28 @@ enum Role {
 fn classify(req: &Request) -> Option<Role> {
     let method = req.method();
     match method {
-        "textDocument/didOpen"
-        | "textDocument/didChange"
-        | "textDocument/didSave"
-        | "textDocument/didClose" => {
+        "textDocument/didSave" => {
+            // Cleanup for a missing save is signalled by the typed handler.
+            // Decode the complete params before issuing a ticket so malformed
+            // payloads rejected before handler entry cannot retain sequencing
+            // state indefinitely.
+            serde_json::from_value::<tower_lsp_server::ls_types::DidSaveTextDocumentParams>(
+                req.params()?.clone(),
+            )
+            .ok()?;
+            let uri = text_document_uri(req)?;
+            Some(Role::Writer {
+                uri,
+                close: false,
+                reclaim_if_missing: true,
+            })
+        }
+        "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didClose" => {
             let uri = text_document_uri(req)?;
             Some(Role::Writer {
                 uri,
                 close: method == "textDocument/didClose",
-                reclaim_if_missing: method == "textDocument/didSave",
+                reclaim_if_missing: false,
             })
         }
         "textDocument/semanticTokens/full"
@@ -362,14 +375,15 @@ fn classify(req: &Request) -> Option<Role> {
 /// Extract `params.textDocument.uri`, normalized through `Url` so spelling
 /// variants of the same document (percent-encoding, default ports) sequence
 /// together — internal document state is keyed on parsed `Url`s, and the
-/// gate's keys must not be finer-grained than that. Falls back to the raw
-/// wire string when it doesn't parse (such requests fail in handlers anyway;
-/// gating them consistently by spelling is harmless).
+/// gate's keys must not be finer-grained than that. Invalid URIs are left
+/// ungated: typed LSP parameter decoding rejects them before a handler can
+/// request cleanup, so issuing a ticket would retain unreachable state.
 fn text_document_uri(req: &Request) -> Option<String> {
     // Indexing a missing key or non-object yields Value::Null, whose as_str()
     // returns None — same outcome as get() chains, less noise.
     let raw = req.params()?["textDocument"]["uri"].as_str()?;
-    Some(normalize_uri(raw))
+    let lsp_uri = raw.parse::<tower_lsp_server::ls_types::Uri>().ok()?;
+    url::Url::parse(lsp_uri.as_str()).map(String::from).ok()
 }
 
 /// Normalize a URI spelling through `Url` so variants of the same document
@@ -701,6 +715,39 @@ mod tests {
         late_save.await.unwrap();
 
         assert!(!gate.sequencer.docs.contains_key(URI));
+    }
+
+    #[tokio::test]
+    async fn malformed_save_reclaims_sequence_state_through_the_real_handler() {
+        let (service, _socket) = tower_lsp_server::LspService::new(crate::lsp::Kakehashi::new);
+        let mut gate = IngressOrderGate::new(service);
+        // WHATWG `url::Url` accepts and percent-encodes this space, while the
+        // typed LSP URI parser rejects it before `did_save_impl` is entered.
+        let malformed = "file:///test/a b";
+
+        gate.call(notification("textDocument/didSave", malformed))
+            .await
+            .unwrap();
+
+        assert!(gate.sequencer.docs.is_empty());
+        assert!(classify(&notification("textDocument/didSave", malformed)).is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_save_params_do_not_create_sequence_state() {
+        let (service, _socket) = tower_lsp_server::LspService::new(crate::lsp::Kakehashi::new);
+        let mut gate = IngressOrderGate::new(service);
+        let malformed = Request::build("textDocument/didSave")
+            .params(serde_json::json!({
+                "textDocument": { "uri": URI },
+                "text": 1,
+            }))
+            .finish();
+
+        assert!(classify(&malformed).is_none());
+        gate.call(malformed).await.unwrap();
+
+        assert!(gate.sequencer.docs.is_empty());
     }
 
     #[test]

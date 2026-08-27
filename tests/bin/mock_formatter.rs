@@ -97,10 +97,11 @@
 //! - `will-save` — advertises `hoverProvider` + a `textDocumentSync` Options
 //!   block with `willSave`, `willSaveWaitUntil`, and `save` true. Records every
 //!   `textDocument/willSave` (count + last reason + last URI) and
-//!   `textDocument/didSave` (count + last URI), and answers
+//!   `textDocument/didSave` (count + last URI + optional payload text), and answers
 //!   `textDocument/willSaveWaitUntil` with a save-time edit echoing the
 //!   requested URI (only for documents synced via `didOpen`). `hover` returns
-//!   the recorded state as a JSON string (`{will,reason,willUri,did,didUri}`),
+//!   the recorded state as JSON, including the save payload and synchronized
+//!   document text,
 //!   so a test can prove the notifications reached this server carrying the URI
 //!   it knows — the host URI for a host server, the *virtual* URI for a virt
 //!   server. Used by `tests/e2e/e2e_host_bridge.rs` to prove host- AND virt-bridge
