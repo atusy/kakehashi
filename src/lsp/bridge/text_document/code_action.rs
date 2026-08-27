@@ -32,7 +32,9 @@ use tower_lsp_server::ls_types::{
 };
 use url::Url;
 
-use super::super::pool::{ConnectionHandle, ConnectionKey, LanguageServerPool, UpstreamId};
+use super::super::pool::{
+    ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId,
+};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
     host_position_within_region, response_has_jsonrpc_error, strip_bridge_local_versions,
@@ -1069,10 +1071,9 @@ impl LanguageServerPool {
         // handle, losing cancel forwarding and waiting out the full timeout.
         {
             let connections = self.connections().await;
-            if !connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, handle))
-            {
+            if !connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+            }) {
                 drop(connections);
                 warn!(
                     target: "kakehashi::bridge",
@@ -1116,6 +1117,15 @@ impl LanguageServerPool {
                 return None;
             }
         };
+        let producer_is_still_live = {
+            let connections = self.connections().await;
+            connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+            })
+        };
+        if !producer_is_still_live {
+            return None;
+        }
         parse_code_action_resolve_response(response)
     }
 }
@@ -1639,6 +1649,7 @@ fn disable_action(
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
+    use crate::lsp::bridge::test_helpers::create_handle_with_key;
     use serde_json::json;
     use tower_lsp_server::ls_types::{CodeActionKind, CodeActionTriggerKind, Diagnostic, Position};
 
@@ -1654,6 +1665,65 @@ mod tests {
 
     fn make_virtual_uri_string() -> String {
         VirtualDocumentUri::new(&make_host_uri(), "lua", "region-0").to_uri_string()
+    }
+
+    #[tokio::test]
+    async fn resolve_response_rejects_a_retired_producer_after_send() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("ruff");
+        let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let upstream_id = UpstreamId::Number(77);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let handle = Arc::clone(&handle);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_code_action_resolve_on_handle(
+                    &handle,
+                    CodeAction {
+                        title: "old".into(),
+                        ..Default::default()
+                    },
+                    Some(upstream_id),
+                )
+                .await
+            })
+        };
+        let downstream_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = handle
+                    .router()
+                    .lookup_downstream_ids(&upstream_id)
+                    .into_iter()
+                    .next()
+                {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolve request must be admitted");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !handle.router().is_sent(downstream_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolve request must be sent before retirement");
+
+        handle.begin_shutdown();
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": { "title": "stale" }
+        }));
+
+        assert!(
+            request.await.unwrap().is_none(),
+            "a response from a no-longer-Ready code-action producer must be discarded"
+        );
     }
 
     fn range(start_line: u32, end_line: u32) -> Range {

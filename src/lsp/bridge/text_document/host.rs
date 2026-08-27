@@ -690,10 +690,9 @@ impl LanguageServerPool {
         // this sync, closing the race entirely.
         let connection_generation = {
             let connections = self.connections().await;
-            if !connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle))
-            {
+            if !connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+            }) {
                 drop(connections);
                 if let Some(ref id) = upstream_request_id {
                     self.unregister_upstream_request(id, connection_key);
