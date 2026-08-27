@@ -460,8 +460,19 @@ priorities = ["virt", "host"]
     assert_eq!(host_values[0]["text"], json!("host:frame=7"));
     assert_eq!(host_values[0]["range"], host_range);
 
-    let virtual_range = json!({
+    let injection_range = json!({
         "start": { "line": 3, "character": 2 },
+        "end": { "line": 3, "character": 6 }
+    });
+    let host_fallback = request(&mut client, injection_range.clone(), host_range.clone());
+    assert_eq!(host_fallback[0]["text"], json!("host:frame=7"));
+    assert_eq!(host_fallback[0]["range"], injection_range);
+    assert_eq!(host_fallback[1]["range"], host_range);
+
+    // A viewport normally begins outside the stopped injection. Routing must
+    // use stoppedLocation and clamp this visible span to the Lua region.
+    let virtual_range = json!({
+        "start": { "line": 0, "character": 0 },
         "end": { "line": 3, "character": 6 }
     });
     let stopped_location = json!({
@@ -470,7 +481,13 @@ priorities = ["virt", "host"]
     });
     let virtual_values = request(&mut client, virtual_range.clone(), stopped_location.clone());
     assert_eq!(virtual_values[0]["text"], json!("virt:frame=7"));
-    assert_eq!(virtual_values[0]["range"], virtual_range);
+    assert_eq!(
+        virtual_values[0]["range"],
+        json!({
+            "start": { "line": 3, "character": 2 },
+            "end": { "line": 3, "character": 6 }
+        })
+    );
     assert_eq!(virtual_values[1]["range"], stopped_location);
     assert_eq!(
         virtual_values[2]["range"],
@@ -480,6 +497,264 @@ priorities = ["virt", "host"]
         })
     );
 
+    shutdown(&mut client);
+}
+
+fn init_inline_value_virt_client(mode: &str, event_dir: &std::path::Path) -> LspClient {
+    let mut client = LspClient::builder()
+        .env("MOCK_LSP_CANCEL_DIR", event_dir.to_string_lossy())
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-inline-value": {
+                        "cmd": [mock_bin(), mode],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    client
+}
+
+fn open_inline_value_document(client: &mut LspClient, uri: &str, version: i32, text: &str) {
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": version,
+                "text": text
+            }
+        }),
+    );
+}
+
+fn inline_value_params(uri: &str) -> Value {
+    json!({
+        "textDocument": { "uri": uri },
+        "range": {
+            "start": { "line": 1, "character": 2 },
+            "end": { "line": 1, "character": 6 }
+        },
+        "context": {
+            "frameId": 7,
+            "stoppedLocation": {
+                "start": { "line": 1, "character": 2 },
+                "end": { "line": 1, "character": 6 }
+            }
+        }
+    })
+}
+
+#[test]
+fn e2e_inline_value_drops_a_response_after_content_changes() {
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let mut client = init_inline_value_virt_client("inline-value-delayed", event_dir.path());
+    let uri = "file:///test_inline_value_stale.md";
+    open_inline_value_document(&mut client, uri, 1, "> ```lua\n> old!\n> ```\n");
+    let request_id =
+        client.send_request_async("textDocument/inlineValue", inline_value_params(uri));
+    let request_marker = event_dir.path().join("inline-value-delayed.request.json");
+    assert!(
+        (0..60).any(|_| {
+            if request_marker.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "the delayed inlineValue request should reach the virtual server"
+    );
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "> ```lua\n> new!\n> ```\n" }]
+        }),
+    );
+    let change_barrier = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(change_barrier.get("error").is_none());
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response["result"],
+        Value::Null,
+        "inline values authored against the old content must be dropped: {response:?}"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_inline_value_cancellation_reaches_the_virtual_request() {
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let mut client = init_inline_value_virt_client("inline-value-slow", event_dir.path());
+    let uri = "file:///test_inline_value_cancel.md";
+    open_inline_value_document(&mut client, uri, 1, "> ```lua\n> code\n> ```\n");
+    let request_id =
+        client.send_request_async("textDocument/inlineValue", inline_value_params(uri));
+    let request_marker = event_dir.path().join("inline-value-slow.request.json");
+    assert!(
+        (0..60).any(|_| {
+            if request_marker.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "the slow inlineValue request should reach the virtual server"
+    );
+    let downstream_id = serde_json::from_slice::<Value>(
+        &std::fs::read(&request_marker).expect("read downstream request marker"),
+    )
+    .expect("parse downstream request marker")["id"]
+        .clone();
+
+    client.send_notification("$/cancelRequest", json!({ "id": request_id }));
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32800),
+        "inlineValue must answer RequestCancelled: {response:?}"
+    );
+    let cancel_marker = event_dir.path().join("inline-value-slow.cancel.json");
+    assert!(
+        (0..60).any(|_| {
+            if cancel_marker.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "the virtual server should observe downstream cancellation"
+    );
+    let cancelled = serde_json::from_slice::<Value>(
+        &std::fs::read(cancel_marker).expect("read downstream cancel marker"),
+    )
+    .expect("parse downstream cancel marker");
+    assert_eq!(cancelled["params"]["id"], downstream_id);
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_inline_value_rejects_virtual_reopen_during_admission() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("inline_value_reopen.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/inlineValue"]
+priorities = ["virt"]
+"#,
+    )
+    .expect("write config");
+    let barrier_dir = tempfile::TempDir::new().expect("barrier dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env(
+            "KAKEHASHI_E2E_INLINE_VALUE_BARRIER_DIR",
+            barrier_dir.path().to_string_lossy(),
+        )
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-inline-value": {
+                        "cmd": [mock_bin(), "inline-value-virt"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_inline_value_reopen.md";
+    let open = |client: &mut LspClient, text: &str| {
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "markdown",
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        );
+    };
+    open(&mut client, "> ```lua\n> old!\n> ```\n");
+    let request_id = client.send_request_async(
+        "textDocument/inlineValue",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 1, "character": 2 },
+                "end": { "line": 1, "character": 6 }
+            },
+            "context": {
+                "frameId": 7,
+                "stoppedLocation": {
+                    "start": { "line": 1, "character": 2 },
+                    "end": { "line": 1, "character": 6 }
+                }
+            }
+        }),
+    );
+    let captured = barrier_dir.path().join("captured");
+    assert!(
+        (0..60).any(|_| {
+            if captured.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "the old virtual context should be captured before dispatch admission"
+    );
+
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    open(&mut client, "> ```lua\n> new!\n> ```\n");
+    let reopen_barrier = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(reopen_barrier.get("error").is_none());
+    std::fs::write(barrier_dir.path().join("release"), b"release")
+        .expect("release inline value admission");
+
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response["result"],
+        Value::Null,
+        "a request carrying the closed incarnation must not answer from the reopened document: {response:?}"
+    );
     shutdown(&mut client);
 }
 
