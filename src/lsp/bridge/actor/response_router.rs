@@ -302,6 +302,16 @@ impl ResponseRouter {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_sent(&self, id: RequestId) -> bool {
+        self.state
+            .lock()
+            .recover_poison("ResponseRouter::is_sent")
+            .pending
+            .get(&id)
+            .is_some_and(|pending| pending.delivery == RequestDelivery::Sent)
+    }
+
     /// Route a response to its pending request, also cleaning up both cancel-map
     /// directions for this ID in O(1).
     pub(crate) fn route(&self, response: serde_json::Value) -> RouteResult {
