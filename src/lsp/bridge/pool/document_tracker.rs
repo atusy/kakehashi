@@ -102,6 +102,10 @@ pub(crate) struct DocumentTracker {
     /// Enables O(1) lookup in `get_all_connections_for_virtual_uri()`, replacing the
     /// previous O(N×M) scan over `host_to_virtual`.
     virtual_to_servers: DashMap<String, Vec<ConnectionKey>>,
+    /// Every virtual URI whose didOpen was enqueued to one connection
+    /// generation. Monotonic until that generation is purged, so in-flight
+    /// responses can recognize a sibling URI after its didClose.
+    issued_virtual_uris: DashMap<(ConnectionKey, u64), std::collections::HashSet<String>>,
     /// Pre-send claims keyed by exact connection. Waiters park until the owner
     /// promotes the claim after enqueue or finishes rollback.
     open_claims: DashMap<(ConnectionKey, String), Arc<tokio::sync::Notify>>,
@@ -121,6 +125,7 @@ impl DocumentTracker {
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
+            issued_virtual_uris: DashMap::new(),
             open_claims: DashMap::new(),
             connection_generations: DashMap::new(),
         }
@@ -247,6 +252,11 @@ impl DocumentTracker {
         if newly_opened {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
+        let generation = self.connection_generation(connection_key);
+        self.issued_virtual_uris
+            .entry((connection_key.clone(), generation))
+            .or_default()
+            .insert(uri_string);
         notify.notify_waiters();
         true
     }
@@ -556,6 +566,8 @@ impl DocumentTracker {
             .or_insert(0);
         *generation = generation.wrapping_add(1);
         drop(generation);
+        self.issued_virtual_uris
+            .retain(|(key, _), _| key != connection_key);
         // Take this connection's version map; its keys are the virtual URIs it
         // had open. Done first so the per-URI refcount/reverse-index cleanup
         // below mirrors `untrack_document` exactly, once per opened document.
@@ -682,15 +694,14 @@ impl DocumentTracker {
             .unwrap_or_default()
     }
 
-    pub(super) async fn virtual_uris_for_connection(
+    pub(super) fn issued_virtual_uris_for_connection(
         &self,
         connection_key: &ConnectionKey,
+        generation: u64,
     ) -> std::collections::HashSet<String> {
-        self.document_versions
-            .lock()
-            .await
-            .get(connection_key)
-            .map(|documents| documents.keys().cloned().collect())
+        self.issued_virtual_uris
+            .get(&(connection_key.clone(), generation))
+            .map(|uris| uris.clone())
             .unwrap_or_default()
     }
 
@@ -2126,6 +2137,32 @@ mod tests {
                 .resolve_virtual_uri("file:///project/other.lua")
                 .await,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn issued_virtual_uri_tombstones_survive_close_until_generation_purge() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "lua-0");
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        tracker.untrack_document(&virtual_uri, &key).await;
+
+        assert!(
+            tracker
+                .issued_virtual_uris_for_connection(&key, generation)
+                .contains(&virtual_uri.to_uri_string())
+        );
+
+        tracker.purge_connection(&key).await;
+        assert!(
+            tracker
+                .issued_virtual_uris_for_connection(&key, generation)
+                .is_empty()
         );
     }
 }
