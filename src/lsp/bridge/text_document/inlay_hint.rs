@@ -481,7 +481,6 @@ impl LanguageServerPool {
 fn merge_resolved_inlay_hint(mut original: InlayHint, mut resolved: InlayHint) -> InlayHint {
     original.tooltip = resolved.tooltip.take().or(original.tooltip);
     original.text_edits = resolved.text_edits.take().or(original.text_edits);
-    original.data = resolved.data.take().or(original.data);
 
     if let (InlayHintLabel::LabelParts(original_parts), InlayHintLabel::LabelParts(resolved_parts)) =
         (&mut original.label, resolved.label)
@@ -863,6 +862,7 @@ mod tests {
                 "tooltip": "resolved part tooltip"
             }],
             "tooltip": "resolved tooltip",
+            "data": { "resolver": "must not replace original data" },
             "textEdits": [{
                 "range": {
                     "start": { "line": 4, "character": 0 },
