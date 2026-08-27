@@ -82,6 +82,37 @@ fn fingerprint(text: &str) -> u64 {
     hasher.finish()
 }
 
+async fn resync_open_host_document<S: MessageSender>(
+    sender: &mut S,
+    state: &mut HostDocSyncState,
+    uri: Uri,
+    text: &str,
+) -> io::Result<()> {
+    let fp = fingerprint(text);
+    if state.fingerprint == fp {
+        return Ok(());
+    }
+
+    let version = state.version + 1;
+    let notification = JsonRpcNotification::new(
+        "textDocument/didChange",
+        DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(uri, version),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: text.to_string(),
+            }],
+        },
+    );
+    sender.send_notification(notification).await?;
+    *state = HostDocSyncState {
+        version,
+        fingerprint: fp,
+    };
+    Ok(())
+}
+
 /// Owned reader of a host document's current text, shared across the eager
 /// re-sync's per-server tasks. The eager on-edit re-sync builds one (capturing
 /// the document store + URI) and hands a clone to each task; the task passes it
@@ -155,25 +186,7 @@ pub(super) async fn sync_host_document<S: MessageSender>(
             });
         }
         Entry::Occupied(mut entry) => {
-            if entry.get().fingerprint != fp {
-                let version = entry.get().version + 1;
-                let notification = JsonRpcNotification::new(
-                    "textDocument/didChange",
-                    DidChangeTextDocumentParams {
-                        text_document: VersionedTextDocumentIdentifier::new(uri_lsp, version),
-                        content_changes: vec![TextDocumentContentChangeEvent {
-                            range: None,
-                            range_length: None,
-                            text: text.to_string(),
-                        }],
-                    },
-                );
-                sender.send_notification(notification).await?;
-                *entry.get_mut() = HostDocSyncState {
-                    version,
-                    fingerprint: fp,
-                };
-            }
+            resync_open_host_document(sender, entry.get_mut(), uri_lsp, text).await?;
         }
     }
     Ok(())
@@ -278,18 +291,37 @@ impl LanguageServerPool {
         .await;
     }
 
-    /// Forward a textless `textDocument/didSave` notification to every host
-    /// bridge server that already has this host document open and whose static
-    /// sync capability accepts saves without text.
-    pub(crate) async fn notify_host_did_save(&self, uri: &Url) {
+    /// Re-sync the current host text and then forward a textless
+    /// `textDocument/didSave` to every eligible, already-open host server.
+    /// Both notifications are queued while the connection and host-document
+    /// maps stay locked, preserving their downstream wire order.
+    pub(crate) async fn sync_and_notify_host_did_save(&self, uri: &Url, text: &str) {
         let params = serde_json::json!({ "textDocument": { "uri": uri.as_str() } });
-        self.notify_open_host_documents(
-            uri,
-            "textDocument/didSave",
-            ConnectionHandle::accepts_textless_did_save,
-            &params,
-        )
-        .await;
+        let Ok(uri_lsp) = host_url_to_lsp_uri(uri) else {
+            return;
+        };
+        let uri_string = uri.as_str().to_owned();
+
+        let connections = self.connections().await;
+        let mut docs = self.host_documents().await;
+        for (connection_key, handle) in connections.iter() {
+            if !can_notify_host_document(handle, &ConnectionHandle::accepts_textless_did_save) {
+                continue;
+            }
+            let Some(state) = docs.get_mut(&(uri_string.clone(), connection_key.clone())) else {
+                continue;
+            };
+
+            let mut sender = ConnectionHandleSender(handle);
+            if resync_open_host_document(&mut sender, state, uri_lsp.clone(), text)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let notification = JsonRpcNotification::new("textDocument/didSave", &params);
+            let _ = sender.send_notification(notification).await;
+        }
     }
 
     /// Notify every live host connection that already has `uri` open and

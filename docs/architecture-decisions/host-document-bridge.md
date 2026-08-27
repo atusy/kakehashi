@@ -83,7 +83,10 @@ Partially implemented:
     open *and* to every open virtual document (URI rewritten to the virtual
     one, reason verbatim);
   - **`didSave`** goes to host servers that already have the real document open
-    and to every open virtual document (URI rewritten for the latter).
+    and to every open virtual document (URI rewritten for the latter). Before
+    an eligible host server receives the textless notification, kakehashi
+    queues any pending full-text `didChange` and `didSave` under the same
+    connection/document lock, so save hooks observe the editor's latest text.
 
   Each recipient is **gated per-server** on the relevant capability —
   `willSave` on `textDocumentSync.willSave`, `didSave` on `textDocumentSync.save`
@@ -92,8 +95,7 @@ Partially implemented:
   `didSave` gate on both layers additionally **excludes servers that demand
   `save.includeText = true`**: kakehashi advertises `includeText = false`
   upstream and so never receives the editor's saved bytes, so rather than send a
-  contract-violating textless didSave it declines (the server still has current
-  content from didChange). That gate reads **static** capabilities only — a
+  contract-violating textless didSave it declines. That gate reads **static** capabilities only — a
   *dynamic* didSave registration is not honored for forwarding, since the
   method-name-only dynamic registry cannot carry `includeText` and could
   otherwise smuggle an `includeText = true` server past the filter. Both are

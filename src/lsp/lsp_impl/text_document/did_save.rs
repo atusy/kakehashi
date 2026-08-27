@@ -24,12 +24,22 @@ impl Kakehashi {
             uri
         );
 
-        // Forward didSave to both bridge layers, in the same host-before-virt
-        // order as willSave. Each path only touches an already-open document
-        // and excludes servers that require save text, which kakehashi does not
-        // advertise upstream (#357).
+        // Serialize the host save with document edits and snapshot the latest
+        // text. Host didSave is textless, so every recipient must first receive
+        // any pending full-text didChange on the same downstream queue.
+        let edit_lock = self.documents.edit_lock(&uri);
+        let edit_guard = edit_lock.lock().await;
+        let host_text = self.documents.get(&uri).map(|document| document.text_arc());
+
+        // Forward didSave to both bridge layers, in host-before-virt order.
+        // Each path only touches an already-open document and excludes servers
+        // that require save text, which kakehashi does not advertise upstream
+        // (#357).
         let pool = self.bridge.pool_arc();
-        pool.notify_host_did_save(&uri).await;
+        if let Some(host_text) = host_text {
+            pool.sync_and_notify_host_did_save(&uri, &host_text).await;
+        }
+        drop(edit_guard);
         pool.forward_did_save_to_virtual_docs(&uri).await;
 
         // Ensure a fresh tree before the synthetic task snapshots it: a save
