@@ -309,22 +309,24 @@ fn e2e_host_code_lens_reserved_data_cannot_impersonate_bridge_envelope() {
     shutdown(&mut client);
 }
 
-#[test]
-fn e2e_host_code_lens_from_replaced_connection_stays_unresolved() {
+fn assert_replaced_connection_lens_stays_unresolved(change_pool_key: bool) {
     let bin = mock_formatter_bin();
     let (mut client, _config_dir) = init_host_client();
     open_markdown(&mut client);
     let old_lens = code_lens_with_retry(&mut client).remove(0);
 
+    let mut server = json!({
+        "cmd": [bin, "code-lens-replacement"],
+        "languages": ["markdown"]
+    });
+    if change_pool_key {
+        server["preferSharedInstance"] = json!(true);
+    }
     client.send_notification(
         "workspace/didChangeConfiguration",
         json!({ "settings": {
             "languageServers": {
-                "mock-codelens": {
-                    "cmd": [bin, "code-lens-replacement"],
-                    "languages": ["markdown"],
-                    "preferSharedInstance": true
-                }
+                "mock-codelens": server
             },
             "languages": {
                 "markdown": { "bridge": { "_self": { "enabled": true } } }
@@ -332,11 +334,27 @@ fn e2e_host_code_lens_from_replaced_connection_stays_unresolved() {
         }}),
     );
     let replacement_lens = code_lens_with_retry(&mut client).remove(0);
-    assert_ne!(
-        old_lens["data"]["kakehashi"]["connection_key"],
-        replacement_lens["data"]["kakehashi"]["connection_key"],
-        "precondition: the replacement must use a different pool key"
-    );
+    let old_envelope = &old_lens["data"]["kakehashi"];
+    let replacement_envelope = &replacement_lens["data"]["kakehashi"];
+    if change_pool_key {
+        assert_ne!(
+            old_envelope["connection_key"], replacement_envelope["connection_key"],
+            "precondition: replacement must move from client-fallback to shared"
+        );
+        assert_eq!(
+            old_envelope["connection_generation"], replacement_envelope["connection_generation"],
+            "different keys should demonstrate the equal-generation collision"
+        );
+    } else {
+        assert_eq!(
+            old_envelope["connection_key"], replacement_envelope["connection_key"],
+            "precondition: replacement must reuse the same pool key"
+        );
+        assert_ne!(
+            old_envelope["connection_generation"], replacement_envelope["connection_generation"],
+            "same-key replacement must advance its generation"
+        );
+    }
     let replacement = client.send_request("codeLens/resolve", replacement_lens);
     assert_eq!(
         replacement["result"]["command"]["title"], "replacement resolved:lens-1",
@@ -351,6 +369,16 @@ fn e2e_host_code_lens_from_replaced_connection_stays_unresolved() {
     );
 
     shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_code_lens_from_same_key_replacement_stays_unresolved() {
+    assert_replaced_connection_lens_stays_unresolved(false);
+}
+
+#[test]
+fn e2e_host_code_lens_from_different_key_replacement_stays_unresolved() {
+    assert_replaced_connection_lens_stays_unresolved(true);
 }
 
 #[test]
