@@ -6,7 +6,7 @@
 //! - Host-to-virtual mappings (for didClose propagation)
 //! - Opened state (for LSP spec compliance - ls-bridge-message-ordering)
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,25 +26,14 @@ struct VirtualUriObserverState {
     uris: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
-const SCRATCH_URI_HISTORY_CAPACITY: usize = 1024;
-
 #[derive(Default)]
 struct ScratchUriHistory {
-    order: VecDeque<String>,
     uris: HashSet<String>,
 }
 
 impl ScratchUriHistory {
     fn insert(&mut self, uri: String) {
-        if !self.uris.insert(uri.clone()) {
-            return;
-        }
-        self.order.push_back(uri);
-        if self.order.len() > SCRATCH_URI_HISTORY_CAPACITY
-            && let Some(evicted) = self.order.pop_front()
-        {
-            self.uris.remove(&evicted);
-        }
+        self.uris.insert(uri);
     }
 }
 
@@ -163,8 +152,10 @@ pub(crate) struct DocumentTracker {
     /// Downstream indexes may return a URI after didClose, so provenance must
     /// survive until the producing process is purged.
     issued_virtual_uris: DashMap<(ConnectionKey, u64), HashSet<String>>,
-    /// Bounded exact aliases for scratch documents. Exact provenance avoids
-    /// classifying a real file with a valid scratch-shaped name as virtual.
+    /// Exact aliases for scratch documents. Exact provenance avoids classifying
+    /// a real file with a valid scratch-shaped name as virtual. Like canonical
+    /// issued URI history, aliases live until the producing generation is
+    /// purged because downstream indexes may return them after didClose.
     scratch_uri_history: DashMap<(ConnectionKey, u64), ScratchUriHistory>,
     /// Active request-scoped observers of virtual URIs issued by a connection.
     /// They extend the generation snapshot atomically across in-flight opens.
@@ -2312,7 +2303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scratch_uri_history_retains_exact_provenance_within_its_bound() {
+    async fn scratch_uri_history_retains_exact_provenance() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
         let key = ConnectionKey::for_server("formatter");
@@ -2357,7 +2348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scratch_uri_history_evicts_the_oldest_exact_alias() {
+    async fn scratch_uri_history_retains_old_exact_aliases_until_generation_purge() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
         let key = ConnectionKey::for_server("formatter");
@@ -2365,7 +2356,7 @@ mod tests {
         let mut oldest = None;
         let mut newest = None;
 
-        for step in 0..=SCRATCH_URI_HISTORY_CAPACITY {
+        for step in 0..=1024 {
             let uri = VirtualDocumentUri::new(
                 &host_lsp_uri,
                 "lua",
@@ -2383,11 +2374,18 @@ mod tests {
             .observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key))
             .await;
         let snapshot = observer.snapshot();
-        assert!(!snapshot.contains(oldest.as_ref().unwrap()));
+        assert!(snapshot.contains(oldest.as_ref().unwrap()));
         assert!(snapshot.contains(newest.as_ref().unwrap()));
         assert!(snapshot.contains(
             &VirtualDocumentUri::canonical_uri_for_scratch(newest.as_ref().unwrap()).unwrap()
         ));
+
+        drop(observer);
+        tracker.purge_connection(&key).await;
+        let observer = tracker
+            .observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key))
+            .await;
+        assert!(observer.snapshot().is_empty());
     }
 
     #[tokio::test]
