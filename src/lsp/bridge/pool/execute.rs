@@ -69,6 +69,8 @@ impl LanguageServerPool {
         })?;
         let guard = Arc::clone(&lifecycle).lock_owned().await;
         let Some(incarnation) = self.current_host_incarnation(host_uri) else {
+            drop(guard);
+            self.remove_host_lifecycle_lock_if_unshared(host_uri, &lifecycle);
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 format!("bridge: host document is closed: {host_uri}"),
@@ -573,6 +575,24 @@ mod tests {
             panic!("an old resolve must not enter the reopened lifetime");
         };
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn closed_host_request_reclaims_a_lifecycle_lock_retained_by_the_race() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/closed-race.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        let raced_clone = pool.host_lifecycle_lock(&host_uri);
+        pool.close_host_incarnation(&host_uri, 1).await;
+        assert!(pool.existing_host_lifecycle_lock(&host_uri).is_some());
+        drop(raced_clone);
+
+        assert!(pool.request_host_lifecycle(&host_uri).await.is_err());
+        assert!(
+            pool.existing_host_lifecycle_lock(&host_uri).is_none(),
+            "the losing request must reclaim the stale lifecycle-map entry"
+        );
     }
 
     /// Test that send_hover_request returns Ok(None) when server lacks hover capability.
