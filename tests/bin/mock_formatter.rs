@@ -235,6 +235,7 @@ fn main() {
     // processed the close and the reopen, so the reply lands after them.
     let mut pending_resolve: Option<(Option<Value>, Value)> = None;
     let mut pending_call_hierarchy_incoming: Option<(Option<Value>, Value)> = None;
+    let mut pending_call_hierarchy_outgoing: Option<(Option<Value>, Value)> = None;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -260,7 +261,9 @@ fn main() {
                     | "call-hierarchy-replacement"
                     | "call-hierarchy-marker-incoming"
                     | "call-hierarchy-slow-incoming"
-                    | "call-hierarchy-delayed-incoming" => json!({
+                    | "call-hierarchy-delayed-incoming"
+                    | "call-hierarchy-slow-outgoing"
+                    | "call-hierarchy-delayed-outgoing" => json!({
                         "callHierarchyProvider": true,
                         "textDocumentSync": 1
                     }),
@@ -608,6 +611,12 @@ fn main() {
                     if mode == "call-hierarchy-delayed-incoming"
                         && let Some((pending_id, pending_result)) =
                             pending_call_hierarchy_incoming.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
+                    if mode == "call-hierarchy-delayed-outgoing"
+                        && let Some((pending_id, pending_result)) =
+                            pending_call_hierarchy_outgoing.take()
                     {
                         respond(&mut writer, pending_id, pending_result);
                     }
@@ -1867,6 +1876,15 @@ fn main() {
                 }
             }
             "callHierarchy/outgoingCalls" => {
+                if mode == "call-hierarchy-slow-outgoing" {
+                    record_mock_event(&mode, "request", &message);
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "call-hierarchy-outgoing-started" }),
+                    );
+                    continue;
+                }
                 let item = message.pointer("/params/item").cloned();
                 let result = item
                     .as_ref()
@@ -1926,7 +1944,16 @@ fn main() {
                         ])
                     })
                     .unwrap_or(Value::Null);
-                respond(&mut writer, id, result);
+                if mode == "call-hierarchy-delayed-outgoing" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "call-hierarchy-outgoing-started" }),
+                    );
+                    pending_call_hierarchy_outgoing = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
             }
             "inlayHint/resolve" => {
                 if mode == "inlay-hint-marker-resolve" {
