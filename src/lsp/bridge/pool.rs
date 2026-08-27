@@ -6993,6 +6993,16 @@ mod tests {
         })
         .await
         .expect("detached promotion should finish after caller cancellation");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool
+                .open_transition_locks
+                .contains_key(&(connection_key.clone(), virtual_uri.to_uri_string()))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached promotion must reclaim its transition lock entry");
 
         let (mut retry_sender, mut retry_rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
         pool.ensure_document_opened(
@@ -7008,16 +7018,12 @@ mod tests {
             retry_rx.try_recv().is_err(),
             "retry must not enqueue a duplicate didOpen"
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while pool
+        assert!(
+            !pool
                 .open_transition_locks
-                .contains_key(&(connection_key.clone(), virtual_uri.to_uri_string()))
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("successful reuse must reclaim its transition lock entry");
+                .contains_key(&(connection_key.clone(), virtual_uri.to_uri_string())),
+            "successful reuse must reclaim its transition lock entry"
+        );
     }
 
     #[tokio::test]
