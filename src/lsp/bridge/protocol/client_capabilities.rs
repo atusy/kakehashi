@@ -74,6 +74,9 @@ fn build_baseline_capabilities(
             dynamic_registration: Some(false),
             tooltip_support: Some(true),
         }),
+        call_hierarchy: Some(DynamicRegistrationClientCapabilities {
+            dynamic_registration: Some(false),
+        }),
         inlay_hint: Some(InlayHintClientCapabilities {
             dynamic_registration: Some(false),
             ..Default::default()
@@ -505,6 +508,18 @@ mod tests {
 
         assert_eq!(synchronization.dynamic_registration, Some(false));
         assert_eq!(synchronization.did_save, Some(true));
+    }
+
+    #[test]
+    fn bridge_advertises_static_call_hierarchy_support() {
+        let capabilities = build_bridge_client_capabilities(None, true, false);
+        let call_hierarchy = capabilities
+            .text_document
+            .as_ref()
+            .and_then(|text_document| text_document.call_hierarchy.as_ref())
+            .expect("the bridge must advertise call-hierarchy support downstream");
+
+        assert_eq!(call_hierarchy.dynamic_registration, Some(false));
     }
 
     #[test]
