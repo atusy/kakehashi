@@ -354,6 +354,9 @@ embedded virtual documents and host-language bridge layers. Returned items
 remember their exact producing server and region, so recursive supertype and
 subtype requests return to that producer. Stale items from changed, reopened,
 moved, or reconfigured documents fail softly with `null`.
+Only items from the request's own virtual region are projected into host
+coordinates; items from another known virtual region are filtered, while real
+external-file URIs and their coordinate spaces are preserved.
 
 ### Document color (experimental)
 
