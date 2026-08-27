@@ -271,6 +271,7 @@ impl DocumentTracker {
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
         expected_claim: &Arc<tokio::sync::Notify>,
+        retain_scratch_provenance: bool,
     ) -> bool {
         let uri_string = virtual_uri.to_uri_string();
         let Some((_, notify)) = self
@@ -294,7 +295,7 @@ impl DocumentTracker {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
         let generation = self.connection_generation(connection_key);
-        if !VirtualDocumentUri::is_scratch_uri(&uri_string) {
+        if !VirtualDocumentUri::is_scratch_uri(&uri_string) || retain_scratch_provenance {
             self.issued_virtual_uris
                 .entry((connection_key.clone(), generation))
                 .or_default()
@@ -332,7 +333,24 @@ impl DocumentTracker {
             .entry((connection_key.clone(), virtual_uri.to_uri_string()))
             .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
             .clone();
-        assert!(self.mark_open_sent(virtual_uri, connection_key, &claim));
+        assert!(self.mark_open_sent(virtual_uri, connection_key, &claim, false));
+    }
+
+    #[cfg(test)]
+    async fn register_opened_document_with_scratch_provenance(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+    ) {
+        self.register_pending_document(host_uri, virtual_uri, connection_key)
+            .await;
+        let claim = self
+            .open_claims
+            .entry((connection_key.clone(), virtual_uri.to_uri_string()))
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone();
+        assert!(self.mark_open_sent(virtual_uri, connection_key, &claim, true));
     }
 
     /// Register close-cleanup ownership without exposing the document to
@@ -2305,6 +2323,21 @@ mod tests {
             .register_opened_document(&host_uri, &during, &key)
             .await;
         assert!(observer.snapshot().contains(&during.to_uri_string()));
+
+        let retained = VirtualDocumentUri::new(
+            &url_to_uri(&host_uri),
+            "lua",
+            &format!("region{}0-3", VirtualDocumentUri::SCRATCH_ID_MARKER),
+        );
+        tracker
+            .register_opened_document_with_scratch_provenance(&host_uri, &retained, &key)
+            .await;
+        tracker.untrack_document(&retained, &key).await;
+        drop(observer);
+        let observer = tracker
+            .observe_virtual_uris_for_connection(&key, generation)
+            .await;
+        assert!(observer.snapshot().contains(&retained.to_uri_string()));
     }
 
     #[tokio::test]
