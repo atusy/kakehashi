@@ -274,6 +274,7 @@ fn main() {
                     | "type-hierarchy-marker-supertypes"
                     | "type-hierarchy-slow-supertypes"
                     | "type-hierarchy-delayed-supertypes"
+                    | "type-hierarchy-marker-subtypes"
                     | "type-hierarchy-slow-subtypes"
                     | "type-hierarchy-delayed-subtypes" => json!({
                         "typeHierarchyProvider": true,
@@ -1929,6 +1930,9 @@ fn main() {
                 }
             }
             "typeHierarchy/subtypes" => {
+                if mode == "type-hierarchy-marker-subtypes" {
+                    record_mock_event(&mode, "request", &message);
+                }
                 if mode == "type-hierarchy-slow-subtypes" {
                     record_mock_event(&mode, "request", &message);
                     notify(
