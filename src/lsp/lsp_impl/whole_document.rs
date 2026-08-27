@@ -287,7 +287,6 @@ impl Kakehashi {
                 move |t| {
                     let params = raw_params.clone();
                     async move {
-                        let incarnation = t.pool.current_host_incarnation(&t.uri);
                         let raw = t
                             .pool
                             .send_host_raw_request(
@@ -313,7 +312,7 @@ impl Kakehashi {
                             items,
                             server_name: t.server_name,
                             host_uri: t.uri,
-                            incarnation,
+                            incarnation: Some(raw.incarnation),
                             handle: raw.handle,
                         }))
                     }

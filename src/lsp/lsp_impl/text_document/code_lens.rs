@@ -8,6 +8,7 @@ use url::Url;
 
 use super::super::Kakehashi;
 use crate::lsp::bridge::{CodeLensEnvelope, envelope_host_code_lenses, extract_code_lens_envelope};
+use crate::lsp::current_upstream_id;
 use crate::text::PositionMapper;
 
 impl Kakehashi {
@@ -77,11 +78,23 @@ impl Kakehashi {
         }
 
         let settings = self.settings_manager.load_settings();
-        let upstream_id = crate::lsp::current_upstream_id();
         let pool = self.bridge.pool_arc();
-        Ok(pool
-            .dispatch_code_lens_resolve(lens, &settings, upstream_id)
-            .await)
+        let upstream_id = current_upstream_id();
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let sweep_id = upstream_id.clone();
+        let dispatch = pool.dispatch_code_lens_resolve(lens, &settings, upstream_id);
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            std::sync::Arc::clone(&pool),
+            sweep_id,
+        );
+        match cancel_rx {
+            Some(rx) => tokio::select! {
+                biased;
+                _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                lens = dispatch => Ok(lens),
+            },
+            None => Ok(dispatch.await),
+        }
     }
 
     /// Whether the envelope's injection region still exists at the position it

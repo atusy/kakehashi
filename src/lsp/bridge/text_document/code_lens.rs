@@ -318,6 +318,25 @@ impl LanguageServerPool {
             return lens;
         }
 
+        let _host_lifecycle = if envelope.is_host_layer() {
+            let Some(expected_incarnation) = envelope.incarnation else {
+                re_envelope_lens(&mut lens, &envelope);
+                return lens;
+            };
+            match self
+                .request_host_lifecycle_for_incarnation(&host_uri, expected_incarnation)
+                .await
+            {
+                Ok(lifecycle) => Some(lifecycle),
+                Err(_) => {
+                    re_envelope_lens(&mut lens, &envelope);
+                    return lens;
+                }
+            }
+        } else {
+            None
+        };
+
         // Route per-connection cancel state by this handle's pool key (#382).
         let connection_key = handle.key();
 

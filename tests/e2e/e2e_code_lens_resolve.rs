@@ -52,7 +52,7 @@ fn init_client() -> (LspClient, tempfile::TempDir) {
     (client, config_dir)
 }
 
-fn init_host_client() -> (LspClient, tempfile::TempDir) {
+fn init_host_client_with_mode(mode: &str) -> (LspClient, tempfile::TempDir) {
     let bin = mock_formatter_bin();
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("host_code_lens_resolve.toml");
@@ -73,7 +73,7 @@ fn init_host_client() -> (LspClient, tempfile::TempDir) {
             "initializationOptions": {
                 "languageServers": {
                     "mock-codelens": {
-                        "cmd": [bin, "code-lens"],
+                        "cmd": [bin, mode],
                         "languages": ["markdown"]
                     }
                 },
@@ -92,6 +92,10 @@ fn init_host_client() -> (LspClient, tempfile::TempDir) {
     );
     client.send_notification("initialized", json!({}));
     (client, config_dir)
+}
+
+fn init_host_client() -> (LspClient, tempfile::TempDir) {
+    init_host_client_with_mode("code-lens")
 }
 
 /// Markdown host: the lua fence content sits on host line 3.
@@ -251,10 +255,56 @@ fn e2e_host_code_lens_resolve_round_trips_verbatim() {
         "resolve must reach the host origin with its original data: {resolved}"
     );
     assert_eq!(
-        resolved["range"]["start"]["line"], 0,
-        "host coordinates must pass through without virtual translation"
+        resolved["range"], lens["range"],
+        "the complete host range must pass through without virtual translation"
     );
     assert_eq!(resolved["data"]["kakehashi"]["host_layer"], true);
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_code_lens_without_resolve_keeps_original_data_bare() {
+    let (mut client, _config_dir) = init_host_client_with_mode("code-lens-no-resolve");
+    open_markdown(&mut client);
+
+    let lenses = code_lens_with_retry(&mut client);
+    assert_eq!(lenses.len(), 1);
+    assert_eq!(lenses[0]["data"], json!({ "mock": "lens-1" }));
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_code_lens_from_closed_incarnation_stays_unresolved() {
+    let (mut client, _config_dir) = init_host_client();
+    open_markdown(&mut client);
+    let lens = code_lens_with_retry(&mut client).remove(0);
+
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": MARKDOWN_URI } }),
+    );
+    open_markdown(&mut client);
+
+    let response = client.send_request("codeLens/resolve", lens);
+    assert_eq!(response["result"].get("command"), None);
+    assert_eq!(response["result"]["data"]["kakehashi"]["host_layer"], true);
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_code_lens_resolve_cancel_returns_request_cancelled() {
+    let (mut client, _config_dir) = init_host_client_with_mode("code-lens-slow-resolve");
+    open_markdown(&mut client);
+    let lens = code_lens_with_retry(&mut client).remove(0);
+
+    let request_id = client.send_request_async("codeLens/resolve", lens);
+    std::thread::sleep(Duration::from_millis(100));
+    client.send_notification("$/cancelRequest", json!({ "id": request_id }));
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(response["error"]["code"], -32800, "{response}");
 
     shutdown(&mut client);
 }

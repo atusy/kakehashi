@@ -37,7 +37,9 @@
 //!   request-failure path.
 //! - `code-action` — advertises `codeActionProvider`; returns one
 //!   edit-carrying quickfix plus one bare Command action (#568).
-//! - `code-lens` — advertises `codeLensProvider` with `resolveProvider`;
+//! - `code-lens` / `code-lens-slow-resolve` — advertise `codeLensProvider`
+//!   with `resolveProvider`; the slow variant pauses before resolving;
+//! - `code-lens-no-resolve` — advertises code lenses without resolve support;
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
 //!   Used by `tests/e2e/e2e_code_lens_resolve.rs` (#355).
@@ -180,8 +182,12 @@ fn main() {
                         "hoverProvider": true,
                         "textDocumentSync": 1
                     }),
-                    "code-lens" => json!({
+                    "code-lens" | "code-lens-slow-resolve" => json!({
                         "codeLensProvider": { "resolveProvider": true },
+                        "textDocumentSync": 1
+                    }),
+                    "code-lens-no-resolve" => json!({
+                        "codeLensProvider": { "resolveProvider": false },
                         "textDocumentSync": 1
                     }),
                     "document-link" | "document-link-slow-host" | "document-link-slow-virt" => {
@@ -1266,6 +1272,9 @@ fn main() {
                 }
             }
             "codeLens/resolve" => {
+                if mode == "code-lens-slow-resolve" {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
                 // Materialize the command, echoing the lens's own data back so
                 // the test can prove the downstream data round-tripped through
                 // the bridge envelope.

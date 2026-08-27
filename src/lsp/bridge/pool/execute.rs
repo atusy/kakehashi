@@ -34,11 +34,18 @@ pub(crate) struct BridgeResponseContext<'a> {
     pub offset: &'a RegionOffset,
 }
 
-struct RequestHostLifecycle<'a> {
+pub(crate) struct RequestHostLifecycle<'a> {
     pool: &'a LanguageServerPool,
     host_uri: &'a Url,
     lifecycle: Arc<tokio::sync::Mutex<()>>,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    incarnation: u64,
+}
+
+impl RequestHostLifecycle<'_> {
+    pub(crate) fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
 }
 
 impl Drop for RequestHostLifecycle<'_> {
@@ -50,7 +57,7 @@ impl Drop for RequestHostLifecycle<'_> {
 }
 
 impl LanguageServerPool {
-    async fn request_host_lifecycle<'a>(
+    pub(crate) async fn request_host_lifecycle<'a>(
         &'a self,
         host_uri: &'a Url,
     ) -> io::Result<RequestHostLifecycle<'a>> {
@@ -61,16 +68,31 @@ impl LanguageServerPool {
             )
         })?;
         let guard = Arc::clone(&lifecycle).lock_owned().await;
-        let lifecycle = RequestHostLifecycle {
+        let Some(incarnation) = self.current_host_incarnation(host_uri) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("bridge: host document is closed: {host_uri}"),
+            ));
+        };
+        Ok(RequestHostLifecycle {
             pool: self,
             host_uri,
             lifecycle,
             guard: Some(guard),
-        };
-        if self.current_host_incarnation(host_uri).is_none() {
+            incarnation,
+        })
+    }
+
+    pub(crate) async fn request_host_lifecycle_for_incarnation<'a>(
+        &'a self,
+        host_uri: &'a Url,
+        expected_incarnation: u64,
+    ) -> io::Result<RequestHostLifecycle<'a>> {
+        let lifecycle = self.request_host_lifecycle(host_uri).await?;
+        if lifecycle.incarnation() != expected_incarnation {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
-                format!("bridge: host document is closed: {host_uri}"),
+                format!("bridge: host document incarnation changed before request: {host_uri}"),
             ));
         }
         Ok(lifecycle)
@@ -518,6 +540,7 @@ mod tests {
         let host_uri = Url::parse("file:///test/guarded-close.md").unwrap();
         pool.open_host_incarnation(&host_uri, 1).await;
         let guard = pool.request_host_lifecycle(&host_uri).await.unwrap();
+        assert_eq!(guard.incarnation(), 1);
 
         let close = {
             let pool = Arc::clone(&pool);
@@ -531,6 +554,23 @@ mod tests {
         close.await.unwrap();
         let Err(error) = pool.request_host_lifecycle(&host_uri).await else {
             panic!("closed host must reject a late request");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn host_request_rejects_a_reopened_incarnation() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/reopened.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.close_host_incarnation(&host_uri, 1).await;
+        pool.open_host_incarnation(&host_uri, 2).await;
+
+        let Err(error) = pool
+            .request_host_lifecycle_for_incarnation(&host_uri, 1)
+            .await
+        else {
+            panic!("an old resolve must not enter the reopened lifetime");
         };
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
     }
