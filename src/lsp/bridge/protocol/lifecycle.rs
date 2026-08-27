@@ -139,6 +139,7 @@ pub(crate) struct ParsedInitializeCapabilities {
     pub(crate) capabilities: ServerCapabilities,
     pub(crate) dropped: Vec<DroppedCapability>,
     pub(crate) bridge_routing: bool,
+    pub(crate) type_hierarchy_provider: bool,
 }
 
 /// Validates a JSON-RPC initialize response and extracts usable capabilities.
@@ -196,6 +197,7 @@ pub(crate) fn parse_initialize_response_capabilities(
             capabilities: ServerCapabilities::default(),
             dropped: Vec::new(),
             bridge_routing: false,
+            type_hierarchy_provider: false,
         });
     };
     let Some(capabilities) = capabilities.as_object() else {
@@ -216,18 +218,7 @@ pub(crate) fn parse_initialize_response_capabilities(
         .get("typeHierarchyProvider")
         .is_some_and(|value| value == true || value.is_object());
     let mut parsed = recover_server_capabilities(capabilities)?;
-    if type_hierarchy_provider {
-        let original = parsed.capabilities.experimental.take();
-        let mut experimental = match original {
-            Some(serde_json::Value::Object(experimental)) => experimental,
-            _ => serde_json::Map::new(),
-        };
-        experimental.insert(
-            "kakehashiInternalTypeHierarchyProvider".into(),
-            serde_json::Value::Bool(true),
-        );
-        parsed.capabilities.experimental = Some(serde_json::Value::Object(experimental));
-    }
+    parsed.type_hierarchy_provider = type_hierarchy_provider;
     parsed.bridge_routing = bridge_routing;
     Ok(parsed)
 }
@@ -273,6 +264,7 @@ fn recover_server_capabilities(
         capabilities,
         dropped,
         bridge_routing: false,
+        type_hierarchy_provider: false,
     })
 }
 
@@ -623,18 +615,18 @@ mod tests {
     #[test]
     fn type_hierarchy_provider_survives_missing_typed_server_field() {
         let response = serde_json::json!({
-            "result": { "capabilities": { "typeHierarchyProvider": true } }
+            "result": { "capabilities": {
+                "typeHierarchyProvider": true,
+                "experimental": ["preserve", "me"]
+            } }
         });
 
         let parsed = parse_initialize_response_capabilities(&response).unwrap();
 
+        assert!(parsed.type_hierarchy_provider);
         assert_eq!(
-            parsed
-                .capabilities
-                .experimental
-                .as_ref()
-                .and_then(|value| value.get("kakehashiInternalTypeHierarchyProvider")),
-            Some(&serde_json::Value::Bool(true))
+            parsed.capabilities.experimental,
+            Some(serde_json::json!(["preserve", "me"]))
         );
     }
 
