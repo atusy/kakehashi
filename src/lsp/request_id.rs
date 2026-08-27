@@ -432,7 +432,7 @@ where
                 Some(ActiveRequestGuard::new(forwarder, upstream_id))
             })
         };
-        if req.method() == "$/cancelRequest"
+        let cancel_request = if req.method() == "$/cancelRequest"
             && let Some(forwarder) = cancel_forwarder.as_ref()
             && let Some(params) = req.params()
         {
@@ -451,36 +451,13 @@ where
             if let Some(upstream_id) = id_to_cancel
                 && let Some(generation) = forwarder.request_generation(&upstream_id)
             {
-                let forwarder = forwarder.clone();
-                // Fire-and-forget: spawn without tracking JoinHandle.
-                //
-                // This is intentional for $/cancelRequest because:
-                // 1. LSP notifications don't expect responses (fire-and-forget by spec)
-                // 2. Cancel is "best effort" - failures are logged but non-fatal
-                // 3. We must not block the main request flow
-                // 4. Graceful shutdown doesn't need to wait for cancels - the downstream
-                //    server will clean up its own state when it shuts down
-                //
-                // Upstream subscribers are notified inside forward_cancel, AFTER
-                // it captures the downstream targets — notifying here first would
-                // let the woken handler tear down the registry/router state the
-                // forwarding pass is about to read (capture-before-notify).
-                tokio::spawn(async move {
-                    if let Err(e) = forwarder
-                        .forward_cancel_for_generation(upstream_id.clone(), Some(generation))
-                        .await
-                    {
-                        // Log the error but don't fail - cancel forwarding is best-effort
-                        log::debug!(
-                            target: "kakehashi::cancel",
-                            "Failed to forward cancel for request {}: {}",
-                            upstream_id,
-                            e
-                        );
-                    }
-                });
+                Some((forwarder.clone(), upstream_id, generation))
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         // Intercept window/workDoneProgress/cancel and route it to the downstream
         // that owns the progress token (window-work-done-progress bridging).
@@ -505,6 +482,24 @@ where
 
         Box::pin(async move {
             let _active_request = active_request;
+            // Capture downstream targets and queue their cancels before tower-lsp
+            // observes the client notification. Polling the inner future first can
+            // abort the request handler, whose guards remove the registry/router
+            // state needed to translate the upstream request ID.
+            if let Some((forwarder, upstream_id, generation)) = cancel_request
+                && let Err(e) = forwarder
+                    .forward_cancel_for_generation(upstream_id.clone(), Some(generation))
+                    .await
+            {
+                // Cancellation is best-effort: an unavailable downstream must
+                // not prevent tower-lsp from handling the client notification.
+                log::debug!(
+                    target: "kakehashi::cancel",
+                    "Failed to forward cancel for request {}: {}",
+                    upstream_id,
+                    e
+                );
+            }
             // Set the task-local request ID and await the inner future
             CURRENT_REQUEST_ID.scope(request_id, inner_fut).await
         })
