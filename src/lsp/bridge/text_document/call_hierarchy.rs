@@ -705,9 +705,7 @@ fn transform_call_hierarchy_outgoing_response_to_host(
 }
 
 fn is_known_scratch_uri(uri: &str, known_virtual_uris: &HashSet<String>) -> bool {
-    VirtualDocumentUri::canonical_uri_for_scratch(uri).is_some_and(|canonical| {
-        known_virtual_uris.contains(uri) || known_virtual_uris.contains(&canonical)
-    })
+    VirtualDocumentUri::is_scratch_uri(uri) && known_virtual_uris.contains(uri)
 }
 
 fn build_call_hierarchy_prepare_request(
@@ -1074,7 +1072,7 @@ mod tests {
         });
         let shaped_real_item = json!({
             "name": "shaped-real", "kind": 12,
-            "uri": "file:///kakehashi-virtual-uri-region-kakehashi-scratch-01-2.lua",
+            "uri": "file:///kakehashi-virtual-uri-region-kakehashi-scratch-1-2.lua",
             "range": { "start": { "line": 9, "character": 0 }, "end": { "line": 9, "character": 3 } },
             "selectionRange": { "start": { "line": 9, "character": 0 }, "end": { "line": 9, "character": 1 } }
         });
@@ -1093,6 +1091,7 @@ mod tests {
         let known_virtual_uris = HashSet::from([
             virtual_uri.to_uri_string(),
             other_virtual_uri.to_uri_string(),
+            scratch_uri.to_uri_string(),
         ]);
 
         let calls = transform_call_hierarchy_incoming_response_to_host(
@@ -1114,7 +1113,7 @@ mod tests {
         assert_eq!(calls[1].from_ranges[0].start, Position::new(8, 1));
         assert_eq!(
             calls[2].from.uri.as_str(),
-            "file:///kakehashi-virtual-uri-region-kakehashi-scratch-01-2.lua"
+            "file:///kakehashi-virtual-uri-region-kakehashi-scratch-1-2.lua"
         );
         assert_eq!(
             extract_call_hierarchy_envelope(&calls[1].from)
@@ -1143,7 +1142,7 @@ mod tests {
             "data": { "callee": "virtual" }
         });
         let external_item = json!({
-            "name": "external", "kind": 12, "uri": "file:///kakehashi-virtual-uri-region-kakehashi-scratch-01-2.lua",
+            "name": "external", "kind": 12, "uri": "file:///kakehashi-virtual-uri-region-kakehashi-scratch-1-2.lua",
             "range": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 3 } },
             "selectionRange": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 1 } },
             "data": { "callee": "external" }
@@ -1167,6 +1166,7 @@ mod tests {
             &HashSet::from([
                 virtual_uri.to_uri_string(),
                 other_virtual_uri.to_uri_string(),
+                scratch_uri.to_uri_string(),
             ]),
         )
         .unwrap()
@@ -1178,7 +1178,7 @@ mod tests {
         assert_eq!(calls[0].from_ranges[0].start, Position::new(3, 3));
         assert_eq!(
             calls[1].to.uri.as_str(),
-            "file:///kakehashi-virtual-uri-region-kakehashi-scratch-01-2.lua"
+            "file:///kakehashi-virtual-uri-region-kakehashi-scratch-1-2.lua"
         );
         assert_eq!(calls[1].to.range.start, Position::new(8, 0));
         assert_eq!(calls[1].from_ranges[0].start, Position::new(3, 4));

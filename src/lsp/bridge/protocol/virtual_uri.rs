@@ -182,20 +182,21 @@ impl VirtualDocumentUri {
         let path = url.path();
         let filename_start = path.rfind('/').map_or(0, |slash| slash + 1);
         let filename = &path[filename_start..];
-        let marker = filename.rfind(Self::SCRATCH_ID_MARKER)?;
-        let suffix = &filename[marker + Self::SCRATCH_ID_MARKER.len()..];
-        let extension = suffix.find('.')?;
-        let (run, step) = suffix[..extension].split_once('-')?;
+        let virtual_name = filename.strip_prefix(VIRTUAL_URI_PREFIX)?;
+        let (region_id, extension) = virtual_name.split_once('.')?;
+        let marker = region_id.rfind(Self::SCRATCH_ID_MARKER)?;
+        let (run, step) = region_id[marker + Self::SCRATCH_ID_MARKER.len()..].split_once('-')?;
         let run_number = run.parse::<usize>().ok()?;
         let step_number = step.parse::<usize>().ok()?;
         if run_number.to_string() != run || step_number.to_string() != step {
             return None;
         }
         let canonical_path = format!(
-            "{}{}{}",
+            "{}{}{}.{}",
             &path[..filename_start],
-            &filename[..marker],
-            &suffix[extension..]
+            VIRTUAL_URI_PREFIX,
+            &region_id[..marker],
+            extension
         );
         Some(format!(
             "{}{}{}",
@@ -379,7 +380,7 @@ mod tests {
             Some(canonical_with_suffix.to_string())
         );
 
-        for language in ["foo.bar", "foo bar"] {
+        for language in ["foo.bar", "foo bar", "foo-kakehashi-scratch-bar"] {
             for host_uri in [
                 url_to_uri(&Url::parse("file:///project/doc.md").unwrap()),
                 "untitled:test".parse().unwrap(),
