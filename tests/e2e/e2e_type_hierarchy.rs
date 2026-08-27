@@ -232,7 +232,15 @@ fn supertypes_without_a_routing_envelope_return_null() {
 
 #[test]
 fn supertypes_reject_stale_document_content_before_dispatch() {
-    let (mut client, _config_dir) = init_client(false);
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let request_file = event_dir
+        .path()
+        .join("type-hierarchy-marker-supertypes.request.json");
+    let (mut client, _config_dir) = init_client_with_mode(
+        false,
+        "type-hierarchy-marker-supertypes",
+        Some(event_dir.path()),
+    );
     let uri = "file:///test_stale_supertype_content.md";
     client.send_notification(
         "textDocument/didOpen",
@@ -253,6 +261,10 @@ fn supertypes_reject_stale_document_content_before_dispatch() {
     let response = client.send_request("typeHierarchy/supertypes", json!({ "item": item }));
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"], Value::Null);
+    assert!(
+        !request_file.exists(),
+        "stale content must fail before downstream dispatch"
+    );
     shutdown(&mut client);
 }
 
