@@ -29,10 +29,11 @@ Partially implemented:
   no per-method request builders or response transformers. Handlers run the
   layer walk (`Kakehashi::walk_layers`, cross-layer-aggregation,
   `preferred` semantics): layers are tried lazily in `priorities` — by default
-  virt first, host as fallback. Two methods need per-server identity in the
-  host arm and so build their own (codeAction, for the `"{title} — {server}"`
-  suffix; completion, for the resolve-routing envelope), calling
-  `walk_layer_futures` / `walk_layers_by_strategy` with it. Covered: definition, hover, declaration,
+  virt first, host as fallback. Three methods consume per-server identity in
+  the host arm: codeAction for the `"{title} — {server}"` suffix, completion
+  for its resolve-routing envelope, and codeLens for the winning server's
+  resolve capability and envelope. CodeAction and completion build their own
+  host arms; codeLens uses the shared whole-document winner hook. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
   inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
@@ -52,7 +53,9 @@ Partially implemented:
   envelope, and resolving one forwards the original payload and coordinates
   verbatim. The envelope retains the host-document incarnation so a lens from
   an earlier open is returned unresolved instead of being sent to a reopened
-  document.
+  document. Ordinary downstream failures remain fail-soft, while an upstream
+  client cancellation returns `RequestCancelled` and cancels the in-flight
+  downstream resolve.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one

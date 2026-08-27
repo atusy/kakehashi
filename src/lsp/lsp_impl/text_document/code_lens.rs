@@ -56,10 +56,11 @@ impl Kakehashi {
     /// `codeLens/resolve`: route the lens back to the downstream server that
     /// produced it, identified by the envelope in `lens.data` (#355).
     ///
-    /// Fails soft at every step: a lens without an envelope (foreign, or from
-    /// a host server without resolve support) passes through unchanged, and a
-    /// stale region returns the lens unresolved with its envelope intact —
-    /// clients re-request lenses on change, so the staleness window is short.
+    /// Fails soft except for client cancellation: a lens without an envelope
+    /// (foreign, or from a host server without resolve support) passes through
+    /// unchanged, and a stale region returns the lens unresolved with its
+    /// envelope intact — clients re-request lenses on change, so the staleness
+    /// window is short.
     pub(crate) async fn code_lens_resolve_impl(&self, lens: CodeLens) -> Result<CodeLens> {
         let Some(envelope) = extract_code_lens_envelope(&lens) else {
             return Ok(lens);
