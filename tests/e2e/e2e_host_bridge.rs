@@ -1228,6 +1228,56 @@ fn e2e_virt_will_save_and_did_save_reach_virtual_doc() {
 }
 
 #[test]
+fn e2e_virt_did_save_observes_the_latest_virtual_text() {
+    const SAVED_MARKDOWN: &str = "# Title\n\n```lua\nprint(2)\n```\n";
+    let (mut client, _config_dir) = init_virt_save_client();
+
+    let mut warmed = false;
+    for _ in 0..300 {
+        if virt_save_hover(&mut client).is_some() {
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(warmed, "virtual document must be open before the edit");
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": VIRT_SAVE_URI, "version": 2 },
+            "contentChanges": [{ "text": SAVED_MARKDOWN }],
+        }),
+    );
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": VIRT_SAVE_URI } }),
+    );
+
+    let mut seen = None;
+    for _ in 0..300 {
+        if let Some(state) = virt_save_hover(&mut client)
+            && state["did"] != 0
+        {
+            seen = Some(state);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = seen.expect("the immediate didSave must reach the virtual server");
+    let saved_text = state["didDocumentText"]
+        .as_str()
+        .expect("the server must retain its virtual document text at didSave");
+    assert!(
+        saved_text.contains("print(2)"),
+        "virtual didChange must precede didSave; got {saved_text:?}"
+    );
+    assert!(!saved_text.contains("print(1)"), "stale virtual text remained");
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_virt_save_skips_server_without_save_capability() {
     // The per-server capability gate is the phantom-save mitigation: a virt
     // server that advertises neither `willSave` nor `save` must NOT be told
