@@ -819,6 +819,10 @@ impl ConnectionHandle {
                     Some(OneOf::Left(true) | OneOf::Right(_))
                 )
             }
+            "textDocument/inlineValue" => matches!(
+                caps.inline_value_provider,
+                Some(OneOf::Left(true) | OneOf::Right(_))
+            ),
             "textDocument/prepareCallHierarchy" => matches!(
                 caps.call_hierarchy_provider,
                 Some(
@@ -2441,6 +2445,12 @@ mod tests {
                 }),
             ),
             (
+                "textDocument/inlineValue",
+                Box::new(|c| {
+                    c.inline_value_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
                 "textDocument/prepareCallHierarchy",
                 Box::new(|c| {
                     c.call_hierarchy_provider = Some(CallHierarchyServerCapability::Simple(true));
@@ -2668,6 +2678,12 @@ mod tests {
                 }),
             ),
             (
+                "textDocument/inlineValue",
+                Box::new(|c| {
+                    c.inline_value_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
                 "textDocument/prepareCallHierarchy",
                 Box::new(|c| {
                     c.call_hierarchy_provider = Some(CallHierarchyServerCapability::Simple(false));
@@ -2721,6 +2737,7 @@ mod tests {
             "textDocument/prepareRename",
             "textDocument/moniker",
             "textDocument/inlayHint",
+            "textDocument/inlineValue",
             "textDocument/prepareCallHierarchy",
             "textDocument/documentColor",
             "textDocument/colorPresentation",

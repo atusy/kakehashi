@@ -22,6 +22,7 @@ mod formatting;
 mod hover;
 mod implementation;
 mod inlay_hint;
+mod inline_value;
 mod linked_editing_range;
 mod moniker;
 mod native_bindings;

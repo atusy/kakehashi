@@ -113,6 +113,9 @@ expression: request
         "typeHierarchy": {
           "dynamicRegistration": false
         },
+        "inlineValue": {
+          "dynamicRegistration": false
+        },
         "inlayHint": {
           "dynamicRegistration": false
         },
