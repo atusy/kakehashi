@@ -118,25 +118,14 @@ impl LanguageServerPool {
             self.remove_open_transition_lock_if_unshared(scratch_uri, connection_key, &transition);
             return;
         }
-        // Remove from ALL tracking BEFORE awaiting the didClose send, to narrow
-        // the window in which a concurrent `close_host_document` finds this
-        // scratch URI in `host_to_virtual` and issues a redundant double-close.
-        // (It only narrows, not eliminates: if `close_host_document` already
-        // snapshotted the host's virtual-doc list before this removal, it can
-        // still send a second didClose — a harmless, best-effort redundancy the
-        // `is_document_opened` guard above also helps avoid.) `untrack_document`
-        // does not touch `host_to_virtual`, so we remove that registration (added
-        // by `ensure_document_opened`) explicitly.
-        //
-        // Untrack-first (rather than didClose-first) is safe against cancel-drop
-        // because the concatenated pipeline's `ScratchCleanupGuard` runs this on a
-        // DETACHED task that is not a child of the aborted dispatch future — so the
-        // didClose await below always completes even when the caller is cancelled
-        // mid-flight. The ordering is therefore kept to preserve the
-        // double-close-race fix without reintroducing an orphaned-downstream-doc
-        // leak on cancel.
-        self.unregister_virtual_doc(host_uri, scratch_uri).await;
-        self.untrack_document(scratch_uri, connection_key).await;
+        // Enqueue didClose before removing the URI's tracking provenance. This
+        // keeps request admission ordered with the downstream wire state: a
+        // request that no longer observes this URI can only be enqueued after
+        // didClose. The send itself is synchronous, so there is no cancellation
+        // point between the open-state check and enqueue. A concurrent host close
+        // may still enqueue a harmless duplicate close, while the detached
+        // `ScratchCleanupGuard` ensures the async cleanup below completes even if
+        // the original dispatch future is cancelled.
         if let Err(e) = Self::send_didclose_notification_to(handle.as_ref(), scratch_uri) {
             log::warn!(
                 target: "kakehashi::bridge",
@@ -144,6 +133,10 @@ impl LanguageServerPool {
                 scratch_uri.to_uri_string(), e
             );
         }
+        // `untrack_document` does not touch `host_to_virtual`, so remove the
+        // registration added by `ensure_document_opened` explicitly.
+        self.unregister_virtual_doc(host_uri, scratch_uri).await;
+        self.untrack_document(scratch_uri, connection_key).await;
         drop(transition_guard);
         self.remove_open_transition_lock_if_unshared(scratch_uri, connection_key, &transition);
     }
