@@ -1041,6 +1041,7 @@ fn assert_host_did_save_is_skipped(mode: &str) {
 
 #[test]
 fn e2e_host_did_save_includes_saved_text_when_requested() {
+    const INCLUDED_SAVED_TEXT: &str = "# Included saved text\n";
     let (mut client, _config_dir, _init) = init_will_save_client_with_mode(
         "[languages.markdown.bridge._self]\nenabled = true\n",
         "will-save-include-text",
@@ -1053,6 +1054,13 @@ fn e2e_host_did_save_includes_saved_text_when_requested() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": SAVE_URI, "version": 2 },
+            "contentChanges": [{ "text": INCLUDED_SAVED_TEXT }],
+        }),
+    );
     client.send_notification(
         "textDocument/didSave",
         json!({ "textDocument": { "uri": SAVE_URI } }),
@@ -1070,7 +1078,8 @@ fn e2e_host_did_save_includes_saved_text_when_requested() {
     }
     let state = seen.expect("includeText=true server must receive didSave");
     assert_eq!(state["didHadText"], true);
-    assert_eq!(state["didDocumentText"], MARKDOWN);
+    assert_eq!(state["didText"], INCLUDED_SAVED_TEXT);
+    assert_eq!(state["didDocumentText"], INCLUDED_SAVED_TEXT);
 
     shutdown(&mut client);
 }
@@ -1313,6 +1322,7 @@ fn e2e_virt_did_save_observes_the_latest_virtual_text() {
 
 #[test]
 fn e2e_virt_did_save_includes_projected_text_when_requested() {
+    const INCLUDED_SAVED_MARKDOWN: &str = "# Title\n\n```lua\nprint(2)\n```\n";
     let (mut client, _config_dir) = init_virt_save_client_with_mode("will-save-include-text");
 
     for _ in 0..300 {
@@ -1322,6 +1332,13 @@ fn e2e_virt_did_save_includes_projected_text_when_requested() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": VIRT_SAVE_URI, "version": 2 },
+            "contentChanges": [{ "text": INCLUDED_SAVED_MARKDOWN }],
+        }),
+    );
     client.send_notification(
         "textDocument/didSave",
         json!({ "textDocument": { "uri": VIRT_SAVE_URI } }),
@@ -1339,10 +1356,11 @@ fn e2e_virt_did_save_includes_projected_text_when_requested() {
     }
     let state = seen.expect("includeText=true virtual server must receive didSave");
     assert_eq!(state["didHadText"], true);
-    let text = state["didDocumentText"]
+    let text = state["didText"]
         .as_str()
         .expect("didSave must include projected virtual text");
-    assert!(text.contains("print(1)"));
+    assert_eq!(state["didText"], state["didDocumentText"]);
+    assert!(text.contains("print(2)"));
     assert!(!text.contains("# Title"));
 
     shutdown(&mut client);

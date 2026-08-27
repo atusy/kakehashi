@@ -112,8 +112,8 @@
 //! - `will-save-incapable` — like `will-save` (records + reports save state via
 //!   hover) but advertises NEITHER `willSave` nor `save`, so the bridge's
 //!   per-server capability gate must skip it and its counts stay zero (#357).
-//! - `will-save-include-text` — records save state but requires didSave text;
-//!   textless forwarding must skip it.
+//! - `will-save-include-text` — records save state and requires didSave text;
+//!   hover exposes the received payload so forwarding can be checked exactly.
 //! - `notify` — right after answering `initialize`, emits a
 //!   `window/showMessage` followed by a `window/logMessage` notification.
 //!   Used by `tests/e2e/e2e_window_notifications.rs` to prove the bridge forwards
@@ -160,6 +160,7 @@ fn main() {
     let mut did_save_count: usize = 0;
     let mut last_did_save_uri: Option<String> = None;
     let mut last_did_save_had_text = false;
+    let mut last_did_save_text: Option<String> = None;
     let mut last_did_save_document_text: Option<String> = None;
     let mut diagnostic_generation: u64 = 0;
     // `diagnostics-refresh-prefetch-unchanged`: once ANY unchanged report was
@@ -492,11 +493,14 @@ fn main() {
                     .map(str::to_string);
             }
             "textDocument/didSave" => {
-                // Notification (no id): record receipt + URI for the hover probe
-                // (#357). didSave carries no text (includeText:false), so just
-                // accepting it is the property under test.
+                // Notification (no id): record receipt, URI, and the optional
+                // payload text for the hover probe (#357).
                 did_save_count += 1;
-                last_did_save_had_text = message.pointer("/params/text").is_some();
+                last_did_save_text = message
+                    .pointer("/params/text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                last_did_save_had_text = last_did_save_text.is_some();
                 last_did_save_uri = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
@@ -566,6 +570,7 @@ fn main() {
                         "did": did_save_count,
                         "didUri": last_did_save_uri,
                         "didHadText": last_did_save_had_text,
+                        "didText": last_did_save_text,
                         "didDocumentText": last_did_save_document_text,
                         "documentText": document_text,
                     });

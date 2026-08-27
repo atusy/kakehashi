@@ -46,6 +46,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use dashmap::DashMap;
@@ -71,6 +72,11 @@ tokio::task_local! {
     /// reader handler so it can wait for the parse watermark to reach this ticket.
     /// Read via [`current_reader_tail`].
     static READER_TAIL: u64;
+
+    /// Set by a reclaimable writer handler after it determines that the URI
+    /// has no live document. The outer gate then removes idle sequencing state
+    /// without resetting tickets for a live document.
+    static RECLAIM_WRITER_SEQUENCE: Arc<AtomicBool>;
 }
 
 /// The ingress writer ticket of the currently-running gated writer handler, or
@@ -89,6 +95,12 @@ pub(crate) fn current_writer_ticket() -> Option<u64> {
 #[cfg(test)]
 pub(crate) fn current_reader_tail() -> Option<u64> {
     READER_TAIL.try_with(|ticket| *ticket).ok()
+}
+
+/// Ask the ingress gate to remove this writer's per-URI sequencing entry once
+/// the handler completes, provided no later writer was already ticketed.
+pub(crate) fn reclaim_current_writer_sequence() {
+    let _ = RECLAIM_WRITER_SEQUENCE.try_with(|flag| flag.store(true, Ordering::Release));
 }
 
 /// Per-document sequencing state.
@@ -275,7 +287,11 @@ impl ReaderBarrier {
 /// How a request participates in per-document ordering.
 enum Role {
     /// Mutates document state; applies in strict wire order per URI.
-    Writer { uri: String, close: bool },
+    Writer {
+        uri: String,
+        close: bool,
+        reclaim_if_missing: bool,
+    },
     /// Reads the document tree; waits for writers that preceded it.
     Reader { uri: String },
 }
@@ -311,6 +327,7 @@ fn classify(req: &Request) -> Option<Role> {
             Some(Role::Writer {
                 uri,
                 close: method == "textDocument/didClose",
+                reclaim_if_missing: method == "textDocument/didSave",
             })
         }
         "textDocument/semanticTokens/full"
@@ -401,7 +418,11 @@ where
         let inner_fut = self.inner.call(req);
         match role {
             None => Box::pin(inner_fut),
-            Some(Role::Writer { uri, close }) => {
+            Some(Role::Writer {
+                uri,
+                close,
+                reclaim_if_missing,
+            }) => {
                 let sequencer = Arc::clone(&self.sequencer);
                 let mut gate = sequencer.issue_writer_ticket(&uri);
                 let ticket = gate.ticket();
@@ -409,10 +430,17 @@ where
                     gate.wait_turn().await;
                     // Scope the ticket around the handler so it can stamp its
                     // scheduled parse with this wire-order ticket.
-                    let result = WRITER_TICKET.scope(ticket, inner_fut).await;
+                    let reclaim = reclaim_if_missing.then(|| Arc::new(AtomicBool::new(false)));
+                    let result = if let Some(flag) = &reclaim {
+                        RECLAIM_WRITER_SEQUENCE
+                            .scope(Arc::clone(flag), WRITER_TICKET.scope(ticket, inner_fut))
+                            .await
+                    } else {
+                        WRITER_TICKET.scope(ticket, inner_fut).await
+                    };
                     // Mark done before any cleanup decision.
                     drop(gate);
-                    if close {
+                    if close || reclaim.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                         sequencer.finish_close(&uri, ticket);
                     }
                     result
@@ -625,6 +653,54 @@ mod tests {
         Request::build(method)
             .params(serde_json::json!({ "textDocument": { "uri": uri } }))
             .finish()
+    }
+
+    struct MissingSaveInner;
+
+    impl Service<Request> for MissingSaveInner {
+        type Response = Option<Response>;
+        type Error = std::convert::Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request) -> Self::Future {
+            Box::pin(async move {
+                if req.method() == "textDocument/didSave" {
+                    reclaim_current_writer_sequence();
+                }
+                Ok(None)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_save_reclaims_idle_sequence_state() {
+        let mut gate = IngressOrderGate::new(MissingSaveInner);
+
+        gate.call(notification("textDocument/didSave", URI))
+            .await
+            .unwrap();
+
+        assert!(!gate.sequencer.docs.contains_key(URI));
+    }
+
+    #[tokio::test]
+    async fn late_missing_save_reclaims_state_preserved_by_close() {
+        let mut gate = IngressOrderGate::new(MissingSaveInner);
+
+        let close = gate.call(notification("textDocument/didClose", URI));
+        let late_save = gate.call(notification("textDocument/didSave", URI));
+        close.await.unwrap();
+        assert!(
+            gate.sequencer.docs.contains_key(URI),
+            "close must retain state while the late save ticket is pending"
+        );
+        late_save.await.unwrap();
+
+        assert!(!gate.sequencer.docs.contains_key(URI));
     }
 
     #[test]

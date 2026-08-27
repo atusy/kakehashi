@@ -70,6 +70,7 @@ impl Kakehashi {
         if saved_document.is_none() {
             self.documents
                 .remove_edit_lock_if_unshared(&uri, &edit_lock);
+            crate::lsp::reclaim_current_writer_sequence();
         }
 
         // A didChange reparses and refreshes virtual documents off-ingress.
