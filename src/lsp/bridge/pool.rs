@@ -1784,6 +1784,11 @@ impl LanguageServerPool {
         // Failed/SpawnNew path and repeats the idempotent purge instead of
         // leaving a Closing entry that fails fast forever.
         failed_handle.set_state(ConnectionState::Failed);
+        // Own teardown independently of this cleanup future. The purge below
+        // can await several locks and be cancelled; the detached, bounded
+        // shutdown must still retire the live process before a replacement is
+        // allowed to coexist with it.
+        shutdown_invalidated_connection(connection_key.clone(), Arc::clone(failed_handle));
         self.host_documents
             .lock()
             .await
@@ -1793,11 +1798,8 @@ impl LanguageServerPool {
         self.pending_reopen.arm(connection_key);
         self.invalidate_diagnostic_connections(std::slice::from_ref(connection_key));
         self.purge_open_transition_locks(connection_key).await;
-        let removed = connections.remove(connection_key);
+        connections.remove(connection_key);
         drop(connections);
-        if let Some(handle) = removed {
-            shutdown_invalidated_connection(connection_key.clone(), handle);
-        }
         true
     }
 
