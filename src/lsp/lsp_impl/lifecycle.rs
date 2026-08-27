@@ -587,7 +587,7 @@ impl Kakehashi {
                 })),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 document_link_provider: Some(DocumentLinkOptions {
-                    resolve_provider: None,
+                    resolve_provider: Some(true),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
                 // Advertise workDoneProgress so spec-compliant clients attach a
