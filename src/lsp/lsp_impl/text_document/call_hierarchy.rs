@@ -7,7 +7,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use super::super::Kakehashi;
-use super::super::region_offset::resolve_region_offset;
+use super::super::region_offset::resolve_region_offset_and_language;
 use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
@@ -107,18 +107,20 @@ impl Kakehashi {
         // a DashMap read guard across that nested lookup; a queued didChange
         // writer could otherwise deadlock a task-fair shard lock. Revalidate
         // the lineage after geometry resolution to close the intervening race.
-        let geometry_is_current = resolve_region_offset(
+        let geometry_is_current = resolve_region_offset_and_language(
             &self.documents,
             &self.language,
             &self.bridge,
             &uri,
             &envelope.region_id,
         )
-        .is_some_and(|(offset, _, contiguous)| {
+        .is_some_and(|(offset, _, contiguous, injection_language)| {
             call_hierarchy_region_geometry_is_fresh(
                 &crate::lsp::bridge::RegionOffset::from(&envelope.offset),
                 &offset,
                 contiguous,
+                &envelope.injection_language,
+                &injection_language,
             )
         });
         geometry_is_current && lineage_is_current()
@@ -243,8 +245,10 @@ fn call_hierarchy_region_geometry_is_fresh(
     expected: &crate::lsp::bridge::RegionOffset,
     current: &crate::lsp::bridge::RegionOffset,
     contiguous: bool,
+    expected_language: &str,
+    current_language: &str,
 ) -> bool {
-    contiguous && current == expected
+    contiguous && current == expected && current_language == expected_language
 }
 
 struct HostCallHierarchyItems {
@@ -279,15 +283,20 @@ mod tests {
     fn incoming_calls_require_current_contiguous_region_geometry() {
         let expected = RegionOffset::new(3, 2);
         assert!(call_hierarchy_region_geometry_is_fresh(
-            &expected, &expected, true
+            &expected, &expected, true, "lua", "lua"
         ));
         assert!(!call_hierarchy_region_geometry_is_fresh(
-            &expected, &expected, false
+            &expected, &expected, false, "lua", "lua"
         ));
         assert!(!call_hierarchy_region_geometry_is_fresh(
             &expected,
             &RegionOffset::new(4, 2),
-            true
+            true,
+            "lua",
+            "lua"
+        ));
+        assert!(!call_hierarchy_region_geometry_is_fresh(
+            &expected, &expected, true, "lua", "luau"
         ));
     }
 }

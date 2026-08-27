@@ -1,5 +1,6 @@
 //! Call-hierarchy preparation for host and virtual bridge layers.
 
+use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 
@@ -371,13 +372,49 @@ impl LanguageServerPool {
         if !producer_is_still_live {
             return None;
         }
+        let known_virtual_uris = self
+            .known_virtual_call_hierarchy_item_uris(
+                &response,
+                "from",
+                virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string),
+            )
+            .await;
         transform_call_hierarchy_incoming_response_to_host(
             response,
             virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string),
             &host_uri_lsp,
             &envelope,
+            &known_virtual_uris,
         )
         .ok()?
+    }
+
+    async fn known_virtual_call_hierarchy_item_uris(
+        &self,
+        response: &Value,
+        item_field: &str,
+        request_virtual_uri: Option<String>,
+    ) -> HashSet<String> {
+        let mut known = HashSet::new();
+        if let Some(uri) = request_virtual_uri {
+            known.insert(uri);
+        }
+        let Some(calls) = response.get("result").and_then(Value::as_array) else {
+            return known;
+        };
+        for call in calls {
+            let Some(uri) = call
+                .get(item_field)
+                .and_then(|item| item.get("uri"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if !known.contains(uri) && self.resolve_virtual_uri(uri).await.is_some() {
+                known.insert(uri.to_string());
+            }
+        }
+        known
     }
 
     async fn call_hierarchy_producer_is_live(
@@ -416,6 +453,7 @@ fn transform_call_hierarchy_incoming_response_to_host(
     request_virtual_uri: Option<String>,
     host_uri: &Uri,
     envelope: &CallHierarchyEnvelope,
+    known_virtual_uris: &HashSet<String>,
 ) -> io::Result<Option<Vec<CallHierarchyIncomingCall>>> {
     const METHOD: &str = "callHierarchy/incomingCalls";
     if response_has_jsonrpc_error(&response, METHOD) {
@@ -439,21 +477,20 @@ fn transform_call_hierarchy_incoming_response_to_host(
     let calls = calls
         .into_iter()
         .filter_map(|mut call| {
-            let projected_from_virtual =
-                if VirtualDocumentUri::is_virtual_uri(call.from.uri.as_str()) {
-                    if request_virtual_uri.as_deref() != Some(call.from.uri.as_str()) {
-                        return None;
-                    }
-                    call.from.uri = host_uri.clone();
-                    translate_virtual_range_to_host(&mut call.from.range, &offset);
-                    translate_virtual_range_to_host(&mut call.from.selection_range, &offset);
-                    for range in &mut call.from_ranges {
-                        translate_virtual_range_to_host(range, &offset);
-                    }
-                    true
-                } else {
-                    false
-                };
+            let projected_from_virtual = if known_virtual_uris.contains(call.from.uri.as_str()) {
+                if request_virtual_uri.as_deref() != Some(call.from.uri.as_str()) {
+                    return None;
+                }
+                call.from.uri = host_uri.clone();
+                translate_virtual_range_to_host(&mut call.from.range, &offset);
+                translate_virtual_range_to_host(&mut call.from.selection_range, &offset);
+                for range in &mut call.from_ranges {
+                    translate_virtual_range_to_host(range, &offset);
+                }
+                true
+            } else {
+                false
+            };
             re_envelope_item(&mut call.from, envelope, projected_from_virtual);
             Some(call)
         })
@@ -800,30 +837,47 @@ mod tests {
             "selectionRange": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 1 } },
             "data": { "caller": "external" }
         });
+        let shaped_real_item = json!({
+            "name": "shaped-real", "kind": 12,
+            "uri": "file:///external/kakehashi-virtual-uri-other.lua",
+            "range": { "start": { "line": 9, "character": 0 }, "end": { "line": 9, "character": 3 } },
+            "selectionRange": { "start": { "line": 9, "character": 0 }, "end": { "line": 9, "character": 1 } }
+        });
         let mut cross_item = virtual_item.clone();
         cross_item["uri"] = json!(other_virtual_uri.to_uri_string());
         let response = json!({ "result": [
             { "from": virtual_item, "fromRanges": [{ "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 2 } }] },
             { "from": external_item, "fromRanges": [{ "start": { "line": 8, "character": 1 }, "end": { "line": 8, "character": 2 } }] },
+            { "from": shaped_real_item, "fromRanges": [] },
             { "from": cross_item, "fromRanges": [] }
         ]});
+
+        let known_virtual_uris = HashSet::from([
+            virtual_uri.to_uri_string(),
+            other_virtual_uri.to_uri_string(),
+        ]);
 
         let calls = transform_call_hierarchy_incoming_response_to_host(
             response,
             Some(virtual_uri.to_uri_string()),
             &host_uri,
             &envelope,
+            &known_virtual_uris,
         )
         .unwrap()
         .unwrap();
 
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].from.uri, host_uri);
         assert_eq!(calls[0].from.range.start, Position::new(3, 2));
         assert_eq!(calls[0].from_ranges[0].start, Position::new(3, 3));
         assert_eq!(calls[1].from.uri.as_str(), "file:///external.lua");
         assert_eq!(calls[1].from.range.start, Position::new(8, 0));
         assert_eq!(calls[1].from_ranges[0].start, Position::new(8, 1));
+        assert_eq!(
+            calls[2].from.uri.as_str(),
+            "file:///external/kakehashi-virtual-uri-other.lua"
+        );
         assert_eq!(
             extract_call_hierarchy_envelope(&calls[1].from)
                 .unwrap()
