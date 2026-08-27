@@ -620,6 +620,7 @@ impl KnownVirtualUris for VirtualUriObserver {
 mod tests {
     use super::*;
     use crate::lsp::bridge::protocol::{RegionOffset, RequestId, VirtualDocumentUri};
+    use crate::lsp::bridge::test_helpers::create_handle_with_key;
     use tower_lsp_server::ls_types::{NumberOrString, Position};
 
     fn test_envelope(host_uri: &Uri, key: &ConnectionKey) -> TypeHierarchyEnvelope {
@@ -951,6 +952,173 @@ mod tests {
             serde_json::json!({ "line": 0, "character": 0 })
         );
         assert_eq!(downstream["data"], serde_json::json!({ "token": "parent" }));
+    }
+
+    #[tokio::test]
+    async fn supertype_response_rejects_a_replaced_producer_after_admission() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua-ls");
+        let admitted = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&admitted)).await;
+        let host_uri = url::Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let generation = pool.document_connection_generation(&key);
+        let host_uri_lsp: Uri = host_uri.as_str().parse().unwrap();
+        let envelope = TypeHierarchyEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            content_version: 1,
+            connection_generation: generation,
+            connection_key: key.clone(),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            inner: Some(serde_json::json!({ "token": 9 })),
+            host_layer: true,
+            projected_from_virtual: false,
+        };
+        let params: TypeHierarchySupertypesParams = serde_json::from_value(serde_json::json!({
+            "item": type_item(host_uri.as_str(), serde_json::json!({ "token": 9 }))
+        }))
+        .unwrap();
+        let upstream_id = UpstreamId::Number(77);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_type_hierarchy_supertypes_request(
+                    &BridgeServerConfig::default(),
+                    params,
+                    envelope,
+                    Some(upstream_id),
+                )
+                .await
+            })
+        };
+        let downstream_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = admitted
+                    .router()
+                    .lookup_downstream_ids(&upstream_id)
+                    .into_iter()
+                    .next()
+                {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("supertype request must be admitted");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !admitted.router().is_sent(downstream_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("supertype request must be sent before replacement");
+
+        let replacement = create_handle_with_key(ConnectionState::Ready, key).await;
+        pool.insert_connection(replacement).await;
+        let _ = admitted.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": [{
+                "name": "OldParent", "kind": 5, "uri": host_uri_lsp,
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }
+            }]
+        }));
+
+        assert!(
+            request.await.unwrap().is_none(),
+            "the full response path must discard an admitted old-producer response"
+        );
+    }
+
+    #[tokio::test]
+    async fn supertype_response_classifies_sibling_opened_then_closed_in_flight() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua-ls");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_uri = url::Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let generation = pool.document_connection_generation(&key);
+        let envelope = TypeHierarchyEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            content_version: 1,
+            connection_generation: generation,
+            connection_key: key.clone(),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            inner: Some(serde_json::json!({ "token": 9 })),
+            host_layer: true,
+            projected_from_virtual: false,
+        };
+        let params: TypeHierarchySupertypesParams = serde_json::from_value(serde_json::json!({
+            "item": type_item(host_uri.as_str(), serde_json::json!({ "token": 9 }))
+        }))
+        .unwrap();
+        let upstream_id = UpstreamId::Number(79);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_type_hierarchy_supertypes_request(
+                    &BridgeServerConfig::default(),
+                    params,
+                    envelope,
+                    Some(upstream_id),
+                )
+                .await
+            })
+        };
+        let downstream_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = handle
+                    .router()
+                    .lookup_downstream_ids(&upstream_id)
+                    .into_iter()
+                    .next()
+                {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("supertype request must be admitted");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !handle.router().is_sent(downstream_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("supertype request must be sent");
+
+        let sibling_host = url::Url::parse("file:///sibling.md").unwrap();
+        let sibling_host_lsp: Uri = sibling_host.as_str().parse().unwrap();
+        let sibling_virtual = VirtualDocumentUri::new(&sibling_host_lsp, "lua", "sibling");
+        pool.register_opened_document(&sibling_host, &sibling_virtual, &key)
+            .await;
+        pool.untrack_document(&sibling_virtual, &key).await;
+        assert!(!pool.is_document_opened_on_connection(&sibling_virtual, &key));
+        let _ = handle.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": [{
+                "name": "Sibling", "kind": 5, "uri": sibling_virtual.to_uri_string(),
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                "selectionRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }
+            }]
+        }));
+
+        assert_eq!(request.await.unwrap(), Some(Vec::new()));
     }
 
     #[test]

@@ -230,6 +230,71 @@ fn supertypes_without_a_routing_envelope_return_null() {
     shutdown(&mut client);
 }
 
+#[test]
+fn supertypes_reject_stale_document_content_before_dispatch() {
+    let (mut client, _config_dir) = init_client(false);
+    let uri = "file:///test_stale_supertype_content.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": "markdown", "version": 1,
+            "text": "```lua\nMockChild\n```\n"
+        }}),
+    );
+    let item = prepare(&mut client, uri, 1, 1).remove(0);
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "```lua\nChanged\n```\n" }]
+        }),
+    );
+
+    let response = client.send_request("typeHierarchy/supertypes", json!({ "item": item }));
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
+#[test]
+fn supertypes_reject_stale_virtual_geometry_and_language_before_dispatch() {
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let request_file = event_dir
+        .path()
+        .join("type-hierarchy-slow-supertypes.request.json");
+    let (mut client, _config_dir) = init_client_with_mode(
+        false,
+        "type-hierarchy-slow-supertypes",
+        Some(event_dir.path()),
+    );
+    let uri = "file:///test_stale_supertype_geometry.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": "markdown", "version": 1,
+            "text": "```lua\nMockChild\n```\n"
+        }}),
+    );
+    let item = prepare(&mut client, uri, 1, 1).remove(0);
+    let mutations: [(&str, Value); 3] = [
+        ("/data/kakehashi/offset/line", json!(99)),
+        ("/data/kakehashi/injection_language", json!("luau")),
+        ("/data/kakehashi/region_id", json!("missing-region")),
+    ];
+    for (pointer, replacement) in mutations {
+        let mut stale = item.clone();
+        *stale.pointer_mut(pointer).expect("envelope field") = replacement;
+        let response = client.send_request("typeHierarchy/supertypes", json!({ "item": stale }));
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"], Value::Null);
+    }
+    assert!(
+        !request_file.exists(),
+        "stale virtual provenance must fail before downstream dispatch"
+    );
+    shutdown(&mut client);
+}
+
 fn assert_supertypes_discard_response_after_document_change(host_layer: bool) {
     let (mut client, _config_dir) =
         init_client_with_mode(host_layer, "type-hierarchy-delayed-supertypes", None);
