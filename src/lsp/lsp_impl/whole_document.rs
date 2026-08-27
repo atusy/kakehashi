@@ -281,6 +281,7 @@ impl Kakehashi {
             };
             let (cancel_rx, _cancel_guard) =
                 self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+            let incarnation = ctx.incarnation;
             let pool = self.bridge.pool_arc();
             let fan_in = dispatch_host_preferred(
                 &ctx,
@@ -290,7 +291,7 @@ impl Kakehashi {
                     async move {
                         let raw = t
                             .pool
-                            .send_host_raw_request(
+                            .send_host_raw_request_for_incarnation(
                                 &t.server_name,
                                 &t.server_config,
                                 &HostDocument {
@@ -301,6 +302,7 @@ impl Kakehashi {
                                 method_name,
                                 params,
                                 t.upstream_id,
+                                incarnation,
                             )
                             .await?;
                         let Some(raw) = raw else {
