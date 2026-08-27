@@ -83,9 +83,16 @@ Partially implemented:
   The host layer forwards coordinates verbatim; the virtual layer reverses the
   hint position, existing accept edits, and same-document label locations for
   the request, then translates lazily materialized edits and locations back to
-  the host. Resolve keeps the original hint position and applies the same
-  all-or-nothing edit safety guard as initial hint retrieval. Runtime-adjusted
-  region geometry (`#offset!` / `#trim!`) participates in the freshness check.
+  the host. Resolve merges only the protocol's lazy fields (`tooltip`,
+  `textEdits`, and label-part `tooltip` / `location` / `command`) into the
+  original hint, preserving its position, label values, kind, padding, and
+  opaque data. Every host-content revision invalidates a produced hint even
+  when the edit preserves the region's shape; this revision check runs both
+  before downstream dispatch and after its response. Runtime-adjusted region
+  geometry (`#offset!` / `#trim!`) also participates in freshness checks, and
+  non-contiguous combined injections fail soft before dispatch because a lazy
+  edit could otherwise cross a masked host-only gap. Safe resolves apply the
+  same all-or-nothing edit guard as initial hint retrieval.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one
