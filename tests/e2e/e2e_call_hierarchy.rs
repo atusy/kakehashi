@@ -10,17 +10,29 @@ fn mock_formatter_bin() -> &'static str {
 }
 
 fn init_client(host_layer: bool) -> (LspClient, tempfile::TempDir) {
+    init_client_with_mode(host_layer, "call-hierarchy-prepare", None)
+}
+
+fn init_client_with_mode(
+    host_layer: bool,
+    mode: &str,
+    event_dir: Option<&std::path::Path>,
+) -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("config temp dir");
     let config_path = config_dir.path().join("call_hierarchy.toml");
     std::fs::write(&config_path, "").expect("write config");
-    let mut client = LspClient::builder()
+    let builder = LspClient::builder()
         .arg("--config-file")
-        .arg(config_path.to_str().expect("UTF-8 config path"))
-        .build();
+        .arg(config_path.to_str().expect("UTF-8 config path"));
+    let builder = match event_dir {
+        Some(dir) => builder.env("MOCK_LSP_CANCEL_DIR", dir.to_string_lossy()),
+        None => builder,
+    };
+    let mut client = builder.build();
     let mut initialization_options = json!({
         "languageServers": {
             "mock-call-hierarchy": {
-                "cmd": [mock_formatter_bin(), "call-hierarchy-prepare"],
+                "cmd": [mock_formatter_bin(), mode],
                 "languages": ["lua"]
             }
         }
@@ -80,6 +92,20 @@ fn incoming_calls(client: &mut LspClient, item: Value) -> Vec<Value> {
 fn shutdown(client: &mut LspClient) {
     let _ = client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
+}
+
+fn wait_for_log_message(client: &mut LspClient, needle: &str) -> Option<Value> {
+    for _ in 0..20 {
+        let message = client.wait_for_notification("window/logMessage", Duration::from_secs(1));
+        if message.as_ref().is_some_and(|params| {
+            params["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(needle))
+        }) {
+            return message;
+        }
+    }
+    None
 }
 
 #[test]
@@ -255,4 +281,258 @@ fn incoming_calls_reject_items_from_stale_document_content() {
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"], Value::Null);
     shutdown(&mut client);
+}
+
+#[test]
+fn incoming_calls_reject_stale_virtual_geometry() {
+    let (mut client, _config_dir) = init_client(false);
+    let uri = "file:///test_stale_incoming_geometry.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "```lua\ncall()\n```\n"
+        }}),
+    );
+
+    let mut item = prepare_with_retry(&mut client, uri, 1, 1).remove(0);
+    item["data"]["kakehashi"]["offset"]["line"] = json!(99);
+    let response = client.send_request("callHierarchy/incomingCalls", json!({ "item": item }));
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
+#[test]
+fn incoming_calls_discard_response_after_document_change() {
+    let (mut client, _config_dir) =
+        init_client_with_mode(false, "call-hierarchy-delayed-incoming", None);
+    let uri = "file:///test_delayed_incoming.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "```lua\ncall()\n```\n"
+        }}),
+    );
+    let item = prepare_with_retry(&mut client, uri, 1, 1).remove(0);
+
+    let request_id =
+        client.send_request_async("callHierarchy/incomingCalls", json!({ "item": item }));
+    let started = wait_for_log_message(&mut client, "call-hierarchy-incoming-started");
+    assert!(
+        started.as_ref().is_some_and(|params| params["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("call-hierarchy-incoming-started"))),
+        "incoming request must reach the downstream sent-state barrier: {started:?}"
+    );
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "```lua\nchanged()\n```\n" }]
+        }),
+    );
+    let response = client.receive_response_for_id_public(request_id);
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
+#[test]
+fn incoming_calls_cancel_targets_exact_downstream_request() {
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let request_file = event_dir
+        .path()
+        .join("call-hierarchy-slow-incoming.request.json");
+    let cancel_file = event_dir
+        .path()
+        .join("call-hierarchy-slow-incoming.cancel.json");
+    let (mut client, _config_dir) =
+        init_client_with_mode(true, "call-hierarchy-slow-incoming", Some(event_dir.path()));
+    let uri = "file:///test_cancel_incoming.lua";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": "lua", "version": 1, "text": "call()\n"
+        }}),
+    );
+    let item = prepare_with_retry(&mut client, uri, 0, 1).remove(0);
+
+    let request_id =
+        client.send_request_async("callHierarchy/incomingCalls", json!({ "item": item }));
+    let started = wait_for_log_message(&mut client, "call-hierarchy-incoming-started");
+    assert!(started.is_some(), "downstream request must start");
+    assert!(request_file.exists(), "downstream request must be recorded");
+    client.send_notification("$/cancelRequest", json!({ "id": request_id }));
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(response["error"]["code"], -32800, "{response}");
+    let forwarded = (0..200).any(|_| {
+        if cancel_file.exists() {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+            false
+        }
+    });
+    assert!(forwarded, "cancel must reach downstream");
+    let request: Value = serde_json::from_slice(&std::fs::read(request_file).unwrap()).unwrap();
+    let cancel: Value = serde_json::from_slice(&std::fs::read(cancel_file).unwrap()).unwrap();
+    assert_eq!(cancel["params"]["id"], request["id"]);
+    shutdown(&mut client);
+}
+
+fn assert_replaced_call_hierarchy_producer_fails_soft(host_layer: bool, change_pool_key: bool) {
+    let (mut client, _config_dir) = init_client(host_layer);
+    let (uri, language_id, text, line, character) = if host_layer {
+        ("file:///test_replace_incoming.lua", "lua", "call()\n", 0, 1)
+    } else {
+        (
+            "file:///test_replace_incoming.md",
+            "markdown",
+            "```lua\ncall()\n```\n",
+            1,
+            1,
+        )
+    };
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": language_id, "version": 1, "text": text
+        }}),
+    );
+    let old_item = prepare_with_retry(&mut client, uri, line, character).remove(0);
+
+    let mut server = json!({
+        "cmd": [mock_formatter_bin(), "call-hierarchy-replacement"],
+        "languages": ["lua"]
+    });
+    if change_pool_key {
+        server["preferSharedInstance"] = json!(true);
+    }
+    let mut settings = json!({
+        "languageServers": { "mock-call-hierarchy": server }
+    });
+    if host_layer {
+        settings["languages"] = json!({
+            "lua": { "bridge": { "_self": { "enabled": true } } }
+        });
+    }
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": settings }),
+    );
+    if !host_layer {
+        client.send_notification(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": uri } }),
+        );
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({ "textDocument": {
+                "uri": uri, "languageId": language_id, "version": 1, "text": text
+            }}),
+        );
+    }
+
+    let replacement_item = prepare_with_retry(&mut client, uri, line, character).remove(0);
+    let old_envelope = &old_item["data"]["kakehashi"];
+    let replacement_envelope = &replacement_item["data"]["kakehashi"];
+    if change_pool_key {
+        assert_ne!(
+            old_envelope["connection_key"],
+            replacement_envelope["connection_key"]
+        );
+        assert_eq!(
+            old_envelope["connection_generation"], replacement_envelope["connection_generation"],
+            "different keys exercise the equal-generation collision"
+        );
+    } else {
+        assert_eq!(
+            old_envelope["connection_key"],
+            replacement_envelope["connection_key"]
+        );
+        assert_ne!(
+            old_envelope["connection_generation"],
+            replacement_envelope["connection_generation"]
+        );
+    }
+    assert_eq!(
+        incoming_calls(&mut client, replacement_item.clone()).len(),
+        1
+    );
+    // Keep current content/incarnation/geometry and replace only producer
+    // identity, isolating the key and generation checks.
+    let mut stale_item = replacement_item;
+    stale_item["data"]["kakehashi"]["connection_key"] = old_envelope["connection_key"].clone();
+    stale_item["data"]["kakehashi"]["connection_generation"] =
+        old_envelope["connection_generation"].clone();
+    stale_item["data"]["kakehashi"]["inner"] = old_envelope["inner"].clone();
+    let response =
+        client.send_request("callHierarchy/incomingCalls", json!({ "item": stale_item }));
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
+#[test]
+fn incoming_calls_reject_same_key_replacement_for_both_layers() {
+    assert_replaced_call_hierarchy_producer_fails_soft(false, false);
+    assert_replaced_call_hierarchy_producer_fails_soft(true, false);
+}
+
+#[test]
+fn incoming_calls_reject_different_key_equal_generation_for_both_layers() {
+    assert_replaced_call_hierarchy_producer_fails_soft(false, true);
+    assert_replaced_call_hierarchy_producer_fails_soft(true, true);
+}
+
+fn assert_reopened_call_hierarchy_item_fails_soft(host_layer: bool) {
+    let (mut client, _config_dir) = init_client(host_layer);
+    let (uri, language_id, text, line, character) = if host_layer {
+        ("file:///test_reopen_incoming.lua", "lua", "call()\n", 0, 1)
+    } else {
+        (
+            "file:///test_reopen_incoming.md",
+            "markdown",
+            "```lua\ncall()\n```\n",
+            1,
+            1,
+        )
+    };
+    let open = |client: &mut LspClient| {
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({ "textDocument": {
+                "uri": uri, "languageId": language_id, "version": 1, "text": text
+            }}),
+        );
+    };
+    open(&mut client);
+    let old_item = prepare_with_retry(&mut client, uri, line, character).remove(0);
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    open(&mut client);
+    let current_item = prepare_with_retry(&mut client, uri, line, character).remove(0);
+    assert_ne!(
+        old_item["data"]["kakehashi"]["incarnation"],
+        current_item["data"]["kakehashi"]["incarnation"]
+    );
+    assert_eq!(incoming_calls(&mut client, current_item).len(), 1);
+    let response = client.send_request("callHierarchy/incomingCalls", json!({ "item": old_item }));
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
+#[test]
+fn incoming_calls_reject_items_from_reopened_documents_for_both_layers() {
+    assert_reopened_call_hierarchy_item_fails_soft(false);
+    assert_reopened_call_hierarchy_item_fails_soft(true);
 }

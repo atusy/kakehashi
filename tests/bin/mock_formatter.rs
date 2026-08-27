@@ -234,6 +234,7 @@ fn main() {
     // reopened lifetime's, which the upstream forwards only after it has
     // processed the close and the reopen, so the reply lands after them.
     let mut pending_resolve: Option<(Option<Value>, Value)> = None;
+    let mut pending_call_hierarchy_incoming: Option<(Option<Value>, Value)> = None;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -255,7 +256,10 @@ fn main() {
                         "hoverProvider": true,
                         "textDocumentSync": 1
                     }),
-                    "call-hierarchy-prepare" => json!({
+                    "call-hierarchy-prepare"
+                    | "call-hierarchy-replacement"
+                    | "call-hierarchy-slow-incoming"
+                    | "call-hierarchy-delayed-incoming" => json!({
                         "callHierarchyProvider": true,
                         "textDocumentSync": 1
                     }),
@@ -597,6 +601,12 @@ fn main() {
                             | "document-link-delayed-resolve"
                             | "completion-resolve-delayed"
                     ) && let Some((pending_id, pending_result)) = pending_resolve.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
+                    if mode == "call-hierarchy-delayed-incoming"
+                        && let Some((pending_id, pending_result)) =
+                            pending_call_hierarchy_incoming.take()
                     {
                         respond(&mut writer, pending_id, pending_result);
                     }
@@ -1795,6 +1805,15 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "callHierarchy/incomingCalls" => {
+                if mode == "call-hierarchy-slow-incoming" {
+                    record_mock_event(&mode, "request", &message);
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "call-hierarchy-incoming-started" }),
+                    );
+                    continue;
+                }
                 let item = message.pointer("/params/item").cloned();
                 let result = item
                     .as_ref()
@@ -1832,7 +1851,16 @@ fn main() {
                         }])
                     })
                     .unwrap_or(Value::Null);
-                respond(&mut writer, id, result);
+                if mode == "call-hierarchy-delayed-incoming" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "call-hierarchy-incoming-started" }),
+                    );
+                    pending_call_hierarchy_incoming = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
             }
             "inlayHint/resolve" => {
                 if mode == "inlay-hint-marker-resolve" {
