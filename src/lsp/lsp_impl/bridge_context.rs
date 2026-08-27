@@ -1021,8 +1021,7 @@ impl Kakehashi {
     /// resolved `layers.priorities`, the bridge dispatch is skipped entirely.
     ///
     /// Used by entry points outside the [`Self::walk_layers`] race — the
-    /// shared bridge preamble and the virt-only handlers (rangeFormatting's
-    /// region pass, documentColor) that have no host contributor yet.
+    /// shared bridge preamble and rangeFormatting's virtual-region pass.
     /// Handlers on the walk get layer membership from the race itself, and
     /// the diagnostics paths resolve the full layer config directly (they
     /// gate virt and host independently).

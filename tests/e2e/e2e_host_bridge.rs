@@ -242,7 +242,7 @@ priorities = ["virt", "host"]
                 "uri": uri,
                 "languageId": "markdown",
                 "version": 1,
-                "text": "# Title\n\n```lua\nred!\n```\n"
+                "text": "# Title\n\n> ```lua\n> red!\n> ```\n"
             }
         }),
     );
@@ -268,17 +268,25 @@ priorities = ["virt", "host"]
         })
         .expect("concatenated document colors should include virt and host results");
 
-    let lines = colors
-        .iter()
-        .filter_map(|color| color.pointer("/range/start/line").and_then(Value::as_u64))
-        .collect::<Vec<_>>();
     assert!(
-        lines.contains(&0),
+        colors.iter().any(|color| {
+            color["range"]
+                == json!({
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 4 }
+                })
+        }),
         "host-layer documentColor should keep the host range: {colors:?}"
     );
     assert!(
-        lines.contains(&3),
-        "virt-layer documentColor should translate to the injected lua line: {colors:?}"
+        colors.iter().any(|color| {
+            color["range"]
+                == json!({
+                    "start": { "line": 3, "character": 2 },
+                    "end": { "line": 3, "character": 6 }
+                })
+        }),
+        "virt-layer documentColor should translate the injected lua line and column: {colors:?}"
     );
 
     shutdown(&mut client);
