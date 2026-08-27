@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use tokio::sync::Mutex;
 
 use crate::error::LockResultExt;
@@ -20,8 +20,10 @@ use super::ConnectionKey;
 use crate::lsp::bridge::protocol::VirtualDocumentUri;
 
 #[derive(Default)]
-struct ScratchUriHistory {
-    uris: HashSet<String>,
+struct VirtualUriProvenance {
+    issued: DashSet<String>,
+    scratch: DashSet<String>,
+    queued: DashSet<String>,
 }
 
 /// Retire a healthy producer before exact URI provenance can grow with an
@@ -29,17 +31,22 @@ struct ScratchUriHistory {
 /// downstream process index that could still return its closed documents.
 pub(super) const MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION: usize = 65_536;
 
-impl ScratchUriHistory {
-    fn insert(&mut self, uri: String) {
-        self.uris.insert(uri);
+impl VirtualUriProvenance {
+    fn contains(&self, uri: &str) -> bool {
+        self.issued.contains(uri) || self.scratch.contains(uri) || self.queued.contains(uri)
+    }
+
+    fn insert_issued(&self, uri: String) {
+        if VirtualDocumentUri::canonical_uri_for_scratch(&uri).is_some() {
+            self.scratch.insert(uri);
+        } else {
+            self.issued.insert(uri);
+        }
     }
 }
 
 pub(crate) struct VirtualUriObserver {
-    connection_key: ConnectionKey,
-    generation: u64,
-    issued_virtual_uris: Arc<DashMap<(ConnectionKey, u64), HashSet<String>>>,
-    scratch_uri_history: Arc<DashMap<(ConnectionKey, u64), ScratchUriHistory>>,
+    provenance: Arc<VirtualUriProvenance>,
     explicit_uris: std::sync::Mutex<HashSet<String>>,
 }
 
@@ -60,14 +67,7 @@ impl VirtualUriObserver {
         {
             return true;
         }
-        let key = (self.connection_key.clone(), self.generation);
-        self.issued_virtual_uris
-            .get(&key)
-            .is_some_and(|uris| uris.contains(uri))
-            || self
-                .scratch_uri_history
-                .get(&key)
-                .is_some_and(|history| history.uris.contains(uri))
+        self.provenance.contains(uri)
     }
 }
 
@@ -157,12 +157,10 @@ pub(crate) struct DocumentTracker {
     /// Every virtual URI whose didOpen reached a connection generation.
     /// Downstream indexes may return a URI after didClose, so provenance must
     /// survive until the producing process is purged.
-    issued_virtual_uris: Arc<DashMap<(ConnectionKey, u64), HashSet<String>>>,
-    /// Exact aliases for scratch documents. Exact provenance avoids classifying
-    /// a real file with a valid scratch-shaped name as virtual. Like canonical
-    /// issued URI history, aliases live until the producing generation is
-    /// purged because downstream indexes may return them after didClose.
-    scratch_uri_history: Arc<DashMap<(ConnectionKey, u64), ScratchUriHistory>>,
+    /// Exact canonical, scratch, and queued URI provenance for each producer
+    /// generation. The Arc lets in-flight requests retain an immutable-generation
+    /// lease after the registry entry is purged during producer replacement.
+    virtual_uri_provenance: DashMap<(ConnectionKey, u64), Arc<VirtualUriProvenance>>,
     /// Pre-send claims keyed by exact connection. Waiters park until the owner
     /// promotes the claim after enqueue or finishes rollback.
     open_claims: DashMap<(ConnectionKey, String), Arc<tokio::sync::Notify>>,
@@ -182,8 +180,7 @@ impl DocumentTracker {
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
-            issued_virtual_uris: Arc::new(DashMap::new()),
-            scratch_uri_history: Arc::new(DashMap::new()),
+            virtual_uri_provenance: DashMap::new(),
             open_claims: DashMap::new(),
             connection_generations: DashMap::new(),
         }
@@ -195,38 +192,55 @@ impl DocumentTracker {
             .map_or(0, |generation| *generation)
     }
 
+    fn provenance_for_generation(
+        &self,
+        connection_key: &ConnectionKey,
+        generation: u64,
+    ) -> Arc<VirtualUriProvenance> {
+        self.virtual_uri_provenance
+            .entry((connection_key.clone(), generation))
+            .or_default()
+            .clone()
+    }
+
     pub(super) fn virtual_uri_provenance_limit_reached(
         &self,
         connection_key: &ConnectionKey,
     ) -> bool {
         let generation = self.connection_generation(connection_key);
-        let key = (connection_key.clone(), generation);
-        let issued = self
-            .issued_virtual_uris
-            .get(&key)
-            .map_or(0, |uris| uris.len());
-        let scratch = self
-            .scratch_uri_history
-            .get(&key)
-            .map_or(0, |history| history.uris.len());
+        let provenance = self
+            .virtual_uri_provenance
+            .get(&(connection_key.clone(), generation))
+            .map(|state| Arc::clone(state.value()));
+        let issued = provenance.as_ref().map_or(0, |state| state.issued.len());
+        let scratch = provenance.as_ref().map_or(0, |state| state.scratch.len());
+        let queued = provenance.as_ref().map_or(0, |state| state.queued.len());
         let pending = self
             .open_claims
             .iter()
             .filter(|claim| &claim.key().0 == connection_key)
+            .filter(|claim| {
+                provenance
+                    .as_ref()
+                    .is_none_or(|state| !state.queued.contains(&claim.key().1))
+            })
             .count();
-        issued.saturating_add(scratch).saturating_add(pending)
+        issued
+            .saturating_add(scratch)
+            .saturating_add(queued)
+            .saturating_add(pending)
             >= MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION
     }
 
     #[cfg(test)]
     pub(super) fn saturate_virtual_uri_provenance(&self, connection_key: &ConnectionKey) {
         let generation = self.connection_generation(connection_key);
-        self.issued_virtual_uris.insert(
-            (connection_key.clone(), generation),
-            (0..MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION)
-                .map(|index| format!("file:///virtual-{index}.lua"))
-                .collect(),
-        );
+        let provenance = self.provenance_for_generation(connection_key, generation);
+        for index in 0..MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION {
+            provenance
+                .issued
+                .insert(format!("file:///virtual-{index}.lua"));
+        }
     }
 
     #[cfg(test)]
@@ -327,6 +341,33 @@ impl DocumentTracker {
         connections
     }
 
+    /// Publish exact provenance immediately after didOpen enters the FIFO.
+    /// This is synchronous so caller cancellation cannot leave a downstream-open
+    /// URI invisible while detached opened-state promotion waits on an async lock.
+    pub(super) fn mark_open_queued(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        expected_generation: u64,
+        expected_claim: &Arc<tokio::sync::Notify>,
+    ) -> bool {
+        if self.connection_generation(connection_key) != expected_generation {
+            return false;
+        }
+        let uri = virtual_uri.to_uri_string();
+        if !self
+            .open_claims
+            .get(&(connection_key.clone(), uri.clone()))
+            .is_some_and(|claim| Arc::ptr_eq(&claim, expected_claim))
+        {
+            return false;
+        }
+        self.provenance_for_generation(connection_key, expected_generation)
+            .queued
+            .insert(uri);
+        true
+    }
+
     /// Promote a pre-send claim only after didOpen is confirmed enqueued.
     pub(super) async fn mark_open_sent(
         &self,
@@ -353,18 +394,11 @@ impl DocumentTracker {
         else {
             return false;
         };
-        let generation = expected_generation;
-        if VirtualDocumentUri::canonical_uri_for_scratch(&uri_string).is_some() {
-            self.scratch_uri_history
-                .entry((connection_key.clone(), generation))
-                .or_default()
-                .insert(uri_string.clone());
-        } else {
-            self.issued_virtual_uris
-                .entry((connection_key.clone(), generation))
-                .or_default()
-                .insert(uri_string.clone());
-        }
+        let provenance = self.provenance_for_generation(connection_key, expected_generation);
+        // Insert confirmed history before removing queued visibility so observers
+        // never see a gap between FIFO admission and local promotion.
+        provenance.insert_issued(uri_string.clone());
+        provenance.queued.remove(&uri_string);
         let mut servers = self
             .virtual_to_servers
             .entry(uri_string.clone())
@@ -659,9 +693,7 @@ impl DocumentTracker {
             .or_insert(0);
         *generation = generation.wrapping_add(1);
         drop(generation);
-        self.issued_virtual_uris
-            .retain(|(key, _), _| key != connection_key);
-        self.scratch_uri_history
+        self.virtual_uri_provenance
             .retain(|(key, _), _| key != connection_key);
         // Take this connection's version map; its keys are the virtual URIs it
         // had open. Done first so the per-URI refcount/reverse-index cleanup
@@ -765,6 +797,13 @@ impl DocumentTracker {
         else {
             return false;
         };
+        for provenance in self
+            .virtual_uri_provenance
+            .iter()
+            .filter(|entry| &entry.key().0 == connection_key)
+        {
+            provenance.queued.remove(&uri_string);
+        }
         if let Some(docs) = versions.get_mut(connection_key) {
             docs.remove(&uri_string);
         }
@@ -816,10 +855,11 @@ impl DocumentTracker {
         generation: u64,
     ) -> VirtualUriObserver {
         VirtualUriObserver {
-            connection_key: connection_key.clone(),
-            generation,
-            issued_virtual_uris: Arc::clone(&self.issued_virtual_uris),
-            scratch_uri_history: Arc::clone(&self.scratch_uri_history),
+            provenance: if self.connection_generation(connection_key) == generation {
+                self.provenance_for_generation(connection_key, generation)
+            } else {
+                Arc::new(VirtualUriProvenance::default())
+            },
             explicit_uris: std::sync::Mutex::new(HashSet::new()),
         }
     }
@@ -2289,9 +2329,11 @@ mod tests {
 
         let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
         assert!(observer.contains(&virtual_uri.to_uri_string()));
-        drop(observer);
-
         tracker.purge_connection(&key).await;
+        assert!(
+            observer.contains(&virtual_uri.to_uri_string()),
+            "an in-flight generation lease survives registry purge"
+        );
         let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
         assert!(!observer.contains(&virtual_uri.to_uri_string()));
     }
@@ -2395,9 +2437,8 @@ mod tests {
         let generation = tracker.connection_generation(&key);
         tracker.saturate_virtual_uri_provenance(&key);
         tracker
-            .issued_virtual_uris
-            .get_mut(&(key.clone(), generation))
-            .unwrap()
+            .provenance_for_generation(&key, generation)
+            .issued
             .remove("file:///virtual-0.lua");
         let host_uri = url_to_uri(&Url::parse("file:///host.md").unwrap());
         let first = VirtualDocumentUri::new(&host_uri, "lua", "first");
@@ -2422,9 +2463,8 @@ mod tests {
         let generation = tracker.connection_generation(&key);
         tracker.saturate_virtual_uri_provenance(&key);
         tracker
-            .issued_virtual_uris
-            .get_mut(&(key.clone(), generation))
-            .unwrap()
+            .provenance_for_generation(&key, generation)
+            .issued
             .remove("file:///virtual-0.lua");
         let host_uri = url_to_uri(&Url::parse("file:///host.md").unwrap());
         let promoted = VirtualDocumentUri::new(&host_uri, "lua", "promoted");
