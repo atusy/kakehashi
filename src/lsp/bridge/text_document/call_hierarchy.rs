@@ -17,9 +17,10 @@ use url::Url;
 use crate::config::settings::BridgeServerConfig;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 
+#[cfg(test)]
+use super::super::pool::ConnectionHandle;
 use super::super::pool::{
-    ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId,
-    VirtualUriObserver,
+    ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId, VirtualUriObserver,
 };
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
@@ -413,24 +414,27 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, connection_key);
         }
         let response = response.ok()?;
-        if !self
-            .call_hierarchy_producer_is_live(
-                connection_key,
-                &handle,
-                envelope.connection_generation,
-            )
-            .await
-        {
+        let connections = self.connections().await;
+        let producer_is_live = connections.get(connection_key).is_some_and(|current| {
+            Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+        }) && self.document_connection_generation(connection_key)
+            == envelope.connection_generation;
+        if !producer_is_live {
             return None;
         }
-        transform_call_hierarchy_incoming_response_to_host(
+        // Keep the producer admission guard through synchronous classification:
+        // replacement purges the shared generation histories, so releasing it
+        // here could make one stale response classify virtual URIs as real.
+        let transformed = transform_call_hierarchy_incoming_response_to_host(
             response,
             virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string),
             &host_uri_lsp,
             &envelope,
             &virtual_uri_observer,
         )
-        .ok()?
+        .ok()?;
+        drop(connections);
+        transformed
     }
 
     async fn send_call_hierarchy_outgoing_request(
@@ -541,26 +545,27 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, connection_key);
         }
         let response = response.ok()?;
-        if !self
-            .call_hierarchy_producer_is_live(
-                connection_key,
-                &handle,
-                envelope.connection_generation,
-            )
-            .await
-        {
+        let connections = self.connections().await;
+        let producer_is_live = connections.get(connection_key).is_some_and(|current| {
+            Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+        }) && self.document_connection_generation(connection_key)
+            == envelope.connection_generation;
+        if !producer_is_live {
             return None;
         }
-        transform_call_hierarchy_outgoing_response_to_host(
+        let transformed = transform_call_hierarchy_outgoing_response_to_host(
             response,
             virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string),
             &host_uri_lsp,
             &envelope,
             &virtual_uri_observer,
         )
-        .ok()?
+        .ok()?;
+        drop(connections);
+        transformed
     }
 
+    #[cfg(test)]
     async fn call_hierarchy_producer_is_live(
         &self,
         connection_key: &ConnectionKey,
