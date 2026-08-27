@@ -31,6 +31,11 @@ struct ScratchUriHistory {
     uris: HashSet<String>,
 }
 
+/// Retire a healthy producer before exact URI provenance can grow with an
+/// editor session forever. Replacement purges both this history and the
+/// downstream process index that could still return its closed documents.
+pub(super) const MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION: usize = 65_536;
+
 impl ScratchUriHistory {
     fn insert(&mut self, uri: String) {
         self.uris.insert(uri);
@@ -193,6 +198,23 @@ impl DocumentTracker {
         self.connection_generations
             .get(connection_key)
             .map_or(0, |generation| *generation)
+    }
+
+    pub(super) fn virtual_uri_provenance_limit_reached(
+        &self,
+        connection_key: &ConnectionKey,
+    ) -> bool {
+        let generation = self.connection_generation(connection_key);
+        let key = (connection_key.clone(), generation);
+        let issued = self
+            .issued_virtual_uris
+            .get(&key)
+            .map_or(0, |uris| uris.len());
+        let scratch = self
+            .scratch_uri_history
+            .get(&key)
+            .map_or(0, |history| history.uris.len());
+        issued.saturating_add(scratch) >= MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION
     }
 
     /// Check if a virtual document is opened on a downstream server.
@@ -2382,6 +2404,23 @@ mod tests {
             .observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key))
             .await;
         assert!(observer.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn virtual_uri_provenance_requests_generation_recycle_at_its_bound() {
+        let tracker = DocumentTracker::new();
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        tracker.issued_virtual_uris.insert(
+            (key.clone(), generation),
+            (0..MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION)
+                .map(|index| format!("file:///virtual-{index}.lua"))
+                .collect(),
+        );
+
+        assert!(tracker.virtual_uri_provenance_limit_reached(&key));
+        tracker.purge_connection(&key).await;
+        assert!(!tracker.virtual_uri_provenance_limit_reached(&key));
     }
 
     #[tokio::test]
