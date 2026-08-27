@@ -38,7 +38,7 @@ impl Kakehashi {
                     .await
             },
             |mut won| {
-                if won.resolves {
+                if won.handle.has_capability("codeLens/resolve") {
                     envelope_host_code_lenses(
                         &mut won.items,
                         &won.server_name,

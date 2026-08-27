@@ -35,7 +35,7 @@ pub(super) struct HostWholeDocumentResponse<T> {
     pub(super) server_name: String,
     pub(super) host_uri: url::Url,
     pub(super) incarnation: Option<u64>,
-    pub(super) resolves: bool,
+    pub(super) handle: Arc<crate::lsp::bridge::ConnectionHandle>,
 }
 
 impl Kakehashi {
@@ -306,7 +306,6 @@ impl Kakehashi {
                         let Some(raw) = raw else {
                             return Ok(None);
                         };
-                        let resolves = raw.handle.has_capability("codeLens/resolve");
                         let Some(items) = parse_host_verbatim::<Vec<T>>(raw.value) else {
                             return Ok(None);
                         };
@@ -315,7 +314,7 @@ impl Kakehashi {
                             server_name: t.server_name,
                             host_uri: t.uri,
                             incarnation,
-                            resolves,
+                            handle: raw.handle,
                         }))
                     }
                 },
