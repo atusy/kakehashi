@@ -185,6 +185,22 @@ pub(crate) struct ConnectionHandle {
 }
 
 impl ConnectionHandle {
+    /// Stop the writer and wait until its outbound receiver is gone.
+    #[cfg(test)]
+    pub(crate) async fn cancel_writer_for_test(&self) {
+        if let Some(handle) = self
+            .writer_handle
+            .lock()
+            .recover_poison("ConnectionHandle::cancel_writer_for_test")
+            .as_ref()
+        {
+            handle.cancel();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), self.tx.closed())
+            .await
+            .expect("writer receiver should close after cancellation");
+    }
+
     /// Create a new ConnectionHandle in Ready state (test helper).
     ///
     /// Used in tests where we need a connection handle without going through
