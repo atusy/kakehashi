@@ -815,6 +815,12 @@ impl ConnectionHandle {
                         | tower_lsp_server::ls_types::CallHierarchyServerCapability::Options(_)
                 )
             ),
+            "textDocument/prepareTypeHierarchy" => caps
+                .experimental
+                .as_ref()
+                .and_then(|value| value.get("kakehashiInternalTypeHierarchyProvider"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             "inlayHint/resolve" => match caps.inlay_hint_provider.as_ref() {
                 Some(OneOf::Right(
                     tower_lsp_server::ls_types::InlayHintServerCapabilities::Options(options),
@@ -2432,6 +2438,14 @@ mod tests {
                 "textDocument/prepareCallHierarchy",
                 Box::new(|c| {
                     c.call_hierarchy_provider = Some(CallHierarchyServerCapability::Simple(true));
+                }),
+            ),
+            (
+                "textDocument/prepareTypeHierarchy",
+                Box::new(|c| {
+                    c.experimental = Some(serde_json::json!({
+                        "kakehashiInternalTypeHierarchyProvider": true
+                    }));
                 }),
             ),
             (

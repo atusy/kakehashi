@@ -212,7 +212,22 @@ pub(crate) fn parse_initialize_response_capabilities(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    let type_hierarchy_provider = capabilities
+        .get("typeHierarchyProvider")
+        .is_some_and(|value| value == true || value.is_object());
     let mut parsed = recover_server_capabilities(capabilities)?;
+    if type_hierarchy_provider {
+        let original = parsed.capabilities.experimental.take();
+        let mut experimental = match original {
+            Some(serde_json::Value::Object(experimental)) => experimental,
+            _ => serde_json::Map::new(),
+        };
+        experimental.insert(
+            "kakehashiInternalTypeHierarchyProvider".into(),
+            serde_json::Value::Bool(true),
+        );
+        parsed.capabilities.experimental = Some(serde_json::Value::Object(experimental));
+    }
     parsed.bridge_routing = bridge_routing;
     Ok(parsed)
 }
@@ -603,6 +618,24 @@ mod tests {
             .strip_prefix("hoverProvider: ")
             .expect("serde error must include the JSON field path");
         assert!(!detail.is_empty(), "serde error must retain its cause");
+    }
+
+    #[test]
+    fn type_hierarchy_provider_survives_missing_typed_server_field() {
+        let response = serde_json::json!({
+            "result": { "capabilities": { "typeHierarchyProvider": true } }
+        });
+
+        let parsed = parse_initialize_response_capabilities(&response).unwrap();
+
+        assert_eq!(
+            parsed
+                .capabilities
+                .experimental
+                .as_ref()
+                .and_then(|value| value.get("kakehashiInternalTypeHierarchyProvider")),
+            Some(&serde_json::Value::Bool(true))
+        );
     }
 
     #[test]

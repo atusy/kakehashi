@@ -146,6 +146,9 @@ expression: merged
     "moniker": {
       "dynamicRegistration": false
     },
+    "typeHierarchy": {
+      "dynamicRegistration": false
+    },
     "inlayHint": {
       "dynamicRegistration": false
     },
