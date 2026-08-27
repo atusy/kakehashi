@@ -46,6 +46,7 @@ impl Kakehashi {
                     won.host_uri.as_str(),
                     won.incarnation,
                     won.connection_generation,
+                    won.handle.key(),
                     server_resolves,
                 );
                 Some(won.items)

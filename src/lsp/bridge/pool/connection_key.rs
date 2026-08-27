@@ -17,7 +17,7 @@ use std::fmt;
 
 /// How a [`ConnectionKey`] is rooted — the discriminator that decides which
 /// downstream process a document routes to.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 enum ConnectionRoot {
     /// Resolved marker workspace root URI string: documents under distinct
     /// marker roots get distinct connections (per-root pooling, #382).
@@ -44,7 +44,7 @@ enum ConnectionRoot {
 /// [`ConnectionHandle`](super::ConnectionHandle) so downstream request,
 /// `didChange`, and cancel paths can recover it via `handle.key()` without
 /// re-resolving the root.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ConnectionKey {
     /// Config server name (the `language_servers` map key), e.g. `tsgo`.
     server: String,

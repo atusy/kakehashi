@@ -1287,7 +1287,10 @@ fn main() {
             "codeLens/resolve" => {
                 if mode == "code-lens-slow-resolve" {
                     record_mock_event(&mode, "request", &message);
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    // Keep the request in flight while continuing the read
+                    // loop so a queued $/cancelRequest is observed before any
+                    // resolve response exists.
+                    continue;
                 }
                 // Materialize the command, echoing the lens's own data back so
                 // the test can prove the downstream data round-tripped through
@@ -1567,6 +1570,7 @@ fn record_mock_event(mode: &str, event: &str, message: &Value) {
     let payload = json!({
         "mode": mode,
         "event": event,
+        "id": message.get("id").cloned().unwrap_or(Value::Null),
         "params": message.get("params").cloned().unwrap_or(Value::Null)
     });
     let _ = std::fs::write(

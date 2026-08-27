@@ -54,10 +54,11 @@ Partially implemented:
   non-resolving server's lens normally stays bare; the reserved-key collision
   exception wraps `data.kakehashi` as opaque `inner` data so a downstream
   payload cannot impersonate bridge routing metadata. The envelope retains
-  both the host-document incarnation and producing connection generation, so
-  an old lens is returned unresolved after either a document reopen or a
-  downstream process replacement. Resolve never spawns a replacement for
-  process-owned lens data. Ordinary downstream failures remain fail-soft,
+  the host-document incarnation plus the exact producing `ConnectionKey` and
+  its generation, so an old lens is returned unresolved after either a
+  document reopen, a rooted/shared routing-key change, or a downstream process
+  replacement. Resolve never spawns a replacement for process-owned lens data.
+  Ordinary downstream failures remain fail-soft,
   while an upstream client cancellation returns `RequestCancelled` and
   cancels the in-flight downstream resolve.
   Formatting additionally supports the cross-layer

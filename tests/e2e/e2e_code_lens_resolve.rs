@@ -322,7 +322,8 @@ fn e2e_host_code_lens_from_replaced_connection_stays_unresolved() {
             "languageServers": {
                 "mock-codelens": {
                     "cmd": [bin, "code-lens-replacement"],
-                    "languages": ["markdown"]
+                    "languages": ["markdown"],
+                    "preferSharedInstance": true
                 }
             },
             "languages": {
@@ -331,6 +332,11 @@ fn e2e_host_code_lens_from_replaced_connection_stays_unresolved() {
         }}),
     );
     let replacement_lens = code_lens_with_retry(&mut client).remove(0);
+    assert_ne!(
+        old_lens["data"]["kakehashi"]["connection_key"],
+        replacement_lens["data"]["kakehashi"]["connection_key"],
+        "precondition: the replacement must use a different pool key"
+    );
     let replacement = client.send_request("codeLens/resolve", replacement_lens);
     assert_eq!(
         replacement["result"]["command"]["title"], "replacement resolved:lens-1",
@@ -406,6 +412,17 @@ fn e2e_host_code_lens_resolve_cancel_returns_request_cancelled() {
     assert!(
         forwarded,
         "cancel must be forwarded to the downstream server"
+    );
+    let request_event: Value = serde_json::from_slice(
+        &std::fs::read(&request_file).expect("read downstream request event"),
+    )
+    .expect("parse downstream request event");
+    let cancel_event: Value =
+        serde_json::from_slice(&std::fs::read(&cancel_file).expect("read downstream cancel event"))
+            .expect("parse downstream cancel event");
+    assert_eq!(
+        cancel_event["params"]["id"], request_event["id"],
+        "cancel must target the exact downstream resolve request"
     );
 
     shutdown(&mut client);

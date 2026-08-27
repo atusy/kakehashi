@@ -30,7 +30,7 @@ use serde_json::Value;
 use tower_lsp_server::ls_types::{CodeLens, NumberOrString};
 use url::Url;
 
-use super::super::pool::{LanguageServerPool, UpstreamId};
+use super::super::pool::{ConnectionKey, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, WholeDocumentRequestParams,
     build_whole_document_request_with_progress, response_has_jsonrpc_error,
@@ -70,6 +70,10 @@ pub(crate) struct CodeLensEnvelope {
     /// hand process-owned data to a replacement process under the same key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) connection_generation: Option<u64>,
+    /// Exact pool key of the producing host connection. Generations are local
+    /// to a key, so the key and generation together identify the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) connection_key: Option<ConnectionKey>,
     /// Region offset snapshot for coordinate translation at resolve time.
     pub(crate) offset: EnvelopeOffset,
     /// The downstream server's original `data` value (preserved verbatim).
@@ -98,6 +102,7 @@ struct CodeLensEnvelopeContext<'a> {
     injection_language: &'a str,
     incarnation: Option<u64>,
     connection_generation: Option<u64>,
+    connection_key: Option<&'a ConnectionKey>,
     offset: &'a RegionOffset,
     host_layer: bool,
 }
@@ -112,6 +117,7 @@ fn envelope_lens_data(lens: &mut CodeLens, ctx: &CodeLensEnvelopeContext) {
         injection_language: ctx.injection_language.to_string(),
         incarnation: ctx.incarnation,
         connection_generation: ctx.connection_generation,
+        connection_key: ctx.connection_key.cloned(),
         offset: EnvelopeOffset::from(ctx.offset),
         inner,
         host_layer: ctx.host_layer,
@@ -147,6 +153,7 @@ fn re_envelope_lens(lens: &mut CodeLens, envelope: &CodeLensEnvelope) {
         injection_language: &envelope.injection_language,
         incarnation: envelope.incarnation,
         connection_generation: envelope.connection_generation,
+        connection_key: envelope.connection_key.as_ref(),
         offset: &RegionOffset::from(&envelope.offset),
         host_layer: envelope.host_layer,
     };
@@ -159,6 +166,7 @@ pub(crate) fn envelope_host_code_lenses(
     host_uri: &str,
     incarnation: Option<u64>,
     connection_generation: u64,
+    connection_key: &ConnectionKey,
     server_resolves: bool,
 ) {
     let offset = RegionOffset::new(0, 0);
@@ -169,6 +177,7 @@ pub(crate) fn envelope_host_code_lenses(
         injection_language: "",
         incarnation,
         connection_generation: Some(connection_generation),
+        connection_key: Some(connection_key),
         offset: &offset,
         host_layer: true,
     };
@@ -237,6 +246,7 @@ impl LanguageServerPool {
                     injection_language,
                     incarnation: host_incarnation,
                     connection_generation: None,
+                    connection_key: None,
                     offset: ctx.offset,
                     host_layer: false,
                 };
@@ -312,14 +322,19 @@ impl LanguageServerPool {
                 re_envelope_lens(&mut lens, &envelope);
                 return lens;
             };
-            let (_, connection_key) = self
-                .resolve_acquire(server_name, server_config, Some(&host_uri))
-                .await;
-            if self.document_connection_generation(&connection_key) != expected_generation {
+            let Some(connection_key) = envelope
+                .connection_key
+                .as_ref()
+                .filter(|key| key.server() == server_name)
+            else {
+                re_envelope_lens(&mut lens, &envelope);
+                return lens;
+            };
+            if self.document_connection_generation(connection_key) != expected_generation {
                 re_envelope_lens(&mut lens, &envelope);
                 return lens;
             }
-            self.ready_connection_by_key_for_config(&connection_key, Some(server_config))
+            self.ready_connection_by_key_for_config(connection_key, Some(server_config))
                 .await
                 .ok_or_else(|| {
                     io::Error::new(
@@ -575,6 +590,7 @@ mod tests {
             injection_language: "lua",
             incarnation: Some(1),
             connection_generation: None,
+            connection_key: None,
             offset,
             host_layer: false,
         }
