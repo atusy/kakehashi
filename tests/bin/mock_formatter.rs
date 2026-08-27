@@ -227,9 +227,13 @@ fn main() {
                     "inlay-hint-resolve"
                     | "inlay-hint-resolve-replacement"
                     | "inlay-hint-delayed-resolve"
-                    | "inlay-hint-marker-resolve"
                     | "inlay-hint-slow-resolve" => json!({
                         "inlayHintProvider": { "resolveProvider": true },
+                        "textDocumentSync": 1
+                    }),
+                    "inlay-hint-marker-resolve" => json!({
+                        "inlayHintProvider": { "resolveProvider": true },
+                        "hoverProvider": true,
                         "textDocumentSync": 1
                     }),
                     "inlay-hint-no-resolve" | "inlay-hint-no-resolve-reserved-data" => json!({
@@ -595,7 +599,13 @@ fn main() {
                 }
             }
             "textDocument/hover" => {
-                let result = if mode.starts_with("will-save") {
+                let result = if mode == "inlay-hint-marker-resolve" {
+                    let observation = json!({
+                        "uri": message.pointer("/params/textDocument/uri"),
+                        "position": message.pointer("/params/position"),
+                    });
+                    json!({ "contents": observation.to_string() })
+                } else if mode.starts_with("will-save") {
                     // Report the recorded willSave/didSave state as a JSON string
                     // so the test can prove the notifications reached this server
                     // and carried the document URI it knows (#357).

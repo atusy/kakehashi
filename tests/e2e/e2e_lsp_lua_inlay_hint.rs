@@ -441,6 +441,44 @@ fn e2e_inlay_hint_resolve_rejects_live_non_contiguous_region_before_dispatch() {
     );
     wait_for_injected_node(&mut client, uri, 7);
 
+    let current = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 7, "character": 1 }
+        }),
+    );
+    assert!(current.get("error").is_none(), "{current}");
+    let current: Value = serde_json::from_str(
+        current["result"]["contents"]
+            .as_str()
+            .expect("combined hover observation"),
+    )
+    .expect("parse combined hover observation");
+    let region_id = hint["data"]["kakehashi"]["region_id"]
+        .as_str()
+        .expect("enveloped region id");
+    assert!(
+        current["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.contains(&format!("kakehashi-virtual-uri-{region_id}.lua"))),
+        "the edited combined region must retain the exact producer region id: {current}"
+    );
+    assert_eq!(
+        7 - current["position"]["line"].as_u64().expect("virtual line"),
+        hint["data"]["kakehashi"]["offset"]["line"]
+            .as_u64()
+            .expect("enveloped line offset")
+    );
+    assert_eq!(
+        1 - current["position"]["character"]
+            .as_u64()
+            .expect("virtual character"),
+        hint["data"]["kakehashi"]["offset"]["column"]
+            .as_u64()
+            .expect("enveloped column offset")
+    );
+
     // The real edit made the once-single combined capture non-contiguous. Set
     // only the opaque freshness stamp to the current version so this request
     // specifically exercises the live geometry/contiguity guard.
