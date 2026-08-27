@@ -36,7 +36,7 @@ use tower_lsp_server::ls_types::{
     SelectionRange, SelectionRangeParams, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
     SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
     SemanticTokensResult, SignatureHelp, SignatureHelpParams, TextDocumentPositionParams, TextEdit,
-    Uri, WillSaveTextDocumentParams, WorkspaceEdit,
+    TypeHierarchyItem, TypeHierarchyPrepareParams, Uri, WillSaveTextDocumentParams, WorkspaceEdit,
 };
 use tower_lsp_server::ls_types::{
     ColorInformation, ColorPresentation, ColorPresentationParams, DocumentColorParams,
@@ -969,6 +969,13 @@ impl LanguageServer for Kakehashi {
         params: CallHierarchyOutgoingCallsParams,
     ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
         self.call_hierarchy_outgoing_impl(params).await
+    }
+
+    async fn prepare_type_hierarchy(
+        &self,
+        params: TypeHierarchyPrepareParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        self.prepare_type_hierarchy_impl(params).await
     }
 
     async fn document_highlight(

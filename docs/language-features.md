@@ -347,6 +347,16 @@ non-contiguous, or the producing downstream connection was replaced. Returned
 callers and callees carry fresh routing data so clients can expand the tree
 recursively.
 
+### Type hierarchy
+
+[`textDocument/prepareTypeHierarchy`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_prepareTypeHierarchy)
+
+Type-hierarchy preparation works for both embedded virtual documents and
+host-language servers enabled with `bridge._self`. Virtual item URIs and ranges
+are translated back to host coordinates, while real external-file items remain
+unchanged. Each prepared item retains the producing server's opaque `data` in a
+kakehashi routing envelope for the subsequent supertype and subtype requests.
+
 ### Document color (experimental)
 
 [`textDocument/documentColor`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentColor)

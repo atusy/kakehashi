@@ -239,6 +239,10 @@ fn main() {
                         "callHierarchyProvider": true,
                         "textDocumentSync": 1
                     }),
+                    "type-hierarchy-prepare" => json!({
+                        "typeHierarchyProvider": true,
+                        "textDocumentSync": 1
+                    }),
                     "code-lens" | "code-lens-replacement" | "code-lens-slow-resolve" => json!({
                         "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
@@ -1609,6 +1613,31 @@ fn main() {
                                 "end": { "line": 0, "character": 4 }
                             },
                             "data": { "mock": "call-item" }
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "textDocument/prepareTypeHierarchy" => {
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        json!([{
+                            "name": "MockChild",
+                            "detail": "prepared type",
+                            "kind": 5,
+                            "uri": uri,
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 9 }
+                            },
+                            "selectionRange": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 9 }
+                            },
+                            "data": { "mock": "type-item" }
                         }])
                     })
                     .unwrap_or(Value::Null);
