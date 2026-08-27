@@ -326,6 +326,41 @@ fn incoming_calls_reject_stale_virtual_geometry() {
 }
 
 #[test]
+fn incoming_calls_reject_stale_canonical_injection_language_before_dispatch() {
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let request_file = event_dir
+        .path()
+        .join("call-hierarchy-marker-incoming.request.json");
+    let (mut client, _config_dir) = init_client_with_mode(
+        false,
+        "call-hierarchy-marker-incoming",
+        Some(event_dir.path()),
+    );
+    let uri = "file:///test_stale_incoming_language.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "```lua\ncall()\n```\n"
+        }}),
+    );
+
+    let mut item = prepare_with_retry(&mut client, uri, 1, 1).remove(0);
+    item["data"]["kakehashi"]["injection_language"] = json!("luau");
+    let response = client.send_request("callHierarchy/incomingCalls", json!({ "item": item }));
+
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    assert!(
+        !request_file.exists(),
+        "stale canonical language must fail before downstream dispatch"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
 fn incoming_calls_discard_response_after_document_change() {
     let (mut client, _config_dir) =
         init_client_with_mode(false, "call-hierarchy-delayed-incoming", None);

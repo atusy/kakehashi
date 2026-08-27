@@ -302,6 +302,14 @@ impl LanguageServerPool {
         });
 
         let connection_key = handle.key();
+        // Snapshot the exact producer's issued virtual URI namespace before
+        // enqueue. A sibling virtual document may close while this request is
+        // in flight; response classification must not then leak its synthetic
+        // URI upstream as if it were a real external file.
+        let mut known_virtual_uris = self.virtual_uris_for_connection(connection_key).await;
+        if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
+            known_virtual_uris.insert(uri);
+        }
         if let Some(ref id) = upstream_id {
             self.register_upstream_request_for_handle(id.clone(), &handle);
         }
@@ -362,23 +370,16 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, connection_key);
         }
         let response = response.ok()?;
-        let producer_is_still_live = self
+        if !self
             .call_hierarchy_producer_is_live(
                 connection_key,
                 &handle,
                 envelope.connection_generation,
             )
-            .await;
-        if !producer_is_still_live {
+            .await
+        {
             return None;
         }
-        let known_virtual_uris = self
-            .known_virtual_call_hierarchy_item_uris(
-                &response,
-                "from",
-                virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string),
-            )
-            .await;
         transform_call_hierarchy_incoming_response_to_host(
             response,
             virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string),
@@ -387,34 +388,6 @@ impl LanguageServerPool {
             &known_virtual_uris,
         )
         .ok()?
-    }
-
-    async fn known_virtual_call_hierarchy_item_uris(
-        &self,
-        response: &Value,
-        item_field: &str,
-        request_virtual_uri: Option<String>,
-    ) -> HashSet<String> {
-        let mut known = HashSet::new();
-        if let Some(uri) = request_virtual_uri {
-            known.insert(uri);
-        }
-        let Some(calls) = response.get("result").and_then(Value::as_array) else {
-            return known;
-        };
-        for call in calls {
-            let Some(uri) = call
-                .get(item_field)
-                .and_then(|item| item.get("uri"))
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-            if !known.contains(uri) && self.resolve_virtual_uri(uri).await.is_some() {
-                known.insert(uri.to_string());
-            }
-        }
-        known
     }
 
     async fn call_hierarchy_producer_is_live(
@@ -884,6 +857,22 @@ mod tests {
                 .inner,
             Some(json!({ "caller": "external" }))
         );
+    }
+
+    #[tokio::test]
+    async fn virtual_uri_snapshot_uses_producer_tracking_not_filename_shape() {
+        let pool = LanguageServerPool::new();
+        let host_uri = url::Url::parse("file:///project/test.md").unwrap();
+        let host_uri_lsp: Uri = host_uri.as_str().parse().unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, "lua", "region");
+        let key = ConnectionKey::for_server("lua-ls");
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        let shaped_real_uri = "file:///external/kakehashi-virtual-uri-other.lua";
+        let known = pool.virtual_uris_for_connection(&key).await;
+
+        assert!(known.contains(&virtual_uri.to_uri_string()));
+        assert!(!known.contains(shaped_real_uri));
     }
 
     #[tokio::test]

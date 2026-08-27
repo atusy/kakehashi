@@ -230,6 +230,7 @@ fn main() {
                     }),
                     "call-hierarchy-prepare"
                     | "call-hierarchy-replacement"
+                    | "call-hierarchy-marker-incoming"
                     | "call-hierarchy-slow-incoming"
                     | "call-hierarchy-delayed-incoming" => json!({
                         "callHierarchyProvider": true,
@@ -1605,6 +1606,9 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "callHierarchy/incomingCalls" => {
+                if mode == "call-hierarchy-marker-incoming" {
+                    record_mock_event(&mode, "request", &message);
+                }
                 if mode == "call-hierarchy-slow-incoming" {
                     record_mock_event(&mode, "request", &message);
                     notify(

@@ -1245,6 +1245,15 @@ impl LanguageServerPool {
         self.document_tracker.host_virtual_docs(host_uri).await
     }
 
+    pub(super) async fn virtual_uris_for_connection(
+        &self,
+        connection_key: &ConnectionKey,
+    ) -> std::collections::HashSet<String> {
+        self.document_tracker
+            .virtual_uris_for_connection(connection_key)
+            .await
+    }
+
     /// Remove and return all virtual documents for a host URI.
     ///
     /// Used by did_close module for cleanup.
