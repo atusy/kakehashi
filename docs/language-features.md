@@ -260,6 +260,8 @@ variable-lookup, or evaluatable-expression range back to the host document.
 Virtual results whose ranges escape the block are dropped. A stopped location
 outside the selected block does not have a valid virtual coordinate, so the
 virtual layer is skipped and an enabled `bridge._self` host server may answer.
+Downstream `workspace/inlineValue/refresh` requests are not forwarded; editors
+refresh inline values only through their own debugger/client lifecycle.
 Default combine strategy: `preferred`.
 
 ### Moniker

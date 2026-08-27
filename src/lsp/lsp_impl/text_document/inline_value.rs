@@ -14,6 +14,7 @@ use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::HostDocument;
+use crate::lsp::bridge::RegionOffset;
 use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
 
 const METHOD: &str = "textDocument/inlineValue";
@@ -91,19 +92,44 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         range: Range,
-        context: InlineValueContext,
+        mut context: InlineValueContext,
         progress_token: Option<NumberOrString>,
     ) -> Result<Option<Vec<InlineValue>>> {
+        // `range` is the editor's visible span and commonly starts in host
+        // prose. The debugger stop identifies the one language region that
+        // owns this request; resolve by that location, then intersect the
+        // visible span with the resolved region.
         let Some(mut ctx) = self
-            .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
+            .resolve_bridge_contexts_for_range(lsp_uri, context.stopped_location, METHOD)
             .await
         else {
             return Ok(None);
         };
+        let offset = RegionOffset::with_per_line_offsets(
+            ctx.document.resolved.region.line_range.start,
+            ctx.document.resolved.line_column_offsets.clone(),
+        );
+        let region_start = tower_lsp_server::ls_types::Position {
+            line: offset.line(),
+            character: offset.column_for_line(0),
+        };
+        let Some(region_end) = ctx.document.region_end else {
+            return Ok(None);
+        };
+        let Some(range) = clamp_visible_range_to_region(range, region_start, region_end) else {
+            return Ok(None);
+        };
+        context.stopped_location = ctx.range;
         ctx.document.client_progress_token = progress_token;
+        let incarnation = ctx.incarnation;
+        let content_version = ctx.content_version;
+        #[cfg(feature = "e2e")]
+        wait_for_inline_value_admission_release().await;
+        if !self.inline_value_snapshot_is_current(lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
         let (cancel_rx, _cancel_guard) =
             self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
-        let range = ctx.range;
         let result = dispatch_preferred(
             &ctx.document,
             self.bridge.pool_arc(),
@@ -124,6 +150,7 @@ impl Kakehashi {
                             &t.virtual_content,
                             t.upstream_id,
                             t.client_progress_token,
+                            incarnation,
                         )
                         .await
                 }
@@ -133,8 +160,98 @@ impl Kakehashi {
         )
         .await;
 
-        result
+        let values = result
             .handle(&self.notifier(), "inline value", None, Ok)
-            .await
+            .await?;
+        if !self.inline_value_snapshot_is_current(lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
+        Ok(values)
+    }
+
+    fn inline_value_snapshot_is_current(
+        &self,
+        lsp_uri: &Uri,
+        incarnation: u64,
+        content_version: u64,
+    ) -> bool {
+        super::super::uri_to_url(lsp_uri)
+            .ok()
+            .and_then(|uri| {
+                self.documents.get(&uri).map(|document| {
+                    document.incarnation() == incarnation
+                        && document.content_version() == content_version
+                })
+            })
+            .unwrap_or(false)
+    }
+}
+
+fn clamp_visible_range_to_region(
+    range: Range,
+    region_start: tower_lsp_server::ls_types::Position,
+    region_end: tower_lsp_server::ls_types::Position,
+) -> Option<Range> {
+    if range.start > range.end {
+        return None;
+    }
+    let intersects = if range.start == range.end {
+        region_start <= range.start && range.start < region_end
+    } else {
+        range.start < region_end && region_start < range.end
+    };
+    intersects.then(|| Range {
+        start: range.start.max(region_start),
+        end: range.end.min(region_end),
+    })
+}
+
+#[cfg(feature = "e2e")]
+async fn wait_for_inline_value_admission_release() {
+    let Ok(dir) = std::env::var("KAKEHASHI_E2E_INLINE_VALUE_BARRIER_DIR") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir);
+    if std::fs::create_dir_all(dir).is_err()
+        || std::fs::write(dir.join("captured"), b"captured").is_err()
+    {
+        return;
+    }
+    let release = dir.join("release");
+    for _ in 0..300 {
+        if release.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower_lsp_server::ls_types::Position;
+
+    #[test]
+    fn visible_range_is_clamped_to_the_stopped_region() {
+        assert_eq!(
+            clamp_visible_range_to_region(
+                Range::new(Position::new(0, 0), Position::new(3, 6)),
+                Position::new(3, 2),
+                Position::new(3, 6),
+            ),
+            Some(Range::new(Position::new(3, 2), Position::new(3, 6)))
+        );
+    }
+
+    #[test]
+    fn visible_range_without_region_overlap_is_rejected() {
+        assert_eq!(
+            clamp_visible_range_to_region(
+                Range::new(Position::new(0, 0), Position::new(1, 0)),
+                Position::new(3, 2),
+                Position::new(3, 6),
+            ),
+            None
+        );
     }
 }
