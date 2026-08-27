@@ -1779,7 +1779,11 @@ impl LanguageServerPool {
         if !Arc::ptr_eq(current, failed_handle) {
             return false;
         }
-        failed_handle.begin_shutdown();
+        // Mark Failed before the first cleanup await. If this invalidation
+        // future is cancelled, the next acquisition takes the existing
+        // Failed/SpawnNew path and repeats the idempotent purge instead of
+        // leaving a Closing entry that fails fast forever.
+        failed_handle.set_state(ConnectionState::Failed);
         self.host_documents
             .lock()
             .await

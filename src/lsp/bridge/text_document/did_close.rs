@@ -424,6 +424,8 @@ mod tests {
 
     #[tokio::test]
     async fn didclose_failure_invalidates_the_exact_ready_connection() {
+        use futures::FutureExt;
+
         let pool = LanguageServerPool::new();
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "REGION");
@@ -432,12 +434,21 @@ mod tests {
         pool.insert_connection(Arc::clone(&handle)).await;
         pool.register_opened_document(&host_uri, &virtual_uri, &key)
             .await;
+        let host_documents = pool.host_documents().await;
+        let mut invalidation =
+            std::pin::pin!(pool.invalidate_connection_after_didclose_failure(&key, &handle));
 
         assert!(
-            pool.invalidate_connection_after_didclose_failure(&key, &handle)
-                .await,
-            "a send failure on a live handle must invalidate that exact connection"
+            invalidation.as_mut().now_or_never().is_none(),
+            "invalidation should wait for host-document cleanup"
         );
+        assert_eq!(
+            handle.state(),
+            ConnectionState::Failed,
+            "cancellation during cleanup must leave the connection retryable"
+        );
+        drop(host_documents);
+        assert!(invalidation.await);
 
         assert!(!pool.is_document_opened(&virtual_uri));
         assert!(pool.connections().await.get(&key).is_none());
