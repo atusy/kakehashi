@@ -32,6 +32,7 @@ impl LanguageServerPool {
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
         client_progress_token: Option<NumberOrString>,
+        expected_incarnation: u64,
     ) -> io::Result<Option<Vec<InlineValue>>> {
         if context.stopped_location.start > context.stopped_location.end
             || !host_position_within_region_bounds(
@@ -59,7 +60,7 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/inlineValue") {
             return Ok(None);
         }
-        self.execute_bridge_request_with_handle(
+        self.execute_bridge_request_observed(
             handle,
             host_uri,
             injection_language,
@@ -67,6 +68,7 @@ impl LanguageServerPool {
             &offset,
             virtual_content,
             upstream_request_id,
+            Some(expected_incarnation),
             |virtual_uri, request_id| {
                 build_inline_value_request(
                     virtual_uri,
@@ -80,6 +82,7 @@ impl LanguageServerPool {
             |response, ctx| {
                 transform_inline_value_response_to_host(response, ctx.offset, region_end)
             },
+            None,
         )
         .await
     }
@@ -226,6 +229,7 @@ mod tests {
                 "code",
                 None,
                 None,
+                1,
             )
             .await
             .unwrap();
