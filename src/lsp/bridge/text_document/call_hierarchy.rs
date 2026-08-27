@@ -495,20 +495,35 @@ impl LanguageServerPool {
         let request =
             JsonRpcRequest::new(request_id.as_i64(), "callHierarchy/outgoingCalls", params);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
-        let send_result = {
+        let (send_result, virtual_uri_observer) = {
             let connections = self.connections().await;
-            let producer_is_live = connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle));
+            let producer_is_live = connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+            });
             let generation_matches = self.document_connection_generation(connection_key)
                 == envelope.connection_generation;
             if !producer_is_live || !generation_matches {
-                Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "producer connection was replaced before outgoingCalls send",
-                ))
+                (
+                    Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "producer connection was replaced before outgoingCalls send",
+                    )),
+                    None,
+                )
             } else {
-                handle.send_request(request, request_id).map_err(Into::into)
+                let observer = self
+                    .observe_virtual_uris_for_connection(
+                        connection_key,
+                        envelope.connection_generation,
+                    )
+                    .await;
+                if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
+                    observer.insert(uri);
+                }
+                (
+                    handle.send_request(request, request_id).map_err(Into::into),
+                    Some(observer),
+                )
             }
         };
         if let Err(error) = send_result {
@@ -521,6 +536,7 @@ impl LanguageServerPool {
             }
             return None;
         }
+        let virtual_uri_observer = virtual_uri_observer?;
 
         drop(host_lifecycle);
         let response = handle.wait_for_response(request_id, response_rx).await;
@@ -539,11 +555,13 @@ impl LanguageServerPool {
         {
             return None;
         }
+        let known_virtual_uris = virtual_uri_observer.snapshot();
         transform_call_hierarchy_outgoing_response_to_host(
             response,
             virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string),
             &host_uri_lsp,
             &envelope,
+            &known_virtual_uris,
         )
         .ok()?
     }
@@ -633,6 +651,7 @@ fn transform_call_hierarchy_outgoing_response_to_host(
     request_virtual_uri: Option<String>,
     host_uri: &Uri,
     envelope: &CallHierarchyEnvelope,
+    known_virtual_uris: &HashSet<String>,
 ) -> io::Result<Option<Vec<CallHierarchyOutgoingCall>>> {
     const METHOD: &str = "callHierarchy/outgoingCalls";
     if response_has_jsonrpc_error(&response, METHOD) {
@@ -661,8 +680,7 @@ fn transform_call_hierarchy_outgoing_response_to_host(
                     translate_virtual_range_to_host(range, &offset);
                 }
             }
-            let projected_from_virtual = if VirtualDocumentUri::is_virtual_uri(call.to.uri.as_str())
-            {
+            let projected_from_virtual = if known_virtual_uris.contains(call.to.uri.as_str()) {
                 if request_virtual_uri.as_deref() != Some(call.to.uri.as_str()) {
                     return None;
                 }
@@ -1100,7 +1118,7 @@ mod tests {
             "data": { "callee": "virtual" }
         });
         let external_item = json!({
-            "name": "external", "kind": 12, "uri": "file:///external.lua",
+            "name": "external", "kind": 12, "uri": "file:///external/kakehashi-virtual-uri-other.lua",
             "range": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 3 } },
             "selectionRange": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 1 } },
             "data": { "callee": "external" }
@@ -1118,6 +1136,10 @@ mod tests {
             Some(virtual_uri.to_uri_string()),
             &host_uri,
             &envelope,
+            &HashSet::from([
+                virtual_uri.to_uri_string(),
+                other_virtual_uri.to_uri_string(),
+            ]),
         )
         .unwrap()
         .unwrap();
@@ -1126,7 +1148,10 @@ mod tests {
         assert_eq!(calls[0].to.uri, host_uri);
         assert_eq!(calls[0].to.range.start, Position::new(3, 2));
         assert_eq!(calls[0].from_ranges[0].start, Position::new(3, 3));
-        assert_eq!(calls[1].to.uri.as_str(), "file:///external.lua");
+        assert_eq!(
+            calls[1].to.uri.as_str(),
+            "file:///external/kakehashi-virtual-uri-other.lua"
+        );
         assert_eq!(calls[1].to.range.start, Position::new(8, 0));
         assert_eq!(calls[1].from_ranges[0].start, Position::new(3, 4));
         assert_eq!(
@@ -1156,6 +1181,7 @@ mod tests {
             Some(virtual_uri.to_uri_string()),
             &host_uri,
             &envelope,
+            &HashSet::from([virtual_uri.to_uri_string()]),
         )
         .unwrap()
         .unwrap();
@@ -1461,5 +1487,93 @@ mod tests {
             request.await.unwrap().is_none(),
             "the full outgoing response path must discard an admitted old-producer response"
         );
+    }
+
+    #[tokio::test]
+    async fn outgoing_response_classifies_sibling_opened_then_closed_in_flight() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua-ls");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_uri = url::Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let generation = pool.document_connection_generation(&key);
+        let envelope = CallHierarchyEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            content_version: 1,
+            connection_generation: generation,
+            connection_key: key.clone(),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            inner: Some(json!({ "token": 9 })),
+            host_layer: true,
+            projected_from_virtual: false,
+        };
+        let params = CallHierarchyOutgoingCallsParams {
+            item: call_item(host_uri.as_str(), json!({ "token": 9 })),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let upstream_id = UpstreamId::Number(80);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_call_hierarchy_outgoing_request(
+                    &BridgeServerConfig::default(),
+                    params,
+                    envelope,
+                    Some(upstream_id),
+                )
+                .await
+            })
+        };
+        let downstream_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = handle
+                    .router()
+                    .lookup_downstream_ids(&upstream_id)
+                    .into_iter()
+                    .next()
+                {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("outgoing request must be admitted");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !handle.router().is_sent(downstream_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("outgoing request must be sent");
+
+        let sibling_host = url::Url::parse("file:///sibling.md").unwrap();
+        let sibling_host_lsp: Uri = sibling_host.as_str().parse().unwrap();
+        let sibling_virtual = VirtualDocumentUri::new(&sibling_host_lsp, "lua", "sibling");
+        pool.register_opened_document(&sibling_host, &sibling_virtual, &key)
+            .await;
+        pool.untrack_document(&sibling_virtual, &key).await;
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": [{
+                "to": {
+                    "name": "sibling", "kind": 12,
+                    "uri": sibling_virtual.to_uri_string(),
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                    "selectionRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }
+                },
+                "fromRanges": []
+            }]
+        }));
+
+        assert_eq!(request.await.unwrap(), Some(Vec::new()));
     }
 }
