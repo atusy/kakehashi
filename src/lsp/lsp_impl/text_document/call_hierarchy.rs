@@ -109,12 +109,13 @@ impl Kakehashi {
         position: Position,
         work_done_token: Option<NumberOrString>,
     ) -> Result<Option<Vec<CallHierarchyItem>>> {
-        let Some(ctx) = self
+        let Some(mut ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
             .await
         else {
             return Ok(None);
         };
+        ctx.document.client_progress_token = work_done_token;
         let (cancel_rx, _cancel_guard) =
             self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
@@ -124,27 +125,24 @@ impl Kakehashi {
         let result = dispatch_preferred(
             &ctx.document,
             pool,
-            |t| {
-                let work_done_token = work_done_token.clone();
-                async move {
-                    t.pool
-                        .send_call_hierarchy_prepare_request(
-                            &t.server_name,
-                            &t.server_config,
-                            &t.uri,
-                            position,
-                            t.region_end(),
-                            &t.injection_language,
-                            &t.region_id,
-                            t.offset,
-                            &t.virtual_content,
-                            incarnation,
-                            content_version,
-                            t.upstream_id,
-                            work_done_token,
-                        )
-                        .await
-                }
+            |t| async move {
+                t.pool
+                    .send_call_hierarchy_prepare_request(
+                        &t.server_name,
+                        &t.server_config,
+                        &t.uri,
+                        position,
+                        t.region_end(),
+                        &t.injection_language,
+                        &t.region_id,
+                        t.offset,
+                        &t.virtual_content,
+                        incarnation,
+                        content_version,
+                        t.upstream_id,
+                        t.client_progress_token,
+                    )
+                    .await
             },
             |opt| matches!(opt, Some(v) if !v.is_empty()),
             cancel_rx,
