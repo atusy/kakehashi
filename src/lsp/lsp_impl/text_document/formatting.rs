@@ -1441,13 +1441,16 @@ impl Drop for ScratchCleanupGuard {
             Ok(handle) => {
                 let pool = Arc::clone(&self.pool);
                 let host_uri = self.host_uri.clone();
-                handle.spawn(async move {
-                    for doc in remaining {
-                        pool.close_scratch_document(&host_uri, &doc.uri, &doc.connection_key)
-                            .await;
-                    }
-                    drop(run_slot);
-                });
+                spawn_with_scratch_run_slot(
+                    &handle,
+                    async move {
+                        for doc in remaining {
+                            pool.close_scratch_document(&host_uri, &doc.uri, &doc.connection_key)
+                                .await;
+                        }
+                    },
+                    run_slot,
+                );
             }
             Err(_) => {
                 std::mem::forget(run_slot);
@@ -1546,6 +1549,19 @@ impl Drop for ScratchRunSlot {
             .push(self.id);
         drop(self.permit.take());
     }
+}
+
+fn spawn_with_scratch_run_slot<F>(
+    handle: &tokio::runtime::Handle,
+    cleanup: F,
+    run_slot: ScratchRunSlot,
+) where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    handle.spawn(async move {
+        cleanup.await;
+        drop(run_slot);
+    });
 }
 
 fn scratch_region_id(region_id: &str, run: usize, step: usize) -> String {
@@ -2159,6 +2175,53 @@ mod tests {
             plan_region_format(AggregationStrategy::Concatenated, &names, &configs, None),
             RegionFormatPlan::Concatenated(names[..MAX_CONCATENATED_FORMATTING_STEPS].to_vec())
         );
+        assert_eq!(
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &names,
+                &configs,
+                Some(MAX_CONCATENATED_FORMATTING_STEPS + 1),
+            ),
+            RegionFormatPlan::Concatenated(names[..MAX_CONCATENATED_FORMATTING_STEPS].to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn scratch_run_slot_is_reused_only_after_cleanup_finishes() {
+        let mut slots = Vec::with_capacity(SCRATCH_RUN_SLOT_COUNT);
+        for _ in 0..SCRATCH_RUN_SLOT_COUNT {
+            slots.push(ScratchRunSlot::acquire().await);
+        }
+        let leased = slots.pop().unwrap();
+        let leased_id = leased.id;
+        let release_cleanup = Arc::new(tokio::sync::Notify::new());
+        let cleanup_started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::clone(&release_cleanup);
+        let started = Arc::clone(&cleanup_started);
+        spawn_with_scratch_run_slot(
+            &tokio::runtime::Handle::current(),
+            async move {
+                started.notify_one();
+                release.notified().await;
+            },
+            leased,
+        );
+        cleanup_started.notified().await;
+
+        let acquire = ScratchRunSlot::acquire();
+        tokio::pin!(acquire);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut acquire)
+                .await
+                .is_err(),
+            "the leased slot must not return before cleanup completes"
+        );
+
+        release_cleanup.notify_one();
+        let reused = tokio::time::timeout(std::time::Duration::from_secs(1), &mut acquire)
+            .await
+            .expect("cleanup completion must release a slot");
+        assert_eq!(reused.id, leased_id);
     }
 
     #[test]
