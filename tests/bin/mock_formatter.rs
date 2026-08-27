@@ -160,6 +160,7 @@ fn main() {
     let mut did_save_count: usize = 0;
     let mut last_did_save_uri: Option<String> = None;
     let mut last_did_save_had_text = false;
+    let mut last_did_save_document_text: Option<String> = None;
     let mut diagnostic_generation: u64 = 0;
     // `diagnostics-refresh-prefetch-unchanged`: once ANY unchanged report was
     // answered, the baseline demonstrably exists — a later baseline-less full
@@ -500,6 +501,10 @@ fn main() {
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                last_did_save_document_text = last_did_save_uri
+                    .as_deref()
+                    .and_then(|uri| documents.get(uri))
+                    .cloned();
             }
             "$/cancelRequest" => {
                 record_mock_event(&mode, "cancel", &message);
@@ -557,6 +562,7 @@ fn main() {
                         "did": did_save_count,
                         "didUri": last_did_save_uri,
                         "didHadText": last_did_save_had_text,
+                        "didDocumentText": last_did_save_document_text,
                     });
                     json!({ "contents": state.to_string() })
                 } else if mode.starts_with("workspace-folders") {

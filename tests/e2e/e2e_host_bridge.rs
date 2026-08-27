@@ -963,6 +963,50 @@ fn e2e_host_did_save_notification_reaches_host() {
     shutdown(&mut client);
 }
 
+#[test]
+fn e2e_host_did_save_observes_the_latest_host_text() {
+    const SAVED_TEXT: &str = "# Saved immediately\n";
+    let (mut client, _config_dir, _init) =
+        init_will_save_client("[languages.markdown.bridge._self]\nenabled = true\n");
+
+    for _ in 0..300 {
+        if host_save_hover(&mut client).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": SAVE_URI, "version": 2 },
+            "contentChanges": [{ "text": SAVED_TEXT }],
+        }),
+    );
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": SAVE_URI } }),
+    );
+
+    let mut seen = None;
+    for _ in 0..300 {
+        if let Some(state) = host_save_hover(&mut client)
+            && state["did"] != 0
+        {
+            seen = Some(state);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = seen.expect("the immediate didSave must reach the host server");
+    assert_eq!(
+        state["didDocumentText"], SAVED_TEXT,
+        "host didChange must precede didSave on the downstream wire"
+    );
+
+    shutdown(&mut client);
+}
+
 fn assert_host_did_save_is_skipped(mode: &str) {
     let (mut client, _config_dir, _init) = init_will_save_client_with_mode(
         "[languages.markdown.bridge._self]\nenabled = true\n",
