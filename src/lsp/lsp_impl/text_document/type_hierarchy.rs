@@ -1,9 +1,9 @@
-//! Type-hierarchy preparation and supertype expansion across virtual and host bridge layers.
+//! Type-hierarchy preparation and expansion across virtual and host bridge layers.
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     NumberOrString, Position, TypeHierarchyItem, TypeHierarchyPrepareParams,
-    TypeHierarchySupertypesParams, Uri,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri,
 };
 
 use super::super::Kakehashi;
@@ -59,6 +59,40 @@ impl Kakehashi {
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let sweep_id = upstream_id.clone();
         let dispatch = pool.dispatch_type_hierarchy_supertypes(params, &settings, upstream_id);
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            std::sync::Arc::clone(&pool),
+            sweep_id,
+        );
+        let items = match cancel_rx {
+            Some(rx) => tokio::select! {
+                biased;
+                _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                items = dispatch => Ok(items),
+            },
+            None => Ok(dispatch.await),
+        }?;
+        if !self.type_hierarchy_envelope_is_fresh(&envelope, &pool) {
+            return Ok(None);
+        }
+        Ok(items)
+    }
+
+    pub(crate) async fn type_hierarchy_subtypes_impl(
+        &self,
+        params: TypeHierarchySubtypesParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let Some(envelope) = extract_type_hierarchy_envelope(&params.item) else {
+            return Ok(None);
+        };
+        let pool = self.bridge.pool_arc();
+        if !self.type_hierarchy_envelope_is_fresh(&envelope, &pool) {
+            return Ok(None);
+        }
+        let settings = self.settings_manager.load_settings();
+        let upstream_id = current_upstream_id();
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let sweep_id = upstream_id.clone();
+        let dispatch = pool.dispatch_type_hierarchy_subtypes(params, &settings, upstream_id);
         let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
             std::sync::Arc::clone(&pool),
             sweep_id,
