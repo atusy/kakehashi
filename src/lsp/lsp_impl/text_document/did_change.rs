@@ -31,6 +31,14 @@ impl Kakehashi {
         let edit_lock = self.documents.edit_lock(&uri);
         let _edit_guard = edit_lock.lock().await;
 
+        // Stop both the timer body and any already-registered collection from
+        // the previous edit before advancing the document version.
+        self.debounced_diagnostics.cancel(&uri);
+        // A save-triggered pull owns the exact saved incarnation/version. Abort
+        // it before changing the document so it cannot publish that old result
+        // after this edit. The later post-parse debounce installs the replacement.
+        self.synthetic_diagnostics.remove_document(&uri);
+
         self.notifier()
             .log_trace(format!("[DID_CHANGE] START uri={}", uri))
             .await;
@@ -144,5 +152,55 @@ impl Kakehashi {
         // like vim-lsp on Vim, which cannot respond to server requests while processing.
 
         self.notifier().log_info("file changed!").await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower_lsp_server::LspService;
+    use tower_lsp_server::ls_types::{
+        TextDocumentContentChangeEvent, VersionedTextDocumentIdentifier,
+    };
+
+    #[tokio::test]
+    async fn did_change_aborts_an_in_flight_saved_diagnostic() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = url::Url::parse("file:///test/edit-after-save.md").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "# saved\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        server
+            .diagnostic_scheduler()
+            .spawn_synthetic_diagnostic_task_when_current(
+                uri.clone(),
+                incarnation,
+                content_version,
+            );
+        assert!(server.synthetic_diagnostics.has_active_task(&uri));
+
+        server
+            .did_change_impl(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "# edited\n".to_string(),
+                }],
+            })
+            .await;
+
+        assert!(
+            !server.synthetic_diagnostics.has_active_task(&uri),
+            "didChange must supersede the saved-version pull before editing"
+        );
     }
 }

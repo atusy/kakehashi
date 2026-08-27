@@ -98,7 +98,19 @@ Partially implemented:
     Synthetic diagnostic collection registers an abortable background waiter
     for that exact saved incarnation/version and snapshots only after its tree
     is ready; parse or parser-install latency therefore neither blocks the
-    writer nor silently loses the save trigger.
+    writer nor silently loses the save trigger. Snapshot preparation repeats
+    that lineage check atomically with the snapshot read. A later `didChange`
+    aborts the saved pull before mutating the document, and the completed pull
+    revalidates and publishes under the same edit lock, so neither the
+    wait-to-snapshot window nor an in-flight downstream request can commit
+    diagnostics for an obsolete saved version. Background diagnostic ownership
+    is ordered by `(incarnation, content version, settings generation, trigger)`, with
+    `didSave > didChange > didOpen` at an equal version and settings generation;
+    a late parse/debounce registration therefore cannot cancel the
+    already-registered save trigger, while a newer configuration generation
+    can legitimately supersede it.
+    Tasks remain behind a start gate until that ownership registration wins;
+    shutdown permanently closes registration before aborting current tasks.
 
   Each recipient is **gated per-server** on the relevant capability —
   `willSave` on `textDocumentSync.willSave`, `didSave` on `textDocumentSync.save`

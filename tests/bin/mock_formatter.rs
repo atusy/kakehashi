@@ -243,6 +243,7 @@ fn main() {
                     // (below). Used to prove `pullFallback = false` still
                     // publishes a pull-driven server's spontaneous push (#425).
                     "diagnostics"
+                    | "diagnostics-save"
                     | "diagnostics-fail"
                     | "diagnostics-malformed"
                     | "diagnostics-refresh-prefetch"
@@ -1005,6 +1006,9 @@ fn main() {
                 respond(&mut writer, id, json!({ "executed": command }));
             }
             "textDocument/diagnostic" => {
+                if mode == "diagnostics-save" {
+                    diagnostic_generation += 1;
+                }
                 if matches!(
                     mode.as_str(),
                     "diagnostics-refresh-prefetch"
@@ -1248,7 +1252,9 @@ fn main() {
                 // but only for documents this server actually received via
                 // didOpen, so the test also proves the host document was
                 // synced before the pull.
-                let diagnostic_message = if mode == "diagnostics-refresh-burst" {
+                let diagnostic_message = if mode == "diagnostics-save" {
+                    format!("mock-diagnostic-save:{diagnostic_generation}")
+                } else if mode == "diagnostics-refresh-burst" {
                     format!("mock-diagnostic-generation:{diagnostic_generation}")
                 } else if matches!(
                     mode.as_str(),

@@ -10,12 +10,41 @@ use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, HostRequestCo
 use url::Url;
 
 use crate::lsp::lsp_impl::Kakehashi;
-use crate::lsp::lsp_impl::snapshot_read::FIRST_PARSE_BACKSTOP;
 use crate::lsp::lsp_impl::text_document::publish_diagnostic::{
     DiagnosticSnapshot, DiagnosticSnapshotLineage, PullLayerOutcome, collect_push_diagnostics,
 };
 use crate::lsp::settings_manager::SettingsManager;
-use crate::lsp::synthetic_diagnostics::SyntheticDiagnosticsManager;
+use crate::lsp::synthetic_diagnostics::{SyntheticDiagnosticTrigger, SyntheticDiagnosticsManager};
+
+fn document_matches_lineage(
+    document: &crate::document::Document,
+    expected_incarnation: u64,
+    expected_content_version: u64,
+) -> bool {
+    document.incarnation() == expected_incarnation
+        && document.content_version() == expected_content_version
+}
+
+fn snapshot_document_for_lineage(
+    documents: &DocumentStore,
+    uri: &Url,
+    expected_lineage: Option<(u64, u64)>,
+) -> Option<(
+    crate::document::model::DocumentSnapshot,
+    Option<String>,
+    u64,
+)> {
+    let document = documents.get(uri)?;
+    if expected_lineage.is_some_and(|(incarnation, content_version)| {
+        !document_matches_lineage(&document, incarnation, content_version)
+    }) {
+        return None;
+    }
+    let snapshot = document.snapshot()?;
+    let language_id = document.language_id().map(str::to_owned);
+    let content_version = document.content_version();
+    Some((snapshot, language_id, content_version))
+}
 
 /// Whether the proactive pull's **config-level** server selection for a method
 /// is non-empty — the visible walk resolved exactly as dispatch does (expand
@@ -79,25 +108,40 @@ pub(crate) struct DiagnosticScheduler {
     publisher: std::sync::Arc<super::DiagnosticPublisher>,
 }
 
-async fn collect_and_publish_synthetic_diagnostics(
-    snapshot_data: Option<DiagnosticSnapshot>,
-    bridge_pool: std::sync::Arc<crate::lsp::bridge::LanguageServerPool>,
-    publisher: std::sync::Arc<super::DiagnosticPublisher>,
-    uri: Url,
+async fn commit_synthetic_diagnostics_when_current(
+    documents: &DocumentStore,
+    publisher: &super::DiagnosticPublisher,
+    uri: &Url,
+    expected_incarnation: u64,
+    expected_content_version: u64,
+    outcome: PullLayerOutcome,
 ) {
-    let diagnostics = collect_push_diagnostics(snapshot_data, &bridge_pool, &uri, LOG_TARGET).await;
+    // Keep the saved-lineage check and cache/wire commit in the same edit-lock
+    // critical section. A didChange therefore either aborts this task before
+    // mutating the document, or runs strictly after the saved diagnostics have
+    // been published; it cannot let an older pull overwrite a newer edit.
+    let edit_lock = documents.edit_lock(uri);
+    let edit_guard = edit_lock.lock().await;
+    let is_current = documents.get(uri).is_some_and(|document| {
+        document_matches_lineage(&document, expected_incarnation, expected_content_version)
+    });
+    if !is_current {
+        drop(edit_guard);
+        documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+        return;
+    }
 
-    match diagnostics {
+    match outcome {
         PullLayerOutcome::Skip => {}
-        PullLayerOutcome::Clear => publisher.clear_pull_layer(&uri).await,
+        PullLayerOutcome::Clear => publisher.clear_pull_layer(uri).await,
         PullLayerOutcome::Publish(diagnostics) => {
             log::debug!(
                 target: LOG_TARGET,
-                "Collected {} pull-layer diagnostics for {}",
+                "Collected {} current pull-layer diagnostics for {}",
                 diagnostics.len(),
                 uri
             );
-            publisher.publish_pull_layer(&uri, diagnostics).await;
+            publisher.publish_pull_layer(uri, diagnostics).await;
         }
     }
 }
@@ -118,14 +162,20 @@ async fn wait_for_expected_diagnostic_tree(
             let Some(document) = documents.get(uri) else {
                 return false;
             };
-            if document.incarnation() != expected_incarnation
-                || document.content_version() != expected_content_version
+            if !document_matches_lineage(&document, expected_incarnation, expected_content_version)
             {
                 return false;
             }
-            let tree_is_ready = document.tree().is_some();
             drop(document);
-            if tree_is_ready {
+            let snapshot_is_ready = documents.latest_snapshot(uri).is_some_and(|view| {
+                view.content_version == expected_content_version
+                    && view.slot.snapshot.is_some_and(|snapshot| {
+                        snapshot.incarnation == expected_incarnation
+                            && snapshot.parsed_version == expected_content_version
+                            && snapshot.tree.is_some()
+                    })
+            });
+            if snapshot_is_ready {
                 return true;
             }
             if receiver.changed().await.is_err() {
@@ -133,9 +183,7 @@ async fn wait_for_expected_diagnostic_tree(
             }
         }
     };
-    tokio::time::timeout(FIRST_PARSE_BACKSTOP, wait)
-        .await
-        .unwrap_or(false)
+    wait.await
 }
 
 impl DiagnosticScheduler {
@@ -187,22 +235,36 @@ impl DiagnosticScheduler {
     /// `textDocument/publishDiagnostics`.
     pub(crate) fn spawn_synthetic_diagnostic_task(&self, uri: Url) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
+        let Some(lineage) = snapshot_data.as_ref().map(|snapshot| snapshot.lineage) else {
+            return;
+        };
         let bridge_pool = self.bridge.pool_arc();
         let publisher = std::sync::Arc::clone(&self.publisher);
+        let documents = std::sync::Arc::clone(&self.documents);
         let task_uri = uri.clone();
 
-        let task = tokio::spawn(async move {
-            collect_and_publish_synthetic_diagnostics(
-                snapshot_data,
-                bridge_pool,
-                publisher,
-                task_uri,
+        let future = async move {
+            let outcome =
+                collect_push_diagnostics(snapshot_data, &bridge_pool, &task_uri, LOG_TARGET).await;
+            commit_synthetic_diagnostics_when_current(
+                &documents,
+                &publisher,
+                &task_uri,
+                lineage.incarnation,
+                lineage.content_version,
+                outcome,
             )
             .await;
-        });
+        };
 
-        self.synthetic_diagnostics
-            .register_task(uri, task.abort_handle());
+        self.synthetic_diagnostics.spawn_task_for_lineage(
+            uri,
+            lineage.incarnation,
+            lineage.content_version,
+            lineage.settings_generation,
+            SyntheticDiagnosticTrigger::Open,
+            future,
+        );
     }
 
     /// Spawn the didSave diagnostic pull immediately, but defer snapshotting
@@ -221,7 +283,7 @@ impl DiagnosticScheduler {
         let publisher = std::sync::Arc::clone(&self.publisher);
         let task_uri = uri.clone();
 
-        let task = tokio::spawn(async move {
+        let future = async move {
             if !wait_for_expected_diagnostic_tree(
                 &documents,
                 &task_uri,
@@ -232,18 +294,33 @@ impl DiagnosticScheduler {
             {
                 return;
             }
-            let snapshot_data = snapshot_preparer.prepare_diagnostic_snapshot(&task_uri);
-            collect_and_publish_synthetic_diagnostics(
-                snapshot_data,
-                bridge_pool,
-                publisher,
-                task_uri,
+            let snapshot_data = snapshot_preparer.prepare_diagnostic_snapshot_when_current(
+                &task_uri,
+                expected_incarnation,
+                expected_content_version,
+            );
+            let outcome =
+                collect_push_diagnostics(snapshot_data, &bridge_pool, &task_uri, LOG_TARGET).await;
+            commit_synthetic_diagnostics_when_current(
+                &documents,
+                &publisher,
+                &task_uri,
+                expected_incarnation,
+                expected_content_version,
+                outcome,
             )
             .await;
-        });
+        };
 
-        self.synthetic_diagnostics
-            .register_task(uri, task.abort_handle());
+        let settings_generation = self.settings_manager.settings_generation();
+        self.synthetic_diagnostics.spawn_task_for_lineage(
+            uri,
+            expected_incarnation,
+            expected_content_version,
+            settings_generation,
+            SyntheticDiagnosticTrigger::Save,
+            future,
+        );
     }
 
     /// Prepare the per-layer diagnostic snapshot for a background task
@@ -263,18 +340,34 @@ impl DiagnosticScheduler {
 
 impl DiagnosticSnapshotPreparer {
     pub(crate) fn prepare_diagnostic_snapshot(&self, uri: &Url) -> Option<DiagnosticSnapshot> {
-        let (snapshot, language_name, content_version) = {
-            let doc = self.documents.get(uri)?;
-            let snapshot = doc.snapshot()?;
-            let language_name = self.language.detect_language(
-                uri.path(),
-                snapshot.text(),
-                None,
-                doc.language_id(),
-            )?;
-            let content_version = doc.content_version();
-            (snapshot, language_name, content_version)
-        };
+        self.prepare_diagnostic_snapshot_for_lineage(uri, None)
+    }
+
+    fn prepare_diagnostic_snapshot_when_current(
+        &self,
+        uri: &Url,
+        expected_incarnation: u64,
+        expected_content_version: u64,
+    ) -> Option<DiagnosticSnapshot> {
+        self.prepare_diagnostic_snapshot_for_lineage(
+            uri,
+            Some((expected_incarnation, expected_content_version)),
+        )
+    }
+
+    fn prepare_diagnostic_snapshot_for_lineage(
+        &self,
+        uri: &Url,
+        expected_lineage: Option<(u64, u64)>,
+    ) -> Option<DiagnosticSnapshot> {
+        let (snapshot, language_id, content_version) =
+            snapshot_document_for_lineage(&self.documents, uri, expected_lineage)?;
+        let language_name = self.language.detect_language(
+            uri.path(),
+            snapshot.text(),
+            None,
+            language_id.as_deref(),
+        )?;
 
         // Cross-layer gating, keyed by the same method name as the
         // aggregation configs below. A layer gated off still yields a
@@ -549,8 +642,9 @@ const LOG_TARGET: &str = "kakehashi::synthetic_diag";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_lsp_server::LspService;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn saved_diagnostic_wait_survives_the_virtual_settle_budget() {
         let documents = DocumentStore::new();
         let uri = Url::parse("file:///test/delayed-save.md").unwrap();
@@ -573,10 +667,10 @@ mod tests {
             content_version,
         ));
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(250), &mut wait)
+            tokio::time::timeout(std::time::Duration::from_secs(16), &mut wait)
                 .await
                 .is_err(),
-            "diagnostic readiness must not be abandoned at the 200ms virtual-save budget"
+            "diagnostic readiness must survive both the 200ms virtual-save budget and the old 15s reader backstop"
         );
 
         let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
@@ -613,6 +707,69 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait)
                 .await
                 .expect("tree publication must release the diagnostic waiter")
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_diagnostic_snapshot_input_rejects_a_later_edit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/saved-lineage.md").unwrap();
+        let text = "# saved\n";
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let document = server.documents.get(&uri).unwrap();
+        let expected_text = document.text_arc();
+        let content_version = document.content_version();
+        drop(document);
+
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        assert!(server.documents.set_parse_result_if_inputs_unchanged(
+            &uri,
+            &expected_text,
+            incarnation,
+            content_version,
+            Some("markdown"),
+            Some(tree),
+        ));
+
+        assert!(document_matches_lineage(
+            &server.documents.get(&uri).unwrap(),
+            incarnation,
+            content_version,
+        ));
+        assert!(
+            snapshot_document_for_lineage(
+                &server.documents,
+                &uri,
+                Some((incarnation, content_version)),
+            )
+            .is_some(),
+            "the exact saved lineage should produce its parsed snapshot"
+        );
+        server
+            .documents
+            .apply_edit_clearing_tree(&uri, "# edited\n".to_string(), &[]);
+        assert!(!document_matches_lineage(
+            &server.documents.get(&uri).unwrap(),
+            incarnation,
+            content_version,
+        ));
+        assert!(
+            snapshot_document_for_lineage(
+                &server.documents,
+                &uri,
+                Some((incarnation, content_version)),
+            )
+            .is_none(),
+            "a save-triggered pull must not snapshot the later unsaved version"
         );
     }
 }
