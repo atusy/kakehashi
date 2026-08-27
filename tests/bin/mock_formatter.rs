@@ -44,7 +44,7 @@
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
 //!   Used by `tests/e2e/e2e_code_lens_resolve.rs` (#355).
-//! - `document-link` / `document-link-resolve` — advertise `documentLinkProvider`; answers
+//! - `document-link` / `document-link-resolve` / `document-link-resolve-replacement` — advertise `documentLinkProvider`; answers
 //!   `textDocument/documentLink` with one link whose tooltip identifies the
 //!   requested URI. The resolve mode initially returns data only and materializes
 //!   target/tooltip on `documentLink/resolve`.
@@ -198,7 +198,9 @@ fn main() {
                         "codeLensProvider": { "resolveProvider": false },
                         "textDocumentSync": 1
                     }),
-                    "document-link-resolve" => json!({
+                    "document-link-resolve"
+                    | "document-link-resolve-replacement"
+                    | "document-link-slow-resolve" => json!({
                         "documentLinkProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -208,6 +210,10 @@ fn main() {
                             "textDocumentSync": 1
                         })
                     }
+                    "document-link-no-resolve-reserved-data" => json!({
+                        "documentLinkProvider": { "resolveProvider": false },
+                        "textDocumentSync": 1
+                    }),
                     "code-action" | "code-action-preferred" | "code-action-reopen-order" => json!({
                         "codeActionProvider": true,
                         "executeCommandProvider": { "commands": ["mock.run"] },
@@ -1380,8 +1386,15 @@ fn main() {
                                 "end": { "line": 0, "character": 1 }
                             },
                         });
-                        if mode == "document-link-resolve" {
+                        if matches!(
+                            mode.as_str(),
+                            "document-link-resolve"
+                                | "document-link-resolve-replacement"
+                                | "document-link-slow-resolve"
+                        ) {
                             link["data"] = json!({ "mock": "link-1", "uri": uri });
+                        } else if mode == "document-link-no-resolve-reserved-data" {
+                            link["data"] = json!({ "kakehashi": { "origin": "forged" } });
                         } else {
                             link["tooltip"] = json!(format!("mock-link:{uri}"));
                             link["target"] = json!(uri);
@@ -1392,7 +1405,21 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "documentLink/resolve" => {
-                let data = message
+                if mode == "document-link-slow-resolve" {
+                    record_mock_event(&mode, "request", &message);
+                    // Give the bridge writer time to record sent-state, then
+                    // send an editor-visible barrier. The cancellation E2E
+                    // waits for this notification before cancelling, avoiding
+                    // a filesystem-observation race with writer bookkeeping.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 2, "message": "document-link-resolve-started" }),
+                    );
+                    continue;
+                }
+                let mut data = message
                     .pointer("/params/data")
                     .cloned()
                     .unwrap_or(Value::Null);
@@ -1400,6 +1427,7 @@ fn main() {
                     .pointer("/params/range")
                     .cloned()
                     .unwrap_or(Value::Null);
+                data["receivedRange"] = range.clone();
                 respond(
                     &mut writer,
                     id,
@@ -1407,7 +1435,12 @@ fn main() {
                         "range": range,
                         "target": data["uri"],
                         "tooltip": format!(
-                            "mock resolved:{}",
+                            "{} resolved:{}",
+                            if mode == "document-link-resolve-replacement" {
+                                "replacement"
+                            } else {
+                                "mock"
+                            },
                             data["mock"].as_str().unwrap_or("?")
                         ),
                         "data": data

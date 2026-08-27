@@ -179,6 +179,8 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/documentLink") {
             return Ok(None);
         }
+        let connection_key = handle.key().clone();
+        let connection_generation = self.document_connection_generation(&connection_key);
         self.execute_bridge_request_with_handle(
             handle,
             host_uri,
@@ -198,8 +200,8 @@ impl LanguageServerPool {
                         region_id,
                         injection_language,
                         incarnation: host_incarnation,
-                        connection_generation: None,
-                        connection_key: None,
+                        connection_generation: Some(connection_generation),
+                        connection_key: Some(&connection_key),
                         offset: ctx.offset,
                         host_layer: false,
                     },
@@ -256,41 +258,31 @@ impl LanguageServerPool {
             return link;
         }
 
-        let handle_result = if envelope.is_host_layer() {
-            let Some(expected_generation) = envelope.connection_generation else {
-                re_envelope_link(&mut link, &envelope);
-                return link;
-            };
-            let Some(connection_key) = envelope
-                .connection_key
-                .as_ref()
-                .filter(|key| key.server() == server_name)
-            else {
-                re_envelope_link(&mut link, &envelope);
-                return link;
-            };
-            if self.document_connection_generation(connection_key) != expected_generation {
-                re_envelope_link(&mut link, &envelope);
-                return link;
-            }
-            self.ready_connection_by_key_for_config(connection_key, Some(server_config))
-                .await
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "producer connection is no longer live",
-                    )
-                })
-        } else {
-            self.get_or_create_virtual_connection(
-                server_name,
-                server_config,
-                &host_uri,
-                &envelope.injection_language,
-                &envelope.region_id,
-            )
-            .await
+        let Some(expected_generation) = envelope.connection_generation else {
+            re_envelope_link(&mut link, &envelope);
+            return link;
         };
+        let Some(connection_key) = envelope
+            .connection_key
+            .as_ref()
+            .filter(|key| key.server() == server_name)
+        else {
+            re_envelope_link(&mut link, &envelope);
+            return link;
+        };
+        if self.document_connection_generation(connection_key) != expected_generation {
+            re_envelope_link(&mut link, &envelope);
+            return link;
+        }
+        let handle_result = self
+            .ready_connection_by_key_for_config(connection_key, Some(server_config))
+            .await
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "producer connection is no longer live",
+                )
+            });
         let handle = match handle_result {
             Ok(handle) => handle,
             Err(error) => {
@@ -363,10 +355,9 @@ impl LanguageServerPool {
             let producer_is_live = connections
                 .get(connection_key)
                 .is_some_and(|current| Arc::ptr_eq(current, &handle));
-            let generation_matches = !envelope.is_host_layer()
-                || envelope.connection_generation.is_some_and(|expected| {
-                    self.document_connection_generation(connection_key) == expected
-                });
+            let generation_matches = envelope.connection_generation.is_some_and(|expected| {
+                self.document_connection_generation(connection_key) == expected
+            });
             if !producer_is_live || !generation_matches {
                 Err(io::Error::new(
                     io::ErrorKind::NotConnected,
@@ -493,6 +484,7 @@ mod tests {
         response: serde_json::Value,
         offset: &RegionOffset,
     ) -> Option<Vec<DocumentLink>> {
+        let connection_key = ConnectionKey::shared("lua-ls");
         transform_document_link_response_to_host(
             response,
             offset,
@@ -502,8 +494,8 @@ mod tests {
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 injection_language: "lua",
                 incarnation: Some(1),
-                connection_generation: None,
-                connection_key: None,
+                connection_generation: Some(4),
+                connection_key: Some(&connection_key),
                 offset,
                 host_layer: false,
             },
@@ -575,6 +567,11 @@ mod tests {
         assert_eq!(envelope.origin, "lua-ls");
         assert_eq!(envelope.host_uri, "file:///test.md");
         assert_eq!(envelope.inner, Some(json!({"token": "link-1"})));
+        assert_eq!(envelope.connection_generation, Some(4));
+        assert_eq!(
+            envelope.connection_key,
+            Some(ConnectionKey::shared("lua-ls"))
+        );
         assert_eq!(links[0].range.start.line, 3);
         assert_eq!(links[0].range.start.character, 3);
     }
