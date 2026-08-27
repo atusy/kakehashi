@@ -266,16 +266,17 @@ fn e2e_inlay_hint_resolve_round_trips_to_virtual_origin() {
             "textDocument": { "uri": uri, "version": 2 },
             "contentChanges": [{
                 "range": {
-                    "start": { "line": 0, "character": 0 },
-                    "end": { "line": 0, "character": 0 }
+                    "start": { "line": 3, "character": 6 },
+                    "end": { "line": 3, "character": 7 }
                 },
-                "text": "shift\n"
+                "text": "y"
             }]
         }),
     );
-    let stale = client.send_request("inlayHint/resolve", hint);
+    let stale = client.send_request("inlayHint/resolve", hint.clone());
     assert!(stale.get("error").is_none(), "{stale}");
     assert!(stale["result"].get("tooltip").is_none());
+    assert_eq!(stale["result"]["position"], hint["position"]);
 
     shutdown_client(&mut client);
 }
