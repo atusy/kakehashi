@@ -3093,7 +3093,11 @@ impl LanguageServerPool {
                 .launch_config()
                 .is_some_and(|old| !same_launch_config(old, server_config))
         });
-        let existing_state = if launch_config_changed {
+        let provenance_limit_reached = existing.is_some()
+            && self
+                .document_tracker
+                .virtual_uri_provenance_limit_reached(&connection_key);
+        let existing_state = if launch_config_changed || provenance_limit_reached {
             // Reuse the stale/closed cleanup path below. `Failed` maps to
             // SpawnNew, while the explicit flag also schedules process shutdown.
             Some(ConnectionState::Failed)
@@ -3135,8 +3139,9 @@ impl LanguageServerPool {
             ConnectionAction::SpawnNew => {
                 // Remove stale connection if present (Failed or Closed state)
                 if existing_state.is_some() {
-                    let invalidated_handle =
-                        launch_config_changed.then(|| existing.cloned()).flatten();
+                    let invalidated_handle = (launch_config_changed || provenance_limit_reached)
+                        .then(|| existing.cloned())
+                        .flatten();
                     if let Some(handle) = &invalidated_handle {
                         handle.begin_shutdown();
                     }

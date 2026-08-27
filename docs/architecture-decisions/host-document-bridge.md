@@ -39,7 +39,7 @@ Partially implemented:
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
   inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
-  prepareCallHierarchy, incomingCalls,
+  prepareCallHierarchy, incomingCalls, outgoingCalls,
   formatting, and rangeFormatting (which shares the formatting layer key).
   Diagnostics are covered with real cross-layer `concatenated` (the
   cross-layer-aggregation diagnostics phase): pull and synthetic push both
@@ -111,6 +111,11 @@ Partially implemented:
   the response; cancellation targets the exact downstream request. With both
   expansion directions implemented, kakehashi advertises upstream
   `callHierarchyProvider`.
+  Exact virtual-URI provenance survives `didClose` because downstream indexes
+  may still return closed documents. To keep this generation history bounded,
+  the pool retires and recreates a producer before admitting another request
+  once 65,536 canonical and scratch aliases have been issued; retiring the
+  process clears both its index and the matching provenance atomically.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one
