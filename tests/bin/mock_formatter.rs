@@ -208,6 +208,7 @@ fn main() {
     let mut pending_inlay_resolve: Option<(Option<Value>, Value)> = None;
     let mut pending_call_hierarchy_incoming: Option<(Option<Value>, Value)> = None;
     let mut pending_call_hierarchy_outgoing: Option<(Option<Value>, Value)> = None;
+    let mut pending_type_hierarchy_supertypes: Option<(Option<Value>, Value)> = None;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -239,7 +240,10 @@ fn main() {
                         "callHierarchyProvider": true,
                         "textDocumentSync": 1
                     }),
-                    "type-hierarchy-prepare" => json!({
+                    "type-hierarchy-prepare"
+                    | "type-hierarchy-replacement"
+                    | "type-hierarchy-slow-supertypes"
+                    | "type-hierarchy-delayed-supertypes" => json!({
                         "typeHierarchyProvider": true,
                         "textDocumentSync": 1
                     }),
@@ -551,6 +555,12 @@ fn main() {
                     if mode == "call-hierarchy-delayed-outgoing"
                         && let Some((pending_id, pending_result)) =
                             pending_call_hierarchy_outgoing.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
+                    if mode == "type-hierarchy-delayed-supertypes"
+                        && let Some((pending_id, pending_result)) =
+                            pending_type_hierarchy_supertypes.take()
                     {
                         respond(&mut writer, pending_id, pending_result);
                     }
@@ -1651,30 +1661,59 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "typeHierarchy/supertypes" => {
+                if mode == "type-hierarchy-slow-supertypes" {
+                    record_mock_event(&mode, "request", &message);
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "type-hierarchy-supertypes-started" }),
+                    );
+                    continue;
+                }
                 let item = &message["params"]["item"];
                 let result = item["uri"]
                     .as_str()
                     .filter(|uri| documents.contains_key(*uri))
-                    .filter(|_| item["data"] == json!({ "mock": "type-item" }))
+                    .filter(|_| {
+                        matches!(
+                            item.pointer("/data/mock").and_then(Value::as_str),
+                            Some("type-item" | "parent-item")
+                        )
+                    })
                     .map(|uri| {
+                        let (name, end, data) = if item["data"] == json!({ "mock": "parent-item" })
+                        {
+                            ("MockGrandparent", 15, "grandparent-item")
+                        } else {
+                            ("MockParent", 10, "parent-item")
+                        };
                         json!([{
-                            "name": "MockParent",
+                            "name": name,
                             "kind": 5,
                             "tags": [1],
                             "uri": uri,
                             "range": {
                                 "start": { "line": 0, "character": 0 },
-                                "end": { "line": 0, "character": 10 }
+                                "end": { "line": 0, "character": end }
                             },
                             "selectionRange": {
                                 "start": { "line": 0, "character": 0 },
-                                "end": { "line": 0, "character": 10 }
+                                "end": { "line": 0, "character": end }
                             },
-                            "data": { "mock": "parent-item" }
+                            "data": { "mock": data }
                         }])
                     })
                     .unwrap_or(Value::Null);
-                respond(&mut writer, id, result);
+                if mode == "type-hierarchy-delayed-supertypes" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "type-hierarchy-supertypes-started" }),
+                    );
+                    pending_type_hierarchy_supertypes = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
             }
             "callHierarchy/incomingCalls" => {
                 if mode == "call-hierarchy-marker-incoming" {
