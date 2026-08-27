@@ -111,12 +111,15 @@ Partially implemented:
   the response; cancellation targets the exact downstream request. With both
   expansion directions implemented, kakehashi advertises upstream
   `callHierarchyProvider`.
-  Staged groundwork for `textDocument/prepareTypeHierarchy` follows the same preparation contract:
+  Staged groundwork for `textDocument/prepareTypeHierarchy` and
+  `typeHierarchy/supertypes` follows the same preparation/exact-producer contract:
   host items are enveloped without coordinate changes, while same-region
   virtual items are projected to host coordinates and cross-region virtual
   items are dropped. The envelope preserves the exact producer metadata needed
-  by the later supertype/subtype expansion stages. It remains unadvertised until
-  both expansion directions are implemented.
+  by the later expansion stages. Supertypes restore only projected items to the
+  producing virtual URI, reject stale documents/regions/processes, and re-envelope
+  results for recursive traversal. The family remains unadvertised until subtype
+  expansion is implemented too.
   Exact virtual-URI provenance survives `didClose` because downstream indexes
   may still return closed documents. To keep this generation history bounded,
   the pool retires and recreates a producer before admitting another request

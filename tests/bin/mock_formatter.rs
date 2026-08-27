@@ -1650,6 +1650,32 @@ fn main() {
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }
+            "typeHierarchy/supertypes" => {
+                let item = &message["params"]["item"];
+                let result = item["uri"]
+                    .as_str()
+                    .filter(|uri| documents.contains_key(*uri))
+                    .filter(|_| item["data"] == json!({ "mock": "type-item" }))
+                    .map(|uri| {
+                        json!([{
+                            "name": "MockParent",
+                            "kind": 5,
+                            "tags": [1],
+                            "uri": uri,
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 10 }
+                            },
+                            "selectionRange": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 10 }
+                            },
+                            "data": { "mock": "parent-item" }
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
             "callHierarchy/incomingCalls" => {
                 if mode == "call-hierarchy-marker-incoming" {
                     record_mock_event(&mode, "request", &message);

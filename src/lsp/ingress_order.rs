@@ -384,6 +384,12 @@ fn classify(req: &Request) -> Option<Role> {
                 uri: normalize_uri(raw),
             })
         }
+        "typeHierarchy/supertypes" => {
+            let raw = req.params()?["item"]["data"]["kakehashi"]["host_uri"].as_str()?;
+            Some(Role::Reader {
+                uri: normalize_uri(raw),
+            })
+        }
         _ if method == "kakehashi/node" || method.starts_with("kakehashi/node/") => {
             let uri = text_document_uri(req)?;
             Some(Role::Reader { uri })
