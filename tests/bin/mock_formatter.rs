@@ -1571,8 +1571,12 @@ fn main() {
                     .and_then(Value::as_str)
                     .filter(|uri| documents.contains_key(*uri))
                     .map(|uri| {
+                        let position = message.pointer("/params/position").map(|position| {
+                            format!("{}:{}", position["line"], position["character"])
+                        });
                         json!([{
                             "name": "mock-call",
+                            "detail": position,
                             "kind": 12,
                             "uri": uri,
                             "range": {
