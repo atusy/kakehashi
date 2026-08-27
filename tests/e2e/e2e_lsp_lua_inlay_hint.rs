@@ -67,6 +67,62 @@ fn init_mock_inlay_hint_client(
     (client, config_dir)
 }
 
+fn init_combined_marker_inlay_hint_client(
+    marker_dir: &std::path::Path,
+) -> (LspClient, tempfile::TempDir) {
+    let config_dir = tempfile::TempDir::new().expect("config temp dir");
+    let config_path = config_dir.path().join("inlay_hint_combined.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let query_path = config_dir.path().join("combined-injections.scm");
+    std::fs::write(
+        &query_path,
+        r#"
+        (fenced_code_block
+          (info_string (language) @injection.language)
+          (code_fence_content) @injection.content
+          (#set! injection.combined)
+          (#set! injection.include-children))
+        "#,
+    )
+    .expect("write combined injection query");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("UTF-8 config path"))
+        .env("MOCK_LSP_CANCEL_DIR", marker_dir.to_string_lossy())
+        .build();
+    let init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-inlay-hint": {
+                        "cmd": [mock_formatter_bin(), "inlay-hint-marker-resolve"],
+                        "languages": ["lua"]
+                    }
+                },
+                "languages": {
+                    "markdown": {
+                        "queries": [{
+                            "path": query_path.to_str().expect("UTF-8 query path"),
+                            "kind": "injections"
+                        }]
+                    }
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        init["result"]["capabilities"]["inlayHintProvider"]["resolveProvider"],
+        json!(true)
+    );
+    client.send_notification("initialized", json!({}));
+    (client, config_dir)
+}
+
 fn inlay_hints_with_retry(
     client: &mut LspClient,
     uri: &str,
@@ -93,6 +149,34 @@ fn inlay_hints_with_retry(
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     panic!("timed out waiting for inlay hints");
+}
+
+fn resolve_request_observation(resolved: &Value) -> Value {
+    serde_json::from_str(
+        resolved["label"][0]["tooltip"]
+            .as_str()
+            .expect("mock resolve observation tooltip"),
+    )
+    .expect("parse mock resolve observation")
+}
+
+fn wait_for_injected_node(client: &mut LspClient, uri: &str, line: u64) {
+    for _ in 0..300 {
+        let response = client.send_request(
+            "kakehashi/node",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": 1 },
+                "injection": true
+            }),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        if !response["result"].is_null() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("timed out waiting for current injected parse");
 }
 
 /// E2E test: inlay hint request is handled without error
@@ -226,28 +310,30 @@ fn e2e_inlay_hint_resolve_round_trips_to_virtual_origin() {
     let response = client.send_request("inlayHint/resolve", hint.clone());
     assert!(response.get("error").is_none(), "{response}");
     let resolved = &response["result"];
+    let observed = resolve_request_observation(resolved);
     assert_eq!(resolved["tooltip"], "mock resolved:hint-1");
     assert_eq!(resolved["position"], hint["position"]);
     assert_eq!(
-        resolved["data"]["kakehashi"]["inner"]["receivedPosition"],
+        observed["receivedPosition"],
         json!({ "line": 0, "character": 1 })
     );
     assert_eq!(
-        resolved["data"]["kakehashi"]["inner"]["receivedTextEdit"]["start"],
+        observed["receivedTextEdit"]["start"],
         json!({ "line": 0, "character": 0 })
     );
     assert!(
-        resolved["data"]["kakehashi"]["inner"]["receivedLocation"]["uri"]
+        observed["receivedLocation"]["uri"]
             .as_str()
             .is_some_and(|uri| uri.contains("kakehashi-virtual-uri-"))
     );
     assert_eq!(
-        resolved["data"]["kakehashi"]["inner"]["receivedLocation"]["range"]["start"],
+        observed["receivedLocation"]["range"]["start"],
         json!({ "line": 0, "character": 0 })
     );
+    assert_eq!(observed["receivedCommand"], "mock.hint");
     assert_eq!(
-        resolved["data"]["kakehashi"]["inner"]["receivedCommand"],
-        "mock.hint"
+        resolved["data"]["kakehashi"]["inner"],
+        hint["data"]["kakehashi"]["inner"]
     );
     assert_eq!(
         resolved["textEdits"][0]["range"]["start"],
@@ -282,6 +368,92 @@ fn e2e_inlay_hint_resolve_round_trips_to_virtual_origin() {
 }
 
 #[test]
+fn e2e_inlay_hint_resolve_discards_response_after_same_shape_edit() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-delayed-resolve", "lua", false, None);
+    let uri = "file:///test_inlay_hint_resolve_didchange_during_wait.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "```lua\nlocal x = 1\n```\n"
+        }}),
+    );
+    let hint = inlay_hints_with_retry(&mut client, uri, 1, 3).remove(0);
+
+    let request_id = client.send_request_async("inlayHint/resolve", hint.clone());
+    let started =
+        client.wait_for_notification("window/logMessage", std::time::Duration::from_secs(10));
+    assert!(
+        started.as_ref().is_some_and(|params| params["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("inlay-hint-resolve-started"))),
+        "resolve must reach the downstream sent-state barrier: {started:?}"
+    );
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{
+                "range": {
+                    "start": { "line": 1, "character": 6 },
+                    "end": { "line": 1, "character": 7 }
+                },
+                "text": "y"
+            }]
+        }),
+    );
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(response["result"], hint);
+
+    shutdown_client(&mut client);
+}
+
+#[test]
+fn e2e_inlay_hint_resolve_rejects_live_non_contiguous_region_before_dispatch() {
+    let marker_dir = tempfile::TempDir::new().expect("marker dir");
+    let marker = marker_dir
+        .path()
+        .join("inlay-hint-marker-resolve.request.json");
+    let (mut client, _config_dir) = init_combined_marker_inlay_hint_client(marker_dir.path());
+    let uri = "file:///test_inlay_hint_resolve_combined.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "```lua\nlocal x = 1\n```\n"
+        }}),
+    );
+    let mut hint = inlay_hints_with_retry(&mut client, uri, 1, 3).remove(0);
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{
+                "text": "```lua\nlocal x = 1\n```\n\nprose\n\n```lua\nlocal y = 2\n```\n"
+            }]
+        }),
+    );
+    wait_for_injected_node(&mut client, uri, 7);
+
+    // The real edit made the once-single combined capture non-contiguous. Set
+    // only the opaque freshness stamp to the current version so this request
+    // specifically exercises the live geometry/contiguity guard.
+    hint["data"]["kakehashi"]["content_version"] = json!(2);
+    let response = client.send_request("inlayHint/resolve", hint.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], hint);
+    assert!(!marker.exists(), "resolve must not reach the downstream");
+
+    shutdown_client(&mut client);
+}
+
+#[test]
 fn e2e_inlay_hint_resolve_accepts_offset_frontmatter_region() {
     let (mut client, _config_dir) =
         init_mock_inlay_hint_client("inlay-hint-resolve", "yaml", false, None);
@@ -303,7 +475,7 @@ fn e2e_inlay_hint_resolve_accepts_offset_frontmatter_region() {
     assert_eq!(response["result"]["tooltip"], "mock resolved:hint-1");
     assert_eq!(response["result"]["position"], hint["position"]);
     assert_eq!(
-        response["result"]["data"]["kakehashi"]["inner"]["receivedPosition"],
+        resolve_request_observation(&response["result"])["receivedPosition"],
         json!({ "line": 0, "character": 1 })
     );
     assert_eq!(
@@ -336,22 +508,11 @@ fn e2e_inlay_hint_resolve_round_trips_to_host_origin() {
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"]["tooltip"], "mock resolved:hint-1");
     assert_eq!(response["result"]["position"], hint["position"]);
-    assert_eq!(
-        response["result"]["data"]["kakehashi"]["inner"]["receivedPosition"],
-        hint["position"]
-    );
-    assert_eq!(
-        response["result"]["data"]["kakehashi"]["inner"]["receivedTextEdit"],
-        hint["textEdits"][0]["range"]
-    );
-    assert_eq!(
-        response["result"]["data"]["kakehashi"]["inner"]["receivedLocation"],
-        hint["label"][0]["location"]
-    );
-    assert_eq!(
-        response["result"]["data"]["kakehashi"]["inner"]["receivedCommand"],
-        "mock.hint"
-    );
+    let observed = resolve_request_observation(&response["result"]);
+    assert_eq!(observed["receivedPosition"], hint["position"]);
+    assert_eq!(observed["receivedTextEdit"], hint["textEdits"][0]["range"]);
+    assert_eq!(observed["receivedLocation"], hint["label"][0]["location"]);
+    assert_eq!(observed["receivedCommand"], "mock.hint");
 
     shutdown_client(&mut client);
 }

@@ -174,6 +174,10 @@ fn main() {
     // answered, the baseline demonstrably exists — a later baseline-less full
     // request means a pull LOST it and is re-fetching.
     let mut unchanged_answered = false;
+    // The delayed inlay resolver does not answer until it observes the
+    // downstream didChange caused by the upstream edit. This is a deterministic
+    // sent-state barrier for post-response freshness tests.
+    let mut pending_inlay_resolve: Option<(Option<Value>, Value)> = None;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -222,6 +226,8 @@ fn main() {
                     }),
                     "inlay-hint-resolve"
                     | "inlay-hint-resolve-replacement"
+                    | "inlay-hint-delayed-resolve"
+                    | "inlay-hint-marker-resolve"
                     | "inlay-hint-slow-resolve" => json!({
                         "inlayHintProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
@@ -477,6 +483,11 @@ fn main() {
                     // the host cleared (#469).
                     if mode == "diagnostics-push-crash" {
                         std::process::exit(0);
+                    }
+                    if mode == "inlay-hint-delayed-resolve"
+                        && let Some((pending_id, pending_result)) = pending_inlay_resolve.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
                     }
                 }
             }
@@ -1503,6 +1514,9 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "inlayHint/resolve" => {
+                if mode == "inlay-hint-marker-resolve" {
+                    record_mock_event(&mode, "request", &message);
+                }
                 if mode == "inlay-hint-slow-resolve" {
                     record_mock_event(&mode, "request", &message);
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1513,61 +1527,58 @@ fn main() {
                     );
                     continue;
                 }
-                let mut data = message
+                let data = message
                     .pointer("/params/data")
                     .cloned()
                     .unwrap_or(Value::Null);
-                data["receivedPosition"] = message
-                    .pointer("/params/position")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                data["receivedTextEdit"] = message
-                    .pointer("/params/textEdits/0/range")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                data["receivedLocation"] = message
-                    .pointer("/params/label/0/location")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                data["receivedCommand"] = message
-                    .pointer("/params/label/0/command/command")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                respond(
-                    &mut writer,
-                    id,
-                    json!({
-                        "position": { "line": 9, "character": 9 },
-                        "label": [{
-                            "value": ": number",
-                            "location": {
-                                "uri": data["uri"],
-                                "range": {
-                                    "start": { "line": 0, "character": 0 },
-                                    "end": { "line": 0, "character": 1 }
-                                }
-                            },
-                            "command": { "title": "Resolved hint", "command": "mock.resolved" }
-                        }],
-                        "tooltip": format!(
-                            "{} resolved:{}",
-                            if mode == "inlay-hint-resolve-replacement" {
-                                "replacement"
-                            } else {
-                                "mock"
-                            },
-                            data["mock"].as_str().unwrap_or("?")
-                        ),
-                        "textEdits": [{
+                let observation = json!({
+                    "receivedPosition": message.pointer("/params/position"),
+                    "receivedTextEdit": message.pointer("/params/textEdits/0/range"),
+                    "receivedLocation": message.pointer("/params/label/0/location"),
+                    "receivedCommand": message.pointer("/params/label/0/command/command"),
+                });
+                let result = json!({
+                    "position": { "line": 9, "character": 9 },
+                    "label": [{
+                        "value": ": number",
+                        "tooltip": observation.to_string(),
+                        "location": {
+                            "uri": data["uri"],
                             "range": {
                                 "start": { "line": 0, "character": 0 },
-                                "end": { "line": 0, "character": 0 }
-                            },
-                            "newText": "resolved "
-                        }],
-                        "data": data
-                    }),
-                );
+                                "end": { "line": 0, "character": 1 }
+                            }
+                        },
+                        "command": { "title": "Resolved hint", "command": "mock.resolved" }
+                    }],
+                    "tooltip": format!(
+                        "{} resolved:{}",
+                        if mode == "inlay-hint-resolve-replacement" {
+                            "replacement"
+                        } else {
+                            "mock"
+                        },
+                        data["mock"].as_str().unwrap_or("?")
+                    ),
+                    "textEdits": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 0 }
+                        },
+                        "newText": "resolved "
+                    }],
+                    "data": { "resolver": "must-not-replace-original-data" }
+                });
+                if mode == "inlay-hint-delayed-resolve" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "inlay-hint-resolve-started" }),
+                    );
+                    pending_inlay_resolve = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
             }
             "textDocument/onTypeFormatting" => {
                 // Answer with the whole-document transformation REGARDLESS of
