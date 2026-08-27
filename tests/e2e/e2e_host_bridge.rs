@@ -922,6 +922,77 @@ fn e2e_host_will_save_notification_reaches_host() {
 }
 
 #[test]
+fn e2e_host_did_save_notification_reaches_host() {
+    let (mut client, _config_dir, _init) =
+        init_will_save_client("[languages.markdown.bridge._self]\nenabled = true\n");
+
+    let mut warmed = false;
+    for _ in 0..300 {
+        if let Some(state) = host_save_hover(&mut client) {
+            assert_eq!(state["did"], 0, "no didSave before notification: {state}");
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(warmed, "host document must be open before didSave");
+
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": SAVE_URI } }),
+    );
+
+    let mut seen = None;
+    for _ in 0..300 {
+        if let Some(state) = host_save_hover(&mut client)
+            && state["did"] != 0
+        {
+            seen = Some(state);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = seen.expect("the forwarded didSave must reach the host server");
+    assert_eq!(state["did"], 1);
+    assert_eq!(state["didUri"], SAVE_URI, "host URI must remain verbatim");
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_did_save_skips_server_requiring_text() {
+    let (mut client, _config_dir, _init) = init_will_save_client_with_mode(
+        "[languages.markdown.bridge._self]\nenabled = true\n",
+        "will-save-include-text",
+    );
+
+    let mut warmed = false;
+    for _ in 0..300 {
+        if host_save_hover(&mut client).is_some() {
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(warmed, "host document must be open before didSave");
+
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": SAVE_URI } }),
+    );
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let state = host_save_hover(&mut client).expect("hover must answer");
+        assert_eq!(
+            state["did"], 0,
+            "textless didSave must not reach includeText=true server: {state}"
+        );
+    }
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_host_will_save_wait_until_times_out_without_hanging_save() {
     // The host server stalls 8s on willSaveWaitUntil; kakehashi's 5s save budget
     // must abandon the request and return null near 5s — NOT wait the 30s

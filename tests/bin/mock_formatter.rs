@@ -112,6 +112,8 @@
 //! - `will-save-incapable` — like `will-save` (records + reports save state via
 //!   hover) but advertises NEITHER `willSave` nor `save`, so the bridge's
 //!   per-server capability gate must skip it and its counts stay zero (#357).
+//! - `will-save-include-text` — records save state but requires didSave text;
+//!   textless forwarding must skip it.
 //! - `notify` — right after answering `initialize`, emits a
 //!   `window/showMessage` followed by a `window/logMessage` notification.
 //!   Used by `tests/e2e/e2e_window_notifications.rs` to prove the bridge forwards
@@ -295,6 +297,14 @@ fn main() {
                     "will-save-incapable" => json!({
                         "hoverProvider": true,
                         "textDocumentSync": 1
+                    }),
+                    "will-save-include-text" => json!({
+                        "hoverProvider": true,
+                        "textDocumentSync": {
+                            "openClose": true,
+                            "change": 1,
+                            "save": { "includeText": true }
+                        }
                     }),
                     "workspace-folders" => json!({
                         "hoverProvider": true,
