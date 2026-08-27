@@ -454,6 +454,32 @@ mod tests {
         assert!(pool.connections().await.get(&key).is_none());
     }
 
+    #[tokio::test]
+    async fn delayed_close_failure_does_not_invalidate_a_replacement() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua_ls");
+        let failed = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&failed)).await;
+        let generation = pool.document_connection_generation(&key);
+        let replacement = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&replacement)).await;
+
+        assert!(
+            !pool
+                .invalidate_connection_after_didclose_failure(&key, &failed)
+                .await,
+            "delayed cleanup must reject a replaced handle"
+        );
+
+        let connections = pool.connections().await;
+        assert!(
+            connections
+                .get(&key)
+                .is_some_and(|current| { Arc::ptr_eq(current, &replacement) })
+        );
+        assert_eq!(pool.document_connection_generation(&key), generation);
+    }
+
     /// A scratch URI is distinct from the canonical region URI, so an
     /// already-open canonical document does NOT suppress the scratch `didOpen`.
     ///
