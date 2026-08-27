@@ -5,11 +5,12 @@
 //! position parameter, like document link); `codeLens/resolve` takes a single
 //! lens as its complete params — see `dispatch_code_lens_resolve`.
 //!
-//! Every bridged lens gets a routing envelope in `lens.data` (the
-//! `completionItem/resolve` pattern) so a later `codeLens/resolve` can be sent
-//! to the origin downstream server. Unresolved lenses (no `command`, only
-//! `data`) are therefore forwarded instead of dropped — servers like
-//! rust-analyzer return mostly-unresolved lenses by design.
+//! Every injection lens gets a routing envelope in `lens.data` (the
+//! `completionItem/resolve` pattern), as does a winning host lens when its
+//! server advertises resolve, so a later `codeLens/resolve` can be sent to the
+//! origin downstream server. Unresolved lenses (no `command`, only `data`) are
+//! therefore forwarded instead of dropped — servers like rust-analyzer return
+//! mostly-unresolved lenses by design.
 //!
 //! Resolution fails soft: any failure (stale region, missing server,
 //! connection error, parse failure) returns the lens unresolved with its

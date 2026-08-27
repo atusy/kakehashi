@@ -29,7 +29,7 @@ Current bridge-backed requests include:
 - Rename / Prepare Rename
 - Document Highlight / Document Symbol / Document Link
 - Moniker / Inlay Hint
-- Code Lens (incl. `codeLens/resolve` routed back to the origin server for injection-layer lenses — host-layer lenses pass through unrouted; resolution fails soft when the region was moved or invalidated since the lens was produced, and always in runtime-range-adjusted (`#offset!` / `#trim!`) regions such as frontmatter)
+- Code Lens (incl. `codeLens/resolve` routed back to the origin server for both injection- and host-layer lenses; host-layer payloads and coordinates pass through verbatim, while injection resolution fails soft when the region was moved or invalidated since the lens was produced, and always in runtime-range-adjusted (`#offset!` / `#trim!`) regions such as frontmatter)
 - Code Action (incl. `codeAction/resolve` routed back to the origin server, host-layer actions via `bridge._self`, and a merged menu across every injection region a multi-fence range overlaps; advertised only to clients with `codeActionLiteralSupport`)
 - `workspace/executeCommand` (commands surfaced through bridged actions route back to their origin server by name; palette-fired commands — those that a downstream advertised in its initialize result — route via dynamically registered names when the client supports dynamic registration (a downstream's own later dynamic command registrations are not routed). Known limitations: action-embedded command names encode the origin connection and are not registered, so clients that only dispatch command ids from registered lists — VS Code's vscode-languageclient — show such actions without running their command; and the palette registry is session-global by raw command id, which carries no workspace context — so when several LIVE connections advertise the same raw name, kakehashi refuses to guess and the invocation is a no-op, reported to the editor as a `window/logMessage` warning naming the connections involved. Note that per-root pooling is on by default, so one server rooted at two workspace folders is enough to trigger this; disambiguate by narrowing `workspaceMarkers`, enabling `preferSharedInstance`, or disabling one of the servers)
 - `workspace/applyEdit` from downstream servers (virtual-document edits are translated to the host document and relayed to the editor; untranslatable edits answer `applied: false`)
@@ -605,8 +605,7 @@ The reserved `_self` key makes the host language its own bridge target: with
 it enabled, requests on the host document are forwarded to servers whose
 `languages` matches the **host** language (including a `"*"` server), with the real URI and no
 coordinate translation. All bridged request methods are wired (exceptions:
-semantic tokens; document color stays injection-only; host code-lens
-resolves pass through unrouted); by default the host layer is
+semantic tokens and document color); by default the host layer is
 tried after
 `virt` (see `layers` above), so for `preferred` methods injections keep
 winning inside code fences while the host server answers everywhere else —

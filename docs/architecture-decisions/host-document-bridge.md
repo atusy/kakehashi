@@ -47,6 +47,12 @@ Partially implemented:
   translation and no injection-region edit guard), but only for a server that
   advertises `completionItem/resolve`. Without that capability the items stay
   bare and a resolve falls back gracefully (item returned unresolved).
+  `codeLens/resolve` follows the same host-layer rule: only a winning host
+  server that advertises resolve has its lenses stamped with an origin
+  envelope, and resolving one forwards the original payload and coordinates
+  verbatim. The envelope retains the host-document incarnation so a lens from
+  an earlier open is returned unresolved instead of being sent to a reopened
+  document.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one
