@@ -407,6 +407,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | rangeFormatting | ✅ Implemented | Shares the formatting guards |
 | onTypeFormatting | ✅ Implemented | Shares the formatting guards |
 | inlayHint | ✅ Implemented | Unsafe accept-edit sets dropped whole; hint kept; `inlayHint/resolve` edits pass the same guard |
+| documentColor | ✅ Implemented | Experimental opt-in; whole-document host/virt results follow the configured layer strategy |
 | colorPresentation | ✅ Implemented | Experimental opt-in; unsafe presentations dropped |
 | documentHighlight | ✅ Implemented | Strategy-2 shape (single-document, position-mapped) |
 | diagnostics | ✅ Implemented | Push + pull with host translation |

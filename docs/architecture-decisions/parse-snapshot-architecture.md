@@ -361,8 +361,8 @@ Any reader that must resolve against **live** positions is position-critical
   remains for the backstop path and non-edit token changes. The `CancelToken`
   bail stays narrowed to reclaiming a superseded compute's CPU (§4).
 - **Serve-stale, passively refreshed** — whole-document, no-position reads:
-  `documentSymbol`, `documentColor`, plus the `whole_document_fan_out` family
-  (`documentLink`, `foldingRange`, `codeLens`), and pull-mode
+  `documentSymbol`, plus the `whole_document_fan_out` family
+  (`documentColor`, `documentLink`, `foldingRange`, `codeLens`), and pull-mode
   `textDocument/diagnostic` (the `virt_enabled` branch that calls
   `ensure_document_parsed`). `did_save`'s synthetic-diagnostic effect is likewise
   passive (a notification, not a request — its *diagnostics* may trail a snapshot,
@@ -718,8 +718,8 @@ Two Stage-2 pieces remain deliberately open:
   of serving stale: a stale read must never mint, and currency remains the
   way to guarantee that until those readers consume snapshot-owned region
   identity instead of minting.
-- Several notification-path consumers (pull diagnostics, `did_save`,
-  `documentSymbol`/`documentColor`) still read the legacy store tree after the
+- Several notification-path consumers (pull diagnostics, `did_save`, and
+  `documentSymbol`) still read the legacy store tree after the
   bounded current-wait; they migrate to `latest_snapshot` with the Stage-3
   consolidation.
 
