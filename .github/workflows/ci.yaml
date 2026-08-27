@@ -30,7 +30,8 @@ jobs:
       - run: make deps/tree-sitter
       - run: cargo test
       - run: cargo test --features e2e --test e2e e2e_type_hierarchy::
-      - run: cargo test --features e2e --test e2e e2e_host_bridge::e2e_document_colors_concatenate_virt_and_host_layers
+      - run: cargo test --features e2e --test e2e e2e_host_bridge::e2e_document_color
+      - run: cargo test --features e2e --test e2e e2e_host_bridge::e2e_color_presentation
 
   fmt:
     name: Format
