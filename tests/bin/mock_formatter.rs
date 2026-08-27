@@ -220,6 +220,16 @@ fn main() {
                         "documentLinkProvider": { "resolveProvider": false },
                         "textDocumentSync": 1
                     }),
+                    "inlay-hint-resolve"
+                    | "inlay-hint-resolve-replacement"
+                    | "inlay-hint-slow-resolve" => json!({
+                        "inlayHintProvider": { "resolveProvider": true },
+                        "textDocumentSync": 1
+                    }),
+                    "inlay-hint-no-resolve" | "inlay-hint-no-resolve-reserved-data" => json!({
+                        "inlayHintProvider": { "resolveProvider": false },
+                        "textDocumentSync": 1
+                    }),
                     "code-action" | "code-action-preferred" | "code-action-reopen-order" => json!({
                         "codeActionProvider": true,
                         "executeCommandProvider": { "commands": ["mock.run"] },
@@ -1451,6 +1461,71 @@ fn main() {
                             },
                             data["mock"].as_str().unwrap_or("?")
                         ),
+                        "data": data
+                    }),
+                );
+            }
+            "textDocument/inlayHint" => {
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        let data = if mode == "inlay-hint-no-resolve-reserved-data" {
+                            json!({ "kakehashi": { "origin": "downstream" } })
+                        } else {
+                            json!({ "mock": "hint-1", "uri": uri })
+                        };
+                        json!([{
+                            "position": { "line": 0, "character": 1 },
+                            "label": ": number",
+                            "data": data
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "inlayHint/resolve" => {
+                if mode == "inlay-hint-slow-resolve" {
+                    record_mock_event(&mode, "request", &message);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 2, "message": "inlay-hint-resolve-started" }),
+                    );
+                    continue;
+                }
+                let mut data = message
+                    .pointer("/params/data")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                data["receivedPosition"] = message
+                    .pointer("/params/position")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                respond(
+                    &mut writer,
+                    id,
+                    json!({
+                        "position": { "line": 9, "character": 9 },
+                        "label": ": number",
+                        "tooltip": format!(
+                            "{} resolved:{}",
+                            if mode == "inlay-hint-resolve-replacement" {
+                                "replacement"
+                            } else {
+                                "mock"
+                            },
+                            data["mock"].as_str().unwrap_or("?")
+                        ),
+                        "textEdits": [{
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 0 }
+                            },
+                            "newText": "resolved "
+                        }],
                         "data": data
                     }),
                 );
