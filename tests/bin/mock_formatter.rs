@@ -82,9 +82,9 @@
 //!   target/tooltip on `documentLink/resolve`.
 //! - `document-link-slow-host` / `document-link-slow-virt` — like
 //!   `document-link`, but sleeps before answering and records request-start
-//! - `document-color` — advertises `colorProvider` and returns one red color
-//!   for every open document.
 //!   and downstream `$/cancelRequest` markers under `MOCK_LSP_CANCEL_DIR`.
+//! - `document-color` — advertises `colorProvider`, returns one red color for
+//!   every open document, and presents it as `#ff0000`.
 //! - `diagnostics` — advertises `diagnosticProvider`; answers
 //!   `textDocument/diagnostic` with a full report carrying one diagnostic
 //!   that echoes the requested URI, but only for documents it received via
@@ -1548,6 +1548,22 @@ fn main() {
                                 "blue": 0.0,
                                 "alpha": 1.0
                             }
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "textDocument/colorPresentation" => {
+                let range = message.pointer("/params/range").cloned();
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .and(range)
+                    .map(|range| {
+                        json!([{
+                            "label": "#ff0000",
+                            "textEdit": { "range": range, "newText": "#ff0000" }
                         }])
                     })
                     .unwrap_or(Value::Null);

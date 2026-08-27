@@ -289,6 +289,32 @@ priorities = ["virt", "host"]
         "virt-layer documentColor should translate the injected lua line and column: {colors:?}"
     );
 
+    let presentation = client.send_request(
+        "textDocument/colorPresentation",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 4 }
+            },
+            "color": { "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 }
+        }),
+    );
+    assert_eq!(
+        presentation.pointer("/result/0"),
+        Some(&json!({
+            "label": "#ff0000",
+            "textEdit": {
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 4 }
+                },
+                "newText": "#ff0000"
+            }
+        })),
+        "a host document color should present through its host server: {presentation:?}"
+    );
+
     shutdown(&mut client);
 }
 
