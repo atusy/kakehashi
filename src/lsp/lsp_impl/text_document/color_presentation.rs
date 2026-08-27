@@ -62,13 +62,6 @@ impl Kakehashi {
 
         // Fan-out color presentation requests to all matching servers
         let pool = self.bridge.pool_arc();
-        // The virtual arm owns its downstream registry entries. Clean them on
-        // every exit, including a dropped layer future (dispatch_preferred
-        // aborts losers without joining).
-        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
-            pool.clone(),
-            ctx.document.upstream_request_id.clone(),
-        );
         let range = ctx.range;
         let result = dispatch_preferred(
             &ctx.document,

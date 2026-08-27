@@ -282,7 +282,9 @@ fn main() {
                         "documentLinkProvider": { "resolveProvider": false },
                         "textDocumentSync": 1
                     }),
-                    "document-color" => json!({
+                    "document-color"
+                    | "document-color-empty-presentation"
+                    | "document-color-slow-presentation" => json!({
                         "colorProvider": true,
                         "textDocumentSync": 1
                     }),
@@ -1554,19 +1556,27 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "textDocument/colorPresentation" => {
+                if mode == "document-color-slow-presentation" {
+                    record_mock_event(&mode, "request", &message);
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
                 let range = message.pointer("/params/range").cloned();
-                let result = message
-                    .pointer("/params/textDocument/uri")
-                    .and_then(Value::as_str)
-                    .filter(|uri| documents.contains_key(*uri))
-                    .and(range)
-                    .map(|range| {
-                        json!([{
-                            "label": "#ff0000",
-                            "textEdit": { "range": range, "newText": "#ff0000" }
-                        }])
-                    })
-                    .unwrap_or(Value::Null);
+                let result = if mode == "document-color-empty-presentation" {
+                    json!([])
+                } else {
+                    message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .filter(|uri| documents.contains_key(*uri))
+                        .and(range)
+                        .map(|range| {
+                            json!([{
+                                "label": "#ff0000",
+                                "textEdit": { "range": range, "newText": "#ff0000" }
+                            }])
+                        })
+                        .unwrap_or(Value::Null)
+                };
                 respond(&mut writer, id, result);
             }
             "documentLink/resolve" => {
