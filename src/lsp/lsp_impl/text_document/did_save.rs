@@ -24,14 +24,13 @@ impl Kakehashi {
             uri
         );
 
-        // Forward didSave to virt-bridge servers that have a virtual document
-        // open for this host and advertise `save` (#357). A save hook on a
-        // fenced language (e.g. a server caching dirty state) reacts here;
-        // willSaveWaitUntil stays host-only.
-        self.bridge
-            .pool_arc()
-            .forward_did_save_to_virtual_docs(&uri)
-            .await;
+        // Forward didSave to both bridge layers, in the same host-before-virt
+        // order as willSave. Each path only touches an already-open document
+        // and excludes servers that require save text, which kakehashi does not
+        // advertise upstream (#357).
+        let pool = self.bridge.pool_arc();
+        pool.notify_host_did_save(&uri).await;
+        pool.forward_did_save_to_virtual_docs(&uri).await;
 
         // Ensure a fresh tree before the synthetic task snapshots it: a save
         // batched right after an edit (autosave / format-on-save) races the

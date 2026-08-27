@@ -271,6 +271,20 @@ impl LanguageServerPool {
         .await;
     }
 
+    /// Forward a textless `textDocument/didSave` notification to every host
+    /// bridge server that already has this host document open and whose static
+    /// sync capability accepts saves without text.
+    pub(crate) async fn notify_host_did_save(&self, uri: &Url) {
+        let params = serde_json::json!({ "textDocument": { "uri": uri.as_str() } });
+        self.notify_open_host_documents(
+            uri,
+            "textDocument/didSave",
+            ConnectionHandle::accepts_textless_did_save,
+            &params,
+        )
+        .await;
+    }
+
     /// Notify every live host connection that already has `uri` open and
     /// satisfies the method-specific capability predicate.
     async fn notify_open_host_documents<P: serde::Serialize + ?Sized>(
