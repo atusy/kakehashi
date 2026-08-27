@@ -48,14 +48,18 @@ Partially implemented:
   translation and no injection-region edit guard), but only for a server that
   advertises `completionItem/resolve`. Without that capability the items stay
   bare and a resolve falls back gracefully (item returned unresolved).
-  `codeLens/resolve` follows the same host-layer rule: only a winning host
-  server that advertises resolve has its lenses stamped with an origin
-  envelope, and resolving one forwards the original payload and coordinates
-  verbatim. The envelope retains the host-document incarnation so a lens from
-  an earlier open is returned unresolved instead of being sent to a reopened
-  document. Ordinary downstream failures remain fail-soft, while an upstream
-  client cancellation returns `RequestCancelled` and cancels the in-flight
-  downstream resolve.
+  `codeLens/resolve` follows the same host-layer rule: a winning host server
+  that advertises resolve has its lenses stamped with an origin envelope, and
+  resolving one forwards the original payload and coordinates verbatim. A
+  non-resolving server's lens normally stays bare; the reserved-key collision
+  exception wraps `data.kakehashi` as opaque `inner` data so a downstream
+  payload cannot impersonate bridge routing metadata. The envelope retains
+  both the host-document incarnation and producing connection generation, so
+  an old lens is returned unresolved after either a document reopen or a
+  downstream process replacement. Resolve never spawns a replacement for
+  process-owned lens data. Ordinary downstream failures remain fail-soft,
+  while an upstream client cancellation returns `RequestCancelled` and
+  cancels the in-flight downstream resolve.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one
