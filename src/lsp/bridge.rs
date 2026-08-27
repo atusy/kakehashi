@@ -90,6 +90,7 @@ pub(crate) use text_document::{
     envelope_host_inlay_hints, envelope_host_type_hierarchy_items, extract_call_hierarchy_envelope,
     extract_code_action_envelope, extract_code_lens_envelope, extract_document_link_envelope,
     extract_envelope, extract_inlay_hint_envelope, parse_code_actions_leniently,
+    parse_type_hierarchy_items,
 };
 pub(crate) use text_document::{OpenExpectation, OpenOutcome};
 pub(crate) use workspace::WorkspaceFolderSet;

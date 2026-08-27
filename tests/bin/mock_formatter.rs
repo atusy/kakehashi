@@ -243,6 +243,9 @@ fn main() {
                         "typeHierarchyProvider": true,
                         "textDocumentSync": 1
                     }),
+                    "type-hierarchy-unsupported" => json!({
+                        "textDocumentSync": 1
+                    }),
                     "code-lens" | "code-lens-replacement" | "code-lens-slow-resolve" => json!({
                         "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
@@ -1619,6 +1622,9 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "textDocument/prepareTypeHierarchy" => {
+                let position = message
+                    .pointer("/params/position")
+                    .map(|position| format!("{}:{}", position["line"], position["character"]));
                 let result = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
@@ -1626,8 +1632,9 @@ fn main() {
                     .map(|uri| {
                         json!([{
                             "name": "MockChild",
-                            "detail": "prepared type",
+                            "detail": position,
                             "kind": 5,
+                            "tags": [1],
                             "uri": uri,
                             "range": {
                                 "start": { "line": 0, "character": 0 },

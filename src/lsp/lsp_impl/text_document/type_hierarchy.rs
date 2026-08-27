@@ -11,8 +11,8 @@ use crate::lsp::aggregation::server::{
 };
 use crate::lsp::bridge::{
     HostDocument, TypeHierarchyDocumentRevision, envelope_host_type_hierarchy_items,
+    parse_type_hierarchy_items,
 };
-use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
 
 const METHOD: &str = "textDocument/prepareTypeHierarchy";
 
@@ -76,8 +76,7 @@ impl Kakehashi {
                     let Some(raw) = raw else {
                         return Ok(None);
                     };
-                    let Some(items) = parse_host_verbatim::<Vec<TypeHierarchyItem>>(raw.value)
-                    else {
+                    let Ok(items) = parse_type_hierarchy_items(raw.value) else {
                         return Ok(None);
                     };
                     Ok(Some(HostTypeHierarchyItems {
