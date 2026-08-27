@@ -625,6 +625,9 @@ fn transform_call_hierarchy_incoming_response_to_host(
     let calls = calls
         .into_iter()
         .filter_map(|mut call| {
+            if VirtualDocumentUri::is_scratch_uri(call.from.uri.as_str()) {
+                return None;
+            }
             let projected_from_virtual = if known_virtual_uris.contains(call.from.uri.as_str()) {
                 if request_virtual_uri.as_deref() != Some(call.from.uri.as_str()) {
                     return None;
@@ -679,6 +682,9 @@ fn transform_call_hierarchy_outgoing_response_to_host(
                 for range in &mut call.from_ranges {
                     translate_virtual_range_to_host(range, &offset);
                 }
+            }
+            if VirtualDocumentUri::is_scratch_uri(call.to.uri.as_str()) {
+                return None;
             }
             let projected_from_virtual = if known_virtual_uris.contains(call.to.uri.as_str()) {
                 if request_virtual_uri.as_deref() != Some(call.to.uri.as_str()) {
@@ -1043,6 +1049,11 @@ mod tests {
         let envelope = incoming_test_envelope(&host_uri, &key);
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region");
         let other_virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "other");
+        let scratch_uri = VirtualDocumentUri::new(
+            &host_uri,
+            "lua",
+            &format!("region{}0-1", VirtualDocumentUri::SCRATCH_ID_MARKER),
+        );
         let virtual_item = json!({
             "name": "virtual", "kind": 12, "uri": virtual_uri.to_uri_string(),
             "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 3 } },
@@ -1063,16 +1074,20 @@ mod tests {
         });
         let mut cross_item = virtual_item.clone();
         cross_item["uri"] = json!(other_virtual_uri.to_uri_string());
+        let mut scratch_item = virtual_item.clone();
+        scratch_item["uri"] = json!(scratch_uri.to_uri_string());
         let response = json!({ "result": [
             { "from": virtual_item, "fromRanges": [{ "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 2 } }] },
             { "from": external_item, "fromRanges": [{ "start": { "line": 8, "character": 1 }, "end": { "line": 8, "character": 2 } }] },
             { "from": shaped_real_item, "fromRanges": [] },
-            { "from": cross_item, "fromRanges": [] }
+            { "from": cross_item, "fromRanges": [] },
+            { "from": scratch_item, "fromRanges": [] }
         ]});
 
         let known_virtual_uris = HashSet::from([
             virtual_uri.to_uri_string(),
             other_virtual_uri.to_uri_string(),
+            scratch_uri.to_uri_string(),
         ]);
 
         let calls = transform_call_hierarchy_incoming_response_to_host(
@@ -1111,6 +1126,11 @@ mod tests {
         let envelope = incoming_test_envelope(&host_uri, &key);
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region");
         let other_virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "other");
+        let scratch_uri = VirtualDocumentUri::new(
+            &host_uri,
+            "lua",
+            &format!("region{}0-1", VirtualDocumentUri::SCRATCH_ID_MARKER),
+        );
         let virtual_item = json!({
             "name": "virtual", "kind": 12, "uri": virtual_uri.to_uri_string(),
             "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 3 } },
@@ -1125,10 +1145,13 @@ mod tests {
         });
         let mut cross_item = virtual_item.clone();
         cross_item["uri"] = json!(other_virtual_uri.to_uri_string());
+        let mut scratch_item = virtual_item.clone();
+        scratch_item["uri"] = json!(scratch_uri.to_uri_string());
         let response = json!({ "result": [
             { "to": virtual_item, "fromRanges": [{ "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 2 } }] },
             { "to": external_item, "fromRanges": [{ "start": { "line": 0, "character": 2 }, "end": { "line": 0, "character": 3 } }] },
-            { "to": cross_item, "fromRanges": [] }
+            { "to": cross_item, "fromRanges": [] },
+            { "to": scratch_item, "fromRanges": [] }
         ]});
 
         let calls = transform_call_hierarchy_outgoing_response_to_host(
@@ -1139,6 +1162,7 @@ mod tests {
             &HashSet::from([
                 virtual_uri.to_uri_string(),
                 other_virtual_uri.to_uri_string(),
+                scratch_uri.to_uri_string(),
             ]),
         )
         .unwrap()

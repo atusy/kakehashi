@@ -294,10 +294,12 @@ impl DocumentTracker {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
         let generation = self.connection_generation(connection_key);
-        self.issued_virtual_uris
-            .entry((connection_key.clone(), generation))
-            .or_default()
-            .insert(uri_string.clone());
+        if !VirtualDocumentUri::is_scratch_uri(&uri_string) {
+            self.issued_virtual_uris
+                .entry((connection_key.clone(), generation))
+                .or_default()
+                .insert(uri_string.clone());
+        }
         for observer in self.virtual_uri_observers.iter() {
             if observer.connection_key == *connection_key && observer.generation == generation {
                 observer
@@ -2246,6 +2248,38 @@ mod tests {
             .observe_virtual_uris_for_connection(&key, generation)
             .await;
         assert!(observer.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scratch_uri_is_observed_in_flight_but_not_retained_in_generation_history() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let key = ConnectionKey::for_server("formatter");
+        let generation = tracker.connection_generation(&key);
+        let before = VirtualDocumentUri::new(
+            &url_to_uri(&host_uri),
+            "lua",
+            &format!("region{}0-1", VirtualDocumentUri::SCRATCH_ID_MARKER),
+        );
+        tracker
+            .register_opened_document(&host_uri, &before, &key)
+            .await;
+        tracker.untrack_document(&before, &key).await;
+
+        let observer = tracker
+            .observe_virtual_uris_for_connection(&key, generation)
+            .await;
+        assert!(!observer.snapshot().contains(&before.to_uri_string()));
+
+        let during = VirtualDocumentUri::new(
+            &url_to_uri(&host_uri),
+            "lua",
+            &format!("region{}0-2", VirtualDocumentUri::SCRATCH_ID_MARKER),
+        );
+        tracker
+            .register_opened_document(&host_uri, &during, &key)
+            .await;
+        assert!(observer.snapshot().contains(&during.to_uri_string()));
     }
 
     #[tokio::test]
