@@ -372,6 +372,12 @@ fn classify(req: &Request) -> Option<Role> {
                 uri: normalize_uri(raw),
             })
         }
+        "callHierarchy/incomingCalls" => {
+            let raw = req.params()?["item"]["data"]["kakehashi"]["host_uri"].as_str()?;
+            Some(Role::Reader {
+                uri: normalize_uri(raw),
+            })
+        }
         _ if method == "kakehashi/node" || method.starts_with("kakehashi/node/") => {
             let uri = text_document_uri(req)?;
             Some(Role::Reader { uri })
@@ -866,6 +872,33 @@ mod tests {
         assert!(
             matches!(classify(&enveloped_hint), Some(Role::Reader { ref uri }) if uri == URI),
             "enveloped inlayHint/resolve must be keyed by the envelope's host_uri"
+        );
+
+        let enveloped_call = Request::build("callHierarchy/incomingCalls")
+            .params(serde_json::json!({
+                "item": {
+                    "name": "f",
+                    "kind": 12,
+                    "uri": URI,
+                    "range": { "start": { "line": 0, "character": 0 },
+                               "end": { "line": 0, "character": 1 } },
+                    "selectionRange": { "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 1 } },
+                    "data": { "kakehashi": { "host_uri": URI } }
+                }
+            }))
+            .finish();
+        assert!(
+            matches!(classify(&enveloped_call), Some(Role::Reader { ref uri }) if uri == URI),
+            "enveloped callHierarchy/incomingCalls must be keyed by item.data host_uri"
+        );
+
+        let unenveloped_call = Request::build("callHierarchy/incomingCalls")
+            .params(serde_json::json!({ "item": { "data": { "custom": true } } }))
+            .finish();
+        assert!(
+            classify(&unenveloped_call).is_none(),
+            "unenveloped callHierarchy/incomingCalls passes through ungated"
         );
 
         // codeAction/resolve is classified the same way (#568): the URI comes
