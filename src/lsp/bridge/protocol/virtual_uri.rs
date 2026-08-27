@@ -182,7 +182,7 @@ impl VirtualDocumentUri {
         let filename = url.path_segments()?.next_back()?.to_string();
         let marker = filename.rfind(Self::SCRATCH_ID_MARKER)?;
         let suffix = &filename[marker + Self::SCRATCH_ID_MARKER.len()..];
-        let extension = suffix.rfind('.')?;
+        let extension = suffix.find('.')?;
         let (run, step) = suffix[..extension].split_once('-')?;
         let run_number = run.parse::<usize>().ok()?;
         let step_number = step.parse::<usize>().ok()?;
@@ -370,6 +370,22 @@ mod tests {
             VirtualDocumentUri::canonical_uri_for_scratch(scratch_with_suffix.as_str()),
             Some(canonical_with_suffix.to_string())
         );
+
+        for host_uri in [
+            url_to_uri(&Url::parse("file:///project/doc.md").unwrap()),
+            "untitled:test".parse().unwrap(),
+        ] {
+            let canonical = VirtualDocumentUri::new(&host_uri, "foo.bar", "region");
+            let scratch = VirtualDocumentUri::new(
+                &host_uri,
+                "foo.bar",
+                &format!("region{}3-4", VirtualDocumentUri::SCRATCH_ID_MARKER),
+            );
+            assert_eq!(
+                VirtualDocumentUri::canonical_uri_for_scratch(&scratch.to_uri_string()),
+                Some(canonical.to_uri_string())
+            );
+        }
     }
 
     #[test]
