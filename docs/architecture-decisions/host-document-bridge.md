@@ -95,6 +95,10 @@ Partially implemented:
     drops the virtual `didSave` instead of running a save hook on stale or later
     unsaved fragment text. At ingress, `didSave` is a per-document writer fence,
     so a later wire-order `didChange` cannot overtake save-time version capture.
+    Synthetic diagnostic collection registers an abortable background waiter
+    for that exact saved incarnation/version and snapshots only after its tree
+    is ready; parse or parser-install latency therefore neither blocks the
+    writer nor silently loses the save trigger.
 
   Each recipient is **gated per-server** on the relevant capability —
   `willSave` on `textDocumentSync.willSave`, `didSave` on `textDocumentSync.save`

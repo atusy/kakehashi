@@ -10,6 +10,7 @@ use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, HostRequestCo
 use url::Url;
 
 use crate::lsp::lsp_impl::Kakehashi;
+use crate::lsp::lsp_impl::snapshot_read::FIRST_PARSE_BACKSTOP;
 use crate::lsp::lsp_impl::text_document::publish_diagnostic::{
     DiagnosticSnapshot, DiagnosticSnapshotLineage, PullLayerOutcome, collect_push_diagnostics,
 };
@@ -78,6 +79,65 @@ pub(crate) struct DiagnosticScheduler {
     publisher: std::sync::Arc<super::DiagnosticPublisher>,
 }
 
+async fn collect_and_publish_synthetic_diagnostics(
+    snapshot_data: Option<DiagnosticSnapshot>,
+    bridge_pool: std::sync::Arc<crate::lsp::bridge::LanguageServerPool>,
+    publisher: std::sync::Arc<super::DiagnosticPublisher>,
+    uri: Url,
+) {
+    let diagnostics = collect_push_diagnostics(snapshot_data, &bridge_pool, &uri, LOG_TARGET).await;
+
+    match diagnostics {
+        PullLayerOutcome::Skip => {}
+        PullLayerOutcome::Clear => publisher.clear_pull_layer(&uri).await,
+        PullLayerOutcome::Publish(diagnostics) => {
+            log::debug!(
+                target: LOG_TARGET,
+                "Collected {} pull-layer diagnostics for {}",
+                diagnostics.len(),
+                uri
+            );
+            publisher.publish_pull_layer(&uri, diagnostics).await;
+        }
+    }
+}
+
+async fn wait_for_expected_diagnostic_tree(
+    documents: &DocumentStore,
+    uri: &Url,
+    expected_incarnation: u64,
+    expected_content_version: u64,
+) -> bool {
+    let wait = async {
+        loop {
+            // Subscribe before checking to avoid losing a parse publication
+            // between the state read and `changed()`.
+            let Some(mut receiver) = documents.subscribe_snapshots(uri) else {
+                return false;
+            };
+            let Some(document) = documents.get(uri) else {
+                return false;
+            };
+            if document.incarnation() != expected_incarnation
+                || document.content_version() != expected_content_version
+            {
+                return false;
+            }
+            let tree_is_ready = document.tree().is_some();
+            drop(document);
+            if tree_is_ready {
+                return true;
+            }
+            if receiver.changed().await.is_err() {
+                return false;
+            }
+        }
+    };
+    tokio::time::timeout(FIRST_PARSE_BACKSTOP, wait)
+        .await
+        .unwrap_or(false)
+}
+
 impl DiagnosticScheduler {
     pub(crate) fn new(server: &Kakehashi) -> Self {
         Self {
@@ -129,28 +189,57 @@ impl DiagnosticScheduler {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
         let bridge_pool = self.bridge.pool_arc();
         let publisher = std::sync::Arc::clone(&self.publisher);
-        let uri_clone = uri.clone();
+        let task_uri = uri.clone();
 
         let task = tokio::spawn(async move {
-            let diagnostics =
-                collect_push_diagnostics(snapshot_data, &bridge_pool, &uri_clone, LOG_TARGET).await;
+            collect_and_publish_synthetic_diagnostics(
+                snapshot_data,
+                bridge_pool,
+                publisher,
+                task_uri,
+            )
+            .await;
+        });
 
-            // Feed the host-event pull outcome into the cache and republish the
-            // merged set (push-propagation-diagnostic-forwarding) instead of
-            // publishing directly — push slots for the same host survive.
-            match diagnostics {
-                PullLayerOutcome::Skip => {}
-                PullLayerOutcome::Clear => publisher.clear_pull_layer(&uri_clone).await,
-                PullLayerOutcome::Publish(diagnostics) => {
-                    log::debug!(
-                        target: LOG_TARGET,
-                        "Collected {} pull-layer diagnostics for {}",
-                        diagnostics.len(),
-                        uri_clone
-                    );
-                    publisher.publish_pull_layer(&uri_clone, diagnostics).await;
-                }
+        self.synthetic_diagnostics
+            .register_task(uri, task.abort_handle());
+    }
+
+    /// Spawn the didSave diagnostic pull immediately, but defer snapshotting
+    /// until the exact saved document version has a tree. The wait runs off
+    /// ingress and is registered with the synthetic-task manager, so a later
+    /// save, close, or shutdown supersedes it without blocking the writer.
+    pub(crate) fn spawn_synthetic_diagnostic_task_when_current(
+        &self,
+        uri: Url,
+        expected_incarnation: u64,
+        expected_content_version: u64,
+    ) {
+        let documents = std::sync::Arc::clone(&self.documents);
+        let snapshot_preparer = self.snapshot_preparer.clone();
+        let bridge_pool = self.bridge.pool_arc();
+        let publisher = std::sync::Arc::clone(&self.publisher);
+        let task_uri = uri.clone();
+
+        let task = tokio::spawn(async move {
+            if !wait_for_expected_diagnostic_tree(
+                &documents,
+                &task_uri,
+                expected_incarnation,
+                expected_content_version,
+            )
+            .await
+            {
+                return;
             }
+            let snapshot_data = snapshot_preparer.prepare_diagnostic_snapshot(&task_uri);
+            collect_and_publish_synthetic_diagnostics(
+                snapshot_data,
+                bridge_pool,
+                publisher,
+                task_uri,
+            )
+            .await;
         });
 
         self.synthetic_diagnostics
@@ -456,3 +545,74 @@ impl DiagnosticSnapshotPreparer {
 
 /// Logging target for synthetic push diagnostics.
 const LOG_TARGET: &str = "kakehashi::synthetic_diag";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn saved_diagnostic_wait_survives_the_virtual_settle_budget() {
+        let documents = DocumentStore::new();
+        let uri = Url::parse("file:///test/delayed-save.md").unwrap();
+        let text = "# delayed\n";
+        let incarnation = documents.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let document = documents.get(&uri).unwrap();
+        let expected_text = document.text_arc();
+        let content_version = document.content_version();
+        drop(document);
+
+        let mut wait = Box::pin(wait_for_expected_diagnostic_tree(
+            &documents,
+            &uri,
+            incarnation,
+            content_version,
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut wait)
+                .await
+                .is_err(),
+            "diagnostic readiness must not be abandoned at the 200ms virtual-save budget"
+        );
+
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        assert!(documents.set_parse_result_if_inputs_unchanged(
+            &uri,
+            &expected_text,
+            incarnation,
+            content_version,
+            Some("markdown"),
+            Some(tree.clone()),
+        ));
+        let snapshot = crate::document::snapshot::ParseSnapshot {
+            text: expected_text,
+            tree: Some(tree),
+            language: Some("markdown".to_string()),
+            parsed_version: content_version,
+            incarnation,
+            injection_regions: None,
+            bridge_regions: None,
+            resolved_regions: None,
+            layer_trees: std::sync::OnceLock::new(),
+        };
+        assert!(
+            documents
+                .get(&uri)
+                .unwrap()
+                .publish_snapshot(std::sync::Arc::new(snapshot))
+        );
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait)
+                .await
+                .expect("tree publication must release the diagnostic waiter")
+        );
+    }
+}

@@ -79,16 +79,17 @@ impl Kakehashi {
         // otherwise an immediate save can overtake its projected didChange and
         // run the downstream save hook against stale fragment text. If the
         // bounded settle fails, omit didSave rather than violate that contract.
-        if let Some((_, saved_incarnation, saved_content_version)) = saved_document {
+        if let Some((_, saved_incarnation, saved_content_version)) = &saved_document {
             let saved_snapshot_is_current =
-                saved_parse_is_current(self, &uri, saved_incarnation, saved_content_version).await;
+                saved_parse_is_current(self, &uri, *saved_incarnation, *saved_content_version)
+                    .await;
 
             if saved_snapshot_is_current {
                 let edit_lock = self.documents.edit_lock(&uri);
                 let edit_guard = edit_lock.lock().await;
                 let still_saved_version = self.documents.get(&uri).is_some_and(|document| {
-                    document.incarnation() == saved_incarnation
-                        && document.content_version() == saved_content_version
+                    document.incarnation() == *saved_incarnation
+                        && document.content_version() == *saved_content_version
                 });
                 if still_saved_version
                     && let Some((_, injections)) =
@@ -96,7 +97,7 @@ impl Kakehashi {
                 {
                     pool.sync_and_forward_did_save_to_virtual_docs(
                         &uri,
-                        saved_incarnation,
+                        *saved_incarnation,
                         &injections,
                     )
                     .await;
@@ -105,20 +106,18 @@ impl Kakehashi {
             }
         }
 
-        // Ensure a fresh tree before the synthetic task snapshots it: a save
-        // batched right after an edit (autosave / format-on-save) races the
-        // off-ingress reparse, and `prepare_diagnostic_snapshot` returns `None`
-        // without a tree — making the synthetic diagnostic a no-op for the virt
-        // layer.
-        let _ = tokio::time::timeout(
-            VIRTUAL_SAVE_SETTLE_BUDGET,
-            self.ensure_document_parsed(&uri),
-        )
-        .await;
-
-        // Spawn background task for synthetic diagnostic collection
-        self.diagnostic_scheduler()
-            .spawn_synthetic_diagnostic_task(uri);
+        // Register diagnostic collection immediately, but keep its parse wait
+        // off-ingress. This preserves the saved-version trigger even when
+        // parsing exceeds the virtual forwarding budget, while a later save,
+        // edit, close, or shutdown can still supersede the background task.
+        if let Some((_, saved_incarnation, saved_content_version)) = saved_document {
+            self.diagnostic_scheduler()
+                .spawn_synthetic_diagnostic_task_when_current(
+                    uri,
+                    saved_incarnation,
+                    saved_content_version,
+                );
+        }
 
         self.notifier().log_info("file saved!").await;
     }
@@ -174,8 +173,8 @@ mod tests {
         let started = tokio::time::Instant::now();
         server.did_save_impl(params).await;
         assert!(
-            started.elapsed() <= VIRTUAL_SAVE_SETTLE_BUDGET * 2,
-            "both save-time waits must remain hard-bounded"
+            started.elapsed() <= VIRTUAL_SAVE_SETTLE_BUDGET,
+            "diagnostic parse waiting must stay off the ingress writer"
         );
     }
 
