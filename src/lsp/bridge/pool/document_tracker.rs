@@ -736,9 +736,10 @@ impl DocumentTracker {
     /// Observe confirmed virtual URIs for an in-flight request.
     ///
     /// Callers that need an enqueue-consistent namespace hold the pool's
-    /// `connections` admission guard across this synchronous registration and
-    /// request enqueue. There is no cancellation point after observer insertion.
-    pub(super) fn observe_virtual_uris_for_connection(
+    /// `connections` admission guard across this registration and request
+    /// enqueue. Observer insertion happens only after the single seed await, so
+    /// cancellation cannot strand an entry.
+    pub(super) async fn observe_virtual_uris_for_connection(
         &self,
         connection_key: &ConnectionKey,
         generation: u64,
@@ -747,29 +748,33 @@ impl DocumentTracker {
             .next_virtual_uri_observer_id
             .fetch_add(1, Ordering::Relaxed);
         let uris = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        if self.connection_generation(connection_key) == generation {
+            let versions = self.document_versions.lock().await;
+            if let Some(documents) = versions.get(connection_key) {
+                let issued = documents.keys().filter(|uri| {
+                    !self
+                        .open_claims
+                        .contains_key(&(connection_key.clone(), (*uri).clone()))
+                });
+                uris.lock()
+                    .recover_poison("VirtualUriObserver::seed")
+                    .extend(issued.cloned());
+            }
+        }
+        let observer = VirtualUriObserver {
+            id,
+            observers: Arc::clone(&self.virtual_uri_observers),
+            uris: Arc::clone(&uris),
+        };
         self.virtual_uri_observers.insert(
             id,
             VirtualUriObserverState {
                 connection_key: connection_key.clone(),
                 generation,
-                uris: Arc::clone(&uris),
+                uris,
             },
         );
-        if self.connection_generation(connection_key) == generation {
-            let confirmed = self
-                .virtual_to_servers
-                .iter()
-                .filter(|entry| entry.value().contains(connection_key))
-                .map(|entry| entry.key().clone());
-            uris.lock()
-                .recover_poison("VirtualUriObserver::seed")
-                .extend(confirmed);
-        }
-        VirtualUriObserver {
-            id,
-            observers: Arc::clone(&self.virtual_uri_observers),
-            uris,
-        }
+        observer
     }
 
     /// Remove and return all virtual documents for a host URI.
@@ -2217,7 +2222,9 @@ mod tests {
         tracker
             .register_opened_document(&host_uri, &virtual_uri, &key)
             .await;
-        let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
+        let observer = tracker
+            .observe_virtual_uris_for_connection(&key, generation)
+            .await;
         tracker.untrack_document(&virtual_uri, &key).await;
 
         assert!(observer.snapshot().contains(&virtual_uri.to_uri_string()));
@@ -2234,8 +2241,9 @@ mod tests {
         let key = ConnectionKey::for_server("lua");
         assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
 
-        let observer =
-            tracker.observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key));
+        let observer = tracker
+            .observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key))
+            .await;
 
         assert!(!observer.snapshot().contains(&virtual_uri.to_uri_string()));
         tracker.unclaim_document(&virtual_uri, &key).await;
