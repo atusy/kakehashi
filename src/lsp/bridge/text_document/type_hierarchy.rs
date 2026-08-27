@@ -850,6 +850,110 @@ mod tests {
     }
 
     #[test]
+    fn expansion_response_filters_an_issued_sibling_virtual_uri() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("lua-ls");
+        let envelope = test_envelope(&host_uri, &key);
+        let request_uri = VirtualDocumentUri::new(&host_uri, "lua", "region");
+        let sibling_uri = VirtualDocumentUri::new(&host_uri, "lua", "sibling");
+        let response = serde_json::json!({ "result": [{
+            "name": "Sibling", "kind": 5, "uri": sibling_uri.to_uri_string(),
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 7 } },
+            "selectionRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 7 } }
+        }]});
+        let known_virtual_uris =
+            HashSet::from([request_uri.to_uri_string(), sibling_uri.to_uri_string()]);
+
+        let items = transform_type_hierarchy_expansion_response_to_host(
+            response,
+            "typeHierarchy/supertypes",
+            Some(request_uri.to_uri_string()),
+            &host_uri,
+            &envelope,
+            &known_virtual_uris,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn expansion_response_preserves_unissued_virtual_shaped_real_uri() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("lua-ls");
+        let envelope = test_envelope(&host_uri, &key);
+        let request_uri = VirtualDocumentUri::new(&host_uri, "lua", "region");
+        let shaped_real_uri = "file:///external/kakehashi-virtual-uri-real.lua";
+        let response = serde_json::json!({ "result": [{
+            "name": "External", "kind": 5, "uri": shaped_real_uri,
+            "range": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 8 } },
+            "selectionRange": { "start": { "line": 8, "character": 0 }, "end": { "line": 8, "character": 8 } }
+        }]});
+        let known_virtual_uris = HashSet::from([request_uri.to_uri_string()]);
+
+        let items = transform_type_hierarchy_expansion_response_to_host(
+            response,
+            "typeHierarchy/supertypes",
+            Some(request_uri.to_uri_string()),
+            &host_uri,
+            &envelope,
+            &known_virtual_uris,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(items[0].uri.as_str(), shaped_real_uri);
+        assert_eq!(items[0].range.start, Position::new(8, 0));
+        assert_eq!(
+            items[0].data.as_ref().unwrap()["kakehashi"]["projected_from_virtual"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn expansion_response_reenvelope_routes_the_next_request_recursively() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("lua-ls");
+        let envelope = test_envelope(&host_uri, &key);
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region");
+        let response = serde_json::json!({ "result": [{
+            "name": "Parent", "kind": 5, "uri": virtual_uri.to_uri_string(),
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 6 } },
+            "selectionRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 6 } },
+            "data": { "token": "parent" }
+        }]});
+        let known_virtual_uris = HashSet::from([virtual_uri.to_uri_string()]);
+        let item = transform_type_hierarchy_expansion_response_to_host(
+            response,
+            "typeHierarchy/supertypes",
+            Some(virtual_uri.to_uri_string()),
+            &host_uri,
+            &envelope,
+            &known_virtual_uris,
+        )
+        .unwrap()
+        .unwrap()
+        .remove(0);
+        assert_eq!(item.uri, host_uri);
+        assert_eq!(item.range.start, Position::new(3, 2));
+
+        let params: TypeHierarchySupertypesParams =
+            serde_json::from_value(serde_json::json!({ "item": item })).unwrap();
+        let (params, next_envelope) = prepare_supertypes_params(params).unwrap();
+        let downstream =
+            type_hierarchy_item_to_downstream(params.item, &next_envelope, Some(&virtual_uri));
+        let downstream = serde_json::to_value(downstream).unwrap();
+
+        assert_eq!(downstream["uri"], virtual_uri.to_uri_string());
+        assert_eq!(
+            downstream["range"]["start"],
+            serde_json::json!({ "line": 0, "character": 0 })
+        );
+        assert_eq!(downstream["data"], serde_json::json!({ "token": "parent" }));
+    }
+
+    #[test]
     fn prepare_response_accepts_protocol_array_tags() {
         let value = serde_json::json!([{
             "name": "Deprecated", "kind": 5, "tags": [1], "uri": "file:///type.lua",

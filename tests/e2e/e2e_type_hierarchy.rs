@@ -1,4 +1,4 @@
-//! End-to-end coverage for type-hierarchy preparation.
+//! End-to-end coverage for staged type-hierarchy routing.
 
 use std::time::Duration;
 
@@ -25,6 +25,7 @@ fn init_client_with_mode(
         .arg("--config-file")
         .arg(config_path.to_str().expect("UTF-8 config path"));
     let builder = match wire_log {
+        Some(path) if path.is_dir() => builder.env("MOCK_LSP_CANCEL_DIR", path.to_string_lossy()),
         Some(path) => builder.env("MOCK_LSP_WIRE_LOG", path.to_string_lossy()),
         None => builder,
     };
@@ -57,7 +58,7 @@ fn init_client_with_mode(
         initialized["result"]["capabilities"]
             .get("typeHierarchyProvider")
             .is_none(),
-        "prepare-only stack must not advertise the incomplete hierarchy surface"
+        "prepare+supertypes stack must not advertise until subtypes lands"
     );
     client.send_notification("initialized", json!({}));
     (client, config_dir)
@@ -136,6 +137,20 @@ fn supertypes(client: &mut LspClient, item: Value) -> Vec<Value> {
         .expect("supertype array")
 }
 
+fn wait_for_log_message(client: &mut LspClient, needle: &str) -> Option<Value> {
+    for _ in 0..20 {
+        let message = client.wait_for_notification("window/logMessage", Duration::from_secs(1));
+        if message.as_ref().is_some_and(|params| {
+            params["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(needle))
+        }) {
+            return message;
+        }
+    }
+    None
+}
+
 #[test]
 fn supertypes_restore_the_virtual_item_and_re_envelope_results() {
     let (mut client, _config_dir) = init_client(false);
@@ -163,6 +178,13 @@ fn supertypes_restore_the_virtual_item_and_re_envelope_results() {
     assert_eq!(
         parent["data"]["kakehashi"]["inner"],
         json!({ "mock": "parent-item" })
+    );
+    let grandparent = supertypes(&mut client, parent).remove(0);
+    assert_eq!(grandparent["name"], "MockGrandparent");
+    assert_eq!(grandparent["uri"], uri);
+    assert_eq!(
+        grandparent["data"]["kakehashi"]["inner"],
+        json!({ "mock": "grandparent-item" })
     );
     shutdown(&mut client);
 }
@@ -206,6 +228,276 @@ fn supertypes_without_a_routing_envelope_return_null() {
     );
     assert_eq!(response["result"], Value::Null);
     shutdown(&mut client);
+}
+
+fn assert_supertypes_discard_response_after_document_change(host_layer: bool) {
+    let (mut client, _config_dir) =
+        init_client_with_mode(host_layer, "type-hierarchy-delayed-supertypes", None);
+    let (uri, language_id, text, line, character) = if host_layer {
+        (
+            "file:///test_delayed_supertype.lua",
+            "lua",
+            "MockChild\n",
+            0,
+            1,
+        )
+    } else {
+        (
+            "file:///test_delayed_supertype.md",
+            "markdown",
+            "```lua\nMockChild\n```\n",
+            1,
+            1,
+        )
+    };
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": language_id, "version": 1, "text": text
+        }}),
+    );
+    let item = prepare(&mut client, uri, line, character).remove(0);
+
+    let request_id = client.send_request_async("typeHierarchy/supertypes", json!({ "item": item }));
+    assert!(
+        wait_for_log_message(&mut client, "type-hierarchy-supertypes-started").is_some(),
+        "downstream request must reach the sent-state barrier"
+    );
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": text.replace("MockChild", "Changed") }]
+        }),
+    );
+    let response = client.receive_response_for_id_public(request_id);
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
+#[test]
+fn supertypes_discard_stale_responses_for_both_layers() {
+    assert_supertypes_discard_response_after_document_change(false);
+    assert_supertypes_discard_response_after_document_change(true);
+}
+
+fn assert_supertypes_cancel_targets_exact_downstream_request(host_layer: bool) {
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let request_file = event_dir
+        .path()
+        .join("type-hierarchy-slow-supertypes.request.json");
+    let cancel_file = event_dir
+        .path()
+        .join("type-hierarchy-slow-supertypes.cancel.json");
+    let (mut client, _config_dir) = init_client_with_mode(
+        host_layer,
+        "type-hierarchy-slow-supertypes",
+        Some(event_dir.path()),
+    );
+    let (uri, language_id, text, line, character) = if host_layer {
+        (
+            "file:///test_cancel_supertype.lua",
+            "lua",
+            "MockChild\n",
+            0,
+            1,
+        )
+    } else {
+        (
+            "file:///test_cancel_supertype.md",
+            "markdown",
+            "```lua\nMockChild\n```\n",
+            1,
+            1,
+        )
+    };
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": language_id, "version": 1, "text": text
+        }}),
+    );
+    let item = prepare(&mut client, uri, line, character).remove(0);
+
+    let request_id = client.send_request_async("typeHierarchy/supertypes", json!({ "item": item }));
+    assert!(
+        wait_for_log_message(&mut client, "type-hierarchy-supertypes-started").is_some(),
+        "downstream request must start"
+    );
+    assert!(request_file.exists(), "downstream request must be recorded");
+    client.send_notification("$/cancelRequest", json!({ "id": request_id }));
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(response["error"]["code"], -32800, "{response}");
+    let forwarded = (0..200).any(|_| {
+        if cancel_file.exists() {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+            false
+        }
+    });
+    assert!(forwarded, "cancel must reach downstream");
+    let request: Value = serde_json::from_slice(&std::fs::read(request_file).unwrap()).unwrap();
+    let cancel: Value = serde_json::from_slice(&std::fs::read(cancel_file).unwrap()).unwrap();
+    assert_eq!(cancel["params"]["id"], request["id"]);
+    shutdown(&mut client);
+}
+
+#[test]
+fn supertypes_cancel_exact_downstream_request_for_both_layers() {
+    assert_supertypes_cancel_targets_exact_downstream_request(false);
+    assert_supertypes_cancel_targets_exact_downstream_request(true);
+}
+
+fn assert_replaced_supertype_producer_fails_soft(host_layer: bool, change_pool_key: bool) {
+    let (mut client, _config_dir) = init_client(host_layer);
+    let (uri, language_id, text, line, character) = if host_layer {
+        (
+            "file:///test_replace_supertype.lua",
+            "lua",
+            "MockChild\n",
+            0,
+            1,
+        )
+    } else {
+        (
+            "file:///test_replace_supertype.md",
+            "markdown",
+            "```lua\nMockChild\n```\n",
+            1,
+            1,
+        )
+    };
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri, "languageId": language_id, "version": 1, "text": text
+        }}),
+    );
+    let old_item = prepare(&mut client, uri, line, character).remove(0);
+
+    let mut server = json!({
+        "cmd": [mock_formatter_bin(), "type-hierarchy-replacement"],
+        "languages": ["lua"]
+    });
+    if change_pool_key {
+        server["preferSharedInstance"] = json!(true);
+    }
+    let mut settings = json!({ "languageServers": { "mock-type-hierarchy": server } });
+    if host_layer {
+        settings["languages"] = json!({
+            "lua": { "bridge": { "_self": { "enabled": true } } }
+        });
+    }
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": settings }),
+    );
+    if !host_layer {
+        client.send_notification(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": uri } }),
+        );
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({ "textDocument": {
+                "uri": uri, "languageId": language_id, "version": 1, "text": text
+            }}),
+        );
+    }
+    let replacement_item = prepare(&mut client, uri, line, character).remove(0);
+    let old_envelope = &old_item["data"]["kakehashi"];
+    let replacement_envelope = &replacement_item["data"]["kakehashi"];
+    if change_pool_key {
+        assert_ne!(
+            old_envelope["connection_key"],
+            replacement_envelope["connection_key"]
+        );
+        assert_eq!(
+            old_envelope["connection_generation"],
+            replacement_envelope["connection_generation"]
+        );
+    } else {
+        assert_eq!(
+            old_envelope["connection_key"],
+            replacement_envelope["connection_key"]
+        );
+        assert_ne!(
+            old_envelope["connection_generation"],
+            replacement_envelope["connection_generation"]
+        );
+    }
+    assert_eq!(supertypes(&mut client, replacement_item.clone()).len(), 1);
+    let mut stale_item = replacement_item;
+    stale_item["data"]["kakehashi"]["connection_key"] = old_envelope["connection_key"].clone();
+    stale_item["data"]["kakehashi"]["connection_generation"] =
+        old_envelope["connection_generation"].clone();
+    stale_item["data"]["kakehashi"]["inner"] = old_envelope["inner"].clone();
+    let response = client.send_request("typeHierarchy/supertypes", json!({ "item": stale_item }));
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
+#[test]
+fn supertypes_reject_replaced_producers_for_both_layers_and_key_shapes() {
+    for host_layer in [false, true] {
+        assert_replaced_supertype_producer_fails_soft(host_layer, false);
+        assert_replaced_supertype_producer_fails_soft(host_layer, true);
+    }
+}
+
+fn assert_reopened_supertype_item_fails_soft(host_layer: bool) {
+    let (mut client, _config_dir) = init_client(host_layer);
+    let (uri, language_id, text, line, character) = if host_layer {
+        (
+            "file:///test_reopen_supertype.lua",
+            "lua",
+            "MockChild\n",
+            0,
+            1,
+        )
+    } else {
+        (
+            "file:///test_reopen_supertype.md",
+            "markdown",
+            "```lua\nMockChild\n```\n",
+            1,
+            1,
+        )
+    };
+    let open = |client: &mut LspClient| {
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({ "textDocument": {
+                "uri": uri, "languageId": language_id, "version": 1, "text": text
+            }}),
+        );
+    };
+    open(&mut client);
+    let old_item = prepare(&mut client, uri, line, character).remove(0);
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    open(&mut client);
+    let current_item = prepare(&mut client, uri, line, character).remove(0);
+    assert_ne!(
+        old_item["data"]["kakehashi"]["incarnation"],
+        current_item["data"]["kakehashi"]["incarnation"]
+    );
+    assert_eq!(supertypes(&mut client, current_item).len(), 1);
+    let response = client.send_request("typeHierarchy/supertypes", json!({ "item": old_item }));
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], Value::Null);
+    shutdown(&mut client);
+}
+
+#[test]
+fn supertypes_reject_items_from_reopened_documents_for_both_layers() {
+    assert_reopened_supertype_item_fails_soft(false);
+    assert_reopened_supertype_item_fails_soft(true);
 }
 
 #[test]
