@@ -319,7 +319,7 @@ enum Role {
 /// wire — but their params carry no `textDocument`, so the URI comes from the
 /// routing envelope (`params.data` for resolve methods and `params.item.data`
 /// for hierarchy expansion). Unenveloped items pass through ungated; resolve
-/// handlers return their inputs unchanged, while call-hierarchy expansion returns
+/// handlers return their inputs unchanged, while hierarchy expansion returns
 /// `null` because it has no producer to expand. The
 /// full `kakehashi/node` family is gated too (#698). Its tracker and
 /// incarnation checks catch staleness only after a lifecycle writer has run;
