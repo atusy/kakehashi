@@ -25,12 +25,6 @@ use crate::lsp::bridge::protocol::JsonRpcNotification;
 /// to `ErrorKind::BrokenPipe` (channel closed) and `ErrorKind::WouldBlock`
 /// (channel full — non-blocking backpressure).
 pub(crate) trait MessageSender: Send {
-    /// Whether confirmed scratch opens need exact generation-scoped
-    /// provenance for call-hierarchy response classification.
-    fn retains_scratch_call_hierarchy_provenance(&self) -> bool {
-        false
-    }
-
     /// Send a notification to the downstream language server.
     ///
     /// Accepts typed `JsonRpcNotification<P>` to ensure callers provide
@@ -81,10 +75,6 @@ pub(crate) struct ConnectionHandleSender<'a>(pub(crate) &'a Arc<ConnectionHandle
 // - ChannelClosed -> BrokenPipe (terminal failure)
 // - SerializationFailed -> InvalidData (bug in caller)
 impl MessageSender for ConnectionHandleSender<'_> {
-    fn retains_scratch_call_hierarchy_provenance(&self) -> bool {
-        self.0.has_capability("textDocument/prepareCallHierarchy")
-    }
-
     async fn send_notification<P: serde::Serialize + Send>(
         &mut self,
         notification: JsonRpcNotification<P>,
