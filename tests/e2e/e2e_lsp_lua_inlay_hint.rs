@@ -582,6 +582,56 @@ fn e2e_inlay_hint_reserved_data_collision_round_trips_on_both_layers() {
 }
 
 #[test]
+fn e2e_inlay_hint_from_closed_incarnation_stays_unresolved_on_both_layers() {
+    for host in [false, true] {
+        let (mut client, _config_dir) =
+            init_mock_inlay_hint_client("inlay-hint-resolve", "lua", host, None);
+        let uri = if host {
+            "file:///test_reopen_host_inlay_hint.lua"
+        } else {
+            "file:///test_reopen_virtual_inlay_hint.md"
+        };
+        let (language_id, text, start, end) = if host {
+            ("lua", "local x = 1\n", 0, 1)
+        } else {
+            ("markdown", "```lua\nlocal x = 1\n```\n", 1, 3)
+        };
+        let open = |client: &mut LspClient| {
+            client.send_notification(
+                "textDocument/didOpen",
+                json!({ "textDocument": {
+                    "uri": uri, "languageId": language_id, "version": 1, "text": text
+                }}),
+            );
+        };
+        open(&mut client);
+        let old_hint = inlay_hints_with_retry(&mut client, uri, start, end).remove(0);
+        client.send_notification(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": uri } }),
+        );
+        open(&mut client);
+        let current_hint = inlay_hints_with_retry(&mut client, uri, start, end).remove(0);
+        let old_envelope = &old_hint["data"]["kakehashi"];
+        let current_envelope = &current_hint["data"]["kakehashi"];
+        assert_eq!(
+            old_envelope["connection_key"],
+            current_envelope["connection_key"]
+        );
+        assert_eq!(
+            old_envelope["connection_generation"],
+            current_envelope["connection_generation"]
+        );
+        assert_ne!(old_envelope["incarnation"], current_envelope["incarnation"]);
+
+        let response = client.send_request("inlayHint/resolve", old_hint.clone());
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"], old_hint);
+        shutdown_client(&mut client);
+    }
+}
+
+#[test]
 fn e2e_host_inlay_hint_resolve_cancel_targets_downstream_request() {
     let cancel_dir = tempfile::TempDir::new().expect("cancel dir");
     let request_file = cancel_dir
