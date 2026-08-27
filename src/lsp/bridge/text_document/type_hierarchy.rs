@@ -207,10 +207,25 @@ impl LanguageServerPool {
                 if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
                     observer.insert(uri);
                 }
-                (
-                    handle.send_request(request, request_id).map_err(Into::into),
-                    Some(observer),
-                )
+                let queued = if handle.has_static_type_hierarchy_provider() {
+                    Some(handle.send_request(request, request_id))
+                } else {
+                    handle
+                        .dynamic_capabilities()
+                        .with_registration("textDocument/prepareTypeHierarchy", || {
+                            handle.send_request(request, request_id)
+                        })
+                };
+                match queued {
+                    Some(result) => (result.map_err(Into::into), Some(observer)),
+                    None => (
+                        Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "type hierarchy provider was unregistered before supertypes send",
+                        )),
+                        None,
+                    ),
+                }
             }
         };
         if let Err(error) = send_result {
@@ -1169,20 +1184,24 @@ mod tests {
         }))
         .unwrap();
 
-        let result = pool
-            .send_type_hierarchy_supertypes_request(
+        let upstream_id = UpstreamId::Number(81);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool.send_type_hierarchy_supertypes_request(
                 &BridgeServerConfig::default(),
                 params,
                 envelope,
-                None,
-            )
-            .await;
+                Some(upstream_id.clone()),
+            ),
+        )
+        .await
+        .expect("unregistered provider must fail without waiting for a response");
 
         assert!(result.is_none());
         assert!(
             handle
                 .router()
-                .lookup_downstream_ids(&UpstreamId::Number(1))
+                .lookup_downstream_ids(&upstream_id)
                 .is_empty()
         );
     }

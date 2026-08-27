@@ -629,6 +629,10 @@ impl ConnectionHandle {
             .store(supported, Ordering::Release);
     }
 
+    pub(crate) fn has_static_type_hierarchy_provider(&self) -> bool {
+        self.type_hierarchy_provider.load(Ordering::Acquire)
+    }
+
     /// Access the server capabilities from the initialize response.
     ///
     /// Returns `None` if capabilities haven't been set yet (server still initializing).
@@ -822,9 +826,7 @@ impl ConnectionHandle {
                         | tower_lsp_server::ls_types::CallHierarchyServerCapability::Options(_)
                 )
             ),
-            "textDocument/prepareTypeHierarchy" => {
-                self.type_hierarchy_provider.load(Ordering::Acquire)
-            }
+            "textDocument/prepareTypeHierarchy" => self.has_static_type_hierarchy_provider(),
             "inlayHint/resolve" => match caps.inlay_hint_provider.as_ref() {
                 Some(OneOf::Right(
                     tower_lsp_server::ls_types::InlayHintServerCapabilities::Options(options),
