@@ -186,6 +186,105 @@ priorities = ["virt", "host"]
 }
 
 #[test]
+fn e2e_document_colors_concatenate_virt_and_host_layers() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("document_colors.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.layers.aggregation."textDocument/documentColor"]
+strategy = "concatenated"
+priorities = ["virt", "host"]
+"#,
+    )
+    .expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .build();
+    let init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-color": {
+                        "cmd": [mock_bin(), "document-color"],
+                        "languages": ["markdown"]
+                    },
+                    "mock-virt-color": {
+                        "cmd": [mock_bin(), "document-color"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        init.pointer("/result/capabilities/colorProvider"),
+        Some(&json!(true))
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_document_colors.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "# Title\n\n```lua\nred!\n```\n"
+            }
+        }),
+    );
+
+    let colors = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/documentColor",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            assert!(
+                response.get("error").is_none(),
+                "documentColor must not surface a top-level error; got: {:?}",
+                response.get("error")
+            );
+            let colors = response["result"].as_array().cloned().unwrap_or_default();
+            if colors.len() >= 2 {
+                Some(colors)
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                None
+            }
+        })
+        .expect("concatenated document colors should include virt and host results");
+
+    let lines = colors
+        .iter()
+        .filter_map(|color| color.pointer("/range/start/line").and_then(Value::as_u64))
+        .collect::<Vec<_>>();
+    assert!(
+        lines.contains(&0),
+        "host-layer documentColor should keep the host range: {colors:?}"
+    );
+    assert!(
+        lines.contains(&3),
+        "virt-layer documentColor should translate to the injected lua line: {colors:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_whole_document_link_cancel_forwards_to_concatenated_layers() {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir.path().join("whole_doc_links_cancel.toml");

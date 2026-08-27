@@ -82,6 +82,8 @@
 //!   target/tooltip on `documentLink/resolve`.
 //! - `document-link-slow-host` / `document-link-slow-virt` — like
 //!   `document-link`, but sleeps before answering and records request-start
+//! - `document-color` — advertises `colorProvider` and returns one red color
+//!   for every open document.
 //!   and downstream `$/cancelRequest` markers under `MOCK_LSP_CANCEL_DIR`.
 //! - `diagnostics` — advertises `diagnosticProvider`; answers
 //!   `textDocument/diagnostic` with a full report carrying one diagnostic
@@ -278,6 +280,10 @@ fn main() {
                     "document-link-no-resolve-reserved-data"
                     | "document-link-no-resolve-plain-data" => json!({
                         "documentLinkProvider": { "resolveProvider": false },
+                        "textDocumentSync": 1
+                    }),
+                    "document-color" => json!({
+                        "colorProvider": true,
                         "textDocumentSync": 1
                     }),
                     "inlay-hint-resolve"
@@ -1521,6 +1527,28 @@ fn main() {
                             link["target"] = json!(uri);
                         }
                         json!([link])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "textDocument/documentColor" => {
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|_| {
+                        json!([{
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 4 }
+                            },
+                            "color": {
+                                "red": 1.0,
+                                "green": 0.0,
+                                "blue": 0.0,
+                                "alpha": 1.0
+                            }
+                        }])
                     })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);

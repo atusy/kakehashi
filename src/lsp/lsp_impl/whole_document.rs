@@ -1,6 +1,6 @@
 //! Shared fan-out for whole-document bridged requests.
 //!
-//! documentLink, foldingRange, and codeLens all follow the same shape: no
+//! documentLink, documentColor, foldingRange, and codeLens all follow the same shape: no
 //! position parameter, so the request fans out to every resolved bridge
 //! virtual document, uses the preferred strategy within each document, and
 //! concatenates those results. This module hosts that shape once; the per-method
