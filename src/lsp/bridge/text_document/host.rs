@@ -262,6 +262,24 @@ impl LanguageServerPool {
         uri: &Url,
         params: &tower_lsp_server::ls_types::WillSaveTextDocumentParams,
     ) {
+        self.notify_open_host_documents(
+            uri,
+            "textDocument/willSave",
+            |handle| handle.has_capability("textDocument/willSave"),
+            params,
+        )
+        .await;
+    }
+
+    /// Notify every live host connection that already has `uri` open and
+    /// satisfies the method-specific capability predicate.
+    async fn notify_open_host_documents<P: serde::Serialize + ?Sized>(
+        &self,
+        uri: &Url,
+        method: &'static str,
+        supports: impl Fn(&ConnectionHandle) -> bool,
+        params: &P,
+    ) {
         // `as_str()` is the already-serialized form; `.to_owned()` clones it in
         // one allocation, skipping the `Display`/`to_string` formatting path.
         let uri_string = uri.as_str().to_owned();
@@ -272,10 +290,10 @@ impl LanguageServerPool {
             if !docs.contains_key(&(uri_string.clone(), connection_key.clone())) {
                 continue;
             }
-            if !handle.has_capability("textDocument/willSave") {
+            if !supports(handle) {
                 continue;
             }
-            let notification = JsonRpcNotification::new("textDocument/willSave", params);
+            let notification = JsonRpcNotification::new(method, params);
             handle.send_notification(notification);
         }
     }
