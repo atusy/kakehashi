@@ -93,6 +93,12 @@ Phased roadmap:
    are collapsed to the first occurrence
    (`resolve_preferred_collision`); `preferred` returns the first non-empty
    layer instead.
+6. **List result aggregation** — ✅ implemented for the whole-document
+   `documentColor`, `documentLink`, `foldingRange`, and `codeLens` methods,
+   plus range-based `colorPresentation`. Their default remains `preferred`;
+   an explicit `concatenated` appends non-empty layer results in configured
+   priority order. `colorPresentation` has no producer envelope in the LSP
+   item, so its follow-up routing is determined by the supplied range.
 
 ## Context
 
@@ -162,7 +168,7 @@ priorities = ["virt", "host", "native"]   # innermost-first; mirrors "deeper win
 # enabled flags decide whether a bridge target exists at all.
 # strategy: per-method default (concatenated for diagnostics, codeAction,
 # and formatting; otherwise preferred). List-shaped whole-document methods
-# such as documentLink/foldingRange/codeLens can opt into concatenated.
+# and colorPresentation can opt into concatenated.
 
 # ---- User: markdown hover should prefer the host LS, and drop native ----
 [languages.markdown.layers.aggregation."textDocument/hover"]

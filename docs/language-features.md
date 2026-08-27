@@ -365,8 +365,12 @@ and [`textDocument/colorPresentation`](https://microsoft.github.io/language-serv
 Shows color swatches and color picker presentations for embedded blocks.
 Document colors can also combine embedded and host-language server results;
 set `layers.aggregation."textDocument/documentColor".strategy = "concatenated"`
-to retain both layers. Presentations for host colors route to the host server
-with their real URI, range, and edits unchanged.
+to retain both layers. Presentation routing is range-based because the LSP
+color item carries no producer identity: outside an injection the host server
+receives the real URI, range, and edits unchanged; inside an injection the
+default `virt → host` preference can select the virtual server even for a
+host-produced color. Configure `textDocument/colorPresentation` as
+`concatenated` to retain answers from both layers in that ambiguous case.
 Presentations whose primary edit (explicit, or the implicit label replacement)
 would corrupt the host document around the embedded block are dropped
 fail-closed; unsafe additional edits are dropped as one atomic set while the
