@@ -6,8 +6,9 @@
 //! - Host-to-virtual mappings (for didClose propagation)
 //! - Opened state (for LSP spec compliance - ls-bridge-message-ordering)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use tokio::sync::Mutex;
@@ -18,6 +19,40 @@ use url::Url;
 
 use super::ConnectionKey;
 use crate::lsp::bridge::protocol::VirtualDocumentUri;
+
+struct VirtualUriObserverState {
+    connection_key: ConnectionKey,
+    generation: u64,
+    uris: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+pub(crate) struct VirtualUriObserver {
+    id: u64,
+    observers: Arc<DashMap<u64, VirtualUriObserverState>>,
+    uris: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl VirtualUriObserver {
+    pub(crate) fn insert(&self, uri: String) {
+        self.uris
+            .lock()
+            .recover_poison("VirtualUriObserver::uris")
+            .insert(uri);
+    }
+
+    pub(crate) fn snapshot(&self) -> HashSet<String> {
+        self.uris
+            .lock()
+            .recover_poison("VirtualUriObserver::uris")
+            .clone()
+    }
+}
+
+impl Drop for VirtualUriObserver {
+    fn drop(&mut self) {
+        self.observers.remove(&self.id);
+    }
+}
 
 /// Hash of a virtual document's extracted content, used to skip re-sending an
 /// unchanged `didChange` (#422). Mirrors the host path's fingerprint
@@ -102,10 +137,10 @@ pub(crate) struct DocumentTracker {
     /// Enables O(1) lookup in `get_all_connections_for_virtual_uri()`, replacing the
     /// previous O(N×M) scan over `host_to_virtual`.
     virtual_to_servers: DashMap<String, Vec<ConnectionKey>>,
-    /// Every virtual URI whose didOpen was enqueued to one connection
-    /// generation. Monotonic until that generation is purged, so in-flight
-    /// responses can recognize a sibling URI after its didClose.
-    issued_virtual_uris: DashMap<(ConnectionKey, u64), std::collections::HashSet<String>>,
+    /// Active request-scoped observers of virtual URIs issued by a connection.
+    /// Closed URI provenance lives only until the observing request completes.
+    virtual_uri_observers: Arc<DashMap<u64, VirtualUriObserverState>>,
+    next_virtual_uri_observer_id: AtomicU64,
     /// Pre-send claims keyed by exact connection. Waiters park until the owner
     /// promotes the claim after enqueue or finishes rollback.
     open_claims: DashMap<(ConnectionKey, String), Arc<tokio::sync::Notify>>,
@@ -125,7 +160,8 @@ impl DocumentTracker {
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
-            issued_virtual_uris: DashMap::new(),
+            virtual_uri_observers: Arc::new(DashMap::new()),
+            next_virtual_uri_observer_id: AtomicU64::new(0),
             open_claims: DashMap::new(),
             connection_generations: DashMap::new(),
         }
@@ -253,10 +289,15 @@ impl DocumentTracker {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
         let generation = self.connection_generation(connection_key);
-        self.issued_virtual_uris
-            .entry((connection_key.clone(), generation))
-            .or_default()
-            .insert(uri_string);
+        for observer in self.virtual_uri_observers.iter() {
+            if observer.connection_key == *connection_key && observer.generation == generation {
+                observer
+                    .uris
+                    .lock()
+                    .recover_poison("VirtualUriObserverState::uris")
+                    .insert(uri_string.clone());
+            }
+        }
         notify.notify_waiters();
         true
     }
@@ -566,8 +607,6 @@ impl DocumentTracker {
             .or_insert(0);
         *generation = generation.wrapping_add(1);
         drop(generation);
-        self.issued_virtual_uris
-            .retain(|(key, _), _| key != connection_key);
         // Take this connection's version map; its keys are the virtual URIs it
         // had open. Done first so the per-URI refcount/reverse-index cleanup
         // below mirrors `untrack_document` exactly, once per opened document.
@@ -694,15 +733,35 @@ impl DocumentTracker {
             .unwrap_or_default()
     }
 
-    pub(super) fn issued_virtual_uris_for_connection(
+    pub(super) async fn observe_virtual_uris_for_connection(
         &self,
         connection_key: &ConnectionKey,
         generation: u64,
-    ) -> std::collections::HashSet<String> {
-        self.issued_virtual_uris
-            .get(&(connection_key.clone(), generation))
-            .map(|uris| uris.clone())
-            .unwrap_or_default()
+    ) -> VirtualUriObserver {
+        let id = self
+            .next_virtual_uri_observer_id
+            .fetch_add(1, Ordering::Relaxed);
+        let uris = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        self.virtual_uri_observers.insert(
+            id,
+            VirtualUriObserverState {
+                connection_key: connection_key.clone(),
+                generation,
+                uris: Arc::clone(&uris),
+            },
+        );
+        if self.connection_generation(connection_key) == generation
+            && let Some(documents) = self.document_versions.lock().await.get(connection_key)
+        {
+            uris.lock()
+                .recover_poison("VirtualUriObserver::seed")
+                .extend(documents.keys().cloned());
+        }
+        VirtualUriObserver {
+            id,
+            observers: Arc::clone(&self.virtual_uri_observers),
+            uris,
+        }
     }
 
     /// Remove and return all virtual documents for a host URI.
@@ -2141,7 +2200,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issued_virtual_uri_tombstones_survive_close_until_generation_purge() {
+    async fn virtual_uri_observer_retains_closed_uri_only_for_request_lifetime() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "lua-0");
@@ -2150,19 +2209,14 @@ mod tests {
         tracker
             .register_opened_document(&host_uri, &virtual_uri, &key)
             .await;
+        let observer = tracker
+            .observe_virtual_uris_for_connection(&key, generation)
+            .await;
         tracker.untrack_document(&virtual_uri, &key).await;
 
-        assert!(
-            tracker
-                .issued_virtual_uris_for_connection(&key, generation)
-                .contains(&virtual_uri.to_uri_string())
-        );
+        assert!(observer.snapshot().contains(&virtual_uri.to_uri_string()));
 
-        tracker.purge_connection(&key).await;
-        assert!(
-            tracker
-                .issued_virtual_uris_for_connection(&key, generation)
-                .is_empty()
-        );
+        drop(observer);
+        assert!(tracker.virtual_uri_observers.is_empty());
     }
 }

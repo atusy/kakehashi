@@ -326,7 +326,7 @@ impl LanguageServerPool {
         let request =
             JsonRpcRequest::new(request_id.as_i64(), "callHierarchy/incomingCalls", params);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
-        let (send_result, mut known_virtual_uris): (io::Result<()>, HashSet<String>) = {
+        let (send_result, virtual_uri_observer) = {
             let connections = self.connections().await;
             let producer_is_live = connections
                 .get(connection_key)
@@ -339,22 +339,24 @@ impl LanguageServerPool {
                         io::ErrorKind::NotConnected,
                         "producer connection was replaced before incomingCalls send",
                     )),
-                    HashSet::new(),
+                    None,
                 )
             } else {
-                // Snapshot the exact producer's virtual namespace in the same
-                // admission critical section as enqueue. This gives the set
-                // the producer has seen before this request in FIFO order.
-                let mut known = self.issued_virtual_uris_for_connection(
-                    connection_key,
-                    envelope.connection_generation,
-                );
+                // Observe the exact producer's virtual namespace in the same
+                // admission critical section as enqueue. The request-scoped
+                // observer retains sibling URIs opened then closed in flight.
+                let observer = self
+                    .observe_virtual_uris_for_connection(
+                        connection_key,
+                        envelope.connection_generation,
+                    )
+                    .await;
                 if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
-                    known.insert(uri);
+                    observer.insert(uri);
                 }
                 (
                     handle.send_request(request, request_id).map_err(Into::into),
-                    known,
+                    Some(observer),
                 )
             }
         };
@@ -368,6 +370,7 @@ impl LanguageServerPool {
             }
             return None;
         }
+        let virtual_uri_observer = virtual_uri_observer?;
 
         // Admission is complete once the request is queued. A slow language
         // server must not hold didClose/reopen behind its response.
@@ -378,12 +381,6 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, connection_key);
         }
         let response = response.ok()?;
-        // Keep admission-time tombstones for siblings closed in flight, and
-        // add siblings that became live while the request was running. The
-        // producer fence below follows this final await.
-        known_virtual_uris.extend(
-            self.issued_virtual_uris_for_connection(connection_key, envelope.connection_generation),
-        );
         if !self
             .call_hierarchy_producer_is_live(
                 connection_key,
@@ -394,6 +391,7 @@ impl LanguageServerPool {
         {
             return None;
         }
+        let known_virtual_uris = virtual_uri_observer.snapshot();
         transform_call_hierarchy_incoming_response_to_host(
             response,
             virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string),
@@ -884,7 +882,10 @@ mod tests {
             .await;
         let shaped_real_uri = "file:///external/kakehashi-virtual-uri-other.lua";
         let generation = pool.document_connection_generation(&key);
-        let known = pool.issued_virtual_uris_for_connection(&key, generation);
+        let observer = pool
+            .observe_virtual_uris_for_connection(&key, generation)
+            .await;
+        let known = observer.snapshot();
 
         assert!(known.contains(&virtual_uri.to_uri_string()));
         assert!(!known.contains(shaped_real_uri));
