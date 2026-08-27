@@ -326,7 +326,7 @@ impl DocumentTracker {
     }
 
     /// Promote a pre-send claim only after didOpen is confirmed enqueued.
-    pub(super) fn mark_open_sent(
+    pub(super) async fn mark_open_sent(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
@@ -334,6 +334,15 @@ impl DocumentTracker {
         expected_claim: &Arc<tokio::sync::Notify>,
     ) -> bool {
         let uri_string = virtual_uri.to_uri_string();
+        if self.connection_generation(connection_key) != expected_generation {
+            return false;
+        }
+        // Serialize reservation removal with provenance insertion using the
+        // same mutex as `try_claim_for_open`, so capacity never has a gap.
+        let versions = self.document_versions.lock().await;
+        if self.connection_generation(connection_key) != expected_generation {
+            return false;
+        }
         let Some((_, notify)) = self
             .open_claims
             .remove_if(&(connection_key.clone(), uri_string.clone()), |_, claim| {
@@ -342,9 +351,17 @@ impl DocumentTracker {
         else {
             return false;
         };
-        if self.connection_generation(connection_key) != expected_generation {
-            notify.notify_waiters();
-            return false;
+        let generation = expected_generation;
+        if VirtualDocumentUri::canonical_uri_for_scratch(&uri_string).is_some() {
+            self.scratch_uri_history
+                .entry((connection_key.clone(), generation))
+                .or_default()
+                .insert(uri_string.clone());
+        } else {
+            self.issued_virtual_uris
+                .entry((connection_key.clone(), generation))
+                .or_default()
+                .insert(uri_string.clone());
         }
         let mut servers = self
             .virtual_to_servers
@@ -358,18 +375,6 @@ impl DocumentTracker {
         if newly_opened {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
-        let generation = expected_generation;
-        if VirtualDocumentUri::canonical_uri_for_scratch(&uri_string).is_some() {
-            self.scratch_uri_history
-                .entry((connection_key.clone(), generation))
-                .or_default()
-                .insert(uri_string.clone());
-        } else {
-            self.issued_virtual_uris
-                .entry((connection_key.clone(), generation))
-                .or_default()
-                .insert(uri_string.clone());
-        }
         for observer in self.virtual_uri_observers.iter() {
             if observer.connection_key == *connection_key && observer.generation == generation {
                 observer
@@ -379,6 +384,7 @@ impl DocumentTracker {
                     .insert(uri_string.clone());
             }
         }
+        drop(versions);
         notify.notify_waiters();
         true
     }
@@ -403,7 +409,10 @@ impl DocumentTracker {
             .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
             .clone();
         let generation = self.connection_generation(connection_key);
-        assert!(self.mark_open_sent(virtual_uri, connection_key, generation, &claim));
+        assert!(
+            self.mark_open_sent(virtual_uri, connection_key, generation, &claim)
+                .await
+        );
     }
 
     /// Register close-cleanup ownership without exposing the document to
@@ -2472,23 +2481,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_generation_claim_cannot_promote_after_recycle() {
+    async fn virtual_uri_provenance_promotion_keeps_the_last_slot_reserved() {
+        let tracker = Arc::new(DocumentTracker::new());
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        tracker.saturate_virtual_uri_provenance(&key);
+        tracker
+            .issued_virtual_uris
+            .get_mut(&(key.clone(), generation))
+            .unwrap()
+            .remove("file:///virtual-0.lua");
+        let host_uri = url_to_uri(&Url::parse("file:///host.md").unwrap());
+        let promoted = VirtualDocumentUri::new(&host_uri, "lua", "promoted");
+        let rejected = VirtualDocumentUri::new(&host_uri, "lua", "rejected");
+        assert!(tracker.try_claim_for_open(&promoted, &key).await);
+        let claim = tracker
+            .open_claim_waiter(&promoted, &key)
+            .expect("last slot is reserved");
+
+        let (promoted, rejected) = tokio::join!(
+            tracker.mark_open_sent(&promoted, &key, generation, &claim),
+            tracker.try_claim_for_open(&rejected, &key),
+        );
+
+        assert!(promoted);
+        assert!(!rejected, "promotion must not expose a temporary free slot");
+        assert!(tracker.virtual_uri_provenance_limit_reached(&key));
+    }
+
+    #[tokio::test]
+    async fn old_generation_promotion_can_roll_back_a_new_generation_claim() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///host.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "old");
         let key = ConnectionKey::for_server("lua");
         let generation = tracker.connection_generation(&key);
+        tracker.purge_connection(&key).await;
         assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
+        tracker
+            .register_pending_document(&host_uri, &virtual_uri, &key)
+            .await;
         let claim = tracker
             .open_claim_waiter(&virtual_uri, &key)
             .expect("claim is pending");
 
-        tracker.purge_connection(&key).await;
-
-        assert!(!tracker.mark_open_sent(&virtual_uri, &key, generation, &claim));
+        assert!(
+            !tracker
+                .mark_open_sent(&virtual_uri, &key, generation, &claim)
+                .await
+        );
+        assert!(
+            tracker
+                .rollback_open_claim_if(&host_uri, &virtual_uri, &key, &claim)
+                .await
+        );
         assert!(!tracker.is_document_opened(&virtual_uri));
-        assert!(tracker.issued_virtual_uris.is_empty());
-        assert!(tracker.scratch_uri_history.is_empty());
+        assert!(tracker.host_virtual_docs(&host_uri).await.is_empty());
+        assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
     }
 
     #[tokio::test]
