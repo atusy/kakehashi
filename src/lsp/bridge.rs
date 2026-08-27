@@ -83,11 +83,12 @@ pub(crate) use protocol::workspace_edit_preserves_line_prefixes;
 pub(crate) use protocol::workspace_edit_within_region;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};
 pub(crate) use text_document::{
-    CodeActionEnvelope, EnvelopeOffset, InlayHintDocumentRevision, InlayHintEnvelope,
-    KakehashiEnvelope, UpstreamCodeActionCaps, bridge_code_actions, bridge_host_completion_items,
-    envelope_host_code_lenses, envelope_host_document_links, envelope_host_inlay_hints,
-    extract_code_action_envelope, extract_code_lens_envelope, extract_document_link_envelope,
-    extract_envelope, extract_inlay_hint_envelope, parse_code_actions_leniently,
+    CallHierarchyDocumentRevision, CodeActionEnvelope, EnvelopeOffset, InlayHintDocumentRevision,
+    InlayHintEnvelope, KakehashiEnvelope, UpstreamCodeActionCaps, bridge_code_actions,
+    bridge_host_completion_items, envelope_host_call_hierarchy_items, envelope_host_code_lenses,
+    envelope_host_document_links, envelope_host_inlay_hints, extract_code_action_envelope,
+    extract_code_lens_envelope, extract_document_link_envelope, extract_envelope,
+    extract_inlay_hint_envelope, parse_code_actions_leniently,
 };
 pub(crate) use text_document::{OpenExpectation, OpenOutcome};
 pub(crate) use workspace::WorkspaceFolderSet;

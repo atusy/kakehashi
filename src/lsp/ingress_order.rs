@@ -355,6 +355,7 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/prepareRename"
         | "textDocument/codeAction"
         | "textDocument/inlayHint"
+        | "textDocument/prepareCallHierarchy"
         | "textDocument/diagnostic"
         | "kakehashi/captures/full"
         | "kakehashi/captures/full/delta"
