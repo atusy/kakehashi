@@ -345,12 +345,10 @@ impl LanguageServerPool {
                 // Observe the exact producer's virtual namespace in the same
                 // admission critical section as enqueue. The request-scoped
                 // observer retains sibling URIs opened then closed in flight.
-                let observer = self
-                    .observe_virtual_uris_for_connection(
-                        connection_key,
-                        envelope.connection_generation,
-                    )
-                    .await;
+                let observer = self.observe_virtual_uris_for_connection(
+                    connection_key,
+                    envelope.connection_generation,
+                );
                 if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
                     observer.insert(uri);
                 }
@@ -882,9 +880,7 @@ mod tests {
             .await;
         let shaped_real_uri = "file:///external/kakehashi-virtual-uri-other.lua";
         let generation = pool.document_connection_generation(&key);
-        let observer = pool
-            .observe_virtual_uris_for_connection(&key, generation)
-            .await;
+        let observer = pool.observe_virtual_uris_for_connection(&key, generation);
         let known = observer.snapshot();
 
         assert!(known.contains(&virtual_uri.to_uri_string()));

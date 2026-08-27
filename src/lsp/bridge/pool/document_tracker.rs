@@ -733,7 +733,12 @@ impl DocumentTracker {
             .unwrap_or_default()
     }
 
-    pub(super) async fn observe_virtual_uris_for_connection(
+    /// Observe confirmed virtual URIs for an in-flight request.
+    ///
+    /// Callers that need an enqueue-consistent namespace hold the pool's
+    /// `connections` admission guard across this synchronous registration and
+    /// request enqueue. There is no cancellation point after observer insertion.
+    pub(super) fn observe_virtual_uris_for_connection(
         &self,
         connection_key: &ConnectionKey,
         generation: u64,
@@ -750,12 +755,15 @@ impl DocumentTracker {
                 uris: Arc::clone(&uris),
             },
         );
-        if self.connection_generation(connection_key) == generation
-            && let Some(documents) = self.document_versions.lock().await.get(connection_key)
-        {
+        if self.connection_generation(connection_key) == generation {
+            let confirmed = self
+                .virtual_to_servers
+                .iter()
+                .filter(|entry| entry.value().contains(connection_key))
+                .map(|entry| entry.key().clone());
             uris.lock()
                 .recover_poison("VirtualUriObserver::seed")
-                .extend(documents.keys().cloned());
+                .extend(confirmed);
         }
         VirtualUriObserver {
             id,
@@ -2209,14 +2217,27 @@ mod tests {
         tracker
             .register_opened_document(&host_uri, &virtual_uri, &key)
             .await;
-        let observer = tracker
-            .observe_virtual_uris_for_connection(&key, generation)
-            .await;
+        let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
         tracker.untrack_document(&virtual_uri, &key).await;
 
         assert!(observer.snapshot().contains(&virtual_uri.to_uri_string()));
 
         drop(observer);
         assert!(tracker.virtual_uri_observers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn virtual_uri_observer_does_not_seed_unenqueued_open_claims() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "pending");
+        let key = ConnectionKey::for_server("lua");
+        assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
+
+        let observer =
+            tracker.observe_virtual_uris_for_connection(&key, tracker.connection_generation(&key));
+
+        assert!(!observer.snapshot().contains(&virtual_uri.to_uri_string()));
+        tracker.unclaim_document(&virtual_uri, &key).await;
     }
 }
