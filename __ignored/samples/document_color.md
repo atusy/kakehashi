@@ -27,3 +27,7 @@ while the CSS range must point inside the fenced block:
 ```vim
 :lua local c=vim.lsp.get_clients({bufnr=0})[1]; vim.lsp.buf_request(0, 'textDocument/documentColor', {textDocument={uri=vim.uri_from_bufnr(0)}}, function(e,r) assert(not e, vim.inspect(e)); vim.print(r) end)
 ```
+
+Requesting `textDocument/colorPresentation` for the prose result should route
+back through the Markdown server; requesting it for the CSS result should use
+the embedded CSS server and translate only the safe edits back to this buffer.

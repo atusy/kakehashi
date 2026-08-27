@@ -408,7 +408,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | onTypeFormatting | ✅ Implemented | Shares the formatting guards |
 | inlayHint | ✅ Implemented | Unsafe accept-edit sets dropped whole; hint kept; `inlayHint/resolve` edits pass the same guard |
 | documentColor | ✅ Implemented | Experimental opt-in; whole-document host/virt results follow the configured layer strategy |
-| colorPresentation | ✅ Implemented | Experimental opt-in; unsafe presentations dropped |
+| colorPresentation | ✅ Implemented | Experimental opt-in; host edits pass through verbatim, unsafe virtual presentations are dropped |
 | documentHighlight | ✅ Implemented | Strategy-2 shape (single-document, position-mapped) |
 | diagnostics | ✅ Implemented | Push + pull with host translation |
 | semanticTokens | ❌ Not bridged | Native tree-sitter tokens ARE served (semantic-token-overlap-resolution); downstream-server tokens are not fetched or merged — doing so would enable the parallel fetch strategy |
