@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dashmap::{DashMap, DashSet};
 use tokio::sync::Mutex;
@@ -24,6 +25,8 @@ struct VirtualUriProvenance {
     issued: DashSet<String>,
     scratch: DashSet<String>,
     queued: DashSet<String>,
+    reservations: DashSet<String>,
+    admitted: AtomicUsize,
 }
 
 /// Retire a healthy producer before exact URI provenance can grow with an
@@ -41,6 +44,39 @@ impl VirtualUriProvenance {
             self.scratch.insert(uri);
         } else {
             self.issued.insert(uri);
+        }
+    }
+
+    fn reserve(&self, uri: &str) -> bool {
+        if self.issued.contains(uri) || self.scratch.contains(uri) {
+            return true;
+        }
+        if self.reservations.insert(uri.to_string()) {
+            let previous = self.admitted.fetch_add(1, Ordering::AcqRel);
+            if previous >= MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION {
+                self.admitted.fetch_sub(1, Ordering::AcqRel);
+                self.reservations.remove(uri);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn release_reservation(&self, uri: &str) {
+        if self.reservations.remove(uri).is_some() {
+            self.admitted.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn confirm(&self, uri: String) {
+        self.insert_issued(uri.clone());
+        self.reservations.remove(&uri);
+    }
+
+    #[cfg(test)]
+    fn remove_issued(&self, uri: &str) {
+        if self.issued.remove(uri).is_some() {
+            self.admitted.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -208,19 +244,11 @@ impl DocumentTracker {
         connection_key: &ConnectionKey,
     ) -> bool {
         let generation = self.connection_generation(connection_key);
-        let provenance = self
-            .virtual_uri_provenance
+        self.virtual_uri_provenance
             .get(&(connection_key.clone(), generation))
-            .map(|state| Arc::clone(state.value()));
-        let issued = provenance.as_ref().map_or(0, |state| state.issued.len());
-        let scratch = provenance.as_ref().map_or(0, |state| state.scratch.len());
-        let pending = self
-            .open_claims
-            .iter()
-            .filter(|claim| &claim.key().0 == connection_key)
-            .count();
-        issued.saturating_add(scratch).saturating_add(pending)
-            >= MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION
+            .is_some_and(|state| {
+                state.admitted.load(Ordering::Acquire) >= MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION
+            })
     }
 
     #[cfg(test)]
@@ -232,6 +260,9 @@ impl DocumentTracker {
                 .issued
                 .insert(format!("file:///virtual-{index}.lua"));
         }
+        provenance
+            .admitted
+            .store(MAX_VIRTUAL_URI_PROVENANCE_PER_GENERATION, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -283,7 +314,11 @@ impl DocumentTracker {
             if docs.contains_key(&uri_string) || self.open_claims.contains_key(&claim_key) {
                 return false; // Already claimed by another caller
             }
-            if self.virtual_uri_provenance_limit_reached(connection_key) {
+            let generation = self.connection_generation(connection_key);
+            if !self
+                .provenance_for_generation(connection_key, generation)
+                .reserve(&uri_string)
+            {
                 return false;
             }
             docs.insert(uri_string.clone(), 1);
@@ -390,7 +425,7 @@ impl DocumentTracker {
         // Insert confirmed history before releasing the claim reservation. The
         // versions lock serializes this transfer with claim admission, while
         // the ordering also keeps lock-free capacity readers from seeing a gap.
-        provenance.insert_issued(uri_string.clone());
+        provenance.confirm(uri_string.clone());
         drop(claim);
         let Some((_, notify)) = self
             .open_claims
@@ -438,6 +473,11 @@ impl DocumentTracker {
             .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
             .clone();
         let generation = self.connection_generation(connection_key);
+        assert!(
+            self.provenance_for_generation(connection_key, generation)
+                .reserve(&virtual_uri.to_uri_string()),
+            "test helper must remain within the provenance bound"
+        );
         assert!(
             self.mark_open_sent(virtual_uri, connection_key, generation, &claim)
                 .await
@@ -805,6 +845,7 @@ impl DocumentTracker {
             .filter(|entry| &entry.key().0 == connection_key)
         {
             provenance.queued.remove(&uri_string);
+            provenance.release_reservation(&uri_string);
         }
         if let Some(docs) = versions.get_mut(connection_key) {
             docs.remove(&uri_string);
@@ -2440,8 +2481,7 @@ mod tests {
         tracker.saturate_virtual_uri_provenance(&key);
         tracker
             .provenance_for_generation(&key, generation)
-            .issued
-            .remove("file:///virtual-0.lua");
+            .remove_issued("file:///virtual-0.lua");
         let host_uri = url_to_uri(&Url::parse("file:///host.md").unwrap());
         let first = VirtualDocumentUri::new(&host_uri, "lua", "first");
         let second = VirtualDocumentUri::new(&host_uri, "lua", "second");
@@ -2466,8 +2506,7 @@ mod tests {
         tracker.saturate_virtual_uri_provenance(&key);
         tracker
             .provenance_for_generation(&key, generation)
-            .issued
-            .remove("file:///virtual-0.lua");
+            .remove_issued("file:///virtual-0.lua");
         let host_uri = url_to_uri(&Url::parse("file:///host.md").unwrap());
         let promoted = VirtualDocumentUri::new(&host_uri, "lua", "promoted");
         let rejected = VirtualDocumentUri::new(&host_uri, "lua", "rejected");
@@ -2494,8 +2533,7 @@ mod tests {
         tracker.saturate_virtual_uri_provenance(&key);
         tracker
             .provenance_for_generation(&key, generation)
-            .issued
-            .remove("file:///virtual-0.lua");
+            .remove_issued("file:///virtual-0.lua");
         let host_uri = url_to_uri(&Url::parse("file:///host.md").unwrap());
         let queued = VirtualDocumentUri::new(&host_uri, "lua", "queued");
         let rejected = VirtualDocumentUri::new(&host_uri, "lua", "rejected");
