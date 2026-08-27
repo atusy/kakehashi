@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
-    CallHierarchyPrepareParams, NumberOrString, Position, TextDocumentIdentifier,
-    TextDocumentPositionParams, Uri, WorkDoneProgressParams,
+    CallHierarchyPrepareParams, NumberOrString, PartialResultParams, Position,
+    TextDocumentIdentifier, TextDocumentPositionParams, Uri, WorkDoneProgressParams,
 };
 use url::Url;
 
@@ -40,6 +40,8 @@ pub(crate) struct CallHierarchyEnvelope {
     pub(crate) inner: Option<Value>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) host_layer: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) projected_from_virtual: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -64,7 +66,23 @@ fn strip_call_hierarchy_envelope(item: &mut CallHierarchyItem) -> Option<CallHie
     Some(envelope)
 }
 
-fn re_envelope_item(item: &mut CallHierarchyItem, envelope: &CallHierarchyEnvelope) {
+fn prepare_incoming_params(
+    mut params: CallHierarchyIncomingCallsParams,
+) -> Option<(CallHierarchyIncomingCallsParams, CallHierarchyEnvelope)> {
+    let envelope = strip_call_hierarchy_envelope(&mut params.item)?;
+    // The bridge does not relay typed partial-result chunks or map these
+    // progress tokens for this exact-producer request. Asking downstream to
+    // stream would lose calls, so require one final aggregate result.
+    params.work_done_progress_params = WorkDoneProgressParams::default();
+    params.partial_result_params = PartialResultParams::default();
+    Some((params, envelope))
+}
+
+fn re_envelope_item(
+    item: &mut CallHierarchyItem,
+    envelope: &CallHierarchyEnvelope,
+    projected_from_virtual: bool,
+) {
     let offset = RegionOffset::from(&envelope.offset);
     envelope_item_data(
         item,
@@ -81,6 +99,7 @@ fn re_envelope_item(item: &mut CallHierarchyItem, envelope: &CallHierarchyEnvelo
             connection_key: &envelope.connection_key,
             offset: &offset,
             host_layer: envelope.host_layer,
+            projected_from_virtual,
         },
     );
 }
@@ -100,6 +119,7 @@ struct CallHierarchyEnvelopeContext<'a> {
     connection_key: &'a ConnectionKey,
     offset: &'a RegionOffset,
     host_layer: bool,
+    projected_from_virtual: bool,
 }
 
 fn envelope_item_data(item: &mut CallHierarchyItem, ctx: &CallHierarchyEnvelopeContext<'_>) {
@@ -116,6 +136,7 @@ fn envelope_item_data(item: &mut CallHierarchyItem, ctx: &CallHierarchyEnvelopeC
         offset: EnvelopeOffset::from(ctx.offset),
         inner,
         host_layer: ctx.host_layer,
+        projected_from_virtual: ctx.projected_from_virtual,
     }}));
 }
 
@@ -138,6 +159,7 @@ pub(crate) fn envelope_host_call_hierarchy_items(
         connection_key,
         offset: &offset,
         host_layer: true,
+        projected_from_virtual: false,
     };
     for item in items {
         envelope_item_data(item, &ctx);
@@ -216,6 +238,7 @@ impl LanguageServerPool {
                         connection_key: &connection_key,
                         offset: ctx.offset,
                         host_layer: false,
+                        projected_from_virtual: false,
                     },
                 )
             },
@@ -225,11 +248,11 @@ impl LanguageServerPool {
 
     pub(crate) async fn dispatch_call_hierarchy_incoming(
         &self,
-        mut params: CallHierarchyIncomingCallsParams,
+        params: CallHierarchyIncomingCallsParams,
         settings: &crate::config::settings::WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
     ) -> Option<Vec<CallHierarchyIncomingCall>> {
-        let envelope = strip_call_hierarchy_envelope(&mut params.item)?;
+        let (params, envelope) = prepare_incoming_params(params)?;
         if !crate::config::is_server_spawnable(&settings.language_servers, &envelope.origin) {
             return None;
         }
@@ -364,7 +387,8 @@ fn call_hierarchy_item_to_downstream(
     envelope: &CallHierarchyEnvelope,
     virtual_uri: Option<&VirtualDocumentUri>,
 ) -> CallHierarchyItem {
-    if let Some(virtual_uri) = virtual_uri
+    if envelope.projected_from_virtual
+        && let Some(virtual_uri) = virtual_uri
         && item.uri.as_str() == envelope.host_uri
     {
         item.uri = virtual_uri_to_lsp_uri(virtual_uri);
@@ -403,18 +427,22 @@ fn transform_call_hierarchy_incoming_response_to_host(
     let calls = calls
         .into_iter()
         .filter_map(|mut call| {
-            if VirtualDocumentUri::is_virtual_uri(call.from.uri.as_str()) {
-                if request_virtual_uri.as_deref() != Some(call.from.uri.as_str()) {
-                    return None;
-                }
-                call.from.uri = host_uri.clone();
-                translate_virtual_range_to_host(&mut call.from.range, &offset);
-                translate_virtual_range_to_host(&mut call.from.selection_range, &offset);
-                for range in &mut call.from_ranges {
-                    translate_virtual_range_to_host(range, &offset);
-                }
-            }
-            re_envelope_item(&mut call.from, envelope);
+            let projected_from_virtual =
+                if VirtualDocumentUri::is_virtual_uri(call.from.uri.as_str()) {
+                    if request_virtual_uri.as_deref() != Some(call.from.uri.as_str()) {
+                        return None;
+                    }
+                    call.from.uri = host_uri.clone();
+                    translate_virtual_range_to_host(&mut call.from.range, &offset);
+                    translate_virtual_range_to_host(&mut call.from.selection_range, &offset);
+                    for range in &mut call.from_ranges {
+                        translate_virtual_range_to_host(range, &offset);
+                    }
+                    true
+                } else {
+                    false
+                };
+            re_envelope_item(&mut call.from, envelope, projected_from_virtual);
             Some(call)
         })
         .collect();
@@ -471,15 +499,33 @@ fn transform_call_hierarchy_prepare_response_to_host(
         .into_iter()
         .filter_map(|mut item| {
             let uri = item.uri.as_str();
-            if VirtualDocumentUri::is_virtual_uri(uri) {
+            let projected_from_virtual = if VirtualDocumentUri::is_virtual_uri(uri) {
                 if uri != request_virtual_uri {
                     return None;
                 }
                 item.uri = host_uri.clone();
                 translate_virtual_range_to_host(&mut item.range, offset);
                 translate_virtual_range_to_host(&mut item.selection_range, offset);
-            }
-            envelope_item_data(&mut item, envelope_ctx);
+                true
+            } else {
+                false
+            };
+            let envelope_ctx = CallHierarchyEnvelopeContext {
+                server_name: envelope_ctx.server_name,
+                host_uri: envelope_ctx.host_uri,
+                region_id: envelope_ctx.region_id,
+                injection_language: envelope_ctx.injection_language,
+                revision: CallHierarchyDocumentRevision {
+                    incarnation: envelope_ctx.revision.incarnation,
+                    content_version: envelope_ctx.revision.content_version,
+                },
+                connection_generation: envelope_ctx.connection_generation,
+                connection_key: envelope_ctx.connection_key,
+                offset: envelope_ctx.offset,
+                host_layer: envelope_ctx.host_layer,
+                projected_from_virtual,
+            };
+            envelope_item_data(&mut item, &envelope_ctx);
             Some(item)
         })
         .collect();
@@ -505,6 +551,7 @@ mod tests {
             offset: EnvelopeOffset::from(&RegionOffset::new(3, 2)),
             inner: Some(json!({ "token": 9 })),
             host_layer: false,
+            projected_from_virtual: true,
         }
     }
 
@@ -586,6 +633,7 @@ mod tests {
                 connection_key: &key,
                 offset: &offset,
                 host_layer: false,
+                projected_from_virtual: false,
             },
         )
         .unwrap()
@@ -634,6 +682,7 @@ mod tests {
                 connection_key: &key,
                 offset: &offset,
                 host_layer: false,
+                projected_from_virtual: false,
             },
         )
         .unwrap()
@@ -655,6 +704,67 @@ mod tests {
         assert_eq!(outgoing.range.start, Position::new(0, 0));
         assert_eq!(outgoing.selection_range.end, Position::new(0, 1));
         assert_eq!(outgoing.data, Some(json!({ "token": 9 })));
+    }
+
+    #[test]
+    fn incoming_request_strips_unroutable_progress_tokens() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("lua-ls");
+        let envelope = incoming_test_envelope(&host_uri, &key);
+        let params: CallHierarchyIncomingCallsParams = serde_json::from_value(json!({
+            "item": call_item(host_uri.as_str(), json!({ "kakehashi": envelope })),
+            "workDoneToken": "work",
+            "partialResultToken": "partial"
+        }))
+        .unwrap();
+
+        let (params, _) = prepare_incoming_params(params).unwrap();
+        let value = serde_json::to_value(params).unwrap();
+        assert!(value.get("workDoneToken").is_none());
+        assert!(value.get("partialResultToken").is_none());
+    }
+
+    #[test]
+    fn incoming_request_preserves_real_item_matching_the_host_uri() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("lua-ls");
+        let offset = RegionOffset::new(3, 2);
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region");
+        let response = json!({ "result": [{
+            "name": "real", "kind": 12, "uri": host_uri,
+            "range": { "start": { "line": 3, "character": 2 }, "end": { "line": 3, "character": 5 } },
+            "selectionRange": { "start": { "line": 3, "character": 2 }, "end": { "line": 3, "character": 3 } }
+        }]});
+        let mut item = transform_call_hierarchy_prepare_response_to_host(
+            response,
+            &virtual_uri.to_uri_string(),
+            &host_uri,
+            &offset,
+            &CallHierarchyEnvelopeContext {
+                server_name: "lua-ls",
+                host_uri: host_uri.as_str(),
+                region_id: "region",
+                injection_language: "lua",
+                revision: CallHierarchyDocumentRevision {
+                    incarnation: Some(2),
+                    content_version: 3,
+                },
+                connection_generation: 4,
+                connection_key: &key,
+                offset: &offset,
+                host_layer: false,
+                projected_from_virtual: false,
+            },
+        )
+        .unwrap()
+        .unwrap()
+        .remove(0);
+        let envelope = strip_call_hierarchy_envelope(&mut item).unwrap();
+
+        assert!(!envelope.projected_from_virtual);
+        let outgoing = call_hierarchy_item_to_downstream(item, &envelope, Some(&virtual_uri));
+        assert_eq!(outgoing.uri, host_uri);
+        assert_eq!(outgoing.range.start, Position::new(3, 2));
     }
 
     #[test]
