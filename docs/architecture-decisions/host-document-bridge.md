@@ -131,17 +131,21 @@ Partially implemented:
   dispatch (identity, start, contiguity, language; the end and per-line
   offsets are read live for translation) and refuses a reply the document
   was edited under while it was in flight.
-  `callHierarchy/incomingCalls` follows the same exact-producer contract.
+  `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls` follow the
+  same exact-producer contract.
   Preparation stamps each item with host content/incarnation, connection key
   and generation, region geometry, and whether its URI/ranges were projected
   from a virtual document. Expansion reverses only projected items, strips
   progress and partial-result tokens that the bridge cannot transform, and
-  re-envelopes returned callers for recursive expansion. It rejects stale
+  re-envelopes returned callers/callees for recursive expansion. Outgoing
+  `fromRanges` are caller-relative, so virtual-layer results translate them
+  with the request item's region offset even when the callee is a real external
+  document. Expansion rejects stale
   content, reopen incarnations, moved/non-contiguous regions, and replaced
   producers before dispatch, then rechecks content and producer identity after
-  the response; cancellation targets the exact downstream request. The
-  upstream `callHierarchyProvider` stays hidden until both incoming and
-  outgoing expansion are implemented.
+  the response; cancellation targets the exact downstream request. With both
+  expansion directions implemented, kakehashi advertises upstream
+  `callHierarchyProvider`.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one

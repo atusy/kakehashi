@@ -6,20 +6,20 @@ use tower_lsp_server::Client;
 use tower_lsp_server::jsonrpc::{Error, ErrorCode, Result};
 use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
-    ClientCapabilities, CodeActionOptions, CodeActionProviderCapability, CodeLensOptions,
-    CompletionOptions, DeclarationCapability, DeclarationOptions, DefinitionOptions,
-    DiagnosticOptions, DiagnosticServerCapabilities, DocumentFormattingOptions,
-    DocumentLinkOptions, DocumentOnTypeFormattingOptions, DocumentRangeFormattingOptions,
-    DocumentSymbolOptions, ExecuteCommandOptions, FoldingRangeProviderCapability,
-    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
-    InitializedParams, InlayHintOptions, InlayHintServerCapabilities,
-    LinkedEditingRangeServerCapabilities, OneOf, PositionEncodingKind, ReferenceOptions,
-    RenameOptions, SaveOptions, SelectionRangeProviderCapability, SemanticTokenModifier,
-    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
-    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
-    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+    CallHierarchyServerCapability, ClientCapabilities, CodeActionOptions,
+    CodeActionProviderCapability, CodeLensOptions, CompletionOptions, DeclarationCapability,
+    DeclarationOptions, DefinitionOptions, DiagnosticOptions, DiagnosticServerCapabilities,
+    DocumentFormattingOptions, DocumentLinkOptions, DocumentOnTypeFormattingOptions,
+    DocumentRangeFormattingOptions, DocumentSymbolOptions, ExecuteCommandOptions,
+    FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, InlayHintOptions,
+    InlayHintServerCapabilities, LinkedEditingRangeServerCapabilities, OneOf, PositionEncodingKind,
+    ReferenceOptions, RenameOptions, SaveOptions, SelectionRangeProviderCapability,
+    SemanticTokenModifier, SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend,
+    SemanticTokensOptions, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+    SignatureHelpOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri,
+    WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 use url::Url;
 
@@ -585,6 +585,7 @@ impl Kakehashi {
                         work_done_progress: Some(true),
                     },
                 })),
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 document_link_provider: Some(DocumentLinkOptions {
                     resolve_provider: Some(true),
