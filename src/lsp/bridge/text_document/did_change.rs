@@ -149,7 +149,7 @@ impl LanguageServerPool {
     /// if the queue is full the notification is dropped with a warning log. The
     /// returned [`NotificationSendResult`] lets the caller record the content
     /// fingerprint only on a confirmed `Queued` enqueue (#422).
-    fn send_didchange_for_virtual_doc(
+    pub(super) fn send_didchange_for_virtual_doc(
         handle: &Arc<ConnectionHandle>,
         virtual_uri: &str,
         content: &str,

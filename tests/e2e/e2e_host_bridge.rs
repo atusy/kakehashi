@@ -1281,6 +1281,67 @@ fn e2e_virt_did_save_observes_the_latest_virtual_text() {
 }
 
 #[test]
+fn e2e_virt_did_save_never_observes_a_later_unsaved_edit() {
+    const SAVED_MARKDOWN: &str = "# Title\n\n```lua\nprint(2)\n```\n";
+    const UNSAVED_MARKDOWN: &str = "# Title\n\n```lua\nprint(3)\n```\n";
+    let (mut client, _config_dir) = init_virt_save_client();
+
+    let mut warmed = false;
+    for _ in 0..300 {
+        if virt_save_hover(&mut client).is_some() {
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(warmed, "virtual document must be open before the edits");
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": VIRT_SAVE_URI, "version": 2 },
+            "contentChanges": [{ "text": SAVED_MARKDOWN }],
+        }),
+    );
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": VIRT_SAVE_URI } }),
+    );
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": VIRT_SAVE_URI, "version": 3 },
+            "contentChanges": [{ "text": UNSAVED_MARKDOWN }],
+        }),
+    );
+
+    let mut settled = None;
+    for _ in 0..300 {
+        if let Some(state) = virt_save_hover(&mut client)
+            && state["documentText"]
+                .as_str()
+                .is_some_and(|text| text.contains("print(3)"))
+        {
+            settled = Some(state);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = settled.expect("the later unsaved didChange must reach the virtual server");
+    if state["did"] != 0 {
+        let saved_text = state["didDocumentText"]
+            .as_str()
+            .expect("a delivered didSave must record its document text");
+        assert!(
+            saved_text.contains("print(2)"),
+            "didSave may observe saved text or be omitted, never later unsaved text: {saved_text:?}"
+        );
+    }
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_virt_save_skips_server_without_save_capability() {
     // The per-server capability gate is the phantom-save mitigation: a virt
     // server that advertises neither `willSave` nor `save` must NOT be told

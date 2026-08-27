@@ -87,9 +87,13 @@ Partially implemented:
     an eligible host server receives the textless notification, kakehashi
     queues any pending full-text `didChange` and `didSave` under the same
     connection/document lock, so save hooks observe the editor's latest text.
-    Virtual forwarding first waits for the current parse snapshot and runs the
-    injection `didChange` pass; if that bounded settle cannot complete, it drops
-    the virtual `didSave` instead of running a save hook on stale fragment text.
+    Virtual forwarding binds the parse snapshot and projected content to the
+    exact incarnation/content version observed at save time, revalidates that
+    version under the edit lock, and queues a required injection `didChange`
+    before `didSave` under the virtual document's transition lock. If the 200ms
+    settle expires, the document advances, or the `didChange` enqueue fails, it
+    drops the virtual `didSave` instead of running a save hook on stale or later
+    unsaved fragment text.
 
   Each recipient is **gated per-server** on the relevant capability —
   `willSave` on `textDocumentSync.willSave`, `didSave` on `textDocumentSync.save`

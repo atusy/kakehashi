@@ -555,6 +555,10 @@ fn main() {
                     // Report the recorded willSave/didSave state as a JSON string
                     // so the test can prove the notifications reached this server
                     // and carried the document URI it knows (#357).
+                    let document_text = message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .and_then(|uri| documents.get(uri));
                     let state = json!({
                         "will": will_save_count,
                         "reason": last_will_save_reason,
@@ -563,6 +567,7 @@ fn main() {
                         "didUri": last_did_save_uri,
                         "didHadText": last_did_save_had_text,
                         "didDocumentText": last_did_save_document_text,
+                        "documentText": document_text,
                     });
                     json!({ "contents": state.to_string() })
                 } else if mode.starts_with("workspace-folders") {
