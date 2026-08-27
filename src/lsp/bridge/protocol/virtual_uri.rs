@@ -178,8 +178,10 @@ impl VirtualDocumentUri {
         if !Self::is_scratch_uri(uri) {
             return None;
         }
-        let marker = uri.rfind(Self::SCRATCH_ID_MARKER)?;
-        let suffix = &uri[marker + Self::SCRATCH_ID_MARKER.len()..];
+        let mut url = url::Url::parse(uri).ok()?;
+        let filename = url.path_segments()?.next_back()?.to_string();
+        let marker = filename.rfind(Self::SCRATCH_ID_MARKER)?;
+        let suffix = &filename[marker + Self::SCRATCH_ID_MARKER.len()..];
         let extension = suffix.rfind('.')?;
         let (run, step) = suffix[..extension].split_once('-')?;
         let run_number = run.parse::<usize>().ok()?;
@@ -187,7 +189,12 @@ impl VirtualDocumentUri {
         if run_number.to_string() != run || step_number.to_string() != step {
             return None;
         }
-        Some(format!("{}{}", &uri[..marker], &suffix[extension..]))
+        let canonical_filename = format!("{}{}", &filename[..marker], &suffix[extension..]);
+        url.path_segments_mut()
+            .ok()?
+            .pop()
+            .push(&canonical_filename);
+        Some(url.to_string())
     }
 
     /// Format: `{scheme}:///{host_dir}/kakehashi-virtual-uri-{region_id}.{ext}`,
@@ -351,6 +358,17 @@ mod tests {
                 "file:///project/kakehashi-virtual-uri-region-kakehashi-scratch-01-2.py"
             )
             .is_none()
+        );
+
+        let mut scratch_with_suffix = Url::parse(&scratch).unwrap();
+        scratch_with_suffix.set_query(Some("version=1.2-kakehashi-scratch-note"));
+        scratch_with_suffix.set_fragment(Some("part.3"));
+        let mut canonical_with_suffix = Url::parse(&canonical.to_uri_string()).unwrap();
+        canonical_with_suffix.set_query(scratch_with_suffix.query());
+        canonical_with_suffix.set_fragment(scratch_with_suffix.fragment());
+        assert_eq!(
+            VirtualDocumentUri::canonical_uri_for_scratch(scratch_with_suffix.as_str()),
+            Some(canonical_with_suffix.to_string())
         );
     }
 
