@@ -363,6 +363,127 @@ priorities = ["virt", "host"]
 }
 
 #[test]
+fn e2e_inline_value_routes_host_and_virtual_ranges() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("inline_value.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.layers.aggregation."textDocument/inlineValue"]
+strategy = "preferred"
+priorities = ["virt", "host"]
+"#,
+    )
+    .expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+    let init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-inline-value": {
+                        "cmd": [mock_bin(), "inline-value-host"],
+                        "languages": ["markdown"]
+                    },
+                    "mock-virt-inline-value": {
+                        "cmd": [mock_bin(), "inline-value-virt"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        init.pointer("/result/capabilities/inlineValueProvider"),
+        Some(&json!({ "workDoneProgress": true }))
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_inline_value.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "host\n\n> ```lua\n> code\n> ```\n"
+            }
+        }),
+    );
+
+    let request = |client: &mut LspClient, range: Value, stopped_location: Value| {
+        (0..300)
+            .find_map(|_| {
+                let response = client.send_request(
+                    "textDocument/inlineValue",
+                    json!({
+                        "textDocument": { "uri": uri },
+                        "range": range,
+                        "context": {
+                            "frameId": 7,
+                            "stoppedLocation": stopped_location
+                        }
+                    }),
+                );
+                assert!(
+                    response.get("error").is_none(),
+                    "inlineValue must not surface a top-level error: {response:?}"
+                );
+                let values = response["result"].as_array().cloned().unwrap_or_default();
+                if values.len() == 3 {
+                    Some(values)
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    None
+                }
+            })
+            .expect("inline values should become available")
+    };
+
+    let host_range = json!({
+        "start": { "line": 0, "character": 0 },
+        "end": { "line": 0, "character": 4 }
+    });
+    let host_values = request(&mut client, host_range.clone(), host_range.clone());
+    assert_eq!(host_values[0]["text"], json!("host:frame=7"));
+    assert_eq!(host_values[0]["range"], host_range);
+
+    let virtual_range = json!({
+        "start": { "line": 3, "character": 2 },
+        "end": { "line": 3, "character": 6 }
+    });
+    let stopped_location = json!({
+        "start": { "line": 3, "character": 3 },
+        "end": { "line": 3, "character": 5 }
+    });
+    let virtual_values = request(&mut client, virtual_range.clone(), stopped_location.clone());
+    assert_eq!(virtual_values[0]["text"], json!("virt:frame=7"));
+    assert_eq!(virtual_values[0]["range"], virtual_range);
+    assert_eq!(virtual_values[1]["range"], stopped_location);
+    assert_eq!(
+        virtual_values[2]["range"],
+        json!({
+            "start": { "line": 3, "character": 3 },
+            "end": { "line": 3, "character": 5 }
+        })
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_color_presentation_cancel_reaches_host_after_empty_virt_arm() {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir.path().join("color_presentation_cancel.toml");

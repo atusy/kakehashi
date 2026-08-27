@@ -42,6 +42,7 @@ pub(super) mod host;
 mod hover;
 mod implementation;
 mod inlay_hint;
+mod inline_value;
 pub(crate) use inlay_hint::{
     InlayHintDocumentRevision, InlayHintEnvelope, envelope_host_inlay_hints,
     extract_inlay_hint_envelope,

@@ -363,6 +363,7 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/inlayHint"
         | "textDocument/documentColor"
         | "textDocument/colorPresentation"
+        | "textDocument/inlineValue"
         | "textDocument/prepareCallHierarchy"
         | "textDocument/prepareTypeHierarchy"
         | "textDocument/diagnostic"
@@ -814,6 +815,7 @@ mod tests {
             "textDocument/inlayHint",
             "textDocument/documentColor",
             "textDocument/colorPresentation",
+            "textDocument/inlineValue",
             "textDocument/diagnostic",
             "kakehashi/captures/full",
             "kakehashi/captures/full/delta",
@@ -1144,6 +1146,41 @@ mod tests {
         assert!(writer.poll().is_ready());
         assert!(color.is_woken());
         assert!(color.poll().is_ready());
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["change", "reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_runs_inline_value_only_after_preceding_change() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "textDocument/didChange",
+            release: Some(release_rx),
+        });
+
+        let writer_fut = gate.call(notification("textDocument/didChange", URI));
+        let inline_value_fut = gate.call(notification("textDocument/inlineValue", URI));
+        let mut writer = tokio_test::task::spawn(writer_fut);
+        let mut inline_value = tokio_test::task::spawn(inline_value_fut);
+
+        assert!(inline_value.poll().is_pending());
+        assert!(
+            writer.poll().is_pending(),
+            "didChange stalls on the oneshot"
+        );
+        assert!(
+            inline_value.poll().is_pending(),
+            "inlineValue must remain behind the preceding didChange"
+        );
+
+        release_tx.send(()).expect("didChange is waiting");
+        assert!(writer.poll().is_ready());
+        assert!(inline_value.is_woken());
+        assert!(inline_value.poll().is_ready());
         assert_eq!(
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["change", "reader"]

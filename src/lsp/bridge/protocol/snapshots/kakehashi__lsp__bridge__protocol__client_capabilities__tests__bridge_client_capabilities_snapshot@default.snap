@@ -94,6 +94,9 @@ expression: capabilities
     "typeHierarchy": {
       "dynamicRegistration": false
     },
+    "inlineValue": {
+      "dynamicRegistration": false
+    },
     "inlayHint": {
       "dynamicRegistration": false
     },

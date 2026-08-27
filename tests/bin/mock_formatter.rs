@@ -290,6 +290,10 @@ fn main() {
                         "colorProvider": true,
                         "textDocumentSync": 1
                     }),
+                    "inline-value-host" | "inline-value-virt" => json!({
+                        "inlineValueProvider": true,
+                        "textDocumentSync": 1
+                    }),
                     "inlay-hint-resolve"
                     | "inlay-hint-resolve-replacement"
                     | "inlay-hint-delayed-resolve"
@@ -1584,6 +1588,43 @@ fn main() {
                         })
                         .unwrap_or(Value::Null)
                 };
+                respond(&mut writer, id, result);
+            }
+            "textDocument/inlineValue" => {
+                let range = message.pointer("/params/range").cloned();
+                let stopped_location = message.pointer("/params/context/stoppedLocation").cloned();
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .and(range)
+                    .zip(stopped_location)
+                    .map(|(range, stopped_location)| {
+                        let label = if mode == "inline-value-virt" {
+                            "virt"
+                        } else {
+                            "host"
+                        };
+                        json!([
+                            {
+                                "range": range,
+                                "text": format!("{label}:frame={}", message["params"]["context"]["frameId"])
+                            },
+                            {
+                                "range": stopped_location,
+                                "variableName": label,
+                                "caseSensitiveLookup": true
+                            },
+                            {
+                                "range": {
+                                    "start": { "line": 0, "character": 1 },
+                                    "end": { "line": 0, "character": 3 }
+                                },
+                                "expression": label
+                            }
+                        ])
+                    })
+                    .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }
             "documentLink/resolve" => {

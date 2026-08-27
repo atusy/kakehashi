@@ -84,6 +84,9 @@ fn build_baseline_capabilities(
             dynamic_registration: Some(false),
             ..Default::default()
         }),
+        inline_value: Some(DynamicRegistrationClientCapabilities {
+            dynamic_registration: Some(false),
+        }),
         // Without codeActionLiteralSupport, older servers fall back to
         // returning bare Commands only (issue #568). `dataSupport` +
         // `resolveSupport(["edit"])` let lazy servers (rust-analyzer-style)
