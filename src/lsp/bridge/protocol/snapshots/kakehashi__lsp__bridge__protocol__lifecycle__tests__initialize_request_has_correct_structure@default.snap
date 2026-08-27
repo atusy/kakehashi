@@ -92,6 +92,9 @@ expression: request
           "dynamicRegistration": false,
           "tooltipSupport": true
         },
+        "callHierarchy": {
+          "dynamicRegistration": false
+        },
         "moniker": {
           "dynamicRegistration": false
         },
