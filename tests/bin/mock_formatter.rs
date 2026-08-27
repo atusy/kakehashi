@@ -1666,6 +1666,68 @@ fn main() {
                     respond(&mut writer, id, result);
                 }
             }
+            "callHierarchy/outgoingCalls" => {
+                let item = message.pointer("/params/item").cloned();
+                let result = item
+                    .as_ref()
+                    .and_then(|item| item.get("uri").and_then(Value::as_str))
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        let observation = json!({
+                            "receivedUri": uri,
+                            "receivedRange": item.as_ref().and_then(|item| item.get("range")),
+                            "receivedSelectionRange": item
+                                .as_ref()
+                                .and_then(|item| item.get("selectionRange")),
+                            "receivedData": item.as_ref().and_then(|item| item.get("data")),
+                        });
+                        json!([
+                            {
+                                "to": {
+                                    "name": "mock-callee",
+                                    "detail": observation.to_string(),
+                                    "kind": 12,
+                                    "uri": uri,
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 5 }
+                                    },
+                                    "selectionRange": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 4 }
+                                    },
+                                    "data": { "mock": "outgoing-callee" }
+                                },
+                                "fromRanges": [{
+                                    "start": { "line": 0, "character": 1 },
+                                    "end": { "line": 0, "character": 2 }
+                                }]
+                            },
+                            {
+                                "to": {
+                                    "name": "external-callee",
+                                    "kind": 12,
+                                    "uri": "file:///external.lua",
+                                    "range": {
+                                        "start": { "line": 8, "character": 0 },
+                                        "end": { "line": 8, "character": 5 }
+                                    },
+                                    "selectionRange": {
+                                        "start": { "line": 8, "character": 0 },
+                                        "end": { "line": 8, "character": 4 }
+                                    },
+                                    "data": { "mock": "external-callee" }
+                                },
+                                "fromRanges": [{
+                                    "start": { "line": 0, "character": 2 },
+                                    "end": { "line": 0, "character": 3 }
+                                }]
+                            }
+                        ])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
             "inlayHint/resolve" => {
                 if mode == "inlay-hint-marker-resolve" {
                     record_mock_event(&mode, "request", &message);
