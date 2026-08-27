@@ -1682,7 +1682,7 @@ fn main() {
                         matches!(
                             item.pointer("/data/mock").and_then(Value::as_str),
                             Some("type-item" | "parent-item")
-                        )
+                        ) && item["tags"] == json!([1])
                     })
                     .map(|uri| {
                         let (name, end, data) = if item["data"] == json!({ "mock": "parent-item" })
