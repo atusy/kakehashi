@@ -48,13 +48,13 @@ fn init_client(host_layer: bool) -> (LspClient, tempfile::TempDir) {
     (client, config_dir)
 }
 
-fn prepare_with_retry(client: &mut LspClient, uri: &str, line: u64) -> Vec<Value> {
+fn prepare_with_retry(client: &mut LspClient, uri: &str, line: u64, character: u64) -> Vec<Value> {
     for _ in 0..300 {
         let response = client.send_request(
             "textDocument/prepareCallHierarchy",
             json!({
                 "textDocument": { "uri": uri },
-                "position": { "line": line, "character": 1 }
+                "position": { "line": line, "character": character }
             }),
         );
         assert!(response.get("error").is_none(), "{response}");
@@ -83,18 +83,19 @@ fn prepare_call_hierarchy_translates_virtual_items_and_envelopes_origin() {
             "uri": uri,
             "languageId": "markdown",
             "version": 1,
-            "text": "# Test\n\n```lua\ncall()\n```\n"
+            "text": "> ```lua\n> call()\n> ```\n"
         }}),
     );
 
-    let items = prepare_with_retry(&mut client, uri, 3);
+    let items = prepare_with_retry(&mut client, uri, 1, 3);
     assert_eq!(items.len(), 1);
     let item = &items[0];
     assert_eq!(item["uri"], uri);
-    assert_eq!(item["range"]["start"], json!({ "line": 3, "character": 0 }));
+    assert_eq!(item["detail"], "0:1");
+    assert_eq!(item["range"]["start"], json!({ "line": 1, "character": 2 }));
     assert_eq!(
         item["selectionRange"]["end"],
-        json!({ "line": 3, "character": 4 })
+        json!({ "line": 1, "character": 6 })
     );
     assert_eq!(item["data"]["kakehashi"]["origin"], "mock-call-hierarchy");
     assert_eq!(
@@ -119,7 +120,7 @@ fn prepare_call_hierarchy_envelopes_host_items_without_translation() {
         }}),
     );
 
-    let items = prepare_with_retry(&mut client, uri, 0);
+    let items = prepare_with_retry(&mut client, uri, 0, 1);
     assert_eq!(items.len(), 1);
     let item = &items[0];
     assert_eq!(item["uri"], uri);
