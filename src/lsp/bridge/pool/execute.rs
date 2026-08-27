@@ -187,7 +187,7 @@ impl LanguageServerPool {
         // the cancel will fail at the router lookup (which is acceptable for best-effort
         // cancel semantics) rather than finding the server but no downstream ID.
         if let Some(ref id) = upstream_request_id {
-            self.register_upstream_request(id.clone(), connection_key);
+            self.register_upstream_request_for_handle(id.clone(), &handle);
         }
 
         // Register request with upstream ID mapping for cancel forwarding

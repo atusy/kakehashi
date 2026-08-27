@@ -1787,8 +1787,9 @@ async fn serve_lsp() {
     // the wedge threshold becomes INGRESS_CONCURRENCY + tower-lsp's 100-slot
     // channel queue of outstanding messages, and a wedge self-heals within
     // the parked readers' settle backstop. `$/cancelRequest` is immune either
-    // way — `RequestIdCapture::call` dispatches its forwarding as a detached
-    // fire-and-forget spawn and needs no admission slot to do so. Sized for
+    // way — `RequestIdCapture::call` captures and queues cancellation
+    // synchronously before tower-lsp handles the notification, so it needs no
+    // admission slot. Sized for
     // the worst observed per-keystroke
     // burst (≈10 concurrent reader parks per document) across several
     // documents, with headroom.

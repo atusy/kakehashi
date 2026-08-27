@@ -321,7 +321,7 @@ impl LanguageServerPool {
 
         let connection_key = handle.key();
         if let Some(ref id) = upstream_id {
-            self.register_upstream_request(id.clone(), connection_key);
+            self.register_upstream_request_for_handle(id.clone(), &handle);
         }
         let (request_id, response_rx) = match handle
             .register_request_with_upstream(upstream_id.clone())

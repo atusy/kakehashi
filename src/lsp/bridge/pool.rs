@@ -135,7 +135,7 @@ fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHan
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -200,6 +200,9 @@ impl From<&str> for UpstreamId {
         UpstreamId::String(s.to_string())
     }
 }
+
+type UpstreamCancelHandles =
+    HashMap<UpstreamId, HashMap<ConnectionKey, Vec<Weak<ConnectionHandle>>>>;
 
 /// Metrics for cancel request forwarding.
 ///
@@ -427,6 +430,10 @@ pub struct LanguageServerPool {
     /// entries dangling to avoid a router→pool back-reference — stale lookups
     /// fail gracefully and IDs get reused.
     upstream_request_registry: std::sync::Mutex<HashMap<UpstreamId, HashMap<ConnectionKey, usize>>>,
+    /// Exact producer handles for synchronous cancel capture at middleware
+    /// ingress. Kept separate so key-only registry tests retain their compact
+    /// count model; production registrations always populate both maps.
+    upstream_cancel_handles: std::sync::Mutex<UpstreamCancelHandles>,
     /// Metrics for cancel forwarding observability.
     cancel_metrics: CancelForwardingMetrics,
     /// Consecutive handshake-task panics per connection (reset to 0 on success).
@@ -545,6 +552,7 @@ impl LanguageServerPool {
             diagnostic_host_epoch: AtomicU64::new(1),
             diagnostic_host_generations: DashMap::new(),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
+            upstream_cancel_handles: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
             root_uri: arc_swap::ArcSwap::new(Arc::new(None)),
@@ -3693,6 +3701,7 @@ impl LanguageServerPool {
     /// validity check runs while the upstream registry is locked, so request-ID
     /// reuse cannot replace the old request's downstream mappings between the
     /// check and target capture.
+    #[cfg(test)]
     pub(crate) async fn forward_cancel_by_upstream_id_if_current(
         &self,
         upstream_id: UpstreamId,
@@ -3785,6 +3794,74 @@ impl LanguageServerPool {
         Ok(())
     }
 
+    /// Synchronous production path used from `RequestIdCapture::call` before
+    /// tower-lsp can process the raw-ID cancellation. Production request
+    /// registration retains a weak reference to each exact producer handle, so
+    /// target capture does not need the async connections mutex.
+    pub(crate) fn forward_cancel_by_upstream_id_if_current_sync(
+        &self,
+        upstream_id: UpstreamId,
+        is_current: impl FnOnce() -> bool,
+        notify: impl FnOnce(),
+    ) -> io::Result<()> {
+        let registry = self
+            .upstream_request_registry
+            .lock()
+            .recover_poison("LanguageServerPool::forward_cancel_by_upstream_id_if_current_sync");
+        if !is_current() {
+            return Ok(());
+        }
+        let handles = self
+            .upstream_cancel_handles
+            .lock()
+            .recover_poison("LanguageServerPool::forward_cancel_by_upstream_id_if_current_sync");
+        let mut targets = Vec::new();
+        if let Some(connection_counts) = registry.get(&upstream_id) {
+            for connection_key in connection_counts.keys() {
+                let Some(producers) = handles
+                    .get(&upstream_id)
+                    .and_then(|by_key| by_key.get(connection_key))
+                else {
+                    continue;
+                };
+                for handle in producers
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .filter(|handle| handle.state() == ConnectionState::Ready)
+                {
+                    let (known, downstream_ids) =
+                        handle.router().prepare_cancel_by_upstream(&upstream_id);
+                    if !known {
+                        self.cancel_metrics.record_unknown_id();
+                        continue;
+                    }
+                    targets.push((connection_key.clone(), handle, downstream_ids));
+                }
+            }
+        } else {
+            self.cancel_metrics.record_not_in_registry();
+        }
+        drop(handles);
+        drop(registry);
+
+        notify();
+        for (connection_key, handle, downstream_ids) in targets {
+            for downstream_id in downstream_ids {
+                if let Err(error) =
+                    self.send_cancel_notification(&handle, &connection_key, downstream_id)
+                {
+                    log::warn!(
+                        target: "kakehashi::bridge::cancel",
+                        "Error forwarding cancel for upstream_id {}: {}",
+                        upstream_id,
+                        error
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Forward a client `window/workDoneProgress/cancel` to the downstream that
     /// owns the (bridge-minted) `upstream_token`, rewriting it back to that
     /// downstream's original token. Best-effort, mirroring `$/cancelRequest`:
@@ -3843,6 +3920,7 @@ impl LanguageServerPool {
     /// Callers MUST call `unregister_upstream_request` per request on completion
     /// (success, error, or timeout) — typically after `wait_for_response()` or
     /// in `ensure_document_opened()` error cleanup — to avoid leaking entries.
+    #[cfg(test)]
     pub(crate) fn register_upstream_request(
         &self,
         upstream_id: UpstreamId,
@@ -3859,6 +3937,43 @@ impl LanguageServerPool {
             .or_insert(0) += 1;
     }
 
+    /// Production registration retaining the exact connection handle so
+    /// cancellation targets can be captured synchronously before tower-lsp's
+    /// raw-ID cancel handler runs.
+    pub(crate) fn register_upstream_request_for_handle(
+        &self,
+        upstream_id: UpstreamId,
+        handle: &Arc<ConnectionHandle>,
+    ) {
+        let connection_key = handle.key();
+        let mut registry = self
+            .upstream_request_registry
+            .lock()
+            .recover_poison("LanguageServerPool::register_upstream_request_for_handle");
+        let mut handles = self
+            .upstream_cancel_handles
+            .lock()
+            .recover_poison("LanguageServerPool::register_upstream_request_for_handle");
+        *registry
+            .entry(upstream_id.clone())
+            .or_default()
+            .entry(connection_key.clone())
+            .or_insert(0) += 1;
+        let producers = handles
+            .entry(upstream_id)
+            .or_default()
+            .entry(connection_key.clone())
+            .or_default();
+        producers.retain(|producer| producer.strong_count() > 0);
+        if !producers
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|producer| Arc::ptr_eq(&producer, handle))
+        {
+            producers.push(Arc::downgrade(handle));
+        }
+    }
+
     /// Unregister one in-flight request for `(upstream_id, connection_key)`.
     /// The connection is removed once its count reaches zero; the upstream entry
     /// is fully removed once all connections have been unregistered.
@@ -3872,14 +3987,28 @@ impl LanguageServerPool {
             .lock()
             .recover_poison("LanguageServerPool::unregister_upstream_request");
         if let Some(connections) = registry.get_mut(upstream_id) {
+            let mut remove_handle = false;
             if let Some(count) = connections.get_mut(connection_key) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     connections.remove(connection_key);
+                    remove_handle = true;
                 }
             }
             if connections.is_empty() {
                 registry.remove(upstream_id);
+            }
+            if remove_handle {
+                let mut handles = self
+                    .upstream_cancel_handles
+                    .lock()
+                    .recover_poison("LanguageServerPool::unregister_upstream_request");
+                if let Some(by_key) = handles.get_mut(upstream_id) {
+                    by_key.remove(connection_key);
+                    if by_key.is_empty() {
+                        handles.remove(upstream_id);
+                    }
+                }
             }
         }
     }
@@ -3897,6 +4026,10 @@ impl LanguageServerPool {
             .lock()
             .recover_poison("LanguageServerPool::unregister_all_for_upstream_id");
         registry.remove(upstream_id);
+        self.upstream_cancel_handles
+            .lock()
+            .recover_poison("LanguageServerPool::unregister_all_for_upstream_id")
+            .remove(upstream_id);
     }
 }
 
