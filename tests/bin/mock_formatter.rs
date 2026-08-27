@@ -270,6 +270,7 @@ fn main() {
                     }),
                     "type-hierarchy-prepare"
                     | "type-hierarchy-replacement"
+                    | "type-hierarchy-marker-supertypes"
                     | "type-hierarchy-slow-supertypes"
                     | "type-hierarchy-delayed-supertypes" => json!({
                         "typeHierarchyProvider": true,
@@ -1861,6 +1862,9 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "typeHierarchy/supertypes" => {
+                if mode == "type-hierarchy-marker-supertypes" {
+                    record_mock_event(&mode, "request", &message);
+                }
                 if mode == "type-hierarchy-slow-supertypes" {
                     record_mock_event(&mode, "request", &message);
                     notify(
