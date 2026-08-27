@@ -73,8 +73,9 @@
 //!   `documentLinkProvider` with `resolveProvider: false` and answer with a
 //!   link carrying opaque `data`: an ordinary payload, and one that occupies
 //!   the reserved `kakehashi` key.
-//! - `call-hierarchy-prepare` — advertises `callHierarchyProvider` and returns
-//!   one preparation item that echoes the requested document URI.
+//! - `call-hierarchy-prepare` — advertises `callHierarchyProvider`, returns one
+//!   preparation item, and expands it through incoming calls while echoing the
+//!   downstream item for coordinate and envelope assertions.
 //! - `document-link` / `document-link-resolve` / `document-link-resolve-replacement` — advertise
 //!   `textDocument/documentLink` with one link whose tooltip identifies the
 //!   requested URI. The resolve mode initially returns data only and materializes
@@ -1588,6 +1589,46 @@ fn main() {
                                 "end": { "line": 0, "character": 4 }
                             },
                             "data": { "mock": "call-item" }
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "callHierarchy/incomingCalls" => {
+                let item = message.pointer("/params/item").cloned();
+                let result = item
+                    .as_ref()
+                    .and_then(|item| item.get("uri").and_then(Value::as_str))
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        let observation = json!({
+                            "receivedUri": uri,
+                            "receivedRange": item.as_ref().and_then(|item| item.get("range")),
+                            "receivedSelectionRange": item
+                                .as_ref()
+                                .and_then(|item| item.get("selectionRange")),
+                            "receivedData": item.as_ref().and_then(|item| item.get("data")),
+                        });
+                        json!([{
+                            "from": {
+                                "name": "mock-caller",
+                                "detail": observation.to_string(),
+                                "kind": 12,
+                                "uri": uri,
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 5 }
+                                },
+                                "selectionRange": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 4 }
+                                },
+                                "data": { "mock": "incoming-caller" }
+                            },
+                            "fromRanges": [{
+                                "start": { "line": 0, "character": 1 },
+                                "end": { "line": 0, "character": 2 }
+                            }]
                         }])
                     })
                     .unwrap_or(Value::Null);
