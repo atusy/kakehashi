@@ -35,6 +35,7 @@ pub(super) struct HostWholeDocumentResponse<T> {
     pub(super) server_name: String,
     pub(super) host_uri: url::Url,
     pub(super) incarnation: Option<u64>,
+    pub(super) connection_generation: u64,
     pub(super) handle: Arc<crate::lsp::bridge::ConnectionHandle>,
 }
 
@@ -313,6 +314,7 @@ impl Kakehashi {
                             server_name: t.server_name,
                             host_uri: t.uri,
                             incarnation: Some(raw.incarnation),
+                            connection_generation: raw.connection_generation,
                             handle: raw.handle,
                         }))
                     }

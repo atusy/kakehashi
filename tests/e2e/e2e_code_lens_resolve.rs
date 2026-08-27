@@ -371,6 +371,9 @@ fn e2e_host_code_lens_from_closed_incarnation_stays_unresolved() {
 #[test]
 fn e2e_host_code_lens_resolve_cancel_returns_request_cancelled() {
     let cancel_dir = tempfile::TempDir::new().expect("cancel dir");
+    let request_file = cancel_dir
+        .path()
+        .join("code-lens-slow-resolve.request.json");
     let cancel_file = cancel_dir.path().join("code-lens-slow-resolve.cancel.json");
     let (mut client, _config_dir) = init_host_client_with_mode_and_cancel_dir(
         "code-lens-slow-resolve",
@@ -380,7 +383,15 @@ fn e2e_host_code_lens_resolve_cancel_returns_request_cancelled() {
     let lens = code_lens_with_retry(&mut client).remove(0);
 
     let request_id = client.send_request_async("codeLens/resolve", lens);
-    std::thread::sleep(Duration::from_millis(100));
+    let started = (0..100).any(|_| {
+        if request_file.exists() {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+            false
+        }
+    });
+    assert!(started, "resolve request must reach the downstream server");
     client.send_notification("$/cancelRequest", json!({ "id": request_id }));
     let response = client.receive_response_for_id_public(request_id);
     assert_eq!(response["error"]["code"], -32800, "{response}");

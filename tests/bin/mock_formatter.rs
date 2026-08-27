@@ -1286,6 +1286,7 @@ fn main() {
             }
             "codeLens/resolve" => {
                 if mode == "code-lens-slow-resolve" {
+                    record_mock_event(&mode, "request", &message);
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
                 // Materialize the command, echoing the lens's own data back so

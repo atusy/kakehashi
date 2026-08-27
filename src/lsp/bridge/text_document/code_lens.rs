@@ -66,6 +66,10 @@ pub(crate) struct CodeLensEnvelope {
     /// Host open incarnation that produced this lens. Missing for legacy data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) incarnation: Option<u64>,
+    /// Generation of the producing pooled connection. Host resolve must not
+    /// hand process-owned data to a replacement process under the same key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) connection_generation: Option<u64>,
     /// Region offset snapshot for coordinate translation at resolve time.
     pub(crate) offset: EnvelopeOffset,
     /// The downstream server's original `data` value (preserved verbatim).
@@ -93,6 +97,7 @@ struct CodeLensEnvelopeContext<'a> {
     region_id: &'a str,
     injection_language: &'a str,
     incarnation: Option<u64>,
+    connection_generation: Option<u64>,
     offset: &'a RegionOffset,
     host_layer: bool,
 }
@@ -106,6 +111,7 @@ fn envelope_lens_data(lens: &mut CodeLens, ctx: &CodeLensEnvelopeContext) {
         region_id: ctx.region_id.to_string(),
         injection_language: ctx.injection_language.to_string(),
         incarnation: ctx.incarnation,
+        connection_generation: ctx.connection_generation,
         offset: EnvelopeOffset::from(ctx.offset),
         inner,
         host_layer: ctx.host_layer,
@@ -140,6 +146,7 @@ fn re_envelope_lens(lens: &mut CodeLens, envelope: &CodeLensEnvelope) {
         region_id: &envelope.region_id,
         injection_language: &envelope.injection_language,
         incarnation: envelope.incarnation,
+        connection_generation: envelope.connection_generation,
         offset: &RegionOffset::from(&envelope.offset),
         host_layer: envelope.host_layer,
     };
@@ -151,6 +158,8 @@ pub(crate) fn envelope_host_code_lenses(
     server_name: &str,
     host_uri: &str,
     incarnation: Option<u64>,
+    connection_generation: u64,
+    server_resolves: bool,
 ) {
     let offset = RegionOffset::new(0, 0);
     let ctx = CodeLensEnvelopeContext {
@@ -159,12 +168,21 @@ pub(crate) fn envelope_host_code_lenses(
         region_id: "",
         injection_language: "",
         incarnation,
+        connection_generation: Some(connection_generation),
         offset: &offset,
         host_layer: true,
     };
     for lens in lenses {
-        envelope_lens_data(lens, &ctx);
+        if server_resolves || code_lens_data_carries_envelope_key(lens) {
+            envelope_lens_data(lens, &ctx);
+        }
     }
+}
+
+fn code_lens_data_carries_envelope_key(lens: &CodeLens) -> bool {
+    lens.data
+        .as_ref()
+        .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
 }
 
 impl LanguageServerPool {
@@ -218,6 +236,7 @@ impl LanguageServerPool {
                     region_id,
                     injection_language,
                     incarnation: host_incarnation,
+                    connection_generation: None,
                     offset: ctx.offset,
                     host_layer: false,
                 };
@@ -289,8 +308,25 @@ impl LanguageServerPool {
             return lens;
         }
         let handle_result = if envelope.is_host_layer() {
-            self.get_or_create_connection(server_name, server_config, Some(&host_uri))
+            let Some(expected_generation) = envelope.connection_generation else {
+                re_envelope_lens(&mut lens, &envelope);
+                return lens;
+            };
+            let (_, connection_key) = self
+                .resolve_acquire(server_name, server_config, Some(&host_uri))
+                .await;
+            if self.document_connection_generation(&connection_key) != expected_generation {
+                re_envelope_lens(&mut lens, &envelope);
+                return lens;
+            }
+            self.ready_connection_by_key_for_config(&connection_key, Some(server_config))
                 .await
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "producer connection is no longer live",
+                    )
+                })
         } else {
             self.get_or_create_virtual_connection(
                 server_name,
@@ -375,7 +411,25 @@ impl LanguageServerPool {
 
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        if let Err(e) = handle.send_request(request, request_id) {
+        let send_result = {
+            let connections = self.connections().await;
+            let producer_is_live = connections
+                .get(connection_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle));
+            let generation_matches = !envelope.is_host_layer()
+                || envelope.connection_generation.is_some_and(|expected| {
+                    self.document_connection_generation(connection_key) == expected
+                });
+            if !producer_is_live || !generation_matches {
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "producer connection was replaced before resolve send",
+                ))
+            } else {
+                handle.send_request(request, request_id).map_err(Into::into)
+            }
+        };
+        if let Err(e) = send_result {
             warn!(
                 target: "kakehashi::bridge",
                 "codeLens/resolve: failed to send request for {}: {}",
@@ -520,6 +574,7 @@ mod tests {
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             injection_language: "lua",
             incarnation: Some(1),
+            connection_generation: None,
             offset,
             host_layer: false,
         }

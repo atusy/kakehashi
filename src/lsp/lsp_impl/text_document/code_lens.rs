@@ -39,14 +39,15 @@ impl Kakehashi {
                     .await
             },
             |mut won| {
-                if won.handle.has_capability("codeLens/resolve") {
-                    envelope_host_code_lenses(
-                        &mut won.items,
-                        &won.server_name,
-                        won.host_uri.as_str(),
-                        won.incarnation,
-                    );
-                }
+                let server_resolves = won.handle.has_capability("codeLens/resolve");
+                envelope_host_code_lenses(
+                    &mut won.items,
+                    &won.server_name,
+                    won.host_uri.as_str(),
+                    won.incarnation,
+                    won.connection_generation,
+                    server_resolves,
+                );
                 Some(won.items)
             },
         )
