@@ -84,7 +84,7 @@ impl WriterTaskHandle {
     /// Used when we need to force-stop the connection (e.g., on reader error).
     /// Does not wait for queue drain or writer return.
     #[cfg(test)]
-    fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.cancel_token.cancel();
     }
 }
