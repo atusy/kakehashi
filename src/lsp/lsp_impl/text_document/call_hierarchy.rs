@@ -87,28 +87,41 @@ impl Kakehashi {
         let Ok(uri) = url::Url::parse(&envelope.host_uri) else {
             return false;
         };
-        let Some(document) = self.documents.get(&uri) else {
+        let Some(expected_incarnation) = envelope.incarnation else {
             return false;
         };
-        if document.content_version() != envelope.content_version
-            || envelope.incarnation.is_none_or(|expected| {
-                document.incarnation() != expected
-                    || pool.current_host_incarnation(&uri) != Some(expected)
-            })
-        {
+        let lineage_is_current = || {
+            self.documents.get(&uri).is_some_and(|document| {
+                document.content_version() == envelope.content_version
+                    && document.incarnation() == expected_incarnation
+            }) && pool.current_host_incarnation(&uri) == Some(expected_incarnation)
+        };
+        if !lineage_is_current() {
             return false;
         }
-        envelope.is_host_layer()
-            || resolve_region_offset(
-                &self.documents,
-                &self.language,
-                &self.bridge,
-                &uri,
-                &envelope.region_id,
+        if envelope.is_host_layer() {
+            return true;
+        }
+
+        // `resolve_region_offset` reads the document store itself. Do not keep
+        // a DashMap read guard across that nested lookup; a queued didChange
+        // writer could otherwise deadlock a task-fair shard lock. Revalidate
+        // the lineage after geometry resolution to close the intervening race.
+        let geometry_is_current = resolve_region_offset(
+            &self.documents,
+            &self.language,
+            &self.bridge,
+            &uri,
+            &envelope.region_id,
+        )
+        .is_some_and(|(offset, _, contiguous)| {
+            call_hierarchy_region_geometry_is_fresh(
+                &crate::lsp::bridge::RegionOffset::from(&envelope.offset),
+                &offset,
+                contiguous,
             )
-            .is_some_and(|(offset, _, contiguous)| {
-                contiguous && offset == crate::lsp::bridge::RegionOffset::from(&envelope.offset)
-            })
+        });
+        geometry_is_current && lineage_is_current()
     }
 
     async fn call_hierarchy_prepare_host_layer(
@@ -226,6 +239,14 @@ impl Kakehashi {
     }
 }
 
+fn call_hierarchy_region_geometry_is_fresh(
+    expected: &crate::lsp::bridge::RegionOffset,
+    current: &crate::lsp::bridge::RegionOffset,
+    contiguous: bool,
+) -> bool {
+    contiguous && current == expected
+}
+
 struct HostCallHierarchyItems {
     items: Vec<CallHierarchyItem>,
     server_name: String,
@@ -246,5 +267,27 @@ impl HostCallHierarchyItems {
             &self.connection_key,
         );
         self.items
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsp::bridge::RegionOffset;
+
+    #[test]
+    fn incoming_calls_require_current_contiguous_region_geometry() {
+        let expected = RegionOffset::new(3, 2);
+        assert!(call_hierarchy_region_geometry_is_fresh(
+            &expected, &expected, true
+        ));
+        assert!(!call_hierarchy_region_geometry_is_fresh(
+            &expected, &expected, false
+        ));
+        assert!(!call_hierarchy_region_geometry_is_fresh(
+            &expected,
+            &RegionOffset::new(4, 2),
+            true
+        ));
     }
 }
