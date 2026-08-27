@@ -2989,7 +2989,9 @@ mod tests {
 
     #[tokio::test]
     async fn inlay_hint_resolve_capability_follows_static_resolve_provider() {
-        use tower_lsp_server::ls_types::{InlayHintOptions, InlayHintServerCapabilities};
+        use tower_lsp_server::ls_types::{
+            InlayHintOptions, InlayHintRegistrationOptions, InlayHintServerCapabilities,
+        };
 
         let handle = spawn_sink_handle().await;
         handle.set_server_capabilities(ServerCapabilities {
@@ -3015,6 +3017,21 @@ mod tests {
         });
         assert!(!no_resolve_handle.has_capability("inlayHint/resolve"));
         assert!(no_resolve_handle.has_capability("textDocument/inlayHint"));
+
+        let registration_handle = spawn_sink_handle().await;
+        registration_handle.set_server_capabilities(ServerCapabilities {
+            inlay_hint_provider: Some(OneOf::Right(
+                InlayHintServerCapabilities::RegistrationOptions(InlayHintRegistrationOptions {
+                    inlay_hint_options: InlayHintOptions {
+                        resolve_provider: Some(true),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )),
+            ..Default::default()
+        });
+        assert!(registration_handle.has_capability("inlayHint/resolve"));
     }
 
     #[tokio::test]
