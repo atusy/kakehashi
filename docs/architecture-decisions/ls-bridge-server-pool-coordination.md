@@ -49,7 +49,7 @@ The `ConnectionKey` is stored on each connection handle, so the request,
 
 `completionItem/resolve`, `codeAction/resolve`, `codeLens/resolve`,
 `documentLink/resolve`, `inlayHint/resolve`, and
-`callHierarchy/incomingCalls` carry
+`callHierarchy/incomingCalls` / `callHierarchy/outgoingCalls` carry
 no `textDocument`, so the originating host URI is stashed in their routing
 envelopes (`KakehashiEnvelope` / `CodeActionEnvelope` / `CodeLensEnvelope` /
 `DocumentLinkEnvelope` / `InlayHintEnvelope` / `CallHierarchyEnvelope`)
@@ -59,7 +59,7 @@ the client-root connection — the pre-#382 rule, and still the shipped
 behavior today, via the field's serde default; the code-action, code-lens,
 document-link, inlay-hint, and call-hierarchy envelopes *require* the field. A
 stamp-less resolve item fails to deserialize and is returned unresolved;
-stamp-less `incomingCalls` returns `null` because no producer can expand it. The fail-soft rule
+stamp-less call-hierarchy expansion returns `null` because no producer can expand it. The fail-soft rule
 below is target state that lands with bridge-routing-protocol's
 implementation.) Amended with
 bridge-routing-protocol:

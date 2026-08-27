@@ -313,12 +313,12 @@ enum Role {
 /// their freshness gates read tracker/document
 /// document snapshot (#568). `codeLens/resolve`, `codeAction/resolve`, and
 /// `documentLink/resolve`, `inlayHint/resolve`, and
-/// `callHierarchy/incomingCalls` are readers too (#355, #568): their freshness gates read tracker/document
+/// `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls` are readers too (#355, #568): their freshness gates read tracker/document
 /// state, so they must observe every `didChange` that preceded them on the
 /// wire — but their params carry no `textDocument`, so the URI comes from the
 /// routing envelope (`params.data` for resolve methods and `params.item.data`
 /// for call hierarchy). Unenveloped items pass through ungated; resolve
-/// handlers return their inputs unchanged, while `incomingCalls` returns
+/// handlers return their inputs unchanged, while call-hierarchy expansion returns
 /// `null` because it has no producer to expand. The
 /// full `kakehashi/node` family is gated too (#698). Its tracker and
 /// incarnation checks catch staleness only after a lifecycle writer has run;
@@ -377,7 +377,7 @@ fn classify(req: &Request) -> Option<Role> {
                 uri: normalize_uri(raw),
             })
         }
-        "callHierarchy/incomingCalls" => {
+        "callHierarchy/incomingCalls" | "callHierarchy/outgoingCalls" => {
             let raw = req.params()?["item"]["data"]["kakehashi"]["host_uri"].as_str()?;
             Some(Role::Reader {
                 uri: normalize_uri(raw),
@@ -896,6 +896,18 @@ mod tests {
         assert!(
             matches!(classify(&enveloped_call), Some(Role::Reader { ref uri }) if uri == URI),
             "enveloped callHierarchy/incomingCalls must be keyed by item.data host_uri"
+        );
+
+        let enveloped_outgoing_call = Request::build("callHierarchy/outgoingCalls")
+            .params(serde_json::json!({
+                "item": {
+                    "data": { "kakehashi": { "host_uri": URI } }
+                }
+            }))
+            .finish();
+        assert!(
+            matches!(classify(&enveloped_outgoing_call), Some(Role::Reader { ref uri }) if uri == URI),
+            "enveloped callHierarchy/outgoingCalls must be keyed by item.data host_uri"
         );
 
         let unenveloped_call = Request::build("callHierarchy/incomingCalls")

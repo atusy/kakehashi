@@ -21,21 +21,22 @@ use tower_lsp_server::ls_types::request::{
 };
 use tower_lsp_server::ls_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
-    CallHierarchyPrepareParams, CodeAction, CodeActionParams, CodeActionResponse, CodeLens,
-    CodeLensParams, CompletionItem, CompletionParams, CompletionResponse,
-    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentDiagnosticParams, DocumentDiagnosticReportResult, DocumentFormattingParams,
-    DocumentHighlight, DocumentHighlightParams, DocumentLink, DocumentLinkParams,
-    DocumentOnTypeFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
-    DocumentSymbolResponse, ExecuteCommandParams, FoldingRange, FoldingRangeParams,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
-    InitializeResult, InitializedParams, InlayHint, InlayHintParams, LinkedEditingRangeParams,
-    LinkedEditingRanges, Location, Moniker, MonikerParams, PrepareRenameResponse, ReferenceParams,
-    RenameParams, SelectionRange, SelectionRangeParams, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
-    TextDocumentPositionParams, TextEdit, Uri, WillSaveTextDocumentParams, WorkspaceEdit,
+    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
+    CodeAction, CodeActionParams, CodeActionResponse, CodeLens, CodeLensParams, CompletionItem,
+    CompletionParams, CompletionResponse, DidChangeConfigurationParams,
+    DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentDiagnosticParams,
+    DocumentDiagnosticReportResult, DocumentFormattingParams, DocumentHighlight,
+    DocumentHighlightParams, DocumentLink, DocumentLinkParams, DocumentOnTypeFormattingParams,
+    DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse,
+    ExecuteCommandParams, FoldingRange, FoldingRangeParams, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializeResult,
+    InitializedParams, InlayHint, InlayHintParams, LinkedEditingRangeParams, LinkedEditingRanges,
+    Location, Moniker, MonikerParams, PrepareRenameResponse, ReferenceParams, RenameParams,
+    SelectionRange, SelectionRangeParams, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
+    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
+    SemanticTokensResult, SignatureHelp, SignatureHelpParams, TextDocumentPositionParams, TextEdit,
+    Uri, WillSaveTextDocumentParams, WorkspaceEdit,
 };
 use tower_lsp_server::ls_types::{
     ColorInformation, ColorPresentation, ColorPresentationParams, DocumentColorParams,
@@ -961,6 +962,13 @@ impl LanguageServer for Kakehashi {
         params: CallHierarchyIncomingCallsParams,
     ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
         self.call_hierarchy_incoming_impl(params).await
+    }
+
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        self.call_hierarchy_outgoing_impl(params).await
     }
 
     async fn document_highlight(
