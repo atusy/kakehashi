@@ -16,7 +16,9 @@ use url::Url;
 use crate::config::settings::BridgeServerConfig;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 
-use super::super::pool::{ConnectionHandle, ConnectionKey, LanguageServerPool, UpstreamId};
+use super::super::pool::{
+    ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId,
+};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
     translate_host_position_to_virtual, translate_host_range_to_virtual,
@@ -328,9 +330,9 @@ impl LanguageServerPool {
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
         let (send_result, virtual_uri_observer) = {
             let connections = self.connections().await;
-            let producer_is_live = connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle));
+            let producer_is_live = connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+            });
             let generation_matches = self.document_connection_generation(connection_key)
                 == envelope.connection_generation;
             if !producer_is_live || !generation_matches {
@@ -409,10 +411,9 @@ impl LanguageServerPool {
         expected_generation: u64,
     ) -> bool {
         let connections = self.connections().await;
-        connections
-            .get(connection_key)
-            .is_some_and(|current| Arc::ptr_eq(current, handle))
-            && self.document_connection_generation(connection_key) == expected_generation
+        connections.get(connection_key).is_some_and(|current| {
+            Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+        }) && self.document_connection_generation(connection_key) == expected_generation
     }
 }
 
@@ -889,6 +890,23 @@ mod tests {
 
         assert!(known.contains(&virtual_uri.to_uri_string()));
         assert!(!known.contains(shaped_real_uri));
+    }
+
+    #[tokio::test]
+    async fn retired_exact_producer_is_not_live() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua-ls");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let generation = pool.document_connection_generation(&key);
+        handle.begin_shutdown();
+
+        assert!(
+            !pool
+                .call_hierarchy_producer_is_live(&key, &handle, generation)
+                .await,
+            "pointer and generation equality must not revive a retired producer"
+        );
     }
 
     #[tokio::test]

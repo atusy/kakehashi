@@ -37,7 +37,7 @@ use serde_json::Value;
 use tower_lsp_server::ls_types::{CodeLens, NumberOrString};
 use url::Url;
 
-use super::super::pool::{ConnectionKey, LanguageServerPool, UpstreamId};
+use super::super::pool::{ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, WholeDocumentRequestParams,
     build_whole_document_request_with_progress, response_has_jsonrpc_error,
@@ -478,9 +478,9 @@ impl LanguageServerPool {
 
         let send_result = {
             let connections = self.connections().await;
-            let producer_is_live = connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle));
+            let producer_is_live = connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+            });
             let generation_matches = envelope.connection_generation.is_some_and(|expected| {
                 self.document_connection_generation(connection_key) == expected
             });
@@ -523,6 +523,21 @@ impl LanguageServerPool {
                 return lens;
             }
         };
+
+        let producer_is_still_live = {
+            let connections = self.connections().await;
+            connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle)
+                    && current.state() == ConnectionState::Ready
+                    && envelope.connection_generation.is_some_and(|expected| {
+                        self.document_connection_generation(connection_key) == expected
+                    })
+            })
+        };
+        if !producer_is_still_live {
+            re_envelope_lens(&mut lens, &envelope);
+            return lens;
+        }
 
         match parse_code_lens_resolve_response(response) {
             Some(mut resolved) => {
