@@ -2,23 +2,27 @@
 
 use std::collections::HashSet;
 use std::io;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
-    NumberOrString, Position, Range, SymbolKind, SymbolTag, TextDocumentIdentifier,
-    TextDocumentPositionParams, TypeHierarchyItem, TypeHierarchyPrepareParams, Uri,
-    WorkDoneProgressParams,
+    NumberOrString, PartialResultParams, Position, Range, SymbolKind, SymbolTag,
+    TextDocumentIdentifier, TextDocumentPositionParams, TypeHierarchyItem,
+    TypeHierarchyPrepareParams, TypeHierarchySupertypesParams, Uri, WorkDoneProgressParams,
 };
 
 use super::super::pool::ConnectionKey;
-use super::super::pool::{LanguageServerPool, UpstreamId, VirtualUriObserver};
+use super::super::pool::{ConnectionState, LanguageServerPool, UpstreamId, VirtualUriObserver};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
-    translate_host_position_to_virtual, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    translate_host_position_to_virtual, translate_host_range_to_virtual,
+    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 use super::completion::EnvelopeOffset;
 use crate::config::settings::BridgeServerConfig;
+use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
+use crate::lsp::bridge::actor::RouterCleanupGuard;
 
 impl LanguageServerPool {
     #[allow(clippy::too_many_arguments)]
@@ -102,6 +106,160 @@ impl LanguageServerPool {
         )
         .await?
     }
+
+    pub(crate) async fn dispatch_type_hierarchy_supertypes(
+        &self,
+        params: TypeHierarchySupertypesParams,
+        settings: &crate::config::settings::WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<Vec<TypeHierarchyItem>> {
+        let (params, envelope) = prepare_supertypes_params(params)?;
+        if !crate::config::is_server_spawnable(&settings.language_servers, &envelope.origin) {
+            return None;
+        }
+        let config = resolve_with_wildcard(
+            &settings.language_servers,
+            &envelope.origin,
+            merge_bridge_server_configs,
+        )?;
+        self.send_type_hierarchy_supertypes_request(&config, params, envelope, upstream_id)
+            .await
+    }
+
+    async fn send_type_hierarchy_supertypes_request(
+        &self,
+        server_config: &BridgeServerConfig,
+        mut params: TypeHierarchySupertypesParams,
+        envelope: TypeHierarchyEnvelope,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<Vec<TypeHierarchyItem>> {
+        const METHOD: &str = "typeHierarchy/supertypes";
+        let server_name = &envelope.origin;
+        let host_uri = url::Url::parse(&envelope.host_uri).ok()?;
+        let expected_incarnation = envelope.incarnation?;
+        if self.current_host_incarnation(&host_uri) != Some(expected_incarnation)
+            || envelope.connection_key.server() != server_name
+            || self.document_connection_generation(&envelope.connection_key)
+                != envelope.connection_generation
+        {
+            return None;
+        }
+        let handle = self
+            .ready_connection_by_key_for_config(&envelope.connection_key, Some(server_config))
+            .await?;
+        let host_lifecycle = self
+            .request_host_lifecycle_for_incarnation(&host_uri, expected_incarnation)
+            .await
+            .ok()?;
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).ok()?;
+        let virtual_uri = (!envelope.is_host_layer()).then(|| {
+            VirtualDocumentUri::new(
+                &host_uri_lsp,
+                &envelope.injection_language,
+                &envelope.region_id,
+            )
+        });
+        let connection_key = handle.key();
+        if let Some(ref id) = upstream_id {
+            self.register_upstream_request_for_handle(id.clone(), &handle);
+        }
+        let (request_id, response_rx) =
+            match handle.register_request_with_upstream(upstream_id.clone()) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "{METHOD}: failed to register request for {server_name}: {error}"
+                    );
+                    if let Some(ref id) = upstream_id {
+                        self.unregister_upstream_request(id, connection_key);
+                    }
+                    return None;
+                }
+            };
+        params.item =
+            type_hierarchy_item_to_downstream(params.item, &envelope, virtual_uri.as_ref());
+        let request = build_type_hierarchy_expansion_request(request_id, METHOD, params);
+        let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
+        let (send_result, virtual_uri_observer) = {
+            let connections = self.connections().await;
+            let producer_is_live = connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+            });
+            let generation_matches = self.document_connection_generation(connection_key)
+                == envelope.connection_generation;
+            if !producer_is_live || !generation_matches {
+                (
+                    Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "producer connection was replaced before supertypes send",
+                    )),
+                    None,
+                )
+            } else {
+                let observer = self.observe_virtual_uris_for_connection(
+                    connection_key,
+                    envelope.connection_generation,
+                );
+                if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
+                    observer.insert(uri);
+                }
+                (
+                    handle.send_request(request, request_id).map_err(Into::into),
+                    Some(observer),
+                )
+            }
+        };
+        if let Err(error) = send_result {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "{METHOD}: failed to send request for {server_name}: {error}"
+            );
+            if let Some(ref id) = upstream_id {
+                self.unregister_upstream_request(id, connection_key);
+            }
+            return None;
+        }
+        let virtual_uri_observer = virtual_uri_observer?;
+        drop(host_lifecycle);
+        let response = handle.wait_for_response(request_id, response_rx).await;
+        router_guard.disarm();
+        if let Some(ref id) = upstream_id {
+            self.unregister_upstream_request(id, connection_key);
+        }
+        let response = response.ok()?;
+        if !self
+            .type_hierarchy_producer_is_live(
+                connection_key,
+                &handle,
+                envelope.connection_generation,
+            )
+            .await
+        {
+            return None;
+        }
+        transform_type_hierarchy_expansion_response_to_host(
+            response,
+            METHOD,
+            virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string),
+            &host_uri_lsp,
+            &envelope,
+            &virtual_uri_observer,
+        )
+        .ok()?
+    }
+
+    async fn type_hierarchy_producer_is_live(
+        &self,
+        connection_key: &ConnectionKey,
+        handle: &Arc<super::super::pool::ConnectionHandle>,
+        expected_generation: u64,
+    ) -> bool {
+        let connections = self.connections().await;
+        connections.get(connection_key).is_some_and(|current| {
+            Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+        }) && self.document_connection_generation(connection_key) == expected_generation
+    }
 }
 
 const ENVELOPE_KEY: &str = "kakehashi";
@@ -126,6 +284,76 @@ pub(crate) struct TypeHierarchyEnvelope {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+impl TypeHierarchyEnvelope {
+    pub(crate) fn is_host_layer(&self) -> bool {
+        self.host_layer && self.region_id.is_empty()
+    }
+}
+
+pub(crate) fn extract_type_hierarchy_envelope(
+    item: &TypeHierarchyItem,
+) -> Option<TypeHierarchyEnvelope> {
+    serde_json::from_value(item.data.as_ref()?.get(ENVELOPE_KEY)?.clone()).ok()
+}
+
+fn strip_type_hierarchy_envelope(item: &mut TypeHierarchyItem) -> Option<TypeHierarchyEnvelope> {
+    let mut envelope = extract_type_hierarchy_envelope(item)?;
+    item.data = envelope.inner.take();
+    Some(envelope)
+}
+
+fn prepare_supertypes_params(
+    mut params: TypeHierarchySupertypesParams,
+) -> Option<(TypeHierarchySupertypesParams, TypeHierarchyEnvelope)> {
+    let envelope = strip_type_hierarchy_envelope(&mut params.item)?;
+    params.work_done_progress_params = WorkDoneProgressParams::default();
+    params.partial_result_params = PartialResultParams::default();
+    Some((params, envelope))
+}
+
+fn type_hierarchy_item_to_downstream(
+    mut item: TypeHierarchyItem,
+    envelope: &TypeHierarchyEnvelope,
+    virtual_uri: Option<&VirtualDocumentUri>,
+) -> TypeHierarchyItem {
+    if envelope.projected_from_virtual
+        && let Some(virtual_uri) = virtual_uri
+        && item.uri.as_str() == envelope.host_uri
+    {
+        item.uri = virtual_uri_to_lsp_uri(virtual_uri);
+        let offset = RegionOffset::from(&envelope.offset);
+        translate_host_range_to_virtual(&mut item.range, &offset);
+        translate_host_range_to_virtual(&mut item.selection_range, &offset);
+    }
+    item
+}
+
+fn re_envelope_item(
+    item: &mut TypeHierarchyItem,
+    envelope: &TypeHierarchyEnvelope,
+    projected_from_virtual: bool,
+) {
+    let offset = RegionOffset::from(&envelope.offset);
+    envelope_item_data(
+        item,
+        &TypeHierarchyEnvelopeContext {
+            server_name: &envelope.origin,
+            host_uri: &envelope.host_uri,
+            region_id: &envelope.region_id,
+            injection_language: &envelope.injection_language,
+            revision: TypeHierarchyDocumentRevision {
+                incarnation: envelope.incarnation,
+                content_version: envelope.content_version,
+            },
+            connection_generation: envelope.connection_generation,
+            connection_key: &envelope.connection_key,
+            offset: &offset,
+            host_layer: envelope.host_layer,
+            projected_from_virtual,
+        },
+    );
 }
 
 pub(crate) struct TypeHierarchyDocumentRevision {
@@ -213,6 +441,21 @@ fn build_type_hierarchy_prepare_request(
     )
 }
 
+fn build_type_hierarchy_expansion_request(
+    request_id: RequestId,
+    method: &'static str,
+    params: TypeHierarchySupertypesParams,
+) -> JsonRpcRequest<Value> {
+    let mut params = serde_json::to_value(params).unwrap_or(Value::Null);
+    if let Some(tags) = params.pointer_mut("/item/tags")
+        && !tags.is_array()
+        && !tags.is_null()
+    {
+        *tags = Value::Array(vec![tags.take()]);
+    }
+    JsonRpcRequest::new(request_id.as_i64(), method, params)
+}
+
 fn transform_type_hierarchy_prepare_response_to_host(
     mut response: Value,
     request_virtual_uri: &str,
@@ -276,6 +519,52 @@ fn transform_type_hierarchy_prepare_response_to_host(
     Ok(Some(items))
 }
 
+fn transform_type_hierarchy_expansion_response_to_host(
+    mut response: Value,
+    method: &str,
+    request_virtual_uri: Option<String>,
+    host_uri: &Uri,
+    envelope: &TypeHierarchyEnvelope,
+    known_virtual_uris: &impl KnownVirtualUris,
+) -> io::Result<Option<Vec<TypeHierarchyItem>>> {
+    if response_has_jsonrpc_error(&response, method) {
+        return Ok(None);
+    }
+    let Some(result) = response.get_mut("result").map(Value::take) else {
+        return Err(io::Error::other(format!(
+            "{method} response carries neither result nor error (protocol violation)"
+        )));
+    };
+    if result.is_null() {
+        return Ok(None);
+    }
+    let items = parse_type_hierarchy_items(result).map_err(|error| {
+        io::Error::other(format!(
+            "malformed {method} result from downstream server: {error}"
+        ))
+    })?;
+    let offset = RegionOffset::from(&envelope.offset);
+    let items = items
+        .into_iter()
+        .filter_map(|mut item| {
+            let projected_from_virtual = if known_virtual_uris.contains_uri(item.uri.as_str()) {
+                if request_virtual_uri.as_deref() != Some(item.uri.as_str()) {
+                    return None;
+                }
+                item.uri = host_uri.clone();
+                translate_virtual_range_to_host(&mut item.range, &offset);
+                translate_virtual_range_to_host(&mut item.selection_range, &offset);
+                true
+            } else {
+                false
+            };
+            re_envelope_item(&mut item, envelope, projected_from_virtual);
+            Some(item)
+        })
+        .collect();
+    Ok(Some(items))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireTypeHierarchyItem {
@@ -332,6 +621,61 @@ mod tests {
     use super::*;
     use crate::lsp::bridge::protocol::{RegionOffset, RequestId, VirtualDocumentUri};
     use tower_lsp_server::ls_types::{NumberOrString, Position};
+
+    fn test_envelope(host_uri: &Uri, key: &ConnectionKey) -> TypeHierarchyEnvelope {
+        TypeHierarchyEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: host_uri.to_string(),
+            region_id: "region".into(),
+            injection_language: "lua".into(),
+            incarnation: Some(2),
+            content_version: 3,
+            connection_generation: 4,
+            connection_key: key.clone(),
+            offset: EnvelopeOffset::from(&RegionOffset::new(3, 2)),
+            inner: Some(serde_json::json!({ "token": 9 })),
+            host_layer: false,
+            projected_from_virtual: true,
+        }
+    }
+
+    fn type_item(uri: &str, data: Value) -> TypeHierarchyItem {
+        serde_json::from_value(serde_json::json!({
+            "name": "Child", "kind": 5, "uri": uri,
+            "range": { "start": { "line": 3, "character": 2 }, "end": { "line": 3, "character": 7 } },
+            "selectionRange": { "start": { "line": 3, "character": 2 }, "end": { "line": 3, "character": 7 } },
+            "data": data
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn supertypes_request_restores_virtual_item_and_strips_progress_tokens() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("lua-ls");
+        let params: TypeHierarchySupertypesParams = serde_json::from_value(serde_json::json!({
+            "item": type_item(host_uri.as_str(), serde_json::json!({
+                "kakehashi": test_envelope(&host_uri, &key)
+            })),
+            "workDoneToken": "work",
+            "partialResultToken": "partial"
+        }))
+        .unwrap();
+
+        let (mut params, envelope) = prepare_supertypes_params(params).unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region");
+        params.item = type_hierarchy_item_to_downstream(params.item, &envelope, Some(&virtual_uri));
+        let value = serde_json::to_value(params).unwrap();
+
+        assert_eq!(value["item"]["uri"], virtual_uri.to_uri_string());
+        assert_eq!(
+            value["item"]["range"]["start"],
+            serde_json::json!({ "line": 0, "character": 0 })
+        );
+        assert_eq!(value["item"]["data"], serde_json::json!({ "token": 9 }));
+        assert!(value.get("workDoneToken").is_none());
+        assert!(value.get("partialResultToken").is_none());
+    }
 
     #[test]
     fn prepare_request_uses_virtual_position_and_progress_token() {
