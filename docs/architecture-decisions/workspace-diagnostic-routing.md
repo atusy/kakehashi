@@ -33,9 +33,13 @@ own identifier. Registrations that share an identifier (including an omitted
 identifier) describe the same wire-addressable provider and are queried once.
 Aggregate only full reports and omit downstream result ids from
 the upstream response. For the same URI, concatenate diagnostics in stable
-server-name order. Downstream document versions are connection-local rather
-than comparable revisions; retain a version only when every contributor agrees,
-otherwise report `null`. Sort final reports by URI for deterministic output.
+server-name order. Within one exact connection generation, use its shared
+document-version namespace to discard older provider reports before combining
+equal-version diagnostics. Those versions belong to Kakehashi's synthetic
+downstream synchronization stream, however, and are not the editor's document
+versions; therefore every upstream aggregate reports `null` rather than
+exposing a misleading number. Sort final reports by URI for deterministic
+output.
 
 Do not expose reports or related-information links whose exact URI was issued
 to that producer generation as an internal virtual document. URI shape alone

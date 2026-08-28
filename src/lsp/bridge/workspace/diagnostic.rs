@@ -152,17 +152,15 @@ fn aggregate_reports(
             let key = incoming.uri.as_str().to_owned();
             match by_uri.entry(key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
+                    // A downstream version belongs to Kakehashi's synthetic
+                    // synchronization stream, not the editor's document
+                    // version namespace. It is useful while reconciling one
+                    // exact producer below, but cannot cross the bridge.
+                    incoming.version = None;
                     entry.insert(incoming);
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
                     let current = entry.get_mut();
-                    if incoming.version != current.version {
-                        // Document versions are local to each downstream
-                        // connection. Preserve every producer's diagnostics but
-                        // do not attach their composite to one producer's
-                        // incomparable version.
-                        current.version = None;
-                    }
                     current
                         .full_document_diagnostic_report
                         .items
@@ -177,6 +175,50 @@ fn aggregate_reports(
             .map(WorkspaceDocumentDiagnosticReport::Full)
             .collect(),
     })
+}
+
+fn reconcile_producer_reports(
+    reports: impl IntoIterator<Item = WorkspaceDiagnosticReport>,
+) -> WorkspaceDiagnosticReport {
+    let mut by_uri: BTreeMap<String, WorkspaceFullDocumentDiagnosticReport> = BTreeMap::new();
+    for report in reports {
+        for item in report.items {
+            let WorkspaceDocumentDiagnosticReport::Full(mut incoming) = item else {
+                continue;
+            };
+            incoming.full_document_diagnostic_report.result_id = None;
+            let key = incoming.uri.as_str().to_owned();
+            match by_uri.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(incoming);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let current = entry.get_mut();
+                    match (current.version, incoming.version) {
+                        (Some(current_version), Some(incoming_version))
+                            if incoming_version > current_version =>
+                        {
+                            *current = incoming;
+                        }
+                        (Some(current_version), Some(incoming_version))
+                            if incoming_version < current_version => {}
+                        (None, Some(_)) => *current = incoming,
+                        (Some(_), None) => {}
+                        _ => current
+                            .full_document_diagnostic_report
+                            .items
+                            .extend(incoming.full_document_diagnostic_report.items),
+                    }
+                }
+            }
+        }
+    }
+    WorkspaceDiagnosticReport {
+        items: by_uri
+            .into_values()
+            .map(WorkspaceDocumentDiagnosticReport::Full)
+            .collect(),
+    }
 }
 
 impl LanguageServerPool {
@@ -267,17 +309,13 @@ impl LanguageServerPool {
                         .flatten()
                     }
                 });
-                Some(
-                    join_all(requests)
-                        .await
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>(),
-                )
+                Some(reconcile_producer_reports(
+                    join_all(requests).await.into_iter().flatten(),
+                ))
             }
         });
 
-        aggregate_reports(join_all(requests).await.into_iter().flatten().flatten())
+        aggregate_reports(join_all(requests).await.into_iter().flatten())
     }
 
     async fn send_workspace_diagnostic_request(
@@ -434,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregation_merges_equal_versions_and_drops_private_result_ids() {
+    fn aggregation_merges_reports_without_exposing_downstream_versions() {
         let result = aggregate_reports([
             WorkspaceDiagnosticReport {
                 items: vec![full("file:///workspace/a.rs", Some(4), "alpha")],
@@ -449,6 +487,7 @@ mod tests {
         let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
             panic!("full report")
         };
+        assert_eq!(report.version, None);
         assert_eq!(report.full_document_diagnostic_report.result_id, None);
         assert_eq!(report.full_document_diagnostic_report.items.len(), 2);
         assert_eq!(
@@ -458,6 +497,38 @@ mod tests {
         assert_eq!(
             report.full_document_diagnostic_report.items[1].message,
             "zeta"
+        );
+    }
+
+    #[test]
+    fn producer_reconciliation_prefers_highest_version_within_one_handle() {
+        let report = reconcile_producer_reports([
+            WorkspaceDiagnosticReport {
+                items: vec![full("file:///workspace/a.rs", Some(3), "old")],
+            },
+            WorkspaceDiagnosticReport {
+                items: vec![full("file:///workspace/a.rs", None, "not-open")],
+            },
+            WorkspaceDiagnosticReport {
+                items: vec![full("file:///workspace/a.rs", Some(4), "new-a")],
+            },
+            WorkspaceDiagnosticReport {
+                items: vec![full("file:///workspace/a.rs", Some(4), "new-b")],
+            },
+        ]);
+        let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
+            panic!("full report")
+        };
+        assert_eq!(report.version, Some(4));
+        assert_eq!(report.full_document_diagnostic_report.result_id, None);
+        assert_eq!(
+            report
+                .full_document_diagnostic_report
+                .items
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["new-a", "new-b"]
         );
     }
 
@@ -692,6 +763,7 @@ mod tests {
         let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
             panic!("full document report")
         };
+        assert_eq!(report.version, None);
         assert_eq!(report.full_document_diagnostic_report.items.len(), 2);
     }
 
