@@ -40,6 +40,10 @@ expression: capabilities
   "documentSymbolProvider": {
     "workDoneProgress": true
   },
+  "workspaceSymbolProvider": {
+    "workDoneProgress": false,
+    "resolveProvider": true
+  },
   "codeLensProvider": {
     "resolveProvider": true
   },
@@ -67,6 +71,7 @@ expression: capabilities
       "changeNotifications": true
     }
   },
+  "callHierarchyProvider": true,
   "semanticTokensProvider": {
     "legend": {
       "tokenTypes": [
@@ -114,6 +119,9 @@ expression: capabilities
   },
   "monikerProvider": true,
   "linkedEditingRangeProvider": true,
+  "inlineValueProvider": {
+    "workDoneProgress": true
+  },
   "inlayHintProvider": {
     "workDoneProgress": true,
     "resolveProvider": true
@@ -121,5 +129,6 @@ expression: capabilities
   "diagnosticProvider": {
     "interFileDependencies": false,
     "workspaceDiagnostics": false
-  }
+  },
+  "typeHierarchyProvider": true
 }
