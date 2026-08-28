@@ -288,11 +288,8 @@ impl LanguageServerPool {
     ) -> io::Result<Option<WorkspaceDiagnosticReport>> {
         let key = handle.key();
         let virtual_uris = self.observe_virtual_uris_for_connection(key, expected_generation);
-        if let Some(id) = &upstream_id {
-            self.register_upstream_request_for_handle(id.clone(), handle);
-        }
         let (request_id, response_rx) =
-            match handle.register_request_with_upstream(upstream_id.clone()) {
+            match self.register_request_for_handle_with_upstream(upstream_id.clone(), handle) {
                 Ok(request) => request,
                 Err(error) => {
                     if let Some(id) = &upstream_id {

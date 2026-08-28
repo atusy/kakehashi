@@ -4798,6 +4798,60 @@ impl LanguageServerPool {
         }
     }
 
+    /// Register the router request and its exact producer in one critical
+    /// section relative to synchronous cancellation target capture.
+    pub(crate) fn register_request_for_handle_with_upstream(
+        &self,
+        upstream_id: Option<UpstreamId>,
+        handle: &Arc<ConnectionHandle>,
+    ) -> io::Result<(RequestId, tokio::sync::oneshot::Receiver<serde_json::Value>)> {
+        self.register_request_for_handle_with_upstream_inner(upstream_id, handle, || {})
+    }
+
+    fn register_request_for_handle_with_upstream_inner(
+        &self,
+        upstream_id: Option<UpstreamId>,
+        handle: &Arc<ConnectionHandle>,
+        after_router_registration: impl FnOnce(),
+    ) -> io::Result<(RequestId, tokio::sync::oneshot::Receiver<serde_json::Value>)> {
+        let Some(upstream_id) = upstream_id else {
+            return handle.register_request_with_upstream(None);
+        };
+        let connection_key = handle.key();
+        // Match the production cancel path's lock order: registry, exact
+        // handles, then the router lock acquired by registration. Cancellation
+        // therefore observes either neither mapping or both mappings.
+        let mut registry = self
+            .upstream_request_registry
+            .lock()
+            .recover_poison("LanguageServerPool::register_request_for_handle_with_upstream");
+        let mut handles = self
+            .upstream_cancel_handles
+            .lock()
+            .recover_poison("LanguageServerPool::register_request_for_handle_with_upstream");
+        let request = handle.register_request_with_upstream(Some(upstream_id.clone()))?;
+        after_router_registration();
+        *registry
+            .entry(upstream_id.clone())
+            .or_default()
+            .entry(connection_key.clone())
+            .or_insert(0) += 1;
+        let producers = handles
+            .entry(upstream_id)
+            .or_default()
+            .entry(connection_key.clone())
+            .or_default();
+        producers.retain(|producer| producer.strong_count() > 0);
+        if !producers
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|producer| Arc::ptr_eq(&producer, handle))
+        {
+            producers.push(Arc::downgrade(handle));
+        }
+        Ok(request)
+    }
+
     /// Unregister one in-flight request for `(upstream_id, connection_key)`.
     /// The connection is removed once its count reaches zero; the upstream entry
     /// is fully removed once all connections have been unregistered.
@@ -8881,6 +8935,63 @@ mod tests {
             vec![downstream_id],
             "Cancel map entry should still exist after cancel forwarding"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_registration_is_atomic_with_synchronous_cancel_capture() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
+        let upstream_id = UpstreamId::Number(4242);
+        let registration_entered = Arc::new(std::sync::Barrier::new(2));
+        let registration_release = Arc::new(std::sync::Barrier::new(2));
+        let cancel_started = Arc::new(std::sync::Barrier::new(2));
+
+        let registration = {
+            let pool = Arc::clone(&pool);
+            let handle = Arc::clone(&handle);
+            let upstream_id = upstream_id.clone();
+            let entered = Arc::clone(&registration_entered);
+            let release = Arc::clone(&registration_release);
+            tokio::task::spawn_blocking(move || {
+                pool.register_request_for_handle_with_upstream_inner(
+                    Some(upstream_id),
+                    &handle,
+                    || {
+                        entered.wait();
+                        release.wait();
+                    },
+                )
+            })
+        };
+        registration_entered.wait();
+
+        let cancel = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            let started = Arc::clone(&cancel_started);
+            tokio::task::spawn_blocking(move || {
+                started.wait();
+                pool.forward_cancel_by_upstream_id_if_current_sync(upstream_id, || true, || {})
+            })
+        };
+        cancel_started.wait();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !cancel.is_finished(),
+            "cancel capture must wait for both request registries to become visible"
+        );
+
+        registration_release.wait();
+        let (request_id, _response_rx) = registration.await.unwrap().unwrap();
+        cancel.await.unwrap().unwrap();
+
+        assert!(
+            !handle.router().claim_for_write(request_id),
+            "cancel capture must mark the atomically registered queued request"
+        );
+        let (_, _, _, unknown_id, not_in_registry) = pool.cancel_metrics.snapshot();
+        assert_eq!((unknown_id, not_in_registry), (0, 0));
     }
 
     /// `forward_cancel_downstream` sends the cancel for the EXACT downstream
