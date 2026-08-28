@@ -38,6 +38,14 @@ dynamically declared provider identifier, and no progress tokens. If one server
 registers multiple workspace-diagnostic providers, query each provider with its
 own identifier. Registrations that share an identifier (including an omitted
 identifier) describe the same wire-addressable provider and are queried once.
+For a cold connection with no provider snapshot, keep the bounded registration
+settle window open through its deadline so sequential post-initialize
+registrations join the same first pull.
+
+Treat the planned provider and server sets as one complete aggregate. If any
+planned contribution fails, return a JSON-RPC error instead of a partial report;
+otherwise the client could replace its previous composite with a response that
+silently omitted one producer.
 Aggregate only full reports and omit downstream result ids from
 the upstream response. For the same URI, concatenate diagnostics in stable
 server-name order. Preserve every provider's contribution even when downstream
@@ -68,6 +76,8 @@ pass through unchanged, including unopened files.
 - A response from a replaced producer generation is discarded.
 - Every report in one aggregate comes from the same stable client workspace;
   a crossed generation invalidates the entire aggregate.
+- A failed planned provider or server invalidates the whole pull rather than
+  authorizing a partial composite to replace the client's prior diagnostics.
 
 ## Consequences
 

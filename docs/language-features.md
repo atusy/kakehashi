@@ -322,12 +322,16 @@ Workspace diagnostic pulls start every explicitly configured, runnable server
 that supports them, including cold servers, and combine full reports for real
 workspace files. Reports for one URI are concatenated in stable server-name
 order. A cold connection gives post-initialize dynamic registration one bounded
-settle window before the first pull; later provider changes request another pull
-when the editor advertises `workspace.diagnostics.refreshSupport`. Without that
-client capability, a provider registered after the settle window becomes visible
-on the client's next pull because LSP provides no way for the server to initiate
-one. Every provider contribution is retained because provider requests can
-cross a document close/reopen and downstream version counters can reset. Those
+settle window before the first pull and collects registrations through the
+window's deadline. Later provider changes request another pull when the editor
+advertises `workspace.diagnostics.refreshSupport`. Without that client
+capability, a provider registered after the settle window becomes visible on
+the client's next pull because LSP provides no way for the server to initiate
+one. A failure from any planned provider or server fails the request instead of
+returning a partial composite that could replace previously reported
+diagnostics. Every successful provider contribution is retained because
+provider requests can cross a document close/reopen and downstream version
+counters can reset. Those
 numeric versions are also bridge-local rather than editor document versions, so
 the upstream composite always uses `null`.
 Downstream result IDs, provider identifiers, and progress tokens are not shared

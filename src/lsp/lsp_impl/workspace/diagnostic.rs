@@ -35,9 +35,11 @@ impl Kakehashi {
             Some(rx) => tokio::select! {
                 biased;
                 _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
-                result = dispatch => Ok(result),
+                result = dispatch => result.map_err(|_| tower_lsp_server::jsonrpc::Error::internal_error()),
             },
-            None => Ok(dispatch.await),
+            None => dispatch
+                .await
+                .map_err(|_| tower_lsp_server::jsonrpc::Error::internal_error()),
         }
     }
 }
