@@ -121,18 +121,18 @@ impl Kakehashi {
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 self.settings_manager.set_root_path(root_path);
                 self.apply_raw_settings_locked(&reload, raw, settings).await;
-                drop(reload);
                 workspace_change.finish();
+                drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
             }
             Err(error) => {
+                workspace_change.finish();
                 drop(reload);
                 self.notifier()
                     .log_warning(format!(
                         "Workspace root changed, but reloaded settings were invalid: {error}"
                     ))
                     .await;
-                workspace_change.finish();
             }
         }
     }

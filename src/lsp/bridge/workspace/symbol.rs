@@ -174,8 +174,8 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
         supports_tags: bool,
         admit: &(dyn Fn() -> bool + Sync),
+        request_workspace_generation: u64,
     ) -> Option<WorkspaceSymbolResponse> {
-        let request_workspace_generation = self.workspace_generation();
         if request_workspace_generation & 1 != 0 {
             return None;
         }
@@ -457,6 +457,7 @@ mod tests {
     use super::*;
     use crate::lsp::bridge::pool::test_helpers::{
         create_handle_advertising_workspace_symbols,
+        create_handle_advertising_workspace_symbols_with_folder_changes,
         create_handle_advertising_workspace_symbols_with_initial_folders,
         create_handle_advertising_workspace_symbols_with_state, create_handle_with_key,
         record_test_spawn_root, seed_test_client_root, transition_handle_to_ready,
@@ -946,7 +947,14 @@ mod tests {
         let pool_for_request = Arc::clone(&pool);
         let request = tokio::spawn(async move {
             pool_for_request
-                .dispatch_workspace_symbol(params, &settings, None, true, &|| true)
+                .dispatch_workspace_symbol(
+                    params,
+                    &settings,
+                    None,
+                    true,
+                    &|| true,
+                    pool_for_request.workspace_generation(),
+                )
                 .await
         });
 
@@ -1017,7 +1025,14 @@ mod tests {
         let pool_for_request = Arc::clone(&pool);
         let request = tokio::spawn(async move {
             pool_for_request
-                .dispatch_workspace_symbol(params, &settings, None, true, &|| true)
+                .dispatch_workspace_symbol(
+                    params,
+                    &settings,
+                    None,
+                    true,
+                    &|| true,
+                    pool_for_request.workspace_generation(),
+                )
                 .await
         });
 
@@ -1068,7 +1083,14 @@ mod tests {
         let pool_for_request = Arc::clone(&pool);
         let request = tokio::spawn(async move {
             pool_for_request
-                .dispatch_workspace_symbol(params, &settings, None, true, &|| true)
+                .dispatch_workspace_symbol(
+                    params,
+                    &settings,
+                    None,
+                    true,
+                    &|| true,
+                    pool_for_request.workspace_generation(),
+                )
                 .await
         });
 
@@ -1131,7 +1153,14 @@ mod tests {
         let pool_for_request = Arc::clone(&pool);
         let request = tokio::spawn(async move {
             pool_for_request
-                .dispatch_workspace_symbol(params, &settings, None, true, &|| true)
+                .dispatch_workspace_symbol(
+                    params,
+                    &settings,
+                    None,
+                    true,
+                    &|| true,
+                    pool_for_request.workspace_generation(),
+                )
                 .await
         });
 
@@ -1197,7 +1226,14 @@ mod tests {
         let pool_for_request = Arc::clone(&pool);
         let request = tokio::spawn(async move {
             pool_for_request
-                .dispatch_workspace_symbol(params, &settings, None, true, &|| true)
+                .dispatch_workspace_symbol(
+                    params,
+                    &settings,
+                    None,
+                    true,
+                    &|| true,
+                    pool_for_request.workspace_generation(),
+                )
                 .await
         });
 
@@ -1337,9 +1373,16 @@ mod tests {
         }))
         .unwrap();
         assert!(
-            pool.dispatch_workspace_symbol(params, &settings, None, true, &|| true)
-                .await
-                .is_none()
+            pool.dispatch_workspace_symbol(
+                params,
+                &settings,
+                None,
+                true,
+                &|| true,
+                pool.workspace_generation(),
+            )
+            .await
+            .is_none()
         );
         assert!(
             !shared.router().is_sent(RequestId::new(2)),
@@ -1354,6 +1397,21 @@ mod tests {
     #[tokio::test]
     async fn cancelled_workspace_update_remains_inadmissible() {
         let pool = Arc::new(LanguageServerPool::new());
+        let folder_a = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/a").unwrap(),
+            name: "a".into(),
+        };
+        pool.set_workspace_folders(Some(vec![folder_a.clone()]));
+        seed_test_client_root(&pool, "file:///workspace/a");
+        let producer = create_handle_advertising_workspace_symbols_with_folder_changes(
+            ConnectionKey::shared("symbols"),
+        )
+        .await;
+        record_test_spawn_root(&producer, "file:///workspace/a");
+        producer.workspace_folders().replace(Some(vec![folder_a]));
+        pool.connections()
+            .await
+            .insert(producer.key().clone(), Arc::clone(&producer));
         let connections = pool.connections().await;
         let updating_pool = Arc::clone(&pool);
         let update = tokio::spawn(async move {
@@ -1382,6 +1440,22 @@ mod tests {
             pool.workspace_generation() & 1,
             1,
             "cancellation must not publish a partially applied workspace"
+        );
+
+        pool.apply_workspace_folder_change(
+            vec![WorkspaceFolder {
+                uri: Uri::from_str("file:///workspace/c").unwrap(),
+                name: "c".into(),
+            }],
+            &[],
+        )
+        .await
+        .expect("recovery change")
+        .finish();
+        assert_eq!(pool.workspace_generation() & 1, 0);
+        assert!(
+            !pool.connections().await.contains_key(producer.key()),
+            "recovery must recycle a shared producer that may have missed the cancelled delta"
         );
     }
 
@@ -1424,7 +1498,14 @@ mod tests {
                 true
             };
             request_pool
-                .dispatch_workspace_symbol(params, &settings, None, true, &admit)
+                .dispatch_workspace_symbol(
+                    params,
+                    &settings,
+                    None,
+                    true,
+                    &admit,
+                    request_pool.workspace_generation(),
+                )
                 .await
         });
         let request_id = RequestId::new(2);
@@ -1509,7 +1590,14 @@ mod tests {
         .unwrap();
 
         let response = pool
-            .dispatch_workspace_symbol(params, &settings, None, true, &|| false)
+            .dispatch_workspace_symbol(
+                params,
+                &settings,
+                None,
+                true,
+                &|| false,
+                pool.workspace_generation(),
+            )
             .await;
 
         assert_eq!(response, None);
