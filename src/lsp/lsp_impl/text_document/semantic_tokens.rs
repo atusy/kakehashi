@@ -955,7 +955,7 @@ impl Kakehashi {
         )))
     }
 
-    fn semantic_delta_has_applicable_bridge(
+    async fn semantic_delta_has_applicable_bridge(
         &self,
         lsp_uri: &tower_lsp_server::ls_types::Uri,
         uri: &Url,
@@ -983,6 +983,39 @@ impl Kakehashi {
             return false;
         }
 
+        let generation = self.cache.semantic_token_generation();
+        let owned_regions;
+        let regions = if let Some((stamped, regions)) = snapshot.resolved_regions.as_ref()
+            && *stamped == generation
+        {
+            regions.as_slice()
+        } else {
+            let (Some(tree), Some(query)) = (
+                snapshot.tree.as_ref(),
+                self.language.injection_query(language_name),
+            ) else {
+                return false;
+            };
+            owned_regions = InjectionResolver::resolve_all(
+                &self.language,
+                self.bridge.node_tracker(),
+                uri,
+                tree,
+                &snapshot.text,
+                query.as_ref(),
+                snapshot.incarnation,
+            );
+            &owned_regions
+        };
+        let incapable = self
+            .incapable_virt_servers(
+                language_name,
+                regions
+                    .iter()
+                    .map(|region| region.injection_language.as_str()),
+                METHOD,
+            )
+            .await;
         let has_configured_region = |regions: &[ResolvedInjection]| {
             regions.iter().any(|region| {
                 let configs = self.bridge_configs_for_injection_language(
@@ -999,31 +1032,11 @@ impl Kakehashi {
                     &agg.priorities,
                     &configs,
                     agg.max_fan_out,
+                    &incapable,
                 )
             })
         };
-        let generation = self.cache.semantic_token_generation();
-        if let Some((stamped, regions)) = snapshot.resolved_regions.as_ref()
-            && *stamped == generation
-        {
-            return has_configured_region(regions);
-        }
-        let (Some(tree), Some(query)) = (
-            snapshot.tree.as_ref(),
-            self.language.injection_query(language_name),
-        ) else {
-            return false;
-        };
-        let regions = InjectionResolver::resolve_all(
-            &self.language,
-            self.bridge.node_tracker(),
-            uri,
-            tree,
-            &snapshot.text,
-            query.as_ref(),
-            snapshot.incarnation,
-        );
-        has_configured_region(&regions)
+        has_configured_region(regions)
     }
 
     pub(crate) async fn semantic_tokens_full_delta_impl(
@@ -1163,7 +1176,10 @@ impl Kakehashi {
         // make a host layer applicable) after that lineage was advertised.
         // Re-enter full aggregation in that case; a full response is legal for
         // full/delta and prevents a native-only lineage from hiding the bridge.
-        if self.semantic_delta_has_applicable_bridge(&lsp_uri, &uri, &snapshot, &language_name) {
+        if self
+            .semantic_delta_has_applicable_bridge(&lsp_uri, &uri, &snapshot, &language_name)
+            .await
+        {
             self.cache.finish_request(&uri, request_id);
             let full = self.semantic_tokens_full_impl(full_params);
             let result = match cancel_rx.as_mut() {
@@ -2025,9 +2041,17 @@ fn semantic_region_selects_servers(
     priorities: &[String],
     configs: &[crate::lsp::bridge::ResolvedServerConfig],
     max_fan_out: Option<usize>,
+    incapable: &std::collections::HashSet<String>,
 ) -> bool {
-    contiguous
-        && super::super::whole_document::request_selects_servers(priorities, configs, max_fan_out)
+    if !contiguous {
+        return false;
+    }
+    let configs = configs
+        .iter()
+        .filter(|config| !incapable.contains(&config.server_name))
+        .cloned()
+        .collect::<Vec<_>>();
+    super::super::whole_document::request_selects_servers(priorities, &configs, max_fan_out)
 }
 
 #[cfg(test)]
@@ -2058,13 +2082,22 @@ mod tests {
             false,
             &priorities,
             &configs,
-            None
+            None,
+            &std::collections::HashSet::new(),
         ));
         assert!(semantic_region_selects_servers(
             true,
             &priorities,
             &configs,
-            None
+            None,
+            &std::collections::HashSet::new(),
+        ));
+        assert!(!semantic_region_selects_servers(
+            true,
+            &priorities,
+            &configs,
+            None,
+            &std::collections::HashSet::from(["tokens".into()]),
         ));
     }
 
