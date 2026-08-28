@@ -122,19 +122,22 @@ impl SemanticFullRequestGuard {
         uri: Url,
         request_id: u64,
         cancel_token: crate::cancel::CancelToken,
+        owns_tracking: bool,
     ) -> Self {
         Self {
             cache,
             uri,
             request_id,
             cancel_token,
-            armed: true,
+            armed: owns_tracking,
         }
     }
 
     fn finish(&mut self) {
-        self.cache.finish_request(&self.uri, self.request_id);
-        self.armed = false;
+        if self.armed {
+            self.cache.finish_request(&self.uri, self.request_id);
+            self.armed = false;
+        }
     }
 }
 
@@ -376,9 +379,20 @@ impl Kakehashi {
         params: SemanticTokensParams,
         tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
     ) -> Result<Option<SemanticTokensResult>> {
-        let uri = uri_to_url(&params.text_document.uri).ok();
-        let absent_identity = uri.as_ref().and_then(|uri| {
-            let view = self.documents.latest_snapshot(uri)?;
+        let Ok(uri) = uri_to_url(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let owns_tracking = tracking.is_none();
+        let (request_id, cancel_token) = tracking.unwrap_or_else(|| self.cache.start_request(&uri));
+        let mut request_guard = SemanticFullRequestGuard::new(
+            std::sync::Arc::clone(&self.cache),
+            uri.clone(),
+            request_id,
+            cancel_token.clone(),
+            owns_tracking,
+        );
+        let tracking = Some((request_id, cancel_token));
+        let absent_identity = self.documents.latest_snapshot(&uri).and_then(|view| {
             view.slot.snapshot.is_none().then_some((
                 view.slot.current_incarnation,
                 view.content_version,
@@ -391,26 +405,30 @@ impl Kakehashi {
             .semantic_tokens_full_impl_with_tracking_once(params, tracking)
             .await?;
         if outcome.is_some() {
+            request_guard.finish();
             return Ok(outcome);
         }
-        let retry_after_snapshot_publication = uri.as_ref().is_some_and(|uri| {
+        let retry_after_snapshot_publication =
             absent_identity.is_some_and(|(incarnation, content_version, generation)| {
                 self.cache.semantic_token_generation() == generation
-                    && self.documents.latest_snapshot(uri).is_some_and(|view| {
+                    && self.documents.latest_snapshot(&uri).is_some_and(|view| {
                         view.slot.current_incarnation == incarnation
                             && view.content_version == content_version
                             && view.slot.snapshot.is_some()
                     })
                     && retry_tracking.as_ref().is_some_and(|(request_id, cancel)| {
-                        !cancel.is_cancelled() && self.cache.is_request_active(uri, *request_id)
+                        !cancel.is_cancelled() && self.cache.is_request_active(&uri, *request_id)
                     })
-            })
-        });
+            });
         if !retry_after_snapshot_publication {
+            request_guard.finish();
             return Ok(None);
         }
-        self.semantic_tokens_full_impl_with_tracking_once(retry_params, retry_tracking)
-            .await
+        let outcome = self
+            .semantic_tokens_full_impl_with_tracking_once(retry_params, retry_tracking)
+            .await;
+        request_guard.finish();
+        outcome
     }
 
     async fn semantic_tokens_full_impl_with_tracking_once(
@@ -614,12 +632,14 @@ impl Kakehashi {
         // `cancel_token` is flipped when a newer request supersedes this one (or
         // the document closes); it is threaded into the blocking compute so a
         // superseded request stops mid-flight instead of running to completion.
+        let owns_tracking = tracking.is_none();
         let (request_id, cancel_token) = tracking.unwrap_or_else(|| self.cache.start_request(&uri));
         let request_guard = SemanticFullRequestGuard::new(
             std::sync::Arc::clone(&self.cache),
             uri.clone(),
             request_id,
             cancel_token.clone(),
+            owns_tracking,
         );
 
         // Snapshot the settings generation NOW, before reading any
