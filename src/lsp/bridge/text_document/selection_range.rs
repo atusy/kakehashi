@@ -164,7 +164,8 @@ fn translate_and_validate_chain(
             ));
         }
         if child_range.is_none()
-            && !(range.start <= virtual_position && virtual_position <= range.end)
+            && !((range.start == virtual_position && range.end == virtual_position)
+                || (range.start <= virtual_position && virtual_position < range.end))
         {
             return Err(io::Error::other(
                 "textDocument/selectionRange does not contain the requested position",
@@ -290,6 +291,42 @@ mod tests {
             )
             .is_err(),
             "an overlong intermediate-line column must not spill into a later line"
+        );
+    }
+
+    #[test]
+    fn response_uses_end_exclusive_containment_but_allows_empty_at_position() {
+        let ending_at_position = json!({
+            "jsonrpc": "2.0", "id": 1, "result": [{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 2 } }
+            }]
+        });
+        assert!(
+            transform_selection_range_response_to_host(
+                ending_at_position,
+                &RegionOffset::new(3, 0),
+                "code",
+                Position::new(3, 2),
+                Position::new(3, 4),
+            )
+            .is_err()
+        );
+
+        let empty_at_position = json!({
+            "jsonrpc": "2.0", "id": 1, "result": [{
+                "range": { "start": { "line": 0, "character": 2 }, "end": { "line": 0, "character": 2 } }
+            }]
+        });
+        assert!(
+            transform_selection_range_response_to_host(
+                empty_at_position,
+                &RegionOffset::new(3, 0),
+                "code",
+                Position::new(3, 2),
+                Position::new(3, 4),
+            )
+            .expect("valid empty range")
+            .is_some()
         );
     }
 }

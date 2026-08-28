@@ -586,6 +586,7 @@ fn collect_query_range<'a>(
 
 /// Detects injection and returns both the language and the content node
 /// Also returns the pattern index of the innermost injection for offset lookups
+#[cfg(test)]
 pub(crate) fn detect_injection<'a>(
     root: &Node<'a>,
     text: &str,

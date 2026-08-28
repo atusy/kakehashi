@@ -251,12 +251,13 @@ pub fn build(
     let nested_injection_query = inj_ctx.injection_query(injected_lang);
 
     let injected_selection = if let Some(nested_inj_query) = nested_injection_query.as_ref() {
-        let nested_injection_info = injection::detect_injection(
+        let nested_injection_info = injection::detect_injection_cancellable(
             &injected_root,
             content_text,
             relative_byte,
             Some(nested_inj_query.as_ref()),
             injected_lang,
+            Some(cancel_token),
         );
 
         if let Some((nested_hierarchy, nested_content_node, _nested_pattern_index, nested_offset)) =

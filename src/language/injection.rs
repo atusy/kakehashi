@@ -27,7 +27,7 @@ pub(crate) use discovery::assert_discovery_matches_reference;
 pub(crate) use discovery::{
     CacheableInjectionRegion, InjectionRegionInfo, InjectionResolver, REGION_IDENTITY_LAYER_BASE,
     RegionBoundary, ResolvedInjection, collect_all_injections,
-    collect_all_injections_parallel_cancellable, detect_injection, detect_injection_cancellable,
+    collect_all_injections_parallel_cancellable, detect_injection_cancellable,
     effective_content_range,
 };
 #[cfg(test)]
