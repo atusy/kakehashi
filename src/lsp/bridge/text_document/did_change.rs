@@ -134,6 +134,7 @@ impl LanguageServerPool {
                         &virtual_uri,
                         &connection_key,
                         &injection.content,
+                        version,
                     )
                     .await;
                 }

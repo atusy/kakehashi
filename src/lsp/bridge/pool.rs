@@ -2281,7 +2281,7 @@ impl LanguageServerPool {
         // clears on didChange, flicker the diagnostics) because no fingerprint existed
         // to compare against (#422).
         self.document_tracker
-            .record_sent_content_fingerprint(virtual_uri, connection_key, virtual_content)
+            .record_sent_content_fingerprint(virtual_uri, connection_key, virtual_content, 1)
             .await;
         Ok(())
     }
@@ -2459,9 +2459,15 @@ impl LanguageServerPool {
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
         content: &str,
+        confirmed_version: i32,
     ) {
         self.document_tracker
-            .record_sent_content_fingerprint(virtual_uri, connection_key, content)
+            .record_sent_content_fingerprint(
+                virtual_uri,
+                connection_key,
+                content,
+                confirmed_version,
+            )
             .await
     }
 

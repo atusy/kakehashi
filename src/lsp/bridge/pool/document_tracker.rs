@@ -684,18 +684,9 @@ impl DocumentTracker {
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
         content: &str,
+        confirmed_version: i32,
     ) {
         let uri_string = virtual_uri.to_uri_string();
-        let Some(version) = self
-            .document_versions
-            .lock()
-            .await
-            .get(connection_key)
-            .and_then(|docs| docs.get(&uri_string))
-            .copied()
-        else {
-            return;
-        };
         let fp = content_fingerprint(content);
         {
             let mut fingerprints = self
@@ -718,7 +709,7 @@ impl DocumentTracker {
             .await
             .entry(connection_key.clone())
             .or_default()
-            .insert(virtual_uri.to_uri_string(), version);
+            .insert(virtual_uri.to_uri_string(), confirmed_version);
     }
 
     /// Remove a document from `document_versions` and `opened_documents`.
@@ -1616,7 +1607,7 @@ mod tests {
             "first didChange sends and bumps the version"
         );
         tracker
-            .record_sent_content_fingerprint(&virtual_uri, &conn, "local x = 1")
+            .record_sent_content_fingerprint(&virtual_uri, &conn, "local x = 1", 2)
             .await;
         // Same content now recorded-as-sent → skip (no bump, no re-send).
         assert_eq!(
@@ -1633,6 +1624,37 @@ mod tests {
                 .await,
             Some(3),
             "changed content sends and bumps"
+        );
+    }
+
+    #[tokio::test]
+    async fn sent_fingerprint_records_the_version_that_was_enqueued() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/enqueued-version.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+
+        assert_eq!(
+            tracker
+                .increment_document_version(&virtual_uri, &conn)
+                .await,
+            Some(2),
+            "an overlapping edit may advance the raw counter after didOpen enqueue"
+        );
+        tracker
+            .record_sent_content_fingerprint(&virtual_uri, &conn, "opened", 1)
+            .await;
+
+        assert_eq!(
+            tracker
+                .confirmed_document_versions_for_connection(&conn)
+                .await
+                .get(&virtual_uri.to_uri_string()),
+            Some(&1),
+            "confirmation must retain didOpen's enqueued version instead of rereading the newer raw counter"
         );
     }
 

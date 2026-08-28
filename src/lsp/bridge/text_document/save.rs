@@ -127,6 +127,7 @@ impl LanguageServerPool {
                             &virtual_uri,
                             &connection_key,
                             &injection.content,
+                            version,
                         )
                         .await;
                     }
@@ -261,7 +262,7 @@ mod tests {
             VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
         pool.register_opened_document(&host_uri, &virtual_uri, &key)
             .await;
-        pool.record_sent_content_fingerprint(&virtual_uri, &key, &injection.content)
+        pool.record_sent_content_fingerprint(&virtual_uri, &key, &injection.content, 1)
             .await;
 
         let transition = pool.open_transition_lock(&virtual_uri, &key);
