@@ -2236,6 +2236,7 @@ impl LanguageServerPool {
         let promotion_virtual_uri = virtual_uri.clone();
         let promotion_connection_key = connection_key.clone();
         let promotion_claim = Arc::clone(&claim);
+        let promotion_content = virtual_content.to_owned();
         let transition_locks = Arc::clone(&self.open_transition_locks);
         let promotion = tokio::spawn(async move {
             let promoted = queued
@@ -2247,6 +2248,19 @@ impl LanguageServerPool {
                         &promotion_claim,
                     )
                     .await;
+            if promoted {
+                // Confirm didOpen's exact content/version before releasing the
+                // per-document transition. A queued didChange must not publish
+                // v2 and then be overwritten by this older v1 confirmation.
+                tracker
+                    .record_sent_content_fingerprint(
+                        &promotion_virtual_uri,
+                        &promotion_connection_key,
+                        &promotion_content,
+                        1,
+                    )
+                    .await;
+            }
             if !promoted {
                 tracker
                     .rollback_open_claim_if(
@@ -2274,15 +2288,6 @@ impl LanguageServerPool {
                 "bridge: didOpen claim invalidated during enqueue",
             ));
         }
-        // The didOpen was confirmed enqueued (the `MessageSender` maps `Queued` →
-        // `Ok`), so seed the content fingerprint with the opened content. Without
-        // this, the FIRST position-only host edit — which leaves this region's
-        // content unchanged — would still re-send a didChange (and, for a server that
-        // clears on didChange, flicker the diagnostics) because no fingerprint existed
-        // to compare against (#422).
-        self.document_tracker
-            .record_sent_content_fingerprint(virtual_uri, connection_key, virtual_content, 1)
-            .await;
         Ok(())
     }
 
