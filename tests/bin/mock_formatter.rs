@@ -1765,7 +1765,7 @@ fn main() {
                 let result = inline_value_result(&message, &documents, label);
                 if mode == "inline-value-delayed" {
                     record_mock_event(&mode, "request", &message);
-                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    wait_for_mock_release(&mode);
                 }
                 if mode == "inline-value-slow" {
                     record_mock_event(&mode, "request", &message);
@@ -2485,6 +2485,19 @@ fn record_mock_event(mode: &str, event: &str, message: &Value) {
     let staging = dir.join(format!("{mode}.{event}.json.tmp"));
     if std::fs::write(&staging, serde_json::to_vec(&payload).unwrap_or_default()).is_ok() {
         let _ = std::fs::rename(&staging, &path);
+    }
+}
+
+fn wait_for_mock_release(mode: &str) {
+    let Ok(dir) = std::env::var("MOCK_LSP_CANCEL_DIR") else {
+        return;
+    };
+    let release = Path::new(&dir).join(format!("{mode}.release"));
+    for _ in 0..300 {
+        if release.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 

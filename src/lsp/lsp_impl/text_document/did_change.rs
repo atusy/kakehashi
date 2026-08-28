@@ -108,6 +108,8 @@ impl Kakehashi {
         // scratch (#348).
         let ticket = crate::lsp::current_writer_ticket();
         self.documents.apply_edit(&uri, text, &edits);
+        #[cfg(feature = "e2e")]
+        mark_inline_value_change_processed();
 
         // NOTE: We intentionally do NOT invalidate the semantic token cache here.
         // The cached tokens (with their result_id) are needed for delta calculations.
@@ -154,6 +156,17 @@ impl Kakehashi {
         // like vim-lsp on Vim, which cannot respond to server requests while processing.
 
         self.notifier().log_info("file changed!").await;
+    }
+}
+
+#[cfg(feature = "e2e")]
+fn mark_inline_value_change_processed() {
+    let Ok(dir) = std::env::var("KAKEHASHI_E2E_INLINE_VALUE_CHANGE_DIR") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir);
+    if std::fs::create_dir_all(dir).is_ok() {
+        let _ = std::fs::write(dir.join("changed"), b"changed");
     }
 }
 

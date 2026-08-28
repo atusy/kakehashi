@@ -119,7 +119,7 @@ fn normalize_client_position(mapper: &PositionMapper, position: Position) -> Opt
 /// request whose intent is "everything". Over-long characters still clamp
 /// within their own lines. The end is floored at the start so a degenerate
 /// all-overlong input stays well-formed.
-fn normalize_range_endpoints(mapper: &PositionMapper, range: Range) -> Option<Range> {
+pub(super) fn normalize_range_endpoints(mapper: &PositionMapper, range: Range) -> Option<Range> {
     let start = mapper.byte_to_position(mapper.position_to_byte_clamped(range.start))?;
     let end = mapper.byte_to_position(mapper.position_to_byte_clamped(range.end))?;
     Some(Range {
