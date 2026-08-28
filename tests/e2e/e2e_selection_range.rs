@@ -681,7 +681,7 @@ enabled = true
             .path()
             .join("selection-range-host.request.json")
             .exists(),
-        "the parser-less host document must reach the downstream server"
+        "the host document must reach the downstream server"
     );
 }
 
@@ -767,6 +767,109 @@ enabled = true
             .expect("request count"),
         "1",
         "the empty highest-priority host layer must not be dispatched twice"
+    );
+}
+
+#[test]
+fn e2e_host_first_reuses_mixed_results_per_position() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("selection_range_host_mixed.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/selectionRange"]
+priorities = ["host", "native"]
+
+[languages.markdown.bridge._self]
+enabled = true
+"#,
+    )
+    .expect("write config");
+    let events = tempfile::TempDir::new().expect("events");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("UTF-8 config path"))
+        .env("MOCK_LSP_CANCEL_DIR", events.path().to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-selection-range-mixed": {
+                        "cmd": [mock_bin(), "selection-range-mixed-empty"],
+                        "languages": ["markdown"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///selection_range_host_mixed.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "word\n"
+            }
+        }),
+    );
+
+    let marker = events
+        .path()
+        .join("selection-range-mixed-empty.request.json");
+    poll_until(100, 50, || {
+        let _ = client.send_request(
+            "textDocument/selectionRange",
+            json!({
+                "textDocument": { "uri": uri },
+                "positions": [{ "line": 0, "character": 1 }]
+            }),
+        );
+        marker.exists().then_some(())
+    })
+    .expect("mixed host server should become ready");
+    std::fs::write(
+        events
+            .path()
+            .join("selection-range-mixed-empty.request.count"),
+        "0",
+    )
+    .expect("reset request count");
+
+    let response = selection_range_when_parsed(
+        &mut client,
+        json!({
+            "textDocument": { "uri": uri },
+            "positions": [
+                { "line": 0, "character": 1 },
+                { "line": 0, "character": 3 }
+            ]
+        }),
+    );
+    assert_eq!(
+        response.pointer("/result/1/range/start/character"),
+        Some(&json!(3))
+    );
+    assert_eq!(
+        response.pointer("/result/1/range/end/character"),
+        Some(&json!(4))
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            events
+                .path()
+                .join("selection-range-mixed-empty.request.count")
+        )
+        .expect("request count"),
+        "2",
+        "each host position must be dispatched once and its result reused"
     );
 }
 
