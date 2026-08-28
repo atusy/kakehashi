@@ -470,6 +470,11 @@ pub struct LanguageServerPool {
     /// initialize, then updated by `workspace/didChangeWorkspaceFolders` and
     /// snapshotted for each later downstream handshake.
     workspace_folders: super::WorkspaceFolderSet,
+    /// Advances before every non-empty upstream workspace-folder change.
+    /// Document-free requests carry this generation from producer selection
+    /// through wire admission so an incapable shared process cannot outlive
+    /// the client-workspace proof used to select it.
+    workspace_generation: AtomicU64,
     /// Client capabilities forwarded from upstream client.
     ///
     /// Set once via `set_client_capabilities()` after receiving the upstream initialize request.
@@ -577,6 +582,7 @@ impl LanguageServerPool {
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
             root_uri: arc_swap::ArcSwap::new(Arc::new(None)),
             workspace_folders: super::WorkspaceFolderSet::new(None),
+            workspace_generation: AtomicU64::new(0),
             client_capabilities: OnceLock::new(),
             log_message_level: AtomicU8::new(
                 crate::config::settings::LogMessageLevel::Info.as_u8(),
@@ -795,6 +801,11 @@ impl LanguageServerPool {
             return false;
         }
 
+        // Publish the invalidation before changing either workspace snapshot.
+        // A request that already selected a producer will therefore fail its
+        // exact-send fence even while this async update is still recycling
+        // connections or awaiting notification queues.
+        self.workspace_generation.fetch_add(1, Ordering::AcqRel);
         self.workspace_folders.apply_change(added.clone(), removed);
         self.set_root_uri(
             self.workspace_folders()
@@ -2563,7 +2574,8 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         timeout: Duration,
         admit: &(dyn Fn() -> bool + Sync),
-    ) -> io::Result<Arc<ConnectionHandle>> {
+    ) -> io::Result<(Arc<ConnectionHandle>, u64)> {
+        let workspace_generation = self.workspace_generation.load(Ordering::Acquire);
         let start = std::time::Instant::now();
         let handle = self
             .get_or_create_connection_wait_ready_admitted(
@@ -2574,25 +2586,36 @@ impl LanguageServerPool {
                 admit,
             )
             .await?;
-        if !handle.key().is_shared()
+        let handle = if !handle.key().is_shared()
             || handle.supports_workspace_folder_changes()
             || self.incapable_shared_serves_client_workspace(&handle)
         {
-            return Ok(handle);
+            handle
+        } else {
+            self.acquire_resolved_wait_ready(
+                server_name,
+                server_config,
+                ConnectionKey::new(server_name, None),
+                None,
+                WaitReadyOptions {
+                    timeout: timeout.saturating_sub(start.elapsed()),
+                    rootless: false,
+                    admit: Some(admit),
+                },
+            )
+            .await?
+        };
+        if !admit() || self.workspace_generation.load(Ordering::Acquire) != workspace_generation {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "client workspace changed while selecting a producer",
+            ));
         }
+        Ok((handle, workspace_generation))
+    }
 
-        self.acquire_resolved_wait_ready(
-            server_name,
-            server_config,
-            ConnectionKey::new(server_name, None),
-            None,
-            WaitReadyOptions {
-                timeout: timeout.saturating_sub(start.elapsed()),
-                rootless: false,
-                admit: Some(admit),
-            },
-        )
-        .await
+    pub(super) fn workspace_generation(&self) -> u64 {
+        self.workspace_generation.load(Ordering::Acquire)
     }
 
     fn incapable_shared_serves_client_workspace(&self, handle: &ConnectionHandle) -> bool {
@@ -2600,7 +2623,7 @@ impl LanguageServerPool {
             self.workspace_folders(),
             handle.workspace_folders().snapshot(),
         ) {
-            (Some(expected), Some(actual)) => {
+            (Some(expected), Some(actual)) if handle.supports_initial_workspace_folders() => {
                 expected.len() == actual.len()
                     && expected.iter().all(|expected| {
                         actual.iter().any(|actual| {
