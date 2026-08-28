@@ -95,6 +95,7 @@ struct NativeSemanticLayer {
     snapshot: Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
     request_guard: SemanticRequestGuard,
     generation: u64,
+    pending_native: Option<PendingNativeBaseline>,
 }
 
 impl NativeSemanticLayer {
@@ -109,7 +110,35 @@ impl NativeSemanticLayer {
             snapshot,
             request_guard,
             generation,
+            pending_native: None,
         }
+    }
+
+    fn with_pending_native(mut self, pending_native: Option<PendingNativeBaseline>) -> Self {
+        self.pending_native = pending_native;
+        self
+    }
+}
+
+struct PendingNativeBaseline {
+    uri: Url,
+    tokens: SemanticTokens,
+    language: String,
+    cache_key: u64,
+    snapshot: SemanticSnapshotIdentity,
+    served_version: u64,
+}
+
+impl PendingNativeBaseline {
+    fn commit(self, cache: &crate::lsp::cache::CacheCoordinator) {
+        cache.store_tokens(
+            self.uri.clone(),
+            self.tokens,
+            self.language,
+            self.cache_key,
+            self.snapshot,
+        );
+        cache.record_served_semantic_version(&self.uri, self.served_version);
     }
 }
 
@@ -135,6 +164,7 @@ impl PendingWireBaseline {
 
 struct SemanticFullComputation {
     result: SemanticTokensResult,
+    pending_native: Option<PendingNativeBaseline>,
     pending_wire: Option<PendingWireBaseline>,
 }
 
@@ -459,6 +489,7 @@ impl Kakehashi {
         let generation = native_layer.generation;
         let native_tokens = native_layer.tokens;
         let snapshot = native_layer.snapshot;
+        let pending_native = native_layer.pending_native;
         if actionable_virtual
             && snapshot
                 .as_ref()
@@ -627,6 +658,7 @@ impl Kakehashi {
             }
             Ok(Some(SemanticFullComputation {
                 result: SemanticTokensResult::Tokens(tokens),
+                pending_native,
                 pending_wire,
             }))
         };
@@ -1064,20 +1096,31 @@ impl Kakehashi {
             finish_if_owned();
             return Ok(None);
         }
-        // Store keyed by result_id (delta baseline) AND cache_key (so an
-        // unchanged-document repeat request short-circuits the re-tokenization
-        // above). `language_name` is unused after this, so move it in.
-        self.cache.store_tokens(
-            uri.clone(),
-            stored_tokens,
-            language_name,
-            cache_key,
-            snapshot_identity,
-        );
-
-        // Finish tracking this request
-        self.cache
-            .record_served_semantic_version(&uri, snapshot.parsed_version);
+        // A nested full borrows the outer delta's tracker. Keep its freshly
+        // minted native baseline private until that outer request passes its
+        // own lifecycle fence; otherwise a discarded delta can evict the last
+        // baseline actually held by the editor.
+        let pending_native = if owns_tracking {
+            self.cache.store_tokens(
+                uri.clone(),
+                stored_tokens,
+                language_name,
+                cache_key,
+                snapshot_identity,
+            );
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            None
+        } else {
+            Some(PendingNativeBaseline {
+                uri: uri.clone(),
+                tokens: stored_tokens,
+                language: language_name,
+                cache_key,
+                snapshot: snapshot_identity,
+                served_version: snapshot.parsed_version,
+            })
+        };
 
         log::debug!(
             target: "kakehashi::semantic",
@@ -1085,12 +1128,10 @@ impl Kakehashi {
             uri, request_id, lsp_tokens.data.len()
         );
 
-        Ok(Some(NativeSemanticLayer::new(
-            lsp_tokens,
-            Some(snapshot),
-            request_guard,
-            token_generation,
-        )))
+        Ok(Some(
+            NativeSemanticLayer::new(lsp_tokens, Some(snapshot), request_guard, token_generation)
+                .with_pending_native(pending_native),
+        ))
     }
 
     async fn semantic_delta_has_applicable_bridge(
@@ -1459,6 +1500,7 @@ impl Kakehashi {
         else {
             return Ok(None);
         };
+        let pending_native = current.pending_native;
         let pending_wire = current.pending_wire;
         let current = match current.result {
             SemanticTokensResult::Tokens(tokens) => tokens,
@@ -1488,6 +1530,9 @@ impl Kakehashi {
             return Ok(None);
         }
 
+        if let Some(pending) = pending_native {
+            pending.commit(&self.cache);
+        }
         if let Some(pending) = pending_wire {
             pending.commit(&self.cache);
         }
@@ -2662,6 +2707,45 @@ mod tests {
                 .get_wire_tokens_if_valid(&uri, &result_id)
                 .is_some(),
             "a successful outer delta fence must publish its baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_native_baseline_is_invisible_until_outer_commit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///pending-native-baseline.rs").expect("valid test URI");
+        let result_id = "pending-native".to_string();
+        let pending = PendingNativeBaseline {
+            uri: uri.clone(),
+            tokens: SemanticTokens {
+                result_id: Some(result_id.clone()),
+                data: vec![tower_lsp_server::ls_types::SemanticToken {
+                    delta_line: 0,
+                    delta_start: 0,
+                    length: 1,
+                    token_type: 0,
+                    token_modifiers_bitset: 0,
+                }],
+            },
+            language: "rust".into(),
+            cache_key: 1,
+            snapshot: SemanticSnapshotIdentity {
+                parsed_version: 1,
+                incarnation: 1,
+                generation: 1,
+            },
+            served_version: 1,
+        };
+
+        assert!(
+            server.cache.get_tokens_if_valid(&uri, &result_id).is_none(),
+            "a nested native baseline must remain private before the delta fence"
+        );
+        pending.commit(&server.cache);
+        assert!(
+            server.cache.get_tokens_if_valid(&uri, &result_id).is_some(),
+            "a successful outer delta fence must publish its native baseline"
         );
     }
 
