@@ -337,6 +337,7 @@ impl InjectionCoordinator {
             return false;
         }
         let incarnation = document.incarnation();
+        let content_version = document.content_version();
         drop(document);
 
         // Stored language first (see `document_language`): parser-aware
@@ -394,7 +395,7 @@ impl InjectionCoordinator {
 
         if forward_did_change {
             self.bridge
-                .forward_didchange_to_opened_docs(uri, incarnation, &injections)
+                .forward_didchange_to_opened_docs(uri, incarnation, content_version, &injections)
                 .await;
         }
 
