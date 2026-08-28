@@ -684,11 +684,14 @@ impl Kakehashi {
             let document = self.documents.get(uri)?;
             (
                 document.language_id().map(str::to_owned),
-                document.text().to_owned(),
+                document.text_arc(),
             )
         };
         let language = self.document_language(uri).or(stored_language)?;
-        Some(self.language.canonical_injection_language(&language, &text))
+        Some(
+            self.language
+                .canonical_injection_language(&language, text.as_ref()),
+        )
     }
 
     pub(super) fn bridge_configs_for_injection_language(
