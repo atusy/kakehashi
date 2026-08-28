@@ -21,6 +21,8 @@ impl Kakehashi {
             // documentLink is fast; not advertised for client progress (#437), so
             // no token is carried.
             None,
+            None,
+            None,
             false,
             false,
             std::future::ready(Ok(None)),
@@ -51,6 +53,10 @@ impl Kakehashi {
                     server_resolves,
                 );
                 Some(won.items)
+            },
+            |mut acc, next| {
+                acc.extend(next);
+                acc
             },
             |mut acc, next| {
                 acc.extend(next);
