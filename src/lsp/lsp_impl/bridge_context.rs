@@ -1501,7 +1501,7 @@ impl Kakehashi {
             log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
             return Ok(None);
         };
-        let Some(host_language) = self.document_language(&uri) else {
+        let Some(host_language) = self.document_bridge_language(&uri) else {
             return Ok(None);
         };
         let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
@@ -1573,7 +1573,7 @@ impl Kakehashi {
             log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
             return Ok(None);
         };
-        let Some(host_language) = self.document_language(&uri) else {
+        let Some(host_language) = self.document_bridge_language(&uri) else {
             return Ok(None);
         };
         // ONE resolve for both the strategy decision and the priorities passed
@@ -1622,11 +1622,7 @@ impl Kakehashi {
             log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
             return Ok(None);
         };
-        let Some(host_language) = self.document_language(&uri).or_else(|| {
-            self.documents
-                .get(&uri)
-                .and_then(|document| document.language_id().map(str::to_owned))
-        }) else {
+        let Some(host_language) = self.document_bridge_language(&uri) else {
             return Ok(None);
         };
         let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
