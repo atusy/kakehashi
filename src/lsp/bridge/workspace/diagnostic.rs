@@ -122,6 +122,14 @@ fn reconcile_overlapping_root_reports(
                     && producer.provider_identifiers == report.provider_identifiers
             }) {
                 let containing_depth = containing_root_depth(producer.spawn_root.as_deref(), uri);
+                let producer_reported_uri = producer
+                    .report
+                    .items
+                    .iter()
+                    .any(|item| item_uri(item) == uri);
+                if containing_depth.is_none() && !producer_reported_uri {
+                    continue;
+                }
                 let candidate = (
                     containing_depth.is_some(),
                     containing_depth.unwrap_or_default(),
@@ -429,7 +437,40 @@ fn collect_complete_server_contributions<T>(
         .collect())
 }
 
+fn workspace_diagnostic_retrigger_requested(response: &Value) -> bool {
+    response.pointer("/error/code").and_then(Value::as_i64) == Some(-32802)
+        && response
+            .pointer("/error/data/retriggerRequest")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+}
+
 impl LanguageServerPool {
+    fn schedule_workspace_diagnostic_retrigger(&self, response: &Value) {
+        if workspace_diagnostic_retrigger_requested(response) {
+            let _ = self
+                .upstream_tx()
+                .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
+        }
+    }
+
+    fn mark_workspace_diagnostic_pulls_completed<'a>(
+        &self,
+        handles: impl Iterator<Item = &'a Arc<ConnectionHandle>>,
+    ) {
+        let mut refresh = false;
+        for handle in handles {
+            refresh |= handle
+                .dynamic_capabilities()
+                .mark_workspace_diagnostic_pull_completed();
+        }
+        if refresh {
+            let _ = self
+                .upstream_tx()
+                .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
+        }
+    }
+
     fn collect_completed_workspace_diagnostic_requests(
         &self,
         contributions: impl IntoIterator<Item = io::Result<Vec<CompletedDiagnosticProducer>>>,
@@ -444,21 +485,29 @@ impl LanguageServerPool {
             }
         }
         if let Some(error) = first_error {
-            let mut refresh = false;
-            for producer in &completed {
-                refresh |= producer
-                    .handle
-                    .dynamic_capabilities()
-                    .mark_workspace_diagnostic_pull_completed();
-            }
-            if refresh {
-                let _ = self
-                    .upstream_tx()
-                    .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
-            }
+            self.mark_workspace_diagnostic_pulls_completed(
+                completed.iter().map(|producer| &producer.handle),
+            );
             return Err(error);
         }
         Ok(completed)
+    }
+
+    fn collect_completed_workspace_diagnostic_provider_reports(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        reports: impl IntoIterator<
+            Item = (
+                Option<String>,
+                io::Result<Option<WorkspaceDiagnosticReport>>,
+            ),
+        >,
+    ) -> Option<Vec<ProviderDiagnosticReport>> {
+        let completed = combine_complete_provider_reports(reports);
+        if completed.is_none() {
+            self.mark_workspace_diagnostic_pulls_completed(std::iter::once(handle));
+        }
+        completed
     }
 
     fn release_changed_provider_refreshes<'a>(
@@ -848,13 +897,19 @@ impl LanguageServerPool {
                                 )
                             }
                         });
-                        let provider_reports =
-                            combine_complete_provider_reports(join_all(requests).await)?;
+                        let provider_reports = self
+                            .collect_completed_workspace_diagnostic_provider_reports(
+                                &handle,
+                                join_all(requests).await,
+                            )?;
                         if !self
                             .workspace_diagnostic_producer_is_live(&handle, generation)
                             .await
                             || !workspace_admit()
                         {
+                            self.mark_workspace_diagnostic_pulls_completed(std::iter::once(
+                                &handle,
+                            ));
                             return None;
                         }
                         Some(CompletedDiagnosticProducer {
@@ -995,6 +1050,7 @@ impl LanguageServerPool {
             ));
         }
         if response_has_jsonrpc_error(&response, DIAGNOSTIC_METHOD) {
+            self.schedule_workspace_diagnostic_retrigger(&response);
             return Ok(None);
         }
         let Some(result) = response.get("result") else {
@@ -1175,6 +1231,32 @@ mod tests {
     }
 
     #[test]
+    fn empty_disjoint_root_does_not_suppress_an_external_uri_reported_elsewhere() {
+        let provider_identifiers = vec![Some("rust".to_owned())];
+        let reports = reconcile_overlapping_root_reports([
+            RootedDiagnosticReport {
+                server: "diagnostics".into(),
+                spawn_root: Some("file:///workspace/a".into()),
+                provider_identifiers: provider_identifiers.clone(),
+                report: WorkspaceDiagnosticReport {
+                    items: vec![full("file:///generated/shared.rs", None, "reported-by-a")],
+                },
+            },
+            RootedDiagnosticReport {
+                server: "diagnostics".into(),
+                spawn_root: Some("file:///workspace/z".into()),
+                provider_identifiers,
+                report: WorkspaceDiagnosticReport::default(),
+            },
+        ]);
+
+        let WorkspaceDiagnosticReportResult::Report(report) = aggregate_reports(reports) else {
+            panic!("final report")
+        };
+        assert_eq!(report.items.len(), 1);
+    }
+
+    #[test]
     fn overlapping_root_reconciliation_preserves_independent_providers() {
         let uri = "file:///workspace/nested/doc.rs";
         let reports = reconcile_overlapping_root_reports([
@@ -1352,6 +1434,80 @@ mod tests {
                 .request_or_defer_workspace_diagnostic_registration_refresh(),
             "the rejected cold pull must be marked complete"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_cold_producer_releases_its_own_deferred_refresh() {
+        let pool = LanguageServerPool::new();
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("failed"))
+                .await;
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "late".into(),
+            method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
+        }]);
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .request_or_defer_workspace_diagnostic_registration_refresh()
+        );
+
+        let reports = pool.collect_completed_workspace_diagnostic_provider_reports(
+            &handle,
+            [(None, Err(io::Error::other("provider failed")))],
+        );
+
+        assert!(reports.is_none());
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .take_workspace_diagnostic_registration_refresh()
+        );
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .request_or_defer_workspace_diagnostic_registration_refresh()
+        );
+    }
+
+    #[tokio::test]
+    async fn server_cancelled_defaults_to_retrigger_and_honors_explicit_data() {
+        let pool = LanguageServerPool::new();
+        let mut notifications = pool.take_upstream_rx().expect("upstream receiver");
+        let response = |data: Option<Value>| {
+            let mut error = serde_json::json!({
+                "code": -32802,
+                "message": "cancelled"
+            });
+            if let Some(data) = data {
+                error["data"] = data;
+            }
+            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "error": error })
+        };
+
+        pool.schedule_workspace_diagnostic_retrigger(&response(None));
+        assert!(matches!(
+            notifications.recv().await,
+            Some(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged)
+        ));
+        pool.schedule_workspace_diagnostic_retrigger(&response(Some(serde_json::json!({
+            "retriggerRequest": true
+        }))));
+        assert!(matches!(
+            notifications.recv().await,
+            Some(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged)
+        ));
+        pool.schedule_workspace_diagnostic_retrigger(&response(Some(serde_json::json!({
+            "retriggerRequest": false
+        }))));
+        pool.schedule_workspace_diagnostic_retrigger(&serde_json::json!({
+            "error": { "code": -32603, "message": "internal" }
+        }));
+        assert!(notifications.try_recv().is_err());
     }
 
     #[test]
