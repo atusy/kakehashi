@@ -113,6 +113,31 @@ impl NativeSemanticLayer {
     }
 }
 
+struct PendingWireBaseline {
+    uri: Url,
+    tokens: SemanticTokens,
+    language: String,
+    cache_key: u64,
+    snapshot: SemanticSnapshotIdentity,
+}
+
+impl PendingWireBaseline {
+    fn commit(self, cache: &crate::lsp::cache::CacheCoordinator) {
+        cache.store_wire_tokens(
+            self.uri,
+            self.tokens,
+            self.language,
+            self.cache_key,
+            self.snapshot,
+        );
+    }
+}
+
+struct SemanticFullComputation {
+    result: SemanticTokensResult,
+    pending_wire: Option<PendingWireBaseline>,
+}
+
 /// Owns a semantic request's tracker entry through its complete native + bridge
 /// pipeline. Async cancellation drops the handler future, so explicit cleanup
 /// branches alone cannot reclaim an already-started blocking compute. A nested
@@ -350,15 +375,17 @@ impl Kakehashi {
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
-        self.semantic_tokens_full_impl_with_tracking(params, None)
-            .await
+        Ok(self
+            .semantic_tokens_full_impl_with_tracking(params, None)
+            .await?
+            .map(|computed| computed.result))
     }
 
     async fn semantic_tokens_full_impl_with_tracking(
         &self,
         params: SemanticTokensParams,
         tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
-    ) -> Result<Option<SemanticTokensResult>> {
+    ) -> Result<Option<SemanticFullComputation>> {
         const METHOD: &str = "textDocument/semanticTokens/full";
         let lsp_uri = params.text_document.uri.clone();
         let Ok(uri) = uri_to_url(&lsp_uri) else {
@@ -413,6 +440,7 @@ impl Kakehashi {
         // backstop expires instead, the no-snapshot path carries the live
         // incarnation/content version through fan-out and revalidates that
         // identity before returning.
+        let defer_wire_commit = tracking.is_some();
         let Some(native_layer) = self
             .semantic_tokens_full_native_layer(
                 params,
@@ -573,30 +601,36 @@ impl Kakehashi {
                 native_result_id
             };
             let tokens = SemanticTokens { result_id, data };
-            if bridge_attempted {
-                self.cache.store_wire_tokens(
-                    uri.clone(),
-                    tokens.clone(),
-                    snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.language.clone())
-                        .unwrap_or(live_language),
-                    self.cache.cache_key_for(&live_text, generation),
-                    snapshot.as_ref().map_or(
-                        SemanticSnapshotIdentity {
-                            parsed_version: live_identity.1,
-                            incarnation: live_identity.0,
-                            generation,
-                        },
-                        |snapshot| SemanticSnapshotIdentity {
-                            parsed_version: snapshot.parsed_version,
-                            incarnation: snapshot.incarnation,
-                            generation,
-                        },
-                    ),
-                );
+            let mut pending_wire = bridge_attempted.then(|| PendingWireBaseline {
+                uri: uri.clone(),
+                tokens: tokens.clone(),
+                language: snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.language.clone())
+                    .unwrap_or(live_language),
+                cache_key: self.cache.cache_key_for(&live_text, generation),
+                snapshot: snapshot.as_ref().map_or(
+                    SemanticSnapshotIdentity {
+                        parsed_version: live_identity.1,
+                        incarnation: live_identity.0,
+                        generation,
+                    },
+                    |snapshot| SemanticSnapshotIdentity {
+                        parsed_version: snapshot.parsed_version,
+                        incarnation: snapshot.incarnation,
+                        generation,
+                    },
+                ),
+            });
+            if !defer_wire_commit {
+                if let Some(pending) = pending_wire.take() {
+                    pending.commit(&self.cache);
+                }
             }
-            Ok(Some(SemanticTokensResult::Tokens(tokens)))
+            Ok(Some(SemanticFullComputation {
+                result: SemanticTokensResult::Tokens(tokens),
+                pending_wire,
+            }))
         };
         let outcome = match cancel_rx.as_mut() {
             Some(cancel_rx) => {
@@ -1427,7 +1461,8 @@ impl Kakehashi {
         else {
             return Ok(None);
         };
-        let current = match current {
+        let pending_wire = current.pending_wire;
+        let current = match current.result {
             SemanticTokensResult::Tokens(tokens) => tokens,
             SemanticTokensResult::Partial(partial) => SemanticTokens {
                 result_id: None,
@@ -1453,6 +1488,10 @@ impl Kakehashi {
             )
         {
             return Ok(None);
+        }
+
+        if let Some(pending) = pending_wire {
+            pending.commit(&self.cache);
         }
 
         Ok(Some(result))
@@ -2582,6 +2621,50 @@ mod tests {
         assert!(cancel_token.is_cancelled());
         assert!(!server.cache.is_request_active(&uri, request_id));
         server.cache.finish_request(&uri, newer_id);
+    }
+
+    #[tokio::test]
+    async fn pending_wire_baseline_is_invisible_until_outer_commit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///pending-wire-baseline.rs").expect("valid test URI");
+        let result_id = "pending-wire".to_string();
+        let pending = PendingWireBaseline {
+            uri: uri.clone(),
+            tokens: SemanticTokens {
+                result_id: Some(result_id.clone()),
+                data: vec![tower_lsp_server::ls_types::SemanticToken {
+                    delta_line: 0,
+                    delta_start: 0,
+                    length: 1,
+                    token_type: 0,
+                    token_modifiers_bitset: 0,
+                }],
+            },
+            language: "rust".into(),
+            cache_key: 1,
+            snapshot: SemanticSnapshotIdentity {
+                parsed_version: 1,
+                incarnation: 1,
+                generation: 1,
+            },
+        };
+
+        assert!(
+            server
+                .cache
+                .get_wire_tokens_if_valid(&uri, &result_id)
+                .is_none(),
+            "a nested full baseline must remain private before the delta fence"
+        );
+        pending.commit(&server.cache);
+        assert!(
+            server
+                .cache
+                .get_wire_tokens_if_valid(&uri, &result_id)
+                .is_some(),
+            "a successful outer delta fence must publish its baseline"
+        );
     }
 
     fn range_params(uri: &Url, range: Range) -> SemanticTokensRangeParams {
