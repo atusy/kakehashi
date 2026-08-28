@@ -126,9 +126,6 @@ async fn diagnostic_providers_after_registration_settle(
                     if !admit() {
                         return Err(());
                     }
-                    if !diagnostic_providers(handle).is_empty() {
-                        return Ok(());
-                    }
                     if tokio::time::timeout_at(deadline, changes.changed())
                         .await
                         .is_err()
@@ -270,6 +267,17 @@ fn combine_complete_provider_reports(
     reports.map(combine_producer_reports)
 }
 
+fn collect_complete_server_contributions<T>(
+    contributions: impl IntoIterator<Item = io::Result<Vec<T>>>,
+) -> io::Result<Vec<T>> {
+    Ok(contributions
+        .into_iter()
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
 impl LanguageServerPool {
     #[cfg(test)]
     async fn aggregate_admitted_workspace_diagnostic_reports<F>(
@@ -332,9 +340,9 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
         admit: &(dyn Fn() -> bool + Sync),
         request_workspace_generation: u64,
-    ) -> WorkspaceDiagnosticReportResult {
+    ) -> io::Result<WorkspaceDiagnosticReportResult> {
         if request_workspace_generation & 1 != 0 {
-            return aggregate_reports(std::iter::empty());
+            return Ok(aggregate_reports(std::iter::empty()));
         }
         // Provider result IDs, identifiers, and progress tokens are scoped to
         // one server. The bridge aggregates several producers into one full
@@ -344,7 +352,7 @@ impl LanguageServerPool {
         params.partial_result_params.partial_result_token = None;
         params.work_done_progress_params.work_done_token = None;
         let Ok(mut params) = serde_json::to_value(params) else {
-            return aggregate_reports(std::iter::empty());
+            return Ok(aggregate_reports(std::iter::empty()));
         };
         if let Some(params) = params.as_object_mut() {
             // ls-types 0.0.6 serializes the optional identifier as JSON null,
@@ -374,19 +382,19 @@ impl LanguageServerPool {
             let params = params.clone();
             let upstream_id = upstream_id.clone();
             async move {
-                let Ok((handles, workspace_generation)) = self
+                let (handles, workspace_generation) = self
                     .get_or_create_workspace_connections_wait_ready_admitted(
                         &name,
                         &config,
                         Duration::from_secs(INIT_TIMEOUT_SECS),
                         admit,
                     )
-                    .await
-                else {
-                    return Vec::new();
-                };
+                    .await?;
                 if workspace_generation != request_workspace_generation {
-                    return Vec::new();
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "workspace changed during diagnostic producer acquisition",
+                    ));
                 }
                 let workspace_admit =
                     || admit() && self.workspace_generation() == workspace_generation;
@@ -435,15 +443,22 @@ impl LanguageServerPool {
                         })
                     }
                 });
-                join_all(producers).await.into_iter().flatten().collect()
+                join_all(producers)
+                    .await
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| {
+                        io::Error::other("workspace diagnostic producer set was incomplete")
+                    })
             }
         });
 
         let workspace_admit =
             || admit() && self.workspace_generation() == request_workspace_generation;
-        let reports = join_all(requests).await.into_iter().flatten();
-        self.aggregate_admitted_completed_workspace_diagnostic_reports(reports, &workspace_admit)
-            .await
+        let reports = collect_complete_server_contributions(join_all(requests).await)?;
+        Ok(self
+            .aggregate_admitted_completed_workspace_diagnostic_reports(reports, &workspace_admit)
+            .await)
     }
 
     async fn send_workspace_diagnostic_request(
@@ -668,6 +683,19 @@ mod tests {
                 .items
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn server_combination_is_atomic_across_producer_failures() {
+        let contributions = collect_complete_server_contributions([
+            Ok(vec!["alpha"]),
+            Err(io::Error::other("server failed")),
+        ]);
+        assert!(contributions.is_err());
+        assert_eq!(
+            collect_complete_server_contributions([Ok(vec!["alpha"]), Ok(vec!["beta"])]).unwrap(),
+            ["alpha", "beta"]
         );
     }
 
@@ -1035,6 +1063,57 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn provider_plan_collects_sequential_registrations_through_settle_deadline() {
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("diagnostics"),
+        )
+        .await;
+        let providers = diagnostic_providers_after_registration_settle(&handle, &|| true);
+        tokio::pin!(providers);
+        assert!(futures::poll!(providers.as_mut()).is_pending());
+
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "alpha".into(),
+            method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "identifier": "alpha",
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
+        }]);
+        assert!(futures::poll!(providers.as_mut()).is_pending());
+        tokio::time::advance(DYNAMIC_REGISTRATION_SETTLE / 2).await;
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "beta".into(),
+            method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "identifier": "beta",
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
+        }]);
+        assert!(futures::poll!(providers.as_mut()).is_pending());
+        tokio::time::advance(DYNAMIC_REGISTRATION_SETTLE / 2).await;
+
+        assert_eq!(
+            providers.await,
+            vec![
+                DiagnosticProvider {
+                    identifier: Some("alpha".into()),
+                    has_static_provider: false,
+                    dynamic_registration_ids: vec!["alpha".into()],
+                },
+                DiagnosticProvider {
+                    identifier: Some("beta".into()),
+                    has_static_provider: false,
+                    dynamic_registration_ids: vec!["beta".into()],
+                },
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn provider_plan_settles_only_once_for_an_incapable_connection() {
         let handle = create_handle_with_key(
             ConnectionState::Ready,
@@ -1167,7 +1246,8 @@ mod tests {
             }));
         }
 
-        let WorkspaceDiagnosticReportResult::Report(report) = request.await.unwrap() else {
+        let WorkspaceDiagnosticReportResult::Report(report) = request.await.unwrap().unwrap()
+        else {
             panic!("full report")
         };
         let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
@@ -1178,7 +1258,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_discards_completed_provider_after_producer_replacement() {
+    async fn dispatch_fails_after_producer_replacement() {
         let pool = Arc::new(LanguageServerPool::new());
         let key = ConnectionKey::for_server("diagnostics");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
@@ -1276,13 +1356,7 @@ mod tests {
             "result": { "items": [] }
         }));
 
-        let WorkspaceDiagnosticReportResult::Report(report) = request.await.unwrap() else {
-            panic!("full report")
-        };
-        assert!(
-            report.items.is_empty(),
-            "a completed sibling report must not survive producer replacement"
-        );
+        assert!(request.await.unwrap().is_err());
     }
 
     #[tokio::test]
@@ -1443,7 +1517,7 @@ mod tests {
         }));
 
         assert_eq!(
-            request.await.unwrap(),
+            request.await.unwrap().unwrap(),
             WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport::default())
         );
     }
@@ -1540,7 +1614,7 @@ mod tests {
         }));
 
         assert_eq!(
-            request.await.unwrap(),
+            request.await.unwrap().unwrap(),
             WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport::default())
         );
     }
@@ -1618,7 +1692,7 @@ mod tests {
         }
 
         assert_eq!(
-            request.await.unwrap(),
+            request.await.unwrap().unwrap(),
             WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport::default())
         );
     }
@@ -1681,7 +1755,8 @@ mod tests {
                 &|| true,
                 pool.workspace_generation(),
             )
-            .await;
+            .await
+            .unwrap();
         assert_eq!(
             response,
             WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport::default())
@@ -1696,7 +1771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_discards_completed_reports_when_workspace_changes_during_fanout() {
+    async fn dispatch_fails_when_workspace_changes_during_fanout() {
         let pool = Arc::new(LanguageServerPool::new());
         seed_test_client_root(&pool, "file:///workspace");
         let first =
@@ -1790,13 +1865,7 @@ mod tests {
             "result": { "items": [] }
         }));
 
-        let WorkspaceDiagnosticReportResult::Report(report) = request.await.unwrap() else {
-            panic!("full report")
-        };
-        assert!(
-            report.items.is_empty(),
-            "a completed old-workspace report must not survive final aggregation"
-        );
+        assert!(request.await.unwrap().is_err());
     }
 
     #[tokio::test]
@@ -1882,7 +1951,7 @@ mod tests {
         }))
         .unwrap();
 
-        let response = pool
+        let error = pool
             .dispatch_workspace_diagnostic(
                 params,
                 &settings,
@@ -1890,12 +1959,10 @@ mod tests {
                 &|| false,
                 pool.workspace_generation(),
             )
-            .await;
+            .await
+            .unwrap_err();
 
-        assert_eq!(
-            response,
-            WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport::default())
-        );
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(pool.connections().await.is_empty());
     }
 }
