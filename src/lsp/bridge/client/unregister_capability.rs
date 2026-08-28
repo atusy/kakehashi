@@ -1,9 +1,9 @@
 //! `client/unregisterCapability` server-request handler.
 //!
 //! Inbound (downstream → bridge). A downstream server unregisters a dynamic
-//! capability it previously registered; the handler stages the removal so the
-//! reader can ack with `null` before updating the shared
-//! [`DynamicCapabilityRegistry`]. Param-parse failures (or
+//! capability it previously registered; the handler parses the removal so the
+//! reader can update the shared [`DynamicCapabilityRegistry`] before queuing
+//! the acknowledgement. Param-parse failures (or
 //! a missing `params` field) reply with InvalidParams (-32602), mirroring
 //! [`register_capability`](super::register_capability).
 //!
@@ -18,8 +18,8 @@ pub(in crate::lsp::bridge) struct UnregistrationReply {
     pub(in crate::lsp::bridge) unregisterations: Vec<tower_lsp_server::ls_types::Unregistration>,
 }
 
-/// Handle a `client/unregisterCapability` request, returning the JSON-RPC body
-/// the dispatcher wraps in a response.
+/// Parse a `client/unregisterCapability` request into removals the reader
+/// commits before queuing the acknowledgement.
 pub(in crate::lsp::bridge) fn handle(
     message: &serde_json::Value,
     server_prefix: &str,
