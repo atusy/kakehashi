@@ -381,6 +381,7 @@ impl Kakehashi {
                     Some(std::sync::Arc::clone(&bridge_attempted)),
                     true,
                     true,
+                    true,
                     native,
                     move |task| async move {
                         let region_end = task.region_end();

@@ -23,9 +23,12 @@ use tower_lsp_server::ls_types::{NumberOrString, Uri};
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, dispatch_host_preferred, dispatch_preferred,
-    dispatch_preferred_with_tokens, mint_region_progress_source,
+    dispatch_preferred_with_tokens, expand_priorities, mint_region_progress_source,
+    truncate_entries,
 };
-use crate::lsp::bridge::{ClientProgressAggregator, ClientProgressDeregisterGuard, HostDocument};
+use crate::lsp::bridge::{
+    ClientProgressAggregator, ClientProgressDeregisterGuard, HostDocument, ResolvedServerConfig,
+};
 
 use super::bridge_context::DocumentRequestContext;
 use super::{Kakehashi, uri_to_url};
@@ -73,6 +76,7 @@ impl Kakehashi {
         bridge_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
         require_all_layers: bool,
         preserve_empty: bool,
+        nested_regions_first: bool,
         native: N,
         send: F,
         parse_host: P,
@@ -165,6 +169,11 @@ impl Kakehashi {
             if all_regions.is_empty() {
                 return Ok(None);
             }
+            let region_ranges = all_regions
+                .iter()
+                .map(|resolved| resolved.region.byte_range.clone())
+                .collect::<Vec<_>>();
+            let region_merge_order = region_merge_order(&region_ranges, nested_regions_first);
 
             // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
             let upstream_request_id = crate::lsp::current_upstream_id();
@@ -223,15 +232,17 @@ impl Kakehashi {
                 if configs.is_empty() {
                     continue;
                 }
-                if let Some(attempted) = &bridge_attempted {
-                    attempted.store(true, std::sync::atomic::Ordering::Release);
-                }
-
                 let agg = self.resolve_aggregation_config(
                     &language_name,
                     &resolved.injection_language,
                     method_name,
                 );
+                if !request_selects_servers(&agg.priorities, &configs, agg.max_fan_out) {
+                    continue;
+                }
+                if let Some(attempted) = &bridge_attempted {
+                    attempted.store(true, std::sync::atomic::Ordering::Release);
+                }
                 let region_ctx = DocumentRequestContext {
                     uri: uri.clone(),
                     resolved: resolved.clone(),
@@ -254,6 +265,7 @@ impl Kakehashi {
 
                 let pool = Arc::clone(&pool);
                 let send = send.clone();
+                let merge_order = region_merge_order[region_index];
 
                 outer_join_set.spawn(async move {
                     let is_nonempty =
@@ -279,7 +291,7 @@ impl Kakehashi {
                         FanInResult::Done(items) => items,
                         FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
                     };
-                    (region_index, items)
+                    (merge_order, items)
                 });
             }
 
@@ -318,6 +330,9 @@ impl Kakehashi {
                 return Ok(None);
             };
             if expected_snapshot.is_some_and(|expected| ctx.incarnation != expected.incarnation) {
+                return Ok(None);
+            }
+            if !request_selects_servers(&ctx.priorities, &ctx.configs, ctx.max_fan_out) {
                 return Ok(None);
             }
             if let Some(attempted) = &bridge_attempted {
@@ -410,6 +425,38 @@ impl Kakehashi {
     }
 }
 
+fn request_selects_servers(
+    priorities: &[String],
+    configs: &[ResolvedServerConfig],
+    max_fan_out: Option<usize>,
+) -> bool {
+    !truncate_entries(expand_priorities(priorities, configs), max_fan_out).is_empty()
+}
+
+fn region_merge_order(ranges: &[std::ops::Range<usize>], nested_regions_first: bool) -> Vec<usize> {
+    let mut indices = (0..ranges.len()).collect::<Vec<_>>();
+    if nested_regions_first {
+        let depth = |index: usize| {
+            ranges
+                .iter()
+                .enumerate()
+                .filter(|(other_index, outer)| {
+                    *other_index != index
+                        && outer.start <= ranges[index].start
+                        && ranges[index].end <= outer.end
+                        && *outer != &ranges[index]
+                })
+                .count()
+        };
+        indices.sort_by_key(|&index| (std::cmp::Reverse(depth(index)), index));
+    }
+    let mut order = vec![0; ranges.len()];
+    for (rank, index) in indices.into_iter().enumerate() {
+        order[index] = rank;
+    }
+    order
+}
+
 #[cfg(feature = "e2e")]
 async fn wait_for_host_admission_release() {
     let Ok(dir) = std::env::var("KAKEHASHI_E2E_WHOLE_DOCUMENT_HOST_BARRIER_DIR") else {
@@ -483,6 +530,7 @@ where
 mod tests {
     use super::*;
     use crate::config::WorkspaceSettings;
+    use crate::config::settings::BridgeServerConfig;
     use crate::config::settings::{
         AggregationStrategy, LanguageSettings, LayerAggregationConfig, LayerSource, LayersConfig,
     };
@@ -503,6 +551,26 @@ mod tests {
     fn empty_whole_document_layer_items_are_absent() {
         assert_eq!(nonempty_whole_document_items::<i32>(vec![]), None);
         assert_eq!(nonempty_whole_document_items(vec![1]), Some(vec![1]));
+    }
+
+    #[test]
+    fn disabled_fan_out_selects_no_bridge_server() {
+        let configs = vec![ResolvedServerConfig {
+            server_name: "tokens".into(),
+            config: Arc::new(BridgeServerConfig::default()),
+        }];
+
+        assert!(!request_selects_servers(&[], &configs, None));
+        assert!(!request_selects_servers(
+            &[crate::config::settings::PRIORITIES_WILDCARD.into()],
+            &configs,
+            Some(0),
+        ));
+        assert!(request_selects_servers(
+            &[crate::config::settings::PRIORITIES_WILDCARD.into()],
+            &configs,
+            None,
+        ));
     }
 
     #[tokio::test]
@@ -598,5 +666,30 @@ mod ordered_region_tests {
         );
 
         assert_eq!(flattened, vec![token(3), token(7)]);
+    }
+
+    #[test]
+    fn nested_semantic_region_overlays_its_outer_region() {
+        let orders = region_merge_order(&[0..10, 2..5], true);
+        let token = |delta_start, length, token_type| SemanticToken {
+            delta_line: 0,
+            delta_start,
+            length,
+            token_type,
+            token_modifiers_bitset: 0,
+        };
+
+        let flattened = flatten_ordered_region_items_with(
+            vec![
+                (orders[0], Some(vec![token(0, 10, 1)])),
+                (orders[1], Some(vec![token(2, 3, 2)])),
+            ],
+            crate::lsp::bridge::merge_semantic_token_layers,
+        );
+
+        assert_eq!(
+            flattened,
+            vec![token(0, 2, 1), token(2, 3, 2), token(3, 5, 1)]
+        );
     }
 }

@@ -102,8 +102,11 @@ tokens are dropped.
 For full-document requests, kakehashi first establishes the current built-in
 Tree-sitter baseline, then fetches every selected host and virtual bridge layer.
 Higher-priority bridge spans replace overlapping lower-priority spans while
-uncovered built-in highlighting remains. Omitting `native` from the layer
-priorities removes that built-in coverage. Only the
+uncovered built-in highlighting remains. A nested virtual region overlays its
+containing virtual region; unrelated regions retain document order. Omitting
+`native` from the layer priorities removes that built-in coverage. A bridge
+target disabled by an empty server allowlist or zero fan-out does not break an
+otherwise unchanged native full/delta lineage. Only the
 `textDocument/semanticTokens/full/delta` request remains built-in-only.
 
 Highlight colors are driven by the token types/modifiers
