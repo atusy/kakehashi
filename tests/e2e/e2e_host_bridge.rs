@@ -1708,6 +1708,116 @@ priorities = ["virt", "native"]
 }
 
 #[test]
+fn e2e_semantic_tokens_full_delta_rejects_an_edit_before_commit() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir
+        .path()
+        .join("semantic_tokens_full_delta_stale.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/semanticTokens/full"]
+priorities = ["virt", "native"]
+"#,
+    )
+    .expect("write config");
+    let barrier_dir = tempfile::TempDir::new().expect("barrier dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env(
+            "KAKEHASHI_E2E_SEMANTIC_DELTA_COMMIT_BARRIER_DIR",
+            barrier_dir.path().to_string_lossy(),
+        )
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-semantic-full": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-changing"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_full_delta_stale.md";
+    open_inline_value_document(&mut client, uri, 1, "> ```lua\n> old!\n> ```\n");
+
+    let previous_result_id = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            response
+                .pointer("/result/resultId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    None
+                })
+        })
+        .expect("bridged full result should establish a wire baseline");
+    let delta_id = client.send_request_async(
+        "textDocument/semanticTokens/full/delta",
+        json!({
+            "textDocument": { "uri": uri },
+            "previousResultId": previous_result_id
+        }),
+    );
+    let captured = barrier_dir.path().join("captured");
+    assert!(
+        (0..60).any(|_| {
+            if captured.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "the delta response should reach its final lifecycle fence"
+    );
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "> ```lua\n> changed\n> ```\n" }]
+        }),
+    );
+    let ingress_barrier = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 2 }
+        }),
+    );
+    assert!(
+        ingress_barrier.get("error").is_none(),
+        "{ingress_barrier:?}"
+    );
+    std::fs::write(barrier_dir.path().join("release"), b"release")
+        .expect("release delta commit barrier");
+
+    let response = client.receive_response_for_id_public(delta_id);
+    assert_eq!(
+        response["result"],
+        Value::Null,
+        "a delta computed before didChange must not commit afterwards: {response:?}"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_semantic_tokens_range_drops_a_virtual_response_after_content_changes() {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir.path().join("semantic_tokens_range.toml");
