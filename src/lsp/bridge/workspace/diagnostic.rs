@@ -15,10 +15,10 @@ use tower_lsp_server::ls_types::{
 use crate::config::settings::WorkspaceSettings;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionState, LanguageServerPool, UpstreamId};
-use crate::lsp::bridge::protocol::{
-    JsonRpcRequest, VirtualDocumentUri, response_has_jsonrpc_error,
+use crate::lsp::bridge::pool::{
+    ConnectionHandle, ConnectionState, LanguageServerPool, UpstreamId, VirtualUriObserver,
 };
+use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
 
 const DIAGNOSTIC_METHOD: &str = "workspace/diagnostic";
 
@@ -35,17 +35,37 @@ fn has_static_workspace_diagnostics(handle: &ConnectionHandle) -> bool {
     }
 }
 
-fn sanitize_diagnostics(report: &mut WorkspaceFullDocumentDiagnosticReport) {
+fn sanitize_diagnostics(
+    report: &mut WorkspaceFullDocumentDiagnosticReport,
+    virtual_uris: &VirtualUriObserver,
+) {
     for diagnostic in &mut report.full_document_diagnostic_report.items {
         if let Some(related) = &mut diagnostic.related_information {
-            related.retain(|information| {
-                VirtualDocumentUri::region_id_of(information.location.uri.as_str()).is_none()
-            });
+            related.retain(|information| !virtual_uris.contains(information.location.uri.as_str()));
             if related.is_empty() {
                 diagnostic.related_information = None;
             }
         }
     }
+}
+
+fn sanitize_report(
+    mut report: WorkspaceDiagnosticReport,
+    virtual_uris: &VirtualUriObserver,
+) -> WorkspaceDiagnosticReport {
+    report.items.retain_mut(|item| match item {
+        WorkspaceDocumentDiagnosticReport::Full(report) => {
+            if virtual_uris.contains(report.uri.as_str()) {
+                return false;
+            }
+            sanitize_diagnostics(report, virtual_uris);
+            true
+        }
+        WorkspaceDocumentDiagnosticReport::Unchanged(report) => {
+            !virtual_uris.contains(report.uri.as_str())
+        }
+    });
+    report
 }
 
 fn aggregate_reports(
@@ -60,14 +80,7 @@ fn aggregate_reports(
                 // no full report the bridge can safely reconstruct.
                 continue;
             };
-            if VirtualDocumentUri::region_id_of(incoming.uri.as_str()).is_some() {
-                // Internal virtual URIs are not editor documents. Open-document
-                // diagnostics already flow through textDocument/diagnostic where
-                // the current region offset is available for host translation.
-                continue;
-            }
             incoming.full_document_diagnostic_report.result_id = None;
-            sanitize_diagnostics(&mut incoming);
             let key = incoming.uri.as_str().to_owned();
             match by_uri.entry(key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -178,6 +191,7 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
     ) -> io::Result<Option<WorkspaceDiagnosticReport>> {
         let key = handle.key();
+        let virtual_uris = self.observe_virtual_uris_for_connection(key, expected_generation);
         if let Some(id) = &upstream_id {
             self.register_upstream_request_for_handle(id.clone(), handle);
         }
@@ -257,6 +271,7 @@ impl LanguageServerPool {
             return Ok(None);
         }
         serde_json::from_value(result.clone())
+            .map(|report| sanitize_report(report, &virtual_uris))
             .map(Some)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
@@ -267,11 +282,13 @@ mod tests {
     use std::str::FromStr;
 
     use tower_lsp_server::ls_types::{
-        Diagnostic, FullDocumentDiagnosticReport, Position, Range,
-        UnchangedDocumentDiagnosticReport, Uri, WorkspaceUnchangedDocumentDiagnosticReport,
+        Diagnostic, DiagnosticRelatedInformation, FullDocumentDiagnosticReport, Location, Position,
+        Range, UnchangedDocumentDiagnosticReport, Uri, WorkspaceUnchangedDocumentDiagnosticReport,
     };
 
     use super::*;
+    use crate::lsp::bridge::ConnectionKey;
+    use crate::lsp::bridge::protocol::VirtualDocumentUri;
 
     fn full(uri: &str, version: Option<i64>, message: &str) -> WorkspaceDocumentDiagnosticReport {
         WorkspaceDocumentDiagnosticReport::Full(WorkspaceFullDocumentDiagnosticReport {
@@ -339,8 +356,8 @@ mod tests {
     }
 
     #[test]
-    fn aggregation_ignores_unusable_unchanged_and_internal_virtual_reports() {
-        let virtual_uri = "file:///workspace/kakehashi-virtual-uri-region-0.lua";
+    fn aggregation_ignores_unusable_unchanged_but_keeps_real_lookalike_uri() {
+        let lookalike_uri = "file:///workspace/kakehashi-virtual-uri-region-0.lua";
         let result = aggregate_reports([WorkspaceDiagnosticReport {
             items: vec![
                 WorkspaceDocumentDiagnosticReport::Unchanged(
@@ -352,13 +369,77 @@ mod tests {
                         },
                     },
                 ),
-                full(virtual_uri, Some(1), "virtual"),
+                full(lookalike_uri, Some(1), "real lookalike"),
             ],
         }]);
         let WorkspaceDiagnosticReportResult::Report(report) = result else {
             panic!("final report")
         };
-        assert!(report.items.is_empty());
+        assert_eq!(report.items.len(), 1);
+        let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
+            panic!("full report")
+        };
+        assert_eq!(report.uri.as_str(), lookalike_uri);
+    }
+
+    #[tokio::test]
+    async fn sanitization_drops_only_uris_issued_to_the_exact_producer() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("diagnostics");
+        let generation = pool.document_connection_generation(&key);
+        let host = url::Url::parse("file:///workspace/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &tower_lsp_server::ls_types::Uri::from_str(host.as_str()).unwrap(),
+            "lua",
+            "region-0",
+        );
+        pool.register_opened_document(&host, &virtual_uri, &key)
+            .await;
+        let observer = pool.observe_virtual_uris_for_connection(&key, generation);
+        let real_uri = "file:///workspace/kakehashi-virtual-uri-real.lua";
+        let mut real = full(real_uri, Some(1), "real");
+        let WorkspaceDocumentDiagnosticReport::Full(real_report) = &mut real else {
+            unreachable!()
+        };
+        real_report.full_document_diagnostic_report.items[0].related_information = Some(vec![
+            DiagnosticRelatedInformation {
+                location: Location::new(
+                    Uri::from_str(&virtual_uri.to_uri_string()).unwrap(),
+                    Range::default(),
+                ),
+                message: "internal".into(),
+            },
+            DiagnosticRelatedInformation {
+                location: Location::new(Uri::from_str(real_uri).unwrap(), Range::default()),
+                message: "real".into(),
+            },
+        ]);
+
+        let sanitized = sanitize_report(
+            WorkspaceDiagnosticReport {
+                items: vec![
+                    full(&virtual_uri.to_uri_string(), Some(1), "internal"),
+                    real,
+                ],
+            },
+            &observer,
+        );
+
+        assert_eq!(sanitized.items.len(), 1);
+        let WorkspaceDocumentDiagnosticReport::Full(report) = &sanitized.items[0] else {
+            panic!("full report")
+        };
+        assert_eq!(report.uri.as_str(), real_uri);
+        assert_eq!(
+            report.full_document_diagnostic_report.items[0]
+                .related_information
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|information| information.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["real"]
+        );
     }
 
     #[cfg(unix)]
