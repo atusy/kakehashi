@@ -176,14 +176,22 @@ struct SemanticDeltaComputation {
 
 fn commit_direct_wire_baseline(
     cache: &crate::lsp::cache::CacheCoordinator,
+    uri: &Url,
+    request_id: crate::lsp::cache::RequestId,
     direct_request: bool,
     outcome: &mut Result<Option<SemanticFullComputation>>,
 ) {
     if direct_request
         && let Ok(Some(computed)) = outcome
-        && let Some(pending) = computed.pending_wire.take()
+        && cache
+            .with_active_request(uri, request_id, || {
+                if let Some(pending) = computed.pending_wire.take() {
+                    pending.commit(cache);
+                }
+            })
+            .is_none()
     {
-        pending.commit(cache);
+        *outcome = Ok(None);
     }
 }
 
@@ -703,7 +711,7 @@ impl Kakehashi {
         // future can finish concurrently with a cancellation which wins here,
         // and caching a response the client never receives can evict its last
         // usable delta baseline.
-        commit_direct_wire_baseline(&self.cache, direct_request, &mut outcome);
+        commit_direct_wire_baseline(&self.cache, &uri, request_id, direct_request, &mut outcome);
         request_guard.finish();
         outcome
     }
@@ -2823,7 +2831,8 @@ mod tests {
             pending_native: None,
             pending_wire: Some(pending),
         }));
-        commit_direct_wire_baseline(&server.cache, false, &mut outcome);
+        let (request_id, _cancel) = server.cache.start_request(&uri);
+        commit_direct_wire_baseline(&server.cache, &uri, request_id, false, &mut outcome);
         assert!(
             server
                 .cache
@@ -2831,7 +2840,7 @@ mod tests {
                 .is_none(),
             "a nested full must leave the baseline for the outer delta fence"
         );
-        commit_direct_wire_baseline(&server.cache, true, &mut outcome);
+        commit_direct_wire_baseline(&server.cache, &uri, request_id, true, &mut outcome);
         assert!(
             server
                 .cache
