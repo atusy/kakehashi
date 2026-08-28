@@ -4,6 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{ColorInformation, DocumentColorParams};
 
 use super::super::Kakehashi;
+use super::super::bridge_context::parse_host_verbatim;
 
 impl Kakehashi {
     pub(crate) async fn document_color_impl(
@@ -22,6 +23,9 @@ impl Kakehashi {
             "textDocument/documentColor",
             raw_params,
             None,
+            false,
+            false,
+            std::future::ready(Ok(None)),
             |t| async move {
                 let colors = t
                     .pool
@@ -38,7 +42,12 @@ impl Kakehashi {
                     .await?;
                 Ok((!colors.is_empty()).then_some(colors))
             },
+            parse_host_verbatim::<Vec<ColorInformation>>,
             |won| Some(won.items),
+            |mut acc, next| {
+                acc.extend(next);
+                acc
+            },
         )
         .await
         .map(Option::unwrap_or_default)

@@ -18,7 +18,7 @@
 
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
-    NumberOrString, Range, SemanticTokens, SemanticTokensDeltaParams,
+    NumberOrString, Position, Range, SemanticTokens, SemanticTokensDeltaParams,
     SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
     SemanticTokensRangeResult, SemanticTokensResult,
 };
@@ -26,7 +26,7 @@ use url::Url;
 
 #[cfg(test)]
 use tower_lsp_server::ls_types::{
-    PartialResultParams, Position, TextDocumentIdentifier, WorkDoneProgressParams,
+    PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams,
 };
 
 use crate::analysis::{
@@ -261,6 +261,134 @@ impl Kakehashi {
     }
 
     pub(crate) async fn semantic_tokens_full_impl(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        const METHOD: &str = "textDocument/semanticTokens/full";
+        let lsp_uri = params.text_document.uri.clone();
+        let Ok(uri) = uri_to_url(&lsp_uri) else {
+            return Ok(None);
+        };
+        let generation = self.cache.semantic_token_generation();
+        let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+        let progress_token = params.work_done_progress_params.work_done_token.clone();
+        // Establish the serve-current native baseline first. Besides providing
+        // immediate syntax coverage, this preserves the existing park,
+        // supersession, and cancellation contract. Once it resolves, the shared
+        // snapshot is current, so whole-document bridge discovery is immediate
+        // and the barrier cannot keep a superseded native request alive.
+        let Some(native_result) = self.semantic_tokens_full_native_layer(params).await? else {
+            return Ok(None);
+        };
+        let native_data = match native_result {
+            SemanticTokensResult::Tokens(tokens) => tokens.data,
+            SemanticTokensResult::Partial(partial) => partial.data,
+        };
+        let native = std::future::ready(Ok(Some(native_data)));
+
+        let data = self
+            .whole_document_fan_out(
+                &lsp_uri,
+                METHOD,
+                raw_params,
+                progress_token,
+                true,
+                true,
+                native,
+                |task| async move {
+                    let region_end = task.region_end();
+                    task.pool
+                        .send_semantic_tokens_full_request(
+                            &task.server_name,
+                            &task.server_config,
+                            &task.uri,
+                            region_end,
+                            &task.injection_language,
+                            &task.region_id,
+                            task.offset,
+                            &task.virtual_content,
+                            task.upstream_id,
+                            task.client_progress_token,
+                            None,
+                        )
+                        .await
+                        .map(|tokens| tokens.map(|tokens| tokens.data))
+                },
+                |value| {
+                    serde_json::from_value::<SemanticTokensResult>(value)
+                        .ok()
+                        .map(|result| match result {
+                            SemanticTokensResult::Tokens(tokens) => tokens.data,
+                            SemanticTokensResult::Partial(partial) => partial.data,
+                        })
+                },
+                |won| {
+                    let legend = won.handle.semantic_tokens_legend()?;
+                    let mapper = crate::text::PositionMapper::new(&won.host_text);
+                    let document_end = mapper.byte_to_position(won.host_text.len())?;
+                    crate::lsp::bridge::transform_semantic_tokens_result_to_host(
+                        serde_json::to_value(SemanticTokens {
+                            result_id: None,
+                            data: won.items,
+                        })
+                        .ok()?,
+                        legend,
+                        &RegionOffset::new(0, 0),
+                        document_end,
+                        &won.host_text,
+                        Range::new(Position::new(0, 0), document_end),
+                    )
+                    .map(|tokens| tokens.data)
+                },
+                crate::lsp::bridge::merge_semantic_token_layers,
+            )
+            .await?;
+
+        let Some(data) = data else {
+            return Ok(None);
+        };
+        let Some(view) = self.documents.latest_snapshot(&uri) else {
+            return Ok(None);
+        };
+        let Some(snapshot) = view.slot.snapshot else {
+            return Ok(None);
+        };
+        let Some(language_name) = snapshot.language.clone() else {
+            return Ok(None);
+        };
+        let tokens = SemanticTokens {
+            result_id: Some(next_result_id()),
+            data,
+        };
+        let cache_key = self.cache.cache_key_for(&snapshot.text, generation);
+        let edit_lock = self.documents.edit_lock(&uri);
+        let _edit_guard = edit_lock.lock().await;
+        if !self.semantic_snapshot_is_current(
+            &uri,
+            snapshot.incarnation,
+            snapshot.parsed_version,
+            generation,
+            &edit_lock,
+        ) {
+            return Ok(None);
+        }
+        self.cache.store_tokens(
+            uri.clone(),
+            tokens.clone(),
+            language_name,
+            cache_key,
+            SemanticSnapshotIdentity {
+                parsed_version: snapshot.parsed_version,
+                incarnation: snapshot.incarnation,
+                generation,
+            },
+        );
+        self.cache
+            .record_served_semantic_version(&uri, snapshot.parsed_version);
+        Ok(Some(SemanticTokensResult::Tokens(tokens)))
+    }
+
+    async fn semantic_tokens_full_native_layer(
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {

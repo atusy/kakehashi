@@ -5,6 +5,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{CodeLens, CodeLensParams};
 
 use super::super::Kakehashi;
+use super::super::bridge_context::parse_host_verbatim;
 use crate::lsp::bridge::{envelope_host_code_lenses, extract_code_lens_envelope};
 use crate::lsp::current_upstream_id;
 
@@ -20,6 +21,9 @@ impl Kakehashi {
             "textDocument/codeLens",
             raw_params,
             work_done_token,
+            false,
+            false,
+            std::future::ready(Ok(None)),
             |t| async move {
                 t.pool
                     .send_code_lens_request(
@@ -35,6 +39,7 @@ impl Kakehashi {
                     )
                     .await
             },
+            parse_host_verbatim::<Vec<CodeLens>>,
             |mut won| {
                 let server_resolves = won.handle.has_capability("codeLens/resolve");
                 envelope_host_code_lenses(
@@ -47,6 +52,10 @@ impl Kakehashi {
                     server_resolves,
                 );
                 Some(won.items)
+            },
+            |mut acc, next| {
+                acc.extend(next);
+                acc
             },
         )
         .await

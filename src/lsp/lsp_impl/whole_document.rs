@@ -27,13 +27,14 @@ use crate::lsp::aggregation::server::{
 };
 use crate::lsp::bridge::{ClientProgressAggregator, ClientProgressDeregisterGuard, HostDocument};
 
-use super::bridge_context::{DocumentRequestContext, parse_host_verbatim};
+use super::bridge_context::DocumentRequestContext;
 use super::{Kakehashi, uri_to_url};
 
 pub(super) struct HostWholeDocumentResponse<T> {
     pub(super) items: Vec<T>,
     pub(super) server_name: String,
     pub(super) host_uri: url::Url,
+    pub(super) host_text: Arc<str>,
     pub(super) incarnation: Option<u64>,
     pub(super) connection_generation: u64,
     pub(super) handle: Arc<crate::lsp::bridge::ConnectionHandle>,
@@ -54,20 +55,29 @@ impl Kakehashi {
     /// `Some`, one shared aggregator relays the first region to begin as a single
     /// `Begin → … → End` on that token (ls-bridge-client-progress); `None` (the
     /// fast methods that don't advertise `workDoneProgress`) keeps prior behavior.
-    pub(super) async fn whole_document_fan_out<T, F, Fut, H>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn whole_document_fan_out<T, N, F, Fut, P, H, M>(
         &self,
         lsp_uri: &Uri,
         method_name: &'static str,
         raw_params: serde_json::Value,
         client_progress_token: Option<NumberOrString>,
+        require_all_layers: bool,
+        preserve_empty: bool,
+        native: N,
         send: F,
+        parse_host: P,
         on_host_winner: H,
+        merge_layers: M,
     ) -> Result<Option<Vec<T>>>
     where
-        T: Send + 'static + serde::de::DeserializeOwned,
+        T: Send + 'static,
+        N: Future<Output = Result<Option<Vec<T>>>>,
         F: Fn(FanOutTask) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = io::Result<Option<Vec<T>>>> + Send + 'static,
+        P: Fn(serde_json::Value) -> Option<Vec<T>> + Clone + Send + 'static,
         H: FnOnce(HostWholeDocumentResponse<T>) -> Option<Vec<T>> + Send,
+        M: Fn(Vec<T>, Vec<T>) -> Vec<T>,
     {
         let virt = async {
             // Convert ls_types::Uri to url::Url for internal use
@@ -290,6 +300,7 @@ impl Kakehashi {
                 pool.clone(),
                 move |t| {
                     let params = raw_params.clone();
+                    let parse_host = parse_host.clone();
                     async move {
                         let raw = t
                             .pool
@@ -310,13 +321,14 @@ impl Kakehashi {
                         let Some(raw) = raw else {
                             return Ok(None);
                         };
-                        let Some(items) = parse_host_verbatim::<Vec<T>>(raw.value) else {
+                        let Some(items) = parse_host(raw.value) else {
                             return Ok(None);
                         };
                         Ok(Some(HostWholeDocumentResponse {
                             items,
                             server_name: t.server_name,
                             host_uri: t.uri,
+                            host_text: t.text,
                             incarnation: Some(raw.incarnation),
                             connection_generation: raw.connection_generation,
                             handle: raw.handle,
@@ -331,20 +343,36 @@ impl Kakehashi {
                 .await
         };
 
-        let result = self
-            .walk_layers_by_strategy(
+        let result = if require_all_layers {
+            self.walk_layers_concatenated(
                 lsp_uri,
                 method_name,
                 method_name,
                 virt,
                 host,
-                std::future::ready(Ok(None)),
-                |items: &Vec<T>| !items.is_empty(),
-                concat_whole_document_items,
+                native,
+                merge_layers,
             )
-            .await?;
+            .await?
+        } else {
+            self.walk_layers_by_strategy(
+                lsp_uri,
+                method_name,
+                method_name,
+                virt,
+                host,
+                native,
+                |items: &Vec<T>| !items.is_empty(),
+                merge_layers,
+            )
+            .await?
+        };
 
-        Ok(result.and_then(nonempty_whole_document_items))
+        Ok(if preserve_empty {
+            result
+        } else {
+            result.and_then(nonempty_whole_document_items)
+        })
     }
 }
 
@@ -368,6 +396,7 @@ async fn wait_for_host_admission_release() {
     }
 }
 
+#[cfg(test)]
 fn concat_whole_document_items<T>(mut acc: Vec<T>, next: Vec<T>) -> Vec<T> {
     acc.extend(next);
     acc

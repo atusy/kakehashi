@@ -1583,6 +1583,43 @@ impl Kakehashi {
         }
     }
 
+    /// Cross-layer barrier merge using the configured priorities while
+    /// intentionally ignoring the configurable strategy. Whole-document
+    /// semantic tokens require every selected layer: a preferred virt result
+    /// contains only injection spans and cannot represent the host document.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn walk_layers_concatenated<R>(
+        &self,
+        lsp_uri: &Uri,
+        layer_method: &'static str,
+        request_method: &'static str,
+        virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        combine: impl Fn(R, R) -> R,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+        let Ok(uri) = uri_to_url(lsp_uri) else {
+            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
+            return Ok(None);
+        };
+        let Some(host_language) = self.document_language(&uri).or_else(|| {
+            self.documents
+                .get(&uri)
+                .and_then(|document| document.language_id().map(str::to_owned))
+        }) else {
+            return Ok(None);
+        };
+        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
+        self.run_layer_race(race_layers_concatenated(
+            &layer_cfg.priorities,
+            virt,
+            host,
+            native,
+            combine,
+        ))
+        .await
+    }
+
     /// Resolve injection context for a bridge endpoint request (all matching servers).
     ///
     /// Delegates to the shared preamble, then looks up ALL bridge server configs

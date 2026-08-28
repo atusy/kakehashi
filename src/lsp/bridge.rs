@@ -39,6 +39,9 @@ mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_logging;
 mod text_document;
+pub(crate) use text_document::{
+    merge_semantic_token_layers, transform_semantic_tokens_result_to_host,
+};
 mod window;
 mod workspace;
 

@@ -4,6 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{FoldingRange, FoldingRangeParams};
 
 use super::super::Kakehashi;
+use super::super::bridge_context::parse_host_verbatim;
 
 impl Kakehashi {
     pub(crate) async fn folding_range_impl(
@@ -18,6 +19,9 @@ impl Kakehashi {
             // foldingRange is fast; not advertised for client progress (#437), so
             // no token is carried.
             None,
+            false,
+            false,
+            std::future::ready(Ok(None)),
             |t| async move {
                 t.pool
                     .send_folding_range_request(
@@ -32,7 +36,12 @@ impl Kakehashi {
                     )
                     .await
             },
+            parse_host_verbatim::<Vec<FoldingRange>>,
             |won| Some(won.items),
+            |mut acc, next| {
+                acc.extend(next);
+                acc
+            },
         )
         .await
     }
