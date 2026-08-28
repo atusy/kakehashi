@@ -26,6 +26,11 @@ needed and combines every capable server's result in server-name order. Flat
 `SymbolInformation` responses are normalized to `WorkspaceSymbol`, so results
 from old and new servers have one response shape.
 
+If a `preferSharedInstance` process was initialized from a document's marker
+root and cannot follow workspace-folder changes, search uses the client-root
+fallback connection instead. Reusing that marker-rooted process would make the
+search scope depend on which document happened to start it first.
+
 Symbols from a resolve-capable server carry an opaque envelope containing the
 producer's server name, connection identity, connection generation, and
 original `data`. Resolve is sent only to that exact live producer. A missing,
@@ -33,8 +38,9 @@ replaced, or reconfigured producer returns the unresolved enveloped symbol
 instead of sending opaque process-owned data to another process.
 
 The bridge advertises downstream lazy-location support only when the upstream
-editor declared `workspace.symbol.resolveSupport`. Search returns one final
-aggregate; partial-result and work-done tokens are not copied across producers.
+editor's `workspace.symbol.resolveSupport.properties` contains
+`location.range`. Search returns one final aggregate; partial-result and
+work-done tokens are not copied across producers.
 
 ## Invariants
 
@@ -72,6 +78,8 @@ aggregate; partial-result and work-done tokens are not copied across producers.
 ### Negative
 
 - The first search can pay server startup and indexing latency.
+- A workspace-folder-incapable shared server can require a separate
+  client-root fallback process for document-free workspace requests.
 - Search currently returns no streamed partial results or work-done progress.
 
 ### Neutral
