@@ -71,6 +71,11 @@ regardless of the setting:
 | `preferred` | Uses the first non-empty response, in your configured `priorities` order. **Default for every feature except diagnostics and code actions.** |
 | `concatenated` | Merges the responses from all servers. **Default for diagnostics and code actions.** For full formatting it instead runs a sequential formatter pipeline over `priorities` (see [Formatting](#formatting)). |
 
+This table describes aggregation between servers for one bridge target. Across
+the `virt` / `host` / `native` layers, full semantic tokens are a deliberate
+exception: every selected layer is overlaid in priority order, regardless of
+the configured cross-layer `strategy`.
+
 `priorities` is an ordered **allowlist**: servers absent from the list do not
 run, and a `"*"` element stands for the unlisted rest (see the
 [configuration reference](README.md) for details, including the `layers`
@@ -97,7 +102,9 @@ tokens are dropped.
 For full-document requests, kakehashi first establishes the current built-in
 Tree-sitter baseline, then fetches every selected host and virtual bridge layer.
 Higher-priority bridge spans replace overlapping lower-priority spans while
-uncovered built-in highlighting remains. Full/delta requests remain built-in only.
+uncovered built-in highlighting remains. Omitting `native` from the layer
+priorities removes that built-in coverage. Only the
+`textDocument/semanticTokens/full/delta` request remains built-in-only.
 
 Highlight colors are driven by the token types/modifiers
 kakehashi exposes; capture names can be remapped via

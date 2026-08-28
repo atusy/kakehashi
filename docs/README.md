@@ -604,8 +604,8 @@ Each entry in the `bridge` map configures bridging for one injection language:
 The reserved `_self` key makes the host language its own bridge target: with
 it enabled, requests on the host document are forwarded to servers whose
 `languages` matches the **host** language (including a `"*"` server), with the real URI and no
-coordinate translation. All bridged request methods are wired except semantic
-tokens; by default the host layer is
+coordinate translation. Semantic-token `full` and `range` requests are wired too;
+`textDocument/semanticTokens/full/delta` remains native-only. By default the host layer is
 tried after
 `virt` (see `layers` above), so for `preferred` methods injections keep
 winning inside code fences while the host server answers everywhere else —
@@ -696,7 +696,7 @@ returning the response:
 | Field | Description |
 |-------|-------------|
 | `priorities` | Ordered allowlist of layers, highest priority first (same allowlist rule as the server-name `priorities` above, but over the closed set `virt`/`host`/`native` — no `"*"`). Layers omitted from the list do not participate; `[]` disables the method entirely. Default: `["virt", "host", "native"]`. Omitting `"virt"` turns off injection bridging for that method. |
-| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins) or `"concatenated"`. Consumed by `textDocument/formatting` (default `"concatenated"`: a sequential pipeline — injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit), by the diagnostics methods (default `"concatenated"`: the `virt` regions' diagnostics and the host servers' diagnostics for the real document merge into one report/publish; `"preferred"` returns the first non-empty layer instead), by `textDocument/codeAction` (default `"concatenated"`: the injection region's actions and the host servers' actions appear in one menu, with at most one `isPreferred` action kept), by list-shaped whole-document methods such as `textDocument/documentColor`, `textDocument/documentLink`, `textDocument/foldingRange`, and `textDocument/codeLens`, and by `textDocument/colorPresentation` when explicitly configured. Every other method combines with `"preferred"` regardless of this field. |
+| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins) or `"concatenated"`. Consumed by `textDocument/formatting` (default `"concatenated"`: a sequential pipeline — injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit), by the diagnostics methods (default `"concatenated"`: the `virt` regions' diagnostics and the host servers' diagnostics for the real document merge into one report/publish; `"preferred"` returns the first non-empty layer instead), by `textDocument/codeAction` (default `"concatenated"`: the injection region's actions and the host servers' actions appear in one menu, with at most one `isPreferred` action kept), by list-shaped whole-document methods such as `textDocument/documentColor`, `textDocument/documentLink`, `textDocument/foldingRange`, and `textDocument/codeLens`, and by `textDocument/colorPresentation` when explicitly configured. `textDocument/semanticTokens/full` always overlays every selected layer in `priorities` order, regardless of this field, so bridge classifications can replace overlaps while lower-layer uncovered spans remain. Every other method combines with `"preferred"` regardless of this field. |
 
 Details:
 
@@ -730,7 +730,10 @@ Details:
   rename from Tree-sitter bindings under `KAKEHASHI_EXPERIMENTAL=true` (for
   languages shipping a `bindings.scm`; runtime-range-adjusted (`#offset!` /
   `#trim!`) regions declined).
-  Semantic tokens stay native-only for now.
+  Full and range semantic tokens also consume the selected bridge layers.
+  Full requests always overlay all selected layers: omitting `native` removes
+  built-in Tree-sitter coverage, while including it preserves every uncovered
+  native span. Only `textDocument/semanticTokens/full/delta` stays native-only.
 
 > **Migration note**: the layer list was renamed `order` →
 > `priorities` (and, one change earlier, the method map moved under
