@@ -382,6 +382,16 @@ fn main() {
                         },
                         "textDocumentSync": 1
                     }),
+                    "semantic-tokens-full-host-invalid" => json!({
+                        "semanticTokensProvider": {
+                            "legend": {
+                                "tokenTypes": ["custom"],
+                                "tokenModifiers": []
+                            },
+                            "full": true
+                        },
+                        "textDocumentSync": 1
+                    }),
                     "semantic-tokens-range-virt" | "semantic-tokens-range-delayed" => json!({
                         "semanticTokensProvider": {
                             "legend": {
@@ -1850,6 +1860,8 @@ fn main() {
                     .map(|_| {
                         let (length, token_type) = if mode == "semantic-tokens-full-host" {
                             (8, 1)
+                        } else if mode == "semantic-tokens-full-host-invalid" {
+                            (8, 0)
                         } else {
                             (4, 1)
                         };
