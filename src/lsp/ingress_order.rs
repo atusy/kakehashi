@@ -361,6 +361,7 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/prepareRename"
         | "textDocument/codeAction"
         | "textDocument/inlayHint"
+        | "textDocument/documentColor"
         | "textDocument/colorPresentation"
         | "textDocument/prepareCallHierarchy"
         | "textDocument/prepareTypeHierarchy"
@@ -811,6 +812,7 @@ mod tests {
             "textDocument/prepareRename",
             "textDocument/codeAction",
             "textDocument/inlayHint",
+            "textDocument/documentColor",
             "textDocument/colorPresentation",
             "textDocument/diagnostic",
             "kakehashi/captures/full",
@@ -1113,6 +1115,35 @@ mod tests {
         assert!(writer.poll().is_ready());
         assert!(presentation.is_woken());
         assert!(presentation.poll().is_ready());
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["change", "reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_runs_document_color_only_after_preceding_change() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "textDocument/didChange",
+            release: Some(release_rx),
+        });
+
+        let writer_fut = gate.call(notification("textDocument/didChange", URI));
+        let color_fut = gate.call(notification("textDocument/documentColor", URI));
+        let mut writer = tokio_test::task::spawn(writer_fut);
+        let mut color = tokio_test::task::spawn(color_fut);
+
+        assert!(color.poll().is_pending());
+        assert!(writer.poll().is_pending());
+        assert!(color.poll().is_pending());
+
+        release_tx.send(()).expect("didChange is waiting");
+        assert!(writer.poll().is_ready());
+        assert!(color.is_woken());
+        assert!(color.poll().is_ready());
         assert_eq!(
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["change", "reader"]
