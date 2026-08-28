@@ -15,9 +15,9 @@ use tower_lsp_server::ls_types::{
     CodeActionOptions, CodeActionProviderCapability, ColorProviderCapability,
     DeclarationCapability, FoldingRangeProviderCapability, HoverProviderCapability,
     ImplementationProviderCapability, LinkedEditingRangeServerCapabilities, OneOf, RenameOptions,
-    SaveOptions, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensServerCapabilities,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
+    SaveOptions, SelectionRangeProviderCapability, SemanticTokensFullOptions, SemanticTokensLegend,
+    SemanticTokensServerCapabilities, ServerCapabilities, TextDocumentSyncCapability,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
 };
 
 use super::connection_action::BridgeError;
@@ -880,6 +880,14 @@ impl ConnectionHandle {
                     LinkedEditingRangeServerCapabilities::Simple(true)
                         | LinkedEditingRangeServerCapabilities::Options(_)
                         | LinkedEditingRangeServerCapabilities::RegistrationOptions(_)
+                )
+            ),
+            "textDocument/selectionRange" => matches!(
+                caps.selection_range_provider,
+                Some(
+                    SelectionRangeProviderCapability::Simple(true)
+                        | SelectionRangeProviderCapability::Options(_)
+                        | SelectionRangeProviderCapability::RegistrationOptions(_)
                 )
             ),
             "textDocument/codeAction" => matches!(

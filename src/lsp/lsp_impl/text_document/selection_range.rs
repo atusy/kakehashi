@@ -1,11 +1,57 @@
 //! Selection range method for Kakehashi.
 
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{SelectionRange, SelectionRangeParams};
+use tower_lsp_server::ls_types::{
+    PartialResultParams, Position, SelectionRange, SelectionRangeParams, TextDocumentIdentifier,
+    Uri, WorkDoneProgressParams,
+};
 
 use crate::analysis::handle_selection_range;
+use crate::lsp::aggregation::server::dispatch_preferred;
+use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
 
 use super::super::{Kakehashi, uri_to_url};
+
+const METHOD: &str = "textDocument/selectionRange";
+
+fn parse_single_host_selection_range(
+    value: serde_json::Value,
+    position: Position,
+    document_end: Position,
+) -> Option<SelectionRange> {
+    let mut ranges = parse_host_verbatim::<Vec<SelectionRange>>(value)?;
+    if ranges.len() != 1 {
+        return None;
+    }
+    let selection = ranges.pop().expect("length checked");
+    selection_chain_is_valid(&selection, position, document_end).then_some(selection)
+}
+
+fn selection_chain_is_valid(
+    selection: &SelectionRange,
+    position: Position,
+    document_end: Position,
+) -> bool {
+    let mut child = None;
+    let mut current = Some(selection);
+    while let Some(selection) = current {
+        let range = selection.range;
+        if range.start > range.end
+            || range.end > document_end
+            || child.is_some_and(|child: tower_lsp_server::ls_types::Range| {
+                range.start > child.start || range.end < child.end
+            })
+        {
+            return false;
+        }
+        if child.is_none() && !(range.start <= position && position <= range.end) {
+            return false;
+        }
+        child = Some(range);
+        current = selection.parent.as_deref();
+    }
+    true
+}
 
 /// The explicit-action bounded wait (parse-snapshot ADR §3): `selectionRange`
 /// is keyboard-triggered expand/shrink — a silent no-op on a consciously
@@ -100,6 +146,9 @@ impl Kakehashi {
         let expected_version = snapshot.parsed_version;
         let expected_incarnation = snapshot.incarnation;
         let expected_settings_generation = self.cache.semantic_token_generation();
+        let document_end = crate::text::PositionMapper::new(&snapshot.text)
+            .byte_to_position(snapshot.text.len())
+            .unwrap_or_default();
 
         // Run the synchronous injection-aware walk as one work-unit on the
         // compute pool against the snapshot's consistent (text, tree). The
@@ -111,6 +160,7 @@ impl Kakehashi {
         // a user-triggered, infrequent read, so per-request parsers beat
         // cross-request reuse here.
         let language = std::sync::Arc::clone(&self.language);
+        let native_positions = positions.clone();
         let result = self
             .compute_pool
             .run(None, move || {
@@ -119,7 +169,7 @@ impl Kakehashi {
                     &snapshot.text,
                     snapshot.tree.as_ref(),
                     snapshot.language.as_deref(),
-                    &positions,
+                    &native_positions,
                     &language,
                     &mut pool,
                 )
@@ -139,8 +189,105 @@ impl Kakehashi {
             return Err(crate::error::content_modified_error());
         }
 
-        // None = the work-unit panicked (logged by the pool); serve the
-        // no-result fallback rather than an error.
-        Ok(result)
+        let native_ranges = result.unwrap_or_default();
+        if native_ranges.len() != positions.len() {
+            return Ok(None);
+        }
+
+        // SelectionRange is position-aligned: choosing one winning layer for
+        // the whole array would misroute multi-cursor requests whose positions
+        // belong to different virtual regions. Resolve preferred layers once
+        // per position and preserve the editor's input order.
+        let mut selected = Vec::with_capacity(positions.len());
+        for (index, position) in positions.into_iter().enumerate() {
+            let raw_params = serde_json::to_value(SelectionRangeParams {
+                text_document: TextDocumentIdentifier {
+                    uri: lsp_uri.clone(),
+                },
+                positions: vec![position],
+                // One upstream progress token cannot be forwarded to multiple
+                // independent downstream requests without token collisions.
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .unwrap_or(serde_json::Value::Null);
+            let virt = self.selection_range_virt_layer(&lsp_uri, position);
+            let native = std::future::ready(Ok(native_ranges.get(index).cloned()));
+            let result = self
+                .walk_layers_with_native(
+                    &lsp_uri,
+                    METHOD,
+                    METHOD,
+                    raw_params,
+                    virt,
+                    native,
+                    |value| parse_single_host_selection_range(value, position, document_end),
+                    |_| true,
+                )
+                .await?;
+            let Some(result) = result else {
+                // The protocol requires one result for every input position;
+                // never surface a shorter, index-shifted response.
+                return Ok(None);
+            };
+            selected.push(result);
+        }
+
+        let still_current = self.documents.latest_snapshot(&uri).is_some_and(|view| {
+            view.content_version == expected_version
+                && view.slot.current_incarnation == expected_incarnation
+                && view.slot.snapshot.is_some_and(|snapshot| {
+                    snapshot.parsed_version == expected_version
+                        && snapshot.incarnation == expected_incarnation
+                })
+        });
+        if !still_current || self.cache.semantic_token_generation() != expected_settings_generation
+        {
+            return Err(crate::error::content_modified_error());
+        }
+
+        Ok(Some(selected))
+    }
+
+    async fn selection_range_virt_layer(
+        &self,
+        lsp_uri: &Uri,
+        position: Position,
+    ) -> Result<Option<SelectionRange>> {
+        let Some(ctx) = self
+            .resolve_bridge_contexts(lsp_uri, position, METHOD)
+            .await
+        else {
+            return Ok(None);
+        };
+        let (cancel_rx, _cancel_guard) =
+            self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
+        let pool = self.bridge.pool_arc();
+        let result = dispatch_preferred(
+            &ctx.document,
+            pool,
+            |task| async move {
+                task.pool
+                    .send_selection_range_request(
+                        &task.server_name,
+                        &task.server_config,
+                        &task.uri,
+                        position,
+                        task.region_end(),
+                        &task.injection_language,
+                        &task.region_id,
+                        task.offset,
+                        &task.virtual_content,
+                        task.upstream_id,
+                    )
+                    .await
+            },
+            |result| result.is_some(),
+            cancel_rx,
+        )
+        .await;
+        result
+            .handle(&self.notifier(), "selectionRange", None, Ok)
+            .await
     }
 }
