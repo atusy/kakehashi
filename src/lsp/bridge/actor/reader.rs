@@ -347,6 +347,7 @@ struct ProgressPurgeGuard {
     /// Cancel any forwarded requests still in flight when this connection's
     /// reader exits, so their editor dialogs don't linger (#404).
     inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
+    dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
 }
 
 impl Drop for ProgressPurgeGuard {
@@ -370,11 +371,17 @@ impl Drop for ProgressPurgeGuard {
                 connection_id: self.connection_id,
             });
         // Workspace pull diagnostics are not stored in the pushed-diagnostic
-        // cache above. Ask refresh-capable clients to pull again so reports from
-        // this now-dead producer cannot linger indefinitely.
-        let _ = self
-            .upstream_tx
-            .send(UpstreamNotification::DiagnosticProviderChanged);
+        // cache above. Refresh only when this connection is an actual producer;
+        // otherwise a crashing unrelated server could cause refresh/pull/respawn
+        // loops merely by exiting.
+        if self
+            .dynamic_capabilities
+            .has_workspace_diagnostic_provider()
+        {
+            let _ = self
+                .upstream_tx
+                .send(UpstreamNotification::DiagnosticProviderChanged);
+        }
     }
 }
 
@@ -746,6 +753,7 @@ async fn reader_loop_with_liveness(
         connection_id: server_request_deps.progress_connection_id,
         upstream_tx: server_request_deps.upstream_tx.clone(),
         inbound_request_registry: server_request_deps.inbound_request_registry.clone(),
+        dynamic_capabilities: Arc::clone(&server_request_deps.dynamic_capabilities),
     };
 
     // Consolidated liveness timer state (ls-bridge-async-connection)
@@ -1585,6 +1593,8 @@ mod tests {
         let downstream_token = NumberOrString::Number(1);
         let (upstream_token, _) =
             progress_registry.register(conn, downstream_token.clone(), response_tx.clone());
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        dynamic_capabilities.set_static_workspace_diagnostic_provider(true);
 
         let handle = spawn_reader_task_for_server(
             reader,
@@ -1595,7 +1605,7 @@ mod tests {
                 server_name: None,
                 connection_key: ConnectionKey::for_server("test"),
                 response_tx,
-                dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
+                dynamic_capabilities,
                 upstream_tx,
                 window_tx,
                 upstream_request_tx: mpsc::unbounded_channel().0,
@@ -1664,6 +1674,30 @@ mod tests {
         assert!(
             saw_provider_change,
             "reader exit must refresh workspace pull diagnostics"
+        );
+    }
+
+    #[test]
+    fn non_diagnostic_reader_exit_does_not_request_workspace_refresh() {
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let connection_id = progress_registry.new_connection_id();
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+
+        drop(ProgressPurgeGuard {
+            registry: progress_registry,
+            connection_id,
+            upstream_tx,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
+        });
+
+        assert!(matches!(
+            upstream_rx.try_recv(),
+            Ok(UpstreamNotification::EvictConnectionDiagnostics { .. })
+        ));
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "an unrelated server exit must not trigger a workspace diagnostic pull"
         );
     }
 
