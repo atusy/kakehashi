@@ -22,12 +22,21 @@ use crate::lsp::bridge::pool::{
     ConnectionHandle, ConnectionState, INIT_TIMEOUT_SECS, LanguageServerPool, UpstreamId,
     VirtualUriObserver,
 };
-use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
+use crate::lsp::bridge::protocol::{
+    JsonRpcNotification, JsonRpcRequest, RequestId, response_has_jsonrpc_error,
+};
 use crate::lsp::request_id::CancelForwarder;
 
 const DIAGNOSTIC_METHOD: &str = "workspace/diagnostic";
 const DIAGNOSTIC_REGISTRATION_METHOD: &str = "textDocument/diagnostic";
 const DYNAMIC_REGISTRATION_SETTLE: Duration = Duration::from_millis(100);
+
+fn workspace_diagnostic_cancel(request_id: RequestId) -> JsonRpcNotification<Value> {
+    JsonRpcNotification::new(
+        "$/cancelRequest",
+        serde_json::json!({ "id": request_id.as_i64() }),
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DiagnosticProvider {
@@ -754,6 +763,12 @@ impl LanguageServerPool {
             }
         }
         let response = handle.wait_for_response(request_id, response_rx).await;
+        if response
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
+        {
+            let _ = handle.send_notification(workspace_diagnostic_cancel(request_id));
+        }
         guard.disarm();
         if let Some(id) = &upstream_id {
             self.unregister_upstream_request(id, key);
@@ -816,8 +831,19 @@ mod tests {
         create_handle_advertising_workspace_diagnostics_with_state, create_handle_with_key,
         record_test_spawn_root, seed_test_client_root, transition_handle_to_ready,
     };
-    use crate::lsp::bridge::protocol::RequestId;
     use crate::lsp::bridge::protocol::VirtualDocumentUri;
+
+    #[test]
+    fn workspace_diagnostic_timeout_cancel_preserves_the_exact_request_id() {
+        assert_eq!(
+            serde_json::to_value(workspace_diagnostic_cancel(RequestId::new(37))).unwrap(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "$/cancelRequest",
+                "params": { "id": 37 }
+            })
+        );
+    }
 
     fn full(uri: &str, version: Option<i64>, message: &str) -> WorkspaceDocumentDiagnosticReport {
         WorkspaceDocumentDiagnosticReport::Full(WorkspaceFullDocumentDiagnosticReport {
