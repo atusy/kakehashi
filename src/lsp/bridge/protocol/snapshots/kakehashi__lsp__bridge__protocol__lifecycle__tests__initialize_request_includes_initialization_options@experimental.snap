@@ -106,6 +106,9 @@ expression: request
         "colorProvider": {
           "dynamicRegistration": false
         },
+        "selectionRange": {
+          "dynamicRegistration": false
+        },
         "callHierarchy": {
           "dynamicRegistration": false
         },
