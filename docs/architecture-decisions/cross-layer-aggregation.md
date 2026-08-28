@@ -276,7 +276,14 @@ independent — e.g., diagnostics can be `concatenated` across layers while
 - **Nested injections stay implicit.** When injections nest
   (markdown → python → sql), the virt layer resolves deepest-first,
   consistent with the semantic-token priority convention (deeper wins). Depth
-  order is not user-configurable.
+  order is not user-configurable. Whole-document semantic-token bridge results
+  derive that depth from strict host-span containment; unrelated regions retain
+  document order.
+- **Participation begins after server selection.** A discovered virtual or
+  host target whose server allowlist is empty (including `priorities: []` or
+  `maxFanOut: 0`) did not bridge the request. In particular, an unchanged native
+  semantic-full response retains its native `resultId` and delta lineage when
+  no bridge server was selected.
 
 ### Out of Scope
 
