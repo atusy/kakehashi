@@ -691,10 +691,10 @@ mod tests {
         envelope_symbol(
             &mut second,
             WorkspaceSymbolEnvelope {
-                origin: "opaque-server-data".into(),
-                connection_key: ConnectionKey::for_server("opaque-server-data"),
-                connection_generation: 1,
-                inner: Some(serde_json::json!({"symbol": 2})),
+                origin: "different-opaque-metadata".into(),
+                connection_key: ConnectionKey::for_server("different-opaque-metadata"),
+                connection_generation: 2,
+                inner: Some(serde_json::json!({"symbol": 1})),
             },
         );
 
