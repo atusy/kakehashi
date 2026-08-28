@@ -358,6 +358,15 @@ impl Kakehashi {
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
+        self.semantic_tokens_full_impl_with_tracking(params, None)
+            .await
+    }
+
+    async fn semantic_tokens_full_impl_with_tracking(
+        &self,
+        params: SemanticTokensParams,
+        tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
+    ) -> Result<Option<SemanticTokensResult>> {
         const METHOD: &str = "textDocument/semanticTokens/full";
         let lsp_uri = params.text_document.uri.clone();
         let Ok(uri) = uri_to_url(&lsp_uri) else {
@@ -375,7 +384,7 @@ impl Kakehashi {
         // incarnation/content version through fan-out and revalidates that
         // identity before returning.
         let Some(native_layer) = self
-            .semantic_tokens_full_native_layer(params, &mut cancel_rx)
+            .semantic_tokens_full_native_layer(params, &mut cancel_rx, tracking)
             .await?
         else {
             return Ok(None);
@@ -540,6 +549,7 @@ impl Kakehashi {
         &self,
         params: SemanticTokensParams,
         cancel_rx: &mut Option<crate::lsp::request_id::CancelReceiver>,
+        tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
     ) -> Result<Option<NativeSemanticLayer>> {
         let lsp_uri = params.text_document.uri;
 
@@ -553,7 +563,7 @@ impl Kakehashi {
         // `cancel_token` is flipped when a newer request supersedes this one (or
         // the document closes); it is threaded into the blocking compute so a
         // superseded request stops mid-flight instead of running to completion.
-        let (request_id, cancel_token) = self.cache.start_request(&uri);
+        let (request_id, cancel_token) = tracking.unwrap_or_else(|| self.cache.start_request(&uri));
         let request_guard = SemanticFullRequestGuard::new(
             std::sync::Arc::clone(&self.cache),
             uri.clone(),
@@ -1227,8 +1237,14 @@ impl Kakehashi {
             .semantic_delta_has_applicable_bridge(&lsp_uri, &uri, &snapshot, &language_name)
             .await
         {
-            self.cache.finish_request(&uri, request_id);
-            let full = self.semantic_tokens_full_impl(full_params);
+            // Keep this delta's tracker ownership through the nested full
+            // computation. Starting a fresh full request here would let an
+            // older delta supersede a newer request that arrived while bridge
+            // applicability was being resolved.
+            let full = self.semantic_tokens_full_impl_with_tracking(
+                full_params,
+                Some((request_id, cancel_token.clone())),
+            );
             let result = match cancel_rx.as_mut() {
                 Some(cancel_rx) => {
                     tokio::select! {
@@ -2317,6 +2333,26 @@ mod tests {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn nested_full_with_superseded_delta_tracking_preserves_the_newer_request() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let uri = Url::parse("file:///delta-reentry-superseded.rs").unwrap();
+        let (older_id, older_cancel) = service.inner().cache.start_request(&uri);
+        let (newer_id, _newer_cancel) = service.inner().cache.start_request(&uri);
+
+        let result = service
+            .inner()
+            .semantic_tokens_full_impl_with_tracking(
+                full_params(&uri),
+                Some((older_id, older_cancel)),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        assert!(service.inner().cache.is_request_active(&uri, newer_id));
     }
 
     fn range_params(uri: &Url, range: Range) -> SemanticTokensRangeParams {
