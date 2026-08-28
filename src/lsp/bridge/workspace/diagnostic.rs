@@ -353,10 +353,25 @@ impl LanguageServerPool {
                 "workspace diagnostic admission expired during final aggregation",
             ));
         }
+        let provenance_observers = admitted
+            .iter()
+            .map(|completed| Arc::clone(&completed.virtual_uris))
+            .collect::<Vec<_>>();
+        let _provenance_guards = provenance_observers
+            .iter()
+            .map(|observer| observer.provenance_read_guard())
+            .collect::<Vec<_>>();
         let reports = admitted
             .into_iter()
             .map(|completed| sanitize_report(completed.report, &completed.virtual_uris));
-        Ok(aggregate_reports(reports))
+        let result = aggregate_reports(reports);
+        if !admit() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "workspace diagnostic admission expired after final aggregation",
+            ));
+        }
+        Ok(result)
     }
 
     async fn workspace_diagnostic_producer_is_live(
@@ -964,6 +979,74 @@ mod tests {
             report.items.is_empty(),
             "final provenance must include virtual URIs issued after an early response"
         );
+    }
+
+    #[tokio::test]
+    async fn final_aggregation_rechecks_admission_after_building_result() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("diagnostics");
+        let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+        pool.connections()
+            .await
+            .insert(handle.key().clone(), Arc::clone(&handle));
+        let generation = pool.document_connection_generation(handle.key());
+        let virtual_uris =
+            Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
+        let checks = AtomicUsize::new(0);
+
+        let result = pool
+            .aggregate_admitted_workspace_diagnostic_reports(
+                [std::future::ready(Some(CompletedDiagnosticProducer {
+                    provider_plan: Vec::new(),
+                    handle,
+                    generation,
+                    report: WorkspaceDiagnosticReport {
+                        items: vec![full("file:///workspace/live.rs", None, "live")],
+                    },
+                    virtual_uris,
+                }))],
+                &|| checks.fetch_add(1, Ordering::SeqCst) < 2,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the post-build admission fence must reject"
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn provenance_read_guard_blocks_new_virtual_uri_issuance() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("diagnostics");
+        let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+        let generation = pool.document_connection_generation(handle.key());
+        let virtual_uris =
+            Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
+        let leaked_uri = "kakehashi-virt:///during-sanitize.lua";
+        let guard = virtual_uris.provenance_read_guard();
+        let observer = Arc::clone(&virtual_uris);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            observer.insert_provenance_for_test(leaked_uri.into());
+            finished_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "URI issuance must wait while sanitization owns the provenance read fence"
+        );
+        drop(guard);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("URI issuance should resume after response acceptance");
+        writer.join().unwrap();
+        assert!(virtual_uris.contains(leaked_uri));
     }
 
     #[tokio::test]
