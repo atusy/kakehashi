@@ -59,7 +59,7 @@ pub(crate) enum UpstreamNotification {
     /// A workspace-diagnostic provider became routable after initialization.
     /// Unlike a downstream refresh, this changes the producer plan itself, so
     /// the upstream delivery path must bypass prefetch absorption.
-    DiagnosticProviderRegistered,
+    DiagnosticProviderChanged,
     /// A downstream-initiated `textDocument/publishDiagnostics`
     /// (push-propagation-diagnostic-forwarding). The forwarding loop classifies
     /// `uri`: a virtual injection URI resolves to its host document + region (a
@@ -1045,6 +1045,7 @@ async fn handle_server_request(
     }
 
     let mut pending_registrations = None;
+    let mut pending_unregistrations = None;
     let body: jsonrpc::Result<serde_json::Value> = match method {
         "client/registerCapability" => client::register_capability::handle(&message, server_prefix)
             .map(|reply| {
@@ -1052,7 +1053,10 @@ async fn handle_server_request(
                 serde_json::Value::Null
             }),
         "client/unregisterCapability" => {
-            client::unregister_capability::handle(&message, server_prefix, deps)
+            client::unregister_capability::handle(&message, server_prefix).map(|reply| {
+                pending_unregistrations = Some(reply.unregisterations);
+                serde_json::Value::Null
+            })
         }
         "window/workDoneProgress/create" => {
             window::work_done_progress_create::handle(&message, server_prefix, deps)
@@ -1098,7 +1102,30 @@ async fn handle_server_request(
         if workspace_diagnostics_registered {
             let _ = deps
                 .upstream_tx
-                .send(UpstreamNotification::DiagnosticProviderRegistered);
+                .send(UpstreamNotification::DiagnosticProviderChanged);
+        }
+    }
+    if response_queued && let Some(unregistrations) = pending_unregistrations {
+        let workspace_diagnostics_unregistered = deps
+            .dynamic_capabilities
+            .registrations_for_method("textDocument/diagnostic")
+            .iter()
+            .any(|registration| {
+                unregistrations.iter().any(|unregistration| {
+                    unregistration.id == registration.id
+                        && unregistration.method == registration.method
+                }) && registration
+                    .register_options
+                    .as_ref()
+                    .and_then(|options| options.get("workspaceDiagnostics"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            });
+        deps.dynamic_capabilities.unregister(unregistrations);
+        if workspace_diagnostics_unregistered {
+            let _ = deps
+                .upstream_tx
+                .send(UpstreamNotification::DiagnosticProviderChanged);
         }
     }
     // A downstream server may wait for this response before answering the
@@ -2052,7 +2079,7 @@ mod tests {
             upstream_rx
                 .try_recv()
                 .expect("registration schedules a retry"),
-            UpstreamNotification::DiagnosticProviderRegistered
+            UpstreamNotification::DiagnosticProviderChanged
         );
     }
 
@@ -2094,11 +2121,9 @@ mod tests {
                 }]
             }
         });
-        let task = tokio::spawn(async move {
-            handle_message(request, &router, "", &deps).await;
-        });
-
-        tokio::task::yield_now().await;
+        let handling = handle_message(request, &router, "", &deps);
+        tokio::pin!(handling);
+        assert!(futures::poll!(handling.as_mut()).is_pending());
         assert!(
             !dynamic_capabilities.has_registration("textDocument/diagnostic"),
             "a waiter must not observe the capability before its ack can enter writer FIFO"
@@ -2108,29 +2133,36 @@ mod tests {
             "the retry event must not overtake the registration acknowledgement"
         );
         let _blocker = response_rx.recv().await.expect("prefilled blocker");
+        assert!(futures::poll!(handling.as_mut()).is_ready());
         let ack = response_rx.recv().await.expect("registration ack");
         assert!(matches!(ack, OutboundMessage::Untracked(value) if value["id"] == 1));
-        task.await.unwrap();
         assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
         assert_eq!(
             upstream_rx.try_recv().expect("registration retry event"),
-            UpstreamNotification::DiagnosticProviderRegistered
+            UpstreamNotification::DiagnosticProviderChanged
         );
     }
 
     #[tokio::test]
     async fn handle_message_unregister_capability_updates_registry() {
         let router = ResponseRouter::new();
-        let (response_tx, mut response_rx) = mpsc::channel(16);
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        response_tx
+            .send(OutboundMessage::Untracked(json!({ "blocker": true })))
+            .await
+            .unwrap();
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
-        let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
 
         // First register a capability
         dynamic_capabilities.register(vec![tower_lsp_server::ls_types::Registration {
             id: "diag-1".to_string(),
             method: "textDocument/diagnostic".to_string(),
-            register_options: None,
+            register_options: Some(json!({
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
         }]);
         assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
 
@@ -2165,13 +2197,18 @@ mod tests {
             }
         });
 
-        handle_message(message, &router, "", &deps).await;
+        let handling = handle_message(message, &router, "", &deps);
+        tokio::pin!(handling);
+        assert!(futures::poll!(handling.as_mut()).is_pending());
+        assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
+        assert!(upstream_rx.try_recv().is_err());
 
-        // Registry should no longer have the registration
+        let _blocker = response_rx.recv().await.expect("prefilled blocker");
+        assert!(futures::poll!(handling.as_mut()).is_ready());
         assert!(!dynamic_capabilities.has_registration("textDocument/diagnostic"));
 
         // A success response should have been sent
-        let response = response_rx.try_recv().expect("should have response");
+        let response = response_rx.recv().await.expect("should have response");
         match response {
             OutboundMessage::Untracked(val) => {
                 assert_eq!(val["id"], 2);
@@ -2179,6 +2216,10 @@ mod tests {
             }
             _ => panic!("Expected Untracked variant"),
         }
+        assert_eq!(
+            upstream_rx.try_recv().expect("provider removal retry"),
+            UpstreamNotification::DiagnosticProviderChanged
+        );
     }
 
     /// A downstream `window/workDoneProgress/create` is acknowledged to the
