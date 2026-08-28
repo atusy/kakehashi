@@ -687,7 +687,12 @@ impl Kakehashi {
                 document.text_arc(),
             )
         };
-        let language = self.document_language(uri).or(stored_language)?;
+        let language = stored_language
+            .as_deref()
+            .filter(|language| *language != "plaintext")
+            .map(str::to_owned)
+            .or_else(|| self.document_language(uri))
+            .or(stored_language)?;
         Some(
             self.language
                 .canonical_injection_language(&language, text.as_ref()),

@@ -1357,6 +1357,34 @@ print("hello")
         assert_eq!(context.configs.len(), 1);
     }
 
+    #[tokio::test]
+    async fn explicit_parserless_language_wins_over_path_detection() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: false,
+            ..Default::default()
+        });
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///test/explicit-host-language.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "host syntax\n".to_string(),
+            Some("hostonly".to_string()),
+            None,
+        );
+
+        assert_eq!(server.document_language(&uri).as_deref(), Some("rust"));
+        assert_eq!(
+            server.document_bridge_language(&uri).as_deref(),
+            Some("hostonly"),
+            "an explicit non-plaintext languageId is authoritative for host routing"
+        );
+    }
+
     /// The shared freshness helper never parses inline (parse-snapshot ADR
     /// §3: the reader on-demand parse was a resurrection vector). With no
     /// reparse scheduled for a cleared tree, it returns within its bounded
