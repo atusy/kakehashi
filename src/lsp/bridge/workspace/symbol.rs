@@ -124,6 +124,11 @@ fn normalize_response(
     };
     if !supports_tags {
         for symbol in &mut symbols {
+            symbol.legacy_deprecated |= symbol
+                .symbol
+                .tags
+                .as_ref()
+                .is_some_and(|tags| tags.contains(&SymbolTag::DEPRECATED));
             symbol.symbol.tags = None;
         }
     }
@@ -1038,6 +1043,27 @@ mod tests {
         assert_eq!(symbols[0].tags, None);
         let WorkspaceSymbolResponse::Flat(symbols) = restore_legacy_flat_response(symbols) else {
             panic!("legacy eager symbols should stay in the flat response shape");
+        };
+        assert_eq!(symbols[0].deprecated, Some(true));
+        assert_eq!(symbols[0].tags, None);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn modern_tag_deprecation_is_restored_for_clients_without_tag_support() {
+        let symbols = normalize_response(
+            WorkspaceSymbolResponse::Nested(vec![WorkspaceSymbol {
+                name: "old".into(),
+                kind: SymbolKind::FUNCTION,
+                tags: Some(vec![SymbolTag::DEPRECATED]),
+                container_name: None,
+                location: OneOf::Left(location()),
+                data: None,
+            }]),
+            false,
+        );
+        let WorkspaceSymbolResponse::Flat(symbols) = restore_legacy_flat_response(symbols) else {
+            panic!("eager modern symbols should restore to the flat response shape");
         };
         assert_eq!(symbols[0].deprecated, Some(true));
         assert_eq!(symbols[0].tags, None);
