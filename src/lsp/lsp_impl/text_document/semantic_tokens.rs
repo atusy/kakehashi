@@ -1275,7 +1275,11 @@ impl Kakehashi {
                 Some(cancel_rx) => {
                     tokio::select! {
                         biased;
-                        _ = cancel_rx => return Err(Error::request_cancelled()),
+                        _ = cancel_rx => {
+                            cancel_token.cancel();
+                            self.cache.finish_request(&uri, request_id);
+                            return Err(Error::request_cancelled());
+                        },
                         result = full => result,
                     }
                 }
