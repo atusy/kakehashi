@@ -612,7 +612,7 @@ fn e2e_semantic_tokens_full_merges_host_and_virtual_layers() {
         &config_path,
         r#"
 [languages.markdown.layers.aggregation."textDocument/semanticTokens/full"]
-priorities = ["virt", "host"]
+priorities = ["virt", "host", "native"]
 
 [languages.markdown.bridge._self]
 enabled = true
@@ -638,7 +638,7 @@ enabled = true
                     },
                     "mock-virt-semantic-full": {
                         "cmd": [mock_bin(), "semantic-tokens-full-virt"],
-                        "languages": ["lua"]
+                        "languages": ["lua", "python"]
                     }
                 }
             }
@@ -646,7 +646,12 @@ enabled = true
     );
     client.send_notification("initialized", json!({}));
     let uri = "file:///test_semantic_tokens_full.md";
-    open_inline_value_document(&mut client, uri, 1, "hostword\n\n> ```lua\n> code\n> ```\n");
+    open_inline_value_document(
+        &mut client,
+        uri,
+        1,
+        "hostword\n\n> ```lua\n> code\n> ```\n\n> ```python\n> next\n> ```\n",
+    );
 
     let data = (0..300)
         .find_map(|_| {
@@ -658,7 +663,7 @@ enabled = true
             response
                 .pointer("/result/data")
                 .and_then(Value::as_array)
-                .filter(|data| data.len() == 10)
+                .filter(|data| data.len() == 45)
                 .cloned()
                 .or_else(|| {
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -669,10 +674,277 @@ enabled = true
 
     assert_eq!(
         data,
-        json!([0, 0, 8, 1, 8, 3, 2, 4, 17, 8])
-            .as_array()
-            .unwrap()
-            .clone()
+        json!([
+            0, 0, 8, 1, 8, 2, 2, 3, 2, 0, 0, 3, 3, 17, 0, 1, 2, 4, 17, 8, 1, 2, 3, 2, 0, 2, 2, 3,
+            2, 0, 0, 3, 6, 17, 0, 1, 2, 4, 17, 8, 1, 2, 3, 2, 0
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_semantic_tokens_full_drops_a_virtual_response_after_content_changes() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("semantic_tokens_full_stale.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/semanticTokens/full"]
+priorities = ["virt"]
+"#,
+    )
+    .expect("write config");
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env("MOCK_LSP_CANCEL_DIR", event_dir.path().to_string_lossy())
+        .env(
+            "KAKEHASHI_E2E_INLINE_VALUE_CHANGE_DIR",
+            event_dir.path().to_string_lossy(),
+        )
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-semantic-full": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-delayed"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_full_stale.md";
+    open_inline_value_document(&mut client, uri, 1, "> ```lua\n> old!\n> ```\n");
+
+    let request_id = client.send_request_async(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let request_marker = event_dir
+        .path()
+        .join("semantic-tokens-full-delayed.request.json");
+    assert!(
+        (0..60).any(|_| {
+            if request_marker.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "the delayed full semantic token request should reach the virtual server"
+    );
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "> ```lua\n> new!\n> ```\n" }]
+        }),
+    );
+    let changed = event_dir.path().join("changed");
+    assert!(
+        (0..60).any(|_| {
+            if changed.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "Kakehashi should apply didChange before the delayed response is released"
+    );
+    std::fs::write(
+        event_dir
+            .path()
+            .join("semantic-tokens-full-delayed.release"),
+        b"release",
+    )
+    .expect("release delayed full semantic token response");
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response["result"],
+        Value::Null,
+        "full semantic tokens authored against the old content must be dropped: {response:?}"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_semantic_tokens_full_skips_non_contiguous_combined_injections() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("semantic_tokens_full_combined.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let query_path = config_dir.path().join("combined-injections.scm");
+    std::fs::write(
+        &query_path,
+        r#"
+        (fenced_code_block
+          (info_string (language) @injection.language)
+          (code_fence_content) @injection.content
+          (#set! injection.combined)
+          (#set! injection.include-children))
+        "#,
+    )
+    .expect("write combined injection query");
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env("MOCK_LSP_CANCEL_DIR", event_dir.path().to_string_lossy())
+        .build();
+    let init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-semantic-full": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-marker"],
+                        "languages": ["lua"]
+                    }
+                },
+                "languages": {
+                    "markdown": {
+                        "queries": [{
+                            "path": query_path.to_str().expect("UTF-8 query path"),
+                            "kind": "injections"
+                        }],
+                        "layers": { "aggregation": {
+                            "textDocument/semanticTokens/full": {
+                                "priorities": ["virt", "native"]
+                            }
+                        }}
+                    }
+                }
+            }
+        }),
+    );
+    assert!(init.get("error").is_none(), "{init:?}");
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_full_combined.md";
+    open_inline_value_document(
+        &mut client,
+        uri,
+        1,
+        "```lua\nfirst\n```\ntext gap\n```lua\nsecond\n```\n",
+    );
+
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(response.get("error").is_none(), "{response:?}");
+    assert!(
+        response.pointer("/result/data").is_some(),
+        "the native layer should remain as the safe fallback: {response:?}"
+    );
+    assert!(
+        !event_dir
+            .path()
+            .join("semantic-tokens-full-marker.request.json")
+            .exists(),
+        "a non-contiguous combined virtual document must not be dispatched"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_semantic_tokens_full_supersedes_a_request_waiting_on_the_bridge() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir
+        .path()
+        .join("semantic_tokens_full_supersede.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/semanticTokens/full"]
+priorities = ["virt"]
+"#,
+    )
+    .expect("write config");
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env("MOCK_LSP_CANCEL_DIR", event_dir.path().to_string_lossy())
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-semantic-full": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-delayed"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_full_supersede.md";
+    open_inline_value_document(&mut client, uri, 1, "> ```lua\n> code\n> ```\n");
+
+    let first_id = client.send_request_async(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let request_marker = event_dir
+        .path()
+        .join("semantic-tokens-full-delayed.request.json");
+    assert!(
+        (0..60).any(|_| {
+            if request_marker.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "the first request should wait inside the bridge"
+    );
+    let second_id = client.send_request_async(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    std::fs::write(
+        event_dir
+            .path()
+            .join("semantic-tokens-full-delayed.release"),
+        b"release",
+    )
+    .expect("release delayed full semantic token responses");
+
+    let first = client.receive_response_for_id_public(first_id);
+    assert_eq!(
+        first["result"],
+        Value::Null,
+        "the superseded bridge response must not commit: {first:?}"
+    );
+    let second = client.receive_response_for_id_public(second_id);
+    assert!(
+        second.pointer("/result/data").is_some(),
+        "the newer request should own the final response: {second:?}"
     );
     shutdown(&mut client);
 }
