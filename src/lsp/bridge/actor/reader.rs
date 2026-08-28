@@ -1078,6 +1078,33 @@ async fn handle_server_request(
         }
     };
 
+    let workspace_diagnostics_unregistered =
+        pending_unregistrations
+            .as_ref()
+            .is_some_and(|unregistrations| {
+                deps.dynamic_capabilities
+                    .registrations_for_method("textDocument/diagnostic")
+                    .iter()
+                    .any(|registration| {
+                        unregistrations.iter().any(|unregistration| {
+                            unregistration.id == registration.id
+                                && unregistration.method == registration.method
+                        }) && registration
+                            .register_options
+                            .as_ref()
+                            .and_then(|options| options.get("workspaceDiagnostics"))
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                    })
+            });
+    if let Some(unregistrations) = pending_unregistrations {
+        // Removal takes the registry write lease before its acknowledgement.
+        // Any request already holding a provider read lease therefore enters
+        // the writer FIFO first, while no new request can admit the removed
+        // provider after the acknowledgement.
+        deps.dynamic_capabilities.unregister(unregistrations);
+    }
+
     let response = match body {
         Ok(result) => jsonrpc::Response::from_ok(id, result),
         Err(error) => jsonrpc::Response::from_error(id, error),
@@ -1105,28 +1132,10 @@ async fn handle_server_request(
                 .send(UpstreamNotification::DiagnosticProviderChanged);
         }
     }
-    if response_queued && let Some(unregistrations) = pending_unregistrations {
-        let workspace_diagnostics_unregistered = deps
-            .dynamic_capabilities
-            .registrations_for_method("textDocument/diagnostic")
-            .iter()
-            .any(|registration| {
-                unregistrations.iter().any(|unregistration| {
-                    unregistration.id == registration.id
-                        && unregistration.method == registration.method
-                }) && registration
-                    .register_options
-                    .as_ref()
-                    .and_then(|options| options.get("workspaceDiagnostics"))
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-            });
-        deps.dynamic_capabilities.unregister(unregistrations);
-        if workspace_diagnostics_unregistered {
-            let _ = deps
-                .upstream_tx
-                .send(UpstreamNotification::DiagnosticProviderChanged);
-        }
+    if response_queued && workspace_diagnostics_unregistered {
+        let _ = deps
+            .upstream_tx
+            .send(UpstreamNotification::DiagnosticProviderChanged);
     }
     // A downstream server may wait for this response before answering the
     // diagnostic pull triggered by the refresh. Queue the acknowledgement
@@ -2200,12 +2209,11 @@ mod tests {
         let handling = handle_message(message, &router, "", &deps);
         tokio::pin!(handling);
         assert!(futures::poll!(handling.as_mut()).is_pending());
-        assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
+        assert!(!dynamic_capabilities.has_registration("textDocument/diagnostic"));
         assert!(upstream_rx.try_recv().is_err());
 
         let _blocker = response_rx.recv().await.expect("prefilled blocker");
         assert!(futures::poll!(handling.as_mut()).is_ready());
-        assert!(!dynamic_capabilities.has_registration("textDocument/diagnostic"));
 
         // A success response should have been sent
         let response = response_rx.recv().await.expect("should have response");
