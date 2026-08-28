@@ -1629,6 +1629,12 @@ priorities = ["virt", "native"]
         .expect("full resultId")
         .to_string();
     let initial_data = initial["data"].as_array().expect("full data").clone();
+    assert!(
+        initial_data
+            .chunks_exact(5)
+            .any(|token| token == json!([1, 2, 4, 17, 8]).as_array().unwrap()),
+        "the initial full result must contain the rebased virtual-server token: {initial:?}"
+    );
 
     client.send_notification(
         "textDocument/didChange",
@@ -1684,12 +1690,18 @@ priorities = ["virt", "native"]
         "textDocument/semanticTokens/full",
         json!({ "textDocument": { "uri": uri } }),
     );
+    let current_data = current_full["result"]["data"]
+        .as_array()
+        .expect("current full data")
+        .clone();
+    assert!(
+        current_data
+            .chunks_exact(5)
+            .any(|token| token == json!([1, 2, 7, 17, 8]).as_array().unwrap()),
+        "the changed full result must contain the updated rebased virtual-server token: {current_full:?}"
+    );
     assert_eq!(
-        reconstructed,
-        current_full["result"]["data"]
-            .as_array()
-            .expect("current full data")
-            .clone(),
+        reconstructed, current_data,
         "applying the delta must reproduce the same host/virt/native token set as full"
     );
     shutdown(&mut client);
