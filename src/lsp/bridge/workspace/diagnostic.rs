@@ -487,6 +487,41 @@ fn collect_complete_server_contributions<T>(
         .collect())
 }
 
+fn collect_complete_root_producers(
+    producers: impl IntoIterator<Item = io::Result<Option<CompletedDiagnosticProducer>>>,
+) -> io::Result<Vec<CompletedDiagnosticProducer>> {
+    let mut completed = Vec::new();
+    let mut incomplete = false;
+    let mut first_error = None;
+    let mut server_cancelled = None;
+    for producer in producers {
+        match producer {
+            Ok(Some(producer)) => completed.push(producer),
+            Ok(None) => incomplete = true,
+            Err(error)
+                if error.get_ref().is_some_and(|error| {
+                    error.is::<crate::error::WorkspaceDiagnosticServerCancelled>()
+                }) =>
+            {
+                if server_cancelled.is_none() {
+                    server_cancelled = Some(error);
+                }
+            }
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    if let Some(error) = server_cancelled.or(first_error) {
+        Err(error)
+    } else if incomplete {
+        Err(io::Error::other(
+            "workspace diagnostic producer set was incomplete",
+        ))
+    } else {
+        Ok(completed)
+    }
+}
+
 impl LanguageServerPool {
     fn mark_workspace_diagnostic_pulls_completed<'a>(
         &self,
@@ -1009,16 +1044,7 @@ impl LanguageServerPool {
                         }))
                     }
                 });
-                let mut completed = Vec::new();
-                for producer in join_all(producers).await {
-                    let Some(producer) = producer? else {
-                        return Err(io::Error::other(
-                            "workspace diagnostic producer set was incomplete",
-                        ));
-                    };
-                    completed.push(producer);
-                }
-                Ok(completed)
+                collect_complete_root_producers(join_all(producers).await)
             }
         });
 
@@ -1766,6 +1792,25 @@ mod tests {
         };
         assert_eq!(
             crate::error::map_workspace_diagnostic_error(server_error)
+                .code
+                .code(),
+            -32802
+        );
+
+        let typed =
+            crate::error::WorkspaceDiagnosticServerCancelled::from_response(&response(None))
+                .unwrap();
+        let root_error = collect_complete_root_producers([
+            Err(io::Error::other("ordinary root failure")),
+            Ok(None),
+            Err(io::Error::new(io::ErrorKind::Interrupted, typed)),
+        ]);
+        let root_error = match root_error {
+            Err(error) => error,
+            Ok(_) => panic!("later ServerCancelled must win root aggregation"),
+        };
+        assert_eq!(
+            crate::error::map_workspace_diagnostic_error(root_error)
                 .code
                 .code(),
             -32802
