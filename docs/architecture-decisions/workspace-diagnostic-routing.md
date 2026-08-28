@@ -26,6 +26,13 @@ configured, runnable server. Start cold connections when needed, admit startup
 only while the captured settings generation is current, and accept responses
 only from the same live connection generation.
 
+Use the same client-workspace scope proof as `workspace/symbol`: an incapable
+`preferSharedInstance` process seeded from a marker root is not a workspace
+producer, so the pull uses the client-root fallback. Capture workspace and
+settings generations together. Snapshot capture waits for a normal folder
+update already underway; a crossed or interrupted workspace generation rejects
+the entire aggregate rather than returning reports from mixed scopes.
+
 Send each producer an empty `previousResultIds` list, its own statically or
 dynamically declared provider identifier, and no progress tokens. If one server
 registers multiple workspace-diagnostic providers, query each provider with its
@@ -59,6 +66,8 @@ pass through unchanged, including unopened files.
   as editor workspace documents.
 - A stale settings snapshot cannot start a removed or reconfigured producer.
 - A response from a replaced producer generation is discarded.
+- Every report in one aggregate comes from the same stable client workspace;
+  a crossed generation invalidates the entire aggregate.
 
 ## Consequences
 
