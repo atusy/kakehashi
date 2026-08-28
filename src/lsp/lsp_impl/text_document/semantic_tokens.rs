@@ -971,13 +971,26 @@ impl Kakehashi {
         );
         if layers.priorities.contains(&LayerSource::Host)
             && let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD)
-            && super::super::whole_document::request_selects_servers(
+        {
+            let candidates = ctx
+                .configs
+                .iter()
+                .map(|config| config.server_name.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let incapable = self
+                .bridge
+                .pool_arc()
+                .servers_known_incapable(&candidates, METHOD)
+                .await;
+            if semantic_configs_select_servers(
                 &ctx.priorities,
                 &ctx.configs,
                 ctx.max_fan_out,
-            )
-        {
-            return true;
+                &incapable,
+                &std::collections::HashSet::new(),
+            ) {
+                return true;
+            }
         }
         if !layers.priorities.contains(&LayerSource::Virt) {
             return false;
@@ -1027,12 +1040,35 @@ impl Kakehashi {
                     &region.injection_language,
                     METHOD,
                 );
+                let suppressed = url::Url::parse(
+                    &crate::lsp::bridge::VirtualDocumentUri::new(
+                        lsp_uri,
+                        &region.injection_language,
+                        &region.region.region_id,
+                    )
+                    .to_uri_string(),
+                )
+                .ok()
+                .map(|routing_uri| {
+                    configs
+                        .iter()
+                        .filter(|config| {
+                            self.bridge
+                                .pool()
+                                .host_routing_by_server(&routing_uri, &config.server_name)
+                                == Some(false)
+                        })
+                        .map(|config| config.server_name.clone())
+                        .collect::<std::collections::HashSet<_>>()
+                })
+                .unwrap_or_default();
                 semantic_region_selects_servers(
                     region.contiguous,
                     &agg.priorities,
                     &configs,
                     agg.max_fan_out,
                     &incapable,
+                    &suppressed,
                 )
             })
         };
@@ -2042,13 +2078,26 @@ fn semantic_region_selects_servers(
     configs: &[crate::lsp::bridge::ResolvedServerConfig],
     max_fan_out: Option<usize>,
     incapable: &std::collections::HashSet<String>,
+    suppressed: &std::collections::HashSet<String>,
 ) -> bool {
     if !contiguous {
         return false;
     }
+    semantic_configs_select_servers(priorities, configs, max_fan_out, incapable, suppressed)
+}
+
+fn semantic_configs_select_servers(
+    priorities: &[String],
+    configs: &[crate::lsp::bridge::ResolvedServerConfig],
+    max_fan_out: Option<usize>,
+    incapable: &std::collections::HashSet<String>,
+    suppressed: &std::collections::HashSet<String>,
+) -> bool {
     let configs = configs
         .iter()
-        .filter(|config| !incapable.contains(&config.server_name))
+        .filter(|config| {
+            !incapable.contains(&config.server_name) && !suppressed.contains(&config.server_name)
+        })
         .cloned()
         .collect::<Vec<_>>();
     super::super::whole_document::request_selects_servers(priorities, &configs, max_fan_out)
@@ -2084,6 +2133,7 @@ mod tests {
             &configs,
             None,
             &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
         ));
         assert!(semantic_region_selects_servers(
             true,
@@ -2091,12 +2141,22 @@ mod tests {
             &configs,
             None,
             &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
         ));
         assert!(!semantic_region_selects_servers(
             true,
             &priorities,
             &configs,
             None,
+            &std::collections::HashSet::from(["tokens".into()]),
+            &std::collections::HashSet::new(),
+        ));
+        assert!(!semantic_region_selects_servers(
+            true,
+            &priorities,
+            &configs,
+            None,
+            &std::collections::HashSet::new(),
             &std::collections::HashSet::from(["tokens".into()]),
         ));
     }
