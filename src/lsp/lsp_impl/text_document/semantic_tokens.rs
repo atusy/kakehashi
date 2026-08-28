@@ -82,8 +82,7 @@ enum CurrentTokens {
 struct NativeSemanticLayer {
     tokens: SemanticTokens,
     snapshot: Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
-    request_id: u64,
-    cancel_token: crate::cancel::CancelToken,
+    request_guard: SemanticFullRequestGuard,
     generation: u64,
 }
 
@@ -91,16 +90,56 @@ impl NativeSemanticLayer {
     fn new(
         tokens: SemanticTokens,
         snapshot: Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
-        request_id: u64,
-        cancel_token: crate::cancel::CancelToken,
+        request_guard: SemanticFullRequestGuard,
         generation: u64,
     ) -> Self {
         Self {
             tokens,
             snapshot,
+            request_guard,
+            generation,
+        }
+    }
+}
+
+/// Owns a full request's tracker entry until the complete native + bridge
+/// pipeline finishes. Async cancellation drops the handler future, so explicit
+/// cleanup branches alone cannot reclaim an already-started blocking compute.
+struct SemanticFullRequestGuard {
+    cache: std::sync::Arc<crate::lsp::cache::CacheCoordinator>,
+    uri: Url,
+    request_id: u64,
+    cancel_token: crate::cancel::CancelToken,
+    armed: bool,
+}
+
+impl SemanticFullRequestGuard {
+    fn new(
+        cache: std::sync::Arc<crate::lsp::cache::CacheCoordinator>,
+        uri: Url,
+        request_id: u64,
+        cancel_token: crate::cancel::CancelToken,
+    ) -> Self {
+        Self {
+            cache,
+            uri,
             request_id,
             cancel_token,
-            generation,
+            armed: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.cache.finish_request(&self.uri, self.request_id);
+        self.armed = false;
+    }
+}
+
+impl Drop for SemanticFullRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancel_token.cancel();
+            self.cache.finish_request(&self.uri, self.request_id);
         }
     }
 }
@@ -338,8 +377,9 @@ impl Kakehashi {
         else {
             return Ok(None);
         };
-        let request_id = native_layer.request_id;
-        let cancel_token = native_layer.cancel_token.clone();
+        let mut request_guard = native_layer.request_guard;
+        let request_id = request_guard.request_id;
+        let cancel_token = request_guard.cancel_token.clone();
         let generation = native_layer.generation;
         let native_tokens = native_layer.tokens;
         let snapshot = native_layer.snapshot;
@@ -348,7 +388,7 @@ impl Kakehashi {
             .get(&uri)
             .map(|document| (document.incarnation(), document.content_version()))
         else {
-            self.cache.finish_request(&uri, request_id);
+            request_guard.finish();
             return Ok(None);
         };
         let native_result_id = native_tokens.result_id.clone();
@@ -484,7 +524,7 @@ impl Kakehashi {
                 }
             }
         };
-        self.cache.finish_request(&uri, request_id);
+        request_guard.finish();
         outcome
     }
 
@@ -506,6 +546,12 @@ impl Kakehashi {
         // the document closes); it is threaded into the blocking compute so a
         // superseded request stops mid-flight instead of running to completion.
         let (request_id, cancel_token) = self.cache.start_request(&uri);
+        let request_guard = SemanticFullRequestGuard::new(
+            std::sync::Arc::clone(&self.cache),
+            uri.clone(),
+            request_id,
+            cancel_token.clone(),
+        );
 
         // Snapshot the settings generation NOW, before reading any
         // settings-dependent tokenization input (language resolution, queries,
@@ -549,8 +595,7 @@ impl Kakehashi {
                         data: vec![],
                     },
                     None,
-                    request_id,
-                    cancel_token,
+                    request_guard,
                     token_generation,
                 )));
             }
@@ -601,8 +646,7 @@ impl Kakehashi {
                     data: vec![],
                 },
                 Some(snapshot),
-                request_id,
-                cancel_token,
+                request_guard,
                 token_generation,
             )));
         };
@@ -622,8 +666,7 @@ impl Kakehashi {
                     data: vec![],
                 },
                 Some(snapshot),
-                request_id,
-                cancel_token,
+                request_guard,
                 token_generation,
             )));
         }
@@ -645,8 +688,7 @@ impl Kakehashi {
                     data: vec![],
                 },
                 Some(snapshot),
-                request_id,
-                cancel_token,
+                request_guard,
                 token_generation,
             )));
         };
@@ -697,8 +739,7 @@ impl Kakehashi {
             return Ok(Some(NativeSemanticLayer::new(
                 cached,
                 Some(snapshot),
-                request_id,
-                cancel_token,
+                request_guard,
                 token_generation,
             )));
         }
@@ -746,8 +787,7 @@ impl Kakehashi {
                 return Ok(Some(NativeSemanticLayer::new(
                     cached,
                     Some(snapshot),
-                    request_id,
-                    cancel_token,
+                    request_guard,
                     token_generation,
                 )));
             }
@@ -902,8 +942,7 @@ impl Kakehashi {
         Ok(Some(NativeSemanticLayer::new(
             lsp_tokens,
             Some(snapshot),
-            request_id,
-            cancel_token,
+            request_guard,
             token_generation,
         )))
     }
@@ -2131,6 +2170,53 @@ mod tests {
             service.inner().cache.served_semantic_version(&uri),
             Some(1),
             "the response must be computed from the CURRENT snapshot"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_semantic_tokens_full_cancels_and_forgets_the_request() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///dropped_full_request.rs").expect("valid test uri");
+
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        // With no published snapshot the request parks after installing its
+        // tracker entry, giving the test a deterministic drop boundary.
+        let request = {
+            let service = std::sync::Arc::clone(&service);
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                service
+                    .inner()
+                    .semantic_tokens_full_impl(full_params(&uri))
+                    .await
+            })
+        };
+        sleep(Duration::from_millis(50)).await;
+        assert!(!request.is_finished(), "the request must be parked");
+        let (request_id, cancel_token) = service
+            .inner()
+            .cache
+            .active_request(&uri)
+            .expect("the parked request must be tracked");
+
+        request.abort();
+        let error = request
+            .await
+            .expect_err("aborting must drop the handler future");
+        assert!(error.is_cancelled());
+        assert!(
+            cancel_token.is_cancelled(),
+            "dropping the handler must stop detached blocking work"
+        );
+        assert!(
+            !service.inner().cache.is_request_active(&uri, request_id),
+            "dropping the handler must remove its exact tracker entry"
         );
     }
 

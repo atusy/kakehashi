@@ -382,6 +382,16 @@ fn main() {
                         },
                         "textDocumentSync": 1
                     }),
+                    "semantic-tokens-full-nested" => json!({
+                        "semanticTokensProvider": {
+                            "legend": {
+                                "tokenTypes": ["variable", "keyword"],
+                                "tokenModifiers": ["static"]
+                            },
+                            "full": true
+                        },
+                        "textDocumentSync": 1
+                    }),
                     "inlay-hint-resolve"
                     | "inlay-hint-resolve-replacement"
                     | "inlay-hint-delayed-resolve"
@@ -1725,8 +1735,22 @@ fn main() {
                 let result = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
-                    .filter(|uri| documents.contains_key(*uri))
-                    .map(|_| {
+                    .and_then(|uri| documents.get(uri))
+                    .map(|text| {
+                        if mode == "semantic-tokens-full-nested" {
+                            let marker = text.find("code").expect("nested fixture marker");
+                            let before = &text[..marker];
+                            let line = before.bytes().filter(|byte| *byte == b'\n').count();
+                            let column = before
+                                .rsplit_once('\n')
+                                .map_or(before.len(), |(_, tail)| tail.len());
+                            // The outer Rust virtual document contains the
+                            // function declaration; the nested identifier does not.
+                            // Both tokens project to the same host span.
+                            let token_type = usize::from(text.contains("fn "));
+                            let modifiers = u8::from(text.contains("fn "));
+                            return json!({ "data": [line, column, 4, token_type, modifiers] });
+                        }
                         let (length, token_type) = if mode == "semantic-tokens-full-host" {
                             (8, 1)
                         } else if mode == "semantic-tokens-full-host-invalid" {

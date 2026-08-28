@@ -686,6 +686,101 @@ enabled = true
 }
 
 #[test]
+fn e2e_semantic_tokens_full_nested_virtual_layer_overlays_outer_layer() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("semantic_tokens_full_nested.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let query_path = config_dir.path().join("nested-injections.scm");
+    std::fs::write(
+        &query_path,
+        r#"
+((function_item) @injection.content
+  (#set! injection.language "rust")
+  (#set! injection.include-children))
+
+((identifier) @injection.content
+  (#eq? @injection.content "code")
+  (#set! injection.language "lua")
+  (#set! injection.include-children))
+"#,
+    )
+    .expect("write nested injection query");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-nested-semantic-full": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-nested"],
+                        "languages": ["rust", "lua"]
+                    }
+                },
+                "languages": {
+                    "rust": {
+                        "queries": [{
+                            "path": query_path.to_str().expect("UTF-8 query path"),
+                            "kind": "injections"
+                        }],
+                        "layers": { "aggregation": {
+                            "textDocument/semanticTokens/full": {
+                                "priorities": ["virt"]
+                            }
+                        }}
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_full_nested.rs";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "rust",
+                "version": 1,
+                "text": "fn code() {}\n"
+            }
+        }),
+    );
+
+    let data = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            assert!(response.get("error").is_none(), "{response:?}");
+            response
+                .pointer("/result/data")
+                .and_then(Value::as_array)
+                .filter(|data| !data.is_empty())
+                .cloned()
+                .or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    None
+                })
+        })
+        .expect("nested virtual semantic tokens should become available");
+
+    assert_eq!(
+        data,
+        json!([0, 3, 4, 17, 0]).as_array().unwrap().clone(),
+        "the nested identifier token must replace the outer function token"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_semantic_tokens_full_tries_next_host_after_invalid_transformation() {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir
