@@ -447,18 +447,14 @@ impl Kakehashi {
         let progress_token = params.work_done_progress_params.work_done_token.clone();
         let upstream_id = current_upstream_id();
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
-        let host_only = self
-            .documents
-            .get(&uri)
-            .and_then(|document| document.language_id().map(str::to_owned))
-            .is_some_and(|language| {
-                let layers = self.resolve_layer_config(&language, METHOD);
-                !layers.priorities.is_empty()
-                    && layers
-                        .priorities
-                        .iter()
-                        .all(|source| *source == LayerSource::Host)
-            });
+        let host_only = self.document_language(&uri).is_some_and(|language| {
+            let layers = self.resolve_layer_config(&language, METHOD);
+            !layers.priorities.is_empty()
+                && layers
+                    .priorities
+                    .iter()
+                    .all(|source| *source == LayerSource::Host)
+        });
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
         // supersession, and cancellation contract. A current snapshot makes
@@ -1332,6 +1328,7 @@ impl Kakehashi {
                 }
                 None => full.await,
             };
+            self.cache.finish_request(&uri, request_id);
             return result.map(|result| {
                 result.map(|result| match result {
                     SemanticTokensResult::Tokens(tokens) => {
@@ -2430,7 +2427,7 @@ mod tests {
         );
         let mut languages = HashMap::new();
         languages.insert(
-            "unknown".to_string(),
+            "python".to_string(),
             LanguageSettings {
                 layers: Some(LayersConfig {
                     aggregation: Some(aggregation),
@@ -2443,12 +2440,16 @@ mod tests {
             auto_install: false,
             ..Default::default()
         });
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("python".to_string(), tree_sitter_python::LANGUAGE.into());
 
-        let uri = Url::parse("file:///semantic_host_only.unknown").expect("valid test URI");
+        let uri = Url::parse("file:///semantic_host_only.py").expect("valid test URI");
         server.documents.insert(
             uri.clone(),
             "unparsed".to_string(),
-            Some("unknown".to_string()),
+            Some("py".to_string()),
             None,
         );
 
