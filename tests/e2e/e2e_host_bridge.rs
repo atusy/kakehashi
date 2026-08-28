@@ -418,7 +418,7 @@ priorities = ["virt", "host"]
                 "uri": uri,
                 "languageId": "markdown",
                 "version": 1,
-                "text": "host\n\n> ```lua\n> code\n> ```\n"
+                "text": "host\n\n> ```lua\n> code\n> next\n> ```\n"
             }
         }),
     );
@@ -497,12 +497,35 @@ priorities = ["virt", "host"]
         })
     );
 
+    // Range endpoints are bounds, not routing positions: normalize an
+    // overlong intermediate-line column to that line's end and a past-EOF
+    // endpoint to the document end before intersecting the stopped region.
+    let defended_values = request(
+        &mut client,
+        json!({
+            "start": { "line": 3, "character": 999 },
+            "end": { "line": u32::MAX, "character": u32::MAX }
+        }),
+        stopped_location,
+    );
+    assert_eq!(
+        defended_values[0]["range"],
+        json!({
+            "start": { "line": 3, "character": 6 },
+            "end": { "line": 5, "character": 0 }
+        })
+    );
+
     shutdown(&mut client);
 }
 
 fn init_inline_value_virt_client(mode: &str, event_dir: &std::path::Path) -> LspClient {
     let mut client = LspClient::builder()
         .env("MOCK_LSP_CANCEL_DIR", event_dir.to_string_lossy())
+        .env(
+            "KAKEHASHI_E2E_INLINE_VALUE_CHANGE_DIR",
+            event_dir.to_string_lossy(),
+        )
         .build();
     let _init = client.send_request(
         "initialize",
@@ -584,11 +607,23 @@ fn e2e_inline_value_drops_a_response_after_content_changes() {
             "contentChanges": [{ "text": "> ```lua\n> new!\n> ```\n" }]
         }),
     );
-    let change_barrier = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({ "textDocument": { "uri": uri } }),
+    let changed = event_dir.path().join("changed");
+    assert!(
+        (0..60).any(|_| {
+            if changed.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "Kakehashi should apply didChange before the delayed response is released"
     );
-    assert!(change_barrier.get("error").is_none());
+    std::fs::write(
+        event_dir.path().join("inline-value-delayed.release"),
+        b"release",
+    )
+    .expect("release delayed virtual inlineValue response");
     let response = client.receive_response_for_id_public(request_id);
     assert_eq!(
         response["result"],
