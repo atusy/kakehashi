@@ -369,6 +369,12 @@ impl Drop for ProgressPurgeGuard {
             .send(UpstreamNotification::EvictConnectionDiagnostics {
                 connection_id: self.connection_id,
             });
+        // Workspace pull diagnostics are not stored in the pushed-diagnostic
+        // cache above. Ask refresh-capable clients to pull again so reports from
+        // this now-dead producer cannot linger indefinitely.
+        let _ = self
+            .upstream_tx
+            .send(UpstreamNotification::DiagnosticProviderChanged);
     }
 }
 
@@ -1625,25 +1631,39 @@ mod tests {
         // `Drop` runs `purge_connection` *then* the sends, so the purge above can be
         // observed before the eviction send lands — `recv().await` (not a single
         // `try_recv`) so we wait for it rather than racing the guard's Drop.
-        let saw_eviction = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while let Some(notification) = upstream_rx.recv().await {
-                if let UpstreamNotification::EvictConnectionDiagnostics { connection_id } =
-                    notification
-                {
-                    assert_eq!(
-                        connection_id, conn,
-                        "eviction must target the exited connection"
-                    );
-                    return true;
+        let (saw_eviction, saw_provider_change) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut saw_eviction = false;
+                let mut saw_provider_change = false;
+                while let Some(notification) = upstream_rx.recv().await {
+                    match notification {
+                        UpstreamNotification::EvictConnectionDiagnostics { connection_id } => {
+                            assert_eq!(
+                                connection_id, conn,
+                                "eviction must target the exited connection"
+                            );
+                            saw_eviction = true;
+                        }
+                        UpstreamNotification::DiagnosticProviderChanged => {
+                            saw_provider_change = true;
+                        }
+                        _ => {}
+                    }
+                    if saw_eviction && saw_provider_change {
+                        break;
+                    }
                 }
-            }
-            false // channel closed (all senders dropped) without an eviction
-        })
-        .await
-        .expect("EvictConnectionDiagnostics must arrive after reader exit");
+                (saw_eviction, saw_provider_change)
+            })
+            .await
+            .expect("diagnostic cleanup notifications must arrive after reader exit");
         assert!(
             saw_eviction,
             "reader exit must emit EvictConnectionDiagnostics for its connection"
+        );
+        assert!(
+            saw_provider_change,
+            "reader exit must refresh workspace pull diagnostics"
         );
     }
 
