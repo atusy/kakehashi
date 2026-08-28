@@ -77,6 +77,35 @@ enum CurrentTokens {
     Owned(SemanticTokens),
 }
 
+/// Cancels blocking semantic-token work when its async owner is abandoned.
+///
+/// Dropping a `ComputePool` future cannot stop a work unit that already entered
+/// Rayon. Layer races intentionally drop losing futures, so the native range
+/// arm must turn that drop into the cooperative signal polled by the token
+/// collector.
+struct SemanticComputeCancelGuard {
+    token: crate::cancel::CancelToken,
+    armed: bool,
+}
+
+impl SemanticComputeCancelGuard {
+    fn new(token: crate::cancel::CancelToken) -> Self {
+        Self { token, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SemanticComputeCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.token.cancel();
+        }
+    }
+}
+
 impl CurrentTokens {
     fn from_result(result: SemanticTokensResult) -> Self {
         match result {
@@ -1406,7 +1435,23 @@ impl Kakehashi {
         let supports_multiline = self.settings_manager.supports_multiline_tokens();
         let coordinator = std::sync::Arc::clone(&self.language);
 
-        let result = handle_semantic_tokens_full(
+        // Bind the work to both ownership of this layer future and the input
+        // version it was built from. A higher-priority bridge answer or an
+        // upstream cancellation drops this future and trips the guard; an edit
+        // or close trips the document's version token. In either case, forward
+        // cancellation into the token polled by the blocking collector so a
+        // losing/stale work unit cannot occupy the shared compute pool.
+        let Some(version_cancel) = self.documents.get(&uri).and_then(|document| {
+            (document.incarnation() == snapshot.incarnation
+                && document.content_version() == snapshot.parsed_version)
+                .then(|| document.version_cancel_token())
+        }) else {
+            return Err(crate::error::content_modified_error());
+        };
+        let compute_cancel = crate::cancel::CancelToken::default();
+        let mut compute_guard = SemanticComputeCancelGuard::new(compute_cancel.clone());
+
+        let compute = handle_semantic_tokens_full(
             &self.compute_pool,
             text,
             tree,
@@ -1416,9 +1461,16 @@ impl Kakehashi {
             coordinator,
             supports_multiline,
             None,
-            None,
-        )
-        .await;
+            Some(compute_cancel.clone()),
+        );
+        let result = tokio::select! {
+            result = compute => result,
+            _ = version_cancel.cancelled() => {
+                compute_cancel.cancel();
+                return Err(crate::error::content_modified_error());
+            }
+        };
+        compute_guard.disarm();
 
         // Shape immutable payloads before taking the edit lock. Only the final
         // live-snapshot validation and cache commits need to exclude edits.
@@ -1491,6 +1543,16 @@ mod tests {
     use tokio::time::{Duration, sleep, timeout};
     use tower_lsp_server::LspService;
     use url::Url;
+
+    #[test]
+    fn dropping_semantic_compute_owner_cancels_blocking_work() {
+        let token = crate::cancel::CancelToken::default();
+        {
+            let _guard = SemanticComputeCancelGuard::new(token.clone());
+            assert!(!token.is_cancelled());
+        }
+        assert!(token.is_cancelled());
+    }
 
     /// Publish a snapshot for `uri` built from `text` at `parsed_version`,
     /// tree-less (no parser needed): the handlers' snapshot-resolution and
