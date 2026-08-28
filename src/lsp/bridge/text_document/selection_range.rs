@@ -146,6 +146,7 @@ fn translate_and_validate_chain(
     region_end: Position,
 ) -> io::Result<()> {
     let mapper = crate::text::PositionMapper::new(virtual_content);
+    let document_end = mapper.byte_to_position(virtual_content.len());
     let mut virtual_position = host_position;
     translate_host_position_to_virtual(&mut virtual_position, offset);
     let mut child_range = None;
@@ -165,7 +166,10 @@ fn translate_and_validate_chain(
         }
         if child_range.is_none()
             && !((range.start == virtual_position && range.end == virtual_position)
-                || (range.start <= virtual_position && virtual_position < range.end))
+                || (range.start <= virtual_position
+                    && (virtual_position < range.end
+                        || (Some(virtual_position) == document_end
+                            && virtual_position == range.end))))
         {
             return Err(io::Error::other(
                 "textDocument/selectionRange does not contain the requested position",
@@ -326,6 +330,27 @@ mod tests {
                 Position::new(3, 4),
             )
             .expect("valid empty range")
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn response_allows_a_nonempty_range_ending_at_requested_virtual_eof() {
+        let ending_at_eof = json!({
+            "jsonrpc": "2.0", "id": 1, "result": [{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 4 } }
+            }]
+        });
+
+        assert!(
+            transform_selection_range_response_to_host(
+                ending_at_eof,
+                &RegionOffset::new(3, 0),
+                "code",
+                Position::new(3, 4),
+                Position::new(3, 4),
+            )
+            .expect("the requested EOF belongs to a range ending at EOF")
             .is_some()
         );
     }
