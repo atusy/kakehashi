@@ -189,12 +189,18 @@ fn prepare_symbol_for_aggregation(
     if let Some(mut envelope) = envelope {
         envelope.inner = normalized.symbol.data.take();
         envelope_symbol(&mut normalized.symbol, envelope);
+    } else if !normalized.legacy_flat && matches!(normalized.symbol.location, OneOf::Left(_)) {
+        // Resolve data is useful only for a lazy location. An eager modern
+        // symbol already has its complete location, and retaining opaque data
+        // would unnecessarily prevent restoration to SymbolInformation[] for
+        // tag-incapable clients.
+        normalized.symbol.data = None;
     }
     (normalized, identity)
 }
 
 fn needs_resolve_envelope(symbol: &NormalizedSymbol, resolves: bool) -> bool {
-    resolves && !symbol.legacy_flat
+    resolves && !symbol.legacy_flat && matches!(symbol.location, OneOf::Right(_))
 }
 
 fn deduplicate_symbols(
@@ -1064,17 +1070,18 @@ mod tests {
             }]),
             false,
         );
-        symbols.push(
-            WorkspaceSymbol {
-                name: "new".into(),
-                kind: SymbolKind::FUNCTION,
-                tags: None,
-                container_name: None,
-                location: OneOf::Left(location()),
-                data: None,
-            }
-            .into(),
-        );
+        let modern = NormalizedSymbol::from(WorkspaceSymbol {
+            name: "new".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Left(location()),
+            data: Some(serde_json::json!({ "resolve": "opaque" })),
+        });
+        assert!(!needs_resolve_envelope(&modern, true));
+        let (modern, _) = prepare_symbol_for_aggregation(modern, None);
+        assert_eq!(modern.data, None);
+        symbols.push(modern);
         assert!(can_restore_flat_response(&symbols, false));
         let WorkspaceSymbolResponse::Flat(symbols) = restore_legacy_flat_response(symbols) else {
             panic!("eager mixed responses should preserve the legacy response shape");
