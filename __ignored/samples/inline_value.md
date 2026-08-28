@@ -10,8 +10,8 @@ this block:
 > print(answer)
 > ```
 
-With the cursor in the block, replace `frameId = 1` below with a live DAP stack
-frame id and inspect the translated result in Neovim:
+Place the cursor on `local answer = 42`, replace `frameId = 1` below with a live
+DAP stack frame id, and inspect the translated result in Neovim:
 
 ```vim
 :lua local b=0; local l=vim.api.nvim_win_get_cursor(0)[1]-1; local p=vim.lsp.util.make_text_document_params(b); p.range={start={line=l,character=2},["end"]={line=l+1,character=15}}; p.context={frameId=1,stoppedLocation={start={line=l+1,character=2},["end"]={line=l+1,character=15}}}; vim.lsp.buf_request(b, 'textDocument/inlineValue', p, function(e,r) assert(not e, vim.inspect(e)); vim.print(r) end)
