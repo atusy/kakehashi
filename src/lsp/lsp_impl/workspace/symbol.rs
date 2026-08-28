@@ -5,13 +5,14 @@ use tower_lsp_server::ls_types::{
     SymbolTag, WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 
-use super::super::Kakehashi;
+use super::super::{Kakehashi, lock_settings_reload};
 
 impl Kakehashi {
     pub(crate) async fn workspace_symbol_impl(
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<WorkspaceSymbolResponse>> {
+        let _reload = lock_settings_reload().await;
         let settings_snapshot = self.settings_manager.load_settings_pair();
         let settings = std::sync::Arc::clone(&settings_snapshot.settings);
         let settings_generation = settings_snapshot.generation;
