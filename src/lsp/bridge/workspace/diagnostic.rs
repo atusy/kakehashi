@@ -1,6 +1,7 @@
 //! Workspace-diagnostic fan-out with deterministic full-report aggregation.
 
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
@@ -223,6 +224,7 @@ fn combine_producer_reports(
 }
 
 impl LanguageServerPool {
+    #[cfg(test)]
     async fn aggregate_admitted_workspace_diagnostic_reports<F>(
         &self,
         requests: impl IntoIterator<Item = F>,

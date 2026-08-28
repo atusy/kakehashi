@@ -1040,10 +1040,13 @@ async fn handle_server_request(
         _ => {}
     }
 
+    let mut pending_registrations = None;
     let body: jsonrpc::Result<serde_json::Value> = match method {
-        "client/registerCapability" => {
-            client::register_capability::handle(&message, server_prefix, deps)
-        }
+        "client/registerCapability" => client::register_capability::handle(&message, server_prefix)
+            .map(|reply| {
+                pending_registrations = Some(reply.registrations);
+                serde_json::Value::Null
+            }),
         "client/unregisterCapability" => {
             client::unregister_capability::handle(&message, server_prefix, deps)
         }
@@ -1071,7 +1074,29 @@ async fn handle_server_request(
         Ok(result) => jsonrpc::Response::from_ok(id, result),
         Err(error) => jsonrpc::Response::from_error(id, error),
     };
-    send_server_response(&deps.response_tx, response, server_prefix, method).await;
+    let response_queued =
+        send_server_response(&deps.response_tx, response, server_prefix, method).await;
+    if response_queued && let Some(registrations) = pending_registrations {
+        let workspace_diagnostics_registered = registrations.iter().any(|registration| {
+            registration.method == "textDocument/diagnostic"
+                && registration
+                    .register_options
+                    .as_ref()
+                    .and_then(|options| options.get("workspaceDiagnostics"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        });
+        deps.dynamic_capabilities.register(registrations);
+        // A first workspace pull can race the post-initialized registration.
+        // Publishing the registry only after its acknowledgement preserves
+        // writer FIFO, then this capability-gated upstream path schedules a
+        // fresh pull that plans against the committed provider set.
+        if workspace_diagnostics_registered {
+            let _ = deps
+                .upstream_tx
+                .send(UpstreamNotification::DiagnosticRefresh);
+        }
+    }
     // A downstream server may wait for this response before answering the
     // diagnostic pull triggered by the refresh. Queue the acknowledgement
     // first so prefetch can never deadlock behind its own server request.
@@ -1102,7 +1127,7 @@ pub(in crate::lsp::bridge) async fn send_server_response(
     response: jsonrpc::Response,
     server_prefix: &str,
     method: &str,
-) {
+) -> bool {
     // Response implements Serialize, so convert to Value for OutboundMessage.
     // Serialization cannot fail in practice, but the project bans panics in
     // production code; dropping the response is the only sane fallback here.
@@ -1114,7 +1139,7 @@ pub(in crate::lsp::bridge) async fn send_server_response(
                 "{}Failed to serialize response for server request '{}': {}",
                 server_prefix, method, e
             );
-            return;
+            return false;
         }
     };
 
@@ -1127,7 +1152,9 @@ pub(in crate::lsp::bridge) async fn send_server_response(
             "{}Failed to send response for server request '{}': {}",
             server_prefix, method, e
         );
+        return false;
     }
+    true
 }
 
 #[cfg(test)]
@@ -1970,7 +1997,7 @@ mod tests {
         let router = ResponseRouter::new();
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
-        let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
@@ -1997,7 +2024,7 @@ mod tests {
                     {
                         "id": "diag-1",
                         "method": "textDocument/diagnostic",
-                        "registerOptions": null
+                        "registerOptions": { "workspaceDiagnostics": true }
                     }
                 ]
             }
@@ -2017,6 +2044,12 @@ mod tests {
             }
             _ => panic!("Expected Untracked variant"),
         }
+        assert_eq!(
+            upstream_rx
+                .try_recv()
+                .expect("registration schedules a retry"),
+            UpstreamNotification::DiagnosticRefresh
+        );
     }
 
     #[tokio::test]
