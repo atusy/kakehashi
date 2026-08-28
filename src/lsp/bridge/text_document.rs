@@ -56,6 +56,7 @@ mod range_formatting;
 mod references;
 mod rename;
 mod save;
+mod selection_range;
 mod semantic_tokens;
 pub(crate) use semantic_tokens::{
     merge_semantic_token_layers, transform_semantic_tokens_result_to_host_strict,

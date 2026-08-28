@@ -16,9 +16,9 @@ fn build_baseline_capabilities(advertise_configuration: bool) -> ClientCapabilit
         DiagnosticWorkspaceClientCapabilities, DocumentLinkClientCapabilities,
         DocumentSymbolClientCapabilities, DynamicRegistrationClientCapabilities,
         GeneralClientCapabilities, GotoCapability, HoverClientCapabilities,
-        InlayHintClientCapabilities, PositionEncodingKind, SemanticTokensClientCapabilities,
-        SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions,
-        SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
+        InlayHintClientCapabilities, PositionEncodingKind, SelectionRangeClientCapabilities,
+        SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
+        SemanticTokensFullOptions, SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
         TextDocumentSyncClientCapabilities, TokenFormat, WorkspaceClientCapabilities,
     };
 
@@ -79,6 +79,9 @@ fn build_baseline_capabilities(advertise_configuration: bool) -> ClientCapabilit
             ..Default::default()
         }),
         inline_value: Some(DynamicRegistrationClientCapabilities {
+            dynamic_registration: Some(false),
+        }),
+        selection_range: Some(SelectionRangeClientCapabilities {
             dynamic_registration: Some(false),
         }),
         semantic_tokens: Some(SemanticTokensClientCapabilities {
@@ -670,6 +673,16 @@ mod tests {
         assert_eq!(capability.multiline_token_support, Some(false));
         assert_eq!(capability.server_cancel_support, None);
         assert_eq!(capability.augments_syntax_tokens, None);
+    }
+
+    #[test]
+    fn baseline_advertises_selection_range_without_dynamic_registration() {
+        let capability = build_baseline_capabilities(true)
+            .text_document
+            .and_then(|text_document| text_document.selection_range)
+            .expect("selection range client capability");
+
+        assert_eq!(capability.dynamic_registration, Some(false));
     }
 
     #[test]
