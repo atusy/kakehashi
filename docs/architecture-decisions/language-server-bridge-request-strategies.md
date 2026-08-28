@@ -13,8 +13,7 @@ codeAction, formatting, documentHighlight, diagnostics). Semantic-token range
 requests now support the ordinary preferred host/virt/native layer walk when
 the requested range is wholly owned by one injection. Full requests establish
 a current native baseline, then synchronously overlay all selected host and
-virtual layers in priority order. Full/delta can re-enter that full overlay when
-a bridge becomes applicable, but merged responses do not establish a delta lineage.
+virtual layers in priority order. Full/delta bridging remains unimplemented.
 
 ## Context
 
@@ -339,7 +338,7 @@ When multiple servers are configured for a language:
 
 | Method | Merging Strategy (as implemented; rows marked *aspirational* never shipped) |
 |--------|------------------|
-| Semantic Tokens | Range: `preferred` for injection-contained requests, with legend remapping and native fallback. Full: synchronous native/host/virtual overlay. Full/delta re-enters the full overlay when a bridge becomes applicable, without a merged delta lineage |
+| Semantic Tokens | Range: `preferred` for injection-contained requests, with legend remapping and native fallback. Full: synchronous native/host/virtual overlay. Full/delta bridging remains aspirational |
 | Go-to-Definition | `preferred`: first non-empty result (query in `priorities` order) |
 | Find References | `preferred` by default (first non-empty); *concatenate + dedupe is aspirational* |
 | Completion | `preferred` by default (first non-empty); *list merging is aspirational* |
@@ -405,7 +404,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | diagnostics | ✅ Implemented | Push + pull with host translation |
 | semanticTokens/range | ✅ Implemented | Injection-contained requests use preferred virt/host/native layers; downstream legends and coordinates are translated, invalid tokens drop |
 | semanticTokens/full | ✅ Implemented | Current native baseline plus synchronous host/virt overlay; higher-priority spans replace overlaps and uncovered native spans remain |
-| semanticTokens/full/delta | ⚠️ Full fallback only | A native delta lineage re-enters full aggregation when a bridge becomes applicable. The merged full response omits `resultId`, so it cannot become a delta baseline; native-only full results retain their existing lineage |
+| semanticTokens/full/delta | ✅ Implemented | Recomputes the same full host/virt/native overlay and diffs it against a separate merged-wire baseline; native compute-cache entries never contain downstream tokens |
 
 ### Original Implementation Priority
 
