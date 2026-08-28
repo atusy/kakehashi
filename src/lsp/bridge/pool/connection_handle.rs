@@ -15,9 +15,9 @@ use tower_lsp_server::ls_types::{
     CodeActionOptions, CodeActionProviderCapability, ColorProviderCapability,
     DeclarationCapability, FoldingRangeProviderCapability, HoverProviderCapability,
     ImplementationProviderCapability, LinkedEditingRangeServerCapabilities, OneOf, RenameOptions,
-    SaveOptions, SemanticTokensLegend, SemanticTokensServerCapabilities, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
-    TypeDefinitionProviderCapability,
+    SaveOptions, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensServerCapabilities,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
 };
 
 use super::connection_action::BridgeError;
@@ -843,6 +843,17 @@ impl ConnectionHandle {
             ),
             "textDocument/semanticTokens/range" => {
                 semantic_tokens_options(caps).is_some_and(|options| options.range == Some(true))
+            }
+            "textDocument/semanticTokens/full" => {
+                semantic_tokens_options(caps).is_some_and(|options| {
+                    matches!(
+                        options.full,
+                        Some(
+                            SemanticTokensFullOptions::Bool(true)
+                                | SemanticTokensFullOptions::Delta { .. }
+                        )
+                    )
+                })
             }
             "textDocument/prepareCallHierarchy" => matches!(
                 caps.call_hierarchy_provider,
@@ -2487,6 +2498,20 @@ mod tests {
                 }),
             ),
             (
+                "textDocument/semanticTokens/full",
+                Box::new(|c| {
+                    c.semantic_tokens_provider =
+                        Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+                            SemanticTokensOptions {
+                                legend: SemanticTokensLegend::default(),
+                                range: None,
+                                full: Some(SemanticTokensFullOptions::Bool(true)),
+                                work_done_progress_options: Default::default(),
+                            },
+                        ));
+                }),
+            ),
+            (
                 "textDocument/prepareCallHierarchy",
                 Box::new(|c| {
                     c.call_hierarchy_provider = Some(CallHierarchyServerCapability::Simple(true));
@@ -2729,6 +2754,20 @@ mod tests {
                                 legend: SemanticTokensLegend::default(),
                                 range: Some(false),
                                 full: None,
+                                work_done_progress_options: Default::default(),
+                            },
+                        ));
+                }),
+            ),
+            (
+                "textDocument/semanticTokens/full",
+                Box::new(|c| {
+                    c.semantic_tokens_provider =
+                        Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+                            SemanticTokensOptions {
+                                legend: SemanticTokensLegend::default(),
+                                range: None,
+                                full: Some(SemanticTokensFullOptions::Bool(false)),
                                 work_done_progress_options: Default::default(),
                             },
                         ));
