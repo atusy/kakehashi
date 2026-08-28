@@ -262,61 +262,59 @@ impl Kakehashi {
             return Err(crate::error::content_modified_error());
         };
 
-        // Run the synchronous injection-aware walk as one work-unit on the
-        // compute pool against the snapshot's consistent (text, tree). The
-        // walk uses a TRANSIENT parser pool: holding the shared parser-pool
-        // mutex across the whole injection walk would block any concurrent
-        // parse work-unit's brief acquire/release on it — pinning a second
-        // compute thread for the walk's duration. Parser construction is
-        // cheap (the grammars are already registered), and selectionRange is
-        // a user-triggered, infrequent read, so per-request parsers beat
-        // cross-request reuse here.
+        let native_enabled = layer_config.allows(LayerSource::Native);
+        let (native_tx, native_rx) = tokio::sync::watch::channel(None);
         let language = std::sync::Arc::clone(&self.language);
         let native_positions = positions.clone();
+        let native_position_count = native_positions.len();
         let native_snapshot = std::sync::Arc::clone(&snapshot);
         let compute_cancel = cancel_token.clone();
-        let worker_cancel = compute_cancel.clone();
-        let mut compute_guard = SelectionComputeCancelGuard::new(compute_cancel.clone());
-        let compute = self
-            .compute_pool
-            .run(Some(compute_cancel.clone()), move || {
-                let mut pool = language.create_document_parser_pool();
-                handle_selection_range(
-                    &native_snapshot.text,
-                    native_snapshot.tree.as_ref(),
-                    native_snapshot.language.as_deref(),
-                    &native_positions,
-                    &language,
-                    &mut pool,
-                    &worker_cancel,
-                )
+        // Produce the native result concurrently with the bridge walk. When
+        // native is disabled this future stays inert; when a higher-priority
+        // bridge wins first, dropping it cancels any in-flight blocking work.
+        let native_producer = async {
+            if !native_enabled {
+                std::future::pending::<()>().await;
+            }
+            let worker_cancel = compute_cancel.clone();
+            let mut compute_guard = SelectionComputeCancelGuard::new(compute_cancel.clone());
+            let result = self
+                .compute_pool
+                .run(Some(compute_cancel.clone()), move || {
+                    let mut pool = language.create_document_parser_pool();
+                    handle_selection_range(
+                        &native_snapshot.text,
+                        native_snapshot.tree.as_ref(),
+                        native_snapshot.language.as_deref(),
+                        &native_positions,
+                        &language,
+                        &mut pool,
+                        &worker_cancel,
+                    )
+                })
+                .await;
+            compute_guard.disarm();
+
+            let still_current = self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                view.content_version == expected_version
+                    && view.slot.current_incarnation == expected_incarnation
+                    && view.slot.snapshot.is_some_and(|snapshot| {
+                        snapshot.parsed_version == expected_version
+                            && snapshot.incarnation == expected_incarnation
+                    })
             });
-        let result = tokio::select! {
-            result = compute => result,
-            _ = version_cancel.cancelled() => {
-                compute_cancel.cancel();
+            if !still_current
+                || self.cache.semantic_token_generation() != expected_settings_generation
+            {
                 return Err(crate::error::content_modified_error());
             }
+            let result = result.unwrap_or_default();
+            if result.len() != native_position_count {
+                return Ok(false);
+            }
+            let _ = native_tx.send(Some(std::sync::Arc::new(result)));
+            Ok(true)
         };
-        compute_guard.disarm();
-
-        let still_current = self.documents.latest_snapshot(&uri).is_some_and(|view| {
-            view.content_version == expected_version
-                && view.slot.current_incarnation == expected_incarnation
-                && view.slot.snapshot.is_some_and(|snapshot| {
-                    snapshot.parsed_version == expected_version
-                        && snapshot.incarnation == expected_incarnation
-                })
-        });
-        if !still_current || self.cache.semantic_token_generation() != expected_settings_generation
-        {
-            return Err(crate::error::content_modified_error());
-        }
-
-        let native_ranges = result.unwrap_or_default();
-        if native_ranges.len() != positions.len() {
-            return Ok(None);
-        }
 
         // SelectionRange is position-aligned: choosing one winning layer for
         // the whole array would misroute multi-cursor requests whose positions
@@ -359,7 +357,21 @@ impl Kakehashi {
                         .await
                     }
                 };
-                let native = std::future::ready(Ok(native_ranges.get(index).cloned()));
+                let native = async {
+                    if !native_enabled {
+                        Ok(None)
+                    } else {
+                        let mut receiver = native_rx.clone();
+                        loop {
+                            if let Some(ranges) = receiver.borrow().as_ref() {
+                                break Ok(ranges.get(index).cloned());
+                            }
+                            if receiver.changed().await.is_err() {
+                                break Ok(None);
+                            }
+                        }
+                    }
+                };
                 let result = self
                     .walk_layer_futures(&lsp_uri, METHOD, METHOD, virt, host, native, |_| true)
                     .await?;
@@ -372,12 +384,27 @@ impl Kakehashi {
             }
             Ok(Some(selected))
         };
+        tokio::pin!(native_producer);
+        tokio::pin!(layer_walk);
         let selected = tokio::select! {
             biased;
             _ = version_cancel.cancelled() => {
+                compute_cancel.cancel();
                 return Err(crate::error::content_modified_error());
             }
-            result = layer_walk => result?,
+            result = &mut layer_walk => result?,
+            produced = &mut native_producer => {
+                if !produced? {
+                    return Ok(None);
+                }
+                tokio::select! {
+                    biased;
+                    _ = version_cancel.cancelled() => {
+                        return Err(crate::error::content_modified_error());
+                    }
+                    result = &mut layer_walk => result?,
+                }
+            }
         };
 
         let still_current = self.documents.latest_snapshot(&uri).is_some_and(|view| {
