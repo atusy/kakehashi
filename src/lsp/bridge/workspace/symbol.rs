@@ -193,6 +193,10 @@ fn prepare_symbol_for_aggregation(
     (normalized, identity)
 }
 
+fn needs_resolve_envelope(symbol: &NormalizedSymbol, resolves: bool) -> bool {
+    resolves && !symbol.legacy_flat
+}
+
 fn deduplicate_symbols(
     symbols: impl IntoIterator<Item = IdentifiedSymbol>,
 ) -> Vec<NormalizedSymbol> {
@@ -487,7 +491,7 @@ impl LanguageServerPool {
                         let virtual_uri_observer =
                             self.observe_virtual_uris_for_connection(handle.key(), generation);
                         let virtual_versions = self
-                            .virtual_document_versions_for_connection(handle.key())
+                            .confirmed_virtual_document_versions_for_connection(handle.key())
                             .await;
                         let Some((response, resolves)) = self
                             .send_workspace_request(
@@ -531,9 +535,10 @@ impl LanguageServerPool {
                             } else {
                                 None
                             };
+                            let needs_envelope = needs_resolve_envelope(&symbol, resolves);
                             prepared.push(prepare_symbol_for_aggregation(
                                 symbol,
-                                resolves.then(|| WorkspaceSymbolEnvelope {
+                                needs_envelope.then(|| WorkspaceSymbolEnvelope {
                                     origin: name.clone(),
                                     connection_key: handle.key().clone(),
                                     connection_generation: generation,
@@ -894,7 +899,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_symbol_projection_rejects_a_virtual_document_edited_in_flight() {
+    async fn workspace_symbol_projection_rejects_a_did_change_that_was_not_confirmed_enqueued() {
         let bridge = BridgeCoordinator::new();
         let pool = bridge.pool_arc();
         let key = ConnectionKey::for_server("symbols");
@@ -909,12 +914,21 @@ mod tests {
             .await;
         let observer = pool
             .observe_virtual_uris_for_connection(&key, pool.document_connection_generation(&key));
-        let versions = pool.virtual_document_versions_for_connection(&key).await;
+        let versions = pool
+            .confirmed_virtual_document_versions_for_connection(&key)
+            .await;
         assert_eq!(
             bridge
                 .increment_document_version_for_test(&virtual_uri, &key)
                 .await,
             Some(2)
+        );
+        assert_eq!(
+            pool.confirmed_virtual_document_versions_for_connection(&key)
+                .await
+                .get(&virtual_uri.to_uri_string()),
+            Some(&1),
+            "a dropped didChange must not advance the response projection snapshot"
         );
         let mut symbol = WorkspaceSymbol {
             name: "stale".into(),
@@ -985,6 +999,29 @@ mod tests {
         };
         assert_eq!(symbols[0].deprecated, Some(true));
         assert_eq!(symbols[0].tags, None);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_flat_symbol_does_not_gain_a_resolve_envelope() {
+        let mut symbols = normalize_response(
+            WorkspaceSymbolResponse::Flat(vec![SymbolInformation {
+                name: "old".into(),
+                kind: SymbolKind::FUNCTION,
+                tags: None,
+                deprecated: Some(true),
+                location: location(),
+                container_name: None,
+            }]),
+            false,
+        );
+        let symbol = symbols.pop().unwrap();
+        let needs_envelope = needs_resolve_envelope(&symbol, true);
+        assert!(!needs_envelope);
+        let (symbol, _) =
+            prepare_symbol_for_aggregation(symbol, needs_envelope.then(|| unreachable!()));
+        assert_eq!(symbol.data, None);
+        assert!(symbol.legacy_deprecated);
     }
 
     #[test]

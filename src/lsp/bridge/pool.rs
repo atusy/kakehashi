@@ -1815,7 +1815,6 @@ impl LanguageServerPool {
             .await
     }
 
-    #[cfg(test)]
     pub(super) async fn confirmed_virtual_document_versions_for_connection(
         &self,
         connection_key: &ConnectionKey,
