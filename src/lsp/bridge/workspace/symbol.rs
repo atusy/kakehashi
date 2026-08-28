@@ -88,17 +88,32 @@ fn flatten_symbol(symbol: SymbolInformation) -> WorkspaceSymbol {
     }
 }
 
+#[allow(deprecated)]
 fn normalize_response(
     response: WorkspaceSymbolResponse,
     supports_tags: bool,
-) -> Vec<WorkspaceSymbol> {
+) -> Vec<NormalizedSymbol> {
     let mut symbols = match response {
-        WorkspaceSymbolResponse::Flat(symbols) => symbols.into_iter().map(flatten_symbol).collect(),
-        WorkspaceSymbolResponse::Nested(symbols) => symbols,
+        WorkspaceSymbolResponse::Flat(symbols) => symbols
+            .into_iter()
+            .map(|symbol| NormalizedSymbol {
+                legacy_deprecated: symbol.deprecated == Some(true),
+                symbol: flatten_symbol(symbol),
+                legacy_flat: true,
+            })
+            .collect::<Vec<NormalizedSymbol>>(),
+        WorkspaceSymbolResponse::Nested(symbols) => symbols
+            .into_iter()
+            .map(|symbol| NormalizedSymbol {
+                symbol,
+                legacy_deprecated: false,
+                legacy_flat: false,
+            })
+            .collect::<Vec<NormalizedSymbol>>(),
     };
     if !supports_tags {
         for symbol in &mut symbols {
-            symbol.tags = None;
+            symbol.symbol.tags = None;
         }
     }
     symbols
@@ -107,7 +122,7 @@ fn normalize_response(
 fn decode_response(
     response: Value,
     supports_tags: bool,
-) -> serde_json::Result<Vec<WorkspaceSymbol>> {
+) -> serde_json::Result<Vec<NormalizedSymbol>> {
     if response.is_null() {
         return Ok(Vec::new());
     }
@@ -122,23 +137,54 @@ fn decode_response(
     Ok(normalize_response(response, supports_tags))
 }
 
-type IdentifiedSymbol = (WorkspaceSymbol, Option<Vec<u8>>);
+struct NormalizedSymbol {
+    symbol: WorkspaceSymbol,
+    legacy_deprecated: bool,
+    legacy_flat: bool,
+}
+
+impl From<WorkspaceSymbol> for NormalizedSymbol {
+    fn from(symbol: WorkspaceSymbol) -> Self {
+        Self {
+            symbol,
+            legacy_deprecated: false,
+            legacy_flat: false,
+        }
+    }
+}
+
+impl std::ops::Deref for NormalizedSymbol {
+    type Target = WorkspaceSymbol;
+
+    fn deref(&self) -> &Self::Target {
+        &self.symbol
+    }
+}
+
+impl std::ops::DerefMut for NormalizedSymbol {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.symbol
+    }
+}
+
+type IdentifiedSymbol = (NormalizedSymbol, Option<Vec<u8>>);
 
 fn prepare_symbol_for_aggregation(
-    mut symbol: WorkspaceSymbol,
+    symbol: impl Into<NormalizedSymbol>,
     envelope: Option<WorkspaceSymbolEnvelope>,
 ) -> IdentifiedSymbol {
-    let identity = serde_json::to_vec(&symbol).ok();
+    let mut normalized = symbol.into();
+    let identity = serde_json::to_vec(&normalized.symbol).ok();
     if let Some(mut envelope) = envelope {
-        envelope.inner = symbol.data.take();
-        envelope_symbol(&mut symbol, envelope);
+        envelope.inner = normalized.symbol.data.take();
+        envelope_symbol(&mut normalized.symbol, envelope);
     }
-    (symbol, identity)
+    (normalized, identity)
 }
 
 fn deduplicate_symbols(
     symbols: impl IntoIterator<Item = IdentifiedSymbol>,
-) -> Vec<WorkspaceSymbol> {
+) -> Vec<NormalizedSymbol> {
     let mut seen = HashSet::new();
     symbols
         .into_iter()
@@ -150,6 +196,28 @@ fn deduplicate_symbols(
             }
         })
         .collect()
+}
+
+#[allow(deprecated)]
+fn restore_legacy_flat_response(symbols: Vec<NormalizedSymbol>) -> WorkspaceSymbolResponse {
+    WorkspaceSymbolResponse::Flat(
+        symbols
+            .into_iter()
+            .map(|normalized| {
+                let OneOf::Left(location) = normalized.symbol.location else {
+                    unreachable!("caller checked eager locations")
+                };
+                SymbolInformation {
+                    name: normalized.symbol.name,
+                    kind: normalized.symbol.kind,
+                    tags: None,
+                    deprecated: normalized.legacy_deprecated.then_some(true),
+                    location,
+                    container_name: normalized.symbol.container_name,
+                }
+            })
+            .collect(),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -315,7 +383,24 @@ impl LanguageServerPool {
         if !admit() || self.workspace_generation() != request_workspace_generation {
             return None;
         }
-        (!symbols.is_empty()).then_some(WorkspaceSymbolResponse::Nested(symbols))
+        if symbols.is_empty() {
+            return None;
+        }
+        if !supports_tags
+            && symbols.iter().all(|normalized| {
+                normalized.legacy_flat
+                    && normalized.symbol.data.is_none()
+                    && matches!(normalized.symbol.location, OneOf::Left(_))
+            })
+        {
+            return Some(restore_legacy_flat_response(symbols));
+        }
+        Some(WorkspaceSymbolResponse::Nested(
+            symbols
+                .into_iter()
+                .map(|normalized| normalized.symbol)
+                .collect(),
+        ))
     }
 
     pub(crate) async fn dispatch_workspace_symbol_resolve(
@@ -548,7 +633,7 @@ mod tests {
 
     #[test]
     #[allow(deprecated)]
-    fn tags_are_suppressed_for_clients_without_tag_support() {
+    fn legacy_deprecation_is_restored_for_clients_without_tag_support() {
         let symbols = normalize_response(
             WorkspaceSymbolResponse::Flat(vec![SymbolInformation {
                 name: "old".into(),
@@ -560,6 +645,11 @@ mod tests {
             }]),
             false,
         );
+        assert_eq!(symbols[0].tags, None);
+        let WorkspaceSymbolResponse::Flat(symbols) = restore_legacy_flat_response(symbols) else {
+            panic!("legacy eager symbols should stay in the flat response shape");
+        };
+        assert_eq!(symbols[0].deprecated, Some(true));
         assert_eq!(symbols[0].tags, None);
     }
 
