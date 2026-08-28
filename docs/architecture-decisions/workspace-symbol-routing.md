@@ -27,7 +27,10 @@ connection; otherwise each root has its own producer. Kakehashi starts those
 connections when needed and combines every capable server's result in
 server-name and workspace-root order. Flat `SymbolInformation` responses are
 normalized to `WorkspaceSymbol`, so results from old and new servers have one
-response shape.
+response shape when the client supports symbol tags. For a tag-incapable client,
+an all-legacy eager result stays flat so the deprecated field is not lost.
+An explicit empty `workspaceFolders` list selects no producer; only an absent
+list falls back to the deprecated `rootUri` scope.
 
 Overlapping roots can make two producers for the same configured server return
 the same symbol. Those per-server contributions are stably deduplicated using
@@ -46,6 +49,14 @@ producer's server name, connection identity, connection generation, and
 original `data`. Resolve is sent only to that exact live producer. A missing,
 replaced, or reconfigured producer returns the unresolved enveloped symbol
 instead of sending opaque process-owned data to another process.
+
+An exact virtual URI previously issued to the producing connection is projected
+back to its host URI and current injection offset. The request snapshots the
+producer's virtual-document versions; an edit, close, connection replacement,
+unknown virtual-shaped URI, or non-contiguous eager range fails closed. Lazy
+locations retain the original downstream location inside the resolve envelope,
+so resolve restores virtual coordinates for the producer and projects the
+resolved range back to the host.
 
 The bridge advertises downstream lazy-location support only when the upstream
 editor's `workspace.symbol.resolveSupport.properties` contains
