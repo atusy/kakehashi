@@ -104,7 +104,7 @@ fn selection_chain_is_valid(selection: &SelectionRange, position: Position, text
 fn append_containing_selection_ancestors(
     mut selection: SelectionRange,
     mut ancestors: SelectionRange,
-) -> SelectionRange {
+) -> (SelectionRange, bool) {
     fn attach_to_tail(selection: &mut SelectionRange, ancestors: SelectionRange) {
         match selection.parent.as_mut() {
             Some(parent) => attach_to_tail(parent, ancestors),
@@ -122,14 +122,14 @@ fn append_containing_selection_ancestors(
             && ancestors.range != outer;
         if strictly_contains {
             attach_to_tail(&mut selection, ancestors);
-            break;
+            return (selection, true);
         }
         let Some(parent) = ancestors.parent.take() else {
             break;
         };
         ancestors = *parent;
     }
-    selection
+    (selection, false)
 }
 
 /// The explicit-action bounded wait (parse-snapshot ADR §3): `selectionRange`
@@ -518,8 +518,12 @@ impl Kakehashi {
                             _ => None,
                         };
                         if let Some(ancestors) = ancestors {
-                            result = append_containing_selection_ancestors(result, ancestors);
-                            break;
+                            let (extended, appended) =
+                                append_containing_selection_ancestors(result, ancestors);
+                            result = extended;
+                            if appended {
+                                break;
+                            }
                         }
                     }
                 }
@@ -798,11 +802,30 @@ mod tests {
             })),
         };
 
-        let merged = append_containing_selection_ancestors(virtual_chain, host_chain);
+        let (merged, appended) = append_containing_selection_ancestors(virtual_chain, host_chain);
+        assert!(appended);
         let virtual_outer = merged.parent.expect("virtual outer range");
         let host_outer = virtual_outer.parent.expect("containing host range");
         assert_eq!(host_outer.range.start, Position::new(1, 0));
         assert!(host_outer.parent.is_some());
+    }
+
+    #[test]
+    fn non_containing_chain_does_not_stop_lower_layer_search() {
+        let virtual_chain = SelectionRange {
+            range: tower_lsp_server::ls_types::Range::new(Position::new(2, 2), Position::new(2, 8)),
+            parent: None,
+        };
+        let bounded_host_chain = SelectionRange {
+            range: tower_lsp_server::ls_types::Range::new(Position::new(2, 3), Position::new(2, 7)),
+            parent: None,
+        };
+
+        let (unchanged, appended) =
+            append_containing_selection_ancestors(virtual_chain.clone(), bounded_host_chain);
+
+        assert!(!appended);
+        assert_eq!(unchanged, virtual_chain);
     }
 
     #[tokio::test]
