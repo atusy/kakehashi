@@ -2550,6 +2550,48 @@ impl LanguageServerPool {
         .await
     }
 
+    /// Acquire one producer for a document-free client-workspace request.
+    ///
+    /// A `preferSharedInstance` connection may have been initialized from the
+    /// first document's marker root. If it cannot follow workspace-folder
+    /// changes, reusing it would make workspace-wide results depend on document
+    /// open history. Use the client-root fallback in that case; a capable shared
+    /// producer still remains the preferred single process.
+    pub(super) async fn get_or_create_workspace_connection_wait_ready_admitted(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        timeout: Duration,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<Arc<ConnectionHandle>> {
+        let start = std::time::Instant::now();
+        let handle = self
+            .get_or_create_connection_wait_ready_admitted(
+                server_name,
+                server_config,
+                None,
+                timeout,
+                admit,
+            )
+            .await?;
+        if !handle.key().is_shared() || handle.supports_workspace_folder_changes() {
+            return Ok(handle);
+        }
+
+        self.acquire_resolved_wait_ready(
+            server_name,
+            server_config,
+            ConnectionKey::new(server_name, None),
+            None,
+            WaitReadyOptions {
+                timeout: timeout.saturating_sub(start.elapsed()),
+                rootless: false,
+                admit: Some(admit),
+            },
+        )
+        .await
+    }
+
     async fn get_or_create_connection_wait_ready_with_admit(
         &self,
         server_name: &str,

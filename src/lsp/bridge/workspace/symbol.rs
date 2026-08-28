@@ -201,10 +201,9 @@ impl LanguageServerPool {
             let upstream_id = upstream_id.clone();
             async move {
                 let handle = self
-                    .get_or_create_connection_wait_ready_admitted(
+                    .get_or_create_workspace_connection_wait_ready_admitted(
                         &name,
                         &config,
-                        None,
                         Duration::from_secs(INIT_TIMEOUT_SECS),
                         admit,
                     )
@@ -973,6 +972,58 @@ mod tests {
             request.await.unwrap(),
             Some(WorkspaceSymbolResponse::Nested(symbols)) if symbols.len() == 1
         ));
+    }
+
+    #[tokio::test]
+    async fn search_uses_client_fallback_when_shared_producer_cannot_follow_workspace() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let shared =
+            create_handle_advertising_workspace_symbols(ConnectionKey::shared("symbols")).await;
+        let fallback =
+            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+        pool.connections().await.extend([
+            (shared.key().clone(), Arc::clone(&shared)),
+            (fallback.key().clone(), Arc::clone(&fallback)),
+        ]);
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "symbols".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-symbols".into()]),
+                languages: Some(Vec::new()),
+                prefer_shared_instance: Some(true),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
+            "query": "workspace"
+        }))
+        .unwrap();
+        let pool_for_request = Arc::clone(&pool);
+        let request = tokio::spawn(async move {
+            pool_for_request
+                .dispatch_workspace_symbol(params, &settings, None, true, &|| true)
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !fallback.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace search reaches the client-fallback producer");
+        assert!(
+            !shared.router().is_sent(request_id),
+            "a marker-rooted incapable shared producer must not own workspace search"
+        );
+        let _ = fallback.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": []
+        }));
+        assert!(request.await.unwrap().is_none());
     }
 
     #[cfg(unix)]
