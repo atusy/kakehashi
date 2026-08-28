@@ -12,7 +12,9 @@ impl Kakehashi {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<WorkspaceSymbolResponse>> {
-        let settings = self.settings_manager.load_settings();
+        let settings_snapshot = self.settings_manager.load_settings_pair();
+        let settings = std::sync::Arc::clone(&settings_snapshot.settings);
+        let settings_generation = settings_snapshot.generation;
         let upstream_id = crate::lsp::current_upstream_id();
         let supports_tags = self
             .settings_manager
@@ -28,8 +30,9 @@ impl Kakehashi {
             std::sync::Arc::clone(&pool),
             upstream_id.clone(),
         );
+        let admit = || self.settings_manager.settings_generation() == settings_generation;
         let dispatch =
-            pool.dispatch_workspace_symbol(params, &settings, upstream_id, supports_tags);
+            pool.dispatch_workspace_symbol(params, &settings, upstream_id, supports_tags, &admit);
         match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
