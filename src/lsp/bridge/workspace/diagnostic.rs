@@ -117,20 +117,23 @@ async fn diagnostic_providers_after_registration_settle(
     // refresh from the reader path.
     let registry = handle.dynamic_capabilities();
     if diagnostic_providers(handle).is_empty() {
-        registry
+        let _ = registry
             .diagnostic_registration_settle()
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 let mut changes = registry.subscribe_changes();
                 let deadline = tokio::time::Instant::now() + DYNAMIC_REGISTRATION_SETTLE;
                 loop {
-                    if !diagnostic_providers(handle).is_empty() || !admit() {
-                        break;
+                    if !admit() {
+                        return Err(());
+                    }
+                    if !diagnostic_providers(handle).is_empty() {
+                        return Ok(());
                     }
                     if tokio::time::timeout_at(deadline, changes.changed())
                         .await
                         .is_err()
                     {
-                        break;
+                        return Ok(());
                     }
                 }
             })
@@ -1029,6 +1032,34 @@ mod tests {
             futures::poll!(second.as_mut()),
             std::task::Poll::Ready(providers) if providers.is_empty()
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_request_does_not_consume_the_registration_settle_window() {
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("diagnostics"),
+        )
+        .await;
+
+        assert!(
+            diagnostic_providers_after_registration_settle(&handle, &|| false)
+                .await
+                .is_empty()
+        );
+        let providers = diagnostic_providers_after_registration_settle(&handle, &|| true);
+        tokio::pin!(providers);
+        assert!(futures::poll!(providers.as_mut()).is_pending());
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "dynamic".into(),
+            method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "identifier": "dynamic",
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
+        }]);
+        assert_eq!(providers.await.len(), 1);
     }
 
     #[tokio::test]
