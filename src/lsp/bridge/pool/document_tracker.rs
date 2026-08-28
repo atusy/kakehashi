@@ -459,12 +459,6 @@ impl DocumentTracker {
         if newly_opened {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
-        self.confirmed_document_versions
-            .lock()
-            .await
-            .entry(connection_key.clone())
-            .or_default()
-            .insert(uri_string.clone(), 1);
         drop(versions);
         notify.notify_waiters();
         true
@@ -625,6 +619,7 @@ impl DocumentTracker {
         Some(version)
     }
 
+    #[cfg(test)]
     pub(super) async fn confirmed_document_versions_for_connection(
         &self,
         connection_key: &ConnectionKey,
@@ -642,9 +637,6 @@ impl DocumentTracker {
             .unwrap_or_default()
     }
 
-    // Read back by this module's tests; the workspace-symbol layer that reads
-    // it in production arrives with the PR that consumes these revisions.
-    #[cfg(test)]
     pub(super) async fn confirmed_document_revisions_for_connection(
         &self,
         connection_key: &ConnectionKey,

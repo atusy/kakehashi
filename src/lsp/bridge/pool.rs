@@ -1815,12 +1815,22 @@ impl LanguageServerPool {
             .await
     }
 
+    #[cfg(test)]
     pub(super) async fn confirmed_virtual_document_versions_for_connection(
         &self,
         connection_key: &ConnectionKey,
     ) -> HashMap<String, i32> {
         self.document_tracker
             .confirmed_document_versions_for_connection(connection_key)
+            .await
+    }
+
+    pub(super) async fn confirmed_virtual_document_revisions_for_connection(
+        &self,
+        connection_key: &ConnectionKey,
+    ) -> HashMap<String, document_tracker::ConfirmedDocumentRevision> {
+        self.document_tracker
+            .confirmed_document_revisions_for_connection(connection_key)
             .await
     }
 

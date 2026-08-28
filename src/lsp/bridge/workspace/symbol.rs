@@ -556,21 +556,19 @@ impl LanguageServerPool {
                         let generation = self.document_connection_generation(handle.key());
                         let virtual_uri_observer =
                             self.observe_virtual_uris_for_connection(handle.key(), generation);
-                        let virtual_versions = self
-                            .confirmed_virtual_document_versions_for_connection(handle.key())
+                        let confirmed_revisions = self
+                            .confirmed_virtual_document_revisions_for_connection(handle.key())
                             .await;
-                        let mut virtual_host_identities = HashMap::new();
-                        if let Some(context) = projection_context {
-                            for virtual_uri in virtual_versions.keys() {
-                                if let Some((host_url, _)) =
-                                    self.resolve_virtual_uri(virtual_uri).await
-                                    && let Some(identity) =
-                                        host_document_identity(context.documents, &host_url)
-                                {
-                                    virtual_host_identities.insert(virtual_uri.clone(), identity);
-                                }
-                            }
-                        }
+                        let virtual_versions = confirmed_revisions
+                            .iter()
+                            .map(|(uri, revision)| (uri.clone(), revision.version))
+                            .collect::<HashMap<_, _>>();
+                        let virtual_host_identities = confirmed_revisions
+                            .into_iter()
+                            .filter_map(|(uri, revision)| {
+                                revision.host_identity.map(|identity| (uri, identity))
+                            })
+                            .collect::<HashMap<_, _>>();
                         let Some((response, resolves)) = self
                             .send_workspace_request(
                                 &handle,
