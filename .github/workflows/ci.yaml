@@ -30,6 +30,7 @@ jobs:
       - run: cargo test --features e2e --test e2e e2e_type_hierarchy::
       - run: cargo test --features e2e --test e2e e2e_host_bridge::e2e_inline_value
       - run: cargo test --features e2e --test e2e e2e_host_bridge::e2e_semantic_tokens_range
+      - run: cargo test --features e2e --test e2e e2e_host_bridge::e2e_semantic_tokens_full
 
   resolve-e2e:
     name: Resolve E2E
