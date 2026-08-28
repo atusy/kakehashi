@@ -444,6 +444,9 @@ impl LanguageServerPool {
                 connections.get(handle.key()).is_none_or(|live| {
                     !Arc::ptr_eq(live, handle)
                         || live.state() != ConnectionState::Ready
+                        || live
+                            .dynamic_capabilities()
+                            .has_workspace_diagnostic_reader_exited()
                         || self.document_connection_generation(handle.key()) != *generation
                         || diagnostic_providers_from_registrations(handle, registrations.values())
                             != *plan
@@ -451,6 +454,8 @@ impl LanguageServerPool {
             },
         );
         if provenance_stale || producers_stale || !admit() {
+            drop(provider_guards);
+            drop(connections);
             self.release_changed_provider_refreshes(
                 provider_plans
                     .iter()
@@ -469,7 +474,13 @@ impl LanguageServerPool {
             } else {
                 handle
                     .dynamic_capabilities()
-                    .mark_workspace_diagnostic_contributed()
+                    .try_mark_workspace_diagnostic_contributed()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "workspace diagnostic producer exited during final acceptance",
+                        )
+                    })?
             };
             if refresh_deferred_registration {
                 let _ = self
@@ -1410,6 +1421,37 @@ mod tests {
             .await;
 
         let error = result.expect_err("a completed stale plan must not be aggregated");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn final_aggregation_rejects_a_reader_that_exited_after_responding() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("diagnostics");
+        let handle = create_handle_advertising_workspace_diagnostics(key.clone(), None).await;
+        let provider_plan = diagnostic_providers(&handle);
+        pool.connections().await.insert(key, Arc::clone(&handle));
+        let generation = pool.document_connection_generation(handle.key());
+        let virtual_uris =
+            Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
+        handle
+            .dynamic_capabilities()
+            .mark_workspace_diagnostic_reader_exited();
+
+        let result = pool
+            .aggregate_admitted_workspace_diagnostic_reports(
+                [std::future::ready(Some(CompletedDiagnosticProducer {
+                    provider_plan,
+                    handle,
+                    generation,
+                    report: WorkspaceDiagnosticReport::default(),
+                    virtual_uris,
+                }))],
+                &|| true,
+            )
+            .await;
+
+        let error = result.expect_err("a response from an exited reader must not be accepted");
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 

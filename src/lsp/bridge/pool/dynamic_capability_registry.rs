@@ -26,7 +26,7 @@ pub(crate) struct DynamicCapabilityRegistry {
     diagnostic_registration_settled: tokio::sync::OnceCell<()>,
     static_workspace_diagnostic_provider: AtomicBool,
     workspace_diagnostic_pull_completed: AtomicBool,
-    workspace_diagnostic_contributed: AtomicBool,
+    workspace_diagnostic_lifecycle: AtomicU8,
     workspace_diagnostic_registration_refresh_pending: AtomicBool,
 }
 
@@ -43,7 +43,7 @@ impl DynamicCapabilityRegistry {
             diagnostic_registration_settled: tokio::sync::OnceCell::new(),
             static_workspace_diagnostic_provider: AtomicBool::new(false),
             workspace_diagnostic_pull_completed: AtomicBool::new(false),
-            workspace_diagnostic_contributed: AtomicBool::new(false),
+            workspace_diagnostic_lifecycle: AtomicU8::new(0),
             workspace_diagnostic_registration_refresh_pending: AtomicBool::new(false),
         }
     }
@@ -96,10 +96,41 @@ impl DynamicCapabilityRegistry {
             || self.registration_options_flag("textDocument/diagnostic", "workspaceDiagnostics")
     }
 
-    pub(crate) fn mark_workspace_diagnostic_contributed(&self) -> bool {
-        self.workspace_diagnostic_contributed
-            .store(true, Ordering::Release);
-        self.mark_workspace_diagnostic_pull_completed()
+    pub(crate) fn try_mark_workspace_diagnostic_contributed(&self) -> Option<bool> {
+        const CONTRIBUTED: u8 = 1;
+        const READER_EXITED: u8 = 2;
+        let mut lifecycle = self.workspace_diagnostic_lifecycle.load(Ordering::Acquire);
+        loop {
+            if lifecycle & READER_EXITED != 0 {
+                return None;
+            }
+            if lifecycle & CONTRIBUTED != 0 {
+                return Some(self.mark_workspace_diagnostic_pull_completed());
+            }
+            match self.workspace_diagnostic_lifecycle.compare_exchange_weak(
+                lifecycle,
+                lifecycle | CONTRIBUTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(self.mark_workspace_diagnostic_pull_completed()),
+                Err(current) => lifecycle = current,
+            }
+        }
+    }
+
+    pub(crate) fn mark_workspace_diagnostic_reader_exited(&self) -> bool {
+        const CONTRIBUTED: u8 = 1;
+        const READER_EXITED: u8 = 2;
+        self.workspace_diagnostic_lifecycle
+            .fetch_or(READER_EXITED, Ordering::AcqRel)
+            & CONTRIBUTED
+            != 0
+    }
+
+    pub(crate) fn has_workspace_diagnostic_reader_exited(&self) -> bool {
+        const READER_EXITED: u8 = 2;
+        self.workspace_diagnostic_lifecycle.load(Ordering::Acquire) & READER_EXITED != 0
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_completed(&self) -> bool {
@@ -114,8 +145,8 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn has_workspace_diagnostic_contributed(&self) -> bool {
-        self.workspace_diagnostic_contributed
-            .load(Ordering::Acquire)
+        const CONTRIBUTED: u8 = 1;
+        self.workspace_diagnostic_lifecycle.load(Ordering::Acquire) & CONTRIBUTED != 0
     }
 
     pub(crate) fn request_or_defer_workspace_diagnostic_registration_refresh(&self) -> bool {
@@ -452,7 +483,7 @@ mod tests {
             "a cold registration must not immediately trigger another pull"
         );
         assert!(
-            registry.mark_workspace_diagnostic_contributed(),
+            registry.try_mark_workspace_diagnostic_contributed() == Some(true),
             "the first accepted aggregate must release the deferred retry"
         );
         assert!(
@@ -460,8 +491,29 @@ mod tests {
             "later registrations invalidate an already accepted aggregate immediately"
         );
         assert!(
-            !registry.mark_workspace_diagnostic_contributed(),
+            registry.try_mark_workspace_diagnostic_contributed() == Some(false),
             "an immediate retry must not leave duplicate deferred work"
+        );
+    }
+
+    #[test]
+    fn reader_exit_and_contribution_use_an_atomic_handoff() {
+        let exited_first = DynamicCapabilityRegistry::new();
+        assert!(!exited_first.mark_workspace_diagnostic_reader_exited());
+        assert_eq!(
+            exited_first.try_mark_workspace_diagnostic_contributed(),
+            None,
+            "an aggregate must not be accepted after reader exit"
+        );
+
+        let contributed_first = DynamicCapabilityRegistry::new();
+        assert_eq!(
+            contributed_first.try_mark_workspace_diagnostic_contributed(),
+            Some(false)
+        );
+        assert!(
+            contributed_first.mark_workspace_diagnostic_reader_exited(),
+            "reader exit must observe an accepted contribution and request refresh"
         );
     }
 
