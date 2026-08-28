@@ -97,6 +97,34 @@ impl DynamicCapabilityRegistry {
             })
     }
 
+    /// Run `f` while a matching registration with a true boolean option stays
+    /// protected from unregistration. Resolve sub-capabilities are registered
+    /// through their parent method, so admission must test the option and hold
+    /// the same read lease through enqueue.
+    pub(crate) fn with_registration_options_flag<R>(
+        &self,
+        method: &str,
+        flag: &str,
+        f: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let guard = self
+            .registrations
+            .read()
+            .recover_poison("DynamicCapabilityRegistry::with_registration_options_flag");
+        guard
+            .values()
+            .filter(|registration| registration.method == method)
+            .any(|registration| {
+                registration
+                    .register_options
+                    .as_ref()
+                    .and_then(|options| options.get(flag))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .then(f)
+    }
+
     pub(crate) fn store_log_message_level(&self, level: crate::config::settings::LogMessageLevel) {
         self.log_message_level
             .store(level.as_u8(), Ordering::Release);
@@ -173,6 +201,21 @@ mod tests {
         );
         registry.unregister(vec![make_unregistration("1", "textDocument/completion")]);
         assert!(!registry.has_registration("textDocument/completion"));
+    }
+
+    #[test]
+    fn registration_option_read_lease_orders_unregistration_after_admission() {
+        let registry = DynamicCapabilityRegistry::new();
+        registry.register(vec![Registration {
+            id: "1".into(),
+            method: "workspace/symbol".into(),
+            register_options: Some(serde_json::json!({ "resolveProvider": true })),
+        }]);
+        let write_is_excluded =
+            registry.with_registration_options_flag("workspace/symbol", "resolveProvider", || {
+                registry.registrations.try_write().is_err()
+            });
+        assert_eq!(write_is_excluded, Some(true));
     }
 
     #[test]

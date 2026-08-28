@@ -12,13 +12,22 @@ impl Kakehashi {
     ) -> Result<Option<WorkspaceSymbolResponse>> {
         let settings = self.settings_manager.load_settings();
         let upstream_id = crate::lsp::current_upstream_id();
+        let supports_tags = self
+            .settings_manager
+            .client_capabilities_lock()
+            .get()
+            .and_then(|capabilities| capabilities.workspace.as_ref())
+            .and_then(|workspace| workspace.symbol.as_ref())
+            .and_then(|symbol| symbol.tag_support.as_ref())
+            .is_some();
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let pool = self.bridge.pool_arc();
         let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
             std::sync::Arc::clone(&pool),
             upstream_id.clone(),
         );
-        let dispatch = pool.dispatch_workspace_symbol(params, &settings, upstream_id);
+        let dispatch =
+            pool.dispatch_workspace_symbol(params, &settings, upstream_id, supports_tags);
         match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
