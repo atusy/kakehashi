@@ -124,6 +124,11 @@ enum WorkspaceCapability {
     Resolve,
 }
 
+struct WorkspaceRequestFence<'a> {
+    expected_generation: Option<u64>,
+    admit: Option<&'a (dyn Fn() -> bool + Sync)>,
+}
+
 fn has_static_capability(handle: &ConnectionHandle, capability: WorkspaceCapability) -> bool {
     matches!(
         (handle.server_capabilities(), capability),
@@ -216,7 +221,10 @@ impl LanguageServerPool {
                         SYMBOL_METHOD,
                         params,
                         upstream_id,
-                        Some(generation),
+                        WorkspaceRequestFence {
+                            expected_generation: Some(generation),
+                            admit: Some(admit),
+                        },
                     )
                     .await
                     .ok()??;
@@ -294,7 +302,10 @@ impl LanguageServerPool {
                 RESOLVE_METHOD,
                 symbol.clone(),
                 upstream_id,
-                Some(envelope.connection_generation),
+                WorkspaceRequestFence {
+                    expected_generation: Some(envelope.connection_generation),
+                    admit: None,
+                },
             )
             .await
         {
@@ -314,12 +325,16 @@ impl LanguageServerPool {
         method: &'static str,
         params: P,
         upstream_id: Option<UpstreamId>,
-        expected_generation: Option<u64>,
+        fence: WorkspaceRequestFence<'_>,
     ) -> io::Result<Option<(R, bool)>>
     where
         P: Serialize,
         R: serde::de::DeserializeOwned,
     {
+        let WorkspaceRequestFence {
+            expected_generation,
+            admit,
+        } = fence;
         let key = handle.key();
         if let Some(id) = &upstream_id {
             self.register_upstream_request_for_handle(id.clone(), handle);
@@ -349,6 +364,15 @@ impl LanguageServerPool {
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "connection replaced",
+                ));
+            }
+            if admit.is_some_and(|admit| !admit()) {
+                if let Some(id) = &upstream_id {
+                    self.unregister_upstream_request(id, key);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "workspace symbol settings changed before request send",
                 ));
             }
             let static_admitted = has_static_capability(handle, capability);
@@ -402,6 +426,12 @@ impl LanguageServerPool {
                 "workspace symbol producer was replaced before its response was accepted",
             ));
         }
+        if admit.is_some_and(|admit| !admit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "workspace symbol settings changed before the response was accepted",
+            ));
+        }
         if response_has_jsonrpc_error(&response, method) {
             return Ok(None);
         }
@@ -421,6 +451,7 @@ mod tests {
     };
     use crate::lsp::bridge::protocol::RequestId;
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tower_lsp_server::ls_types::{
         Location, Position, Range, SymbolKind, Uri, WorkspaceLocation,
     };
@@ -794,7 +825,10 @@ mod tests {
                     SYMBOL_METHOD,
                     params,
                     None,
-                    Some(generation),
+                    WorkspaceRequestFence {
+                        expected_generation: Some(generation),
+                        admit: None,
+                    },
                 )
                 .await
         });
@@ -818,6 +852,60 @@ mod tests {
 
         let error = request.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn search_sender_rejects_a_response_after_settings_change() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("symbols");
+        let producer = create_handle_advertising_workspace_symbols(key.clone()).await;
+        pool.connections()
+            .await
+            .insert(key.clone(), Arc::clone(&producer));
+        let generation = pool.document_connection_generation(&key);
+        let admitted = Arc::new(AtomicBool::new(true));
+        let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
+            "query": "stale settings"
+        }))
+        .unwrap();
+        let pool_for_request = Arc::clone(&pool);
+        let producer_for_request = Arc::clone(&producer);
+        let admitted_for_request = Arc::clone(&admitted);
+        let request = tokio::spawn(async move {
+            let admit = || admitted_for_request.load(Ordering::Acquire);
+            pool_for_request
+                .send_workspace_request::<_, Value>(
+                    &producer_for_request,
+                    WorkspaceCapability::Search,
+                    SYMBOL_METHOD,
+                    params,
+                    None,
+                    WorkspaceRequestFence {
+                        expected_generation: Some(generation),
+                        admit: Some(&admit),
+                    },
+                )
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !producer.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("search request reaches Sent state");
+
+        admitted.store(false, Ordering::Release);
+        let _ = producer.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": []
+        }));
+
+        let error = request.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 
     #[tokio::test]
