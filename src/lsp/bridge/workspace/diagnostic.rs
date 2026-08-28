@@ -23,6 +23,7 @@ use crate::lsp::bridge::pool::{
     VirtualUriObserver,
 };
 use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
+use crate::lsp::request_id::CancelForwarder;
 
 const DIAGNOSTIC_METHOD: &str = "workspace/diagnostic";
 const DIAGNOSTIC_REGISTRATION_METHOD: &str = "textDocument/diagnostic";
@@ -371,13 +372,54 @@ impl LanguageServerPool {
             && self.document_connection_generation(key) == expected_generation
     }
 
+    #[cfg(test)]
     pub(crate) async fn dispatch_workspace_diagnostic(
+        &self,
+        params: WorkspaceDiagnosticParams,
+        settings: &WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+        admit: &(dyn Fn() -> bool + Sync),
+        request_workspace_generation: u64,
+    ) -> io::Result<WorkspaceDiagnosticReportResult> {
+        self.dispatch_workspace_diagnostic_inner(
+            params,
+            settings,
+            upstream_id,
+            admit,
+            request_workspace_generation,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn dispatch_workspace_diagnostic_cancellable(
+        &self,
+        params: WorkspaceDiagnosticParams,
+        settings: &WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+        admit: &(dyn Fn() -> bool + Sync),
+        request_workspace_generation: u64,
+        cancel_forwarder: &CancelForwarder,
+    ) -> io::Result<WorkspaceDiagnosticReportResult> {
+        self.dispatch_workspace_diagnostic_inner(
+            params,
+            settings,
+            upstream_id,
+            admit,
+            request_workspace_generation,
+            Some(cancel_forwarder),
+        )
+        .await
+    }
+
+    async fn dispatch_workspace_diagnostic_inner(
         &self,
         mut params: WorkspaceDiagnosticParams,
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
         admit: &(dyn Fn() -> bool + Sync),
         request_workspace_generation: u64,
+        cancel_forwarder: Option<&CancelForwarder>,
     ) -> io::Result<WorkspaceDiagnosticReportResult> {
         if request_workspace_generation & 1 != 0 {
             return Err(io::Error::new(
@@ -464,6 +506,7 @@ impl LanguageServerPool {
                                     upstream_id,
                                     provider,
                                     Some(&workspace_admit),
+                                    cancel_forwarder,
                                 )
                                 .await
                             }
@@ -502,6 +545,7 @@ impl LanguageServerPool {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_workspace_diagnostic_request(
         &self,
         handle: &Arc<ConnectionHandle>,
@@ -510,10 +554,15 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
         provider: DiagnosticProvider,
         admit: Option<&(dyn Fn() -> bool + Sync)>,
+        cancel_forwarder: Option<&CancelForwarder>,
     ) -> io::Result<Option<WorkspaceDiagnosticReport>> {
         let key = handle.key();
-        let (request_id, response_rx) =
-            self.register_request_for_handle_with_upstream(upstream_id.clone(), handle)?;
+        let (request_id, response_rx) = match (upstream_id.clone(), cancel_forwarder) {
+            (Some(upstream_id), Some(cancel_forwarder)) => {
+                cancel_forwarder.register_downstream_request_if_current(upstream_id, handle)?
+            }
+            _ => self.register_request_for_handle_with_upstream(upstream_id.clone(), handle)?,
+        };
         let mut guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
         let request = JsonRpcRequest::new(request_id.into(), DIAGNOSTIC_METHOD, params);
         {
@@ -1468,6 +1517,7 @@ mod tests {
                         dynamic_registration_ids: vec![],
                     },
                     None,
+                    None,
                 )
                 .await
         });
@@ -1526,6 +1576,7 @@ mod tests {
                     None,
                     provider,
                     None,
+                    None,
                 )
                 .await
         });
@@ -1581,6 +1632,7 @@ mod tests {
                         dynamic_registration_ids: vec![],
                     },
                     Some(&admit),
+                    None,
                 )
                 .await
         });
