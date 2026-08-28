@@ -93,7 +93,11 @@ requests are supported. A range wholly contained in one embedded region is first
 offered to that language's bridge server; outside such a region, an enabled
 `bridge._self` server can answer before the built-in Tree-sitter fallback. Downstream
 legends are remapped into kakehashi's advertised legend, and invalid or unknown
-tokens are dropped. Full and delta requests remain built-in only.
+tokens are dropped.
+For full-document requests, kakehashi first establishes the current built-in
+Tree-sitter baseline, then fetches every selected host and virtual bridge layer.
+Higher-priority bridge spans replace overlapping lower-priority spans while
+uncovered built-in highlighting remains. Full/delta requests remain built-in only.
 
 Highlight colors are driven by the token types/modifiers
 kakehashi exposes; capture names can be remapped via

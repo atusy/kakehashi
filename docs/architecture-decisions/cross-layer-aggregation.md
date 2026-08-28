@@ -21,7 +21,8 @@ Phased roadmap:
    settings arc), keyed `textDocument/publishDiagnostics` to match its
    aggregation config. With host bridging (host-document-bridge)
    implemented for the bridged request methods (`semanticTokens/range` is
-   covered for injection-contained requests; full/delta remain native-only),
+   covered for injection-contained requests; full uses its required overlay
+   barrier; full/delta remains native-only),
    handlers run the real
    stage-2 `preferred` walk (`Kakehashi::walk_layers` →
    `race_layers_preferred`): the virt and host layers fan out
@@ -292,11 +293,11 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   inexpressible. The practical need is still unproven; if it materializes,
   a host-relative weight on `bridge.<inj>` is the extension point — not
   entries in `priorities`.
-- **Semantic tokens**: the progressive-refinement strategy
-  (language-server-bridge-request-strategies Strategy 1) is a *temporal*
-  merge — native immediately, bridged tokens replacing them later — not an
-  ordering. Semantic tokens stay outside this mechanism (native-only today);
-  a future `merged`-style strategy may bring them in.
+- **Semantic tokens**: full-document requests use a required barrier overlay,
+  not the configurable preferred/concatenated choice: a virtual-only winner
+  cannot represent the surrounding host document. Range requests retain the
+  ordinary preferred walk because one injection wholly owns their bridged
+  range. Full/delta remains native-only.
 
 ## Consequences
 
