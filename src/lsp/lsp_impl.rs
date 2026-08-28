@@ -38,7 +38,8 @@ use tower_lsp_server::ls_types::{
     SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp,
     SignatureHelpParams, TextDocumentPositionParams, TextEdit, TypeHierarchyItem,
     TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri,
-    WillSaveTextDocumentParams, WorkspaceEdit,
+    WillSaveTextDocumentParams, WorkspaceEdit, WorkspaceSymbol, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
 };
 use tower_lsp_server::ls_types::{
     ColorInformation, ColorPresentation, ColorPresentationParams, DocumentColorParams,
@@ -1071,6 +1072,17 @@ impl LanguageServer for Kakehashi {
         params: ExecuteCommandParams,
     ) -> Result<Option<serde_json::Value>> {
         self.execute_command_impl(params).await
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<WorkspaceSymbolResponse>> {
+        self.workspace_symbol_impl(params).await
+    }
+
+    async fn symbol_resolve(&self, params: WorkspaceSymbol) -> Result<WorkspaceSymbol> {
+        self.workspace_symbol_resolve_impl(params).await
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
