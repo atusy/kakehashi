@@ -46,12 +46,32 @@ struct DiagnosticProvider {
 }
 
 struct CompletedDiagnosticProducer {
+    pull_attempt: Option<WorkspaceDiagnosticPullAttempt>,
     provider_plan: Vec<DiagnosticProvider>,
     handle: Arc<ConnectionHandle>,
     generation: u64,
     report: WorkspaceDiagnosticReport,
     provider_reports: Option<Vec<ProviderDiagnosticReport>>,
     virtual_uris: Arc<VirtualUriObserver>,
+}
+
+struct WorkspaceDiagnosticPullAttempt {
+    handle: Arc<ConnectionHandle>,
+    upstream_tx: tokio::sync::mpsc::UnboundedSender<crate::lsp::bridge::UpstreamNotification>,
+}
+
+impl Drop for WorkspaceDiagnosticPullAttempt {
+    fn drop(&mut self) {
+        if self
+            .handle
+            .dynamic_capabilities()
+            .mark_workspace_diagnostic_pull_completed()
+        {
+            let _ = self
+                .upstream_tx
+                .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
+        }
+    }
 }
 
 struct ProviderDiagnosticReport {
@@ -410,19 +430,31 @@ fn combine_complete_provider_reports(
             io::Result<Option<WorkspaceDiagnosticReport>>,
         ),
     >,
-) -> Option<Vec<ProviderDiagnosticReport>> {
-    let reports: Option<Vec<_>> = reports
-        .into_iter()
-        .map(|(identifier, report)| {
-            let report = report.ok().flatten()?;
-            report
-                .items
-                .iter()
-                .all(|item| matches!(item, WorkspaceDocumentDiagnosticReport::Full(_)))
-                .then_some(ProviderDiagnosticReport { identifier, report })
-        })
-        .collect();
-    reports
+) -> io::Result<Option<Vec<ProviderDiagnosticReport>>> {
+    let mut completed = Vec::new();
+    for (identifier, report) in reports {
+        let report = match report {
+            Ok(Some(report)) => report,
+            Ok(None) => return Ok(None),
+            Err(error)
+                if error.get_ref().is_some_and(|error| {
+                    error.is::<crate::error::WorkspaceDiagnosticServerCancelled>()
+                }) =>
+            {
+                return Err(error);
+            }
+            Err(_) => return Ok(None),
+        };
+        if !report
+            .items
+            .iter()
+            .all(|item| matches!(item, WorkspaceDocumentDiagnosticReport::Full(_)))
+        {
+            return Ok(None);
+        }
+        completed.push(ProviderDiagnosticReport { identifier, report });
+    }
+    Ok(Some(completed))
 }
 
 #[cfg(test)]
@@ -437,23 +469,7 @@ fn collect_complete_server_contributions<T>(
         .collect())
 }
 
-fn workspace_diagnostic_retrigger_requested(response: &Value) -> bool {
-    response.pointer("/error/code").and_then(Value::as_i64) == Some(-32802)
-        && response
-            .pointer("/error/data/retriggerRequest")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-}
-
 impl LanguageServerPool {
-    fn schedule_workspace_diagnostic_retrigger(&self, response: &Value) {
-        if workspace_diagnostic_retrigger_requested(response) {
-            let _ = self
-                .upstream_tx()
-                .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
-        }
-    }
-
     fn mark_workspace_diagnostic_pulls_completed<'a>(
         &self,
         handles: impl Iterator<Item = &'a Arc<ConnectionHandle>>,
@@ -502,9 +518,9 @@ impl LanguageServerPool {
                 io::Result<Option<WorkspaceDiagnosticReport>>,
             ),
         >,
-    ) -> Option<Vec<ProviderDiagnosticReport>> {
+    ) -> io::Result<Option<Vec<ProviderDiagnosticReport>>> {
         let completed = combine_complete_provider_reports(reports);
-        if completed.is_none() {
+        if !matches!(completed, Ok(Some(_))) {
             self.mark_workspace_diagnostic_pulls_completed(std::iter::once(handle));
         }
         completed
@@ -559,7 +575,7 @@ impl LanguageServerPool {
                 "workspace diagnostic admission expired before final aggregation",
             ));
         }
-        let admitted = reports
+        let mut admitted = reports
             .into_iter()
             .map(|completed| {
                 let key = completed.handle.key();
@@ -600,6 +616,13 @@ impl LanguageServerPool {
                 "workspace diagnostic admission expired during final aggregation",
             ));
         }
+        // Keep every attempt guard alive through all final fences. Any early
+        // return or caller cancellation drops these guards and releases a cold
+        // producer's deferred dynamic-registration refresh.
+        let _pull_attempts = admitted
+            .iter_mut()
+            .filter_map(|completed| completed.pull_attempt.take())
+            .collect::<Vec<_>>();
         let provenance_observers = admitted
             .iter()
             .map(|completed| Arc::clone(&completed.virtual_uris))
@@ -867,6 +890,10 @@ impl LanguageServerPool {
                     let params = params.clone();
                     let upstream_id = upstream_id.clone();
                     async move {
+                        let pull_attempt = WorkspaceDiagnosticPullAttempt {
+                            handle: Arc::clone(&handle),
+                            upstream_tx: self.upstream_tx(),
+                        };
                         let generation = self.document_connection_generation(handle.key());
                         let virtual_uris = Arc::new(
                             self.observe_virtual_uris_for_connection(handle.key(), generation),
@@ -897,11 +924,14 @@ impl LanguageServerPool {
                                 )
                             }
                         });
-                        let provider_reports = self
+                        let Some(provider_reports) = self
                             .collect_completed_workspace_diagnostic_provider_reports(
                                 &handle,
                                 join_all(requests).await,
-                            )?;
+                            )?
+                        else {
+                            return Ok::<Option<CompletedDiagnosticProducer>, io::Error>(None);
+                        };
                         if !self
                             .workspace_diagnostic_producer_is_live(&handle, generation)
                             .await
@@ -910,25 +940,29 @@ impl LanguageServerPool {
                             self.mark_workspace_diagnostic_pulls_completed(std::iter::once(
                                 &handle,
                             ));
-                            return None;
+                            return Ok::<Option<CompletedDiagnosticProducer>, io::Error>(None);
                         }
-                        Some(CompletedDiagnosticProducer {
+                        Ok(Some(CompletedDiagnosticProducer {
+                            pull_attempt: Some(pull_attempt),
                             provider_plan: providers,
                             handle,
                             generation,
                             report: WorkspaceDiagnosticReport::default(),
                             provider_reports: Some(provider_reports),
                             virtual_uris,
-                        })
+                        }))
                     }
                 });
-                join_all(producers)
-                    .await
-                    .into_iter()
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| {
-                        io::Error::other("workspace diagnostic producer set was incomplete")
-                    })
+                let mut completed = Vec::new();
+                for producer in join_all(producers).await {
+                    let Some(producer) = producer? else {
+                        return Err(io::Error::other(
+                            "workspace diagnostic producer set was incomplete",
+                        ));
+                    };
+                    completed.push(producer);
+                }
+                Ok(completed)
             }
         });
 
@@ -1050,7 +1084,11 @@ impl LanguageServerPool {
             ));
         }
         if response_has_jsonrpc_error(&response, DIAGNOSTIC_METHOD) {
-            self.schedule_workspace_diagnostic_retrigger(&response);
+            if let Some(error) =
+                crate::error::WorkspaceDiagnosticServerCancelled::from_response(&response)
+            {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, error));
+            }
             return Ok(None);
         }
         let Some(result) = response.get("result") else {
@@ -1353,6 +1391,7 @@ mod tests {
                     Err(io::Error::other("provider failed")),
                 ),
             ])
+            .unwrap()
             .is_none()
         );
         assert!(
@@ -1360,10 +1399,12 @@ mod tests {
                 (Some("alpha".into()), Ok(Some(successful()))),
                 (Some("zeta".into()), Ok(None)),
             ])
+            .unwrap()
             .is_none()
         );
         let reports =
             combine_complete_provider_reports([(Some("alpha".into()), Ok(Some(successful())))])
+                .unwrap()
                 .expect("complete provider set");
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].identifier.as_deref(), Some("alpha"));
@@ -1408,6 +1449,7 @@ mod tests {
                 .request_or_defer_workspace_diagnostic_registration_refresh()
         );
         let successful = CompletedDiagnosticProducer {
+            pull_attempt: None,
             provider_plan: Vec::new(),
             handle: Arc::clone(&handle),
             generation,
@@ -1461,7 +1503,7 @@ mod tests {
             [(None, Err(io::Error::other("provider failed")))],
         );
 
-        assert!(reports.is_none());
+        assert!(reports.unwrap().is_none());
         assert!(
             !handle
                 .dynamic_capabilities()
@@ -1475,9 +1517,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_cancelled_defaults_to_retrigger_and_honors_explicit_data() {
+    async fn cancelled_producer_attempt_releases_its_deferred_refresh() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("cancelled"),
+        )
+        .await;
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .request_or_defer_workspace_diagnostic_registration_refresh()
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_pool = Arc::clone(&pool);
+        let task_handle = Arc::clone(&handle);
+        let task = tokio::spawn(async move {
+            let _attempt = WorkspaceDiagnosticPullAttempt {
+                handle: task_handle,
+                upstream_tx: task_pool.upstream_tx(),
+            };
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .take_workspace_diagnostic_registration_refresh()
+        );
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .request_or_defer_workspace_diagnostic_registration_refresh()
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_same_server_sibling_drops_successful_attempt_guards() {
         let pool = LanguageServerPool::new();
-        let mut notifications = pool.take_upstream_rx().expect("upstream receiver");
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("siblings"),
+        )
+        .await;
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .request_or_defer_workspace_diagnostic_registration_refresh()
+        );
+        let generation = pool.document_connection_generation(handle.key());
+        let completed = CompletedDiagnosticProducer {
+            pull_attempt: Some(WorkspaceDiagnosticPullAttempt {
+                handle: Arc::clone(&handle),
+                upstream_tx: pool.upstream_tx(),
+            }),
+            provider_plan: Vec::new(),
+            handle: Arc::clone(&handle),
+            generation,
+            report: WorkspaceDiagnosticReport::default(),
+            provider_reports: None,
+            virtual_uris: Arc::new(
+                pool.observe_virtual_uris_for_connection(handle.key(), generation),
+            ),
+        };
+
+        let result = pool
+            .aggregate_admitted_workspace_diagnostic_reports(
+                [
+                    std::future::ready(Some(completed)),
+                    std::future::ready(None),
+                ],
+                &|| true,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .take_workspace_diagnostic_registration_refresh()
+        );
+    }
+
+    #[tokio::test]
+    async fn final_fence_rejection_drops_the_attempt_guard() {
+        let pool = LanguageServerPool::new();
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("final-fence"),
+        )
+        .await;
+        pool.connections()
+            .await
+            .insert(handle.key().clone(), Arc::clone(&handle));
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .request_or_defer_workspace_diagnostic_registration_refresh()
+        );
+        let generation = pool.document_connection_generation(handle.key());
+        let completed = CompletedDiagnosticProducer {
+            pull_attempt: Some(WorkspaceDiagnosticPullAttempt {
+                handle: Arc::clone(&handle),
+                upstream_tx: pool.upstream_tx(),
+            }),
+            provider_plan: Vec::new(),
+            handle: Arc::clone(&handle),
+            generation,
+            report: WorkspaceDiagnosticReport::default(),
+            provider_reports: None,
+            virtual_uris: Arc::new(
+                pool.observe_virtual_uris_for_connection(handle.key(), generation),
+            ),
+        };
+
+        let result = pool
+            .aggregate_admitted_completed_workspace_diagnostic_reports([completed], &|| false)
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .take_workspace_diagnostic_registration_refresh()
+        );
+    }
+
+    #[test]
+    fn server_cancelled_retrigger_is_propagated_without_refresh_support() {
         let response = |data: Option<Value>| {
             let mut error = serde_json::json!({
                 "code": -32802,
@@ -1489,25 +1660,29 @@ mod tests {
             serde_json::json!({ "jsonrpc": "2.0", "id": 1, "error": error })
         };
 
-        pool.schedule_workspace_diagnostic_retrigger(&response(None));
-        assert!(matches!(
-            notifications.recv().await,
-            Some(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged)
-        ));
-        pool.schedule_workspace_diagnostic_retrigger(&response(Some(serde_json::json!({
-            "retriggerRequest": true
-        }))));
-        assert!(matches!(
-            notifications.recv().await,
-            Some(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged)
-        ));
-        pool.schedule_workspace_diagnostic_retrigger(&response(Some(serde_json::json!({
-            "retriggerRequest": false
-        }))));
-        pool.schedule_workspace_diagnostic_retrigger(&serde_json::json!({
-            "error": { "code": -32603, "message": "internal" }
-        }));
-        assert!(notifications.try_recv().is_err());
+        for data in [None, Some(serde_json::json!({ "retriggerRequest": true }))] {
+            let downstream = crate::error::WorkspaceDiagnosticServerCancelled::from_response(
+                &response(data.clone()),
+            )
+            .expect("retriggering ServerCancelled");
+            let combined = combine_complete_provider_reports([(
+                None,
+                Err(io::Error::new(io::ErrorKind::Interrupted, downstream)),
+            )]);
+            let error = match combined {
+                Err(error) => error,
+                Ok(_) => panic!("ServerCancelled must escape provider aggregation"),
+            };
+            let upstream = crate::error::map_workspace_diagnostic_error(error);
+            assert_eq!(upstream.code.code(), -32802);
+            assert_eq!(upstream.data, data);
+        }
+        assert!(
+            crate::error::WorkspaceDiagnosticServerCancelled::from_response(&response(Some(
+                serde_json::json!({ "retriggerRequest": false })
+            )))
+            .is_none()
+        );
     }
 
     #[test]
@@ -1565,6 +1740,7 @@ mod tests {
                 Box::pin(async move {
                     fast_completed.store(true, Ordering::SeqCst);
                     Some(CompletedDiagnosticProducer {
+                        pull_attempt: None,
                         provider_plan: Vec::new(),
                         handle,
                         generation,
@@ -1582,6 +1758,7 @@ mod tests {
                 Box::pin(async move {
                     let _ = slow_released.await;
                     Some(CompletedDiagnosticProducer {
+                        pull_attempt: None,
                         provider_plan: Vec::new(),
                         handle,
                         generation,
@@ -1636,6 +1813,7 @@ mod tests {
                 Box::pin(async move {
                     fast_completed.store(true, Ordering::Release);
                     Some(CompletedDiagnosticProducer {
+                        pull_attempt: None,
                         provider_plan: Vec::new(),
                         handle,
                         generation,
@@ -1653,6 +1831,7 @@ mod tests {
                 Box::pin(async move {
                     let _ = slow_released.await;
                     Some(CompletedDiagnosticProducer {
+                        pull_attempt: None,
                         provider_plan: Vec::new(),
                         handle,
                         generation,
@@ -1701,6 +1880,7 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
+                    pull_attempt: None,
                     provider_plan: Vec::new(),
                     handle,
                     generation,
@@ -1737,6 +1917,7 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
+                    pull_attempt: None,
                     provider_plan: Vec::new(),
                     handle: Arc::clone(&handle),
                     generation,
@@ -1776,6 +1957,7 @@ mod tests {
 
         pool.aggregate_admitted_workspace_diagnostic_reports(
             [std::future::ready(Some(CompletedDiagnosticProducer {
+                pull_attempt: None,
                 provider_plan: Vec::new(),
                 handle: Arc::clone(&handle),
                 generation,
@@ -1824,6 +2006,7 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
+                    pull_attempt: None,
                     provider_plan: Vec::new(),
                     handle: Arc::clone(&handle),
                     generation,
@@ -1901,6 +2084,7 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
+                    pull_attempt: None,
                     provider_plan: Vec::new(),
                     handle,
                     generation,
@@ -1949,6 +2133,7 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [
                     std::future::ready(Some(CompletedDiagnosticProducer {
+                        pull_attempt: None,
                         provider_plan: Vec::new(),
                         handle: stale,
                         generation: stale_generation,
@@ -1959,6 +2144,7 @@ mod tests {
                         virtual_uris: stale_virtual_uris,
                     })),
                     std::future::ready(Some(CompletedDiagnosticProducer {
+                        pull_attempt: None,
                         provider_plan: Vec::new(),
                         handle: live,
                         generation: live_generation,
@@ -2004,6 +2190,7 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
+                    pull_attempt: None,
                     provider_plan,
                     handle,
                     generation,
@@ -2036,6 +2223,7 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
+                    pull_attempt: None,
                     provider_plan,
                     handle,
                     generation,
@@ -2075,6 +2263,7 @@ mod tests {
         let completed = [&first, &exited].map(|handle| {
             let generation = pool.document_connection_generation(handle.key());
             CompletedDiagnosticProducer {
+                pull_attempt: None,
                 provider_plan: diagnostic_providers(handle),
                 handle: Arc::clone(handle),
                 generation,
@@ -2128,6 +2317,7 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
+                    pull_attempt: None,
                     provider_plan,
                     handle: Arc::clone(&handle),
                     generation,
@@ -2831,7 +3021,11 @@ mod tests {
             )],
         };
 
-        assert!(combine_complete_provider_reports([(None, Ok(Some(report)))]).is_none());
+        assert!(
+            combine_complete_provider_reports([(None, Ok(Some(report)))])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
