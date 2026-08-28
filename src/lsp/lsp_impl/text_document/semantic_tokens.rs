@@ -468,7 +468,7 @@ impl Kakehashi {
                             && view.content_version == content_version
                             && view.slot.snapshot.is_some()
                     })
-                    && retry_tracking.as_ref().is_none_or(|(request_id, cancel)| {
+                    && retry_tracking.as_ref().is_some_and(|(request_id, cancel)| {
                         !cancel.is_cancelled() && self.cache.is_request_active(uri, *request_id)
                     })
             })
