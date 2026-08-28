@@ -1,5 +1,6 @@
 //! Workspace-symbol fan-out and origin-preserving resolve routing.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
@@ -9,18 +10,19 @@ use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
-    OneOf, SymbolInformation, SymbolTag, WorkspaceSymbol, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    Location, OneOf, SymbolInformation, SymbolTag, WorkspaceLocation, WorkspaceSymbol,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 
 use crate::config::settings::WorkspaceSettings;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
-use crate::lsp::bridge::ConnectionKey;
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::pool::{
     ConnectionHandle, ConnectionState, INIT_TIMEOUT_SECS, LanguageServerPool, UpstreamId,
+    VirtualUriObserver,
 };
 use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
+use crate::lsp::bridge::{BridgeCoordinator, ConnectionKey};
 
 const SYMBOL_METHOD: &str = "workspace/symbol";
 const RESOLVE_METHOD: &str = "workspaceSymbol/resolve";
@@ -32,6 +34,15 @@ struct WorkspaceSymbolEnvelope {
     connection_key: ConnectionKey,
     connection_generation: u64,
     inner: Option<Value>,
+    #[serde(default)]
+    projection: Option<WorkspaceSymbolProjection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct WorkspaceSymbolProjection {
+    virtual_uri: String,
+    virtual_version: i32,
+    downstream_location: OneOf<Location, WorkspaceLocation>,
 }
 
 fn envelope_symbol(symbol: &mut WorkspaceSymbol, envelope: WorkspaceSymbolEnvelope) {
@@ -220,6 +231,88 @@ fn restore_legacy_flat_response(symbols: Vec<NormalizedSymbol>) -> WorkspaceSymb
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn project_workspace_symbol_location(
+    pool: &LanguageServerPool,
+    symbol: &mut WorkspaceSymbol,
+    observer: &VirtualUriObserver,
+    request_versions: &HashMap<String, i32>,
+    connection_key: &ConnectionKey,
+    documents: &crate::document::DocumentStore,
+    language: &Arc<crate::language::LanguageCoordinator>,
+    bridge: &BridgeCoordinator,
+) -> Option<Option<WorkspaceSymbolProjection>> {
+    let virtual_uri = match &symbol.location {
+        OneOf::Left(location) => location.uri.as_str(),
+        OneOf::Right(location) => location.uri.as_str(),
+    }
+    .to_owned();
+    if !observer.contains(&virtual_uri) {
+        return Some(None);
+    }
+    let virtual_version = *request_versions.get(&virtual_uri)?;
+    if pool
+        .virtual_document_version(&virtual_uri, connection_key)
+        .await
+        != Some(virtual_version)
+    {
+        return None;
+    }
+    let (host_url, region_id) = pool.resolve_virtual_uri(&virtual_uri).await?;
+    let host_uri = crate::lsp::lsp_impl::url_to_uri(&host_url).ok()?;
+    let (offset, region_end, contiguous, _) =
+        crate::lsp::lsp_impl::region_offset::resolve_region_offset(
+            documents, language, bridge, &host_url, &region_id,
+        )?;
+    let downstream_location = symbol.location.clone();
+    match &mut symbol.location {
+        OneOf::Left(location) => {
+            if !contiguous {
+                return None;
+            }
+            crate::lsp::bridge::translate_virtual_range_to_host(&mut location.range, &offset);
+            if location.range.start > location.range.end || location.range.end > region_end {
+                return None;
+            }
+            location.uri = host_uri;
+        }
+        OneOf::Right(location) => location.uri = host_uri,
+    }
+    Some(Some(WorkspaceSymbolProjection {
+        virtual_uri,
+        virtual_version,
+        downstream_location,
+    }))
+}
+
+async fn project_resolved_workspace_symbol_location(
+    pool: &LanguageServerPool,
+    symbol: &mut WorkspaceSymbol,
+    projection: &WorkspaceSymbolProjection,
+    connection_key: &ConnectionKey,
+    documents: &crate::document::DocumentStore,
+    language: &Arc<crate::language::LanguageCoordinator>,
+    bridge: &BridgeCoordinator,
+) -> Option<()> {
+    let observer = pool.observe_virtual_uris_for_connection(
+        connection_key,
+        pool.document_connection_generation(connection_key),
+    );
+    let versions = HashMap::from([(projection.virtual_uri.clone(), projection.virtual_version)]);
+    project_workspace_symbol_location(
+        pool,
+        symbol,
+        &observer,
+        &versions,
+        connection_key,
+        documents,
+        language,
+        bridge,
+    )
+    .await?;
+    Some(())
+}
+
 #[derive(Clone, Copy)]
 enum WorkspaceCapability {
     Search,
@@ -229,6 +322,13 @@ enum WorkspaceCapability {
 struct WorkspaceRequestFence<'a> {
     expected_generation: Option<u64>,
     admit: Option<&'a (dyn Fn() -> bool + Sync)>,
+}
+
+#[derive(Clone, Copy)]
+struct WorkspaceSymbolProjectionContext<'a> {
+    documents: &'a crate::document::DocumentStore,
+    language: &'a Arc<crate::language::LanguageCoordinator>,
+    bridge: &'a BridgeCoordinator,
 }
 
 fn has_static_capability(handle: &ConnectionHandle, capability: WorkspaceCapability) -> bool {
@@ -256,6 +356,28 @@ fn has_static_capability(handle: &ConnectionHandle, capability: WorkspaceCapabil
 }
 
 impl LanguageServerPool {
+    #[cfg(test)]
+    async fn dispatch_workspace_symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+        settings: &WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+        supports_tags: bool,
+        admit: &(dyn Fn() -> bool + Sync),
+        request_workspace_generation: u64,
+    ) -> Option<WorkspaceSymbolResponse> {
+        self.dispatch_workspace_symbol_with_projection(
+            params,
+            settings,
+            upstream_id,
+            supports_tags,
+            admit,
+            request_workspace_generation,
+            None,
+        )
+        .await
+    }
+
     async fn workspace_symbol_producer_is_live(
         &self,
         handle: &Arc<ConnectionHandle>,
@@ -269,7 +391,37 @@ impl LanguageServerPool {
             && self.document_connection_generation(key) == expected_generation
     }
 
-    pub(crate) async fn dispatch_workspace_symbol(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn dispatch_workspace_symbol_projected(
+        &self,
+        params: WorkspaceSymbolParams,
+        settings: &WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+        supports_tags: bool,
+        admit: &(dyn Fn() -> bool + Sync),
+        request_workspace_generation: u64,
+        documents: &crate::document::DocumentStore,
+        language: &Arc<crate::language::LanguageCoordinator>,
+        bridge: &BridgeCoordinator,
+    ) -> Option<WorkspaceSymbolResponse> {
+        self.dispatch_workspace_symbol_with_projection(
+            params,
+            settings,
+            upstream_id,
+            supports_tags,
+            admit,
+            request_workspace_generation,
+            Some(WorkspaceSymbolProjectionContext {
+                documents,
+                language,
+                bridge,
+            }),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_workspace_symbol_with_projection(
         &self,
         mut params: WorkspaceSymbolParams,
         settings: &WorkspaceSettings,
@@ -277,6 +429,7 @@ impl LanguageServerPool {
         supports_tags: bool,
         admit: &(dyn Fn() -> bool + Sync),
         request_workspace_generation: u64,
+        projection_context: Option<WorkspaceSymbolProjectionContext<'_>>,
     ) -> Option<WorkspaceSymbolResponse> {
         if request_workspace_generation & 1 != 0 {
             return None;
@@ -331,6 +484,11 @@ impl LanguageServerPool {
                             return Err(());
                         }
                         let generation = self.document_connection_generation(handle.key());
+                        let virtual_uri_observer =
+                            self.observe_virtual_uris_for_connection(handle.key(), generation);
+                        let virtual_versions = self
+                            .virtual_document_versions_for_connection(handle.key())
+                            .await;
                         let Some((response, resolves)) = self
                             .send_workspace_request(
                                 &handle,
@@ -352,20 +510,39 @@ impl LanguageServerPool {
                             return Err(());
                         };
                         let symbols = decode_response(response, supports_tags).map_err(|_| ())?;
-                        Ok(symbols
-                            .into_iter()
-                            .map(|symbol| {
-                                prepare_symbol_for_aggregation(
-                                    symbol,
-                                    resolves.then(|| WorkspaceSymbolEnvelope {
-                                        origin: name.clone(),
-                                        connection_key: handle.key().clone(),
-                                        connection_generation: generation,
-                                        inner: None,
-                                    }),
+                        let mut prepared = Vec::with_capacity(symbols.len());
+                        for mut symbol in symbols {
+                            let projection = if let Some(context) = projection_context {
+                                let Some(projection) = project_workspace_symbol_location(
+                                    self,
+                                    &mut symbol.symbol,
+                                    &virtual_uri_observer,
+                                    &virtual_versions,
+                                    handle.key(),
+                                    context.documents,
+                                    context.language,
+                                    context.bridge,
                                 )
-                            })
-                            .collect::<Vec<_>>())
+                                .await
+                                else {
+                                    continue;
+                                };
+                                projection
+                            } else {
+                                None
+                            };
+                            prepared.push(prepare_symbol_for_aggregation(
+                                symbol,
+                                resolves.then(|| WorkspaceSymbolEnvelope {
+                                    origin: name.clone(),
+                                    connection_key: handle.key().clone(),
+                                    connection_generation: generation,
+                                    inner: None,
+                                    projection,
+                                }),
+                            ));
+                        }
+                        Ok(prepared)
                     }
                 });
                 let Ok(symbols) = join_all(requests)
@@ -403,11 +580,45 @@ impl LanguageServerPool {
         ))
     }
 
-    pub(crate) async fn dispatch_workspace_symbol_resolve(
+    #[cfg(test)]
+    async fn dispatch_workspace_symbol_resolve(
+        &self,
+        symbol: WorkspaceSymbol,
+        settings: &WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+    ) -> WorkspaceSymbol {
+        self.dispatch_workspace_symbol_resolve_with_projection(symbol, settings, upstream_id, None)
+            .await
+    }
+
+    pub(crate) async fn dispatch_workspace_symbol_resolve_projected(
+        &self,
+        symbol: WorkspaceSymbol,
+        settings: &WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+        documents: &crate::document::DocumentStore,
+        language: &Arc<crate::language::LanguageCoordinator>,
+        bridge: &BridgeCoordinator,
+    ) -> WorkspaceSymbol {
+        self.dispatch_workspace_symbol_resolve_with_projection(
+            symbol,
+            settings,
+            upstream_id,
+            Some(WorkspaceSymbolProjectionContext {
+                documents,
+                language,
+                bridge,
+            }),
+        )
+        .await
+    }
+
+    async fn dispatch_workspace_symbol_resolve_with_projection(
         &self,
         mut symbol: WorkspaceSymbol,
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
+        projection_context: Option<WorkspaceSymbolProjectionContext<'_>>,
     ) -> WorkspaceSymbol {
         let Some(envelope) = strip_envelope(&mut symbol) else {
             return symbol;
@@ -442,12 +653,23 @@ impl LanguageServerPool {
         if !handle.has_capability(RESOLVE_METHOD) {
             return fail_soft(symbol);
         }
+        let mut downstream_symbol = symbol.clone();
+        if let Some(projection) = &envelope.projection {
+            if self
+                .virtual_document_version(&projection.virtual_uri, handle.key())
+                .await
+                != Some(projection.virtual_version)
+            {
+                return fail_soft(symbol);
+            }
+            downstream_symbol.location = projection.downstream_location.clone();
+        }
         match self
             .send_workspace_request::<_, WorkspaceSymbol>(
                 &handle,
                 WorkspaceCapability::Resolve,
                 RESOLVE_METHOD,
-                symbol.clone(),
+                downstream_symbol,
                 upstream_id,
                 WorkspaceRequestFence {
                     expected_generation: Some(envelope.connection_generation),
@@ -456,7 +678,23 @@ impl LanguageServerPool {
             )
             .await
         {
-            Ok(Some((resolved, _))) => {
+            Ok(Some((mut resolved, _))) => {
+                if let Some(projection) = &envelope.projection
+                    && let Some(context) = projection_context
+                    && project_resolved_workspace_symbol_location(
+                        self,
+                        &mut resolved,
+                        projection,
+                        handle.key(),
+                        context.documents,
+                        context.language,
+                        context.bridge,
+                    )
+                    .await
+                    .is_none()
+                {
+                    return fail_soft(symbol);
+                }
                 merge_resolved_range(&mut symbol, resolved);
                 re_envelope(&mut symbol, &envelope);
                 symbol
@@ -599,6 +837,7 @@ mod tests {
         record_test_spawn_root, seed_test_client_root, transition_handle_to_ready,
     };
     use crate::lsp::bridge::protocol::RequestId;
+    use crate::lsp::bridge::protocol::VirtualDocumentUri;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tower_lsp_server::ls_types::{
@@ -610,6 +849,101 @@ mod tests {
             uri: Uri::from_str("file:///workspace/main.rs").unwrap(),
             range: Range::new(Position::new(1, 2), Position::new(1, 5)),
         }
+    }
+
+    #[tokio::test]
+    async fn virtual_shaped_real_workspace_symbol_uri_is_preserved() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("symbols");
+        let observer = pool.observe_virtual_uris_for_connection(&key, 0);
+        let mut symbol = WorkspaceSymbol {
+            name: "real".into(),
+            kind: SymbolKind::FILE,
+            tags: None,
+            container_name: None,
+            location: OneOf::Left(Location {
+                uri: Uri::from_str("file:///real/kakehashi-virtual-uri-looking.lua").unwrap(),
+                range: Range::default(),
+            }),
+            data: None,
+        };
+        let documents = crate::document::DocumentStore::new();
+        let language = Arc::new(crate::language::LanguageCoordinator::new());
+        let bridge = BridgeCoordinator::new();
+
+        let projected = project_workspace_symbol_location(
+            &pool,
+            &mut symbol,
+            &observer,
+            &HashMap::new(),
+            &key,
+            &documents,
+            &language,
+            &bridge,
+        )
+        .await;
+
+        assert!(matches!(projected, Some(None)));
+        assert_eq!(
+            symbol.location,
+            OneOf::Left(Location {
+                uri: Uri::from_str("file:///real/kakehashi-virtual-uri-looking.lua").unwrap(),
+                range: Range::default(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_symbol_projection_rejects_a_virtual_document_edited_in_flight() {
+        let bridge = BridgeCoordinator::new();
+        let pool = bridge.pool_arc();
+        let key = ConnectionKey::for_server("symbols");
+        let host_url = url::Url::parse("file:///workspace/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_url).unwrap(),
+            "lua",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+        bridge
+            .register_opened_document_for_test(&host_url, &virtual_uri, &key)
+            .await;
+        let observer = pool
+            .observe_virtual_uris_for_connection(&key, pool.document_connection_generation(&key));
+        let versions = pool.virtual_document_versions_for_connection(&key).await;
+        assert_eq!(
+            bridge
+                .increment_document_version_for_test(&virtual_uri, &key)
+                .await,
+            Some(2)
+        );
+        let mut symbol = WorkspaceSymbol {
+            name: "stale".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Right(WorkspaceLocation {
+                uri: Uri::from_str(&virtual_uri.to_uri_string()).unwrap(),
+            }),
+            data: None,
+        };
+        let documents = crate::document::DocumentStore::new();
+        let language = Arc::new(crate::language::LanguageCoordinator::new());
+
+        assert!(
+            project_workspace_symbol_location(
+                &pool,
+                &mut symbol,
+                &observer,
+                &versions,
+                &key,
+                &documents,
+                &language,
+                &bridge,
+            )
+            .await
+            .is_none(),
+            "a response from the prior virtual-document version must be dropped"
+        );
     }
 
     #[test]
@@ -693,6 +1027,7 @@ mod tests {
                 connection_key: ConnectionKey::for_server("rust-analyzer"),
                 connection_generation: 3,
                 inner,
+                projection: None,
             },
         );
         let envelope = strip_envelope(&mut symbol).unwrap();
@@ -720,6 +1055,7 @@ mod tests {
                 connection_key: ConnectionKey::new("symbols", Some("file:///workspace".into())),
                 connection_generation: 1,
                 inner: None,
+                projection: None,
             }),
         );
         let duplicate = prepare_symbol_for_aggregation(
@@ -732,6 +1068,7 @@ mod tests {
                 ),
                 connection_generation: 1,
                 inner: None,
+                projection: None,
             }),
         );
         let mut distinct_symbol = symbol;
@@ -746,6 +1083,7 @@ mod tests {
                 ),
                 connection_generation: 1,
                 inner: None,
+                projection: None,
             }),
         );
         let first_data = first.0.data.clone();
@@ -775,6 +1113,7 @@ mod tests {
                 connection_key: ConnectionKey::for_server("opaque-server-data"),
                 connection_generation: 1,
                 inner: Some(serde_json::json!({"symbol": 1})),
+                projection: None,
             },
         );
         let mut second = first.clone();
@@ -785,6 +1124,7 @@ mod tests {
                 connection_key: ConnectionKey::for_server("different-opaque-metadata"),
                 connection_generation: 2,
                 inner: Some(serde_json::json!({"symbol": 1})),
+                projection: None,
             },
         );
 
@@ -1010,6 +1350,7 @@ mod tests {
                 connection_key: key.clone(),
                 connection_generation: pool.document_connection_generation(&key),
                 inner: Some(serde_json::json!({ "owner": "old" })),
+                projection: None,
             },
         );
         let unresolved = symbol.clone();
