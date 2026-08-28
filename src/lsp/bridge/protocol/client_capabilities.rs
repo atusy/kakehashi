@@ -27,6 +27,7 @@ fn build_baseline_capabilities(
         SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
         SemanticTokensFullOptions, SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
         TextDocumentSyncClientCapabilities, TokenFormat, WorkspaceClientCapabilities,
+        WorkspaceSymbolClientCapabilities,
     };
 
     let goto_link = Some(GotoCapability {
@@ -179,6 +180,10 @@ fn build_baseline_capabilities(
             }),
             diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
                 refresh_support: Some(true),
+            }),
+            symbol: Some(WorkspaceSymbolClientCapabilities {
+                dynamic_registration: Some(false),
+                ..Default::default()
             }),
             // The bridge sends InitializeParams.workspaceFolders (upstream
             // passthrough or the workspaceMarkers-derived folder), which LSP makes
@@ -424,6 +429,22 @@ fn merge_upstream_capabilities(
             .workspace_edit = Some(mirrored);
     }
 
+    // The bridge can route workspaceSymbol/resolve, but a downstream may omit
+    // `location.range` only when the editor will actually issue that resolve.
+    // Preserve the editor's exact property declaration rather than overclaiming.
+    if let Some(resolve_support) = upstream
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.symbol.as_ref())
+        .and_then(|symbol| symbol.resolve_support.clone())
+    {
+        base.workspace
+            .get_or_insert_with(Default::default)
+            .symbol
+            .get_or_insert_with(Default::default)
+            .resolve_support = Some(resolve_support);
+    }
+
     // --- workspace.applyEdit (gated on real upstream support) ---
     // The bridge can only relay a downstream `workspace/applyEdit` to an
     // editor that declared the capability itself; advertising it regardless
@@ -560,6 +581,45 @@ mod tests {
             .expect("the bridge must advertise type-hierarchy support downstream");
 
         assert_eq!(type_hierarchy.dynamic_registration, Some(false));
+    }
+
+    #[test]
+    fn workspace_symbol_resolve_support_is_gated_by_the_editor() {
+        use tower_lsp_server::ls_types::{
+            WorkspaceClientCapabilities, WorkspaceSymbolClientCapabilities,
+            WorkspaceSymbolResolveSupportCapability,
+        };
+
+        let baseline = build_bridge_client_capabilities(None, true, false);
+        let baseline_symbol = baseline
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.symbol.as_ref())
+            .expect("workspace symbol search must be advertised downstream");
+        assert_eq!(baseline_symbol.dynamic_registration, Some(false));
+        assert_eq!(baseline_symbol.resolve_support, None);
+
+        let resolve_support = WorkspaceSymbolResolveSupportCapability {
+            properties: vec!["location.range".into()],
+        };
+        let upstream = ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                symbol: Some(WorkspaceSymbolClientCapabilities {
+                    resolve_support: Some(resolve_support.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = build_bridge_client_capabilities(Some(&upstream), true, false);
+        assert_eq!(
+            merged
+                .workspace
+                .and_then(|workspace| workspace.symbol)
+                .and_then(|symbol| symbol.resolve_support),
+            Some(resolve_support)
+        );
     }
 
     #[test]
