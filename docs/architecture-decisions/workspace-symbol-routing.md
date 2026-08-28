@@ -42,6 +42,15 @@ editor's `workspace.symbol.resolveSupport.properties` contains
 `location.range`. Search returns one final aggregate; partial-result and
 work-done tokens are not copied across producers.
 
+One search is bound to one stable client-workspace generation and one settings
+generation from producer selection through final aggregation. Snapshot capture
+waits for a normal folder update already in progress. If either generation
+changes after capture, or an interrupted update leaves the workspace generation
+unstable, search returns `null` rather than a partial result from mixed
+workspace scopes. After an interrupted update, searches remain inadmissible
+until a later complete folder update recycles the client-workspace producers
+that may have missed a delta.
+
 ## Invariants
 
 > The invariants below are normative; the mechanisms that satisfy them are
@@ -54,6 +63,9 @@ work-done tokens are not copied across producers.
   process under the same server and root does not own the old process's data.
 - One upstream progress token must not be presented as independently owned by
   several downstream producers, because their progress lifecycles can collide.
+- Every contribution in one aggregate must describe the same stable client
+  workspace and settings generation; a crossed generation invalidates the
+  entire aggregate rather than only the producer still in flight.
 - A client that cannot resolve `location.range` must not be told downstream
   results may omit it, or it can receive a permanently unusable location.
 
