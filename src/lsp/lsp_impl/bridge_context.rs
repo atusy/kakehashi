@@ -1482,6 +1482,61 @@ impl Kakehashi {
         native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
         is_nonempty: impl Fn(&R) -> bool,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+        self.walk_layer_futures_with_scope(
+            lsp_uri,
+            layer_method,
+            request_method,
+            virt,
+            host,
+            native,
+            is_nonempty,
+            true,
+        )
+        .await
+    }
+
+    /// Race pre-built layer futures inside a request scope that already owns
+    /// the cancellation subscription and upstream-registry sweep.
+    ///
+    /// This is for one protocol request that fans out into multiple concurrent
+    /// layer walks. A per-walk sweep would remove registrations still owned by
+    /// sibling walks as soon as the first walk completed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn walk_layer_futures_in_request_scope<R>(
+        &self,
+        lsp_uri: &Uri,
+        layer_method: &'static str,
+        request_method: &'static str,
+        virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        is_nonempty: impl Fn(&R) -> bool,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+        self.walk_layer_futures_with_scope(
+            lsp_uri,
+            layer_method,
+            request_method,
+            virt,
+            host,
+            native,
+            is_nonempty,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn walk_layer_futures_with_scope<R>(
+        &self,
+        lsp_uri: &Uri,
+        layer_method: &'static str,
+        request_method: &'static str,
+        virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        is_nonempty: impl Fn(&R) -> bool,
+        owns_request_scope: bool,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
         let Ok(uri) = uri_to_url(lsp_uri) else {
             log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
             return Ok(None);
@@ -1490,14 +1545,12 @@ impl Kakehashi {
             return Ok(None);
         };
         let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
-        self.run_layer_race(race_layers_preferred(
-            &layer_cfg.priorities,
-            virt,
-            host,
-            native,
-            is_nonempty,
-        ))
-        .await
+        let race = race_layers_preferred(&layer_cfg.priorities, virt, host, native, is_nonempty);
+        if owns_request_scope {
+            self.run_layer_race(race).await
+        } else {
+            race.await
+        }
     }
 
     /// Run a pre-built layer race under a walk-wide cancel subscription, then

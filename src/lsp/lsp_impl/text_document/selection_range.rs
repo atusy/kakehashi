@@ -1,5 +1,7 @@
 //! Selection range method for Kakehashi.
 
+use std::future::Future;
+
 use futures::FutureExt;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
@@ -52,6 +54,13 @@ fn settle_timed_out_selection(
     } else {
         Err(crate::error::content_modified_error())
     }
+}
+
+async fn join_position_walks<T, F>(walks: impl IntoIterator<Item = F>) -> Result<Vec<T>>
+where
+    F: Future<Output = Result<T>>,
+{
+    futures::future::try_join_all(walks).await
 }
 
 fn parse_single_host_selection_range(
@@ -186,7 +195,12 @@ impl Kakehashi {
         params: SelectionRangeParams,
     ) -> Result<Option<Vec<SelectionRange>>> {
         let cancel_token = crate::cancel::CancelToken::default();
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(current_upstream_id().as_ref());
+        let upstream_id = current_upstream_id();
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            self.bridge.pool_arc(),
+            upstream_id,
+        );
         let request = self.selection_range_inner(params, cancel_token.clone());
         match cancel_rx {
             Some(mut cancel_rx) => {
@@ -479,7 +493,7 @@ impl Kakehashi {
                         }
                     };
                     let result = self
-                        .walk_layer_futures(
+                        .walk_layer_futures_in_request_scope(
                             &lsp_uri,
                             METHOD,
                             METHOD,
@@ -530,10 +544,7 @@ impl Kakehashi {
                     Ok(Some(result))
                 }
             });
-            Ok(futures::future::try_join_all(walks)
-                .await?
-                .into_iter()
-                .collect())
+            Ok(join_position_walks(walks).await?.into_iter().collect())
         };
         let layer_race = race_native_producer(native_producer, layer_walk);
         let selected = tokio::select! {
@@ -598,28 +609,25 @@ impl Kakehashi {
         drop(ctx);
 
         let request = async {
-            let mut selected = Vec::with_capacity(positions.len());
-            for position in positions {
+            let walks = positions.into_iter().map(|position| async move {
                 let host = self.selection_range_host_layer(
                     lsp_uri,
                     position,
                     expected_incarnation,
                     expected_version,
                 );
-                let selection = self
-                    .walk_layer_futures(
-                        lsp_uri,
-                        METHOD,
-                        METHOD,
-                        std::future::ready(Ok(None)),
-                        host,
-                        std::future::ready(Ok(None)),
-                        |_| true,
-                    )
-                    .await?;
-                selected.push(selection);
-            }
-            Ok(selected)
+                self.walk_layer_futures_in_request_scope(
+                    lsp_uri,
+                    METHOD,
+                    METHOD,
+                    std::future::ready(Ok(None)),
+                    host,
+                    std::future::ready(Ok(None)),
+                    |_| true,
+                )
+                .await
+            });
+            join_position_walks(walks).await
         };
         let selected = tokio::select! {
             biased;
@@ -774,7 +782,7 @@ mod tests {
     use tower_lsp_server::LspService;
 
     use super::*;
-    use crate::lsp::bridge::{LanguageServerPool, UpstreamId};
+    use crate::lsp::bridge::{ConnectionKey, LanguageServerPool, UpstreamId};
     use crate::lsp::request_id::CancelForwarder;
 
     #[test]
@@ -921,6 +929,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selected, Some(7));
+    }
+
+    #[tokio::test]
+    async fn scoped_position_walk_does_not_sweep_a_sibling_registration() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = url::Url::parse("file:///test/scoped-selection.hostonly").unwrap();
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
+        server.documents.insert(
+            uri,
+            "word\n".to_string(),
+            Some("hostonly".to_string()),
+            None,
+        );
+        let upstream_id = UpstreamId::Number(41);
+        let pool = server.bridge.pool_arc();
+        let sibling = crate::lsp::bridge::test_helpers::create_handle_with_key(
+            crate::lsp::bridge::ConnectionState::Ready,
+            ConnectionKey::for_server("slow-sibling"),
+        )
+        .await;
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &sibling);
+
+        let selected = crate::lsp::request_id::CURRENT_REQUEST_ID
+            .scope(
+                Some(tower_lsp_server::jsonrpc::Id::Number(41)),
+                server.walk_layer_futures_in_request_scope(
+                    &lsp_uri,
+                    METHOD,
+                    METHOD,
+                    std::future::ready(Ok(None)),
+                    std::future::ready(Ok(Some(7_u8))),
+                    std::future::ready(Ok(None)),
+                    |_| true,
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(selected, Some(7));
+        assert!(
+            pool.has_upstream_request(&upstream_id),
+            "a fast position must not remove the slow sibling's cancellation target"
+        );
+        pool.unregister_all_for_upstream_id(Some(&upstream_id));
+    }
+
+    #[tokio::test]
+    async fn position_walks_start_concurrently_and_keep_input_order() {
+        let second_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::clone(&second_started);
+        let first = async move {
+            release_first.notified().await;
+            Ok::<_, tower_lsp_server::jsonrpc::Error>(1_u8)
+        }
+        .boxed();
+        let notify_first = Arc::clone(&second_started);
+        let second = async move {
+            notify_first.notify_one();
+            Ok::<_, tower_lsp_server::jsonrpc::Error>(2_u8)
+        }
+        .boxed();
+
+        let joined =
+            tokio::time::timeout(Duration::from_secs(1), join_position_walks([first, second]))
+                .await
+                .expect("the second position must start before the first completes")
+                .unwrap();
+
+        assert_eq!(joined, vec![1, 2]);
     }
 
     #[tokio::test]
