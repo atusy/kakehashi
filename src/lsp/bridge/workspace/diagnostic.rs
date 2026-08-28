@@ -75,7 +75,10 @@ fn dynamic_workspace_diagnostic_identifier(registration: &Registration) -> Optio
         .then_some(options.diagnostic_options.identifier)
 }
 
-fn diagnostic_providers(handle: &ConnectionHandle) -> Vec<DiagnosticProvider> {
+fn diagnostic_providers_from_registrations<'a>(
+    handle: &ConnectionHandle,
+    registrations: impl Iterator<Item = &'a Registration>,
+) -> Vec<DiagnosticProvider> {
     let mut providers = static_workspace_diagnostic_identifier(handle)
         .map(|identifier| DiagnosticProvider {
             identifier,
@@ -84,28 +87,37 @@ fn diagnostic_providers(handle: &ConnectionHandle) -> Vec<DiagnosticProvider> {
         })
         .into_iter()
         .collect::<Vec<_>>();
-    let mut registrations = handle
-        .dynamic_capabilities()
-        .registrations_for_method(DIAGNOSTIC_REGISTRATION_METHOD);
+    let mut registrations = registrations
+        .filter(|registration| registration.method == DIAGNOSTIC_REGISTRATION_METHOD)
+        .collect::<Vec<_>>();
     registrations.sort_by(|left, right| left.id.cmp(&right.id));
     for registration in registrations {
-        let Some(identifier) = dynamic_workspace_diagnostic_identifier(&registration) else {
+        let Some(identifier) = dynamic_workspace_diagnostic_identifier(registration) else {
             continue;
         };
         if let Some(provider) = providers
             .iter_mut()
             .find(|provider| provider.identifier == identifier)
         {
-            provider.dynamic_registration_ids.push(registration.id);
+            provider
+                .dynamic_registration_ids
+                .push(registration.id.clone());
         } else {
             providers.push(DiagnosticProvider {
                 identifier,
                 has_static_provider: false,
-                dynamic_registration_ids: vec![registration.id],
+                dynamic_registration_ids: vec![registration.id.clone()],
             });
         }
     }
     providers
+}
+
+fn diagnostic_providers(handle: &ConnectionHandle) -> Vec<DiagnosticProvider> {
+    let registrations = handle
+        .dynamic_capabilities()
+        .registrations_for_method(DIAGNOSTIC_REGISTRATION_METHOD);
+    diagnostic_providers_from_registrations(handle, registrations.iter())
 }
 
 async fn diagnostic_providers_after_registration_settle(
@@ -419,18 +431,25 @@ impl LanguageServerPool {
             .iter()
             .map(|observer| observer.provenance_read_guard())
             .collect::<Vec<_>>();
+        let provider_guards = provider_plans
+            .iter()
+            .map(|(handle, _, _)| handle.dynamic_capabilities().registrations_read())
+            .collect::<Vec<_>>();
         let provenance_stale = provenance_observers
             .iter()
             .zip(provenance_revisions)
             .any(|(observer, revision)| observer.provenance_revision() != revision);
-        let producers_stale = provider_plans.iter().any(|(handle, generation, plan)| {
-            connections.get(handle.key()).is_none_or(|live| {
-                !Arc::ptr_eq(live, handle)
-                    || live.state() != ConnectionState::Ready
-                    || self.document_connection_generation(handle.key()) != *generation
-                    || diagnostic_providers(handle) != *plan
-            })
-        });
+        let producers_stale = provider_plans.iter().zip(&provider_guards).any(
+            |((handle, generation, plan), registrations)| {
+                connections.get(handle.key()).is_none_or(|live| {
+                    !Arc::ptr_eq(live, handle)
+                        || live.state() != ConnectionState::Ready
+                        || self.document_connection_generation(handle.key()) != *generation
+                        || diagnostic_providers_from_registrations(handle, registrations.values())
+                            != *plan
+                })
+            },
+        );
         if provenance_stale || producers_stale || !admit() {
             self.release_changed_provider_refreshes(
                 provider_plans
@@ -442,10 +461,16 @@ impl LanguageServerPool {
                 "workspace diagnostic producer or admission expired after final aggregation",
             ));
         }
-        for (handle, _, _) in &provider_plans {
-            let refresh_deferred_registration = handle
-                .dynamic_capabilities()
-                .mark_workspace_diagnostic_contributed();
+        for (handle, _, plan) in &provider_plans {
+            let refresh_deferred_registration = if plan.is_empty() {
+                handle
+                    .dynamic_capabilities()
+                    .mark_workspace_diagnostic_pull_completed()
+            } else {
+                handle
+                    .dynamic_capabilities()
+                    .mark_workspace_diagnostic_contributed()
+            };
             if refresh_deferred_registration {
                 let _ = self
                     .upstream_tx()
@@ -1138,7 +1163,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_aggregation_marks_its_producer_as_contributing() {
+    async fn empty_accepted_aggregation_does_not_mark_a_contributing_producer() {
         let pool = LanguageServerPool::new();
         let key = ConnectionKey::for_server("diagnostics");
         let handle = create_handle_with_key(ConnectionState::Ready, key).await;
@@ -1163,10 +1188,10 @@ mod tests {
         .expect("accepted diagnostic aggregate");
 
         assert!(
-            handle
+            !handle
                 .dynamic_capabilities()
                 .has_workspace_diagnostic_contributed(),
-            "only an accepted contribution should arm the reader-exit refresh"
+            "an empty provider plan must not arm the reader-exit refresh"
         );
     }
 
