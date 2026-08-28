@@ -686,6 +686,96 @@ enabled = true
 }
 
 #[test]
+fn e2e_semantic_tokens_delta_reenters_bridge_after_first_injection() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("semantic_delta_reentry.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/semanticTokens/full"]
+priorities = ["virt", "native"]
+"#,
+    )
+    .expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-semantic-full": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-virt"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_delta_reentry.md";
+    open_inline_value_document(&mut client, uri, 1, "# heading\n");
+
+    let previous_result_id = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            response
+                .pointer("/result/resultId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    None
+                })
+        })
+        .expect("the injection-free native response should advertise a delta lineage");
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "```lua\ncode\n```\n" }]
+        }),
+    );
+    let data = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/semanticTokens/full/delta",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "previousResultId": previous_result_id
+                }),
+            );
+            assert!(
+                response.get("error").is_none()
+                    || response.pointer("/error/code") == Some(&json!(-32801)),
+                "{response:?}"
+            );
+            response
+                .pointer("/result/data")
+                .and_then(Value::as_array)
+                .filter(|data| data.chunks_exact(5).any(|token| token == [1, 0, 4, 17, 8]))
+                .cloned()
+                .or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    None
+                })
+        })
+        .expect("delta must return a full response containing the new virtual token");
+    assert!(data.chunks_exact(5).any(|token| token == [1, 0, 4, 17, 8]));
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_semantic_tokens_full_nested_virtual_layer_overlays_outer_layer() {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir.path().join("semantic_tokens_full_nested.toml");
