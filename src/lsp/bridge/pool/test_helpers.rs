@@ -133,7 +133,7 @@ pub async fn create_handle_with_state(state: ConnectionState) -> Arc<ConnectionH
 /// Like [`create_handle_with_state`], but assigns the connection's pool key
 /// (`(server_name, root)`) so tests whose `didChange`/host paths route via
 /// `handle.key()` agree with the key the handle is inserted under.
-pub(in crate::lsp::bridge) async fn create_handle_with_key(
+pub(crate) async fn create_handle_with_key(
     state: ConnectionState,
     key: ConnectionKey,
 ) -> Arc<ConnectionHandle> {
