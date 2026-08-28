@@ -1246,7 +1246,7 @@ impl Kakehashi {
                 document.content_version(),
             )
         };
-        let language_name = self.document_language(&uri)?;
+        let language_name = self.document_bridge_language(&uri)?;
 
         let settings = self.settings_manager.load_settings();
         let lang_settings = settings.resolve_host_language_settings(&language_name)?;
