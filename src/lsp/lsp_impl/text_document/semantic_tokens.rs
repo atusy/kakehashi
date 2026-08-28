@@ -43,6 +43,26 @@ use crate::lsp::current_upstream_id;
 
 use super::super::{Kakehashi, uri_to_url};
 
+#[cfg(feature = "e2e")]
+async fn wait_for_semantic_delta_commit_release() {
+    let Ok(dir) = std::env::var("KAKEHASHI_E2E_SEMANTIC_DELTA_COMMIT_BARRIER_DIR") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir);
+    if std::fs::create_dir_all(dir).is_err()
+        || std::fs::write(dir.join("captured"), b"captured").is_err()
+    {
+        return;
+    }
+    let release = dir.join("release");
+    for _ in 0..300 {
+        if release.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Outcome of the serve-current snapshot resolution for the whole-document
 /// token handlers (see [`Kakehashi::current_snapshot_for_tokens`]).
 pub(crate) enum TokenSnapshot {
@@ -1342,6 +1362,8 @@ impl Kakehashi {
             Some(previous) => calculate_delta_or_full(&previous, &current, &previous_result_id),
             None => SemanticTokensFullDeltaResult::Tokens(current),
         };
+        #[cfg(feature = "e2e")]
+        wait_for_semantic_delta_commit_release().await;
         let edit_lock = self.documents.edit_lock(&uri);
         let _edit_guard = edit_lock.lock().await;
         if !self.semantic_full_response_is_current(
