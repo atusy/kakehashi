@@ -321,7 +321,12 @@ cross-layer priorities/strategy only — server-level `priorities`/
 Workspace diagnostic pulls start every explicitly configured, runnable server
 that supports them, including cold servers, and combine full reports for real
 workspace files. Reports for one URI are concatenated in stable server-name
-order. Every provider contribution is retained because provider requests can
+order. A cold connection gives post-initialize dynamic registration one bounded
+settle window before the first pull; later provider changes request another pull
+when the editor advertises `workspace.diagnostics.refreshSupport`. Without that
+client capability, a provider registered after the settle window becomes visible
+on the client's next pull because LSP provides no way for the server to initiate
+one. Every provider contribution is retained because provider requests can
 cross a document close/reopen and downstream version counters can reset. Those
 numeric versions are also bridge-local rather than editor document versions, so
 the upstream composite always uses `null`.

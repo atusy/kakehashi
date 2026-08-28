@@ -115,20 +115,28 @@ async fn diagnostic_providers_after_registration_settle(
     // complete" signal, so a cold capability-less snapshot gets one short
     // settle window; a later registration also schedules a forced upstream
     // refresh from the reader path.
-    let mut changes = handle.dynamic_capabilities().subscribe_changes();
-    let deadline = tokio::time::Instant::now() + DYNAMIC_REGISTRATION_SETTLE;
-    loop {
-        let providers = diagnostic_providers(handle);
-        if !providers.is_empty() || !admit() {
-            return providers;
-        }
-        if tokio::time::timeout_at(deadline, changes.changed())
-            .await
-            .is_err()
-        {
-            return diagnostic_providers(handle);
-        }
+    let registry = handle.dynamic_capabilities();
+    if diagnostic_providers(handle).is_empty() {
+        registry
+            .diagnostic_registration_settle()
+            .get_or_init(|| async {
+                let mut changes = registry.subscribe_changes();
+                let deadline = tokio::time::Instant::now() + DYNAMIC_REGISTRATION_SETTLE;
+                loop {
+                    if !diagnostic_providers(handle).is_empty() || !admit() {
+                        break;
+                    }
+                    if tokio::time::timeout_at(deadline, changes.changed())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .await;
     }
+    diagnostic_providers(handle)
 }
 
 fn params_for_provider(mut params: Value, provider: &DiagnosticProvider) -> Value {
@@ -979,12 +987,9 @@ mod tests {
             ConnectionKey::for_server("diagnostics"),
         )
         .await;
-        let task_handle = Arc::clone(&handle);
-        let task = tokio::spawn(async move {
-            diagnostic_providers_after_registration_settle(&task_handle, &|| true).await
-        });
-
-        tokio::task::yield_now().await;
+        let providers = diagnostic_providers_after_registration_settle(&handle, &|| true);
+        tokio::pin!(providers);
+        assert!(futures::poll!(providers.as_mut()).is_pending());
         handle.dynamic_capabilities().register(vec![Registration {
             id: "dynamic".into(),
             method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
@@ -996,13 +1001,34 @@ mod tests {
         }]);
 
         assert_eq!(
-            task.await.unwrap(),
+            providers.await,
             vec![DiagnosticProvider {
                 identifier: Some("dynamic".into()),
                 has_static_provider: false,
                 dynamic_registration_ids: vec!["dynamic".into()],
             }]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_plan_settles_only_once_for_an_incapable_connection() {
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("diagnostics"),
+        )
+        .await;
+
+        assert!(
+            diagnostic_providers_after_registration_settle(&handle, &|| true)
+                .await
+                .is_empty()
+        );
+        let second = diagnostic_providers_after_registration_settle(&handle, &|| true);
+        tokio::pin!(second);
+        assert!(matches!(
+            futures::poll!(second.as_mut()),
+            std::task::Poll::Ready(providers) if providers.is_empty()
+        ));
     }
 
     #[tokio::test]
