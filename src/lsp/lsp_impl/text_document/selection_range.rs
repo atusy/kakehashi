@@ -137,13 +137,19 @@ impl Kakehashi {
         let Some(language_name) = self.document_language(&uri) else {
             return Ok(None);
         };
+        let expected_settings_generation = self.cache.semantic_token_generation();
         let layer_config = self.resolve_layer_config(&language_name, METHOD);
         let has_parse_layer =
             layer_config.allows(LayerSource::Virt) || layer_config.allows(LayerSource::Native);
         let allows_host = layer_config.allows(LayerSource::Host);
-        if layer_config.priorities.first() == Some(&LayerSource::Host) {
+        let host_attempted = layer_config.priorities.first() == Some(&LayerSource::Host);
+        if host_attempted {
             let host = self
-                .selection_range_host_only(&lsp_uri, positions.clone())
+                .selection_range_host_only(
+                    &lsp_uri,
+                    positions.clone(),
+                    expected_settings_generation,
+                )
                 .await?;
             if host.is_some() || !has_parse_layer {
                 return Ok(host);
@@ -159,7 +165,8 @@ impl Kakehashi {
             .await;
         if !load_result.success {
             return if allows_host {
-                self.selection_range_host_only(&lsp_uri, positions).await
+                self.selection_range_host_only(&lsp_uri, positions, expected_settings_generation)
+                    .await
             } else {
                 Ok(None)
             };
@@ -202,7 +209,12 @@ impl Kakehashi {
                         // pre-snapshot behavior: null.
                         Err(_elapsed) => {
                             return if allows_host {
-                                self.selection_range_host_only(&lsp_uri, positions).await
+                                self.selection_range_host_only(
+                                    &lsp_uri,
+                                    positions,
+                                    expected_settings_generation,
+                                )
+                                .await
                             } else if view.slot.snapshot.is_some() {
                                 Err(crate::error::content_modified_error())
                             } else {
@@ -221,14 +233,25 @@ impl Kakehashi {
         // of settling for its reparse (#923).
         if snapshot.tree.is_none() {
             return if allows_host {
-                self.selection_range_host_only(&lsp_uri, positions).await
+                self.selection_range_host_only(&lsp_uri, positions, expected_settings_generation)
+                    .await
             } else {
                 Ok(None)
             };
         }
+        // LSP defaults an overlong character to the line end. Normalize once
+        // against the exact snapshot and feed the same defended positions to
+        // native and virtual layers; host params remain verbatim below.
+        let raw_positions = positions;
+        let Some(positions) = raw_positions
+            .iter()
+            .map(|position| normalize_position(&snapshot.text, *position))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
         let expected_version = snapshot.parsed_version;
         let expected_incarnation = snapshot.incarnation;
-        let expected_settings_generation = self.cache.semantic_token_generation();
         let Some(version_cancel) = self.documents.get(&uri).and_then(|document| {
             (document.incarnation() == expected_incarnation
                 && document.content_version() == expected_version)
@@ -299,12 +322,14 @@ impl Kakehashi {
         // per position and preserve the editor's input order.
         let layer_walk = async {
             let mut selected = Vec::with_capacity(positions.len());
-            for (index, position) in positions.into_iter().enumerate() {
+            for (index, (raw_position, position)) in
+                raw_positions.into_iter().zip(positions).enumerate()
+            {
                 let raw_params = serde_json::to_value(SelectionRangeParams {
                     text_document: TextDocumentIdentifier {
                         uri: lsp_uri.clone(),
                     },
-                    positions: vec![position],
+                    positions: vec![raw_position],
                     // One upstream progress token cannot be forwarded to multiple
                     // independent downstream requests without token collisions.
                     work_done_progress_params: WorkDoneProgressParams::default(),
@@ -313,13 +338,20 @@ impl Kakehashi {
                 .unwrap_or(serde_json::Value::Null);
                 let virt =
                     self.selection_range_virt_layer(&lsp_uri, position, expected_incarnation);
-                let host = self.selection_range_host_layer(
-                    &lsp_uri,
-                    raw_params,
-                    position,
-                    expected_incarnation,
-                    expected_version,
-                );
+                let host = async {
+                    if host_attempted {
+                        Ok(None)
+                    } else {
+                        self.selection_range_host_layer(
+                            &lsp_uri,
+                            raw_params,
+                            position,
+                            expected_incarnation,
+                            expected_version,
+                        )
+                        .await
+                    }
+                };
                 let native = std::future::ready(Ok(native_ranges.get(index).cloned()));
                 let result = self
                     .walk_layer_futures(&lsp_uri, METHOD, METHOD, virt, host, native, |_| true)
@@ -361,6 +393,7 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         positions: Vec<Position>,
+        expected_settings_generation: u64,
     ) -> Result<Option<Vec<SelectionRange>>> {
         let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
             return Ok(None);
@@ -425,7 +458,8 @@ impl Kakehashi {
             document.incarnation() == expected_incarnation
                 && document.content_version() == expected_version
         });
-        if !still_current {
+        if !still_current || self.cache.semantic_token_generation() != expected_settings_generation
+        {
             return Err(crate::error::content_modified_error());
         }
         Ok(selected)
