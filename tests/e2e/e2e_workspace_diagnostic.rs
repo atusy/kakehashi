@@ -52,6 +52,16 @@ fn init_dynamic_workspace_diagnostic_client(
     (client, config_dir, events)
 }
 
+fn wait_for_file(path: &std::path::Path) {
+    for _ in 0..200 {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
 #[test]
 fn workspace_diagnostic_starts_and_aggregates_cold_producers() {
     let config_dir = tempfile::TempDir::new().expect("config temp dir");
@@ -163,4 +173,32 @@ fn workspace_diagnostic_sends_each_dynamic_provider_its_own_wire_params() {
         assert!(event["params"].get("partialResultToken").is_none());
         assert!(event["params"].get("workDoneToken").is_none());
     }
+}
+
+#[test]
+fn workspace_diagnostic_cancels_every_dynamic_provider_request() {
+    let (mut client, _config_dir, events) =
+        init_dynamic_workspace_diagnostic_client("workspace-diagnostic-dynamic-cancel");
+    let request_id =
+        client.send_request_async("workspace/diagnostic", json!({ "previousResultIds": [] }));
+    for identifier in ["alpha", "zeta"] {
+        wait_for_file(&events.path().join(format!(
+            "workspace-diagnostic-dynamic-cancel.workspace-diagnostic-{identifier}.json"
+        )));
+    }
+
+    client.send_notification("$/cancelRequest", json!({ "id": request_id }));
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(response["error"]["code"], -32800);
+
+    let cancel_count = events
+        .path()
+        .join("workspace-diagnostic-dynamic-cancel.cancel.count");
+    for _ in 0..200 {
+        if std::fs::read_to_string(&cancel_count).ok().as_deref() == Some("2") {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("both downstream provider requests must receive cancellation");
 }
