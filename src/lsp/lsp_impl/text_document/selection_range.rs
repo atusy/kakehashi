@@ -61,8 +61,7 @@ fn parse_single_host_selection_range(
 
 fn normalize_position(text: &str, position: Position) -> Option<Position> {
     let mapper = crate::text::PositionMapper::new(text);
-    let normalized = mapper.byte_to_position(mapper.position_to_byte_clamped(position))?;
-    (normalized.line == position.line).then_some(normalized)
+    mapper.byte_to_position(mapper.position_to_byte_clamped(position))
 }
 
 fn selection_chain_is_valid(selection: &SelectionRange, position: Position, text: &str) -> bool {
@@ -964,5 +963,13 @@ mod tests {
         }]);
 
         assert!(parse_single_host_selection_range(value, position, text).is_some());
+    }
+
+    #[test]
+    fn selection_position_past_eof_defaults_to_document_end() {
+        assert_eq!(
+            normalize_position("a\nb", Position::new(99, 99)),
+            Some(Position::new(1, 1))
+        );
     }
 }
