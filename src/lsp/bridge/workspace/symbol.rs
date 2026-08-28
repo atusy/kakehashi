@@ -446,7 +446,7 @@ mod tests {
     use crate::lsp::bridge::pool::test_helpers::{
         create_handle_advertising_workspace_symbols,
         create_handle_advertising_workspace_symbols_with_state, create_handle_with_key,
-        transition_handle_to_ready,
+        record_test_spawn_root, seed_test_client_root, transition_handle_to_ready,
     };
     use crate::lsp::bridge::protocol::RequestId;
     use std::str::FromStr;
@@ -977,8 +977,10 @@ mod tests {
     #[tokio::test]
     async fn search_uses_client_fallback_when_shared_producer_cannot_follow_workspace() {
         let pool = Arc::new(LanguageServerPool::new());
+        seed_test_client_root(&pool, "file:///workspace");
         let shared =
             create_handle_advertising_workspace_symbols(ConnectionKey::shared("symbols")).await;
+        record_test_spawn_root(&shared, "file:///workspace/project-a");
         let fallback =
             create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
         pool.connections().await.extend([
@@ -1019,6 +1021,54 @@ mod tests {
             "a marker-rooted incapable shared producer must not own workspace search"
         );
         let _ = fallback.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": []
+        }));
+        assert!(request.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn search_reuses_an_incapable_shared_producer_seeded_from_client_root() {
+        let pool = Arc::new(LanguageServerPool::new());
+        seed_test_client_root(&pool, "file:///workspace");
+        let shared =
+            create_handle_advertising_workspace_symbols(ConnectionKey::shared("symbols")).await;
+        record_test_spawn_root(&shared, "file:///workspace");
+        pool.connections()
+            .await
+            .insert(shared.key().clone(), Arc::clone(&shared));
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "symbols".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["must-not-spawn-fallback".into()]),
+                languages: Some(Vec::new()),
+                prefer_shared_instance: Some(true),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
+            "query": "workspace"
+        }))
+        .unwrap();
+        let pool_for_request = Arc::clone(&pool);
+        let request = tokio::spawn(async move {
+            pool_for_request
+                .dispatch_workspace_symbol(params, &settings, None, true, &|| true)
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !shared.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("client-seeded shared producer owns workspace search");
+        assert_eq!(pool.connection_count().await, 1);
+        let _ = shared.router().route(serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
             "result": []

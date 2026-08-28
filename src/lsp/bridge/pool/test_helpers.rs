@@ -14,7 +14,9 @@ pub(in crate::lsp::bridge) use crate::config::settings::BridgeServerConfig;
 
 use crate::lsp::bridge::actor::{ResponseRouter, spawn_reader_task};
 use crate::lsp::bridge::connection::AsyncBridgeConnection;
-use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionKey, ConnectionState, UpstreamId};
+use crate::lsp::bridge::pool::{
+    ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId,
+};
 use crate::lsp::bridge::protocol::RequestId;
 
 // Test ULID constants - valid 26-char alphanumeric strings matching ULID format.
@@ -161,6 +163,14 @@ pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_symbols_
         ..Default::default()
     });
     handle
+}
+
+pub(in crate::lsp::bridge) fn seed_test_client_root(pool: &LanguageServerPool, root: &str) {
+    pool.set_root_uri(Some(root.to_owned()));
+}
+
+pub(in crate::lsp::bridge) fn record_test_spawn_root(handle: &ConnectionHandle, root: &str) {
+    handle.record_spawn_root(Some(root.to_owned()));
 }
 
 pub(in crate::lsp::bridge) fn transition_handle_to_ready(handle: &ConnectionHandle) -> bool {
