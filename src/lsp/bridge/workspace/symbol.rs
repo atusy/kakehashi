@@ -100,6 +100,21 @@ fn normalize_response(
     symbols
 }
 
+fn decode_response(
+    response: Value,
+    supports_tags: bool,
+) -> serde_json::Result<Vec<WorkspaceSymbol>> {
+    let response = if response
+        .as_array()
+        .is_some_and(|symbols| symbols.iter().any(|symbol| symbol.get("data").is_some()))
+    {
+        WorkspaceSymbolResponse::Nested(serde_json::from_value(response)?)
+    } else {
+        serde_json::from_value(response)?
+    };
+    Ok(normalize_response(response, supports_tags))
+}
+
 #[derive(Clone, Copy)]
 enum WorkspaceCapability {
     Search,
@@ -195,7 +210,7 @@ impl LanguageServerPool {
                     )
                     .await
                     .ok()??;
-                let mut symbols = normalize_response(response, supports_tags);
+                let mut symbols = decode_response(response, supports_tags).ok()?;
                 if resolves {
                     for symbol in &mut symbols {
                         let inner = symbol.data.take();
@@ -487,6 +502,26 @@ mod tests {
         assert_eq!(envelope.origin, "rust-analyzer");
         assert_eq!(envelope.connection_generation, 3);
         assert_eq!(symbol.data, Some(serde_json::json!({"server": 7})));
+    }
+
+    #[test]
+    fn full_workspace_symbol_response_preserves_resolve_data() {
+        let response = serde_json::json!([{
+            "name": "main",
+            "kind": 12,
+            "location": {
+                "uri": "file:///workspace/main.rs",
+                "range": {
+                    "start": { "line": 1, "character": 2 },
+                    "end": { "line": 1, "character": 5 }
+                }
+            },
+            "data": { "server": 7 }
+        }]);
+
+        let symbols = decode_response(response, true).unwrap();
+
+        assert_eq!(symbols[0].data, Some(serde_json::json!({"server": 7})));
     }
 
     #[test]
