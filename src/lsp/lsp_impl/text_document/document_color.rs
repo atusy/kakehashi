@@ -23,6 +23,8 @@ impl Kakehashi {
             "textDocument/documentColor",
             raw_params,
             None,
+            None,
+            None,
             false,
             false,
             std::future::ready(Ok(None)),
@@ -44,6 +46,10 @@ impl Kakehashi {
             },
             parse_host_verbatim::<Vec<ColorInformation>>,
             |won| Some(won.items),
+            |mut acc, next| {
+                acc.extend(next);
+                acc
+            },
             |mut acc, next| {
                 acc.extend(next);
                 acc

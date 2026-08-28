@@ -40,6 +40,13 @@ pub(super) struct HostWholeDocumentResponse<T> {
     pub(super) handle: Arc<crate::lsp::bridge::ConnectionHandle>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct WholeDocumentSnapshotIdentity {
+    pub(super) incarnation: u64,
+    pub(super) parsed_version: u64,
+    pub(super) generation: u64,
+}
+
 impl Kakehashi {
     /// Fan out a whole-document bridged request to all injection regions.
     ///
@@ -56,18 +63,21 @@ impl Kakehashi {
     /// `Begin → … → End` on that token (ls-bridge-client-progress); `None` (the
     /// fast methods that don't advertise `workDoneProgress`) keeps prior behavior.
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn whole_document_fan_out<T, N, F, Fut, P, H, M>(
+    pub(super) async fn whole_document_fan_out<T, N, F, Fut, P, H, R, M>(
         &self,
         lsp_uri: &Uri,
         method_name: &'static str,
         raw_params: serde_json::Value,
         client_progress_token: Option<NumberOrString>,
+        expected_snapshot: Option<WholeDocumentSnapshotIdentity>,
+        bridge_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
         require_all_layers: bool,
         preserve_empty: bool,
         native: N,
         send: F,
         parse_host: P,
         on_host_winner: H,
+        merge_regions: R,
         merge_layers: M,
     ) -> Result<Option<Vec<T>>>
     where
@@ -77,6 +87,7 @@ impl Kakehashi {
         Fut: Future<Output = io::Result<Option<Vec<T>>>> + Send + 'static,
         P: Fn(serde_json::Value) -> Option<Vec<T>> + Clone + Send + 'static,
         H: FnOnce(HostWholeDocumentResponse<T>) -> Option<Vec<T>> + Send,
+        R: Fn(Vec<T>, Vec<T>) -> Vec<T> + Copy + Send,
         M: Fn(Vec<T>, Vec<T>) -> Vec<T>,
     {
         let virt = async {
@@ -106,6 +117,13 @@ impl Kakehashi {
                     return Ok(None);
                 }
             };
+            if expected_snapshot.is_some_and(|expected| {
+                snapshot.incarnation != expected.incarnation
+                    || snapshot.parsed_version != expected.parsed_version
+                    || self.cache.semantic_token_generation() != expected.generation
+            }) {
+                return Ok(None);
+            }
             let Some(language_name) = snapshot.language.clone() else {
                 log::debug!("{}: No language detected", method_name);
                 return Ok(None);
@@ -187,6 +205,13 @@ impl Kakehashi {
                 .await;
 
             for (region_index, resolved) in all_regions.iter().enumerate() {
+                // A combined injection concatenates disjoint host spans into one
+                // virtual document. Full semantic-token responses only carry
+                // delta coordinates, so the single-offset projection cannot map
+                // tokens after a removed gap back to the host safely.
+                if method_name == "textDocument/semanticTokens/full" && !resolved.contiguous {
+                    continue;
+                }
                 // Get ALL bridge server configs for this injection language
                 let mut configs = self.bridge_configs_for_injection_language(
                     &language_name,
@@ -197,6 +222,9 @@ impl Kakehashi {
                 }
                 if configs.is_empty() {
                     continue;
+                }
+                if let Some(attempted) = &bridge_attempted {
+                    attempted.store(true, std::sync::atomic::Ordering::Release);
                 }
 
                 let agg = self.resolve_aggregation_config(
@@ -280,15 +308,21 @@ impl Kakehashi {
                 )
                 .await;
 
-            Ok(nonempty_whole_document_items(flatten_ordered_region_items(
-                completion_order_items?,
-            )))
+            Ok(nonempty_whole_document_items(
+                flatten_ordered_region_items_with(completion_order_items?, merge_regions),
+            ))
         };
 
         let host = async {
             let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, method_name) else {
                 return Ok(None);
             };
+            if expected_snapshot.is_some_and(|expected| ctx.incarnation != expected.incarnation) {
+                return Ok(None);
+            }
+            if let Some(attempted) = &bridge_attempted {
+                attempted.store(true, std::sync::atomic::Ordering::Release);
+            }
             let (cancel_rx, _cancel_guard) =
                 self.subscribe_cancel(ctx.upstream_request_id.as_ref());
             let incarnation = ctx.incarnation;
@@ -410,8 +444,21 @@ fn nonempty_whole_document_items<T>(items: Vec<T>) -> Option<Vec<T>> {
 /// order (the region index recorded at fan-out time), regardless of task
 /// completion order.
 pub(super) fn flatten_ordered_region_items<T>(
-    mut region_items: Vec<(usize, Option<Vec<T>>)>,
+    region_items: Vec<(usize, Option<Vec<T>>)>,
 ) -> Vec<T> {
+    flatten_ordered_region_items_with(region_items, |mut acc, mut next| {
+        acc.append(&mut next);
+        acc
+    })
+}
+
+fn flatten_ordered_region_items_with<T, M>(
+    mut region_items: Vec<(usize, Option<Vec<T>>)>,
+    merge: M,
+) -> Vec<T>
+where
+    M: Fn(Vec<T>, Vec<T>) -> Vec<T>,
+{
     region_items.sort_unstable_by_key(|(region_index, _)| *region_index);
     let total_len = region_items
         .iter()
@@ -426,8 +473,8 @@ pub(super) fn flatten_ordered_region_items<T>(
         return Vec::new();
     };
     flattened.reserve(total_len - flattened.len());
-    for mut items in ordered_items {
-        flattened.append(&mut items);
+    for items in ordered_items {
+        flattened = merge(flattened, items);
     }
     flattened
 }
@@ -521,6 +568,7 @@ mod tests {
 #[cfg(test)]
 mod ordered_region_tests {
     use super::*;
+    use tower_lsp_server::ls_types::SemanticToken;
 
     #[test]
     fn flattens_region_results_by_source_order() {
@@ -532,5 +580,23 @@ mod ordered_region_tests {
         ]);
 
         assert_eq!(flattened, vec!["early", "late", "last"]);
+    }
+
+    #[test]
+    fn rebases_independently_encoded_semantic_token_regions() {
+        let token = |delta_line| SemanticToken {
+            delta_line,
+            delta_start: 2,
+            length: 4,
+            token_type: 1,
+            token_modifiers_bitset: 0,
+        };
+
+        let flattened = flatten_ordered_region_items_with(
+            vec![(1, Some(vec![token(10)])), (0, Some(vec![token(3)]))],
+            crate::lsp::bridge::merge_semantic_token_layers,
+        );
+
+        assert_eq!(flattened, vec![token(3), token(7)]);
     }
 }

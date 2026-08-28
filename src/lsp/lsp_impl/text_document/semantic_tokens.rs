@@ -77,6 +77,32 @@ enum CurrentTokens {
     Owned(SemanticTokens),
 }
 
+struct NativeSemanticLayer {
+    tokens: SemanticTokens,
+    snapshot: Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
+    request_id: u64,
+    cancel_token: crate::cancel::CancelToken,
+    generation: u64,
+}
+
+impl NativeSemanticLayer {
+    fn new(
+        tokens: SemanticTokens,
+        snapshot: Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
+        request_id: u64,
+        cancel_token: crate::cancel::CancelToken,
+        generation: u64,
+    ) -> Self {
+        Self {
+            tokens,
+            snapshot,
+            request_id,
+            cancel_token,
+            generation,
+        }
+    }
+}
+
 /// Cancels blocking semantic-token work when its async owner is abandoned.
 ///
 /// Dropping a `ComputePool` future cannot stop a work unit that already entered
@@ -269,7 +295,6 @@ impl Kakehashi {
         let Ok(uri) = uri_to_url(&lsp_uri) else {
             return Ok(None);
         };
-        let generation = self.cache.semantic_token_generation();
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let progress_token = params.work_done_progress_params.work_done_token.clone();
         // Establish the serve-current native baseline first. Besides providing
@@ -277,121 +302,131 @@ impl Kakehashi {
         // supersession, and cancellation contract. Once it resolves, the shared
         // snapshot is current, so whole-document bridge discovery is immediate
         // and the barrier cannot keep a superseded native request alive.
-        let Some(native_result) = self.semantic_tokens_full_native_layer(params).await? else {
+        let Some(native_layer) = self.semantic_tokens_full_native_layer(params).await? else {
             return Ok(None);
         };
-        let native_data = match native_result {
-            SemanticTokensResult::Tokens(tokens) => tokens.data,
-            SemanticTokensResult::Partial(partial) => partial.data,
+        let request_id = native_layer.request_id;
+        let cancel_token = native_layer.cancel_token.clone();
+        let generation = native_layer.generation;
+        let native_tokens = native_layer.tokens;
+        let Some(snapshot) = native_layer.snapshot else {
+            self.cache.finish_request(&uri, request_id);
+            return Ok(Some(SemanticTokensResult::Tokens(native_tokens)));
         };
-        let native = std::future::ready(Ok(Some(native_data)));
-
-        let data = self
-            .whole_document_fan_out(
-                &lsp_uri,
-                METHOD,
-                raw_params,
-                progress_token,
-                true,
-                true,
-                native,
-                |task| async move {
-                    let region_end = task.region_end();
-                    task.pool
-                        .send_semantic_tokens_full_request(
-                            &task.server_name,
-                            &task.server_config,
-                            &task.uri,
-                            region_end,
-                            &task.injection_language,
-                            &task.region_id,
-                            task.offset,
-                            &task.virtual_content,
-                            task.upstream_id,
-                            task.client_progress_token,
-                            None,
-                        )
-                        .await
-                        .map(|tokens| tokens.map(|tokens| tokens.data))
-                },
-                |value| {
-                    serde_json::from_value::<SemanticTokensResult>(value)
-                        .ok()
-                        .map(|result| match result {
-                            SemanticTokensResult::Tokens(tokens) => tokens.data,
-                            SemanticTokensResult::Partial(partial) => partial.data,
-                        })
-                },
-                |won| {
-                    let legend = won.handle.semantic_tokens_legend()?;
-                    let mapper = crate::text::PositionMapper::new(&won.host_text);
-                    let document_end = mapper.byte_to_position(won.host_text.len())?;
-                    crate::lsp::bridge::transform_semantic_tokens_result_to_host(
-                        serde_json::to_value(SemanticTokens {
-                            result_id: None,
-                            data: won.items,
-                        })
-                        .ok()?,
-                        legend,
-                        &RegionOffset::new(0, 0),
-                        document_end,
-                        &won.host_text,
-                        Range::new(Position::new(0, 0), document_end),
-                    )
-                    .map(|tokens| tokens.data)
-                },
-                crate::lsp::bridge::merge_semantic_token_layers,
-            )
-            .await?;
-
-        let Some(data) = data else {
-            return Ok(None);
-        };
-        let Some(view) = self.documents.latest_snapshot(&uri) else {
-            return Ok(None);
-        };
-        let Some(snapshot) = view.slot.snapshot else {
-            return Ok(None);
-        };
-        let Some(language_name) = snapshot.language.clone() else {
-            return Ok(None);
-        };
-        let tokens = SemanticTokens {
-            result_id: Some(next_result_id()),
-            data,
-        };
-        let cache_key = self.cache.cache_key_for(&snapshot.text, generation);
-        let edit_lock = self.documents.edit_lock(&uri);
-        let _edit_guard = edit_lock.lock().await;
-        if !self.semantic_snapshot_is_current(
-            &uri,
-            snapshot.incarnation,
-            snapshot.parsed_version,
+        let native_result_id = native_tokens.result_id.clone();
+        let native_data = native_tokens.data;
+        let native_data_for_comparison = native_data.clone();
+        let expected = super::super::whole_document::WholeDocumentSnapshotIdentity {
+            incarnation: snapshot.incarnation,
+            parsed_version: snapshot.parsed_version,
             generation,
-            &edit_lock,
-        ) {
-            return Ok(None);
+        };
+        let expected_incarnation = snapshot.incarnation;
+        let native = std::future::ready(Ok(Some(native_data)));
+        let bridge_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let outcome = async {
+            let data = self
+                .whole_document_fan_out(
+                    &lsp_uri,
+                    METHOD,
+                    raw_params,
+                    progress_token,
+                    Some(expected),
+                    Some(std::sync::Arc::clone(&bridge_attempted)),
+                    true,
+                    true,
+                    native,
+                    move |task| async move {
+                        let region_end = task.region_end();
+                        task.pool
+                            .send_semantic_tokens_full_request(
+                                &task.server_name,
+                                &task.server_config,
+                                &task.uri,
+                                region_end,
+                                &task.injection_language,
+                                &task.region_id,
+                                task.offset,
+                                &task.virtual_content,
+                                task.upstream_id,
+                                task.client_progress_token,
+                                Some(expected_incarnation),
+                            )
+                            .await
+                            .map(|tokens| tokens.map(|tokens| tokens.data))
+                    },
+                    |value| {
+                        serde_json::from_value::<SemanticTokensResult>(value)
+                            .ok()
+                            .map(|result| match result {
+                                SemanticTokensResult::Tokens(tokens) => tokens.data,
+                                SemanticTokensResult::Partial(partial) => partial.data,
+                            })
+                    },
+                    |won| {
+                        let legend = won.handle.semantic_tokens_legend()?;
+                        let mapper = crate::text::PositionMapper::new(&won.host_text);
+                        let document_end = mapper.byte_to_position(won.host_text.len())?;
+                        crate::lsp::bridge::transform_semantic_tokens_result_to_host(
+                            serde_json::to_value(SemanticTokens {
+                                result_id: None,
+                                data: won.items,
+                            })
+                            .ok()?,
+                            legend,
+                            &RegionOffset::new(0, 0),
+                            document_end,
+                            &won.host_text,
+                            Range::new(Position::new(0, 0), document_end),
+                        )
+                        .map(|tokens| tokens.data)
+                    },
+                    crate::lsp::bridge::merge_semantic_token_layers,
+                    crate::lsp::bridge::merge_semantic_token_layers,
+                )
+                .await?;
+
+            let Some(data) = data else {
+                return Ok(None);
+            };
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            if cancel_token.is_cancelled()
+                || !self.cache.is_request_active(&uri, request_id)
+                || !self.semantic_snapshot_is_current(
+                    &uri,
+                    snapshot.incarnation,
+                    snapshot.parsed_version,
+                    generation,
+                    &edit_lock,
+                )
+            {
+                return Ok(None);
+            }
+
+            // The native cache remains a pure parser baseline. A bridged full
+            // result deliberately has no resultId until the delta handler owns
+            // a distinct merged-wire baseline; otherwise a later native cache
+            // hit would resurrect downstream tokens that a server removed.
+            let result_id = (!bridge_attempted.load(std::sync::atomic::Ordering::Acquire)
+                && data == native_data_for_comparison)
+                .then_some(native_result_id)
+                .flatten();
+            Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+                result_id,
+                data,
+            })))
         }
-        self.cache.store_tokens(
-            uri.clone(),
-            tokens.clone(),
-            language_name,
-            cache_key,
-            SemanticSnapshotIdentity {
-                parsed_version: snapshot.parsed_version,
-                incarnation: snapshot.incarnation,
-                generation,
-            },
-        );
-        self.cache
-            .record_served_semantic_version(&uri, snapshot.parsed_version);
-        Ok(Some(SemanticTokensResult::Tokens(tokens)))
+        .await;
+        self.cache.finish_request(&uri, request_id);
+        outcome
     }
 
     async fn semantic_tokens_full_native_layer(
         &self,
         params: SemanticTokensParams,
-    ) -> Result<Option<SemanticTokensResult>> {
+    ) -> Result<Option<NativeSemanticLayer>> {
         let upstream_id = current_upstream_id();
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let lsp_uri = params.text_document.uri;
@@ -444,11 +479,16 @@ impl Kakehashi {
         {
             TokenSnapshot::Current(snapshot) => snapshot,
             TokenSnapshot::Absent => {
-                self.cache.finish_request(&uri, request_id);
-                return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-                    result_id: None,
-                    data: vec![],
-                })));
+                return Ok(Some(NativeSemanticLayer::new(
+                    SemanticTokens {
+                        result_id: None,
+                        data: vec![],
+                    },
+                    None,
+                    request_id,
+                    cancel_token,
+                    token_generation,
+                )));
             }
             TokenSnapshot::Stale => {
                 // Register token interest (version 0, monotonic max — a real
@@ -491,11 +531,16 @@ impl Kakehashi {
             // doesn't keep refreshing a document that has no tokens.
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-                result_id: None,
-                data: vec![],
-            })));
+            return Ok(Some(NativeSemanticLayer::new(
+                SemanticTokens {
+                    result_id: None,
+                    data: vec![],
+                },
+                Some(snapshot),
+                request_id,
+                cancel_token,
+                token_generation,
+            )));
         };
         let text = std::sync::Arc::clone(&snapshot.text);
 
@@ -507,11 +552,16 @@ impl Kakehashi {
             .ensure_language_loaded_async(&language_name)
             .await;
         if !load_result.success {
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-                result_id: None,
-                data: vec![],
-            })));
+            return Ok(Some(NativeSemanticLayer::new(
+                SemanticTokens {
+                    result_id: None,
+                    data: vec![],
+                },
+                Some(snapshot),
+                request_id,
+                cancel_token,
+                token_generation,
+            )));
         }
 
         // Early exit check after loading language
@@ -525,11 +575,16 @@ impl Kakehashi {
         }
 
         let Some(query) = self.language.highlight_query(&language_name) else {
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-                result_id: None,
-                data: vec![],
-            })));
+            return Ok(Some(NativeSemanticLayer::new(
+                SemanticTokens {
+                    result_id: None,
+                    data: vec![],
+                },
+                Some(snapshot),
+                request_id,
+                cancel_token,
+                token_generation,
+            )));
         };
 
         // Read the remaining settings-dependent tokenization inputs HERE —
@@ -575,8 +630,13 @@ impl Kakehashi {
             }
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensResult::Tokens(cached)));
+            return Ok(Some(NativeSemanticLayer::new(
+                cached,
+                Some(snapshot),
+                request_id,
+                cancel_token,
+                token_generation,
+            )));
         }
 
         // Validity key for the snapshot's text under the generation captured at
@@ -615,12 +675,17 @@ impl Kakehashi {
                 }
                 self.cache
                     .record_served_semantic_version(&uri, snapshot.parsed_version);
-                self.cache.finish_request(&uri, request_id);
                 // The wire type owns its data (`ls_types::SemanticTokensResult`
                 // has no borrowing variant), so this is the one legitimate
                 // materialization point — everything upstream (the cache hit
                 // itself) stayed O(1) via the `Arc`.
-                return Ok(Some(SemanticTokensResult::Tokens(cached)));
+                return Ok(Some(NativeSemanticLayer::new(
+                    cached,
+                    Some(snapshot),
+                    request_id,
+                    cancel_token,
+                    token_generation,
+                )));
             }
 
             // capture_mappings and supports_multiline were read before the await
@@ -763,7 +828,6 @@ impl Kakehashi {
         // Finish tracking this request
         self.cache
             .record_served_semantic_version(&uri, snapshot.parsed_version);
-        self.cache.finish_request(&uri, request_id);
 
         log::debug!(
             target: "kakehashi::semantic",
@@ -771,7 +835,13 @@ impl Kakehashi {
             uri, request_id, lsp_tokens.data.len()
         );
 
-        Ok(Some(SemanticTokensResult::Tokens(lsp_tokens)))
+        Ok(Some(NativeSemanticLayer::new(
+            lsp_tokens,
+            Some(snapshot),
+            request_id,
+            cancel_token,
+            token_generation,
+        )))
     }
 
     pub(crate) async fn semantic_tokens_full_delta_impl(
