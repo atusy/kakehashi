@@ -93,7 +93,7 @@ pub(crate) enum TokenSnapshot {
 struct NativeSemanticLayer {
     tokens: SemanticTokens,
     snapshot: Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
-    request_guard: SemanticFullRequestGuard,
+    request_guard: SemanticRequestGuard,
     generation: u64,
 }
 
@@ -101,7 +101,7 @@ impl NativeSemanticLayer {
     fn new(
         tokens: SemanticTokens,
         snapshot: Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
-        request_guard: SemanticFullRequestGuard,
+        request_guard: SemanticRequestGuard,
         generation: u64,
     ) -> Self {
         Self {
@@ -113,10 +113,11 @@ impl NativeSemanticLayer {
     }
 }
 
-/// Owns a full request's tracker entry until the complete native + bridge
-/// pipeline finishes. Async cancellation drops the handler future, so explicit
-/// cleanup branches alone cannot reclaim an already-started blocking compute.
-struct SemanticFullRequestGuard {
+/// Owns a semantic request's tracker entry through its complete native + bridge
+/// pipeline. Async cancellation drops the handler future, so explicit cleanup
+/// branches alone cannot reclaim an already-started blocking compute. A nested
+/// full computation can borrow the delta request's entry with an unarmed guard.
+struct SemanticRequestGuard {
     cache: std::sync::Arc<crate::lsp::cache::CacheCoordinator>,
     uri: Url,
     request_id: u64,
@@ -124,29 +125,32 @@ struct SemanticFullRequestGuard {
     armed: bool,
 }
 
-impl SemanticFullRequestGuard {
+impl SemanticRequestGuard {
     fn new(
         cache: std::sync::Arc<crate::lsp::cache::CacheCoordinator>,
         uri: Url,
         request_id: u64,
         cancel_token: crate::cancel::CancelToken,
+        owns_tracking: bool,
     ) -> Self {
         Self {
             cache,
             uri,
             request_id,
             cancel_token,
-            armed: true,
+            armed: owns_tracking,
         }
     }
 
     fn finish(&mut self) {
-        self.cache.finish_request(&self.uri, self.request_id);
-        self.armed = false;
+        if self.armed {
+            self.cache.finish_request(&self.uri, self.request_id);
+            self.armed = false;
+        }
     }
 }
 
-impl Drop for SemanticFullRequestGuard {
+impl Drop for SemanticRequestGuard {
     fn drop(&mut self) {
         if self.armed {
             self.cancel_token.cancel();
@@ -345,6 +349,15 @@ impl Kakehashi {
     pub(crate) async fn semantic_tokens_full_impl(
         &self,
         params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        self.semantic_tokens_full_impl_with_tracking(params, None)
+            .await
+    }
+
+    async fn semantic_tokens_full_impl_with_tracking(
+        &self,
+        params: SemanticTokensParams,
+        tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
     ) -> Result<Option<SemanticTokensResult>> {
         const METHOD: &str = "textDocument/semanticTokens/full";
         let lsp_uri = params.text_document.uri.clone();
@@ -613,6 +626,7 @@ impl Kakehashi {
         &self,
         params: SemanticTokensParams,
         cancel_rx: &mut Option<crate::lsp::request_id::CancelReceiver>,
+        tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
         require_snapshot: bool,
     ) -> Result<Option<NativeSemanticLayer>> {
         let lsp_uri = params.text_document.uri;
@@ -627,13 +641,20 @@ impl Kakehashi {
         // `cancel_token` is flipped when a newer request supersedes this one (or
         // the document closes); it is threaded into the blocking compute so a
         // superseded request stops mid-flight instead of running to completion.
-        let (request_id, cancel_token) = self.cache.start_request(&uri);
-        let request_guard = SemanticFullRequestGuard::new(
+        let owns_tracking = tracking.is_none();
+        let (request_id, cancel_token) = tracking.unwrap_or_else(|| self.cache.start_request(&uri));
+        let request_guard = SemanticRequestGuard::new(
             std::sync::Arc::clone(&self.cache),
             uri.clone(),
             request_id,
             cancel_token.clone(),
+            owns_tracking,
         );
+        let finish_if_owned = || {
+            if owns_tracking {
+                self.cache.finish_request(&uri, request_id);
+            }
+        };
 
         // Snapshot the settings generation NOW, before reading any
         // settings-dependent tokenization input (language resolution, queries,
@@ -700,12 +721,12 @@ impl Kakehashi {
                 // document" and the client would stay dark until its next
                 // didChange-driven request.
                 self.cache.record_served_semantic_version(&uri, 0);
-                self.cache.finish_request(&uri, request_id);
+                finish_if_owned();
                 return Err(crate::error::content_modified_error());
             }
             TokenSnapshot::Cancelled => {
                 cancel_token.cancel();
-                self.cache.finish_request(&uri, request_id);
+                finish_if_owned();
                 log::debug!(
                     target: "kakehashi::semantic",
                     "[SEMANTIC_TOKENS] CANCELLED via $/cancelRequest uri={} req={} (while parked)",
@@ -716,7 +737,7 @@ impl Kakehashi {
             TokenSnapshot::Superseded => {
                 // Same contract as a compute superseded mid-flight (below):
                 // the newer request answers; this one drops out quietly.
-                self.cache.finish_request(&uri, request_id);
+                finish_if_owned();
                 log::debug!(
                     target: "kakehashi::semantic",
                     "[SEMANTIC_TOKENS] CANCELLED uri={} req={} (superseded while parked)",
@@ -824,7 +845,7 @@ impl Kakehashi {
                 &edit_lock,
             );
             if !still_current || !self.cache.is_request_active(&uri, request_id) {
-                self.cache.finish_request(&uri, request_id);
+                finish_if_owned();
                 return Ok(None);
             }
             self.cache
@@ -868,7 +889,7 @@ impl Kakehashi {
                     &edit_lock,
                 );
                 if !still_current || !self.cache.is_request_active(&uri, request_id) {
-                    self.cache.finish_request(&uri, request_id);
+                    finish_if_owned();
                     return Ok(None);
                 }
                 self.cache
@@ -934,7 +955,7 @@ impl Kakehashi {
                     // instead of running to completion for a discarded result.
                     _ = &mut cancel_rx => {
                         cancel_token.cancel();
-                        self.cache.finish_request(&uri, request_id);
+                        finish_if_owned();
                         log::debug!(
                             target: "kakehashi::semantic",
                             "[SEMANTIC_TOKENS] CANCELLED via $/cancelRequest uri={} req={}",
@@ -960,7 +981,7 @@ impl Kakehashi {
         // the client's didChange-driven follow-up request supersedes and heals
         // (§4's narrowed CancelToken role).
         if cancel_token.is_cancelled() {
-            self.cache.finish_request(&uri, request_id);
+            finish_if_owned();
             log::debug!(
                 target: "kakehashi::semantic",
                 "[SEMANTIC_TOKENS] CANCELLED uri={} req={} (compute superseded)",
@@ -1008,7 +1029,7 @@ impl Kakehashi {
             &edit_lock,
         );
         if !still_current || !self.cache.is_request_active(&uri, request_id) {
-            self.cache.finish_request(&uri, request_id);
+            finish_if_owned();
             return Ok(None);
         }
         // Store keyed by result_id (delta baseline) AND cache_key (so an
@@ -1319,6 +1340,55 @@ impl Kakehashi {
         &self,
         params: SemanticTokensDeltaParams,
     ) -> Result<Option<SemanticTokensFullDeltaResult>> {
+        let Ok(uri) = uri_to_url(&params.text_document.uri) else {
+            log::warn!(
+                "Invalid URI in semanticTokens/full/delta: {}",
+                params.text_document.uri.as_str()
+            );
+            return Ok(None);
+        };
+        let upstream_id = current_upstream_id();
+        let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let (request_id, cancel_token) = self.cache.start_request(&uri);
+        let mut request_guard = SemanticRequestGuard::new(
+            std::sync::Arc::clone(&self.cache),
+            uri.clone(),
+            request_id,
+            cancel_token.clone(),
+            true,
+        );
+        let request =
+            self.semantic_tokens_full_delta_tracked_impl(params, request_id, cancel_token.clone());
+        let outcome = match cancel_rx.as_mut() {
+            Some(cancel_rx) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx => {
+                        cancel_token.cancel();
+                        Err(Error::request_cancelled())
+                    }
+                    _ = cancel_token.cancelled() => Ok(None),
+                    result = request => result,
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => Ok(None),
+                    result = request => result,
+                }
+            }
+        };
+        request_guard.finish();
+        outcome
+    }
+
+    async fn semantic_tokens_full_delta_tracked_impl(
+        &self,
+        params: SemanticTokensDeltaParams,
+        request_id: crate::lsp::cache::RequestId,
+        cancel_token: crate::cancel::CancelToken,
+    ) -> Result<Option<SemanticTokensFullDeltaResult>> {
         let lsp_uri = params.text_document.uri.clone();
         let Ok(uri) = uri_to_url(&lsp_uri) else {
             log::warn!(
@@ -1348,7 +1418,13 @@ impl Kakehashi {
             work_done_progress_params: params.work_done_progress_params,
             partial_result_params: params.partial_result_params,
         };
-        let Some(current) = self.semantic_tokens_full_impl(full_params).await? else {
+        let Some(current) = self
+            .semantic_tokens_full_impl_with_tracking(
+                full_params,
+                Some((request_id, cancel_token.clone())),
+            )
+            .await?
+        else {
             return Ok(None);
         };
         let current = match current {
@@ -1366,13 +1442,16 @@ impl Kakehashi {
         wait_for_semantic_delta_commit_release().await;
         let edit_lock = self.documents.edit_lock(&uri);
         let _edit_guard = edit_lock.lock().await;
-        if !self.semantic_full_response_is_current(
-            &uri,
-            request_identity,
-            request_generation,
-            None,
-            &edit_lock,
-        ) {
+        if cancel_token.is_cancelled()
+            || !self.cache.is_request_active(&uri, request_id)
+            || !self.semantic_full_response_is_current(
+                &uri,
+                request_identity,
+                request_generation,
+                None,
+                &edit_lock,
+            )
+        {
             return Ok(None);
         }
 
@@ -2471,6 +2550,38 @@ mod tests {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn nested_full_keeps_borrowed_delta_tracking_active() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///semantic_delta_tracking.rs").expect("valid test URI");
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        publish_treeless(server, &uri, "fn main() {}", 0);
+        let (request_id, cancel_token) = server.cache.start_request(&uri);
+
+        server
+            .semantic_tokens_full_impl_with_tracking(
+                full_params(&uri),
+                Some((request_id, cancel_token.clone())),
+            )
+            .await
+            .expect("nested full should complete");
+        assert!(
+            server.cache.is_request_active(&uri, request_id),
+            "nested full must leave the outer delta's request ownership active"
+        );
+
+        let (newer_id, _newer_token) = server.cache.start_request(&uri);
+        assert!(cancel_token.is_cancelled());
+        assert!(!server.cache.is_request_active(&uri, request_id));
+        server.cache.finish_request(&uri, newer_id);
     }
 
     fn range_params(uri: &Url, range: Range) -> SemanticTokensRangeParams {
