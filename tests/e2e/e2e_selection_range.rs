@@ -625,3 +625,317 @@ enabled = true
         })
     );
 }
+
+#[test]
+fn e2e_selection_range_falls_back_to_native_for_incapable_or_empty_virtual_servers() {
+    fn run(mode: Option<&str>, event_dir: &std::path::Path) -> Value {
+        let config_dir = tempfile::TempDir::new().expect("config dir");
+        let config_path = config_dir.path().join("selection_range_fallback.toml");
+        let priorities = if mode.is_some() {
+            r#"[languages.markdown.layers.aggregation."textDocument/selectionRange"]
+priorities = ["virt", "native"]
+"#
+        } else {
+            r#"[languages.markdown.layers.aggregation."textDocument/selectionRange"]
+priorities = ["native"]
+"#
+        };
+        std::fs::write(&config_path, priorities).expect("write config");
+        let mut client = LspClient::builder()
+            .arg("--config-file")
+            .arg(config_path.to_str().expect("UTF-8 config path"))
+            .env("MOCK_LSP_CANCEL_DIR", event_dir.to_string_lossy())
+            .build();
+        let language_servers = mode.map_or_else(
+            || json!({}),
+            |mode| {
+                json!({
+                    "mock-selection-range-fallback": {
+                        "cmd": [mock_bin(), mode],
+                        "languages": ["lua"]
+                    }
+                })
+            },
+        );
+        client.send_request(
+            "initialize",
+            json!({
+                "processId": std::process::id(),
+                "rootUri": null,
+                "capabilities": {},
+                "initializationOptions": { "languageServers": language_servers }
+            }),
+        );
+        client.send_notification("initialized", json!({}));
+        let uri = "file:///selection_range_fallback.md";
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "markdown",
+                    "version": 1,
+                    "text": "```lua\nlocal value = 1\n```\n"
+                }
+            }),
+        );
+        selection_range_when_parsed(
+            &mut client,
+            json!({
+                "textDocument": { "uri": uri },
+                "positions": [{ "line": 1, "character": 7 }]
+            }),
+        )["result"]
+            .clone()
+    }
+
+    let native_events = tempfile::TempDir::new().expect("native events");
+    let expected_native = run(None, native_events.path());
+    for mode in ["selection-range-disabled", "selection-range-empty"] {
+        let events = tempfile::TempDir::new().expect("events");
+        let actual = run(Some(mode), events.path());
+        assert_eq!(
+            actual, expected_native,
+            "{mode} must preserve the exact native selection hierarchy"
+        );
+        let marker = events.path().join(format!("{mode}.request.json"));
+        if mode == "selection-range-disabled" {
+            assert!(
+                !marker.exists(),
+                "an incapable server must not be dispatched"
+            );
+        } else {
+            assert!(marker.exists(), "the capable empty server should be tried");
+        }
+    }
+}
+
+#[test]
+fn e2e_selection_range_skips_non_contiguous_combined_injections() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("selection_range_combined.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let query_path = config_dir.path().join("combined-injections.scm");
+    std::fs::write(
+        &query_path,
+        r#"
+        (fenced_code_block
+          (info_string (language) @injection.language)
+          (code_fence_content) @injection.content
+          (#set! injection.combined)
+          (#set! injection.include-children))
+        "#,
+    )
+    .expect("write injection query");
+    let events = tempfile::TempDir::new().expect("events");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("UTF-8 config path"))
+        .env("MOCK_LSP_CANCEL_DIR", events.path().to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-selection-range": {
+                        "cmd": [mock_bin(), "selection-range-virt"],
+                        "languages": ["lua"]
+                    }
+                },
+                "languages": {
+                    "markdown": {
+                        "queries": [{
+                            "path": query_path.to_str().expect("UTF-8 query path"),
+                            "kind": "injections"
+                        }],
+                        "layers": { "aggregation": {
+                            "textDocument/selectionRange": {
+                                "priorities": ["virt", "native"]
+                            }
+                        }}
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let warmup_uri = "file:///selection_range_combined_warmup.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": warmup_uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "```lua\ncode\n```\n"
+            }
+        }),
+    );
+    let marker = events.path().join("selection-range-virt.request.json");
+    poll_until(100, 50, || {
+        let _ = client.send_request(
+            "textDocument/selectionRange",
+            json!({
+                "textDocument": { "uri": warmup_uri },
+                "positions": [{ "line": 1, "character": 1 }]
+            }),
+        );
+        marker.exists().then_some(())
+    })
+    .expect("a contiguous virtual request should reach the ready server");
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": warmup_uri } }),
+    );
+    std::fs::remove_file(&marker).expect("clear warmup marker");
+    let uri = "file:///selection_range_combined.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "```lua\nfirst\n```\ngap\n```lua\nsecond\n```\n"
+            }
+        }),
+    );
+    let response = selection_range_when_parsed(
+        &mut client,
+        json!({
+            "textDocument": { "uri": uri },
+            "positions": [{ "line": 5, "character": 2 }]
+        }),
+    );
+    assert!(
+        response["result"].is_array(),
+        "native fallback should answer"
+    );
+    assert!(
+        !marker.exists(),
+        "a non-contiguous combined virtual document must not be dispatched"
+    );
+}
+
+#[test]
+fn e2e_selection_range_rejects_a_virtual_response_after_content_changes() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("selection_range_stale.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/selectionRange"]
+priorities = ["virt"]
+"#,
+    )
+    .expect("write config");
+    let events = tempfile::TempDir::new().expect("events");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("UTF-8 config path"))
+        .env("MOCK_LSP_CANCEL_DIR", events.path().to_string_lossy())
+        .env(
+            "KAKEHASHI_E2E_INLINE_VALUE_CHANGE_DIR",
+            events.path().to_string_lossy(),
+        )
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-selection-range": {
+                        "cmd": [mock_bin(), "selection-range-delayed"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///selection_range_stale.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "```lua\nold!\n```\n"
+            }
+        }),
+    );
+
+    // Polling establishes the parse/virtual document before starting the one
+    // deliberately delayed request.
+    std::fs::write(
+        events.path().join("selection-range-delayed.release"),
+        b"release",
+    )
+    .expect("release warmup");
+    let _ = selection_range_when_parsed(
+        &mut client,
+        json!({
+            "textDocument": { "uri": uri },
+            "positions": [{ "line": 1, "character": 1 }]
+        }),
+    );
+    std::fs::remove_file(events.path().join("selection-range-delayed.release"))
+        .expect("re-arm delay");
+    let marker = events.path().join("selection-range-delayed.request.json");
+    std::fs::remove_file(&marker).expect("clear warmup marker");
+    let request_id = client.send_request_async(
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": { "uri": uri },
+            "positions": [{ "line": 1, "character": 1 }]
+        }),
+    );
+    assert!(
+        (0..60).any(|_| {
+            if marker.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "the delayed request should reach the virtual server"
+    );
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "```lua\nchanged\n```\n" }]
+        }),
+    );
+    assert!(
+        (0..60).any(|_| {
+            if events.path().join("changed").exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "didChange should be applied while the response is delayed"
+    );
+    std::fs::write(
+        events.path().join("selection-range-delayed.release"),
+        b"release",
+    )
+    .expect("release delayed response");
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32801),
+        "a response authored against old content must be rejected: {response:?}"
+    );
+}
