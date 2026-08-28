@@ -48,7 +48,9 @@ pub(crate) enum TokenSnapshot {
     /// compute against it.
     Current(std::sync::Arc<crate::document::snapshot::ParseSnapshot>),
     /// Unregistered/closed URI, or the first parse never landed within its
-    /// backstop — the handlers' empty-tokens fallback applies.
+    /// backstop. The native layer contributes no tokens; `full` may still route
+    /// through configured host/virtual layers, while `full/delta` falls back to
+    /// a full response.
     Absent,
     /// The snapshot still trailed the live text when the settle backstop
     /// expired — reject with `ContentModified`; the parse loop's settle
@@ -185,6 +187,30 @@ impl Kakehashi {
         current
     }
 
+    fn semantic_full_response_is_current(
+        &self,
+        uri: &Url,
+        live_identity: (u64, u64),
+        generation: u64,
+        snapshot: Option<&std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
+        edit_lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
+    ) -> bool {
+        self.cache.semantic_token_generation() == generation
+            && snapshot.is_none_or(|snapshot| {
+                self.semantic_snapshot_is_current(
+                    uri,
+                    snapshot.incarnation,
+                    snapshot.parsed_version,
+                    generation,
+                    edit_lock,
+                )
+            })
+            && self.documents.get(uri).is_some_and(|document| {
+                document.incarnation() == live_identity.0
+                    && document.content_version() == live_identity.1
+            })
+    }
+
     /// Latest-completed snapshot resolution (parse-snapshot ADR §3): returns
     /// the newest published snapshot, which may trail the input. The only
     /// wait is the bounded first-parse wait (no snapshot for this lifetime
@@ -302,8 +328,10 @@ impl Kakehashi {
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
         // supersession, and cancellation contract. Once it resolves, the shared
-        // snapshot is current, so whole-document bridge discovery is immediate
-        // and the barrier cannot keep a superseded native request alive.
+        // A current snapshot makes whole-document bridge discovery immediate.
+        // When the first parse backstop expires, the no-snapshot path instead
+        // carries the live incarnation/content version through fan-out and
+        // revalidates that identity before returning.
         let Some(native_layer) = self
             .semantic_tokens_full_native_layer(params, &mut cancel_rx)
             .await?
@@ -411,19 +439,13 @@ impl Kakehashi {
             let _edit_guard = edit_lock.lock().await;
             if cancel_token.is_cancelled()
                 || !self.cache.is_request_active(&uri, request_id)
-                || snapshot.as_ref().is_some_and(|snapshot| {
-                    !self.semantic_snapshot_is_current(
-                        &uri,
-                        snapshot.incarnation,
-                        snapshot.parsed_version,
-                        generation,
-                        &edit_lock,
-                    )
-                })
-                || !self.documents.get(&uri).is_some_and(|document| {
-                    document.incarnation() == live_identity.0
-                        && document.content_version() == live_identity.1
-                })
+                || !self.semantic_full_response_is_current(
+                    &uri,
+                    live_identity,
+                    generation,
+                    snapshot.as_ref(),
+                    &edit_lock,
+                )
             {
                 return Ok(None);
             }
@@ -1856,6 +1878,52 @@ mod tests {
             assert!(!token.is_cancelled());
         }
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn absent_snapshot_full_fence_rejects_document_and_settings_changes() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///semantic_absent_snapshot.unknown").expect("valid test URI");
+        server.documents.insert(
+            uri.clone(),
+            "old".to_string(),
+            Some("unknown".to_string()),
+            None,
+        );
+        let view = server
+            .documents
+            .latest_snapshot(&uri)
+            .expect("document must be open");
+        assert!(view.slot.snapshot.is_none(), "snapshot must stay absent");
+        let identity = (view.slot.current_incarnation, view.content_version);
+        let generation = server.cache.semantic_token_generation();
+        let edit_lock = server.documents.edit_lock(&uri);
+        assert!(
+            server.semantic_full_response_is_current(&uri, identity, generation, None, &edit_lock,)
+        );
+
+        server
+            .documents
+            .update_document(uri.clone(), "new".to_string(), None);
+        assert!(
+            !server
+                .semantic_full_response_is_current(&uri, identity, generation, None, &edit_lock,)
+        );
+
+        let updated = server
+            .documents
+            .latest_snapshot(&uri)
+            .expect("document must remain open");
+        let updated_identity = (updated.slot.current_incarnation, updated.content_version);
+        server.cache.bump_semantic_token_generation();
+        assert!(!server.semantic_full_response_is_current(
+            &uri,
+            updated_identity,
+            generation,
+            None,
+            &edit_lock,
+        ));
     }
 
     /// Publish a snapshot for `uri` built from `text` at `parsed_version`,
