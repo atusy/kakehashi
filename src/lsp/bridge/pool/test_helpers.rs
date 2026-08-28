@@ -204,11 +204,24 @@ pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_diagnost
     key: ConnectionKey,
     identifier: Option<&str>,
 ) -> Arc<ConnectionHandle> {
+    create_handle_advertising_workspace_diagnostics_with_state(
+        ConnectionState::Ready,
+        key,
+        identifier,
+    )
+    .await
+}
+
+pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_diagnostics_with_state(
+    state: ConnectionState,
+    key: ConnectionKey,
+    identifier: Option<&str>,
+) -> Arc<ConnectionHandle> {
     use tower_lsp_server::ls_types::{
         DiagnosticOptions, DiagnosticServerCapabilities, ServerCapabilities,
     };
 
-    let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+    let handle = create_handle_with_key(state, key).await;
     handle.set_server_capabilities(ServerCapabilities {
         diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
             identifier: identifier.map(str::to_owned),
