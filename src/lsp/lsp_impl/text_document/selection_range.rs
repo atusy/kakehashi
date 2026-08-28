@@ -25,6 +25,13 @@ struct HostSelectionPass {
     content_version: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionLayer {
+    Virt,
+    Host,
+    Native,
+}
+
 impl HostSelectionPass {
     fn matches_snapshot(&self, incarnation: u64, content_version: u64) -> bool {
         self.incarnation == incarnation && self.content_version == content_version
@@ -92,6 +99,37 @@ fn selection_chain_is_valid(selection: &SelectionRange, position: Position, text
         current = selection.parent.as_deref();
     }
     true
+}
+
+fn append_containing_selection_ancestors(
+    mut selection: SelectionRange,
+    mut ancestors: SelectionRange,
+) -> SelectionRange {
+    fn attach_to_tail(selection: &mut SelectionRange, ancestors: SelectionRange) {
+        match selection.parent.as_mut() {
+            Some(parent) => attach_to_tail(parent, ancestors),
+            None => selection.parent = Some(Box::new(ancestors)),
+        }
+    }
+    let mut outer = &selection;
+    while let Some(parent) = outer.parent.as_ref() {
+        outer = parent;
+    }
+    let outer = outer.range;
+    loop {
+        let strictly_contains = ancestors.range.start <= outer.start
+            && ancestors.range.end >= outer.end
+            && ancestors.range != outer;
+        if strictly_contains {
+            attach_to_tail(&mut selection, ancestors);
+            break;
+        }
+        let Some(parent) = ancestors.parent.take() else {
+            break;
+        };
+        ancestors = *parent;
+    }
+    selection
 }
 
 /// The explicit-action bounded wait (parse-snapshot ADR §3): `selectionRange`
@@ -390,15 +428,20 @@ impl Kakehashi {
         let layer_walk = async {
             let mut selected = Vec::with_capacity(positions.len());
             for (index, position) in positions.into_iter().enumerate() {
-                let virt =
-                    self.selection_range_virt_layer(&lsp_uri, position, expected_incarnation);
+                let virt = async {
+                    self.selection_range_virt_layer(&lsp_uri, position, expected_incarnation)
+                        .await
+                        .map(|selection| {
+                            selection.map(|selection| (selection, SelectionLayer::Virt))
+                        })
+                };
                 let cached_host = reusable_host_results
                     .map(|host| &host.results)
                     .and_then(|results| results.get(index))
                     .cloned()
                     .flatten();
                 let host = async {
-                    if reusable_host_results.is_some() {
+                    let selection = if reusable_host_results.is_some() {
                         Ok(cached_host)
                     } else {
                         self.selection_range_host_layer(
@@ -408,7 +451,8 @@ impl Kakehashi {
                             expected_version,
                         )
                         .await
-                    }
+                    }?;
+                    Ok(selection.map(|selection| (selection, SelectionLayer::Host)))
                 };
                 let native = async {
                     if !native_enabled {
@@ -417,7 +461,10 @@ impl Kakehashi {
                         let mut receiver = native_rx.clone();
                         loop {
                             if let Some(ranges) = receiver.borrow().as_ref() {
-                                break Ok(ranges.get(index).cloned());
+                                break Ok(ranges
+                                    .get(index)
+                                    .cloned()
+                                    .map(|selection| (selection, SelectionLayer::Native)));
                             }
                             if receiver.changed().await.is_err() {
                                 break Ok(None);
@@ -428,11 +475,54 @@ impl Kakehashi {
                 let result = self
                     .walk_layer_futures(&lsp_uri, METHOD, METHOD, virt, host, native, |_| true)
                     .await?;
-                let Some(result) = result else {
+                let Some((mut result, source)) = result else {
                     // The protocol requires one result for every input position;
                     // never surface a shorter, index-shifted response.
                     return Ok(None);
                 };
+                if source == SelectionLayer::Virt {
+                    let lower_layers = layer_config
+                        .priorities
+                        .iter()
+                        .skip_while(|source| **source != LayerSource::Virt)
+                        .skip(1);
+                    for source in lower_layers {
+                        let ancestors = match source {
+                            LayerSource::Native if native_enabled => {
+                                let mut receiver = native_rx.clone();
+                                loop {
+                                    if let Some(ranges) = receiver.borrow().as_ref() {
+                                        break ranges.get(index).cloned();
+                                    }
+                                    if receiver.changed().await.is_err() {
+                                        break None;
+                                    }
+                                }
+                            }
+                            LayerSource::Host => {
+                                if reusable_host_results.is_some() {
+                                    reusable_host_results
+                                        .and_then(|host| host.results.get(index))
+                                        .cloned()
+                                        .flatten()
+                                } else {
+                                    self.selection_range_host_layer(
+                                        &lsp_uri,
+                                        position,
+                                        expected_incarnation,
+                                        expected_version,
+                                    )
+                                    .await?
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(ancestors) = ancestors {
+                            result = append_containing_selection_ancestors(result, ancestors);
+                            break;
+                        }
+                    }
+                }
                 selected.push(result);
             }
             Ok(Some(selected))
@@ -678,6 +768,42 @@ mod tests {
     use super::*;
     use crate::lsp::bridge::{LanguageServerPool, UpstreamId};
     use crate::lsp::request_id::CancelForwarder;
+
+    #[test]
+    fn virtual_selection_chain_appends_strictly_containing_host_ancestors() {
+        let virtual_chain = SelectionRange {
+            range: tower_lsp_server::ls_types::Range::new(Position::new(2, 4), Position::new(2, 8)),
+            parent: Some(Box::new(SelectionRange {
+                range: tower_lsp_server::ls_types::Range::new(
+                    Position::new(2, 2),
+                    Position::new(2, 10),
+                ),
+                parent: None,
+            })),
+        };
+        let host_chain = SelectionRange {
+            range: tower_lsp_server::ls_types::Range::new(Position::new(2, 4), Position::new(2, 8)),
+            parent: Some(Box::new(SelectionRange {
+                range: tower_lsp_server::ls_types::Range::new(
+                    Position::new(1, 0),
+                    Position::new(3, 0),
+                ),
+                parent: Some(Box::new(SelectionRange {
+                    range: tower_lsp_server::ls_types::Range::new(
+                        Position::new(0, 0),
+                        Position::new(4, 0),
+                    ),
+                    parent: None,
+                })),
+            })),
+        };
+
+        let merged = append_containing_selection_ancestors(virtual_chain, host_chain);
+        let virtual_outer = merged.parent.expect("virtual outer range");
+        let host_outer = virtual_outer.parent.expect("containing host range");
+        assert_eq!(host_outer.range.start, Position::new(1, 0));
+        assert!(host_outer.parent.is_some());
+    }
 
     #[tokio::test]
     async fn aborting_selection_compute_owner_cancels_blocking_work() {
