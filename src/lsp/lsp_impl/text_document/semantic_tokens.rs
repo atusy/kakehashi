@@ -415,17 +415,20 @@ impl Kakehashi {
             request_guard.finish();
             return Err(crate::error::content_modified_error());
         }
-        let Some(live_identity) = self
-            .documents
-            .get(&uri)
-            .map(|document| (document.incarnation(), document.content_version()))
+        let Some((live_identity, live_text, live_language)) =
+            self.documents.get(&uri).map(|document| {
+                (
+                    (document.incarnation(), document.content_version()),
+                    document.text_arc(),
+                    document.language_id().unwrap_or_default().to_string(),
+                )
+            })
         else {
             request_guard.finish();
             return Ok(None);
         };
         let native_result_id = native_tokens.result_id.clone();
         let native_data = native_tokens.data;
-        let native_data_for_comparison = native_data.clone();
         let expected = Some(snapshot.as_ref().map_or_else(
             || super::super::whole_document::WholeDocumentSnapshotIdentity {
                 incarnation: live_identity.0,
@@ -541,13 +544,23 @@ impl Kakehashi {
                 self.cache.store_wire_tokens(
                     uri.clone(),
                     tokens.clone(),
-                    snapshot.language.clone().unwrap_or_default(),
-                    self.cache.cache_key_for(&snapshot.text, generation),
-                    SemanticSnapshotIdentity {
-                        parsed_version: snapshot.parsed_version,
-                        incarnation: snapshot.incarnation,
-                        generation,
-                    },
+                    snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.language.clone())
+                        .unwrap_or(live_language),
+                    self.cache.cache_key_for(&live_text, generation),
+                    snapshot.as_ref().map_or(
+                        SemanticSnapshotIdentity {
+                            parsed_version: live_identity.1,
+                            incarnation: live_identity.0,
+                            generation,
+                        },
+                        |snapshot| SemanticSnapshotIdentity {
+                            parsed_version: snapshot.parsed_version,
+                            incarnation: snapshot.incarnation,
+                            generation,
+                        },
+                    ),
                 );
             }
             Ok(Some(SemanticTokensResult::Tokens(tokens)))
@@ -1295,6 +1308,21 @@ impl Kakehashi {
             return Ok(None);
         };
         let previous_result_id = params.previous_result_id.clone();
+        let Some(request_identity) = self
+            .documents
+            .get(&uri)
+            .map(|document| (document.incarnation(), document.content_version()))
+        else {
+            return Ok(None);
+        };
+        let request_generation = self.cache.semantic_token_generation();
+        // Hold the requested baseline across the nested full request. The wire
+        // cache is byte-bounded, so looking it up afterwards can lose the exact
+        // lineage when the newly computed full result evicts older entries.
+        let previous = self
+            .cache
+            .get_wire_tokens_if_valid(&uri, &previous_result_id)
+            .or_else(|| self.cache.get_tokens_if_valid(&uri, &previous_result_id));
         let full_params = SemanticTokensParams {
             text_document: params.text_document,
             work_done_progress_params: params.work_done_progress_params,
@@ -1310,18 +1338,23 @@ impl Kakehashi {
                 data: partial.data,
             },
         };
-        // Resolve the baseline only after the nested full request has established
-        // and fenced the current document incarnation. Baseline history retains
-        // the requested ID when that request stores its new result.
-        let previous = self
-            .cache
-            .get_wire_tokens_if_valid(&uri, &previous_result_id)
-            .or_else(|| self.cache.get_tokens_if_valid(&uri, &previous_result_id));
-
-        Ok(Some(match previous {
+        let result = match previous {
             Some(previous) => calculate_delta_or_full(&previous, &current, &previous_result_id),
             None => SemanticTokensFullDeltaResult::Tokens(current),
-        }))
+        };
+        let edit_lock = self.documents.edit_lock(&uri);
+        let _edit_guard = edit_lock.lock().await;
+        if !self.semantic_full_response_is_current(
+            &uri,
+            request_identity,
+            request_generation,
+            None,
+            &edit_lock,
+        ) {
+            return Ok(None);
+        }
+
+        Ok(Some(result))
     }
 
     pub(crate) async fn semantic_tokens_range_impl(
