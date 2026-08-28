@@ -22,6 +22,9 @@ expression: request
     },
     "capabilities": {
       "workspace": {
+        "symbol": {
+          "dynamicRegistration": false
+        },
         "executeCommand": {
           "dynamicRegistration": false
         },
