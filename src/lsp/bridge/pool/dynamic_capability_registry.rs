@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use tower_lsp_server::ls_types::{Registration, Unregistration};
 
@@ -21,16 +21,26 @@ pub(crate) struct DynamicCapabilityRegistry {
     /// Live workspace policy copied into every connection. The reader checks
     /// it before a suppressed log can consume bounded window-queue capacity.
     log_message_level: AtomicU8,
+    revision: AtomicU64,
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl DynamicCapabilityRegistry {
     pub(crate) fn new() -> Self {
+        let (changes, _receiver) = tokio::sync::watch::channel(0);
         Self {
             registrations: RwLock::new(HashMap::new()),
             log_message_level: AtomicU8::new(
                 crate::config::settings::LogMessageLevel::Info.as_u8(),
             ),
+            revision: AtomicU64::new(0),
+            changes,
         }
+    }
+
+    fn notify_change(&self) {
+        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        self.changes.send_replace(revision);
     }
 
     pub(crate) fn register(&self, registrations: Vec<Registration>) {
@@ -41,6 +51,8 @@ impl DynamicCapabilityRegistry {
         for reg in registrations {
             guard.insert(reg.id.clone(), reg);
         }
+        drop(guard);
+        self.notify_change();
     }
 
     pub(crate) fn unregister(&self, unregistrations: Vec<Unregistration>) {
@@ -51,6 +63,12 @@ impl DynamicCapabilityRegistry {
         for unreg in unregistrations {
             guard.remove(&unreg.id);
         }
+        drop(guard);
+        self.notify_change();
+    }
+
+    pub(crate) fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 
     pub(crate) fn has_registration(&self, method: &str) -> bool {

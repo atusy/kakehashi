@@ -739,8 +739,9 @@ impl Kakehashi {
         // (workspace/applyEdit is answered locally instead when the editor
         // never declared the capability). The reader tasks feed three
         // channels:
-        // - unbounded `upstream_rx` (loss-intolerant): DiagnosticRefresh and
-        //   work-done progress (create/$progress/forget).
+        // - unbounded `upstream_rx` (loss-intolerant): diagnostic refresh and
+        //   provider-registration events, plus work-done progress
+        //   (create/$progress/forget).
         // - bounded `window_rx` (best-effort, drop-on-full): window/logMessage,
         //   window/showMessage, and telemetry/event.
         // - unbounded `upstream_request_rx` (loss-intolerant): downstream
@@ -967,8 +968,8 @@ async fn forward_upstream_request(
 ///
 /// Consumes from three channels (loss-tolerance split, #378) and dispatches them
 /// to the LSP client:
-/// - `upstream_rx` (unbounded): `DiagnosticRefresh` — forwarded as
-///   `workspace/diagnostic/refresh` — the server-declared work-done progress
+/// - `upstream_rx` (unbounded): diagnostic refresh and provider-registration
+///   events — forwarded as `workspace/diagnostic/refresh` — the server-declared work-done progress
 ///   notifications (`CreateWorkDoneProgress`/`Progress`/`ForgetWorkDoneProgress`,
 ///   window-work-done-progress), and `PublishDiagnostics`/`EvictConnectionDiagnostics`,
 ///   which may not be lost. Each wake-up drains a capped burst and coalesces
@@ -2108,6 +2109,13 @@ async fn deliver_upstream_notification(
                 delivery_context.map(|context| context.diagnostic_publisher.as_ref())
             {
                 publisher.request_forwarded_diagnostic_refresh();
+            }
+        }
+        UpstreamNotification::DiagnosticProviderRegistered => {
+            if let Some(publisher) =
+                delivery_context.map(|context| context.diagnostic_publisher.as_ref())
+            {
+                publisher.request_pull_diagnostic_refresh(true);
             }
         }
         UpstreamNotification::PublishDiagnostics {

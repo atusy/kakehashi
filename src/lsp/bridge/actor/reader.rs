@@ -39,7 +39,7 @@ use crate::lsp::bridge::workspace::{self, WorkspaceFolderSet};
 /// keeping the bridge module decoupled from tower-lsp's Client type.
 ///
 /// Two channels carry these, split by loss tolerance:
-/// - `DiagnosticRefresh` travels on an **unbounded** channel: dropping one
+/// - Diagnostic refresh events travel on an **unbounded** channel: dropping one
 ///   would silently stale the editor's diagnostics, and its volume is tiny
 ///   (one per downstream `workspace/diagnostic/refresh`).
 /// - `LogMessage`/`ShowMessage`/`TelemetryEvent` travel on a **bounded** channel
@@ -56,6 +56,10 @@ pub(crate) enum UpstreamNotification {
     /// Request upstream to re-pull diagnostics.
     /// Sent when downstream server issues `workspace/diagnostic/refresh`.
     DiagnosticRefresh,
+    /// A workspace-diagnostic provider became routable after initialization.
+    /// Unlike a downstream refresh, this changes the producer plan itself, so
+    /// the upstream delivery path must bypass prefetch absorption.
+    DiagnosticProviderRegistered,
     /// A downstream-initiated `textDocument/publishDiagnostics`
     /// (push-propagation-diagnostic-forwarding). The forwarding loop classifies
     /// `uri`: a virtual injection URI resolves to its host document + region (a
@@ -1094,7 +1098,7 @@ async fn handle_server_request(
         if workspace_diagnostics_registered {
             let _ = deps
                 .upstream_tx
-                .send(UpstreamNotification::DiagnosticRefresh);
+                .send(UpstreamNotification::DiagnosticProviderRegistered);
         }
     }
     // A downstream server may wait for this response before answering the
@@ -2048,7 +2052,69 @@ mod tests {
             upstream_rx
                 .try_recv()
                 .expect("registration schedules a retry"),
-            UpstreamNotification::DiagnosticRefresh
+            UpstreamNotification::DiagnosticProviderRegistered
+        );
+    }
+
+    #[tokio::test]
+    async fn register_capability_is_published_only_after_its_ack_is_queued() {
+        let router = ResponseRouter::new();
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        response_tx
+            .send(OutboundMessage::Untracked(json!({ "blocker": true })))
+            .await
+            .unwrap();
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let deps = ServerRequestDeps {
+            settings: Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
+            response_tx,
+            dynamic_capabilities: Arc::clone(&dynamic_capabilities),
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+        };
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "client/registerCapability",
+            "params": {
+                "registrations": [{
+                    "id": "diag-1",
+                    "method": "textDocument/diagnostic",
+                    "registerOptions": { "workspaceDiagnostics": true }
+                }]
+            }
+        });
+        let task = tokio::spawn(async move {
+            handle_message(request, &router, "", &deps).await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !dynamic_capabilities.has_registration("textDocument/diagnostic"),
+            "a waiter must not observe the capability before its ack can enter writer FIFO"
+        );
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "the retry event must not overtake the registration acknowledgement"
+        );
+        let _blocker = response_rx.recv().await.expect("prefilled blocker");
+        let ack = response_rx.recv().await.expect("registration ack");
+        assert!(matches!(ack, OutboundMessage::Untracked(value) if value["id"] == 1));
+        task.await.unwrap();
+        assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
+        assert_eq!(
+            upstream_rx.try_recv().expect("registration retry event"),
+            UpstreamNotification::DiagnosticProviderRegistered
         );
     }
 

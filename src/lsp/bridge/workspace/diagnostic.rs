@@ -26,6 +26,7 @@ use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
 
 const DIAGNOSTIC_METHOD: &str = "workspace/diagnostic";
 const DIAGNOSTIC_REGISTRATION_METHOD: &str = "textDocument/diagnostic";
+const DYNAMIC_REGISTRATION_SETTLE: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DiagnosticProvider {
@@ -103,6 +104,31 @@ fn diagnostic_providers(handle: &ConnectionHandle) -> Vec<DiagnosticProvider> {
         }
     }
     providers
+}
+
+async fn diagnostic_providers_after_registration_settle(
+    handle: &ConnectionHandle,
+    admit: &(dyn Fn() -> bool + Sync),
+) -> Vec<DiagnosticProvider> {
+    // Subscribe before the first snapshot so a registration committed between
+    // the read and `changed()` cannot be missed. LSP has no "registration set
+    // complete" signal, so a cold capability-less snapshot gets one short
+    // settle window; a later registration also schedules a forced upstream
+    // refresh from the reader path.
+    let mut changes = handle.dynamic_capabilities().subscribe_changes();
+    let deadline = tokio::time::Instant::now() + DYNAMIC_REGISTRATION_SETTLE;
+    loop {
+        let providers = diagnostic_providers(handle);
+        if !providers.is_empty() || !admit() {
+            return providers;
+        }
+        if tokio::time::timeout_at(deadline, changes.changed())
+            .await
+            .is_err()
+        {
+            return diagnostic_providers(handle);
+        }
+    }
 }
 
 fn params_for_provider(mut params: Value, provider: &DiagnosticProvider) -> Value {
@@ -351,7 +377,12 @@ impl LanguageServerPool {
                         let virtual_uris = Arc::new(
                             self.observe_virtual_uris_for_connection(handle.key(), generation),
                         );
-                        let requests = diagnostic_providers(&handle).into_iter().map(|provider| {
+                        let providers = diagnostic_providers_after_registration_settle(
+                            &handle,
+                            &workspace_admit,
+                        )
+                        .await;
+                        let requests = providers.into_iter().map(|provider| {
                             let params = params_for_provider(params.clone(), &provider);
                             let upstream_id = upstream_id.clone();
                             let handle = Arc::clone(&handle);
@@ -938,6 +969,39 @@ mod tests {
                 None,
                 Some("zeta".into())
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_plan_waits_for_post_initialize_dynamic_registration() {
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("diagnostics"),
+        )
+        .await;
+        let task_handle = Arc::clone(&handle);
+        let task = tokio::spawn(async move {
+            diagnostic_providers_after_registration_settle(&task_handle, &|| true).await
+        });
+
+        tokio::task::yield_now().await;
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "dynamic".into(),
+            method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "identifier": "dynamic",
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
+        }]);
+
+        assert_eq!(
+            task.await.unwrap(),
+            vec![DiagnosticProvider {
+                identifier: Some("dynamic".into()),
+                has_static_provider: false,
+                dynamic_registration_ids: vec!["dynamic".into()],
+            }]
         );
     }
 
