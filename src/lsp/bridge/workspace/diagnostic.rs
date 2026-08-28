@@ -260,6 +260,16 @@ fn combine_producer_reports(
     }
 }
 
+fn combine_complete_provider_reports(
+    reports: impl IntoIterator<Item = io::Result<Option<WorkspaceDiagnosticReport>>>,
+) -> Option<WorkspaceDiagnosticReport> {
+    let reports: Option<Vec<_>> = reports
+        .into_iter()
+        .map(|report| report.ok().flatten())
+        .collect();
+    reports.map(combine_producer_reports)
+}
+
 impl LanguageServerPool {
     #[cfg(test)]
     async fn aggregate_admitted_workspace_diagnostic_reports<F>(
@@ -407,13 +417,9 @@ impl LanguageServerPool {
                                     Some(&workspace_admit),
                                 )
                                 .await
-                                .ok()
-                                .flatten()
                             }
                         });
-                        let report = combine_producer_reports(
-                            join_all(requests).await.into_iter().flatten(),
-                        );
+                        let report = combine_complete_provider_reports(join_all(requests).await)?;
                         if !self
                             .workspace_diagnostic_producer_is_live(&handle, generation)
                             .await
@@ -451,15 +457,7 @@ impl LanguageServerPool {
     ) -> io::Result<Option<WorkspaceDiagnosticReport>> {
         let key = handle.key();
         let (request_id, response_rx) =
-            match self.register_request_for_handle_with_upstream(upstream_id.clone(), handle) {
-                Ok(request) => request,
-                Err(error) => {
-                    if let Some(id) = &upstream_id {
-                        self.unregister_upstream_request(id, key);
-                    }
-                    return Err(error);
-                }
-            };
+            self.register_request_for_handle_with_upstream(upstream_id.clone(), handle)?;
         let mut guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
         let request = JsonRpcRequest::new(request_id.into(), DIAGNOSTIC_METHOD, params);
         {
@@ -647,6 +645,29 @@ mod tests {
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             ["old-incarnation", "new-incarnation", "closed"]
+        );
+    }
+
+    #[test]
+    fn producer_combination_is_atomic_across_provider_failures() {
+        let successful = || WorkspaceDiagnosticReport {
+            items: vec![full("file:///workspace/a.rs", Some(1), "alpha")],
+        };
+
+        assert!(
+            combine_complete_provider_reports([
+                Ok(Some(successful())),
+                Err(io::Error::other("provider failed")),
+            ])
+            .is_none()
+        );
+        assert!(combine_complete_provider_reports([Ok(Some(successful())), Ok(None)]).is_none());
+        assert_eq!(
+            combine_complete_provider_reports([Ok(Some(successful()))])
+                .expect("complete provider set")
+                .items
+                .len(),
+            1
         );
     }
 
