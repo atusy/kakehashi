@@ -504,9 +504,6 @@ impl LanguageServerPool {
         if !handle.has_capability(method) {
             return Ok(None);
         }
-        if let Some(attempted) = attempted {
-            attempted.store(true, std::sync::atomic::Ordering::Release);
-        }
         // Carried out with the response so a caller that must name this exact
         // connection (the `workspace/executeCommand` routing token) or ask what
         // it advertises (`completionItem/resolve`) does not re-resolve it —
@@ -520,6 +517,7 @@ impl LanguageServerPool {
                 upstream_request_id,
                 expected_incarnation,
                 revision_text_reader,
+                attempted,
                 |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
                 move |response, incarnation, connection_generation| {
                     (
@@ -569,6 +567,7 @@ impl LanguageServerPool {
             handle,
             doc,
             upstream_request_id,
+            None,
             None,
             None,
             |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
@@ -654,6 +653,7 @@ impl LanguageServerPool {
                 upstream_request_id,
                 None,
                 None,
+                None,
                 |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
                 move |response, _incarnation, _connection_generation| {
                     if response_has_jsonrpc_error(&response, method) {
@@ -686,6 +686,7 @@ impl LanguageServerPool {
     /// The skeleton mirrors `execute_bridge_request_with_handle` minus the
     /// virtual URI and the coordinate translation — host responses are the
     /// downstream server's verbatim answer.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_host_request<T, P: serde::Serialize>(
         &self,
         handle: Arc<ConnectionHandle>,
@@ -693,6 +694,7 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
         expected_incarnation: Option<u64>,
         revision_text_reader: Option<HostTextReader>,
+        attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
         build_request: impl FnOnce(RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, u64, u64) -> T,
     ) -> io::Result<T> {
@@ -721,6 +723,9 @@ impl LanguageServerPool {
                 kind,
                 format!("failed to apply host routing workspace folders: {error}"),
             ));
+        }
+        if let Some(attempted) = attempted {
+            attempted.store(true, std::sync::atomic::Ordering::Release);
         }
         if let Some(ref id) = upstream_request_id {
             self.register_upstream_request_for_handle(id.clone(), &handle);
@@ -1008,6 +1013,48 @@ mod tests {
             !can_notify_host_document(&handle, &|_| true),
             "a mapped but failed handle is not a live notification target"
         );
+    }
+
+    #[tokio::test]
+    async fn routing_suppression_does_not_mark_host_bridge_attempted() {
+        let pool = LanguageServerPool::new();
+        let uri = Url::parse("file:///test/suppressed-host.md").unwrap();
+        pool.open_host_incarnation(&uri, 1).await;
+        let key = ConnectionKey::for_server("test-server");
+        let handle = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            key.clone(),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        pool.set_host_routing_suppressed(&uri, &key);
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let result = pool
+            .execute_host_request(
+                handle,
+                &HostDocument {
+                    uri: &uri,
+                    language_id: "markdown",
+                    text: "text",
+                },
+                None,
+                Some(1),
+                None,
+                Some(Arc::clone(&attempted)),
+                |request_id| {
+                    JsonRpcRequest::new(
+                        request_id.as_i64(),
+                        "test/request",
+                        serde_json::Value::Null,
+                    )
+                },
+                |_, _, _| (),
+            )
+            .await;
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotConnected);
+        assert!(!attempted.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

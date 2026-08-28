@@ -126,9 +126,6 @@ impl LanguageServerPool {
         let Some(legend) = handle.semantic_tokens_legend().cloned() else {
             return Ok(None);
         };
-        if let Some(attempted) = attempted {
-            attempted.store(true, std::sync::atomic::Ordering::Release);
-        }
         let host_range = Range::new(
             Position::new(offset.line(), offset.column_for_line(0)),
             region_end,
@@ -142,6 +139,7 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             expected_incarnation,
+            attempted,
             |virtual_uri, request_id| {
                 build_semantic_tokens_full_request(virtual_uri, request_id, client_progress_token)
             },
@@ -201,6 +199,7 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             Some(expected_incarnation),
+            None,
             |virtual_uri, request_id| {
                 build_semantic_tokens_range_request(
                     virtual_uri,
