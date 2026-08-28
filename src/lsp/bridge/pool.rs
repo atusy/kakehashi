@@ -349,7 +349,7 @@ pub(crate) struct HostVirtualContents {
 
 type LatestVirtualContents = DashMap<Url, HostVirtualContents>;
 type LatestVirtualContentSnapshot = (Option<Arc<str>>, (u64, u64));
-type ConnectionAcquiredObserver = dyn Fn(&Arc<ConnectionHandle>) + Sync;
+type ConnectionAcquiredObserver<'a> = dyn Fn(&Arc<ConnectionHandle>) + Sync + 'a;
 
 impl OpenClaimGuard {
     fn disarm(&mut self) {
@@ -2923,7 +2923,7 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         timeout: Duration,
         admit: &(dyn Fn() -> bool + Sync),
-        on_acquired: Option<&ConnectionAcquiredObserver>,
+        on_acquired: Option<&ConnectionAcquiredObserver<'_>>,
     ) -> io::Result<(Arc<ConnectionHandle>, u64)> {
         let workspace_generation = self.workspace_generation.load(Ordering::Acquire);
         if workspace_generation & 1 != 0 {
@@ -2987,7 +2987,7 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         timeout: Duration,
         admit: &(dyn Fn() -> bool + Sync),
-        on_acquired: &ConnectionAcquiredObserver,
+        on_acquired: &ConnectionAcquiredObserver<'_>,
     ) -> io::Result<(Vec<Arc<ConnectionHandle>>, u64)> {
         let initial_workspace_generation = self.workspace_generation.load(Ordering::Acquire);
         if initial_workspace_generation & 1 != 0 || !admit() {
@@ -3223,7 +3223,7 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
         admit: Option<&(dyn Fn() -> bool + Sync)>,
-        on_acquired: Option<&ConnectionAcquiredObserver>,
+        on_acquired: Option<&ConnectionAcquiredObserver<'_>>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         // `timeout` is the caller's overall budget; the incapable-shared divert
         // below acquires a second connection, so track elapsed time and hand it
@@ -3331,7 +3331,7 @@ impl LanguageServerPool {
         connection_key: ConnectionKey,
         marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         options: WaitReadyOptions<'_>,
-        on_acquired: Option<&ConnectionAcquiredObserver>,
+        on_acquired: Option<&ConnectionAcquiredObserver<'_>>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         let WaitReadyOptions {
             timeout,
@@ -3875,7 +3875,7 @@ impl LanguageServerPool {
         timeout: Duration,
         rootless: bool,
         admit: Option<&(dyn Fn() -> bool + Sync)>,
-        on_acquired: Option<&ConnectionAcquiredObserver>,
+        on_acquired: Option<&ConnectionAcquiredObserver<'_>>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         let mut connections = self.connections.lock().await;
 
