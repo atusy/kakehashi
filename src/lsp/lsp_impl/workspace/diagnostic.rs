@@ -158,9 +158,10 @@ mod tests {
 
         let cancel_forwarder = CancelForwarder::new(Arc::clone(&pool));
         let (service, _socket) = LspService::new(|client| {
-            Kakehashi::with_cancel_forwarder(client, Arc::clone(&pool), cancel_forwarder)
+            Kakehashi::with_cancel_forwarder(client, Arc::clone(&pool), cancel_forwarder.clone())
         });
         let server = service.inner();
+        let request_generation = cancel_forwarder.register_request_for_test(upstream_id.clone());
         let mut settings = WorkspaceSettings::default();
         settings.language_servers.insert(
             "diagnostics".into(),
@@ -202,5 +203,6 @@ mod tests {
         assert_eq!(result.unwrap_err().code, ErrorCode::InternalError);
         assert_eq!(pool.upstream_request_count(&upstream_id), 0);
         assert_eq!(handle.router().pending_count(), 0);
+        cancel_forwarder.unregister_request_for_test(&upstream_id, request_generation);
     }
 }
