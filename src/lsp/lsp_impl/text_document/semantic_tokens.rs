@@ -238,15 +238,24 @@ impl Kakehashi {
         edit_lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
     ) -> bool {
         self.cache.semantic_token_generation() == generation
-            && snapshot.is_none_or(|snapshot| {
-                self.semantic_snapshot_is_current(
-                    uri,
-                    snapshot.incarnation,
-                    snapshot.parsed_version,
-                    generation,
-                    edit_lock,
-                )
-            })
+            && snapshot.map_or_else(
+                || {
+                    self.documents.latest_snapshot(uri).is_some_and(|view| {
+                        view.slot.current_incarnation == live_identity.0
+                            && view.content_version == live_identity.1
+                            && view.slot.snapshot.is_none()
+                    })
+                },
+                |snapshot| {
+                    self.semantic_snapshot_is_current(
+                        uri,
+                        snapshot.incarnation,
+                        snapshot.parsed_version,
+                        generation,
+                        edit_lock,
+                    )
+                },
+            )
             && self.documents.get(uri).is_some_and(|document| {
                 document.incarnation() == live_identity.0
                     && document.content_version() == live_identity.1
@@ -2215,6 +2224,12 @@ mod tests {
         let edit_lock = server.documents.edit_lock(&uri);
         assert!(
             server.semantic_full_response_is_current(&uri, identity, generation, None, &edit_lock,)
+        );
+        publish_treeless(server, &uri, "old", 0);
+        assert!(
+            !server
+                .semantic_full_response_is_current(&uri, identity, generation, None, &edit_lock,),
+            "a snapshot published during parserless fan-out invalidates that response"
         );
 
         server
