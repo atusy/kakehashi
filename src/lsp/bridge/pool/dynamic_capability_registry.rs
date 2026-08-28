@@ -25,6 +25,7 @@ pub(crate) struct DynamicCapabilityRegistry {
     changes: tokio::sync::watch::Sender<u64>,
     diagnostic_registration_settled: tokio::sync::OnceCell<()>,
     static_workspace_diagnostic_provider: AtomicBool,
+    workspace_diagnostic_contributed: AtomicBool,
 }
 
 impl DynamicCapabilityRegistry {
@@ -39,6 +40,7 @@ impl DynamicCapabilityRegistry {
             changes,
             diagnostic_registration_settled: tokio::sync::OnceCell::new(),
             static_workspace_diagnostic_provider: AtomicBool::new(false),
+            workspace_diagnostic_contributed: AtomicBool::new(false),
         }
     }
 
@@ -88,6 +90,16 @@ impl DynamicCapabilityRegistry {
         self.static_workspace_diagnostic_provider
             .load(Ordering::Acquire)
             || self.registration_options_flag("textDocument/diagnostic", "workspaceDiagnostics")
+    }
+
+    pub(crate) fn mark_workspace_diagnostic_contributed(&self) {
+        self.workspace_diagnostic_contributed
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn has_workspace_diagnostic_contributed(&self) -> bool {
+        self.workspace_diagnostic_contributed
+            .load(Ordering::Acquire)
     }
 
     pub(crate) fn has_registration(&self, method: &str) -> bool {
