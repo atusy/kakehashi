@@ -19,6 +19,18 @@ use super::super::{Kakehashi, uri_to_url};
 
 const METHOD: &str = "textDocument/selectionRange";
 
+struct HostSelectionPass {
+    results: Vec<Option<SelectionRange>>,
+    incarnation: u64,
+    content_version: u64,
+}
+
+impl HostSelectionPass {
+    fn matches_snapshot(&self, incarnation: u64, content_version: u64) -> bool {
+        self.incarnation == incarnation && self.content_version == content_version
+    }
+}
+
 fn parse_single_host_selection_range(
     value: serde_json::Value,
     position: Position,
@@ -96,6 +108,25 @@ impl Drop for SelectionComputeCancelGuard {
     }
 }
 
+async fn race_native_producer<T>(
+    native_producer: impl std::future::Future<Output = Result<bool>>,
+    layer_walk: impl std::future::Future<Output = Result<Option<T>>>,
+) -> Result<Option<T>> {
+    tokio::pin!(native_producer);
+    tokio::pin!(layer_walk);
+    tokio::select! {
+        biased;
+        result = &mut layer_walk => result,
+        produced = &mut native_producer => {
+            if !produced? {
+                Ok(None)
+            } else {
+                layer_walk.await
+            }
+        }
+    }
+}
+
 impl Kakehashi {
     pub(crate) async fn selection_range_impl(
         &self,
@@ -152,10 +183,14 @@ impl Kakehashi {
                     expected_settings_generation,
                 )
                 .await?;
-            if host.iter().all(Option::is_some) || !has_parse_layer {
-                return Ok(host.into_iter().collect());
+            if let Some(host) = host {
+                if host.results.iter().all(Option::is_some) || !has_parse_layer {
+                    return Ok(host.results.into_iter().collect());
+                }
+                host_results = Some(host);
+            } else if !has_parse_layer {
+                return Ok(None);
             }
-            host_results = Some(host);
         } else if !has_parse_layer {
             return Ok(None);
         }
@@ -254,6 +289,12 @@ impl Kakehashi {
         };
         let expected_version = snapshot.parsed_version;
         let expected_incarnation = snapshot.incarnation;
+        if host_results
+            .as_ref()
+            .is_some_and(|host| !host.matches_snapshot(expected_incarnation, expected_version))
+        {
+            return Err(crate::error::content_modified_error());
+        }
         let Some(version_cancel) = self.documents.get(&uri).and_then(|document| {
             (document.incarnation() == expected_incarnation
                 && document.content_version() == expected_version)
@@ -263,6 +304,7 @@ impl Kakehashi {
         };
 
         let native_enabled = layer_config.allows(LayerSource::Native);
+        let reusable_host_results = host_results.as_ref();
         let (native_tx, native_rx) = tokio::sync::watch::channel(None);
         let language = std::sync::Arc::clone(&self.language);
         let native_positions = positions.clone();
@@ -338,13 +380,13 @@ impl Kakehashi {
                 .unwrap_or(serde_json::Value::Null);
                 let virt =
                     self.selection_range_virt_layer(&lsp_uri, position, expected_incarnation);
-                let cached_host = host_results
-                    .as_ref()
+                let cached_host = reusable_host_results
+                    .map(|host| &host.results)
                     .and_then(|results| results.get(index))
                     .cloned()
                     .flatten();
                 let host = async {
-                    if host_attempted {
+                    if reusable_host_results.is_some() {
                         Ok(cached_host)
                     } else {
                         self.selection_range_host_layer(
@@ -384,27 +426,14 @@ impl Kakehashi {
             }
             Ok(Some(selected))
         };
-        tokio::pin!(native_producer);
-        tokio::pin!(layer_walk);
+        let layer_race = race_native_producer(native_producer, layer_walk);
         let selected = tokio::select! {
             biased;
             _ = version_cancel.cancelled() => {
                 compute_cancel.cancel();
                 return Err(crate::error::content_modified_error());
             }
-            result = &mut layer_walk => result?,
-            produced = &mut native_producer => {
-                if !produced? {
-                    return Ok(None);
-                }
-                tokio::select! {
-                    biased;
-                    _ = version_cancel.cancelled() => {
-                        return Err(crate::error::content_modified_error());
-                    }
-                    result = &mut layer_walk => result?,
-                }
-            }
+            result = layer_race => result?,
         };
 
         let still_current = self.documents.latest_snapshot(&uri).is_some_and(|view| {
@@ -429,11 +458,13 @@ impl Kakehashi {
         positions: Vec<Position>,
         expected_settings_generation: u64,
     ) -> Result<Option<Vec<SelectionRange>>> {
-        Ok(self
+        let Some(pass) = self
             .selection_range_host_pass(lsp_uri, positions, expected_settings_generation)
             .await?
-            .into_iter()
-            .collect())
+        else {
+            return Ok(None);
+        };
+        Ok(pass.results.into_iter().collect())
     }
 
     async fn selection_range_host_pass(
@@ -441,9 +472,9 @@ impl Kakehashi {
         lsp_uri: &Uri,
         positions: Vec<Position>,
         expected_settings_generation: u64,
-    ) -> Result<Vec<Option<SelectionRange>>> {
+    ) -> Result<Option<HostSelectionPass>> {
         let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
-            return Ok(vec![None; positions.len()]);
+            return Ok(None);
         };
         let expected_incarnation = ctx.incarnation;
         let expected_version = ctx.content_version;
@@ -506,7 +537,11 @@ impl Kakehashi {
         {
             return Err(crate::error::content_modified_error());
         }
-        Ok(selected)
+        Ok(Some(HostSelectionPass {
+            results: selected,
+            incarnation: expected_incarnation,
+            content_version: expected_version,
+        }))
     }
 
     async fn selection_range_virt_layer(
@@ -654,6 +689,79 @@ mod tests {
         let _ = owner.await;
 
         assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn higher_priority_layer_drops_a_started_native_producer() {
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let producer_started = Arc::clone(&started);
+        let producer_dropped = Arc::clone(&dropped);
+        let native = async move {
+            let _drop_flag = DropFlag(producer_dropped);
+            producer_started.notify_one();
+            std::future::pending::<()>().await;
+            Ok(false)
+        };
+        let layer = async {
+            started.notified().await;
+            Ok(Some(7_u8))
+        };
+
+        assert_eq!(race_native_producer(native, layer).await.unwrap(), Some(7));
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "a winning higher-priority layer must cancel its native competitor"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_layer_walk_survives_an_unavailable_parser() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = url::Url::parse("file:///test/no_parser.hostonly").unwrap();
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
+        server.documents.insert(
+            uri,
+            "word\n".to_string(),
+            Some("hostonly".to_string()),
+            None,
+        );
+        assert!(!server.language.has_parser_available("hostonly"));
+
+        let selected = server
+            .walk_layer_futures(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                std::future::ready(Ok(None)),
+                std::future::ready(Ok(Some(7_u8))),
+                std::future::ready(Ok(None)),
+                |_| true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected, Some(7));
+    }
+
+    #[test]
+    fn cached_host_pass_is_bound_to_its_snapshot_lineage() {
+        let pass = HostSelectionPass {
+            results: Vec::new(),
+            incarnation: 4,
+            content_version: 9,
+        };
+
+        assert!(pass.matches_snapshot(4, 9));
+        assert!(!pass.matches_snapshot(4, 10));
+        assert!(!pass.matches_snapshot(5, 9));
     }
 
     #[tokio::test]
