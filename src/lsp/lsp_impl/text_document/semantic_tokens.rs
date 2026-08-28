@@ -166,32 +166,27 @@ struct SemanticFullComputation {
     result: SemanticTokensResult,
     pending_native: Option<PendingNativeBaseline>,
     pending_wire: Option<PendingWireBaseline>,
+    identity: (u64, u64),
+    generation: u64,
 }
 
 struct SemanticDeltaComputation {
     result: SemanticTokensFullDeltaResult,
     pending_native: Option<PendingNativeBaseline>,
     pending_wire: Option<PendingWireBaseline>,
+    identity: (u64, u64),
+    generation: u64,
 }
 
-fn commit_direct_wire_baseline(
+fn commit_full_baselines(
     cache: &crate::lsp::cache::CacheCoordinator,
-    uri: &Url,
-    request_id: crate::lsp::cache::RequestId,
-    direct_request: bool,
-    outcome: &mut Result<Option<SemanticFullComputation>>,
+    computed: &mut SemanticFullComputation,
 ) {
-    if direct_request
-        && let Ok(Some(computed)) = outcome
-        && cache
-            .with_active_request(uri, request_id, || {
-                if let Some(pending) = computed.pending_wire.take() {
-                    pending.commit(cache);
-                }
-            })
-            .is_none()
-    {
-        *outcome = Ok(None);
+    if let Some(pending) = computed.pending_native.take() {
+        pending.commit(cache);
+    }
+    if let Some(pending) = computed.pending_wire.take() {
+        pending.commit(cache);
     }
 }
 
@@ -443,9 +438,20 @@ impl Kakehashi {
         params: SemanticTokensParams,
         tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
     ) -> Result<Option<SemanticFullComputation>> {
-        let uri = uri_to_url(&params.text_document.uri).ok();
-        let absent_identity = uri.as_ref().and_then(|uri| {
-            let view = self.documents.latest_snapshot(uri)?;
+        let Ok(uri) = uri_to_url(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let direct_request = tracking.is_none();
+        let (request_id, cancel_token) = tracking.unwrap_or_else(|| self.cache.start_request(&uri));
+        let mut request_guard = SemanticRequestGuard::new(
+            std::sync::Arc::clone(&self.cache),
+            uri.clone(),
+            request_id,
+            cancel_token.clone(),
+            direct_request,
+        );
+        let tracking = Some((request_id, cancel_token));
+        let absent_identity = self.documents.latest_snapshot(&uri).and_then(|view| {
             view.slot.snapshot.is_none().then_some((
                 view.slot.current_incarnation,
                 view.content_version,
@@ -455,35 +461,44 @@ impl Kakehashi {
         let retry_params = params.clone();
         let retry_tracking = tracking.clone();
         let outcome = self
-            .semantic_tokens_full_impl_with_tracking_once(params, tracking)
+            .semantic_tokens_full_impl_with_tracking_once(params, tracking, direct_request)
             .await?;
         if outcome.is_some() {
+            request_guard.finish();
             return Ok(outcome);
         }
-        let retry_after_snapshot_publication = uri.as_ref().is_some_and(|uri| {
+        let retry_after_snapshot_publication =
             absent_identity.is_some_and(|(incarnation, content_version, generation)| {
                 self.cache.semantic_token_generation() == generation
-                    && self.documents.latest_snapshot(uri).is_some_and(|view| {
+                    && self.documents.latest_snapshot(&uri).is_some_and(|view| {
                         view.slot.current_incarnation == incarnation
                             && view.content_version == content_version
                             && view.slot.snapshot.is_some()
                     })
                     && retry_tracking.as_ref().is_some_and(|(request_id, cancel)| {
-                        !cancel.is_cancelled() && self.cache.is_request_active(uri, *request_id)
+                        !cancel.is_cancelled() && self.cache.is_request_active(&uri, *request_id)
                     })
-            })
-        });
+            });
         if !retry_after_snapshot_publication {
+            request_guard.finish();
             return Ok(None);
         }
-        self.semantic_tokens_full_impl_with_tracking_once(retry_params, retry_tracking)
-            .await
+        let outcome = self
+            .semantic_tokens_full_impl_with_tracking_once(
+                retry_params,
+                retry_tracking,
+                direct_request,
+            )
+            .await;
+        request_guard.finish();
+        outcome
     }
 
     async fn semantic_tokens_full_impl_with_tracking_once(
         &self,
         params: SemanticTokensParams,
         tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
+        direct_request: bool,
     ) -> Result<Option<SemanticFullComputation>> {
         const METHOD: &str = "textDocument/semanticTokens/full";
         let lsp_uri = params.text_document.uri.clone();
@@ -539,7 +554,6 @@ impl Kakehashi {
         // backstop expires instead, the no-snapshot path carries the live
         // incarnation/content version through fan-out and revalidates that
         // identity before returning.
-        let direct_request = tracking.is_none();
         let Some(native_layer) = self
             .semantic_tokens_full_native_layer(
                 params,
@@ -726,6 +740,8 @@ impl Kakehashi {
                 result: SemanticTokensResult::Tokens(tokens),
                 pending_native,
                 pending_wire,
+                identity: live_identity,
+                generation,
             }))
         };
         let mut outcome = match cancel_rx.as_mut() {
@@ -748,12 +764,56 @@ impl Kakehashi {
                 }
             }
         };
-        // The biased select above is the cancellation/supersession commit
-        // boundary. Never publish a wire result ID from inside `fan_out`: that
-        // future can finish concurrently with a cancellation which wins here,
-        // and caching a response the client never receives can evict its last
-        // usable delta baseline.
-        commit_direct_wire_baseline(&self.cache, &uri, request_id, direct_request, &mut outcome);
+        // The biased select above accepts the response before publication. A
+        // direct request then reacquires the document edit lock and holds it
+        // through the tracker-gated cache writes, so neither cancellation nor
+        // didChange can publish a baseline the client never receives.
+        if direct_request && matches!(outcome, Ok(Some(_))) {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let lock = edit_lock.lock();
+            let commit_guard = match cancel_rx.as_mut() {
+                Some(cancel_rx) => tokio::select! {
+                    biased;
+                    _ = cancel_rx => {
+                        cancel_token.cancel();
+                        outcome = Err(Error::request_cancelled());
+                        None
+                    }
+                    _ = cancel_token.cancelled() => {
+                        outcome = Ok(None);
+                        None
+                    }
+                    guard = lock => Some(guard),
+                },
+                None => tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        outcome = Ok(None);
+                        None
+                    }
+                    guard = lock => Some(guard),
+                },
+            };
+            if commit_guard.is_some()
+                && let Ok(Some(computed)) = &mut outcome
+            {
+                let current = self.cache.semantic_token_generation() == computed.generation
+                    && self.documents.get(&uri).is_some_and(|document| {
+                        document.incarnation() == computed.identity.0
+                            && document.content_version() == computed.identity.1
+                    });
+                if !current
+                    || self
+                        .cache
+                        .with_active_request(&uri, request_id, || {
+                            commit_full_baselines(&self.cache, computed);
+                        })
+                        .is_none()
+                {
+                    outcome = Ok(None);
+                }
+            }
+        }
         request_guard.finish();
         outcome
     }
@@ -1524,20 +1584,56 @@ impl Kakehashi {
                 }
             }
         };
-        if let Ok(Some(computed)) = &mut outcome
-            && self
-                .cache
-                .with_active_request(&uri, request_id, || {
-                    if let Some(pending) = computed.pending_native.take() {
-                        pending.commit(&self.cache);
+        if matches!(outcome, Ok(Some(_))) {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let lock = edit_lock.lock();
+            let commit_guard = match cancel_rx.as_mut() {
+                Some(cancel_rx) => tokio::select! {
+                    biased;
+                    _ = cancel_rx => {
+                        cancel_token.cancel();
+                        outcome = Err(Error::request_cancelled());
+                        None
                     }
-                    if let Some(pending) = computed.pending_wire.take() {
-                        pending.commit(&self.cache);
+                    _ = cancel_token.cancelled() => {
+                        outcome = Ok(None);
+                        None
                     }
-                })
-                .is_none()
-        {
-            outcome = Ok(None);
+                    guard = lock => Some(guard),
+                },
+                None => tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        outcome = Ok(None);
+                        None
+                    }
+                    guard = lock => Some(guard),
+                },
+            };
+            if commit_guard.is_some()
+                && let Ok(Some(computed)) = &mut outcome
+            {
+                let current = self.cache.semantic_token_generation() == computed.generation
+                    && self.documents.get(&uri).is_some_and(|document| {
+                        document.incarnation() == computed.identity.0
+                            && document.content_version() == computed.identity.1
+                    });
+                if !current
+                    || self
+                        .cache
+                        .with_active_request(&uri, request_id, || {
+                            if let Some(pending) = computed.pending_native.take() {
+                                pending.commit(&self.cache);
+                            }
+                            if let Some(pending) = computed.pending_wire.take() {
+                                pending.commit(&self.cache);
+                            }
+                        })
+                        .is_none()
+                {
+                    outcome = Ok(None);
+                }
+            }
         }
         request_guard.finish();
         outcome.map(|outcome| outcome.map(|computed| computed.result))
@@ -1615,6 +1711,7 @@ impl Kakehashi {
                     request_identity,
                     request_generation,
                     Some(snapshot),
+                    true,
                     &edit_lock,
                 )
             {
@@ -1627,6 +1724,8 @@ impl Kakehashi {
                     }),
                     pending_native: None,
                     pending_wire: None,
+                    identity: request_identity,
+                    generation: request_generation,
                 }));
             }
             return Ok(None);
@@ -1646,8 +1745,8 @@ impl Kakehashi {
         else {
             return Ok(None);
         };
-        let mut pending_native = current.pending_native;
-        let mut pending_wire = current.pending_wire;
+        let pending_native = current.pending_native;
+        let pending_wire = current.pending_wire;
         let current = match current.result {
             SemanticTokensResult::Tokens(tokens) => tokens,
             SemanticTokensResult::Partial(partial) => SemanticTokens {
@@ -1674,28 +1773,12 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        // Commit the newly served baseline while the document edit lock and
-        // this request's tracker entry are both still held. A didChange cannot
-        // slip between the freshness check and either cache write.
-        if self
-            .cache
-            .with_active_request(&uri, request_id, || {
-                if let Some(pending) = pending_native.take() {
-                    pending.commit(&self.cache);
-                }
-                if let Some(pending) = pending_wire.take() {
-                    pending.commit(&self.cache);
-                }
-            })
-            .is_none()
-        {
-            return Ok(None);
-        }
-
         Ok(Some(SemanticDeltaComputation {
             result,
             pending_native,
             pending_wire,
+            identity: request_identity,
+            generation: request_generation,
         }))
     }
 
@@ -2247,9 +2330,7 @@ fn semantic_virt_configs_select_servers(
     // a post-cap filter, matching dispatch.
     let capable_configs = configs
         .iter()
-        .filter(|config| {
-            !incapable.contains(&config.server_name) && !suppressed.contains(&config.server_name)
-        })
+        .filter(|config| !incapable.contains(&config.server_name))
         .cloned()
         .collect::<Vec<_>>();
     crate::lsp::aggregation::server::truncate_entries(
@@ -2554,7 +2635,7 @@ mod tests {
         );
         let mut languages = HashMap::new();
         languages.insert(
-            "unknown".to_string(),
+            "python".to_string(),
             LanguageSettings {
                 layers: Some(LayersConfig {
                     aggregation: Some(aggregation),
@@ -2568,11 +2649,16 @@ mod tests {
             ..Default::default()
         });
 
-        let uri = Url::parse("file:///semantic_host_only.unknown").expect("valid test URI");
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("python".to_string(), tree_sitter_python::LANGUAGE.into());
+
+        let uri = Url::parse("file:///semantic_host_only.py").expect("valid test URI");
         server.documents.insert(
             uri.clone(),
             "unparsed".to_string(),
-            Some("unknown".to_string()),
+            Some("py".to_string()),
             None,
         );
         publish_treeless(server, &uri, "unparsed", 0);
@@ -2881,24 +2967,17 @@ mod tests {
                 .is_none(),
             "a nested full baseline must remain private before the delta fence"
         );
-        let mut outcome = Ok(Some(SemanticFullComputation {
+        let mut computed = SemanticFullComputation {
             result: SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: Some(result_id.clone()),
                 data: Vec::new(),
             }),
             pending_native: None,
             pending_wire: Some(pending),
-        }));
-        let (request_id, _cancel) = server.cache.start_request(&uri);
-        commit_direct_wire_baseline(&server.cache, &uri, request_id, false, &mut outcome);
-        assert!(
-            server
-                .cache
-                .get_wire_tokens_if_valid(&uri, &result_id)
-                .is_none(),
-            "a nested full must leave the baseline for the outer delta fence"
-        );
-        commit_direct_wire_baseline(&server.cache, &uri, request_id, true, &mut outcome);
+            identity: (1, 1),
+            generation: 1,
+        };
+        commit_full_baselines(&server.cache, &mut computed);
         assert!(
             server
                 .cache
