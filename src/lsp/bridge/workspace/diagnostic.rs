@@ -357,6 +357,15 @@ impl LanguageServerPool {
             .iter()
             .map(|completed| Arc::clone(&completed.virtual_uris))
             .collect::<Vec<_>>();
+        let provider_plans = admitted
+            .iter()
+            .map(|completed| {
+                (
+                    Arc::clone(&completed.handle),
+                    completed.provider_plan.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
         let _provenance_guards = provenance_observers
             .iter()
             .map(|observer| observer.provenance_read_guard())
@@ -365,10 +374,14 @@ impl LanguageServerPool {
             .into_iter()
             .map(|completed| sanitize_report(completed.report, &completed.virtual_uris));
         let result = aggregate_reports(reports);
-        if !admit() {
+        if !admit()
+            || provider_plans
+                .iter()
+                .any(|(handle, plan)| diagnostic_providers(handle) != *plan)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "workspace diagnostic admission expired after final aggregation",
+                "workspace diagnostic admission or provider plan expired after final aggregation",
             ));
         }
         Ok(result)
@@ -1138,6 +1151,55 @@ mod tests {
 
         let error = result.expect_err("a completed stale plan must not be aggregated");
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn final_aggregation_rechecks_provider_plans_after_building_result() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("diagnostics");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "alpha-registration".into(),
+            method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "identifier": "alpha",
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
+        }]);
+        let provider_plan = diagnostic_providers(&handle);
+        pool.connections().await.insert(key, Arc::clone(&handle));
+        let generation = pool.document_connection_generation(handle.key());
+        let virtual_uris =
+            Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
+        let checks = AtomicUsize::new(0);
+
+        let result = pool
+            .aggregate_admitted_workspace_diagnostic_reports(
+                [std::future::ready(Some(CompletedDiagnosticProducer {
+                    provider_plan,
+                    handle: Arc::clone(&handle),
+                    generation,
+                    report: WorkspaceDiagnosticReport::default(),
+                    virtual_uris,
+                }))],
+                &|| {
+                    if checks.fetch_add(1, Ordering::SeqCst) == 2 {
+                        handle
+                            .dynamic_capabilities()
+                            .unregister(vec![Unregistration {
+                                id: "alpha-registration".into(),
+                                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+                            }]);
+                    }
+                    true
+                },
+            )
+            .await;
+
+        let error = result.expect_err("a plan changed during aggregation must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
