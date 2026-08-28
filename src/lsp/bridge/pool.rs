@@ -337,11 +337,16 @@ pub(crate) struct HostVirtualContents {
     // container, so a stale publisher holding the old DashMap guard can only
     // mutate detached state that current didOpen readers cannot observe.
     pub(crate) incarnation: u64,
+    // Serializes publication and observation of the host identity together
+    // with its virtual contents. A virtual didOpen must never pair a new host
+    // revision with content left over from the preceding publication.
+    publication: std::sync::RwLock<()>,
     content_version: AtomicU64,
     contents: DashMap<String, DashMap<String, Arc<str>>>,
 }
 
 type LatestVirtualContents = DashMap<Url, HostVirtualContents>;
+type LatestVirtualContentSnapshot = (Option<Arc<str>>, (u64, u64));
 
 impl OpenClaimGuard {
     fn disarm(&mut self) {
@@ -2112,6 +2117,34 @@ impl LanguageServerPool {
             .await
     }
 
+    fn latest_virtual_content_snapshot(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+    ) -> Option<LatestVirtualContentSnapshot> {
+        self.latest_virtual_contents.get(host_uri).map(|host| {
+            let _publication = host
+                .publication
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let content = host
+                .contents
+                .get(virtual_uri.language())
+                .and_then(|regions| {
+                    regions
+                        .get(virtual_uri.region_id())
+                        .map(|entry| Arc::clone(entry.value()))
+                });
+            (
+                content,
+                (
+                    host.incarnation,
+                    host.content_version.load(Ordering::Acquire),
+                ),
+            )
+        })
+    }
+
     /// Send `didOpen` for the virtual document if not already opened, registering
     /// all tracking state on success. Callers handle error cleanup (router entry
     /// and upstream-request registry).
@@ -2215,23 +2248,7 @@ impl LanguageServerPool {
         // Read as close to enqueue as possible, after pending registration's
         // awaits. If an edit publishes after this read, it observes the open
         // claim and serializes a didChange behind this didOpen transition.
-        let current = self.latest_virtual_contents.get(host_uri).map(|host| {
-            let content = host
-                .contents
-                .get(virtual_uri.language())
-                .and_then(|regions| {
-                    regions
-                        .get(virtual_uri.region_id())
-                        .map(|entry| Arc::clone(entry.value()))
-                });
-            (
-                content,
-                (
-                    host.incarnation,
-                    host.content_version.load(Ordering::Acquire),
-                ),
-            )
-        });
+        let current = self.latest_virtual_content_snapshot(host_uri, virtual_uri);
         let virtual_content = current
             .as_ref()
             .and_then(|(content, _)| content.as_deref())
@@ -2330,6 +2347,10 @@ impl LanguageServerPool {
         if host.incarnation != incarnation {
             return;
         }
+        let _publication = host
+            .publication
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         host.content_version
             .store(content_version, Ordering::Release);
         if let Some(regions) = host.contents.get(language) {
@@ -2394,6 +2415,7 @@ impl LanguageServerPool {
             host_uri.clone(),
             HostVirtualContents {
                 incarnation,
+                publication: std::sync::RwLock::new(()),
                 content_version: AtomicU64::new(0),
                 contents: DashMap::new(),
             },
@@ -2422,6 +2444,10 @@ impl LanguageServerPool {
         let invalidated: std::collections::HashSet<String> =
             invalidated_ulids.iter().map(ToString::to_string).collect();
         if let Some(host) = self.latest_virtual_contents.get(host_uri) {
+            let _publication = host
+                .publication
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             host.contents.retain(|_, regions| {
                 regions.retain(|region_id, _| !invalidated.contains(region_id));
                 !regions.is_empty()
@@ -2435,6 +2461,10 @@ impl LanguageServerPool {
         replaced: &[OpenedVirtualDoc],
     ) {
         if let Some(host) = self.latest_virtual_contents.get(host_uri) {
+            let _publication = host
+                .publication
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for doc in replaced {
                 let language = doc.virtual_uri.language();
                 let region_id = doc.virtual_uri.region_id();
@@ -6879,6 +6909,43 @@ mod tests {
             Arc::clone(regions.get(TEST_ULID_LUA_0).unwrap().value())
         };
         assert!(Arc::ptr_eq(&before, &after));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn latest_virtual_content_snapshot_keeps_content_and_host_revision_together() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/cache-publication.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.record_latest_virtual_content(&host_uri, 1, 0, "lua", TEST_ULID_LUA_0, "revision-0");
+
+        let writer_pool = Arc::clone(&pool);
+        let writer_uri = host_uri.clone();
+        let writer = tokio::spawn(async move {
+            for revision in 1..=10_000 {
+                writer_pool.record_latest_virtual_content(
+                    &writer_uri,
+                    1,
+                    revision,
+                    "lua",
+                    TEST_ULID_LUA_0,
+                    &format!("revision-{revision}"),
+                );
+                tokio::task::yield_now().await;
+            }
+        });
+
+        while !writer.is_finished() {
+            let (content, (_, revision)) = pool
+                .latest_virtual_content_snapshot(&host_uri, &virtual_uri)
+                .unwrap();
+            assert_eq!(
+                content.as_deref(),
+                Some(format!("revision-{revision}").as_str())
+            );
+            tokio::task::yield_now().await;
+        }
+        writer.await.unwrap();
     }
 
     #[tokio::test]
