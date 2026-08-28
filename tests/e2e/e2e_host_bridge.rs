@@ -604,6 +604,109 @@ enabled = true
     shutdown(&mut client);
 }
 
+#[test]
+fn e2e_semantic_tokens_range_drops_a_virtual_response_after_content_changes() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("semantic_tokens_range.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/semanticTokens/range"]
+priorities = ["virt"]
+"#,
+    )
+    .expect("write config");
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env("MOCK_LSP_CANCEL_DIR", event_dir.path().to_string_lossy())
+        .env(
+            "KAKEHASHI_E2E_INLINE_VALUE_CHANGE_DIR",
+            event_dir.path().to_string_lossy(),
+        )
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-semantic-range": {
+                        "cmd": [mock_bin(), "semantic-tokens-range-delayed"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_range_stale.md";
+    open_inline_value_document(&mut client, uri, 1, "> ```lua\n> old!\n> ```\n");
+
+    let request_id = client.send_request_async(
+        "textDocument/semanticTokens/range",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 1, "character": 2 },
+                "end": { "line": 1, "character": 6 }
+            }
+        }),
+    );
+    let request_marker = event_dir
+        .path()
+        .join("semantic-tokens-range-delayed.request.json");
+    assert!(
+        (0..60).any(|_| {
+            if request_marker.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "the delayed semantic token request should reach the virtual server"
+    );
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "> ```lua\n> new!\n> ```\n" }]
+        }),
+    );
+    let changed = event_dir.path().join("changed");
+    assert!(
+        (0..60).any(|_| {
+            if changed.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "Kakehashi should apply didChange before the delayed response is released"
+    );
+    std::fs::write(
+        event_dir
+            .path()
+            .join("semantic-tokens-range-delayed.release"),
+        b"release",
+    )
+    .expect("release delayed semantic token response");
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response["result"],
+        Value::Null,
+        "semantic tokens authored against the old content must be dropped: {response:?}"
+    );
+    shutdown(&mut client);
+}
+
 fn init_inline_value_virt_client(mode: &str, event_dir: &std::path::Path) -> LspClient {
     let mut client = LspClient::builder()
         .env("MOCK_LSP_CANCEL_DIR", event_dir.to_string_lossy())

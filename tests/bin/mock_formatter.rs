@@ -340,7 +340,7 @@ fn main() {
                         },
                         "textDocumentSync": 1
                     }),
-                    "semantic-tokens-range-virt" => json!({
+                    "semantic-tokens-range-virt" | "semantic-tokens-range-delayed" => json!({
                         "semanticTokensProvider": {
                             "legend": {
                                 "tokenTypes": ["custom", "variable"],
@@ -1683,6 +1683,10 @@ fn main() {
                         json!({ "data": [0, 0, length, token_type, 1] })
                     })
                     .unwrap_or(Value::Null);
+                if mode == "semantic-tokens-range-delayed" {
+                    record_mock_event(&mode, "request", &message);
+                    wait_for_mock_release(&mode);
+                }
                 respond(&mut writer, id, result);
             }
             "documentLink/resolve" => {
