@@ -168,6 +168,12 @@ struct SemanticFullComputation {
     pending_wire: Option<PendingWireBaseline>,
 }
 
+struct SemanticDeltaComputation {
+    result: SemanticTokensFullDeltaResult,
+    pending_native: Option<PendingNativeBaseline>,
+    pending_wire: Option<PendingWireBaseline>,
+}
+
 fn commit_direct_wire_baseline(
     cache: &crate::lsp::cache::CacheCoordinator,
     direct_request: bool,
@@ -1468,7 +1474,7 @@ impl Kakehashi {
         );
         let request =
             self.semantic_tokens_full_delta_tracked_impl(params, request_id, cancel_token.clone());
-        let outcome = match cancel_rx.as_mut() {
+        let mut outcome = match cancel_rx.as_mut() {
             Some(cancel_rx) => {
                 tokio::select! {
                     biased;
@@ -1488,8 +1494,16 @@ impl Kakehashi {
                 }
             }
         };
+        if let Ok(Some(computed)) = &mut outcome {
+            if let Some(pending) = computed.pending_native.take() {
+                pending.commit(&self.cache);
+            }
+            if let Some(pending) = computed.pending_wire.take() {
+                pending.commit(&self.cache);
+            }
+        }
         request_guard.finish();
-        outcome
+        outcome.map(|outcome| outcome.map(|computed| computed.result))
     }
 
     async fn semantic_tokens_full_delta_tracked_impl(
@@ -1497,7 +1511,7 @@ impl Kakehashi {
         params: SemanticTokensDeltaParams,
         request_id: crate::lsp::cache::RequestId,
         cancel_token: crate::cancel::CancelToken,
-    ) -> Result<Option<SemanticTokensFullDeltaResult>> {
+    ) -> Result<Option<SemanticDeltaComputation>> {
         let lsp_uri = params.text_document.uri.clone();
         let Ok(uri) = uri_to_url(&lsp_uri) else {
             log::warn!(
@@ -1569,12 +1583,14 @@ impl Kakehashi {
             {
                 self.cache
                     .record_served_semantic_version(&uri, snapshot.parsed_version);
-                return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
-                    SemanticTokensDelta {
+                return Ok(Some(SemanticDeltaComputation {
+                    result: SemanticTokensFullDeltaResult::TokensDelta(SemanticTokensDelta {
                         result_id: Some(previous_result_id),
                         edits: Vec::new(),
-                    },
-                )));
+                    }),
+                    pending_native: None,
+                    pending_wire: None,
+                }));
             }
             return Ok(None);
         }
@@ -1623,14 +1639,11 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        if let Some(pending) = pending_native {
-            pending.commit(&self.cache);
-        }
-        if let Some(pending) = pending_wire {
-            pending.commit(&self.cache);
-        }
-
-        Ok(Some(result))
+        Ok(Some(SemanticDeltaComputation {
+            result,
+            pending_native,
+            pending_wire,
+        }))
     }
 
     pub(crate) async fn semantic_tokens_range_impl(
@@ -2184,7 +2197,9 @@ fn semantic_virt_configs_select_servers(
     // a post-cap filter, matching dispatch.
     let capable_configs = configs
         .iter()
-        .filter(|config| !incapable.contains(&config.server_name))
+        .filter(|config| {
+            !incapable.contains(&config.server_name) && !suppressed.contains(&config.server_name)
+        })
         .cloned()
         .collect::<Vec<_>>();
     crate::lsp::aggregation::server::truncate_entries(
