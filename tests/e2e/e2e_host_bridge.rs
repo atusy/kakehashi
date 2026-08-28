@@ -686,6 +686,131 @@ enabled = true
 }
 
 #[test]
+fn e2e_semantic_tokens_full_tries_next_host_after_invalid_transformation() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir
+        .path()
+        .join("semantic_tokens_full_preferred.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/semanticTokens/full"]
+priorities = ["host"]
+
+[languages.markdown.bridge._self]
+enabled = true
+"#,
+    )
+    .expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "a-invalid": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-host-invalid"],
+                        "languages": ["markdown"]
+                    },
+                    "z-valid": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-host"],
+                        "languages": ["markdown"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_full_preferred.md";
+    open_inline_value_document(&mut client, uri, 1, "hostword\n");
+
+    let data = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            response
+                .pointer("/result/data")
+                .and_then(Value::as_array)
+                .filter(|data| !data.is_empty())
+                .cloned()
+                .or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    None
+                })
+        })
+        .expect("the valid fallback host should produce tokens");
+    assert_eq!(data, json!([0, 0, 8, 1, 8]).as_array().unwrap().clone());
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_semantic_tokens_full_empty_priorities_disable_parserless_document() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("semantic_tokens_full_disabled.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.hostonly.layers.aggregation."textDocument/semanticTokens/full"]
+priorities = []
+
+[languages.hostonly.bridge._self]
+enabled = true
+"#,
+    )
+    .expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "host": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-host"],
+                        "languages": ["hostonly"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_full_disabled.hostonly";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "hostonly",
+                "version": 1,
+                "text": "hostword\n"
+            }
+        }),
+    );
+
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(response["result"].is_null(), "{response:?}");
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_semantic_tokens_full_drops_a_virtual_response_after_content_changes() {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir.path().join("semantic_tokens_full_stale.toml");
