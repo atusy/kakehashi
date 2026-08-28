@@ -2755,6 +2755,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_full_with_superseded_delta_tracking_preserves_the_newer_request() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let uri = Url::parse("file:///delta-reentry-superseded.rs").unwrap();
+        let (older_id, older_cancel) = service.inner().cache.start_request(&uri);
+        let (newer_id, _newer_cancel) = service.inner().cache.start_request(&uri);
+
+        let result = service
+            .inner()
+            .semantic_tokens_full_impl_with_tracking(
+                full_params(&uri),
+                Some((older_id, older_cancel)),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        assert!(service.inner().cache.is_request_active(&uri, newer_id));
+    }
+
+    #[tokio::test]
     async fn pending_wire_baseline_is_invisible_until_outer_commit() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
