@@ -398,9 +398,14 @@ impl LanguageServerPool {
             ));
         }
         for (handle, _, _) in &provider_plans {
-            handle
+            let refresh_deferred_registration = handle
                 .dynamic_capabilities()
                 .mark_workspace_diagnostic_contributed();
+            if refresh_deferred_registration {
+                let _ = self
+                    .upstream_tx()
+                    .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
+            }
         }
         Ok(result)
     }
