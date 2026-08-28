@@ -1926,6 +1926,65 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn absent_snapshot_full_honors_empty_layer_priorities() {
+        use crate::config::WorkspaceSettings;
+        use crate::config::settings::{LanguageSettings, LayerAggregationConfig, LayersConfig};
+        use std::collections::HashMap;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let mut aggregation = HashMap::new();
+        aggregation.insert(
+            "textDocument/semanticTokens/full".to_string(),
+            LayerAggregationConfig {
+                priorities: Some(Vec::new()),
+                strategy: None,
+            },
+        );
+        let mut languages = HashMap::new();
+        languages.insert(
+            "unknown".to_string(),
+            LanguageSettings {
+                layers: Some(LayersConfig {
+                    aggregation: Some(aggregation),
+                }),
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            languages,
+            auto_install: false,
+            ..Default::default()
+        });
+
+        let uri = Url::parse("file:///semantic_absent_priorities.unknown").expect("valid test URI");
+        server.documents.insert(
+            uri.clone(),
+            "unparsed".to_string(),
+            Some("unknown".to_string()),
+            None,
+        );
+        let request = server.semantic_tokens_full_impl(full_params(&uri));
+        tokio::pin!(request);
+        tokio::select! {
+            result = &mut request => panic!("request resolved before the first-parse backstop: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(
+            crate::lsp::lsp_impl::snapshot_read::FIRST_PARSE_BACKSTOP + Duration::from_millis(1),
+        )
+        .await;
+
+        let result = request
+            .await
+            .expect("semantic tokens full should return without error");
+        assert!(
+            result.is_none(),
+            "empty priorities must disable every layer after an absent native snapshot: {result:?}"
+        );
+    }
+
     /// Publish a snapshot for `uri` built from `text` at `parsed_version`,
     /// tree-less (no parser needed): the handlers' snapshot-resolution and
     /// served-version bookkeeping are observable without tokenizing.
