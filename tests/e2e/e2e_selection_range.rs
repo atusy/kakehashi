@@ -610,20 +610,24 @@ priorities = ["virt", "native"]
     let ranges = response["result"].as_array().expect("aligned result array");
     assert_eq!(ranges.len(), 2, "one result per requested position");
     assert_eq!(
-        ranges[1],
-        json!({
-            "range": {
-                "start": { "line": 3, "character": 3 },
-                "end": { "line": 3, "character": 4 }
-            },
-            "parent": {
-                "range": {
-                    "start": { "line": 3, "character": 2 },
-                    "end": { "line": 3, "character": 6 }
-                }
-            }
-        }),
-        "the embedded position should use the rebased virtual-server chain"
+        ranges[1].pointer("/range"),
+        Some(&json!({
+            "start": { "line": 3, "character": 3 },
+            "end": { "line": 3, "character": 4 }
+        })),
+        "the embedded position should start with the rebased virtual range"
+    );
+    assert_eq!(
+        ranges[1].pointer("/parent/range"),
+        Some(&json!({
+            "start": { "line": 3, "character": 2 },
+            "end": { "line": 3, "character": 6 }
+        })),
+        "the virtual server's outer range should remain first in the chain"
+    );
+    assert!(
+        ranges[1].pointer("/parent/parent/range").is_some(),
+        "the virtual chain should continue through containing host ancestors"
     );
     assert!(
         ranges[0]["range"]["start"]["line"].as_u64().unwrap_or(1) == 0,
