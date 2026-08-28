@@ -238,27 +238,29 @@ impl Kakehashi {
         live_identity: (u64, u64),
         generation: u64,
         snapshot: Option<&std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
+        require_snapshot_identity: bool,
         edit_lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
     ) -> bool {
         self.cache.semantic_token_generation() == generation
-            && snapshot.map_or_else(
-                || {
-                    self.documents.latest_snapshot(uri).is_some_and(|view| {
-                        view.slot.current_incarnation == live_identity.0
-                            && view.content_version == live_identity.1
-                            && view.slot.snapshot.is_none()
-                    })
-                },
-                |snapshot| {
-                    self.semantic_snapshot_is_current(
-                        uri,
-                        snapshot.incarnation,
-                        snapshot.parsed_version,
-                        generation,
-                        edit_lock,
-                    )
-                },
-            )
+            && (!require_snapshot_identity
+                || snapshot.map_or_else(
+                    || {
+                        self.documents.latest_snapshot(uri).is_some_and(|view| {
+                            view.slot.current_incarnation == live_identity.0
+                                && view.content_version == live_identity.1
+                                && view.slot.snapshot.is_none()
+                        })
+                    },
+                    |snapshot| {
+                        self.semantic_snapshot_is_current(
+                            uri,
+                            snapshot.incarnation,
+                            snapshot.parsed_version,
+                            generation,
+                            edit_lock,
+                        )
+                    },
+                ))
             && self.documents.get(uri).is_some_and(|document| {
                 document.incarnation() == live_identity.0
                     && document.content_version() == live_identity.1
@@ -445,6 +447,18 @@ impl Kakehashi {
         let progress_token = params.work_done_progress_params.work_done_token.clone();
         let upstream_id = current_upstream_id();
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let host_only = self
+            .documents
+            .get(&uri)
+            .and_then(|document| document.language_id().map(str::to_owned))
+            .is_some_and(|language| {
+                let layers = self.resolve_layer_config(&language, METHOD);
+                !layers.priorities.is_empty()
+                    && layers
+                        .priorities
+                        .iter()
+                        .all(|source| *source == LayerSource::Host)
+            });
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
         // supersession, and cancellation contract. A current snapshot makes
@@ -453,7 +467,7 @@ impl Kakehashi {
         // incarnation/content version through fan-out and revalidates that
         // identity before returning.
         let Some(native_layer) = self
-            .semantic_tokens_full_native_layer(params, &mut cancel_rx, tracking)
+            .semantic_tokens_full_native_layer(params, &mut cancel_rx, tracking, !host_only)
             .await?
         else {
             return Ok(None);
@@ -571,6 +585,7 @@ impl Kakehashi {
                     live_identity,
                     generation,
                     snapshot.as_ref(),
+                    !host_only,
                     &edit_lock,
                 )
             {
@@ -619,6 +634,7 @@ impl Kakehashi {
         params: SemanticTokensParams,
         cancel_rx: &mut Option<crate::lsp::request_id::CancelReceiver>,
         tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
+        require_snapshot: bool,
     ) -> Result<Option<NativeSemanticLayer>> {
         let lsp_uri = params.text_document.uri;
 
@@ -664,6 +680,17 @@ impl Kakehashi {
                 uri, request_id
             );
             return Ok(None);
+        }
+        if !require_snapshot {
+            return Ok(Some(NativeSemanticLayer::new(
+                SemanticTokens {
+                    result_id: None,
+                    data: Vec::new(),
+                },
+                None,
+                request_guard,
+                token_generation,
+            )));
         }
         // Serve-current (ADR §3, revised): park until the snapshot matches the
         // live text — see `current_snapshot_for_tokens` for why answering from
@@ -2289,12 +2316,15 @@ mod tests {
         let generation = server.cache.semantic_token_generation();
         let edit_lock = server.documents.edit_lock(&uri);
         assert!(
-            server.semantic_full_response_is_current(&uri, identity, generation, None, &edit_lock,)
+            server.semantic_full_response_is_current(
+                &uri, identity, generation, None, true, &edit_lock,
+            )
         );
         publish_treeless(server, &uri, "old", 0);
         assert!(
-            !server
-                .semantic_full_response_is_current(&uri, identity, generation, None, &edit_lock,),
+            !server.semantic_full_response_is_current(
+                &uri, identity, generation, None, true, &edit_lock,
+            ),
             "a snapshot published during parserless fan-out invalidates that response"
         );
 
@@ -2302,8 +2332,9 @@ mod tests {
             .documents
             .update_document(uri.clone(), "new".to_string(), None);
         assert!(
-            !server
-                .semantic_full_response_is_current(&uri, identity, generation, None, &edit_lock,)
+            !server.semantic_full_response_is_current(
+                &uri, identity, generation, None, true, &edit_lock,
+            )
         );
 
         let updated = server
@@ -2317,6 +2348,7 @@ mod tests {
             updated_identity,
             generation,
             None,
+            true,
             &edit_lock,
         ));
     }
@@ -2378,6 +2410,56 @@ mod tests {
             result.is_none(),
             "empty priorities must disable every layer after an absent native snapshot: {result:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn host_only_full_does_not_wait_for_a_native_snapshot() {
+        use crate::config::WorkspaceSettings;
+        use crate::config::settings::{LanguageSettings, LayerAggregationConfig, LayersConfig};
+        use std::collections::HashMap;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let mut aggregation = HashMap::new();
+        aggregation.insert(
+            "textDocument/semanticTokens/full".to_string(),
+            LayerAggregationConfig {
+                priorities: Some(vec![LayerSource::Host]),
+                strategy: None,
+            },
+        );
+        let mut languages = HashMap::new();
+        languages.insert(
+            "unknown".to_string(),
+            LanguageSettings {
+                layers: Some(LayersConfig {
+                    aggregation: Some(aggregation),
+                }),
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            languages,
+            auto_install: false,
+            ..Default::default()
+        });
+
+        let uri = Url::parse("file:///semantic_host_only.unknown").expect("valid test URI");
+        server.documents.insert(
+            uri.clone(),
+            "unparsed".to_string(),
+            Some("unknown".to_string()),
+            None,
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            server.semantic_tokens_full_impl(full_params(&uri)),
+        )
+        .await
+        .expect("host-only semantic tokens must not wait for the first-parse backstop")
+        .expect("semantic tokens full should return without error");
+        assert!(result.is_none(), "no host server is configured: {result:?}");
     }
 
     /// Publish a snapshot for `uri` built from `text` at `parsed_version`,
