@@ -125,6 +125,16 @@ impl LanguageServerPool {
         params.previous_result_ids.clear();
         params.partial_result_params.partial_result_token = None;
         params.work_done_progress_params.work_done_token = None;
+        let Ok(mut params) = serde_json::to_value(params) else {
+            return aggregate_reports(std::iter::empty());
+        };
+        if let Some(params) = params.as_object_mut() {
+            // ls-types 0.0.6 serializes the optional identifier as JSON null,
+            // but the LSP wire type is `identifier?: string`, not string|null.
+            params.remove("identifier");
+            params.remove("partialResultToken");
+            params.remove("workDoneToken");
+        }
 
         let mut servers: Vec<_> = settings
             .language_servers
@@ -164,7 +174,7 @@ impl LanguageServerPool {
         &self,
         handle: &Arc<ConnectionHandle>,
         expected_generation: u64,
-        params: WorkspaceDiagnosticParams,
+        params: Value,
         upstream_id: Option<UpstreamId>,
     ) -> io::Result<Option<WorkspaceDiagnosticReport>> {
         let key = handle.key();

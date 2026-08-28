@@ -1330,7 +1330,7 @@ fn main() {
                     .get("previousResultIds")
                     .and_then(Value::as_array)
                     .is_some_and(Vec::is_empty)
-                    && params.get("identifier").is_none_or(Value::is_null)
+                    && params.get("identifier").is_none()
                     && params.get("partialResultToken").is_none_or(Value::is_null)
                     && params.get("workDoneToken").is_none_or(Value::is_null);
                 let message = if isolated {
