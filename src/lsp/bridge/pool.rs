@@ -1008,6 +1008,15 @@ impl LanguageServerPool {
         self.connections.lock().await.len()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn insert_test_connection(
+        &self,
+        key: ConnectionKey,
+        handle: Arc<ConnectionHandle>,
+    ) {
+        self.connections.lock().await.insert(key, handle);
+    }
+
     /// Get access to the connections map.
     ///
     /// Used by text_document submodules that need to access connections.
@@ -8947,54 +8956,30 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn request_registration_is_atomic_with_synchronous_cancel_capture() {
-        let pool = Arc::new(LanguageServerPool::new());
+        let pool = LanguageServerPool::new();
         let handle =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
         let upstream_id = UpstreamId::Number(4242);
-        let registration_entered = Arc::new(std::sync::Barrier::new(2));
-        let registration_release = Arc::new(std::sync::Barrier::new(2));
-        let cancel_started = Arc::new(std::sync::Barrier::new(2));
-
-        let registration = {
-            let pool = Arc::clone(&pool);
-            let handle = Arc::clone(&handle);
-            let upstream_id = upstream_id.clone();
-            let entered = Arc::clone(&registration_entered);
-            let release = Arc::clone(&registration_release);
-            tokio::task::spawn_blocking(move || {
-                pool.register_request_for_handle_with_upstream_inner(
-                    Some(upstream_id),
-                    &handle,
-                    || {
-                        entered.wait();
-                        release.wait();
-                    },
-                )
-            })
-        };
-        registration_entered.wait();
-
-        let cancel = {
-            let pool = Arc::clone(&pool);
-            let upstream_id = upstream_id.clone();
-            let started = Arc::clone(&cancel_started);
-            tokio::task::spawn_blocking(move || {
-                started.wait();
-                pool.forward_cancel_by_upstream_id_if_current_sync(upstream_id, || true, || {})
-            })
-        };
-        cancel_started.wait();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(
-            !cancel.is_finished(),
-            "cancel capture must wait for both request registries to become visible"
-        );
-
-        registration_release.wait();
-        let (request_id, _response_rx) = registration.await.unwrap().unwrap();
-        cancel.await.unwrap().unwrap();
+        let (request_id, _response_rx) = pool
+            .register_request_for_handle_with_upstream_inner(
+                Some(upstream_id.clone()),
+                &handle,
+                || {
+                    assert!(
+                        pool.upstream_request_registry.try_lock().is_err(),
+                        "request registry must stay locked through router registration"
+                    );
+                    assert!(
+                        pool.upstream_cancel_handles.try_lock().is_err(),
+                        "exact-handle registry must stay locked through router registration"
+                    );
+                },
+            )
+            .unwrap();
+        pool.forward_cancel_by_upstream_id_if_current_sync(upstream_id, || true, || {})
+            .unwrap();
 
         assert!(
             !handle.router().claim_for_write(request_id),
