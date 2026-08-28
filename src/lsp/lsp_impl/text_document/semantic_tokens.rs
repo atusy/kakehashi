@@ -511,42 +511,25 @@ impl Kakehashi {
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let supersession = tracking.as_ref().map(|(_, cancel)| cancel.clone());
         let settings_generation = self.settings_manager.settings_generation();
+        let only_layer = self.document_language(&uri).and_then(|language| {
+            let layers = self.resolve_layer_config(&language, METHOD);
+            layers
+                .priorities
+                .first()
+                .copied()
+                .filter(|first| layers.priorities.iter().all(|source| source == first))
+        });
         let native_enabled = self.semantic_tokens_full_includes_native(&uri);
         let document_language = self.document_language(&uri);
         let virtual_enabled = document_language.as_ref().is_some_and(|language| {
             self.resolve_layer_config(language, METHOD)
                 .allows(LayerSource::Virt)
         });
-        let actionable_virtual = if virtual_enabled {
-            match document_language.as_deref() {
-                Some(language) => {
-                    let probe =
-                        self.semantic_tokens_full_has_potential_virtual_producer(&uri, language);
-                    match (cancel_rx.as_mut(), supersession.as_ref()) {
-                        (Some(cancel_rx), Some(supersession)) => tokio::select! {
-                            biased;
-                            _ = cancel_rx => return Err(Error::request_cancelled()),
-                            _ = supersession.cancelled() => return Ok(None),
-                            actionable = probe => actionable,
-                        },
-                        (Some(cancel_rx), None) => tokio::select! {
-                            biased;
-                            _ = cancel_rx => return Err(Error::request_cancelled()),
-                            actionable = probe => actionable,
-                        },
-                        (None, Some(supersession)) => tokio::select! {
-                            biased;
-                            _ = supersession.cancelled() => return Ok(None),
-                            actionable = probe => actionable,
-                        },
-                        (None, None) => probe.await,
-                    }
-                }
-                None => false,
-            }
-        } else {
-            false
-        };
+        let actionable_virtual = virtual_enabled
+            && document_language.as_ref().is_some_and(|language| {
+                self.semantic_tokens_full_has_potential_virtual_producer(language)
+            });
+        let virt_only = only_layer == Some(LayerSource::Virt);
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
         // supersession, and cancellation contract. A current snapshot makes
@@ -689,8 +672,19 @@ impl Kakehashi {
                 )
                 .await?;
 
-            let Some(data) = data else {
-                return Ok(None);
+            let data = match data {
+                Some(data) => data,
+                None if virt_only
+                    && !bridge_attempted.load(std::sync::atomic::Ordering::Acquire) =>
+                {
+                    // The selected virtual overlay was recomputed successfully,
+                    // but no injection regions remain. Keep a wire lineage for
+                    // the empty overlay so delta can delete the previous region
+                    // tokens instead of returning null forever.
+                    bridge_attempted.store(true, std::sync::atomic::Ordering::Release);
+                    Vec::new()
+                }
+                None => return Ok(None),
             };
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;

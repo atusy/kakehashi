@@ -1732,6 +1732,118 @@ priorities = ["virt", "native"]
 }
 
 #[test]
+fn e2e_semantic_tokens_full_delta_clears_a_removed_virtual_overlay() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir
+        .path()
+        .join("semantic_tokens_virt_only_delta.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/semanticTokens/full"]
+priorities = ["virt"]
+"#,
+    )
+    .expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-semantic-full": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-virt"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_removed_virtual_overlay.md";
+    open_inline_value_document(&mut client, uri, 1, "```lua\ncode\n```\n");
+
+    let initial = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            let result = response.get("result")?;
+            (result.get("resultId").and_then(Value::as_str).is_some()
+                && result
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .is_some_and(|data| !data.is_empty()))
+            .then(|| result.clone())
+            .or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                None
+            })
+        })
+        .expect("virtual overlay should establish a non-empty wire baseline");
+    let previous_result_id = initial["resultId"].as_str().expect("resultId");
+    let mut reconstructed = initial["data"].as_array().expect("token data").clone();
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "plain text\n" }]
+        }),
+    );
+    let delta = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/semanticTokens/full/delta",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "previousResultId": previous_result_id
+                }),
+            );
+            response
+                .pointer("/result/edits")
+                .and_then(Value::as_array)
+                .map(|edits| (response.clone(), edits.clone()))
+                .or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    None
+                })
+        })
+        .expect("removed virtual overlay should produce a clearing delta");
+    for edit in &delta.1 {
+        let start = edit["start"].as_u64().expect("edit start") as usize;
+        let delete_count = edit["deleteCount"].as_u64().expect("delete count") as usize;
+        let replacement = edit
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        reconstructed.splice(start..start + delete_count, replacement);
+    }
+    assert!(
+        reconstructed.is_empty(),
+        "the stale virtual tokens must clear"
+    );
+    assert!(
+        delta
+            .0
+            .pointer("/result/resultId")
+            .and_then(Value::as_str)
+            .is_some(),
+        "the empty overlay must establish its next baseline"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_semantic_tokens_full_delta_rejects_stale_commits() {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir
