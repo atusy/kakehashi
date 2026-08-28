@@ -26,9 +26,11 @@ configured, runnable server. Start cold connections when needed, admit startup
 only while the captured settings generation is current, and accept responses
 only from the same live connection generation.
 
-Send each producer an empty `previousResultIds` list and no provider identifier
-or progress tokens. Aggregate only full reports and omit downstream result ids
-from the upstream response. For the same URI and version, concatenate
+Send each producer an empty `previousResultIds` list, its own statically or
+dynamically declared provider identifier, and no progress tokens. If one server
+registers multiple workspace-diagnostic providers, query each provider with its
+own identifier. Aggregate only full reports and omit downstream result ids from
+the upstream response. For the same URI and version, concatenate
 diagnostics in stable server-name order. If versions differ, keep the higher
 document version. Sort final reports by URI for deterministic output.
 
@@ -42,8 +44,8 @@ pass through unchanged, including unopened files.
 
 ## Invariants
 
-- A downstream result id or provider identifier never crosses provider
-  boundaries.
+- A downstream result id or upstream provider identifier never crosses provider
+  boundaries; each downstream request uses only that provider's declaration.
 - An `unchanged` report is never interpreted without the exact baseline it
   names.
 - URIs issued internally to the exact producer generation are never returned
