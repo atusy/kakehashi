@@ -402,7 +402,7 @@ impl LanguageServerPool {
             .iter()
             .map(|completed| Arc::clone(&completed.virtual_uris))
             .collect::<Vec<_>>();
-        let provider_plans = admitted
+        let mut provider_plans = admitted
             .iter()
             .map(|completed| {
                 (
@@ -412,6 +412,7 @@ impl LanguageServerPool {
                 )
             })
             .collect::<Vec<_>>();
+        provider_plans.sort_by_key(|(handle, _, _)| handle.key().to_string());
         let _provenance_guards = provenance_observers
             .iter()
             .map(|observer| observer.provenance_read_guard())
@@ -475,22 +476,32 @@ impl LanguageServerPool {
                 "workspace diagnostic producer or admission expired after final aggregation",
             ));
         }
-        for (handle, _, plan) in &provider_plans {
-            let refresh_deferred_registration = if plan.is_empty() {
+        let mut contribution_guards = provider_plans
+            .iter()
+            .filter(|(_, _, plan)| !plan.is_empty())
+            .map(|(handle, _, _)| {
                 handle
                     .dynamic_capabilities()
-                    .mark_workspace_diagnostic_pull_completed()
-            } else {
-                handle
-                    .dynamic_capabilities()
-                    .try_mark_workspace_diagnostic_contributed()
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::Interrupted,
-                            "workspace diagnostic producer exited during final acceptance",
-                        )
-                    })?
-            };
+                    .workspace_diagnostic_lifecycle_lock()
+            })
+            .collect::<Vec<_>>();
+        if contribution_guards
+            .iter()
+            .any(|guard| guard.reader_exited())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "workspace diagnostic producer exited during final acceptance",
+            ));
+        }
+        for guard in &mut contribution_guards {
+            guard.mark_contributed();
+        }
+        drop(contribution_guards);
+        for (handle, _, _) in &provider_plans {
+            let refresh_deferred_registration = handle
+                .dynamic_capabilities()
+                .mark_workspace_diagnostic_pull_completed();
             if refresh_deferred_registration {
                 let _ = self
                     .upstream_tx()
@@ -1479,6 +1490,58 @@ mod tests {
 
         let error = result.expect_err("a response from an exited reader must not be accepted");
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn final_aggregation_does_not_partially_arm_contributions() {
+        let pool = LanguageServerPool::new();
+        let first = create_handle_advertising_workspace_diagnostics(
+            ConnectionKey::for_server("alpha"),
+            None,
+        )
+        .await;
+        let exited = create_handle_advertising_workspace_diagnostics(
+            ConnectionKey::for_server("zeta"),
+            None,
+        )
+        .await;
+        for handle in [&first, &exited] {
+            pool.connections()
+                .await
+                .insert(handle.key().clone(), Arc::clone(handle));
+        }
+        exited
+            .dynamic_capabilities()
+            .mark_workspace_diagnostic_reader_exited();
+        let completed = [&first, &exited].map(|handle| {
+            let generation = pool.document_connection_generation(handle.key());
+            CompletedDiagnosticProducer {
+                provider_plan: diagnostic_providers(handle),
+                handle: Arc::clone(handle),
+                generation,
+                report: WorkspaceDiagnosticReport::default(),
+                virtual_uris: Arc::new(
+                    pool.observe_virtual_uris_for_connection(handle.key(), generation),
+                ),
+            }
+        });
+
+        let result = pool
+            .aggregate_admitted_workspace_diagnostic_reports(
+                completed
+                    .into_iter()
+                    .map(|completed| std::future::ready(Some(completed))),
+                &|| true,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            !first
+                .dynamic_capabilities()
+                .has_workspace_diagnostic_contributed(),
+            "an earlier producer must remain unarmed when a later producer cannot commit"
+        );
     }
 
     #[tokio::test]
