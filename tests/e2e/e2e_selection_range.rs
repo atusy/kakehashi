@@ -557,7 +557,7 @@ fn e2e_selection_range_uses_the_host_layer_for_the_real_document() {
         &config_path,
         r#"
 [languages.markdown.layers.aggregation."textDocument/selectionRange"]
-priorities = ["host", "native"]
+priorities = ["host"]
 
 [languages.markdown.bridge._self]
 enabled = true

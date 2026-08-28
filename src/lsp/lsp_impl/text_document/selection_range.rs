@@ -7,6 +7,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::analysis::handle_selection_range;
+use crate::config::settings::LayerSource;
 use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
@@ -31,6 +32,12 @@ fn parse_single_host_selection_range(
     selection_chain_is_valid(&selection, position, text).then_some(selection)
 }
 
+fn normalize_position(text: &str, position: Position) -> Option<Position> {
+    let mapper = crate::text::PositionMapper::new(text);
+    let normalized = mapper.byte_to_position(mapper.position_to_byte_clamped(position))?;
+    (normalized.line == position.line).then_some(normalized)
+}
+
 fn selection_chain_is_valid(selection: &SelectionRange, position: Position, text: &str) -> bool {
     let mapper = crate::text::PositionMapper::new(text);
     let mut child = None;
@@ -46,7 +53,10 @@ fn selection_chain_is_valid(selection: &SelectionRange, position: Position, text
         {
             return false;
         }
-        if child.is_none() && !(range.start <= position && position <= range.end) {
+        if child.is_none()
+            && !((range.start == position && range.end == position)
+                || (range.start <= position && position < range.end))
+        {
             return false;
         }
         child = Some(range);
@@ -127,6 +137,14 @@ impl Kakehashi {
         let Some(language_name) = self.document_language(&uri) else {
             return Ok(None);
         };
+        let layer_config = self.resolve_layer_config(&language_name, METHOD);
+        if !layer_config.allows(LayerSource::Virt) && !layer_config.allows(LayerSource::Native) {
+            return if layer_config.allows(LayerSource::Host) {
+                self.selection_range_host_only(&lsp_uri, positions).await
+            } else {
+                Ok(None)
+            };
+        }
 
         // Ensure language is loaded (handles race condition with didOpen)
         let load_result = self
@@ -263,38 +281,49 @@ impl Kakehashi {
         // the whole array would misroute multi-cursor requests whose positions
         // belong to different virtual regions. Resolve preferred layers once
         // per position and preserve the editor's input order.
-        let mut selected = Vec::with_capacity(positions.len());
-        for (index, position) in positions.into_iter().enumerate() {
-            let raw_params = serde_json::to_value(SelectionRangeParams {
-                text_document: TextDocumentIdentifier {
-                    uri: lsp_uri.clone(),
-                },
-                positions: vec![position],
-                // One upstream progress token cannot be forwarded to multiple
-                // independent downstream requests without token collisions.
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: PartialResultParams::default(),
-            })
-            .unwrap_or(serde_json::Value::Null);
-            let virt = self.selection_range_virt_layer(&lsp_uri, position, expected_incarnation);
-            let host = self.selection_range_host_layer(
-                &lsp_uri,
-                raw_params,
-                position,
-                expected_incarnation,
-                expected_version,
-            );
-            let native = std::future::ready(Ok(native_ranges.get(index).cloned()));
-            let result = self
-                .walk_layer_futures(&lsp_uri, METHOD, METHOD, virt, host, native, |_| true)
-                .await?;
-            let Some(result) = result else {
-                // The protocol requires one result for every input position;
-                // never surface a shorter, index-shifted response.
-                return Ok(None);
-            };
-            selected.push(result);
-        }
+        let layer_walk = async {
+            let mut selected = Vec::with_capacity(positions.len());
+            for (index, position) in positions.into_iter().enumerate() {
+                let raw_params = serde_json::to_value(SelectionRangeParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: lsp_uri.clone(),
+                    },
+                    positions: vec![position],
+                    // One upstream progress token cannot be forwarded to multiple
+                    // independent downstream requests without token collisions.
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .unwrap_or(serde_json::Value::Null);
+                let virt =
+                    self.selection_range_virt_layer(&lsp_uri, position, expected_incarnation);
+                let host = self.selection_range_host_layer(
+                    &lsp_uri,
+                    raw_params,
+                    position,
+                    expected_incarnation,
+                    expected_version,
+                );
+                let native = std::future::ready(Ok(native_ranges.get(index).cloned()));
+                let result = self
+                    .walk_layer_futures(&lsp_uri, METHOD, METHOD, virt, host, native, |_| true)
+                    .await?;
+                let Some(result) = result else {
+                    // The protocol requires one result for every input position;
+                    // never surface a shorter, index-shifted response.
+                    return Ok(None);
+                };
+                selected.push(result);
+            }
+            Ok(Some(selected))
+        };
+        let selected = tokio::select! {
+            biased;
+            _ = version_cancel.cancelled() => {
+                return Err(crate::error::content_modified_error());
+            }
+            result = layer_walk => result?,
+        };
 
         let still_current = self.documents.latest_snapshot(&uri).is_some_and(|view| {
             view.content_version == expected_version
@@ -309,7 +338,72 @@ impl Kakehashi {
             return Err(crate::error::content_modified_error());
         }
 
-        Ok(Some(selected))
+        Ok(selected)
+    }
+
+    async fn selection_range_host_only(
+        &self,
+        lsp_uri: &Uri,
+        positions: Vec<Position>,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
+            return Ok(None);
+        };
+        let expected_incarnation = ctx.incarnation;
+        let expected_version = ctx.content_version;
+        let Some(version_cancel) = self.documents.get(&ctx.uri).and_then(|document| {
+            (document.incarnation() == expected_incarnation
+                && document.content_version() == expected_version)
+                .then(|| document.version_cancel_token())
+        }) else {
+            return Err(crate::error::content_modified_error());
+        };
+        let uri = ctx.uri.clone();
+        drop(ctx);
+
+        let request = async {
+            let mut selected = Vec::with_capacity(positions.len());
+            for position in positions {
+                let raw_params = serde_json::to_value(SelectionRangeParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: lsp_uri.clone(),
+                    },
+                    positions: vec![position],
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .unwrap_or(serde_json::Value::Null);
+                let Some(selection) = self
+                    .selection_range_host_layer(
+                        lsp_uri,
+                        raw_params,
+                        position,
+                        expected_incarnation,
+                        expected_version,
+                    )
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                selected.push(selection);
+            }
+            Ok(Some(selected))
+        };
+        let selected = tokio::select! {
+            biased;
+            _ = version_cancel.cancelled() => {
+                return Err(crate::error::content_modified_error());
+            }
+            result = request => result?,
+        };
+        let still_current = self.documents.get(&uri).is_some_and(|document| {
+            document.incarnation() == expected_incarnation
+                && document.content_version() == expected_version
+        });
+        if !still_current {
+            return Err(crate::error::content_modified_error());
+        }
+        Ok(selected)
     }
 
     async fn selection_range_virt_layer(
@@ -327,6 +421,7 @@ impl Kakehashi {
         if ctx.incarnation != expected_incarnation {
             return Ok(None);
         }
+        let position = ctx.position;
         let (cancel_rx, _cancel_guard) =
             self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
@@ -375,15 +470,29 @@ impl Kakehashi {
             return Ok(None);
         }
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        let documents = std::sync::Arc::clone(&self.documents);
         let result = dispatch_host_preferred(
             &ctx,
             self.bridge.pool_arc(),
             move |task: HostFanOutTask| {
                 let params = raw_params.clone();
+                let documents = std::sync::Arc::clone(&documents);
                 async move {
+                    let Some(position) = normalize_position(&task.text, position) else {
+                        return Ok(None);
+                    };
+                    let host_uri = task.uri.clone();
+                    let revision_text_reader: crate::lsp::bridge::HostTextReader =
+                        std::sync::Arc::new(move || {
+                            documents.get(&host_uri).and_then(|document| {
+                                (document.incarnation() == expected_incarnation
+                                    && document.content_version() == expected_version)
+                                    .then(|| document.text_arc())
+                            })
+                        });
                     let raw = task
                         .pool
-                        .send_host_raw_request_for_incarnation(
+                        .send_host_raw_request_for_revision(
                             &task.server_name,
                             &task.server_config,
                             &HostDocument {
@@ -395,6 +504,7 @@ impl Kakehashi {
                             params,
                             task.upstream_id,
                             expected_incarnation,
+                            revision_text_reader,
                         )
                         .await?;
                     Ok(raw.and_then(|raw| {
@@ -501,5 +611,20 @@ mod tests {
             }
         }]);
         assert!(parse_single_host_selection_range(value, Position::new(0, 0), "a\nb").is_none());
+    }
+
+    #[test]
+    fn host_selection_range_validates_against_the_defaulted_client_position() {
+        let text = "abc\n";
+        let position = normalize_position(text, Position::new(0, 999)).expect("same-line clamp");
+        assert_eq!(position, Position::new(0, 3));
+        let value = json!([{
+            "range": {
+                "start": { "line": 0, "character": 3 },
+                "end": { "line": 0, "character": 3 }
+            }
+        }]);
+
+        assert!(parse_single_host_selection_range(value, position, text).is_some());
     }
 }
