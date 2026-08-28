@@ -362,6 +362,7 @@ impl LanguageServerPool {
             .map(|completed| {
                 (
                     Arc::clone(&completed.handle),
+                    completed.generation,
                     completed.provider_plan.clone(),
                 )
             })
@@ -374,17 +375,29 @@ impl LanguageServerPool {
             .into_iter()
             .map(|completed| sanitize_report(completed.report, &completed.virtual_uris));
         let result = aggregate_reports(reports);
-        if !admit()
-            || provider_plans
-                .iter()
-                .any(|(handle, plan)| diagnostic_providers(handle) != *plan)
-        {
+        drop(_provenance_guards);
+        if !admit() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "workspace diagnostic admission or provider plan expired after final aggregation",
+                "workspace diagnostic admission expired after final aggregation",
             ));
         }
-        for (handle, _) in &provider_plans {
+        let connections = self.connections().await;
+        let producers_stale = provider_plans.iter().any(|(handle, generation, plan)| {
+            connections.get(handle.key()).is_none_or(|live| {
+                !Arc::ptr_eq(live, handle)
+                    || live.state() != ConnectionState::Ready
+                    || self.document_connection_generation(handle.key()) != *generation
+                    || diagnostic_providers(handle) != *plan
+            })
+        });
+        if producers_stale || !admit() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "workspace diagnostic producer or admission expired after final aggregation",
+            ));
+        }
+        for (handle, _, _) in &provider_plans {
             handle
                 .dynamic_capabilities()
                 .mark_workspace_diagnostic_contributed();
@@ -1030,6 +1043,46 @@ mod tests {
         assert!(
             result.is_err(),
             "the post-build admission fence must reject"
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn final_aggregation_rechecks_producer_liveness_after_building_result() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("diagnostics");
+        let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+        pool.connections()
+            .await
+            .insert(handle.key().clone(), Arc::clone(&handle));
+        let generation = pool.document_connection_generation(handle.key());
+        let virtual_uris =
+            Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
+        let checks = AtomicUsize::new(0);
+
+        let result = pool
+            .aggregate_admitted_workspace_diagnostic_reports(
+                [std::future::ready(Some(CompletedDiagnosticProducer {
+                    provider_plan: Vec::new(),
+                    handle: Arc::clone(&handle),
+                    generation,
+                    report: WorkspaceDiagnosticReport {
+                        items: vec![full("file:///workspace/stale.rs", None, "stale")],
+                    },
+                    virtual_uris,
+                }))],
+                &|| {
+                    if checks.fetch_add(1, Ordering::SeqCst) == 2 {
+                        handle.begin_shutdown();
+                    }
+                    true
+                },
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a producer that exits during aggregation must be rejected at final acceptance"
         );
         assert_eq!(checks.load(Ordering::SeqCst), 3);
     }
