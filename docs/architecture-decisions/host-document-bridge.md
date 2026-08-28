@@ -42,11 +42,12 @@ Partially implemented:
   foldingRange, codeLens,
   prepareCallHierarchy, incomingCalls, outgoingCalls, prepareTypeHierarchy,
   supertypes, subtypes,
-  formatting, and rangeFormatting (which shares the formatting layer key).
+  formatting, rangeFormatting (which shares the formatting layer key), and
+  semanticTokens/range.
   Diagnostics are covered with real cross-layer `concatenated` (the
   cross-layer-aggregation diagnostics phase): pull and synthetic push both
   merge host-server pulls (real URI) with the virt regions' results per the
-  layer strategy. Not covered: semantic tokens (native-only).
+  layer strategy. Not covered: semanticTokens/full and full/delta (native-only).
   `completionItem/resolve` routes by
   the envelope stamped into `CompletionItem.data`; the host layer stamps one
   too (marked `host_layer`, so the resolve forwards VERBATIM — no coordinate
