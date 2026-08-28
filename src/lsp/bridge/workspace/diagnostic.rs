@@ -53,6 +53,105 @@ struct CompletedDiagnosticProducer {
     virtual_uris: Arc<VirtualUriObserver>,
 }
 
+struct RootedDiagnosticReport {
+    server: String,
+    spawn_root: Option<String>,
+    provider_identifiers: Vec<Option<String>>,
+    report: WorkspaceDiagnosticReport,
+}
+
+fn reconcile_overlapping_root_reports(
+    reports: impl IntoIterator<Item = RootedDiagnosticReport>,
+) -> Vec<WorkspaceDiagnosticReport> {
+    struct RootedDiagnosticItem {
+        server: String,
+        spawn_root: Option<String>,
+        provider_identifiers: Vec<Option<String>>,
+        item: WorkspaceDocumentDiagnosticReport,
+    }
+
+    fn item_uri(item: &WorkspaceDocumentDiagnosticReport) -> &str {
+        match item {
+            WorkspaceDocumentDiagnosticReport::Full(report) => report.uri.as_str(),
+            WorkspaceDocumentDiagnosticReport::Unchanged(report) => report.uri.as_str(),
+        }
+    }
+
+    fn containing_root_depth(root: Option<&str>, document_uri: &str) -> Option<usize> {
+        let root = url::Url::parse(root?).ok()?;
+        let document = url::Url::parse(document_uri).ok()?;
+        if root.scheme() != document.scheme()
+            || root.username() != document.username()
+            || root.password() != document.password()
+            || root.host_str() != document.host_str()
+            || root.port_or_known_default() != document.port_or_known_default()
+        {
+            return None;
+        }
+        let mut root_segments = root.path_segments()?.collect::<Vec<_>>();
+        while root_segments.last() == Some(&"") {
+            root_segments.pop();
+        }
+        let document_segments = document.path_segments()?.collect::<Vec<_>>();
+        document_segments
+            .starts_with(&root_segments)
+            .then_some(root_segments.len())
+    }
+
+    let items = reports
+        .into_iter()
+        .flat_map(|report| {
+            report
+                .report
+                .items
+                .into_iter()
+                .map(move |item| RootedDiagnosticItem {
+                    server: report.server.clone(),
+                    spawn_root: report.spawn_root.clone(),
+                    provider_identifiers: report.provider_identifiers.clone(),
+                    item,
+                })
+        })
+        .collect::<Vec<_>>();
+    let mut preferred_roots = BTreeMap::new();
+    for item in &items {
+        let uri = item_uri(&item.item);
+        let Some(depth) = containing_root_depth(item.spawn_root.as_deref(), uri) else {
+            continue;
+        };
+        let key = (
+            item.server.clone(),
+            item.provider_identifiers.clone(),
+            uri.to_owned(),
+        );
+        let candidate = (depth, item.spawn_root.clone().unwrap_or_default());
+        preferred_roots
+            .entry(key)
+            .and_modify(|current| {
+                if candidate > *current {
+                    *current = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+    items
+        .into_iter()
+        .filter(|item| {
+            let uri = item_uri(&item.item);
+            preferred_roots
+                .get(&(
+                    item.server.clone(),
+                    item.provider_identifiers.clone(),
+                    uri.to_owned(),
+                ))
+                .is_none_or(|(_, root)| item.spawn_root.as_deref() == Some(root.as_str()))
+        })
+        .map(|item| WorkspaceDiagnosticReport {
+            items: vec![item.item],
+        })
+        .collect()
+}
+
 impl DiagnosticProvider {
     fn identifier(&self) -> Option<&str> {
         self.identifier.as_deref()
@@ -421,9 +520,22 @@ impl LanguageServerPool {
             .iter()
             .map(|observer| observer.provenance_revision())
             .collect::<Vec<_>>();
-        let reports = admitted
-            .into_iter()
-            .map(|completed| sanitize_report(completed.report, &completed.virtual_uris));
+        let reports = admitted.into_iter().map(|completed| {
+            let mut provider_identifiers = completed
+                .provider_plan
+                .iter()
+                .map(|provider| provider.identifier.clone())
+                .collect::<Vec<_>>();
+            provider_identifiers.sort();
+            provider_identifiers.dedup();
+            RootedDiagnosticReport {
+                server: completed.handle.key().server().to_owned(),
+                spawn_root: completed.handle.spawn_root().map(str::to_owned),
+                provider_identifiers,
+                report: sanitize_report(completed.report, &completed.virtual_uris),
+            }
+        });
+        let reports = reconcile_overlapping_root_reports(reports);
         let result = aggregate_reports(reports);
         drop(_provenance_guards);
         if !admit() {
@@ -896,6 +1008,109 @@ mod tests {
         assert_eq!(
             report.full_document_diagnostic_report.items[1].message,
             "zeta"
+        );
+    }
+
+    #[test]
+    fn overlapping_roots_use_the_most_specific_producer_per_document() {
+        let provider_identifiers = vec![Some("rust".to_owned())];
+        let reports = reconcile_overlapping_root_reports([
+            RootedDiagnosticReport {
+                server: "diagnostics".into(),
+                spawn_root: Some("file:///workspace".into()),
+                provider_identifiers: provider_identifiers.clone(),
+                report: WorkspaceDiagnosticReport {
+                    items: vec![
+                        full("file:///workspace/root.rs", None, "parent-root"),
+                        full("file:///workspace/nested/doc.rs", None, "parent-nested"),
+                    ],
+                },
+            },
+            RootedDiagnosticReport {
+                server: "diagnostics".into(),
+                spawn_root: Some("file:///workspace/nested/".into()),
+                provider_identifiers,
+                report: WorkspaceDiagnosticReport {
+                    items: vec![full("file:///workspace/nested/doc.rs", None, "nested-root")],
+                },
+            },
+        ]);
+        let WorkspaceDiagnosticReportResult::Report(report) = aggregate_reports(reports) else {
+            panic!("final report")
+        };
+        let messages = report
+            .items
+            .iter()
+            .map(|item| match item {
+                WorkspaceDocumentDiagnosticReport::Full(report) => (
+                    report.uri.as_str(),
+                    report.full_document_diagnostic_report.items[0]
+                        .message
+                        .as_str(),
+                ),
+                WorkspaceDocumentDiagnosticReport::Unchanged(_) => panic!("full report"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                ("file:///workspace/nested/doc.rs", "nested-root"),
+                ("file:///workspace/root.rs", "parent-root"),
+            ]
+        );
+    }
+
+    #[test]
+    fn overlapping_root_reconciliation_preserves_independent_providers() {
+        let uri = "file:///workspace/nested/doc.rs";
+        let reports = reconcile_overlapping_root_reports([
+            RootedDiagnosticReport {
+                server: "diagnostics".into(),
+                spawn_root: Some("file:///workspace".into()),
+                provider_identifiers: vec![Some("compiler".into())],
+                report: WorkspaceDiagnosticReport {
+                    items: vec![full(uri, None, "parent-compiler")],
+                },
+            },
+            RootedDiagnosticReport {
+                server: "diagnostics".into(),
+                spawn_root: Some("file:///workspace/nested".into()),
+                provider_identifiers: vec![Some("compiler".into())],
+                report: WorkspaceDiagnosticReport {
+                    items: vec![full(uri, None, "nested-compiler")],
+                },
+            },
+            RootedDiagnosticReport {
+                server: "diagnostics".into(),
+                spawn_root: Some("file:///workspace".into()),
+                provider_identifiers: vec![Some("linter".into())],
+                report: WorkspaceDiagnosticReport {
+                    items: vec![full(uri, None, "parent-linter")],
+                },
+            },
+            RootedDiagnosticReport {
+                server: "other".into(),
+                spawn_root: Some("file:///workspace".into()),
+                provider_identifiers: vec![Some("compiler".into())],
+                report: WorkspaceDiagnosticReport {
+                    items: vec![full(uri, None, "other-server")],
+                },
+            },
+        ]);
+        let WorkspaceDiagnosticReportResult::Report(report) = aggregate_reports(reports) else {
+            panic!("final report")
+        };
+        let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
+            panic!("full report")
+        };
+        assert_eq!(
+            report
+                .full_document_diagnostic_report
+                .items
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["nested-compiler", "parent-linter", "other-server"]
         );
     }
 
@@ -2419,6 +2634,94 @@ mod tests {
             request.await.unwrap().unwrap(),
             WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport::default())
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_reconciles_reports_from_overlapping_client_roots() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let parent_folder = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace").unwrap(),
+            name: "parent".into(),
+        };
+        let nested_folder = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/nested").unwrap(),
+            name: "nested".into(),
+        };
+        pool.set_root_uri(Some(parent_folder.uri.to_string()));
+        pool.set_workspace_folders(Some(vec![parent_folder, nested_folder]));
+        let parent = create_handle_advertising_workspace_diagnostics(
+            ConnectionKey::new("diagnostics", None),
+            None,
+        )
+        .await;
+        record_test_spawn_root(&parent, "file:///workspace");
+        let nested = create_handle_advertising_workspace_diagnostics(
+            ConnectionKey::new("diagnostics", Some("file:///workspace/nested".into())),
+            None,
+        )
+        .await;
+        record_test_spawn_root(&nested, "file:///workspace/nested");
+        pool.connections().await.extend([
+            (parent.key().clone(), Arc::clone(&parent)),
+            (nested.key().clone(), Arc::clone(&nested)),
+        ]);
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "diagnostics".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-diagnostics".into()]),
+                languages: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceDiagnosticParams = serde_json::from_value(serde_json::json!({
+            "previousResultIds": []
+        }))
+        .unwrap();
+        let request_pool = Arc::clone(&pool);
+        let request = tokio::spawn(async move {
+            request_pool
+                .dispatch_workspace_diagnostic(
+                    params,
+                    &settings,
+                    None,
+                    &|| true,
+                    request_pool.workspace_generation(),
+                )
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !parent.router().is_sent(request_id) || !nested.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace pull reaches both overlapping roots");
+        for (handle, message) in [(&parent, "parent"), (&nested, "nested")] {
+            let report = WorkspaceDiagnosticReport {
+                items: vec![full("file:///workspace/nested/doc.rs", Some(1), message)],
+            };
+            let _ = handle.router().route(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": report,
+            }));
+        }
+
+        let WorkspaceDiagnosticReportResult::Report(report) = request.await.unwrap().unwrap()
+        else {
+            panic!("full workspace report")
+        };
+        let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
+            panic!("full document report")
+        };
+        assert_eq!(
+            report.full_document_diagnostic_report.items[0].message,
+            "nested"
+        );
+        assert_eq!(report.full_document_diagnostic_report.items.len(), 1);
     }
 
     #[tokio::test]
