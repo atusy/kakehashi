@@ -1177,6 +1177,59 @@ print("hello")
         );
     }
 
+    #[tokio::test]
+    async fn resolve_host_bridge_context_survives_an_unavailable_parser() {
+        use std::str::FromStr;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let mut language_servers = HashMap::new();
+        language_servers.insert(
+            "hostonly_ls".to_string(),
+            BridgeServerConfig {
+                cmd: Some(vec!["hostonly-ls".to_string()]),
+                languages: Some(vec!["hostonly".to_string()]),
+                ..Default::default()
+            },
+        );
+        let mut languages = HashMap::new();
+        languages.insert(
+            "hostonly".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::from([(
+                    HOST_BRIDGE_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        aggregation: None,
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: false,
+            language_servers,
+            languages,
+            ..Default::default()
+        });
+
+        let uri = Url::parse("file:///test/no_parser.hostonly").unwrap();
+        let lsp_uri = tower_lsp_server::ls_types::Uri::from_str(uri.as_str()).unwrap();
+        server.documents.insert(
+            uri,
+            "word\n".to_string(),
+            Some("hostonly".to_string()),
+            None,
+        );
+
+        assert!(!server.language.has_parser_available("hostonly"));
+        let context = server
+            .resolve_host_bridge_context(&lsp_uri, "textDocument/selectionRange")
+            .expect("an explicit host language must route without a parser");
+        assert_eq!(context.language_id, "hostonly");
+        assert_eq!(context.configs.len(), 1);
+    }
+
     /// The shared freshness helper never parses inline (parse-snapshot ADR
     /// §3: the reader on-demand parse was a resurrection vector). With no
     /// reparse scheduled for a cleared tree, it returns within its bounded
