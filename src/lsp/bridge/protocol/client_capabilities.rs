@@ -429,9 +429,10 @@ fn merge_upstream_capabilities(
             .workspace_edit = Some(mirrored);
     }
 
-    // The bridge can route workspaceSymbol/resolve, but a downstream may omit
-    // `location.range` only when the editor will actually issue that resolve.
-    // Preserve the editor's exact property declaration rather than overclaiming.
+    // The bridge can route workspaceSymbol/resolve, but it only merges the lazy
+    // `location.range` property. Advertise that property only when the editor
+    // will actually issue the resolve; withhold every property the bridge
+    // cannot preserve across its origin envelope.
     if let Some(upstream_symbol) = upstream
         .workspace
         .as_ref()
@@ -450,10 +451,17 @@ fn merge_upstream_capabilities(
             &mut base_symbol.tag_support,
             upstream_symbol.tag_support.clone(),
         );
-        merge_option(
-            &mut base_symbol.resolve_support,
-            upstream_symbol.resolve_support.clone(),
-        );
+        if upstream_symbol
+            .resolve_support
+            .as_ref()
+            .is_some_and(|support| support.properties.iter().any(|p| p == "location.range"))
+        {
+            base_symbol.resolve_support = Some(
+                tower_lsp_server::ls_types::WorkspaceSymbolResolveSupportCapability {
+                    properties: vec!["location.range".into()],
+                },
+            );
+        }
     }
 
     // --- workspace.applyEdit (gated on real upstream support) ---
@@ -595,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_symbol_resolve_support_is_gated_by_the_editor() {
+    fn workspace_symbol_resolve_support_is_gated_and_narrowed_by_the_editor() {
         use tower_lsp_server::ls_types::{
             SymbolKind, SymbolKindCapability, SymbolTag, TagSupport, WorkspaceClientCapabilities,
             WorkspaceSymbolClientCapabilities, WorkspaceSymbolResolveSupportCapability,
@@ -611,7 +619,7 @@ mod tests {
         assert_eq!(baseline_symbol.resolve_support, None);
 
         let resolve_support = WorkspaceSymbolResolveSupportCapability {
-            properties: vec!["location.range".into()],
+            properties: vec!["containerName".into(), "location.range".into()],
         };
         let upstream = ClientCapabilities {
             workspace: Some(WorkspaceClientCapabilities {
@@ -639,7 +647,9 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .resolve_support,
-            Some(resolve_support)
+            Some(WorkspaceSymbolResolveSupportCapability {
+                properties: vec!["location.range".into()],
+            })
         );
         let symbol = merged.workspace.unwrap().symbol.unwrap();
         assert_eq!(
