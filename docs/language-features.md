@@ -107,7 +107,9 @@ containing virtual region; unrelated regions retain document order. Omitting
 `native` from the layer priorities removes that built-in coverage. A bridge
 target disabled by an empty server allowlist or zero fan-out does not break an
 otherwise unchanged native full/delta lineage. Only the
-`textDocument/semanticTokens/full/delta` request remains built-in-only.
+`textDocument/semanticTokens/full/delta` diff remains native-only: when an edit
+introduces an applicable bridge layer, it re-enters full aggregation and returns
+a full merged response without establishing a merged delta lineage.
 
 Highlight colors are driven by the token types/modifiers
 kakehashi exposes; capture names can be remapped via

@@ -48,8 +48,10 @@ Partially implemented:
   cross-layer-aggregation diagnostics phase): pull and synthetic push both
   merge host-server pulls (real URI) with the virt regions' results per the
   layer strategy. SemanticTokens/full always combines every selected layer so
-  injection-only results cannot erase the rest of the document. Not covered:
-  semanticTokens/full/delta (native-only).
+  injection-only results cannot erase the rest of the document. A native
+  semanticTokens/full/delta lineage re-enters that full aggregation when a
+  bridge becomes applicable, but the merged response establishes no delta
+  lineage.
   `completionItem/resolve` routes by
   the envelope stamped into `CompletionItem.data`; the host layer stamps one
   too (marked `host_layer`, so the resolve forwards VERBATIM — no coordinate

@@ -22,7 +22,8 @@ Phased roadmap:
    aggregation config. With host bridging (host-document-bridge)
    implemented for the bridged request methods (`semanticTokens/range` is
    covered for injection-contained requests; full uses its required overlay
-   barrier; full/delta remains native-only),
+   barrier; full/delta re-enters that overlay when a bridge becomes applicable
+   but does not establish a merged delta lineage),
    handlers run the real
    stage-2 `preferred` walk (`Kakehashi::walk_layers` →
    `race_layers_preferred`): the virt and host layers fan out
@@ -304,7 +305,8 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   not the configurable preferred/concatenated choice: a virtual-only winner
   cannot represent the surrounding host document. Range requests retain the
   ordinary preferred walk because one injection wholly owns their bridged
-  range. Full/delta remains native-only.
+  range. Full/delta re-enters the full overlay when a native lineage encounters
+  a newly applicable bridge, returning a full response without a merged lineage.
 
 ## Consequences
 
