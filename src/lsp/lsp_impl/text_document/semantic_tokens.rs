@@ -18,9 +18,9 @@
 
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
-    NumberOrString, Position, Range, SemanticTokens, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult,
+    NumberOrString, Position, Range, SemanticTokens, SemanticTokensDelta,
+    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
 };
 use url::Url;
 
@@ -1482,10 +1482,80 @@ impl Kakehashi {
         // Hold the requested baseline across the nested full request. The wire
         // cache is byte-bounded, so looking it up afterwards can lose the exact
         // lineage when the newly computed full result evicts older entries.
-        let previous = self
+        let previous_wire = self
             .cache
-            .get_wire_tokens_if_valid(&uri, &previous_result_id)
-            .or_else(|| self.cache.get_tokens_if_valid(&uri, &previous_result_id));
+            .get_wire_tokens_if_valid(&uri, &previous_result_id);
+        let previous_native = previous_wire
+            .is_none()
+            .then(|| self.cache.get_tokens_if_valid(&uri, &previous_result_id))
+            .flatten();
+        let settings = self.settings_manager.load_settings();
+
+        // Preserve the native-only idle fast path. A wire baseline or any
+        // eligible bridge layer must still execute the full fan-out because a
+        // downstream server may change its answer without a document edit.
+        if let Some(previous) = previous_native.as_ref()
+            && let Some(view) = self.documents.latest_snapshot(&uri)
+            && let Some(snapshot) = view.slot.snapshot.as_ref()
+            && snapshot.incarnation == view.slot.current_incarnation
+            && snapshot.parsed_version == view.content_version
+            && let Some(language) = snapshot.language.as_deref()
+            && {
+                let layers =
+                    crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+                        &settings,
+                        language,
+                        "textDocument/semanticTokens/full",
+                    );
+                let has_spawnable_server = settings.language_servers.keys().any(|name| {
+                    name != crate::config::WILDCARD_KEY
+                        && crate::config::resolve_with_wildcard(
+                            &settings.language_servers,
+                            name,
+                            crate::config::merge_bridge_server_configs,
+                        )
+                        .is_some_and(|config| config.is_spawnable())
+                });
+                layers.allows(LayerSource::Native)
+                    && (!has_spawnable_server
+                        || (!layers.allows(LayerSource::Virt) && !layers.allows(LayerSource::Host)))
+            }
+            && self.cache.semantic_token_generation() == request_generation
+            && let Some(current) = self.cache.get_current_tokens_for_snapshot(
+                &uri,
+                language,
+                SemanticSnapshotIdentity {
+                    parsed_version: snapshot.parsed_version,
+                    incarnation: snapshot.incarnation,
+                    generation: request_generation,
+                },
+            )
+            && std::sync::Arc::ptr_eq(previous, &current)
+        {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            if !cancel_token.is_cancelled()
+                && self.cache.is_request_active(&uri, request_id)
+                && self.semantic_full_response_is_current(
+                    &uri,
+                    request_identity,
+                    request_generation,
+                    Some(snapshot),
+                    &edit_lock,
+                )
+            {
+                self.cache
+                    .record_served_semantic_version(&uri, snapshot.parsed_version);
+                return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
+                    SemanticTokensDelta {
+                        result_id: Some(previous_result_id),
+                        edits: Vec::new(),
+                    },
+                )));
+            }
+            return Ok(None);
+        }
+        let previous = previous_wire.or(previous_native);
         let full_params = SemanticTokensParams {
             text_document: params.text_document,
             work_done_progress_params: params.work_done_progress_params,
@@ -3412,18 +3482,24 @@ mod tests {
             text_document: TextDocumentIdentifier {
                 uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
             },
-            previous_result_id: delta_result_id,
+            previous_result_id: delta_result_id.clone(),
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
 
         let follow_up_result = server
             .semantic_tokens_full_delta_impl(follow_up_params)
-            .await;
-        assert!(
-            follow_up_result.is_ok(),
-            "follow-up delta request should succeed"
+            .await
+            .expect("follow-up delta request should succeed")
+            .expect("unchanged native baseline should produce a delta");
+        let SemanticTokensFullDeltaResult::TokensDelta(follow_up_delta) = follow_up_result else {
+            panic!("unchanged native baseline should keep the delta fast path");
+        };
+        assert_eq!(
+            follow_up_delta.result_id.as_deref(),
+            Some(delta_result_id.as_str())
         );
+        assert!(follow_up_delta.edits.is_empty());
     }
 
     /// End-to-end for the don't-discover-twice lever (parse-snapshot ADR §3):
