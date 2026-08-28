@@ -1,6 +1,7 @@
 //! Workspace-diagnostic fan-out with deterministic full-report aggregation.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -176,6 +177,20 @@ fn aggregate_reports(
     })
 }
 
+async fn aggregate_admitted_reports<F>(
+    requests: impl IntoIterator<Item = F>,
+    admit: &(dyn Fn() -> bool + Sync),
+) -> WorkspaceDiagnosticReportResult
+where
+    F: Future<Output = Option<WorkspaceDiagnosticReport>>,
+{
+    let reports = join_all(requests).await;
+    if !admit() {
+        return aggregate_reports(std::iter::empty());
+    }
+    aggregate_reports(reports.into_iter().flatten())
+}
+
 fn combine_producer_reports(
     reports: impl IntoIterator<Item = WorkspaceDiagnosticReport>,
 ) -> WorkspaceDiagnosticReport {
@@ -304,10 +319,10 @@ impl LanguageServerPool {
                 });
                 let report =
                     combine_producer_reports(join_all(requests).await.into_iter().flatten());
-                if !admit()
-                    || !self
-                        .workspace_diagnostic_producer_is_live(&handle, generation)
-                        .await
+                if !self
+                    .workspace_diagnostic_producer_is_live(&handle, generation)
+                    .await
+                    || !admit()
                 {
                     return None;
                 }
@@ -315,7 +330,7 @@ impl LanguageServerPool {
             }
         });
 
-        aggregate_reports(join_all(requests).await.into_iter().flatten())
+        aggregate_admitted_reports(requests, admit).await
     }
 
     async fn send_workspace_diagnostic_request(
@@ -558,6 +573,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["old", "new", "not-open"]
         );
+    }
+
+    #[tokio::test]
+    async fn final_aggregation_rejects_a_stale_settings_generation() {
+        use std::pin::Pin;
+
+        let admitted = Arc::new(AtomicBool::new(true));
+        let fast_completed = Arc::new(AtomicBool::new(false));
+        let (release_slow, slow_released) = tokio::sync::oneshot::channel();
+        let requests: Vec<Pin<Box<dyn Future<Output = Option<WorkspaceDiagnosticReport>> + Send>>> = vec![
+            {
+                let fast_completed = Arc::clone(&fast_completed);
+                Box::pin(async move {
+                    fast_completed.store(true, Ordering::SeqCst);
+                    Some(WorkspaceDiagnosticReport {
+                        items: vec![full("file:///workspace/fast.rs", Some(1), "stale")],
+                    })
+                })
+            },
+            Box::pin(async move {
+                let _ = slow_released.await;
+                Some(WorkspaceDiagnosticReport { items: Vec::new() })
+            }),
+        ];
+        let admitted_for_request = Arc::clone(&admitted);
+        let request = tokio::spawn(async move {
+            aggregate_admitted_reports(requests, &|| admitted_for_request.load(Ordering::SeqCst))
+                .await
+        });
+        while !fast_completed.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        admitted.store(false, Ordering::SeqCst);
+        release_slow.send(()).unwrap();
+
+        let WorkspaceDiagnosticReportResult::Report(report) = request.await.unwrap() else {
+            panic!("full report")
+        };
+        assert!(report.items.is_empty());
     }
 
     #[tokio::test]
