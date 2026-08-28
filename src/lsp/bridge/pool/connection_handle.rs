@@ -15,8 +15,9 @@ use tower_lsp_server::ls_types::{
     CodeActionOptions, CodeActionProviderCapability, ColorProviderCapability,
     DeclarationCapability, FoldingRangeProviderCapability, HoverProviderCapability,
     ImplementationProviderCapability, LinkedEditingRangeServerCapabilities, OneOf, RenameOptions,
-    SaveOptions, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
+    SaveOptions, SemanticTokensLegend, SemanticTokensServerCapabilities, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
+    TypeDefinitionProviderCapability,
 };
 
 use super::connection_action::BridgeError;
@@ -48,6 +49,17 @@ pub(crate) fn supports_initial_workspace_folders(caps: &ServerCapabilities) -> b
         .as_ref()
         .and_then(|ws| ws.workspace_folders.as_ref())
         .is_some_and(|folders| folders.supported == Some(true))
+}
+
+fn semantic_tokens_options(
+    caps: &ServerCapabilities,
+) -> Option<&tower_lsp_server::ls_types::SemanticTokensOptions> {
+    match caps.semantic_tokens_provider.as_ref()? {
+        SemanticTokensServerCapabilities::SemanticTokensOptions(options) => Some(options),
+        SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(registration) => {
+            Some(&registration.semantic_tokens_options)
+        }
+    }
 }
 
 /// Whether `caps` advertises everything the shared-instance opt-in (#391)
@@ -642,6 +654,12 @@ impl ConnectionHandle {
         self.server_capabilities.get()
     }
 
+    pub(crate) fn semantic_tokens_legend(&self) -> Option<&SemanticTokensLegend> {
+        self.server_capabilities()
+            .and_then(semantic_tokens_options)
+            .map(|options| &options.legend)
+    }
+
     /// Store whether the downstream advertised bridge routing in `initialize`.
     pub(super) fn set_bridge_routing(&self, advertised: bool) {
         self.bridge_routing.store(advertised, Ordering::Release);
@@ -823,6 +841,9 @@ impl ConnectionHandle {
                 caps.inline_value_provider,
                 Some(OneOf::Left(true) | OneOf::Right(_))
             ),
+            "textDocument/semanticTokens/range" => {
+                semantic_tokens_options(caps).is_some_and(|options| options.range == Some(true))
+            }
             "textDocument/prepareCallHierarchy" => matches!(
                 caps.call_hierarchy_provider,
                 Some(
@@ -2339,7 +2360,8 @@ mod tests {
             CallHierarchyServerCapability, ColorProviderCapability, ColorProviderOptions,
             CompletionOptions, DeclarationCapability, DeclarationOptions,
             DeclarationRegistrationOptions, DocumentLinkOptions, HoverProviderCapability,
-            ImplementationProviderCapability, OneOf, SignatureHelpOptions,
+            ImplementationProviderCapability, OneOf, SemanticTokensLegend, SemanticTokensOptions,
+            SemanticTokensServerCapabilities, SignatureHelpOptions,
             StaticTextDocumentColorProviderOptions, TextDocumentRegistrationOptions,
             TextDocumentSyncCapability, TextDocumentSyncOptions, TypeDefinitionProviderCapability,
         };
@@ -2448,6 +2470,20 @@ mod tests {
                 "textDocument/inlineValue",
                 Box::new(|c| {
                     c.inline_value_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/semanticTokens/range",
+                Box::new(|c| {
+                    c.semantic_tokens_provider =
+                        Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+                            SemanticTokensOptions {
+                                legend: SemanticTokensLegend::default(),
+                                range: Some(true),
+                                full: None,
+                                work_done_progress_options: Default::default(),
+                            },
+                        ));
                 }),
             ),
             (
@@ -2596,7 +2632,8 @@ mod tests {
     async fn has_capability_returns_false_for_explicitly_disabled() {
         use tower_lsp_server::ls_types::{
             CallHierarchyServerCapability, ColorProviderCapability, DeclarationCapability,
-            HoverProviderCapability, ImplementationProviderCapability, OneOf,
+            HoverProviderCapability, ImplementationProviderCapability, OneOf, SemanticTokensLegend,
+            SemanticTokensOptions, SemanticTokensServerCapabilities,
             TypeDefinitionProviderCapability,
         };
 
@@ -2681,6 +2718,20 @@ mod tests {
                 "textDocument/inlineValue",
                 Box::new(|c| {
                     c.inline_value_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/semanticTokens/range",
+                Box::new(|c| {
+                    c.semantic_tokens_provider =
+                        Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+                            SemanticTokensOptions {
+                                legend: SemanticTokensLegend::default(),
+                                range: Some(false),
+                                full: None,
+                                work_done_progress_options: Default::default(),
+                            },
+                        ));
                 }),
             ),
             (

@@ -18,20 +18,25 @@
 
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
-    SemanticTokens, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
-    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
+    NumberOrString, Range, SemanticTokens, SemanticTokensDeltaParams,
+    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
+    SemanticTokensRangeResult, SemanticTokensResult,
 };
 use url::Url;
 
 #[cfg(test)]
 use tower_lsp_server::ls_types::{
-    PartialResultParams, Position, Range, TextDocumentIdentifier, WorkDoneProgressParams,
+    PartialResultParams, Position, TextDocumentIdentifier, WorkDoneProgressParams,
 };
 
 use crate::analysis::{
     SemanticSnapshotIdentity, calculate_delta_or_full, filter_semantic_tokens_by_range,
     handle_semantic_tokens_full, next_result_id,
 };
+use crate::lsp::aggregation::server::{
+    HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
+};
+use crate::lsp::bridge::{HostDocument, RegionOffset, host_position_within_region_bounds};
 use crate::lsp::current_upstream_id;
 
 use super::super::{Kakehashi, uri_to_url};
@@ -1050,6 +1055,178 @@ impl Kakehashi {
     }
 
     pub(crate) async fn semantic_tokens_range_impl(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        const METHOD: &str = "textDocument/semanticTokens/range";
+        let lsp_uri = params.text_document.uri.clone();
+        let range = params.range;
+        let progress_token = params.work_done_progress_params.work_done_token.clone();
+        let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+        let virt = self.semantic_tokens_range_virt_layer(&lsp_uri, range, progress_token);
+        let host = self.semantic_tokens_range_host_layer(&lsp_uri, range, raw_params);
+        let native = self.semantic_tokens_range_native_layer(params);
+
+        self.walk_layer_futures(
+            &lsp_uri,
+            METHOD,
+            METHOD,
+            virt,
+            host,
+            native,
+            |tokens: &SemanticTokensRangeResult| match tokens {
+                SemanticTokensRangeResult::Tokens(tokens) => !tokens.data.is_empty(),
+                SemanticTokensRangeResult::Partial(partial) => !partial.data.is_empty(),
+            },
+        )
+        .await
+    }
+
+    async fn semantic_tokens_range_host_layer(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        range: Range,
+        raw_params: serde_json::Value,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        const METHOD: &str = "textDocument/semanticTokens/range";
+        let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
+            return Ok(None);
+        };
+        let incarnation = ctx.incarnation;
+        let content_version = ctx.content_version;
+        if !self.semantic_range_snapshot_is_current(lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        let result = dispatch_host_preferred(
+            &ctx,
+            self.bridge.pool_arc(),
+            move |task: HostFanOutTask| {
+                let params = raw_params.clone();
+                async move {
+                    task.pool
+                        .send_host_semantic_tokens_range_request(
+                            &task.server_name,
+                            &task.server_config,
+                            &HostDocument {
+                                uri: &task.uri,
+                                language_id: &task.language_id,
+                                text: &task.text,
+                            },
+                            params,
+                            range,
+                            task.upstream_id,
+                            incarnation,
+                        )
+                        .await
+                }
+            },
+            |tokens| {
+                tokens
+                    .as_ref()
+                    .is_some_and(|tokens| !tokens.data.is_empty())
+            },
+            cancel_rx,
+        )
+        .await;
+        let tokens = self.host_layer_result(result, METHOD, |won| won).await?;
+        if !self.semantic_range_snapshot_is_current(lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
+        Ok(tokens.map(SemanticTokensRangeResult::Tokens))
+    }
+
+    async fn semantic_tokens_range_virt_layer(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        range: Range,
+        progress_token: Option<NumberOrString>,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        const METHOD: &str = "textDocument/semanticTokens/range";
+        let Some(mut ctx) = self
+            .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
+            .await
+        else {
+            return Ok(None);
+        };
+        let offset = RegionOffset::with_per_line_offsets(
+            ctx.document.resolved.region.line_range.start,
+            ctx.document.resolved.line_column_offsets.clone(),
+        );
+        let Some(region_end) = ctx.document.region_end else {
+            return Ok(None);
+        };
+        if ctx.range.start > ctx.range.end
+            || !host_position_within_region_bounds(ctx.range.start, &offset, region_end)
+            || !host_position_within_region_bounds(ctx.range.end, &offset, region_end)
+        {
+            return Ok(None);
+        }
+        let host_range = ctx.range;
+        ctx.document.client_progress_token = progress_token;
+        let incarnation = ctx.incarnation;
+        let content_version = ctx.content_version;
+        if !self.semantic_range_snapshot_is_current(lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
+        let (cancel_rx, _cancel_guard) =
+            self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
+        let result = dispatch_preferred(
+            &ctx.document,
+            self.bridge.pool_arc(),
+            |task| async move {
+                task.pool
+                    .send_semantic_tokens_range_request(
+                        &task.server_name,
+                        &task.server_config,
+                        &task.uri,
+                        host_range,
+                        region_end,
+                        &task.injection_language,
+                        &task.region_id,
+                        task.offset,
+                        &task.virtual_content,
+                        task.upstream_id,
+                        task.client_progress_token,
+                        incarnation,
+                    )
+                    .await
+            },
+            |tokens| {
+                tokens
+                    .as_ref()
+                    .is_some_and(|tokens| !tokens.data.is_empty())
+            },
+            cancel_rx,
+        )
+        .await;
+        let tokens = result
+            .handle(&self.notifier(), "semantic token range", None, Ok)
+            .await?;
+        if !self.semantic_range_snapshot_is_current(lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
+        Ok(tokens.map(SemanticTokensRangeResult::Tokens))
+    }
+
+    fn semantic_range_snapshot_is_current(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        incarnation: u64,
+        content_version: u64,
+    ) -> bool {
+        uri_to_url(lsp_uri)
+            .ok()
+            .and_then(|uri| {
+                self.documents.get(&uri).map(|document| {
+                    document.incarnation() == incarnation
+                        && document.content_version() == content_version
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    async fn semantic_tokens_range_native_layer(
         &self,
         params: SemanticTokensRangeParams,
     ) -> Result<Option<SemanticTokensRangeResult>> {

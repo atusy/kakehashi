@@ -56,6 +56,7 @@ mod range_formatting;
 mod references;
 mod rename;
 mod save;
+mod semantic_tokens;
 mod signature_help;
 #[cfg(test)]
 pub(in crate::lsp::bridge) mod test_helpers;
