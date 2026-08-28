@@ -405,7 +405,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | colorPresentation | ✅ Implemented | Experimental opt-in; host edits pass through verbatim, unsafe virtual presentations are dropped |
 | documentHighlight | ✅ Implemented | Strategy-2 shape (single-document, position-mapped) |
 | diagnostics | ✅ Implemented | Push + pull with host translation |
-| workspace/diagnostic | ✅ Implemented | Document-free fan-out; full reports aggregate by real URI and document version, while provider-private result IDs and internal virtual URIs stay isolated |
+| workspace/diagnostic | ✅ Implemented | Document-free fan-out; full reports aggregate by real URI and report `null` versions, while provider-private result IDs and internal virtual URIs stay isolated |
 | semanticTokens/range | ✅ Implemented | Injection-contained requests use preferred virt/host/native layers; downstream legends and coordinates are translated, invalid tokens drop |
 | semanticTokens/full | ✅ Implemented | Current native baseline plus synchronous host/virt overlay; higher-priority spans replace overlaps and uncovered native spans remain |
 | semanticTokens/full/delta | ✅ Implemented | Recomputes the same full host/virt/native overlay and diffs it against a separate merged-wire baseline; native compute-cache entries never contain downstream tokens |
