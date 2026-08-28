@@ -321,10 +321,11 @@ cross-layer priorities/strategy only — server-level `priorities`/
 Workspace diagnostic pulls start every explicitly configured, runnable server
 that supports them, including cold servers, and combine full reports for real
 workspace files. Reports for one URI are concatenated in stable server-name
-order. A cold connection gives post-initialize dynamic registration one bounded
-settle window before the first pull and collects registrations through the
-window's deadline. Later provider changes request another pull when the editor
-advertises `workspace.diagnostics.refreshSupport`. Without that client
+order. Each connection's first provider plan gives post-initialize dynamic
+registration one bounded settle window and collects registrations through the
+deadline even if another provider is already visible. Later provider changes
+request another pull when the editor advertises
+`workspace.diagnostics.refreshSupport`. Without that client
 capability, a provider registered after the settle window becomes visible on
 the client's next pull because LSP provides no way for the server to initiate
 one. A failure from any planned provider or server fails the request instead of
@@ -338,6 +339,8 @@ Downstream result IDs, provider identifiers, and progress tokens are not shared
 across producers, so workspace pulls currently return full, non-streamed
 reports. Internal virtual-document reports are filtered: open embedded regions
 are already served through the range-aware `textDocument/diagnostic` path.
+Because Kakehashi sends no downstream previous-result IDs, an `unchanged`
+downstream item cannot be reconstructed and fails the aggregate.
 For a shared server that cannot follow workspace-folder changes, the pull uses
 the client-root fallback rather than a process seeded from one marker root.
 Each aggregate is bound to one workspace/settings snapshot: capture waits for

@@ -40,9 +40,10 @@ dynamically declared provider identifier, and no progress tokens. If one server
 registers multiple workspace-diagnostic providers, query each provider with its
 own identifier. Registrations that share an identifier (including an omitted
 identifier) describe the same wire-addressable provider and are queried once.
-For a cold connection with no provider snapshot, keep the bounded registration
+For every connection's first provider plan, keep the bounded registration
 settle window open through its deadline so sequential post-initialize
-registrations join the same first pull.
+registrations join the same first pull even when a static or early dynamic
+provider was already visible.
 
 Treat the planned provider and server sets as one complete aggregate. If any
 planned contribution fails, return a JSON-RPC error instead of a partial report;
@@ -57,6 +58,9 @@ reopen, so the numbers do not establish a safe supersession order. Those
 versions also belong to Kakehashi's synthetic downstream synchronization stream
 rather than the editor's document-version namespace; therefore every upstream
 aggregate reports `null`. Sort final reports by URI for deterministic output.
+An `unchanged` item is invalid because Kakehashi never forwards a matching
+`previousResultId`; reject that provider set rather than manufacturing an
+incomplete full aggregate.
 
 Do not expose reports or related-information links whose exact URI was issued
 to that producer generation as an internal virtual document. URI shape alone
