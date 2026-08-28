@@ -48,10 +48,12 @@ fn capability_prefilter_applies(method: &str) -> bool {
     )
 }
 
-/// Whether a bridge response can carry edits, apply edits, or initiate an
-/// editor mutation. These methods require one contiguous host span even when
-/// the response itself (for example linked-editing ranges) is only a precursor
-/// to the client's edit.
+/// Whether a bridge response needs exact virtual-to-host span translation.
+///
+/// This includes methods that can mutate host text and semantic tokens, whose
+/// relative positions are just as unsafe to project across removed gaps. These
+/// methods require one contiguous host span even when the response itself (for
+/// example linked-editing ranges) is only a precursor to the client's edit.
 ///
 /// Non-contiguous `injection.combined` documents mask bytes inside their outer
 /// range, including inter-capture gaps, stripped line prefixes, and excluded
@@ -68,6 +70,7 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
             | "textDocument/onTypeFormatting"
             | "textDocument/prepareRename"
             | "textDocument/rename"
+            | "textDocument/semanticTokens/range"
     )
 }
 
@@ -3154,7 +3157,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_producing_methods_require_contiguous_injections() {
+    fn exact_span_methods_require_contiguous_injections() {
         for method in [
             "textDocument/codeAction",
             "textDocument/colorPresentation",
@@ -3164,6 +3167,7 @@ mod tests {
             "textDocument/onTypeFormatting",
             "textDocument/prepareRename",
             "textDocument/rename",
+            "textDocument/semanticTokens/range",
         ] {
             assert!(method_requires_contiguous_injection(method), "{method}");
         }
