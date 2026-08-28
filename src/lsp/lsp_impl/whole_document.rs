@@ -442,7 +442,7 @@ impl Kakehashi {
     }
 }
 
-fn request_selects_servers(
+pub(super) fn request_selects_servers(
     priorities: &[String],
     configs: &[ResolvedServerConfig],
     max_fan_out: Option<usize>,

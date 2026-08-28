@@ -970,7 +970,12 @@ impl Kakehashi {
             METHOD,
         );
         if layers.priorities.contains(&LayerSource::Host)
-            && self.resolve_host_bridge_context(lsp_uri, METHOD).is_some()
+            && let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD)
+            && super::super::whole_document::request_selects_servers(
+                &ctx.priorities,
+                &ctx.configs,
+                ctx.max_fan_out,
+            )
         {
             return true;
         }
@@ -980,14 +985,20 @@ impl Kakehashi {
 
         let has_configured_region = |regions: &[ResolvedInjection]| {
             regions.iter().any(|region| {
-                !self
-                    .bridge
-                    .get_all_configs_for_language(
-                        &settings,
-                        language_name,
-                        &region.injection_language,
-                    )
-                    .is_empty()
+                let configs = self.bridge_configs_for_injection_language(
+                    language_name,
+                    &region.injection_language,
+                );
+                let agg = self.resolve_aggregation_config(
+                    language_name,
+                    &region.injection_language,
+                    METHOD,
+                );
+                super::super::whole_document::request_selects_servers(
+                    &agg.priorities,
+                    &configs,
+                    agg.max_fan_out,
+                )
             })
         };
         let generation = self.cache.semantic_token_generation();
@@ -1153,22 +1164,30 @@ impl Kakehashi {
         // full/delta and prevents a native-only lineage from hiding the bridge.
         if self.semantic_delta_has_applicable_bridge(&lsp_uri, &uri, &snapshot, &language_name) {
             self.cache.finish_request(&uri, request_id);
-            return self
-                .semantic_tokens_full_impl(full_params)
-                .await
-                .map(|result| {
-                    result.map(|result| match result {
-                        SemanticTokensResult::Tokens(tokens) => {
-                            SemanticTokensFullDeltaResult::Tokens(tokens)
-                        }
-                        SemanticTokensResult::Partial(partial) => {
-                            SemanticTokensFullDeltaResult::Tokens(SemanticTokens {
-                                result_id: None,
-                                data: partial.data,
-                            })
-                        }
-                    })
-                });
+            let full = self.semantic_tokens_full_impl(full_params);
+            let result = match cancel_rx.as_mut() {
+                Some(cancel_rx) => {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_rx => return Err(Error::request_cancelled()),
+                        result = full => result,
+                    }
+                }
+                None => full.await,
+            };
+            return result.map(|result| {
+                result.map(|result| match result {
+                    SemanticTokensResult::Tokens(tokens) => {
+                        SemanticTokensFullDeltaResult::Tokens(tokens)
+                    }
+                    SemanticTokensResult::Partial(partial) => {
+                        SemanticTokensFullDeltaResult::Tokens(SemanticTokens {
+                            result_id: None,
+                            data: partial.data,
+                        })
+                    }
+                })
+            });
         }
 
         // Early exit check after loading language
