@@ -126,6 +126,27 @@ pub(super) async fn lock_settings_reload() -> tokio::sync::MutexGuard<'static, (
     SETTINGS_RELOAD_LOCK.lock().await
 }
 
+fn configured_diagnostic_candidates(
+    settings: &WorkspaceSettings,
+) -> Vec<(String, crate::config::settings::BridgeServerConfig)> {
+    let mut candidates = settings
+        .language_servers
+        .keys()
+        .filter(|name| name.as_str() != crate::config::WILDCARD_KEY)
+        .filter(|name| crate::config::is_server_spawnable(&settings.language_servers, name))
+        .filter_map(|name| {
+            crate::config::resolve_with_wildcard(
+                &settings.language_servers,
+                name,
+                crate::config::merge_bridge_server_configs,
+            )
+            .map(|config| (name.clone(), config))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    candidates
+}
+
 struct ParserReloadGuard<'a> {
     parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
 }
@@ -187,6 +208,9 @@ pub(super) async fn apply_shared_settings_locked(
         raw_settings,
         settings,
     } = input;
+    let diagnostic_candidates_changed = language_state.request_semantic_refresh
+        && configured_diagnostic_candidates(&settings_manager.load_settings())
+            != configured_diagnostic_candidates(&settings);
     // TRANSITIONAL generation bump BEFORE any query/config mutation: from
     // this instant, every generation-stamped product built from the OLD
     // queries (snapshot-riding discovery/bridge/resolved regions, layer
@@ -264,6 +288,12 @@ pub(super) async fn apply_shared_settings_locked(
             target: "kakehashi::bridge",
             "Propagated settings change to {} downstream connection(s)", pushed
         );
+    }
+    if diagnostic_candidates_changed {
+        let _ = bridge
+            .pool()
+            .upstream_tx()
+            .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
     }
     // A settings/query reload can change tokenization for unchanged text, so
     // bump the semantic-token cache generation once more: the ladder is one
@@ -1166,6 +1196,39 @@ mod tests {
 
     // Note: Wildcard config resolution tests are in src/config.rs
     // Note: apply_content_changes_with_edits tests are in src/lsp/text_sync.rs
+
+    #[tokio::test]
+    async fn settings_reload_refreshes_when_diagnostic_candidates_change() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let mut upstream = server.bridge.take_upstream_rx().unwrap();
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "diagnostics".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["diagnostic-server".into()]),
+                languages: Some(vec!["rust".into()]),
+                ..Default::default()
+            },
+        );
+
+        server
+            .apply_raw_settings(RawWorkspaceSettings::default(), settings.clone())
+            .await;
+        assert_eq!(
+            upstream.try_recv(),
+            Ok(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged)
+        );
+
+        settings.diagnostics_debounce_ms += 1;
+        server
+            .apply_raw_settings(RawWorkspaceSettings::default(), settings)
+            .await;
+        assert!(
+            upstream.try_recv().is_err(),
+            "non-server settings must not force a workspace diagnostic refresh"
+        );
+    }
 
     /// Applying settings is what starts a `forceStart` server — there is no
     /// other trigger for one, and a server with `languages = []` has no
