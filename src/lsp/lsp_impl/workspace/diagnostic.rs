@@ -32,3 +32,30 @@ impl Kakehashi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::lsp::bridge::{ConnectionKey, LanguageServerPool, UpstreamId};
+    use crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard;
+
+    #[tokio::test]
+    async fn workspace_diagnostic_sweep_removes_every_provider_registration() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let upstream_id = UpstreamId::Number(42);
+        let provider = crate::lsp::bridge::test_helpers::create_handle_with_key(
+            crate::lsp::bridge::ConnectionState::Ready,
+            ConnectionKey::for_server("diagnostics"),
+        )
+        .await;
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &provider);
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &provider);
+        assert_eq!(pool.upstream_request_count(&upstream_id), 2);
+
+        let sweep = UpstreamRegistrySweepGuard::new(Arc::clone(&pool), Some(upstream_id.clone()));
+        drop(sweep);
+
+        assert_eq!(pool.upstream_request_count(&upstream_id), 0);
+    }
+}
