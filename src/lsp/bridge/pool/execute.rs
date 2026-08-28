@@ -210,10 +210,6 @@ impl LanguageServerPool {
         }
         self.apply_host_routing_workspace_folders(&routing_uri, connection_key.server(), &handle)
             .await?;
-        if let Some(attempted) = attempted {
-            attempted.store(true, std::sync::atomic::Ordering::Release);
-        }
-
         // Register in the upstream request registry before downstream router
         // registration for cancel lookup. This relative order matters: if a
         // cancel arrives between pool and router registration,
@@ -304,6 +300,9 @@ impl LanguageServerPool {
                     self.unregister_upstream_request(id, connection_key);
                 }
                 return Err(e.into());
+            }
+            if let Some(attempted) = attempted {
+                attempted.store(true, std::sync::atomic::Ordering::Release);
             }
         }
         drop(host_lifecycle);
