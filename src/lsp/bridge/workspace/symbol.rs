@@ -297,6 +297,16 @@ async fn project_workspace_symbol_location(
         }
         OneOf::Right(location) => location.uri = host_uri,
     }
+    // Geometry resolution may await or observe a newer host snapshot after
+    // the initial wire-revision check. Reject the projection unless the exact
+    // virtual revision is still current after all geometry work completes.
+    if pool
+        .virtual_document_version(&virtual_uri, connection_key)
+        .await
+        != Some(virtual_version)
+    {
+        return None;
+    }
     Some(Some(WorkspaceSymbolProjection {
         virtual_uri,
         virtual_version,
