@@ -181,7 +181,7 @@ fn test_selection_range_lua_no_injection() {
 }
 
 #[test]
-fn e2e_native_selection_range_defaults_an_overlong_column_to_line_end() {
+fn e2e_native_selection_range_defaults_overlong_positions() {
     let mut client = LspClient::new();
     client.send_request(
         "initialize",
@@ -227,6 +227,38 @@ fn e2e_native_selection_range_defaults_an_overlong_column_to_line_end() {
     assert!(
         (start == defaulted && end == defaulted) || (start <= defaulted && defaulted < end),
         "native range must contain the defaulted line-end position: {response:?}"
+    );
+
+    let response = selection_range_when_parsed(
+        &mut client,
+        json!({
+            "textDocument": { "uri": uri },
+            "positions": [{ "line": 999, "character": 999 }]
+        }),
+    );
+    let range = &response["result"][0]["range"];
+    let start = (
+        range["start"]["line"].as_u64().expect("start line"),
+        range["start"]["character"]
+            .as_u64()
+            .expect("start character"),
+    );
+    let end = (
+        range["end"]["line"].as_u64().expect("end line"),
+        range["end"]["character"].as_u64().expect("end character"),
+    );
+    let eof = (
+        content.matches('\n').count() as u64,
+        content
+            .rsplit('\n')
+            .next()
+            .expect("at least one line")
+            .encode_utf16()
+            .count() as u64,
+    );
+    assert!(
+        start <= eof && eof <= end,
+        "native range must contain the defaulted EOF position: {response:?}"
     );
 }
 
