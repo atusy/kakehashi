@@ -2173,7 +2173,7 @@ async fn deliver_upstream_notification(
                 publisher.request_forwarded_diagnostic_refresh();
             }
         }
-        UpstreamNotification::DiagnosticProviderRegistered => {
+        UpstreamNotification::DiagnosticProviderChanged => {
             if let Some(publisher) =
                 delivery_context.map(|context| context.diagnostic_publisher.as_ref())
             {

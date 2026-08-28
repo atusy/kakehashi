@@ -23,6 +23,7 @@ pub(crate) struct DynamicCapabilityRegistry {
     log_message_level: AtomicU8,
     revision: AtomicU64,
     changes: tokio::sync::watch::Sender<u64>,
+    diagnostic_registration_settled: tokio::sync::OnceCell<()>,
 }
 
 impl DynamicCapabilityRegistry {
@@ -35,6 +36,7 @@ impl DynamicCapabilityRegistry {
             ),
             revision: AtomicU64::new(0),
             changes,
+            diagnostic_registration_settled: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -69,6 +71,10 @@ impl DynamicCapabilityRegistry {
 
     pub(crate) fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.changes.subscribe()
+    }
+
+    pub(crate) fn diagnostic_registration_settle(&self) -> &tokio::sync::OnceCell<()> {
+        &self.diagnostic_registration_settled
     }
 
     pub(crate) fn has_registration(&self, method: &str) -> bool {
