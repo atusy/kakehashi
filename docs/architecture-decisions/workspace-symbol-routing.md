@@ -30,8 +30,8 @@ normalized to `WorkspaceSymbol`, so results from old and new servers have one
 response shape.
 
 Overlapping roots can make two producers for the same configured server return
-the same symbol. Those per-server contributions are stably deduplicated after
-removing only Kakehashi's routing envelope from the identity. The downstream
+the same symbol. Those per-server contributions are stably deduplicated using
+an identity captured before Kakehashi adds its routing envelope. The downstream
 server's original `data` remains part of that identity, and the first duplicate
 keeps its exact resolve route. Contributions from different configured servers
 are not deduplicated.
