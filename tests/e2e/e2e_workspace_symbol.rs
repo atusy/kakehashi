@@ -84,3 +84,86 @@ fn workspace_symbol_search_starts_a_server_and_resolves_on_its_origin() {
     let _ = client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
+
+#[test]
+fn virtual_workspace_symbol_locations_round_trip_through_the_host() {
+    let config_dir = tempfile::TempDir::new().expect("config temp dir");
+    let config_path = config_dir.path().join("workspace_symbol_virtual.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("UTF-8 config path"))
+        .build();
+    let _ = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "workspaceFolders": null,
+            "capabilities": {
+                "workspace": {
+                    "symbol": {
+                        "resolveSupport": { "properties": ["location.range"] }
+                    }
+                }
+            },
+            "initializationOptions": {
+                "languageServers": {
+                    "virtual-symbol": {
+                        "cmd": [env!("CARGO_BIN_EXE_mock-lsp-formatter"), "workspace-symbol-virtual"],
+                        "languages": ["lua"],
+                        "preferSharedInstance": true
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let host_uri = "file:///workspace/virtual-symbol.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": host_uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "```lua\nlocal value = 1\n```\n"
+            }
+        }),
+    );
+
+    let symbol = (0..100)
+        .find_map(|_| {
+            let response = client.send_request("workspace/symbol", json!({ "query": "needle" }));
+            response["result"]
+                .as_array()
+                .and_then(|symbols| symbols.first())
+                .filter(|symbol| symbol["location"]["uri"] == host_uri)
+                .cloned()
+                .or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                })
+        })
+        .expect("the virtual symbol should be projected onto its host URI");
+    assert!(symbol["location"].get("range").is_none());
+    assert!(
+        symbol["data"]["kakehashi"]["workspaceSymbol"]["projection"]["virtual_uri"]
+            .as_str()
+            .is_some_and(|uri| uri.contains("kakehashi-virtual-uri-"))
+    );
+
+    let resolved = client.send_request("workspaceSymbol/resolve", symbol);
+    assert!(
+        resolved.get("error").is_none(),
+        "resolve failed: {resolved:?}"
+    );
+    assert_eq!(resolved["result"]["location"]["uri"], host_uri);
+    assert_eq!(
+        resolved["result"]["location"]["range"]["start"]["line"], 1,
+        "resolved virtual range should be projected: {resolved:?}"
+    );
+
+    let _ = client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}

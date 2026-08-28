@@ -701,6 +701,14 @@ Kakehashi removes exact duplicates while treating the server's original opaque
 `data` as part of symbol identity; the first duplicate's resolve route is kept.
 Results from different configured servers remain distinct.
 
+An explicit empty `workspaceFolders` list searches no workspace producer;
+`rootUri` is used only when the folder list is absent. Legacy eager results stay
+as `SymbolInformation` for clients without deprecated-tag support, preserving
+the legacy `deprecated` field. Locations that name an exact virtual document
+issued to their producer are translated to the host URI and injection offset;
+stale or closed virtual-document results are dropped, and lazy resolve performs
+the same translation on the resolved range.
+
 When a downstream server supports `workspaceSymbol/resolve`, returned symbols
 carry opaque routing data so a later resolve reaches the same downstream
 process, provided the editor's

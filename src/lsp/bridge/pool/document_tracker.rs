@@ -606,6 +606,18 @@ impl DocumentTracker {
         Some(version)
     }
 
+    pub(super) async fn document_versions_for_connection(
+        &self,
+        connection_key: &ConnectionKey,
+    ) -> HashMap<String, i32> {
+        self.document_versions
+            .lock()
+            .await
+            .get(connection_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Like [`Self::increment_document_version`], but a no-op (`None`) when
     /// `content` is unchanged since the last `didChange` sent to this connection
     /// for this virtual document — so a host edit that doesn't alter a region's

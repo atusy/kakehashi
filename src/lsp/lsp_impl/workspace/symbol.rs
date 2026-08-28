@@ -34,13 +34,16 @@ impl Kakehashi {
             upstream_id.clone(),
         );
         let admit = || self.settings_manager.settings_generation() == settings_generation;
-        let dispatch = pool.dispatch_workspace_symbol(
+        let dispatch = pool.dispatch_workspace_symbol_projected(
             params,
             &settings,
             upstream_id,
             supports_tags,
             &admit,
             workspace_generation,
+            &self.documents,
+            &self.language,
+            &self.bridge,
         );
         match cancel_rx {
             Some(rx) => tokio::select! {
@@ -64,7 +67,14 @@ impl Kakehashi {
             std::sync::Arc::clone(&pool),
             upstream_id.clone(),
         );
-        let dispatch = pool.dispatch_workspace_symbol_resolve(symbol, &settings, upstream_id);
+        let dispatch = pool.dispatch_workspace_symbol_resolve_projected(
+            symbol,
+            &settings,
+            upstream_id,
+            &self.documents,
+            &self.language,
+            &self.bridge,
+        );
         match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;

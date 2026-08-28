@@ -550,7 +550,9 @@ fn main() {
                         "hoverProvider": true,
                         "textDocumentSync": 1
                     }),
-                    "workspace-symbol-alpha" | "workspace-symbol-zeta" => json!({
+                    "workspace-symbol-alpha"
+                    | "workspace-symbol-zeta"
+                    | "workspace-symbol-virtual" => json!({
                         "workspaceSymbolProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -1271,26 +1273,40 @@ fn main() {
                     .pointer("/params/query")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                let location_uri = if mode == "workspace-symbol-virtual" {
+                    documents
+                        .keys()
+                        .find(|uri| uri.contains("kakehashi-virtual-uri-"))
+                        .cloned()
+                        .unwrap_or_else(|| "file:///workspace/not-yet-open.rs".into())
+                } else {
+                    format!("file:///workspace/{mode}.rs")
+                };
                 respond(
                     &mut writer,
                     id,
                     json!([{
                         "name": format!("{mode}:{query}"),
                         "kind": 12,
-                        "location": { "uri": format!("file:///workspace/{mode}.rs") },
+                        "location": { "uri": location_uri },
                         "data": { "mock": query, "producer": mode }
                     }]),
                 );
             }
             "workspaceSymbol/resolve" => {
                 let mut symbol = message.get("params").cloned().unwrap_or(Value::Null);
-                let line = if mode == "workspace-symbol-alpha" {
-                    4
+                let line = match mode.as_str() {
+                    "workspace-symbol-alpha" => 4,
+                    "workspace-symbol-virtual" => 0,
+                    _ => 8,
+                };
+                let location_uri = if mode == "workspace-symbol-virtual" {
+                    symbol["location"]["uri"].clone()
                 } else {
-                    8
+                    json!(format!("file:///workspace/{mode}.rs"))
                 };
                 symbol["location"] = json!({
-                    "uri": format!("file:///workspace/{mode}.rs"),
+                    "uri": location_uri,
                     "range": {
                         "start": { "line": line, "character": 1 },
                         "end": { "line": line, "character": 8 }
