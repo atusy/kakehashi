@@ -86,7 +86,7 @@ impl Kakehashi {
         F: Fn(FanOutTask) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = io::Result<Option<Vec<T>>>> + Send + 'static,
         P: Fn(serde_json::Value) -> Option<Vec<T>> + Clone + Send + 'static,
-        H: FnOnce(HostWholeDocumentResponse<T>) -> Option<Vec<T>> + Send,
+        H: Fn(HostWholeDocumentResponse<T>) -> Option<Vec<T>> + Clone + Send + 'static,
         R: Fn(Vec<T>, Vec<T>) -> Vec<T> + Copy + Send,
         M: Fn(Vec<T>, Vec<T>) -> Vec<T>,
     {
@@ -335,6 +335,7 @@ impl Kakehashi {
                 move |t| {
                     let params = raw_params.clone();
                     let parse_host = parse_host.clone();
+                    let on_host_winner = on_host_winner.clone();
                     async move {
                         let raw = t
                             .pool
@@ -358,7 +359,7 @@ impl Kakehashi {
                         let Some(items) = parse_host(raw.value) else {
                             return Ok(None);
                         };
-                        Ok(Some(HostWholeDocumentResponse {
+                        Ok(on_host_winner(HostWholeDocumentResponse {
                             items,
                             server_name: t.server_name,
                             host_uri: t.uri,
@@ -369,12 +370,11 @@ impl Kakehashi {
                         }))
                     }
                 },
-                |opt| matches!(opt, Some(v) if !v.items.is_empty()),
+                |opt| matches!(opt, Some(items) if !items.is_empty()),
                 cancel_rx,
             )
             .await;
-            self.host_layer_result(fan_in, method_name, |won| won.and_then(on_host_winner))
-                .await
+            self.host_layer_result(fan_in, method_name, |won| won).await
         };
 
         let result = if require_all_layers {
