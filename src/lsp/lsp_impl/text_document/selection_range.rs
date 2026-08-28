@@ -138,12 +138,18 @@ impl Kakehashi {
             return Ok(None);
         };
         let layer_config = self.resolve_layer_config(&language_name, METHOD);
-        if !layer_config.allows(LayerSource::Virt) && !layer_config.allows(LayerSource::Native) {
-            return if layer_config.allows(LayerSource::Host) {
-                self.selection_range_host_only(&lsp_uri, positions).await
-            } else {
-                Ok(None)
-            };
+        let has_parse_layer =
+            layer_config.allows(LayerSource::Virt) || layer_config.allows(LayerSource::Native);
+        let allows_host = layer_config.allows(LayerSource::Host);
+        if layer_config.priorities.first() == Some(&LayerSource::Host) {
+            let host = self
+                .selection_range_host_only(&lsp_uri, positions.clone())
+                .await?;
+            if host.is_some() || !has_parse_layer {
+                return Ok(host);
+            }
+        } else if !has_parse_layer {
+            return Ok(None);
         }
 
         // Ensure language is loaded (handles race condition with didOpen)
@@ -152,7 +158,11 @@ impl Kakehashi {
             .ensure_language_loaded_async(&language_name)
             .await;
         if !load_result.success {
-            return Ok(None);
+            return if allows_host {
+                self.selection_range_host_only(&lsp_uri, positions).await
+            } else {
+                Ok(None)
+            };
         }
 
         // Resolve the latest parse snapshot, waiting briefly (bounded) for a
@@ -191,7 +201,9 @@ impl Kakehashi {
                         // snapshot at all (first parse still running) → the
                         // pre-snapshot behavior: null.
                         Err(_elapsed) => {
-                            return if view.slot.snapshot.is_some() {
+                            return if allows_host {
+                                self.selection_range_host_only(&lsp_uri, positions).await
+                            } else if view.slot.snapshot.is_some() {
                                 Err(crate::error::content_modified_error())
                             } else {
                                 Ok(None)
@@ -208,7 +220,11 @@ impl Kakehashi {
         // the wait above breaks on that placeholder and answers `null` instead
         // of settling for its reparse (#923).
         if snapshot.tree.is_none() {
-            return Ok(None);
+            return if allows_host {
+                self.selection_range_host_only(&lsp_uri, positions).await
+            } else {
+                Ok(None)
+            };
         }
         let expected_version = snapshot.parsed_version;
         let expected_incarnation = snapshot.incarnation;
@@ -373,13 +389,22 @@ impl Kakehashi {
                     partial_result_params: PartialResultParams::default(),
                 })
                 .unwrap_or(serde_json::Value::Null);
+                let host = self.selection_range_host_layer(
+                    lsp_uri,
+                    raw_params,
+                    position,
+                    expected_incarnation,
+                    expected_version,
+                );
                 let Some(selection) = self
-                    .selection_range_host_layer(
+                    .walk_layer_futures(
                         lsp_uri,
-                        raw_params,
-                        position,
-                        expected_incarnation,
-                        expected_version,
+                        METHOD,
+                        METHOD,
+                        std::future::ready(Ok(None)),
+                        host,
+                        std::future::ready(Ok(None)),
+                        |_| true,
                     )
                     .await?
                 else {
