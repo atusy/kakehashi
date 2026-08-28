@@ -232,6 +232,15 @@ impl LanguageServerPool {
         F: Future<Output = Option<CompletedDiagnosticProducer>>,
     {
         let reports: Vec<_> = join_all(requests).await.into_iter().flatten().collect();
+        self.aggregate_admitted_completed_workspace_diagnostic_reports(reports, admit)
+            .await
+    }
+
+    async fn aggregate_admitted_completed_workspace_diagnostic_reports(
+        &self,
+        reports: impl IntoIterator<Item = CompletedDiagnosticProducer>,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> WorkspaceDiagnosticReportResult {
         let connections = self.connections().await;
         if !admit() {
             return aggregate_reports(std::iter::empty());
@@ -316,62 +325,74 @@ impl LanguageServerPool {
             let params = params.clone();
             let upstream_id = upstream_id.clone();
             async move {
-                let (handle, workspace_generation) = self
-                    .get_or_create_workspace_connection_wait_ready_admitted(
+                let Ok((handles, workspace_generation)) = self
+                    .get_or_create_workspace_connections_wait_ready_admitted(
                         &name,
                         &config,
                         Duration::from_secs(INIT_TIMEOUT_SECS),
                         admit,
                     )
                     .await
-                    .ok()?;
+                else {
+                    return Vec::new();
+                };
                 if workspace_generation != request_workspace_generation {
-                    return None;
+                    return Vec::new();
                 }
                 let workspace_admit =
                     || admit() && self.workspace_generation() == workspace_generation;
-                let generation = self.document_connection_generation(handle.key());
-                let virtual_uris =
-                    Arc::new(self.observe_virtual_uris_for_connection(handle.key(), generation));
-                let requests = diagnostic_providers(&handle).into_iter().map(|provider| {
-                    let params = params_for_provider(params.clone(), &provider);
+                let producers = handles.into_iter().map(|handle| {
+                    let params = params.clone();
                     let upstream_id = upstream_id.clone();
-                    let handle = Arc::clone(&handle);
                     async move {
-                        self.send_workspace_diagnostic_request(
-                            &handle,
+                        let generation = self.document_connection_generation(handle.key());
+                        let virtual_uris = Arc::new(
+                            self.observe_virtual_uris_for_connection(handle.key(), generation),
+                        );
+                        let requests = diagnostic_providers(&handle).into_iter().map(|provider| {
+                            let params = params_for_provider(params.clone(), &provider);
+                            let upstream_id = upstream_id.clone();
+                            let handle = Arc::clone(&handle);
+                            async move {
+                                self.send_workspace_diagnostic_request(
+                                    &handle,
+                                    generation,
+                                    params,
+                                    upstream_id,
+                                    provider,
+                                    Some(&workspace_admit),
+                                )
+                                .await
+                                .ok()
+                                .flatten()
+                            }
+                        });
+                        let report = combine_producer_reports(
+                            join_all(requests).await.into_iter().flatten(),
+                        );
+                        if !self
+                            .workspace_diagnostic_producer_is_live(&handle, generation)
+                            .await
+                            || !workspace_admit()
+                        {
+                            return None;
+                        }
+                        Some(CompletedDiagnosticProducer {
+                            handle,
                             generation,
-                            params,
-                            upstream_id,
-                            provider,
-                            Some(&workspace_admit),
-                        )
-                        .await
-                        .ok()
-                        .flatten()
+                            report,
+                            virtual_uris,
+                        })
                     }
                 });
-                let report =
-                    combine_producer_reports(join_all(requests).await.into_iter().flatten());
-                if !self
-                    .workspace_diagnostic_producer_is_live(&handle, generation)
-                    .await
-                    || !workspace_admit()
-                {
-                    return None;
-                }
-                Some(CompletedDiagnosticProducer {
-                    handle,
-                    generation,
-                    report,
-                    virtual_uris,
-                })
+                join_all(producers).await.into_iter().flatten().collect()
             }
         });
 
         let workspace_admit =
             || admit() && self.workspace_generation() == request_workspace_generation;
-        self.aggregate_admitted_workspace_diagnostic_reports(requests, &workspace_admit)
+        let reports = join_all(requests).await.into_iter().flatten();
+        self.aggregate_admitted_completed_workspace_diagnostic_reports(reports, &workspace_admit)
             .await
     }
 
@@ -1373,6 +1394,84 @@ mod tests {
             "id": 2,
             "result": { "items": [] }
         }));
+
+        assert_eq!(
+            request.await.unwrap(),
+            WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport::default())
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_queries_every_client_root_when_producer_lacks_workspace_folders() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let folder_a = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/a").unwrap(),
+            name: "a".into(),
+        };
+        let folder_b = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/b").unwrap(),
+            name: "b".into(),
+        };
+        pool.set_root_uri(Some(folder_a.uri.to_string()));
+        pool.set_workspace_folders(Some(vec![folder_a, folder_b]));
+        let fallback = create_handle_advertising_workspace_diagnostics(
+            ConnectionKey::new("diagnostics", None),
+            None,
+        )
+        .await;
+        record_test_spawn_root(&fallback, "file:///workspace/a");
+        let secondary = create_handle_advertising_workspace_diagnostics(
+            ConnectionKey::new("diagnostics", Some("file:///workspace/b".into())),
+            None,
+        )
+        .await;
+        record_test_spawn_root(&secondary, "file:///workspace/b");
+        pool.connections().await.extend([
+            (fallback.key().clone(), Arc::clone(&fallback)),
+            (secondary.key().clone(), Arc::clone(&secondary)),
+        ]);
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "diagnostics".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-diagnostics".into()]),
+                languages: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceDiagnosticParams = serde_json::from_value(serde_json::json!({
+            "previousResultIds": []
+        }))
+        .unwrap();
+        let request_pool = Arc::clone(&pool);
+        let request = tokio::spawn(async move {
+            request_pool
+                .dispatch_workspace_diagnostic(
+                    params,
+                    &settings,
+                    None,
+                    &|| true,
+                    request_pool.workspace_generation(),
+                )
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !fallback.router().is_sent(request_id) || !secondary.router().is_sent(request_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace pull reaches every client-root producer");
+        for handle in [&fallback, &secondary] {
+            let _ = handle.router().route(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": { "items": [] }
+            }));
+        }
 
         assert_eq!(
             request.await.unwrap(),
