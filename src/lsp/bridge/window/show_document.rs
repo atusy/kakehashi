@@ -53,7 +53,8 @@ pub(in crate::lsp::bridge) fn handle(
                     id,
                     jsonrpc::Error::invalid_params(format!("Invalid params: {e}")),
                 );
-                send_server_response(&response_tx, response, &server_prefix_owned, METHOD).await;
+                let _ = send_server_response(&response_tx, response, &server_prefix_owned, METHOD)
+                    .await;
             });
             return;
         }
@@ -86,7 +87,7 @@ pub(in crate::lsp::bridge) fn handle(
         // a fallback whose only safe value is this same object anyway.
         let result = serde_json::json!({ "success": success });
         let response = jsonrpc::Response::from_ok(response_id, result);
-        send_server_response(&response_tx, response, &server_prefix_owned, METHOD).await;
+        let _ = send_server_response(&response_tx, response, &server_prefix_owned, METHOD).await;
     });
 
     if deps
