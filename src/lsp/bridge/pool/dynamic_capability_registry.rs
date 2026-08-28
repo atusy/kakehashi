@@ -45,8 +45,8 @@ impl WorkspaceDiagnosticLifecycleGuard<'_> {
         self.0.reader_exited
     }
 
-    pub(crate) fn mark_contributed(&mut self) {
-        self.0.contributed = true;
+    pub(crate) fn set_contributed(&mut self, contributed: bool) {
+        self.0.contributed = contributed;
     }
 }
 
@@ -122,7 +122,7 @@ impl DynamicCapabilityRegistry {
         if lifecycle.reader_exited() {
             return None;
         }
-        lifecycle.mark_contributed();
+        lifecycle.set_contributed(true);
         drop(lifecycle);
         Some(self.mark_workspace_diagnostic_pull_completed())
     }
@@ -537,13 +537,14 @@ mod tests {
     }
 
     #[test]
-    fn rejected_cold_pull_can_release_its_deferred_registration_refresh() {
+    fn cold_pull_stays_incomplete_until_success_is_recorded() {
         let registry = DynamicCapabilityRegistry::new();
 
         assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
-        assert!(registry.take_workspace_diagnostic_registration_refresh());
+        assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
         assert!(!registry.has_workspace_diagnostic_contributed());
-        assert!(!registry.take_workspace_diagnostic_registration_refresh());
+        assert!(registry.mark_workspace_diagnostic_pull_completed());
+        assert!(registry.request_or_defer_workspace_diagnostic_registration_refresh());
     }
 
     #[test]

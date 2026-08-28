@@ -46,32 +46,12 @@ struct DiagnosticProvider {
 }
 
 struct CompletedDiagnosticProducer {
-    pull_attempt: Option<WorkspaceDiagnosticPullAttempt>,
     provider_plan: Vec<DiagnosticProvider>,
     handle: Arc<ConnectionHandle>,
     generation: u64,
     report: WorkspaceDiagnosticReport,
     provider_reports: Option<Vec<ProviderDiagnosticReport>>,
     virtual_uris: Arc<VirtualUriObserver>,
-}
-
-struct WorkspaceDiagnosticPullAttempt {
-    handle: Arc<ConnectionHandle>,
-    upstream_tx: tokio::sync::mpsc::UnboundedSender<crate::lsp::bridge::UpstreamNotification>,
-}
-
-impl Drop for WorkspaceDiagnosticPullAttempt {
-    fn drop(&mut self) {
-        if self
-            .handle
-            .dynamic_capabilities()
-            .mark_workspace_diagnostic_pull_completed()
-        {
-            let _ = self
-                .upstream_tx
-                .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
-        }
-    }
 }
 
 struct ProviderDiagnosticReport {
@@ -523,23 +503,6 @@ fn collect_complete_root_producers(
 }
 
 impl LanguageServerPool {
-    fn mark_workspace_diagnostic_pulls_completed<'a>(
-        &self,
-        handles: impl Iterator<Item = &'a Arc<ConnectionHandle>>,
-    ) {
-        let mut refresh = false;
-        for handle in handles {
-            refresh |= handle
-                .dynamic_capabilities()
-                .mark_workspace_diagnostic_pull_completed();
-        }
-        if refresh {
-            let _ = self
-                .upstream_tx()
-                .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
-        }
-    }
-
     fn collect_completed_workspace_diagnostic_requests(
         &self,
         contributions: impl IntoIterator<Item = io::Result<Vec<CompletedDiagnosticProducer>>>,
@@ -564,9 +527,6 @@ impl LanguageServerPool {
             }
         }
         if let Some(error) = server_cancelled.or(first_error) {
-            self.mark_workspace_diagnostic_pulls_completed(
-                completed.iter().map(|producer| &producer.handle),
-            );
             return Err(error);
         }
         Ok(completed)
@@ -574,7 +534,6 @@ impl LanguageServerPool {
 
     fn collect_completed_workspace_diagnostic_provider_reports(
         &self,
-        handle: &Arc<ConnectionHandle>,
         reports: impl IntoIterator<
             Item = (
                 Option<String>,
@@ -582,30 +541,7 @@ impl LanguageServerPool {
             ),
         >,
     ) -> io::Result<Option<Vec<ProviderDiagnosticReport>>> {
-        let completed = combine_complete_provider_reports(reports);
-        if !matches!(completed, Ok(Some(_))) {
-            self.mark_workspace_diagnostic_pulls_completed(std::iter::once(handle));
-        }
-        completed
-    }
-
-    fn release_changed_provider_refreshes<'a>(
-        &self,
-        providers: impl Iterator<Item = (&'a Arc<ConnectionHandle>, &'a Vec<DiagnosticProvider>)>,
-    ) {
-        let refresh = providers.fold(false, |refresh, (handle, expected)| {
-            let changed = diagnostic_providers(handle) != *expected;
-            let released = changed
-                && handle
-                    .dynamic_capabilities()
-                    .take_workspace_diagnostic_registration_refresh();
-            refresh || released
-        });
-        if refresh {
-            let _ = self
-                .upstream_tx()
-                .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
-        }
+        combine_complete_provider_reports(reports)
     }
 
     #[cfg(test)]
@@ -638,7 +574,7 @@ impl LanguageServerPool {
                 "workspace diagnostic admission expired before final aggregation",
             ));
         }
-        let mut admitted = reports
+        let admitted = reports
             .into_iter()
             .map(|completed| {
                 let key = completed.handle.key();
@@ -663,11 +599,6 @@ impl LanguageServerPool {
             .iter()
             .any(|completed| diagnostic_providers(&completed.handle) != completed.provider_plan)
         {
-            self.release_changed_provider_refreshes(
-                admitted
-                    .iter()
-                    .map(|completed| (&completed.handle, &completed.provider_plan)),
-            );
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "workspace diagnostic provider plan changed before final aggregation",
@@ -679,13 +610,6 @@ impl LanguageServerPool {
                 "workspace diagnostic admission expired during final aggregation",
             ));
         }
-        // Keep every attempt guard alive through all final fences. Any early
-        // return or caller cancellation drops these guards and releases a cold
-        // producer's deferred dynamic-registration refresh.
-        let _pull_attempts = admitted
-            .iter_mut()
-            .filter_map(|completed| completed.pull_attempt.take())
-            .collect::<Vec<_>>();
         let provenance_observers = admitted
             .iter()
             .map(|completed| Arc::clone(&completed.virtual_uris))
@@ -782,20 +706,25 @@ impl LanguageServerPool {
         if provenance_stale || producers_stale || !admit() {
             drop(provider_guards);
             drop(connections);
-            self.release_changed_provider_refreshes(
-                provider_plans
-                    .iter()
-                    .map(|(handle, _, plan)| (handle, plan)),
-            );
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "workspace diagnostic producer or admission expired after final aggregation",
             ));
         }
-        let mut contribution_guards = provider_plans
+        let mut contribution_states = Vec::<(Arc<ConnectionHandle>, bool)>::new();
+        for (handle, _, plan) in &provider_plans {
+            if let Some((_, contributed)) = contribution_states
+                .iter_mut()
+                .find(|(existing, _)| Arc::ptr_eq(existing, handle))
+            {
+                *contributed |= !plan.is_empty();
+            } else {
+                contribution_states.push((Arc::clone(handle), !plan.is_empty()));
+            }
+        }
+        let mut contribution_guards = contribution_states
             .iter()
-            .filter(|(_, _, plan)| !plan.is_empty())
-            .map(|(handle, _, _)| {
+            .map(|(handle, _)| {
                 handle
                     .dynamic_capabilities()
                     .workspace_diagnostic_lifecycle_lock()
@@ -810,8 +739,8 @@ impl LanguageServerPool {
                 "workspace diagnostic producer exited during final acceptance",
             ));
         }
-        for guard in &mut contribution_guards {
-            guard.mark_contributed();
+        for (guard, (_, contributed)) in contribution_guards.iter_mut().zip(&contribution_states) {
+            guard.set_contributed(*contributed);
         }
         drop(contribution_guards);
         for (handle, _, _) in &provider_plans {
@@ -933,33 +862,12 @@ impl LanguageServerPool {
             let params = params.clone();
             let upstream_id = upstream_id.clone();
             async move {
-                let pull_attempts = Arc::new(std::sync::Mutex::new(Vec::<
-                    WorkspaceDiagnosticPullAttempt,
-                >::new()));
-                let observed_attempts = Arc::clone(&pull_attempts);
-                let upstream_tx = self.upstream_tx();
-                let on_acquired = move |handle: &Arc<ConnectionHandle>| {
-                    let mut attempts = observed_attempts
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if attempts
-                        .iter()
-                        .any(|attempt| Arc::ptr_eq(&attempt.handle, handle))
-                    {
-                        return;
-                    }
-                    attempts.push(WorkspaceDiagnosticPullAttempt {
-                        handle: Arc::clone(handle),
-                        upstream_tx: upstream_tx.clone(),
-                    });
-                };
                 let (handles, workspace_generation) = self
-                    .get_or_create_workspace_connections_wait_ready_admitted_observed(
+                    .get_or_create_workspace_connections_wait_ready_admitted(
                         &name,
                         &config,
                         Duration::from_secs(INIT_TIMEOUT_SECS),
                         admit,
-                        &on_acquired,
                     )
                     .await?;
                 if workspace_generation != request_workspace_generation {
@@ -973,18 +881,7 @@ impl LanguageServerPool {
                 let producers = handles.into_iter().map(|handle| {
                     let params = params.clone();
                     let upstream_id = upstream_id.clone();
-                    let pull_attempts = Arc::clone(&pull_attempts);
                     async move {
-                        let pull_attempt = {
-                            let mut attempts = pull_attempts
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            let index = attempts
-                                .iter()
-                                .position(|attempt| Arc::ptr_eq(&attempt.handle, &handle))
-                                .expect("every acquired diagnostic handle has an attempt guard");
-                            attempts.swap_remove(index)
-                        };
                         let generation = self.document_connection_generation(handle.key());
                         let virtual_uris = Arc::new(
                             self.observe_virtual_uris_for_connection(handle.key(), generation),
@@ -1017,7 +914,6 @@ impl LanguageServerPool {
                         });
                         let Some(provider_reports) = self
                             .collect_completed_workspace_diagnostic_provider_reports(
-                                &handle,
                                 join_all(requests).await,
                             )?
                         else {
@@ -1028,13 +924,9 @@ impl LanguageServerPool {
                             .await
                             || !workspace_admit()
                         {
-                            self.mark_workspace_diagnostic_pulls_completed(std::iter::once(
-                                &handle,
-                            ));
                             return Ok::<Option<CompletedDiagnosticProducer>, io::Error>(None);
                         }
                         Ok(Some(CompletedDiagnosticProducer {
-                            pull_attempt: Some(pull_attempt),
                             provider_plan: providers,
                             handle,
                             generation,
@@ -1507,7 +1399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_server_releases_a_successful_cold_producers_deferred_refresh() {
+    async fn failed_server_does_not_complete_a_successful_cold_producer() {
         let pool = LanguageServerPool::new();
         let handle = create_handle_with_key(
             ConnectionState::Ready,
@@ -1531,7 +1423,6 @@ mod tests {
                 .request_or_defer_workspace_diagnostic_registration_refresh()
         );
         let successful = CompletedDiagnosticProducer {
-            pull_attempt: None,
             provider_plan: Vec::new(),
             handle: Arc::clone(&handle),
             generation,
@@ -1547,21 +1438,21 @@ mod tests {
 
         assert!(result.is_err());
         assert!(
-            !handle
-                .dynamic_capabilities()
-                .take_workspace_diagnostic_registration_refresh(),
-            "the rejected aggregate must consume the deferred refresh"
-        );
-        assert!(
             handle
                 .dynamic_capabilities()
+                .take_workspace_diagnostic_registration_refresh(),
+            "the rejected aggregate must leave the deferred refresh pending"
+        );
+        assert!(
+            !handle
+                .dynamic_capabilities()
                 .request_or_defer_workspace_diagnostic_registration_refresh(),
-            "the rejected cold pull must be marked complete"
+            "the rejected cold pull must remain incomplete"
         );
     }
 
     #[tokio::test]
-    async fn failed_cold_producer_releases_its_own_deferred_refresh() {
+    async fn failed_cold_producer_does_not_complete_its_pull() {
         let pool = LanguageServerPool::new();
         let handle =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("failed"))
@@ -1580,66 +1471,26 @@ mod tests {
                 .request_or_defer_workspace_diagnostic_registration_refresh()
         );
 
-        let reports = pool.collect_completed_workspace_diagnostic_provider_reports(
-            &handle,
-            [(None, Err(io::Error::other("provider failed")))],
-        );
+        let reports = pool.collect_completed_workspace_diagnostic_provider_reports([(
+            None,
+            Err(io::Error::other("provider failed")),
+        )]);
 
         assert!(reports.unwrap().is_none());
         assert!(
-            !handle
+            handle
                 .dynamic_capabilities()
                 .take_workspace_diagnostic_registration_refresh()
         );
         assert!(
-            handle
+            !handle
                 .dynamic_capabilities()
                 .request_or_defer_workspace_diagnostic_registration_refresh()
         );
     }
 
     #[tokio::test]
-    async fn cancelled_producer_attempt_releases_its_deferred_refresh() {
-        let pool = Arc::new(LanguageServerPool::new());
-        let handle = create_handle_with_key(
-            ConnectionState::Ready,
-            ConnectionKey::for_server("cancelled"),
-        )
-        .await;
-        assert!(
-            !handle
-                .dynamic_capabilities()
-                .request_or_defer_workspace_diagnostic_registration_refresh()
-        );
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let task_pool = Arc::clone(&pool);
-        let task_handle = Arc::clone(&handle);
-        let task = tokio::spawn(async move {
-            let _attempt = WorkspaceDiagnosticPullAttempt {
-                handle: task_handle,
-                upstream_tx: task_pool.upstream_tx(),
-            };
-            let _ = started_tx.send(());
-            std::future::pending::<()>().await;
-        });
-        started_rx.await.unwrap();
-        task.abort();
-        let _ = task.await;
-
-        assert!(
-            !handle
-                .dynamic_capabilities()
-                .take_workspace_diagnostic_registration_refresh()
-        );
-        assert!(
-            handle
-                .dynamic_capabilities()
-                .request_or_defer_workspace_diagnostic_registration_refresh()
-        );
-    }
-
-    #[tokio::test]
-    async fn incomplete_same_server_sibling_drops_successful_attempt_guards() {
+    async fn incomplete_same_server_sibling_does_not_complete_the_pull() {
         let pool = LanguageServerPool::new();
         let handle = create_handle_with_key(
             ConnectionState::Ready,
@@ -1653,10 +1504,6 @@ mod tests {
         );
         let generation = pool.document_connection_generation(handle.key());
         let completed = CompletedDiagnosticProducer {
-            pull_attempt: Some(WorkspaceDiagnosticPullAttempt {
-                handle: Arc::clone(&handle),
-                upstream_tx: pool.upstream_tx(),
-            }),
             provider_plan: Vec::new(),
             handle: Arc::clone(&handle),
             generation,
@@ -1679,14 +1526,14 @@ mod tests {
 
         assert!(result.is_err());
         assert!(
-            !handle
+            handle
                 .dynamic_capabilities()
                 .take_workspace_diagnostic_registration_refresh()
         );
     }
 
     #[tokio::test]
-    async fn final_fence_rejection_drops_the_attempt_guard() {
+    async fn final_fence_rejection_does_not_complete_the_pull() {
         let pool = LanguageServerPool::new();
         let handle = create_handle_with_key(
             ConnectionState::Ready,
@@ -1703,10 +1550,6 @@ mod tests {
         );
         let generation = pool.document_connection_generation(handle.key());
         let completed = CompletedDiagnosticProducer {
-            pull_attempt: Some(WorkspaceDiagnosticPullAttempt {
-                handle: Arc::clone(&handle),
-                upstream_tx: pool.upstream_tx(),
-            }),
             provider_plan: Vec::new(),
             handle: Arc::clone(&handle),
             generation,
@@ -1723,7 +1566,7 @@ mod tests {
 
         assert!(result.is_err());
         assert!(
-            !handle
+            handle
                 .dynamic_capabilities()
                 .take_workspace_diagnostic_registration_refresh()
         );
@@ -1878,7 +1721,6 @@ mod tests {
                 Box::pin(async move {
                     fast_completed.store(true, Ordering::SeqCst);
                     Some(CompletedDiagnosticProducer {
-                        pull_attempt: None,
                         provider_plan: Vec::new(),
                         handle,
                         generation,
@@ -1896,7 +1738,6 @@ mod tests {
                 Box::pin(async move {
                     let _ = slow_released.await;
                     Some(CompletedDiagnosticProducer {
-                        pull_attempt: None,
                         provider_plan: Vec::new(),
                         handle,
                         generation,
@@ -1951,7 +1792,6 @@ mod tests {
                 Box::pin(async move {
                     fast_completed.store(true, Ordering::Release);
                     Some(CompletedDiagnosticProducer {
-                        pull_attempt: None,
                         provider_plan: Vec::new(),
                         handle,
                         generation,
@@ -1969,7 +1809,6 @@ mod tests {
                 Box::pin(async move {
                     let _ = slow_released.await;
                     Some(CompletedDiagnosticProducer {
-                        pull_attempt: None,
                         provider_plan: Vec::new(),
                         handle,
                         generation,
@@ -2018,7 +1857,6 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
-                    pull_attempt: None,
                     provider_plan: Vec::new(),
                     handle,
                     generation,
@@ -2055,7 +1893,6 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
-                    pull_attempt: None,
                     provider_plan: Vec::new(),
                     handle: Arc::clone(&handle),
                     generation,
@@ -2082,7 +1919,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_accepted_aggregation_does_not_mark_a_contributing_producer() {
+    async fn empty_accepted_aggregation_clears_a_previous_contribution() {
         let pool = LanguageServerPool::new();
         let key = ConnectionKey::for_server("diagnostics");
         let handle = create_handle_with_key(ConnectionState::Ready, key).await;
@@ -2092,10 +1929,20 @@ mod tests {
         let generation = pool.document_connection_generation(handle.key());
         let virtual_uris =
             Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
+        assert_eq!(
+            handle
+                .dynamic_capabilities()
+                .try_mark_workspace_diagnostic_contributed(),
+            Some(false)
+        );
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .has_workspace_diagnostic_contributed()
+        );
 
         pool.aggregate_admitted_workspace_diagnostic_reports(
             [std::future::ready(Some(CompletedDiagnosticProducer {
-                pull_attempt: None,
                 provider_plan: Vec::new(),
                 handle: Arc::clone(&handle),
                 generation,
@@ -2112,12 +1959,18 @@ mod tests {
             !handle
                 .dynamic_capabilities()
                 .has_workspace_diagnostic_contributed(),
-            "an empty provider plan must not arm the reader-exit refresh"
+            "an accepted empty provider plan must disarm the reader-exit refresh"
+        );
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .mark_workspace_diagnostic_reader_exited(),
+            "a later reader exit must not refresh after the producer stopped contributing"
         );
     }
 
     #[tokio::test]
-    async fn changed_provider_plan_releases_a_deferred_cold_refresh() {
+    async fn changed_provider_plan_keeps_a_deferred_cold_refresh_pending() {
         let pool = LanguageServerPool::new();
         let key = ConnectionKey::for_server("diagnostics");
         let handle = create_handle_with_key(ConnectionState::Ready, key).await;
@@ -2144,7 +1997,6 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
-                    pull_attempt: None,
                     provider_plan: Vec::new(),
                     handle: Arc::clone(&handle),
                     generation,
@@ -2166,10 +2018,16 @@ mod tests {
                 .has_workspace_diagnostic_contributed()
         );
         assert!(
-            !handle
+            handle
                 .dynamic_capabilities()
                 .take_workspace_diagnostic_registration_refresh(),
-            "the rejection must consume the deferred refresh for immediate delivery"
+            "the rejected pull must leave the deferred refresh pending"
+        );
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .request_or_defer_workspace_diagnostic_registration_refresh(),
+            "only a successful accepted pull may make later registrations refresh immediately"
         );
     }
 
@@ -2222,7 +2080,6 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
-                    pull_attempt: None,
                     provider_plan: Vec::new(),
                     handle,
                     generation,
@@ -2271,7 +2128,6 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [
                     std::future::ready(Some(CompletedDiagnosticProducer {
-                        pull_attempt: None,
                         provider_plan: Vec::new(),
                         handle: stale,
                         generation: stale_generation,
@@ -2282,7 +2138,6 @@ mod tests {
                         virtual_uris: stale_virtual_uris,
                     })),
                     std::future::ready(Some(CompletedDiagnosticProducer {
-                        pull_attempt: None,
                         provider_plan: Vec::new(),
                         handle: live,
                         generation: live_generation,
@@ -2328,7 +2183,6 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
-                    pull_attempt: None,
                     provider_plan,
                     handle,
                     generation,
@@ -2361,7 +2215,6 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
-                    pull_attempt: None,
                     provider_plan,
                     handle,
                     generation,
@@ -2401,7 +2254,6 @@ mod tests {
         let completed = [&first, &exited].map(|handle| {
             let generation = pool.document_connection_generation(handle.key());
             CompletedDiagnosticProducer {
-                pull_attempt: None,
                 provider_plan: diagnostic_providers(handle),
                 handle: Arc::clone(handle),
                 generation,
@@ -2455,7 +2307,6 @@ mod tests {
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
-                    pull_attempt: None,
                     provider_plan,
                     handle: Arc::clone(&handle),
                     generation,
