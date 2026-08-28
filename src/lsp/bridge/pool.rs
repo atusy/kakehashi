@@ -2700,10 +2700,11 @@ impl LanguageServerPool {
             })?;
             let root = super::root_markers::normalized_root_url(&root);
             if roots.iter().any(|(existing, _): &(Url, _)| {
-                super::root_markers::same_root_uri(existing.as_str(), root.as_str())
+                super::root_markers::root_uri_contains(existing, &root)
             }) {
                 continue;
             }
+            roots.retain(|(existing, _)| !super::root_markers::root_uri_contains(&root, existing));
             roots.push((root, folder));
         }
         if roots.is_empty() || self.workspace_handle_covers_roots(&primary, &roots) {
