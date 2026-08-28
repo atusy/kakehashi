@@ -20,8 +20,9 @@ Phased roadmap:
    `resolve_layer_config_from_settings` directly (it already holds a loaded
    settings arc), keyed `textDocument/publishDiagnostics` to match its
    aggregation config. With host bridging (host-document-bridge)
-   implemented for the bridged request methods (semantic tokens remain
-   native-only), handlers run the real
+   implemented for the bridged request methods (`semanticTokens/range` is
+   covered for injection-contained requests; full/delta remain native-only),
+   handlers run the real
    stage-2 `preferred` walk (`Kakehashi::walk_layers` →
    `race_layers_preferred`): the virt and host layers fan out
    **concurrently** — the layer-level analogue of the stage-1 `preferred`
