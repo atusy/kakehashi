@@ -7,12 +7,13 @@
 
 ## Decision–Implementation Gap
 
-10 of the 11 per-method strategies described below are implemented
+All 11 per-method strategies described below are at least partially implemented
 (definition, hover, signatureHelp, completion, references, rename,
 codeAction, formatting, documentHighlight, diagnostics). Semantic-token range
 requests now support the ordinary preferred host/virt/native layer walk when
-the requested range is wholly owned by one injection; full/delta bridging and
-the progressive native/downstream merge described below remain unimplemented.
+the requested range is wholly owned by one injection. Full requests establish
+a current native baseline, then synchronously overlay all selected host and
+virtual layers in priority order. Full/delta bridging remains unimplemented.
 
 ## Context
 
@@ -94,6 +95,14 @@ affects how we handle features that can return cross-file results.
 4. When bridged response arrives → send updated tokens (via `textDocument/semanticTokens/full` refresh mechanism)
 
 **Rationale**: Users see instant syntax highlighting from Tree-sitter while richer type-aware tokens arrive asynchronously.
+
+**Implemented refinement**: `semanticTokens/full` returns one synchronously
+merged response instead of trying to answer one JSON-RPC request twice. It
+first establishes the native serve-current baseline (preserving cancellation,
+supersession, and delta-cache semantics), then performs a barrier fan-out over
+the selected bridge layers. Higher-priority spans replace overlapping lower
+spans; uncovered lower-layer fragments remain. A later refresh-based temporal
+refinement can optimize latency without changing that merge result.
 
 ### Strategy 2: Full Delegation with Response Filtering
 
@@ -414,7 +423,8 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | documentHighlight | ✅ Implemented | Strategy-2 shape (single-document, position-mapped) |
 | diagnostics | ✅ Implemented | Push + pull with host translation |
 | semanticTokens/range | ✅ Implemented | Injection-contained requests use preferred virt/host/native layers; downstream legends and coordinates are translated, invalid tokens drop |
-| semanticTokens/full, full/delta | ❌ Not bridged | Native tree-sitter tokens ARE served; downstream-server tokens are not yet fetched or progressively merged |
+| semanticTokens/full | ✅ Implemented | Current native baseline plus synchronous host/virt overlay; higher-priority spans replace overlaps and uncovered native spans remain |
+| semanticTokens/full/delta | ❌ Not bridged | Delta baselines can contain bridged full tokens, but downstream delta requests are not yet fetched |
 
 ### Original Implementation Priority
 
