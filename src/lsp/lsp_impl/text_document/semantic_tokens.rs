@@ -297,12 +297,17 @@ impl Kakehashi {
         };
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let progress_token = params.work_done_progress_params.work_done_token.clone();
+        let upstream_id = current_upstream_id();
+        let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
         // supersession, and cancellation contract. Once it resolves, the shared
         // snapshot is current, so whole-document bridge discovery is immediate
         // and the barrier cannot keep a superseded native request alive.
-        let Some(native_layer) = self.semantic_tokens_full_native_layer(params).await? else {
+        let Some(native_layer) = self
+            .semantic_tokens_full_native_layer(params, &mut cancel_rx)
+            .await?
+        else {
             return Ok(None);
         };
         let request_id = native_layer.request_id;
@@ -325,7 +330,7 @@ impl Kakehashi {
         let native = std::future::ready(Ok(Some(native_data)));
         let bridge_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let outcome = async {
+        let fan_out = async {
             let data = self
                 .whole_document_fan_out(
                     &lsp_uri,
@@ -417,8 +422,27 @@ impl Kakehashi {
                 result_id,
                 data,
             })))
-        }
-        .await;
+        };
+        let outcome = match cancel_rx.as_mut() {
+            Some(cancel_rx) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx => {
+                        cancel_token.cancel();
+                        Err(Error::request_cancelled())
+                    }
+                    _ = cancel_token.cancelled() => Ok(None),
+                    result = fan_out => result,
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => Ok(None),
+                    result = fan_out => result,
+                }
+            }
+        };
         self.cache.finish_request(&uri, request_id);
         outcome
     }
@@ -426,9 +450,8 @@ impl Kakehashi {
     async fn semantic_tokens_full_native_layer(
         &self,
         params: SemanticTokensParams,
+        cancel_rx: &mut Option<crate::lsp::request_id::CancelReceiver>,
     ) -> Result<Option<NativeSemanticLayer>> {
-        let upstream_id = current_upstream_id();
-        let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let lsp_uri = params.text_document.uri;
 
         // Convert ls_types::Uri to url::Url for internal use
@@ -726,7 +749,7 @@ impl Kakehashi {
                 Some(cancel_token.clone()),
             );
 
-            if let Some(cancel_rx) = cancel_rx {
+            if let Some(cancel_rx) = cancel_rx.as_mut() {
                 // Race between computation and cancel notification
                 tokio::pin!(cancel_rx);
                 tokio::select! {
