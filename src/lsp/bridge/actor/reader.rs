@@ -374,13 +374,13 @@ impl Drop for ProgressPurgeGuard {
         // cache above. Refresh only when this connection is an actual producer;
         // otherwise a crashing unrelated server could cause refresh/pull/respawn
         // loops merely by exiting.
-        if self
+        let has_workspace_diagnostic_provider = self
             .dynamic_capabilities
-            .has_workspace_diagnostic_provider()
-            && self
-                .dynamic_capabilities
-                .has_workspace_diagnostic_contributed()
-        {
+            .has_workspace_diagnostic_provider();
+        let workspace_diagnostic_contributed = self
+            .dynamic_capabilities
+            .mark_workspace_diagnostic_reader_exited();
+        if has_workspace_diagnostic_provider && workspace_diagnostic_contributed {
             let _ = self
                 .upstream_tx
                 .send(UpstreamNotification::DiagnosticProviderChanged);
@@ -1606,7 +1606,7 @@ mod tests {
             progress_registry.register(conn, downstream_token.clone(), response_tx.clone());
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         dynamic_capabilities.set_static_workspace_diagnostic_provider(true);
-        let _ = dynamic_capabilities.mark_workspace_diagnostic_contributed();
+        let _ = dynamic_capabilities.try_mark_workspace_diagnostic_contributed();
 
         let handle = spawn_reader_task_for_server(
             reader,
@@ -2129,7 +2129,7 @@ mod tests {
         let router = ResponseRouter::new();
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
-        let _ = dynamic_capabilities.mark_workspace_diagnostic_contributed();
+        let _ = dynamic_capabilities.try_mark_workspace_diagnostic_contributed();
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
@@ -2194,7 +2194,7 @@ mod tests {
             .await
             .unwrap();
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
-        let _ = dynamic_capabilities.mark_workspace_diagnostic_contributed();
+        let _ = dynamic_capabilities.try_mark_workspace_diagnostic_contributed();
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
@@ -2267,7 +2267,7 @@ mod tests {
                 "interFileDependencies": true
             })),
         }]);
-        let _ = dynamic_capabilities.mark_workspace_diagnostic_contributed();
+        let _ = dynamic_capabilities.try_mark_workspace_diagnostic_contributed();
         assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
 
         let deps = ServerRequestDeps {
@@ -2339,7 +2339,7 @@ mod tests {
                 "interFileDependencies": true
             })),
         }]);
-        let _ = dynamic_capabilities.mark_workspace_diagnostic_contributed();
+        let _ = dynamic_capabilities.try_mark_workspace_diagnostic_contributed();
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
