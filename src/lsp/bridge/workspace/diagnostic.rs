@@ -26,71 +26,73 @@ const DIAGNOSTIC_METHOD: &str = "workspace/diagnostic";
 const DIAGNOSTIC_REGISTRATION_METHOD: &str = "textDocument/diagnostic";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum DiagnosticProvider {
-    Static {
-        identifier: Option<String>,
-    },
-    Dynamic {
-        registration_id: String,
-        identifier: Option<String>,
-    },
+struct DiagnosticProvider {
+    identifier: Option<String>,
+    has_static_provider: bool,
+    dynamic_registration_ids: Vec<String>,
 }
 
 impl DiagnosticProvider {
     fn identifier(&self) -> Option<&str> {
-        match self {
-            Self::Static { identifier } | Self::Dynamic { identifier, .. } => identifier.as_deref(),
-        }
+        self.identifier.as_deref()
     }
 }
 
-fn static_workspace_diagnostic_provider(handle: &ConnectionHandle) -> Option<DiagnosticProvider> {
+fn static_workspace_diagnostic_identifier(handle: &ConnectionHandle) -> Option<Option<String>> {
     match handle
         .server_capabilities()
         .and_then(|capabilities| capabilities.diagnostic_provider.as_ref())
     {
         Some(DiagnosticServerCapabilities::Options(options)) if options.workspace_diagnostics => {
-            Some(DiagnosticProvider::Static {
-                identifier: options.identifier.clone(),
-            })
+            Some(options.identifier.clone())
         }
         Some(DiagnosticServerCapabilities::RegistrationOptions(options)) => options
             .diagnostic_options
             .workspace_diagnostics
-            .then(|| DiagnosticProvider::Static {
-                identifier: options.diagnostic_options.identifier.clone(),
-            }),
+            .then(|| options.diagnostic_options.identifier.clone()),
         _ => None,
     }
 }
 
-fn dynamic_workspace_diagnostic_provider(
-    registration: &Registration,
-) -> Option<DiagnosticProvider> {
+fn dynamic_workspace_diagnostic_identifier(registration: &Registration) -> Option<Option<String>> {
     let options: DiagnosticRegistrationOptions =
         serde_json::from_value(registration.register_options.clone()?).ok()?;
     options
         .diagnostic_options
         .workspace_diagnostics
-        .then(|| DiagnosticProvider::Dynamic {
-            registration_id: registration.id.clone(),
-            identifier: options.diagnostic_options.identifier,
-        })
+        .then_some(options.diagnostic_options.identifier)
 }
 
 fn diagnostic_providers(handle: &ConnectionHandle) -> Vec<DiagnosticProvider> {
-    let mut providers = static_workspace_diagnostic_provider(handle)
+    let mut providers = static_workspace_diagnostic_identifier(handle)
+        .map(|identifier| DiagnosticProvider {
+            identifier,
+            has_static_provider: true,
+            dynamic_registration_ids: Vec::new(),
+        })
         .into_iter()
         .collect::<Vec<_>>();
     let mut registrations = handle
         .dynamic_capabilities()
         .registrations_for_method(DIAGNOSTIC_REGISTRATION_METHOD);
     registrations.sort_by(|left, right| left.id.cmp(&right.id));
-    providers.extend(
-        registrations
-            .iter()
-            .filter_map(dynamic_workspace_diagnostic_provider),
-    );
+    for registration in registrations {
+        let Some(identifier) = dynamic_workspace_diagnostic_identifier(&registration) else {
+            continue;
+        };
+        if let Some(provider) = providers
+            .iter_mut()
+            .find(|provider| provider.identifier == identifier)
+        {
+            provider.dynamic_registration_ids.push(registration.id);
+        } else {
+            providers.push(DiagnosticProvider {
+                identifier,
+                has_static_provider: false,
+                dynamic_registration_ids: vec![registration.id],
+            });
+        }
+    }
     providers
 }
 
@@ -324,25 +326,25 @@ impl LanguageServerPool {
                     "workspace diagnostic settings changed before request send",
                 ));
             }
-            let admitted = match &provider {
-                DiagnosticProvider::Static { .. } => {
-                    (static_workspace_diagnostic_provider(handle).as_ref() == Some(&provider))
-                        .then(|| handle.send_request(request, request_id))
-                }
-                DiagnosticProvider::Dynamic {
-                    registration_id, ..
-                } => handle
-                    .dynamic_capabilities()
-                    .with_registration_by_id(
-                        registration_id,
-                        DIAGNOSTIC_REGISTRATION_METHOD,
-                        |registration| {
-                            (dynamic_workspace_diagnostic_provider(registration).as_ref()
-                                == Some(&provider))
+            let static_admitted = provider.has_static_provider
+                && static_workspace_diagnostic_identifier(handle).as_ref()
+                    == Some(&provider.identifier);
+            let admitted = if static_admitted {
+                Some(handle.send_request(request, request_id))
+            } else {
+                handle.dynamic_capabilities().with_registrations_by_id(
+                    &provider.dynamic_registration_ids,
+                    DIAGNOSTIC_REGISTRATION_METHOD,
+                    |registrations| {
+                        registrations
+                            .iter()
+                            .any(|registration| {
+                                dynamic_workspace_diagnostic_identifier(registration).as_ref()
+                                    == Some(&provider.identifier)
+                            })
                             .then(|| handle.send_request(request, request_id))
-                        },
-                    )
-                    .flatten(),
+                    },
+                )
             };
             let Some(send_result) = admitted else {
                 if let Some(id) = &upstream_id {
@@ -525,22 +527,59 @@ mod tests {
                     "interFileDependencies": false
                 })),
             },
+            Registration {
+                id: "static-registration".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+                register_options: Some(serde_json::json!({
+                    "identifier": "static",
+                    "workspaceDiagnostics": true,
+                    "interFileDependencies": true
+                })),
+            },
+            Registration {
+                id: "no-identifier-a".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+                register_options: Some(serde_json::json!({
+                    "workspaceDiagnostics": true,
+                    "interFileDependencies": true
+                })),
+            },
+            Registration {
+                id: "no-identifier-z".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+                register_options: Some(serde_json::json!({
+                    "workspaceDiagnostics": true,
+                    "interFileDependencies": true
+                })),
+            },
         ]);
 
         let providers = diagnostic_providers(&handle);
         assert_eq!(
             providers,
             vec![
-                DiagnosticProvider::Static {
-                    identifier: Some("static".into())
+                DiagnosticProvider {
+                    identifier: Some("static".into()),
+                    has_static_provider: true,
+                    dynamic_registration_ids: vec!["static-registration".into()],
                 },
-                DiagnosticProvider::Dynamic {
-                    registration_id: "a-registration".into(),
-                    identifier: Some("alpha".into())
+                DiagnosticProvider {
+                    identifier: Some("alpha".into()),
+                    has_static_provider: false,
+                    dynamic_registration_ids: vec!["a-registration".into()],
                 },
-                DiagnosticProvider::Dynamic {
-                    registration_id: "z-registration".into(),
-                    identifier: Some("zeta".into())
+                DiagnosticProvider {
+                    identifier: None,
+                    has_static_provider: false,
+                    dynamic_registration_ids: vec![
+                        "no-identifier-a".into(),
+                        "no-identifier-z".into()
+                    ],
+                },
+                DiagnosticProvider {
+                    identifier: Some("zeta".into()),
+                    has_static_provider: false,
+                    dynamic_registration_ids: vec!["z-registration".into()],
                 },
             ]
         );
@@ -548,13 +587,20 @@ mod tests {
             .iter()
             .map(|provider| {
                 params_for_provider(serde_json::json!({ "previousResultIds": [] }), provider)
-                    ["identifier"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned()
+                    .get("identifier")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
             })
             .collect();
-        assert_eq!(identifiers, ["static", "alpha", "zeta"]);
+        assert_eq!(
+            identifiers,
+            [
+                Some("static".into()),
+                Some("alpha".into()),
+                None,
+                Some("zeta".into())
+            ]
+        );
     }
 
     #[tokio::test]
@@ -667,7 +713,11 @@ mod tests {
                     generation,
                     serde_json::json!({ "previousResultIds": [] }),
                     None,
-                    DiagnosticProvider::Static { identifier: None },
+                    DiagnosticProvider {
+                        identifier: None,
+                        has_static_provider: true,
+                        dynamic_registration_ids: vec![],
+                    },
                     None,
                 )
                 .await
@@ -715,7 +765,11 @@ mod tests {
                     generation,
                     serde_json::json!({ "previousResultIds": [] }),
                     None,
-                    DiagnosticProvider::Static { identifier: None },
+                    DiagnosticProvider {
+                        identifier: None,
+                        has_static_provider: true,
+                        dynamic_registration_ids: vec![],
+                    },
                     Some(&admit),
                 )
                 .await

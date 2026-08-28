@@ -85,22 +85,23 @@ impl DynamicCapabilityRegistry {
             .collect()
     }
 
-    /// Run `f` with one exact registration while its ID remains protected from
-    /// unregistration or replacement.
-    pub(crate) fn with_registration_by_id<R>(
+    /// Run `f` with every still-live registration from `ids`, while all of
+    /// them remain protected from unregistration or replacement.
+    pub(crate) fn with_registrations_by_id<R>(
         &self,
-        id: &str,
+        ids: &[String],
         method: &str,
-        f: impl FnOnce(&Registration) -> R,
-    ) -> Option<R> {
+        f: impl FnOnce(Vec<&Registration>) -> R,
+    ) -> R {
         let guard = self
             .registrations
             .read()
-            .recover_poison("DynamicCapabilityRegistry::with_registration_by_id");
-        guard
-            .get(id)
+            .recover_poison("DynamicCapabilityRegistry::with_registrations_by_id");
+        f(ids
+            .iter()
+            .filter_map(|id| guard.get(id))
             .filter(|registration| registration.method == method)
-            .map(f)
+            .collect())
     }
 
     /// Whether any dynamic registration of `method` sets the boolean
@@ -245,12 +246,12 @@ mod tests {
             })),
         }]);
 
-        let snapshot = registry.with_registration_by_id(
-            "diagnostics",
+        let snapshot = registry.with_registrations_by_id(
+            &["diagnostics".into()],
             "textDocument/diagnostic",
-            |registration| {
+            |registrations| {
                 (
-                    registration.register_options.clone(),
+                    registrations[0].register_options.clone(),
                     registry.registrations.try_write().is_err(),
                 )
             },
@@ -258,13 +259,13 @@ mod tests {
 
         assert_eq!(
             snapshot,
-            Some((
+            (
                 Some(serde_json::json!({
                     "identifier": "rust",
                     "workspaceDiagnostics": true
                 })),
                 true
-            ))
+            )
         );
     }
 
