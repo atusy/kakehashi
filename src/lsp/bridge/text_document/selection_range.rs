@@ -33,6 +33,7 @@ impl LanguageServerPool {
         offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
+        expected_incarnation: u64,
     ) -> io::Result<Option<SelectionRange>> {
         let handle = self
             .get_or_create_virtual_connection(
@@ -46,7 +47,7 @@ impl LanguageServerPool {
         if !handle.has_capability(METHOD) {
             return Ok(None);
         }
-        self.execute_position_bridge_request_with_handle(
+        self.execute_position_bridge_request_with_handle_for_incarnation(
             handle,
             host_uri,
             injection_language,
@@ -54,6 +55,7 @@ impl LanguageServerPool {
             &offset,
             virtual_content,
             upstream_request_id,
+            expected_incarnation,
             host_position,
             region_end,
             METHOD,
@@ -64,6 +66,7 @@ impl LanguageServerPool {
                 transform_selection_range_response_to_host(
                     response,
                     ctx.offset,
+                    virtual_content,
                     host_position,
                     region_end,
                 )
@@ -97,6 +100,7 @@ fn build_selection_range_request(
 fn transform_selection_range_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
+    virtual_content: &str,
     host_position: Position,
     region_end: Position,
 ) -> io::Result<Option<SelectionRange>> {
@@ -124,24 +128,33 @@ fn transform_selection_range_response_to_host(
     }
 
     let mut selection = ranges.pop().expect("length checked");
-    translate_and_validate_chain(&mut selection, offset, host_position, region_end)?;
+    translate_and_validate_chain(
+        &mut selection,
+        offset,
+        virtual_content,
+        host_position,
+        region_end,
+    )?;
     Ok(Some(selection))
 }
 
 fn translate_and_validate_chain(
     selection: &mut SelectionRange,
     offset: &RegionOffset,
+    virtual_content: &str,
     host_position: Position,
     region_end: Position,
 ) -> io::Result<()> {
+    let mapper = crate::text::PositionMapper::new(virtual_content);
+    let mut virtual_position = host_position;
+    translate_host_position_to_virtual(&mut virtual_position, offset);
     let mut child_range = None;
     let mut current = selection;
     loop {
-        translate_virtual_range_to_host(&mut current.range, offset);
         let range = current.range;
         let valid_bounds = range.start <= range.end
-            && host_position_within_region_bounds(range.start, offset, region_end)
-            && host_position_within_region_bounds(range.end, offset, region_end);
+            && mapper.position_to_byte_strict(range.start).is_some()
+            && mapper.position_to_byte_strict(range.end).is_some();
         let contains_child = child_range.is_none_or(|child: tower_lsp_server::ls_types::Range| {
             range.start <= child.start && range.end >= child.end
         });
@@ -150,12 +163,22 @@ fn translate_and_validate_chain(
                 "invalid textDocument/selectionRange hierarchy from downstream server",
             ));
         }
-        if child_range.is_none() && !(range.start <= host_position && host_position <= range.end) {
+        if child_range.is_none()
+            && !(range.start <= virtual_position && virtual_position <= range.end)
+        {
             return Err(io::Error::other(
                 "textDocument/selectionRange does not contain the requested position",
             ));
         }
         child_range = Some(range);
+        translate_virtual_range_to_host(&mut current.range, offset);
+        if !host_position_within_region_bounds(current.range.start, offset, region_end)
+            || !host_position_within_region_bounds(current.range.end, offset, region_end)
+        {
+            return Err(io::Error::other(
+                "textDocument/selectionRange hierarchy escapes its virtual region",
+            ));
+        }
         let Some(parent) = current.parent.as_deref_mut() else {
             break;
         };
@@ -208,6 +231,7 @@ mod tests {
         let result = transform_selection_range_response_to_host(
             response,
             &RegionOffset::with_per_line_offsets(3, vec![2, 2]),
+            "code\nvalue",
             Position::new(3, 4),
             Position::new(4, 7),
         )
@@ -227,6 +251,7 @@ mod tests {
             transform_selection_range_response_to_host(
                 wrong_count,
                 &RegionOffset::new(3, 0),
+                "code",
                 Position::new(3, 1),
                 Position::new(3, 9),
             )
@@ -243,10 +268,28 @@ mod tests {
             transform_selection_range_response_to_host(
                 bad_parent,
                 &RegionOffset::new(3, 0),
+                "code",
                 Position::new(3, 2),
                 Position::new(3, 9),
             )
             .is_err()
+        );
+
+        let overlong_column = json!({
+            "jsonrpc": "2.0", "id": 1, "result": [{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 999 } }
+            }]
+        });
+        assert!(
+            transform_selection_range_response_to_host(
+                overlong_column,
+                &RegionOffset::new(3, 0),
+                "a\nb",
+                Position::new(3, 0),
+                Position::new(4, 1),
+            )
+            .is_err(),
+            "an overlong intermediate-line column must not spill into a later line"
         );
     }
 }
