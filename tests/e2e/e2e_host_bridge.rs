@@ -776,6 +776,107 @@ priorities = ["virt", "native"]
 }
 
 #[test]
+fn e2e_semantic_tokens_delta_reentry_keeps_cancellation() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("semantic_delta_reentry_cancel.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/semanticTokens/full"]
+priorities = ["virt", "native"]
+"#,
+    )
+    .expect("write config");
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env("MOCK_LSP_CANCEL_DIR", event_dir.path().to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-semantic-full": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-delayed"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_delta_reentry_cancel.md";
+    open_inline_value_document(&mut client, uri, 1, "# heading\n");
+    let previous_result_id = (0..300)
+        .find_map(|_| {
+            let response = client.send_request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": uri } }),
+            );
+            response
+                .pointer("/result/resultId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    None
+                })
+        })
+        .expect("native baseline resultId");
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "```lua\ncode\n```\n" }]
+        }),
+    );
+
+    let request_id = client.send_request_async(
+        "textDocument/semanticTokens/full/delta",
+        json!({
+            "textDocument": { "uri": uri },
+            "previousResultId": previous_result_id
+        }),
+    );
+    let marker = event_dir
+        .path()
+        .join("semantic-tokens-full-delayed.request.json");
+    assert!(
+        (0..60).any(|_| {
+            if marker.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "delta re-entry should reach the delayed bridge"
+    );
+    client.send_notification("$/cancelRequest", json!({ "id": request_id }));
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32800),
+        "the outer delta subscription must cancel nested full aggregation: {response:?}"
+    );
+
+    std::fs::write(
+        event_dir
+            .path()
+            .join("semantic-tokens-full-delayed.release"),
+        b"release",
+    )
+    .expect("release delayed server before shutdown");
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_semantic_tokens_full_nested_virtual_layer_overlays_outer_layer() {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir.path().join("semantic_tokens_full_nested.toml");
