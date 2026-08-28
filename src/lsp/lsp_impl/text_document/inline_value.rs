@@ -55,6 +55,8 @@ impl Kakehashi {
         };
         let incarnation = ctx.incarnation;
         let content_version = ctx.content_version;
+        #[cfg(feature = "e2e")]
+        wait_for_inline_value_admission_release().await;
         if !self.inline_value_snapshot_is_current(lsp_uri, incarnation, content_version) {
             return Ok(None);
         }

@@ -794,6 +794,110 @@ priorities = ["virt"]
 }
 
 #[test]
+fn e2e_inline_value_rejects_host_edit_during_admission() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("inline_value_host_admission.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.layers.aggregation."textDocument/inlineValue"]
+priorities = ["host"]
+"#,
+    )
+    .expect("write config");
+    let barrier_dir = tempfile::TempDir::new().expect("barrier dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env(
+            "KAKEHASHI_E2E_INLINE_VALUE_BARRIER_DIR",
+            barrier_dir.path().to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_E2E_INLINE_VALUE_CHANGE_DIR",
+            barrier_dir.path().to_string_lossy(),
+        )
+        .env("MOCK_LSP_CANCEL_DIR", barrier_dir.path().to_string_lossy())
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-inline-value": {
+                        "cmd": [mock_bin(), "inline-value-record-host"],
+                        "languages": ["markdown"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_inline_value_host_admission.md";
+    open_inline_value_document(&mut client, uri, 1, "old line\ncode\n");
+    let open_barrier = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(open_barrier.get("error").is_none());
+    let request_id =
+        client.send_request_async("textDocument/inlineValue", inline_value_params(uri));
+    let captured = barrier_dir.path().join("captured");
+    assert!(
+        (0..60).any(|_| {
+            if captured.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "the old host context should be captured before dispatch admission"
+    );
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "new line\ncode\n" }]
+        }),
+    );
+    let changed = barrier_dir.path().join("changed");
+    assert!(
+        (0..60).any(|_| {
+            if changed.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "Kakehashi should apply didChange while host dispatch admission is parked"
+    );
+    std::fs::write(barrier_dir.path().join("release"), b"release")
+        .expect("release host inlineValue admission");
+
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(response["result"], Value::Null);
+    assert!(
+        !barrier_dir
+            .path()
+            .join("inline-value-record-host.request.json")
+            .exists(),
+        "a stale host snapshot must be rejected before downstream dispatch"
+    );
+    shutdown(&mut client);
+}
+
+#[test]
 fn e2e_color_presentation_cancel_reaches_host_after_empty_virt_arm() {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir.path().join("color_presentation_cancel.toml");
