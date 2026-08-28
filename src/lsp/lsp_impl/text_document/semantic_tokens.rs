@@ -314,19 +314,18 @@ impl Kakehashi {
         let cancel_token = native_layer.cancel_token.clone();
         let generation = native_layer.generation;
         let native_tokens = native_layer.tokens;
-        let Some(snapshot) = native_layer.snapshot else {
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensResult::Tokens(native_tokens)));
-        };
+        let snapshot = native_layer.snapshot;
         let native_result_id = native_tokens.result_id.clone();
         let native_data = native_tokens.data;
         let native_data_for_comparison = native_data.clone();
-        let expected = super::super::whole_document::WholeDocumentSnapshotIdentity {
-            incarnation: snapshot.incarnation,
-            parsed_version: snapshot.parsed_version,
-            generation,
-        };
-        let expected_incarnation = snapshot.incarnation;
+        let expected = snapshot.as_ref().map(|snapshot| {
+            super::super::whole_document::WholeDocumentSnapshotIdentity {
+                incarnation: snapshot.incarnation,
+                parsed_version: snapshot.parsed_version,
+                generation,
+            }
+        });
+        let expected_incarnation = snapshot.as_ref().map(|snapshot| snapshot.incarnation);
         let native = std::future::ready(Ok(Some(native_data)));
         let bridge_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -337,7 +336,7 @@ impl Kakehashi {
                     METHOD,
                     raw_params,
                     progress_token,
-                    Some(expected),
+                    expected,
                     Some(std::sync::Arc::clone(&bridge_attempted)),
                     true,
                     true,
@@ -356,7 +355,7 @@ impl Kakehashi {
                                 &task.virtual_content,
                                 task.upstream_id,
                                 task.client_progress_token,
-                                Some(expected_incarnation),
+                                expected_incarnation,
                             )
                             .await
                             .map(|tokens| tokens.map(|tokens| tokens.data))
@@ -399,13 +398,16 @@ impl Kakehashi {
             let _edit_guard = edit_lock.lock().await;
             if cancel_token.is_cancelled()
                 || !self.cache.is_request_active(&uri, request_id)
-                || !self.semantic_snapshot_is_current(
-                    &uri,
-                    snapshot.incarnation,
-                    snapshot.parsed_version,
-                    generation,
-                    &edit_lock,
-                )
+                || snapshot.as_ref().is_some_and(|snapshot| {
+                    !self.semantic_snapshot_is_current(
+                        &uri,
+                        snapshot.incarnation,
+                        snapshot.parsed_version,
+                        generation,
+                        &edit_lock,
+                    )
+                })
+                || snapshot.is_none() && self.documents.get(&uri).is_none()
             {
                 return Ok(None);
             }
