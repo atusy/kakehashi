@@ -122,14 +122,32 @@ fn decode_response(
     Ok(normalize_response(response, supports_tags))
 }
 
-fn deduplicate_symbols(symbols: impl IntoIterator<Item = WorkspaceSymbol>) -> Vec<WorkspaceSymbol> {
+type IdentifiedSymbol = (WorkspaceSymbol, Option<Vec<u8>>);
+
+fn prepare_symbol_for_aggregation(
+    mut symbol: WorkspaceSymbol,
+    envelope: Option<WorkspaceSymbolEnvelope>,
+) -> IdentifiedSymbol {
+    let identity = serde_json::to_vec(&symbol).ok();
+    if let Some(mut envelope) = envelope {
+        envelope.inner = symbol.data.take();
+        envelope_symbol(&mut symbol, envelope);
+    }
+    (symbol, identity)
+}
+
+fn deduplicate_symbols(
+    symbols: impl IntoIterator<Item = IdentifiedSymbol>,
+) -> Vec<WorkspaceSymbol> {
     let mut seen = HashSet::new();
     symbols
         .into_iter()
-        .filter(|symbol| {
-            let mut identity = symbol.clone();
-            strip_envelope(&mut identity);
-            serde_json::to_vec(&identity).map_or(true, |identity| seen.insert(identity))
+        .filter_map(|(symbol, identity)| {
+            if identity.is_none_or(|identity| seen.insert(identity)) {
+                Some(symbol)
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -265,23 +283,21 @@ impl LanguageServerPool {
                             // `Some((Value::Null, _))` and decodes as empty.
                             return Err(());
                         };
-                        let mut symbols =
-                            decode_response(response, supports_tags).map_err(|_| ())?;
-                        if resolves {
-                            for symbol in &mut symbols {
-                                let inner = symbol.data.take();
-                                envelope_symbol(
+                        let symbols = decode_response(response, supports_tags).map_err(|_| ())?;
+                        Ok(symbols
+                            .into_iter()
+                            .map(|symbol| {
+                                prepare_symbol_for_aggregation(
                                     symbol,
-                                    WorkspaceSymbolEnvelope {
+                                    resolves.then(|| WorkspaceSymbolEnvelope {
                                         origin: name.clone(),
                                         connection_key: handle.key().clone(),
                                         connection_generation: generation,
-                                        inner,
-                                    },
-                                );
-                            }
-                        }
-                        Ok(symbols)
+                                        inner: None,
+                                    }),
+                                )
+                            })
+                            .collect::<Vec<_>>())
                     }
                 });
                 let Ok(symbols) = join_all(requests)
@@ -597,7 +613,7 @@ mod tests {
 
     #[test]
     fn duplicate_symbols_keep_the_first_resolve_route() {
-        let mut symbol = WorkspaceSymbol {
+        let symbol = WorkspaceSymbol {
             name: "main".into(),
             kind: SymbolKind::FUNCTION,
             tags: None,
@@ -605,48 +621,89 @@ mod tests {
             location: OneOf::Right(WorkspaceLocation {
                 uri: Uri::from_str("file:///workspace/main.rs").unwrap(),
             }),
-            data: None,
+            data: Some(serde_json::json!({"symbol": 7})),
         };
-        envelope_symbol(
-            &mut symbol,
-            WorkspaceSymbolEnvelope {
+        let first = prepare_symbol_for_aggregation(
+            symbol.clone(),
+            Some(WorkspaceSymbolEnvelope {
                 origin: "symbols".into(),
                 connection_key: ConnectionKey::new("symbols", Some("file:///workspace".into())),
                 connection_generation: 1,
-                inner: Some(serde_json::json!({"symbol": 7})),
-            },
+                inner: None,
+            }),
         );
-        let mut duplicate = symbol.clone();
-        envelope_symbol(
-            &mut duplicate,
-            WorkspaceSymbolEnvelope {
+        let duplicate = prepare_symbol_for_aggregation(
+            symbol.clone(),
+            Some(WorkspaceSymbolEnvelope {
                 origin: "symbols".into(),
                 connection_key: ConnectionKey::new(
                     "symbols",
                     Some("file:///workspace/nested".into()),
                 ),
                 connection_generation: 1,
-                inner: Some(serde_json::json!({"symbol": 7})),
-            },
+                inner: None,
+            }),
         );
-        let mut distinct = duplicate.clone();
-        envelope_symbol(
-            &mut distinct,
-            WorkspaceSymbolEnvelope {
+        let mut distinct_symbol = symbol;
+        distinct_symbol.data = Some(serde_json::json!({"symbol": 8}));
+        let distinct = prepare_symbol_for_aggregation(
+            distinct_symbol,
+            Some(WorkspaceSymbolEnvelope {
                 origin: "symbols".into(),
                 connection_key: ConnectionKey::new(
                     "symbols",
                     Some("file:///workspace/nested".into()),
                 ),
                 connection_generation: 1,
-                inner: Some(serde_json::json!({"symbol": 8})),
-            },
+                inner: None,
+            }),
         );
+        let first_data = first.0.data.clone();
 
-        let symbols = deduplicate_symbols([symbol.clone(), duplicate, distinct]);
+        let symbols = deduplicate_symbols([first, duplicate, distinct]);
 
         assert_eq!(symbols.len(), 2);
-        assert_eq!(symbols[0].data, symbol.data);
+        assert_eq!(symbols[0].data, first_data);
+    }
+
+    #[test]
+    fn opaque_data_that_looks_like_an_envelope_remains_identity_bearing() {
+        let mut first = WorkspaceSymbol {
+            name: "main".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Right(WorkspaceLocation {
+                uri: Uri::from_str("file:///workspace/main.rs").unwrap(),
+            }),
+            data: None,
+        };
+        envelope_symbol(
+            &mut first,
+            WorkspaceSymbolEnvelope {
+                origin: "opaque-server-data".into(),
+                connection_key: ConnectionKey::for_server("opaque-server-data"),
+                connection_generation: 1,
+                inner: Some(serde_json::json!({"symbol": 1})),
+            },
+        );
+        let mut second = first.clone();
+        envelope_symbol(
+            &mut second,
+            WorkspaceSymbolEnvelope {
+                origin: "opaque-server-data".into(),
+                connection_key: ConnectionKey::for_server("opaque-server-data"),
+                connection_generation: 1,
+                inner: Some(serde_json::json!({"symbol": 2})),
+            },
+        );
+
+        let symbols = deduplicate_symbols([
+            prepare_symbol_for_aggregation(first, None),
+            prepare_symbol_for_aggregation(second, None),
+        ]);
+
+        assert_eq!(symbols.len(), 2);
     }
 
     #[test]
