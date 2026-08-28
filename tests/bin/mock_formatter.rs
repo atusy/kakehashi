@@ -360,7 +360,9 @@ fn main() {
                         },
                         "textDocumentSync": 1
                     }),
-                    "semantic-tokens-full-virt" => json!({
+                    "semantic-tokens-full-virt"
+                    | "semantic-tokens-full-delayed"
+                    | "semantic-tokens-full-marker" => json!({
                         "semanticTokensProvider": {
                             "legend": {
                                 "tokenTypes": ["custom", "variable"],
@@ -1723,6 +1725,12 @@ fn main() {
                         json!({ "data": [0, 0, length, token_type, 1] })
                     })
                     .unwrap_or(Value::Null);
+                if mode == "semantic-tokens-full-delayed" {
+                    record_mock_event(&mode, "request", &message);
+                    wait_for_mock_release(&mode);
+                } else if mode == "semantic-tokens-full-marker" {
+                    record_mock_event(&mode, "request", &message);
+                }
                 respond(&mut writer, id, result);
             }
             "documentLink/resolve" => {
