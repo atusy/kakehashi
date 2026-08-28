@@ -2737,6 +2737,60 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn dropping_semantic_tokens_delta_cancels_and_forgets_the_request() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///dropped_delta_request.rs").expect("valid test uri");
+
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let params = SemanticTokensDeltaParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+            },
+            previous_result_id: "missing-baseline".to_string(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        // The nested full computation parks on the absent snapshot while the
+        // outer delta guard remains the sole owner of the tracker entry.
+        let request = {
+            let service = std::sync::Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .inner()
+                    .semantic_tokens_full_delta_impl(params)
+                    .await
+            })
+        };
+        sleep(Duration::from_millis(50)).await;
+        assert!(!request.is_finished(), "the delta request must be parked");
+        let (request_id, cancel_token) = service
+            .inner()
+            .cache
+            .active_request(&uri)
+            .expect("the parked delta request must be tracked");
+
+        request.abort();
+        let error = request
+            .await
+            .expect_err("aborting must drop the delta handler future");
+        assert!(error.is_cancelled());
+        assert!(
+            cancel_token.is_cancelled(),
+            "dropping delta must stop its nested full computation"
+        );
+        assert!(
+            !service.inner().cache.is_request_active(&uri, request_id),
+            "dropping delta must remove its exact tracker entry"
+        );
+    }
+
     /// A parked request superseded by a newer request for the same document
     /// (the tracker flips its token — no `$/cancelRequest` involved) must
     /// release promptly with the compute-superseded contract `Ok(None)`, not
