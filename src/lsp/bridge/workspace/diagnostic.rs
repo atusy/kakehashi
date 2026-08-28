@@ -33,6 +33,12 @@ struct DiagnosticProvider {
     dynamic_registration_ids: Vec<String>,
 }
 
+struct CompletedDiagnosticProducer {
+    handle: Arc<ConnectionHandle>,
+    generation: u64,
+    report: WorkspaceDiagnosticReport,
+}
+
 impl DiagnosticProvider {
     fn identifier(&self) -> Option<&str> {
         self.identifier.as_deref()
@@ -177,20 +183,6 @@ fn aggregate_reports(
     })
 }
 
-async fn aggregate_admitted_reports<F>(
-    requests: impl IntoIterator<Item = F>,
-    admit: &(dyn Fn() -> bool + Sync),
-) -> WorkspaceDiagnosticReportResult
-where
-    F: Future<Output = Option<WorkspaceDiagnosticReport>>,
-{
-    let reports = join_all(requests).await;
-    if !admit() {
-        return aggregate_reports(std::iter::empty());
-    }
-    aggregate_reports(reports.into_iter().flatten())
-}
-
 fn combine_producer_reports(
     reports: impl IntoIterator<Item = WorkspaceDiagnosticReport>,
 ) -> WorkspaceDiagnosticReport {
@@ -230,6 +222,32 @@ fn combine_producer_reports(
 }
 
 impl LanguageServerPool {
+    async fn aggregate_admitted_workspace_diagnostic_reports<F>(
+        &self,
+        requests: impl IntoIterator<Item = F>,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> WorkspaceDiagnosticReportResult
+    where
+        F: Future<Output = Option<CompletedDiagnosticProducer>>,
+    {
+        let reports: Vec<_> = join_all(requests).await.into_iter().flatten().collect();
+        let connections = self.connections().await;
+        if !admit() {
+            return aggregate_reports(std::iter::empty());
+        }
+        aggregate_reports(reports.into_iter().filter_map(|completed| {
+            let key = completed.handle.key();
+            connections
+                .get(key)
+                .is_some_and(|live| {
+                    Arc::ptr_eq(live, &completed.handle)
+                        && live.state() == ConnectionState::Ready
+                        && self.document_connection_generation(key) == completed.generation
+                })
+                .then_some(completed.report)
+        }))
+    }
+
     async fn workspace_diagnostic_producer_is_live(
         &self,
         handle: &Arc<ConnectionHandle>,
@@ -326,11 +344,16 @@ impl LanguageServerPool {
                 {
                     return None;
                 }
-                Some(report)
+                Some(CompletedDiagnosticProducer {
+                    handle,
+                    generation,
+                    report,
+                })
             }
         });
 
-        aggregate_admitted_reports(requests, admit).await
+        self.aggregate_admitted_workspace_diagnostic_reports(requests, admit)
+            .await
     }
 
     async fn send_workspace_diagnostic_request(
@@ -579,27 +602,50 @@ mod tests {
     async fn final_aggregation_rejects_a_stale_settings_generation() {
         use std::pin::Pin;
 
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("diagnostics");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.connections().await.insert(key, Arc::clone(&handle));
+        let generation = pool.document_connection_generation(handle.key());
         let admitted = Arc::new(AtomicBool::new(true));
         let fast_completed = Arc::new(AtomicBool::new(false));
         let (release_slow, slow_released) = tokio::sync::oneshot::channel();
-        let requests: Vec<Pin<Box<dyn Future<Output = Option<WorkspaceDiagnosticReport>> + Send>>> = vec![
+        let requests: Vec<
+            Pin<Box<dyn Future<Output = Option<CompletedDiagnosticProducer>> + Send>>,
+        > = vec![
             {
                 let fast_completed = Arc::clone(&fast_completed);
+                let handle = Arc::clone(&handle);
                 Box::pin(async move {
                     fast_completed.store(true, Ordering::SeqCst);
-                    Some(WorkspaceDiagnosticReport {
-                        items: vec![full("file:///workspace/fast.rs", Some(1), "stale")],
+                    Some(CompletedDiagnosticProducer {
+                        handle,
+                        generation,
+                        report: WorkspaceDiagnosticReport {
+                            items: vec![full("file:///workspace/fast.rs", Some(1), "stale")],
+                        },
                     })
                 })
             },
-            Box::pin(async move {
-                let _ = slow_released.await;
-                Some(WorkspaceDiagnosticReport { items: Vec::new() })
-            }),
+            {
+                let handle = Arc::clone(&handle);
+                Box::pin(async move {
+                    let _ = slow_released.await;
+                    Some(CompletedDiagnosticProducer {
+                        handle,
+                        generation,
+                        report: WorkspaceDiagnosticReport { items: Vec::new() },
+                    })
+                })
+            },
         ];
+        let pool_for_request = Arc::clone(&pool);
         let admitted_for_request = Arc::clone(&admitted);
         let request = tokio::spawn(async move {
-            aggregate_admitted_reports(requests, &|| admitted_for_request.load(Ordering::SeqCst))
+            pool_for_request
+                .aggregate_admitted_workspace_diagnostic_reports(requests, &|| {
+                    admitted_for_request.load(Ordering::SeqCst)
+                })
                 .await
         });
         while !fast_completed.load(Ordering::SeqCst) {
@@ -612,6 +658,53 @@ mod tests {
             panic!("full report")
         };
         assert!(report.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn final_aggregation_discards_a_replaced_producer() {
+        let pool = LanguageServerPool::new();
+        let stale_key = ConnectionKey::for_server("alpha");
+        let live_key = ConnectionKey::for_server("zeta");
+        let stale = create_handle_with_key(ConnectionState::Ready, stale_key.clone()).await;
+        let live = create_handle_with_key(ConnectionState::Ready, live_key.clone()).await;
+        pool.connections().await.extend([
+            (stale_key.clone(), Arc::clone(&stale)),
+            (live_key, Arc::clone(&live)),
+        ]);
+        let stale_generation = pool.document_connection_generation(&stale_key);
+        let live_generation = pool.document_connection_generation(live.key());
+        let replacement = create_handle_with_key(ConnectionState::Ready, stale_key.clone()).await;
+        pool.connections().await.insert(stale_key, replacement);
+
+        let result = pool
+            .aggregate_admitted_workspace_diagnostic_reports(
+                [
+                    std::future::ready(Some(CompletedDiagnosticProducer {
+                        handle: stale,
+                        generation: stale_generation,
+                        report: WorkspaceDiagnosticReport {
+                            items: vec![full("file:///workspace/stale.rs", Some(1), "stale")],
+                        },
+                    })),
+                    std::future::ready(Some(CompletedDiagnosticProducer {
+                        handle: live,
+                        generation: live_generation,
+                        report: WorkspaceDiagnosticReport {
+                            items: vec![full("file:///workspace/live.rs", Some(1), "live")],
+                        },
+                    })),
+                ],
+                &|| true,
+            )
+            .await;
+        let WorkspaceDiagnosticReportResult::Report(report) = result else {
+            panic!("full report")
+        };
+        assert_eq!(report.items.len(), 1);
+        let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
+            panic!("full report")
+        };
+        assert_eq!(report.uri.as_str(), "file:///workspace/live.rs");
     }
 
     #[tokio::test]
