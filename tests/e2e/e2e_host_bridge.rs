@@ -519,6 +519,91 @@ priorities = ["virt", "host"]
     shutdown(&mut client);
 }
 
+#[test]
+fn e2e_semantic_tokens_range_routes_host_and_virtual_legends() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("semantic_tokens_range.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+"#,
+    )
+    .expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-semantic-range": {
+                        "cmd": [mock_bin(), "semantic-tokens-range-host"],
+                        "languages": ["markdown"]
+                    },
+                    "mock-virt-semantic-range": {
+                        "cmd": [mock_bin(), "semantic-tokens-range-virt"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_range.md";
+    open_inline_value_document(&mut client, uri, 1, "hostword\n\n> ```lua\n> code\n> ```\n");
+
+    let request = |client: &mut LspClient, range: Value| {
+        (0..300)
+            .find_map(|_| {
+                let response = client.send_request(
+                    "textDocument/semanticTokens/range",
+                    json!({ "textDocument": { "uri": uri }, "range": range }),
+                );
+                assert!(response.get("error").is_none(), "{response:?}");
+                response
+                    .pointer("/result/data")
+                    .and_then(Value::as_array)
+                    .filter(|data| !data.is_empty())
+                    .cloned()
+                    .or_else(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        None
+                    })
+            })
+            .expect("semantic range tokens should become available")
+    };
+
+    let host = request(
+        &mut client,
+        json!({
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 0, "character": 8 }
+        }),
+    );
+    assert_eq!(host, json!([0, 0, 8, 17, 8]).as_array().unwrap().clone());
+
+    let virtual_tokens = request(
+        &mut client,
+        json!({
+            "start": { "line": 3, "character": 2 },
+            "end": { "line": 3, "character": 6 }
+        }),
+    );
+    assert_eq!(
+        virtual_tokens,
+        json!([3, 2, 4, 17, 8]).as_array().unwrap().clone()
+    );
+    shutdown(&mut client);
+}
+
 fn init_inline_value_virt_client(mode: &str, event_dir: &std::path::Path) -> LspClient {
     let mut client = LspClient::builder()
         .env("MOCK_LSP_CANCEL_DIR", event_dir.to_string_lossy())
