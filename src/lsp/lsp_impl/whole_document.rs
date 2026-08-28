@@ -451,21 +451,62 @@ fn request_selects_servers(
 }
 
 fn region_merge_order(ranges: &[std::ops::Range<usize>], nested_regions_first: bool) -> Vec<usize> {
+    region_merge_order_with_observer(ranges, nested_regions_first, || {})
+}
+
+fn region_merge_order_with_observer(
+    ranges: &[std::ops::Range<usize>],
+    nested_regions_first: bool,
+    mut inspect: impl FnMut(),
+) -> Vec<usize> {
     let mut indices = (0..ranges.len()).collect::<Vec<_>>();
     if nested_regions_first {
-        let depth = |index: usize| {
-            ranges
-                .iter()
-                .enumerate()
-                .filter(|(other_index, outer)| {
-                    *other_index != index
-                        && outer.start <= ranges[index].start
-                        && ranges[index].end <= outer.end
-                        && *outer != &ranges[index]
-                })
-                .count()
-        };
-        indices.sort_by_key(|&index| (std::cmp::Reverse(depth(index)), index));
+        // Count strict containing ranges as a two-dimensional dominance query:
+        // process starts ascending and ends descending, then query how many
+        // previously inserted ends are >= this end. Equal ranges are handled as
+        // one group and inserted only after their shared depth is read.
+        let mut ends = ranges.iter().map(|range| range.end).collect::<Vec<_>>();
+        ends.sort_unstable();
+        ends.dedup();
+        indices.sort_unstable_by_key(|&index| {
+            (ranges[index].start, std::cmp::Reverse(ranges[index].end))
+        });
+        let mut tree = vec![0usize; ends.len() + 1];
+        let mut inserted = 0usize;
+        let mut depths = vec![0usize; ranges.len()];
+        let mut group_start = 0usize;
+        while group_start < indices.len() {
+            let range = &ranges[indices[group_start]];
+            let mut group_end = group_start + 1;
+            while group_end < indices.len() && ranges[indices[group_end]] == *range {
+                group_end += 1;
+            }
+            let end_index = ends
+                .binary_search(&range.end)
+                .expect("range end came from the compressed set");
+            let mut prefix_before = 0usize;
+            let mut cursor = end_index;
+            while cursor > 0 {
+                inspect();
+                prefix_before += tree[cursor];
+                cursor &= cursor - 1;
+            }
+            let depth = inserted - prefix_before;
+            for &index in &indices[group_start..group_end] {
+                depths[index] = depth;
+            }
+            for _ in group_start..group_end {
+                let mut cursor = end_index + 1;
+                while cursor < tree.len() {
+                    inspect();
+                    tree[cursor] += 1;
+                    cursor += cursor & cursor.wrapping_neg();
+                }
+                inserted += 1;
+            }
+            group_start = group_end;
+        }
+        indices.sort_unstable_by_key(|&index| (std::cmp::Reverse(depths[index]), index));
     }
     let mut order = vec![0; ranges.len()];
     for (rank, index) in indices.into_iter().enumerate() {
@@ -708,5 +749,65 @@ mod ordered_region_tests {
             flattened,
             vec![token(0, 2, 1), token(2, 3, 2), token(3, 5, 1)]
         );
+    }
+
+    #[test]
+    fn nested_region_order_scales_with_ordered_sweep() {
+        let disjoint = (0..10_000)
+            .map(|index| index * 2..index * 2 + 1)
+            .collect::<Vec<_>>();
+        let mut inspections = 0usize;
+        let order = region_merge_order_with_observer(&disjoint, true, || inspections += 1);
+
+        assert_eq!(order, (0..disjoint.len()).collect::<Vec<_>>());
+        let nested = (0..10_000)
+            .map(|index| index..20_000 - index)
+            .collect::<Vec<_>>();
+        let nested_order = region_merge_order_with_observer(&nested, true, || inspections += 1);
+        assert_eq!(nested_order[9_999], 0);
+        assert!(
+            inspections < (disjoint.len() + nested.len()) * 40,
+            "region depth calculation must stay O(n log n), got {inspections} tree operations"
+        );
+    }
+
+    #[test]
+    fn ordered_region_depth_matches_quadratic_containment_contract() {
+        let oracle = |ranges: &[std::ops::Range<usize>]| {
+            let mut indices = (0..ranges.len()).collect::<Vec<_>>();
+            let depth = |index: usize| {
+                ranges
+                    .iter()
+                    .enumerate()
+                    .filter(|(other_index, outer)| {
+                        *other_index != index
+                            && outer.start <= ranges[index].start
+                            && ranges[index].end <= outer.end
+                            && *outer != &ranges[index]
+                    })
+                    .count()
+            };
+            indices.sort_by_key(|&index| (std::cmp::Reverse(depth(index)), index));
+            let mut order = vec![0; ranges.len()];
+            for (rank, index) in indices.into_iter().enumerate() {
+                order[index] = rank;
+            }
+            order
+        };
+        let cases = [
+            vec![],
+            vec![0..1, 1..2, 2..3],
+            vec![0..10, 2..8, 3..4],
+            vec![0..5, 2..8, 4..6],
+            vec![0..10, 0..8, 0..8, 2..8, 2..10],
+            vec![0..10, 0..10, 2..5, 2..5],
+        ];
+        for ranges in cases {
+            assert_eq!(region_merge_order(&ranges, true), oracle(&ranges));
+            assert_eq!(
+                region_merge_order(&ranges, false),
+                (0..ranges.len()).collect::<Vec<_>>()
+            );
+        }
     }
 }
