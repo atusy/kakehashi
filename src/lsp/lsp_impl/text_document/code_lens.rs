@@ -21,6 +21,8 @@ impl Kakehashi {
             "textDocument/codeLens",
             raw_params,
             work_done_token,
+            None,
+            None,
             false,
             false,
             std::future::ready(Ok(None)),
@@ -52,6 +54,10 @@ impl Kakehashi {
                     server_resolves,
                 );
                 Some(won.items)
+            },
+            |mut acc, next| {
+                acc.extend(next);
+                acc
             },
             |mut acc, next| {
                 acc.extend(next);
