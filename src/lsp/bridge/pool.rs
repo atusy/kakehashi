@@ -2678,6 +2678,23 @@ impl LanguageServerPool {
         timeout: Duration,
         admit: &(dyn Fn() -> bool + Sync),
     ) -> io::Result<(Vec<Arc<ConnectionHandle>>, u64)> {
+        let initial_workspace_generation = self.workspace_generation.load(Ordering::Acquire);
+        if initial_workspace_generation & 1 != 0 || !admit() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "client workspace update is in progress",
+            ));
+        }
+        // `Some([])` is an explicit empty workspace, unlike `None` where the
+        // deprecated rootUri remains the fallback scope. Do not acquire a
+        // marker-less producer here: doing so can announce rootUri onto and
+        // then reuse a shared process that still serves unrelated marker roots.
+        if self
+            .workspace_folders()
+            .is_some_and(|folders| folders.is_empty())
+        {
+            return Ok((Vec::new(), initial_workspace_generation));
+        }
         let start = std::time::Instant::now();
         let (primary, workspace_generation) = self
             .get_or_create_workspace_connection_wait_ready_admitted(
