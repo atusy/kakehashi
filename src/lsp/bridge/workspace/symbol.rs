@@ -165,6 +165,7 @@ impl LanguageServerPool {
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
         supports_tags: bool,
+        admit: &(dyn Fn() -> bool + Sync),
     ) -> Option<WorkspaceSymbolResponse> {
         // A partial-result token cannot be shared by several downstream producers.
         // Return one deterministic aggregate in the final response instead.
@@ -192,7 +193,7 @@ impl LanguageServerPool {
             let upstream_id = upstream_id.clone();
             async move {
                 let handle = self
-                    .get_or_create_connection(&name, &config, None)
+                    .get_or_create_connection_admitted(&name, &config, None, admit)
                     .await
                     .ok()?;
                 if !handle.has_capability(SYMBOL_METHOD) {
@@ -757,5 +758,42 @@ mod tests {
         }));
 
         assert_eq!(request.await.unwrap(), unresolved);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_settings_refuse_workspace_symbol_producer_admission() {
+        let pool = LanguageServerPool::new();
+        let temp = tempfile::tempdir().unwrap();
+        let sentinel = temp.path().join("stale-producer-started");
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "stale-symbols".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "touch \"$1\"".into(),
+                    "workspace-symbol-admission".into(),
+                    sentinel.to_string_lossy().into_owned(),
+                ]),
+                languages: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
+            "query": "stale"
+        }))
+        .unwrap();
+
+        let response = pool
+            .dispatch_workspace_symbol(params, &settings, None, true, &|| false)
+            .await;
+
+        assert_eq!(response, None);
+        assert!(
+            !sentinel.exists(),
+            "a superseded settings snapshot must not spawn its producer"
+        );
     }
 }
