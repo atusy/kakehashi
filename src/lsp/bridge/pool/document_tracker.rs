@@ -27,6 +27,7 @@ struct VirtualUriProvenance {
     queued: DashSet<String>,
     reservations: DashSet<String>,
     admitted: AtomicUsize,
+    mutation: std::sync::RwLock<()>,
 }
 
 /// Retire a healthy producer before exact URI provenance can grow with an
@@ -69,8 +70,20 @@ impl VirtualUriProvenance {
     }
 
     fn confirm(&self, uri: String) {
+        let _mutation = self
+            .mutation
+            .write()
+            .recover_poison("VirtualUriProvenance::mutation");
         self.insert_issued(uri.clone());
         self.reservations.remove(&uri);
+    }
+
+    fn insert_queued(&self, uri: String) {
+        let _mutation = self
+            .mutation
+            .write()
+            .recover_poison("VirtualUriProvenance::mutation");
+        self.queued.insert(uri);
     }
 
     #[cfg(test)]
@@ -104,6 +117,18 @@ impl VirtualUriObserver {
             return true;
         }
         self.provenance.contains(uri)
+    }
+
+    pub(crate) fn provenance_read_guard(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.provenance
+            .mutation
+            .read()
+            .recover_poison("VirtualUriProvenance::mutation")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_provenance_for_test(&self, uri: String) {
+        self.provenance.insert_queued(uri);
     }
 }
 
@@ -400,8 +425,7 @@ impl DocumentTracker {
             return false;
         }
         self.provenance_for_generation(connection_key, expected_generation)
-            .queued
-            .insert(uri);
+            .insert_queued(uri);
         true
     }
 
