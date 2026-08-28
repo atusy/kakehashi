@@ -1367,6 +1367,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_empty_workspace_folders_selects_no_producer() {
+        let pool = LanguageServerPool::new();
+        pool.set_root_uri(Some("file:///workspace/client".into()));
+        pool.set_workspace_folders(Some(Vec::new()));
+        let shared = create_handle_advertising_workspace_symbols_with_folder_changes(
+            ConnectionKey::shared("symbols"),
+        )
+        .await;
+        shared
+            .workspace_folders()
+            .replace(Some(vec![WorkspaceFolder {
+                uri: Uri::from_str("file:///outside").unwrap(),
+                name: "outside".into(),
+            }]));
+        pool.connections()
+            .await
+            .insert(shared.key().clone(), Arc::clone(&shared));
+        let config = crate::config::settings::BridgeServerConfig {
+            cmd: Some(vec!["mock-symbols".into()]),
+            languages: Some(Vec::new()),
+            prefer_shared_instance: Some(true),
+            ..Default::default()
+        };
+
+        let (handles, _) = pool
+            .get_or_create_workspace_connections_wait_ready_admitted(
+                "symbols",
+                &config,
+                Duration::from_secs(1),
+                &|| true,
+            )
+            .await
+            .unwrap();
+
+        assert!(handles.is_empty());
+        assert_eq!(
+            shared.workspace_folders().snapshot().unwrap()[0].uri,
+            Uri::from_str("file:///outside").unwrap(),
+            "the empty workspace must not announce rootUri onto the shared producer"
+        );
+    }
+
+    #[tokio::test]
     async fn search_drops_a_server_when_one_workspace_root_fails() {
         let pool = Arc::new(LanguageServerPool::new());
         let folder_a = WorkspaceFolder {
