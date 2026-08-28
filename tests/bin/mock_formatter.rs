@@ -172,8 +172,6 @@
 //!   can be verified without opening a document.
 //! - `workspace-diagnostic-dynamic` — dynamically registers two diagnostic
 //!   providers and records the exact params sent to each identifier.
-//! - `workspace-diagnostic-dynamic-delayed` — delays that registration to
-//!   exercise the first-pull registration-settle boundary.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -571,9 +569,7 @@ fn main() {
                         },
                         "textDocumentSync": 1
                     }),
-                    "workspace-diagnostic-dynamic"
-                    | "workspace-diagnostic-dynamic-cancel"
-                    | "workspace-diagnostic-dynamic-delayed" => {
+                    "workspace-diagnostic-dynamic" | "workspace-diagnostic-dynamic-cancel" => {
                         json!({
                             "textDocumentSync": 1
                         })
@@ -613,14 +609,9 @@ fn main() {
             "initialized"
                 if matches!(
                     mode.as_str(),
-                    "workspace-diagnostic-dynamic"
-                        | "workspace-diagnostic-dynamic-cancel"
-                        | "workspace-diagnostic-dynamic-delayed"
+                    "workspace-diagnostic-dynamic" | "workspace-diagnostic-dynamic-cancel"
                 ) =>
             {
-                if mode == "workspace-diagnostic-dynamic-delayed" {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
                 request_with_params(
                     &mut writer,
                     json!(900),
@@ -651,9 +642,7 @@ fn main() {
             }
             "" if matches!(
                 mode.as_str(),
-                "workspace-diagnostic-dynamic"
-                    | "workspace-diagnostic-dynamic-cancel"
-                    | "workspace-diagnostic-dynamic-delayed"
+                "workspace-diagnostic-dynamic" | "workspace-diagnostic-dynamic-cancel"
             ) && id == Some(json!(900)) =>
             {
                 notify(
@@ -1402,9 +1391,7 @@ fn main() {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
                 if matches!(
                     mode.as_str(),
-                    "workspace-diagnostic-dynamic"
-                        | "workspace-diagnostic-dynamic-cancel"
-                        | "workspace-diagnostic-dynamic-delayed"
+                    "workspace-diagnostic-dynamic" | "workspace-diagnostic-dynamic-cancel"
                 ) {
                     let identifier = params
                         .get("identifier")

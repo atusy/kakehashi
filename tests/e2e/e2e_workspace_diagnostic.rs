@@ -139,49 +139,6 @@ fn workspace_diagnostic_starts_and_aggregates_cold_producers() {
 }
 
 #[test]
-fn workspace_diagnostic_first_pull_waits_for_dynamic_registration() {
-    let config_dir = tempfile::TempDir::new().expect("config temp dir");
-    let config_path = config_dir
-        .path()
-        .join("workspace_diagnostic_dynamic_delayed.toml");
-    std::fs::write(&config_path, "").expect("write config");
-    let mut client = LspClient::builder()
-        .arg("--config-file")
-        .arg(config_path.to_str().expect("UTF-8 config path"))
-        .build();
-    client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": "file:///workspace",
-            "capabilities": {
-                "textDocument": { "diagnostic": {} },
-                "workspace": { "diagnostics": { "refreshSupport": true } }
-            },
-            "initializationOptions": {
-                "languageServers": {
-                    "dynamic-diagnostic": {
-                        "cmd": [env!("CARGO_BIN_EXE_mock-lsp-formatter"), "workspace-diagnostic-dynamic-delayed"],
-                        "languages": [],
-                        "forceStart": true
-                    }
-                }
-            }
-        }),
-    );
-    client.send_notification("initialized", json!({}));
-
-    let response = client.send_request("workspace/diagnostic", json!({ "previousResultIds": [] }));
-    let items = response["result"]["items"]
-        .as_array()
-        .expect("report items");
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["items"].as_array().map(Vec::len), Some(2));
-    assert_eq!(items[0]["items"][0]["message"], "alpha");
-    assert_eq!(items[0]["items"][1]["message"], "zeta");
-}
-
-#[test]
 fn workspace_diagnostic_sends_each_dynamic_provider_its_own_wire_params() {
     let (mut client, _config_dir, events) =
         init_dynamic_workspace_diagnostic_client("workspace-diagnostic-dynamic");

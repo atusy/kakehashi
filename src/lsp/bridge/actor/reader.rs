@@ -1132,7 +1132,7 @@ async fn handle_server_request(
                 .send(UpstreamNotification::DiagnosticProviderChanged);
         }
     }
-    if response_queued && workspace_diagnostics_unregistered {
+    if workspace_diagnostics_unregistered {
         let _ = deps
             .upstream_tx
             .send(UpstreamNotification::DiagnosticProviderChanged);
@@ -2224,6 +2224,63 @@ mod tests {
             }
             _ => panic!("Expected Untracked variant"),
         }
+        assert_eq!(
+            upstream_rx.try_recv().expect("provider removal retry"),
+            UpstreamNotification::DiagnosticProviderChanged
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_refreshes_after_ack_queue_failure() {
+        let router = ResponseRouter::new();
+        let (response_tx, response_rx) = mpsc::channel(1);
+        drop(response_rx);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        dynamic_capabilities.register(vec![tower_lsp_server::ls_types::Registration {
+            id: "diag-1".into(),
+            method: "textDocument/diagnostic".into(),
+            register_options: Some(json!({
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
+        }]);
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let deps = ServerRequestDeps {
+            settings: Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
+            response_tx,
+            dynamic_capabilities: Arc::clone(&dynamic_capabilities),
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+        };
+
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "client/unregisterCapability",
+                "params": {
+                    "unregisterations": [{
+                        "id": "diag-1",
+                        "method": "textDocument/diagnostic"
+                    }]
+                }
+            }),
+            &router,
+            "",
+            &deps,
+        )
+        .await;
+
+        assert!(!dynamic_capabilities.has_registration("textDocument/diagnostic"));
         assert_eq!(
             upstream_rx.try_recv().expect("provider removal retry"),
             UpstreamNotification::DiagnosticProviderChanged
