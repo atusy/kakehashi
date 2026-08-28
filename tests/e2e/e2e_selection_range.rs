@@ -20,6 +20,10 @@ use crate::helpers::test_fixtures::{
 };
 use serde_json::{Value, json};
 
+fn mock_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_mock-lsp-formatter")
+}
+
 /// Request `textDocument/selectionRange` once the document's parse has landed.
 ///
 /// `didOpen` schedules parsing asynchronously and the server answers `null`
@@ -457,4 +461,167 @@ fn test_selection_range_multiple_positions() {
             i
         );
     }
+}
+
+#[test]
+fn e2e_selection_range_routes_each_position_to_its_virtual_or_native_layer() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("selection_range_virt.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/selectionRange"]
+priorities = ["virt", "native"]
+"#,
+    )
+    .expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("UTF-8 config path"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-selection-range": {
+                        "cmd": [mock_bin(), "selection-range-virt"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///selection_range_layers.md";
+    let text = "before\n\n> ```lua\n> code\n> ```\n";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+
+    let response = poll_until(100, 50, || {
+        let response = client.send_request(
+            "textDocument/selectionRange",
+            json!({
+                "textDocument": { "uri": uri },
+                "positions": [
+                    { "line": 0, "character": 1 },
+                    { "line": 3, "character": 3 }
+                ]
+            }),
+        );
+        (response.pointer("/result/1/range/start") == Some(&json!({ "line": 3, "character": 3 })))
+            .then_some(response)
+    })
+    .expect("virtual selection range should become available");
+    let ranges = response["result"].as_array().expect("aligned result array");
+    assert_eq!(ranges.len(), 2, "one result per requested position");
+    assert_eq!(
+        ranges[1],
+        json!({
+            "range": {
+                "start": { "line": 3, "character": 3 },
+                "end": { "line": 3, "character": 4 }
+            },
+            "parent": {
+                "range": {
+                    "start": { "line": 3, "character": 2 },
+                    "end": { "line": 3, "character": 6 }
+                }
+            }
+        }),
+        "the embedded position should use the rebased virtual-server chain"
+    );
+    assert!(
+        ranges[0]["range"]["start"]["line"].as_u64().unwrap_or(1) == 0,
+        "the position outside every injection should retain its native aligned result"
+    );
+}
+
+#[test]
+fn e2e_selection_range_uses_the_host_layer_for_the_real_document() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("selection_range_host.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/selectionRange"]
+priorities = ["host", "native"]
+
+[languages.markdown.bridge._self]
+enabled = true
+"#,
+    )
+    .expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("UTF-8 config path"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-selection-range-host": {
+                        "cmd": [mock_bin(), "selection-range-host"],
+                        "languages": ["markdown"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///selection_range_host.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "word\n"
+            }
+        }),
+    );
+
+    let response = poll_until(100, 50, || {
+        let response = client.send_request(
+            "textDocument/selectionRange",
+            json!({
+                "textDocument": { "uri": uri },
+                "positions": [{ "line": 0, "character": 1 }]
+            }),
+        );
+        (response.pointer("/result/0/range/start/character") == Some(&json!(1))).then_some(response)
+    })
+    .expect("host selection range should become available");
+    assert_eq!(
+        response["result"][0],
+        json!({
+            "range": {
+                "start": { "line": 0, "character": 1 },
+                "end": { "line": 0, "character": 2 }
+            },
+            "parent": {
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 4 }
+                }
+            }
+        })
+    );
 }
