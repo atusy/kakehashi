@@ -13,7 +13,8 @@ codeAction, formatting, documentHighlight, diagnostics). Semantic-token range
 requests now support the ordinary preferred host/virt/native layer walk when
 the requested range is wholly owned by one injection. Full requests establish
 a current native baseline, then synchronously overlay all selected host and
-virtual layers in priority order. Full/delta bridging remains unimplemented.
+virtual layers in priority order. Full/delta recomputes that merged overlay and
+diffs it against the stored merged-wire baseline.
 
 ## Context
 
@@ -340,7 +341,7 @@ When multiple servers are configured for a language:
 
 | Method | Merging Strategy (as implemented; rows marked *aspirational* never shipped) |
 |--------|------------------|
-| Semantic Tokens | Range: `preferred` for injection-contained requests, with legend remapping and native fallback. Full: synchronous native/host/virtual overlay. Full/delta bridging remains aspirational |
+| Semantic Tokens | Range: `preferred` for injection-contained requests, with legend remapping and native fallback. Full: synchronous native/host/virtual overlay. Full/delta: recompute the merged overlay and diff against its merged-wire baseline |
 | Go-to-Definition | `preferred`: first non-empty result (query in `priorities` order) |
 | Find References | `preferred` by default (first non-empty); *concatenate + dedupe is aspirational* |
 | Completion | `preferred` by default (first non-empty); *list merging is aspirational* |
