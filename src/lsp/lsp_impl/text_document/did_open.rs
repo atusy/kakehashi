@@ -1372,7 +1372,7 @@ print("hello")
         let uri = Url::parse("file:///test/explicit-host-language.rs").unwrap();
         server.documents.insert(
             uri.clone(),
-            "host syntax\n".to_string(),
+            "#!/usr/bin/env python\nhost syntax\n".to_string(),
             Some("hostonly".to_string()),
             None,
         );
