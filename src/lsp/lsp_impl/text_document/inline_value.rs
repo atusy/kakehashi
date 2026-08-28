@@ -15,7 +15,8 @@ use crate::lsp::aggregation::server::{
 };
 use crate::lsp::bridge::HostDocument;
 use crate::lsp::bridge::RegionOffset;
-use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
+use crate::lsp::lsp_impl::bridge_context::{normalize_range_endpoints, parse_host_verbatim};
+use crate::text::PositionMapper;
 
 const METHOD: &str = "textDocument/inlineValue";
 
@@ -53,6 +54,10 @@ impl Kakehashi {
             return Ok(None);
         };
         let incarnation = ctx.incarnation;
+        let content_version = ctx.content_version;
+        if !self.inline_value_snapshot_is_current(lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
         let fan_in = dispatch_host_preferred(
             &ctx,
@@ -85,7 +90,11 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        self.host_layer_result(fan_in, METHOD, |won| won).await
+        let values = self.host_layer_result(fan_in, METHOD, |won| won).await?;
+        if !self.inline_value_snapshot_is_current(lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
+        Ok(values)
     }
 
     async fn inline_value_virt_layer(
@@ -114,6 +123,14 @@ impl Kakehashi {
             character: offset.column_for_line(0),
         };
         let Some(region_end) = ctx.document.region_end else {
+            return Ok(None);
+        };
+        let Some(range) = self.normalize_inline_value_range_if_current(
+            lsp_uri,
+            ctx.incarnation,
+            ctx.content_version,
+            range,
+        ) else {
             return Ok(None);
         };
         let Some(range) = clamp_visible_range_to_region(range, region_start, region_end) else {
@@ -185,6 +202,19 @@ impl Kakehashi {
             })
             .unwrap_or(false)
     }
+
+    fn normalize_inline_value_range_if_current(
+        &self,
+        lsp_uri: &Uri,
+        incarnation: u64,
+        content_version: u64,
+        range: Range,
+    ) -> Option<Range> {
+        let uri = super::super::uri_to_url(lsp_uri).ok()?;
+        let document = self.documents.get(&uri)?;
+        (document.incarnation() == incarnation && document.content_version() == content_version)
+            .then(|| normalize_range_endpoints(&PositionMapper::new(document.text()), range))?
+    }
 }
 
 fn clamp_visible_range_to_region(
@@ -229,7 +259,38 @@ async fn wait_for_inline_value_admission_release() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_lsp_server::LspService;
     use tower_lsp_server::ls_types::Position;
+
+    #[tokio::test]
+    async fn snapshot_freshness_rejects_edits_and_reopens() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = url::Url::parse("file:///inline-value-freshness.md").unwrap();
+        let lsp_uri = super::super::super::url_to_uri(&uri).unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "old".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+
+        assert!(server.inline_value_snapshot_is_current(&lsp_uri, incarnation, content_version));
+        server
+            .documents
+            .apply_edit_clearing_tree(&uri, "edited".to_string(), &[]);
+        assert!(!server.inline_value_snapshot_is_current(&lsp_uri, incarnation, content_version));
+
+        server.documents.remove(&uri);
+        server.documents.insert(
+            uri.clone(),
+            "reopened".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        assert!(!server.inline_value_snapshot_is_current(&lsp_uri, incarnation, content_version));
+    }
 
     #[test]
     fn visible_range_is_clamped_to_the_stopped_region() {
