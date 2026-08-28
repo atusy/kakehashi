@@ -1919,6 +1919,7 @@ fn main() {
             "textDocument/selectionRange" => {
                 if mode.starts_with("selection-range-") {
                     record_mock_event(&mode, "request", &message);
+                    increment_mock_event_count(&mode, "request");
                 }
                 if mode == "selection-range-delayed" {
                     wait_for_mock_release(&mode);
@@ -2664,6 +2665,19 @@ fn record_mock_event(mode: &str, event: &str, message: &Value) {
     if std::fs::write(&staging, serde_json::to_vec(&payload).unwrap_or_default()).is_ok() {
         let _ = std::fs::rename(&staging, &path);
     }
+}
+
+fn increment_mock_event_count(mode: &str, event: &str) {
+    let Ok(dir) = std::env::var("MOCK_LSP_CANCEL_DIR") else {
+        return;
+    };
+    let path = Path::new(&dir).join(format!("{mode}.{event}.count"));
+    let count = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        + 1;
+    let _ = std::fs::write(path, count.to_string());
 }
 
 fn wait_for_mock_release(mode: &str) {
