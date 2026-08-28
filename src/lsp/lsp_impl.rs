@@ -39,8 +39,8 @@ use tower_lsp_server::ls_types::{
     SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp,
     SignatureHelpParams, TextDocumentPositionParams, TextEdit, TypeHierarchyItem,
     TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri,
-    WillSaveTextDocumentParams, WorkspaceEdit, WorkspaceSymbol, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    WillSaveTextDocumentParams, WorkspaceDiagnosticParams, WorkspaceDiagnosticReportResult,
+    WorkspaceEdit, WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use tower_lsp_server::ls_types::{
     ColorInformation, ColorPresentation, ColorPresentationParams, DocumentColorParams,
@@ -1156,6 +1156,13 @@ impl LanguageServer for Kakehashi {
         params: DocumentDiagnosticParams,
     ) -> Result<DocumentDiagnosticReportResult> {
         self.diagnostic_impl(params).await
+    }
+
+    async fn workspace_diagnostic(
+        &self,
+        params: WorkspaceDiagnosticParams,
+    ) -> Result<WorkspaceDiagnosticReportResult> {
+        self.workspace_diagnostic_impl(params).await
     }
 }
 

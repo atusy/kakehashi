@@ -53,8 +53,8 @@ fn e2e_diagnostic_capability_advertised() {
     );
     assert_eq!(
         provider.get("workspaceDiagnostics"),
-        Some(&json!(false)),
-        "workspaceDiagnostics should be false per pull-first-diagnostic-forwarding"
+        Some(&json!(true)),
+        "workspaceDiagnostics should be advertised with workspace pull routing"
     );
 
     println!("E2E: diagnosticProvider capability advertised correctly");
