@@ -112,30 +112,29 @@ async fn diagnostic_providers_after_registration_settle(
 ) -> Vec<DiagnosticProvider> {
     // Subscribe before the first snapshot so a registration committed between
     // the read and `changed()` cannot be missed. LSP has no "registration set
-    // complete" signal, so a cold capability-less snapshot gets one short
-    // settle window; a later registration also schedules a forced upstream
-    // refresh from the reader path.
+    // complete" signal, so every connection's first provider plan gets one
+    // short settle window, including when a static or early dynamic provider
+    // is already visible. A later registration also schedules a forced
+    // upstream refresh from the reader path.
     let registry = handle.dynamic_capabilities();
-    if diagnostic_providers(handle).is_empty() {
-        let _ = registry
-            .diagnostic_registration_settle()
-            .get_or_try_init(|| async {
-                let mut changes = registry.subscribe_changes();
-                let deadline = tokio::time::Instant::now() + DYNAMIC_REGISTRATION_SETTLE;
-                loop {
-                    if !admit() {
-                        return Err(());
-                    }
-                    if tokio::time::timeout_at(deadline, changes.changed())
-                        .await
-                        .is_err()
-                    {
-                        return Ok(());
-                    }
+    let _ = registry
+        .diagnostic_registration_settle()
+        .get_or_try_init(|| async {
+            let mut changes = registry.subscribe_changes();
+            let deadline = tokio::time::Instant::now() + DYNAMIC_REGISTRATION_SETTLE;
+            loop {
+                if !admit() {
+                    return Err(());
                 }
-            })
-            .await;
-    }
+                if tokio::time::timeout_at(deadline, changes.changed())
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+        })
+        .await;
     diagnostic_providers(handle)
 }
 
@@ -262,7 +261,14 @@ fn combine_complete_provider_reports(
 ) -> Option<WorkspaceDiagnosticReport> {
     let reports: Option<Vec<_>> = reports
         .into_iter()
-        .map(|report| report.ok().flatten())
+        .map(|report| {
+            let report = report.ok().flatten()?;
+            report
+                .items
+                .iter()
+                .all(|item| matches!(item, WorkspaceDocumentDiagnosticReport::Full(_)))
+                .then_some(report)
+        })
         .collect();
     reports.map(combine_producer_reports)
 }
@@ -1084,10 +1090,6 @@ mod tests {
             ConnectionKey::for_server("diagnostics"),
         )
         .await;
-        let providers = diagnostic_providers_after_registration_settle(&handle, &|| true);
-        tokio::pin!(providers);
-        assert!(futures::poll!(providers.as_mut()).is_pending());
-
         handle.dynamic_capabilities().register(vec![Registration {
             id: "alpha".into(),
             method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
@@ -1097,6 +1099,8 @@ mod tests {
                 "interFileDependencies": true
             })),
         }]);
+        let providers = diagnostic_providers_after_registration_settle(&handle, &|| true);
+        tokio::pin!(providers);
         assert!(futures::poll!(providers.as_mut()).is_pending());
         tokio::time::advance(DYNAMIC_REGISTRATION_SETTLE / 2).await;
         handle.dynamic_capabilities().register(vec![Registration {
@@ -1538,30 +1542,20 @@ mod tests {
     }
 
     #[test]
-    fn aggregation_ignores_unusable_unchanged_but_keeps_real_lookalike_uri() {
-        let lookalike_uri = "file:///workspace/kakehashi-virtual-uri-region-0.lua";
-        let result = aggregate_reports([WorkspaceDiagnosticReport {
-            items: vec![
-                WorkspaceDocumentDiagnosticReport::Unchanged(
-                    WorkspaceUnchangedDocumentDiagnosticReport {
-                        uri: Uri::from_str("file:///workspace/a.rs").unwrap(),
-                        version: None,
-                        unchanged_document_diagnostic_report: UnchangedDocumentDiagnosticReport {
-                            result_id: "private".into(),
-                        },
+    fn provider_combination_rejects_unusable_unchanged_reports() {
+        let report = WorkspaceDiagnosticReport {
+            items: vec![WorkspaceDocumentDiagnosticReport::Unchanged(
+                WorkspaceUnchangedDocumentDiagnosticReport {
+                    uri: Uri::from_str("file:///workspace/a.rs").unwrap(),
+                    version: None,
+                    unchanged_document_diagnostic_report: UnchangedDocumentDiagnosticReport {
+                        result_id: "private".into(),
                     },
-                ),
-                full(lookalike_uri, Some(1), "real lookalike"),
-            ],
-        }]);
-        let WorkspaceDiagnosticReportResult::Report(report) = result else {
-            panic!("final report")
+                },
+            )],
         };
-        assert_eq!(report.items.len(), 1);
-        let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
-            panic!("full report")
-        };
-        assert_eq!(report.uri.as_str(), lookalike_uri);
+
+        assert!(combine_complete_provider_reports([Ok(Some(report))]).is_none());
     }
 
     #[tokio::test]
