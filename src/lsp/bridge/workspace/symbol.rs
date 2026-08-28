@@ -42,7 +42,18 @@ struct WorkspaceSymbolEnvelope {
 struct WorkspaceSymbolProjection {
     virtual_uri: String,
     virtual_version: i32,
+    #[serde(default)]
+    host_identity: Option<(u64, u64)>,
     downstream_location: OneOf<Location, WorkspaceLocation>,
+}
+
+fn host_document_identity(
+    documents: &crate::document::DocumentStore,
+    host_url: &url::Url,
+) -> Option<(u64, u64)> {
+    documents
+        .get(host_url)
+        .map(|document| (document.incarnation(), document.content_version()))
 }
 
 fn envelope_symbol(symbol: &mut WorkspaceSymbol, envelope: WorkspaceSymbolEnvelope) {
@@ -261,6 +272,7 @@ async fn project_workspace_symbol_location(
     symbol: &mut WorkspaceSymbol,
     observer: &VirtualUriObserver,
     request_versions: &HashMap<String, i32>,
+    request_host_identities: &HashMap<String, (u64, u64)>,
     connection_key: &ConnectionKey,
     documents: &crate::document::DocumentStore,
     language: &Arc<crate::language::LanguageCoordinator>,
@@ -283,6 +295,10 @@ async fn project_workspace_symbol_location(
         return None;
     }
     let (host_url, region_id) = pool.resolve_virtual_uri(&virtual_uri).await?;
+    let host_identity = *request_host_identities.get(&virtual_uri)?;
+    if host_document_identity(documents, &host_url) != Some(host_identity) {
+        return None;
+    }
     let host_uri = crate::lsp::lsp_impl::url_to_uri(&host_url).ok()?;
     let (offset, region_end, contiguous, _) =
         crate::lsp::lsp_impl::region_offset::resolve_region_offset(
@@ -309,12 +325,14 @@ async fn project_workspace_symbol_location(
         .virtual_document_version(&virtual_uri, connection_key)
         .await
         != Some(virtual_version)
+        || host_document_identity(documents, &host_url) != Some(host_identity)
     {
         return None;
     }
     Some(Some(WorkspaceSymbolProjection {
         virtual_uri,
         virtual_version,
+        host_identity: Some(host_identity),
         downstream_location,
     }))
 }
@@ -333,11 +351,14 @@ async fn project_resolved_workspace_symbol_location(
         pool.document_connection_generation(connection_key),
     );
     let versions = HashMap::from([(projection.virtual_uri.clone(), projection.virtual_version)]);
+    let host_identities =
+        HashMap::from([(projection.virtual_uri.clone(), projection.host_identity?)]);
     project_workspace_symbol_location(
         pool,
         symbol,
         &observer,
         &versions,
+        &host_identities,
         connection_key,
         documents,
         language,
@@ -538,6 +559,18 @@ impl LanguageServerPool {
                         let virtual_versions = self
                             .confirmed_virtual_document_versions_for_connection(handle.key())
                             .await;
+                        let mut virtual_host_identities = HashMap::new();
+                        if let Some(context) = projection_context {
+                            for virtual_uri in virtual_versions.keys() {
+                                if let Some((host_url, _)) =
+                                    self.resolve_virtual_uri(virtual_uri).await
+                                    && let Some(identity) =
+                                        host_document_identity(context.documents, &host_url)
+                                {
+                                    virtual_host_identities.insert(virtual_uri.clone(), identity);
+                                }
+                            }
+                        }
                         let Some((response, resolves)) = self
                             .send_workspace_request(
                                 &handle,
@@ -567,6 +600,7 @@ impl LanguageServerPool {
                                     &mut symbol.symbol,
                                     &virtual_uri_observer,
                                     &virtual_versions,
+                                    &virtual_host_identities,
                                     handle.key(),
                                     context.documents,
                                     context.language,
@@ -940,6 +974,7 @@ mod tests {
             &mut symbol,
             &observer,
             &HashMap::new(),
+            &HashMap::new(),
             &key,
             &documents,
             &language,
@@ -1008,6 +1043,7 @@ mod tests {
                 &mut symbol,
                 &observer,
                 &versions,
+                &HashMap::new(),
                 &key,
                 &documents,
                 &language,
@@ -1016,6 +1052,67 @@ mod tests {
             .await
             .is_none(),
             "a response from the prior virtual-document version must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_symbol_projection_rejects_a_pending_host_reparse() {
+        let bridge = BridgeCoordinator::new();
+        let pool = bridge.pool_arc();
+        let key = ConnectionKey::for_server("symbols");
+        let host_url = url::Url::parse("file:///workspace/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_url).unwrap(),
+            "lua",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+        bridge
+            .register_opened_document_for_test(&host_url, &virtual_uri, &key)
+            .await;
+        let observer = pool
+            .observe_virtual_uris_for_connection(&key, pool.document_connection_generation(&key));
+        let versions = pool
+            .confirmed_virtual_document_versions_for_connection(&key)
+            .await;
+        let documents = crate::document::DocumentStore::new();
+        documents.insert(
+            host_url.clone(),
+            "old".into(),
+            Some("markdown".into()),
+            None,
+        );
+        let request_host_identities = HashMap::from([(
+            virtual_uri.to_uri_string(),
+            host_document_identity(&documents, &host_url).unwrap(),
+        )]);
+        documents.update_document(host_url, "new".into(), None);
+        let mut symbol = WorkspaceSymbol {
+            name: "stale".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Right(WorkspaceLocation {
+                uri: Uri::from_str(&virtual_uri.to_uri_string()).unwrap(),
+            }),
+            data: None,
+        };
+        let language = Arc::new(crate::language::LanguageCoordinator::new());
+
+        assert!(
+            project_workspace_symbol_location(
+                &pool,
+                &mut symbol,
+                &observer,
+                &versions,
+                &request_host_identities,
+                &key,
+                &documents,
+                &language,
+                &bridge,
+            )
+            .await
+            .is_none(),
+            "projection must not combine an old virtual revision with new host geometry"
         );
     }
 
