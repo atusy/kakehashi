@@ -323,6 +323,7 @@ fn main() {
                         "textDocumentSync": 1
                     }),
                     "inline-value-host"
+                    | "inline-value-record-host"
                     | "inline-value-virt"
                     | "inline-value-delayed"
                     | "inline-value-slow" => json!({
@@ -1626,12 +1627,18 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "textDocument/inlineValue" => {
-                let label = if mode == "inline-value-host" {
+                let label = if matches!(
+                    mode.as_str(),
+                    "inline-value-host" | "inline-value-record-host"
+                ) {
                     "host"
                 } else {
                     "virt"
                 };
                 let result = inline_value_result(&message, &documents, label);
+                if mode == "inline-value-record-host" {
+                    record_mock_event(&mode, "request", &message);
+                }
                 if mode == "inline-value-delayed" {
                     record_mock_event(&mode, "request", &message);
                     wait_for_mock_release(&mode);
