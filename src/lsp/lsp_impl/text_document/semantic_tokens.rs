@@ -994,7 +994,8 @@ impl Kakehashi {
                     &region.injection_language,
                     METHOD,
                 );
-                super::super::whole_document::request_selects_servers(
+                semantic_region_selects_servers(
+                    region.contiguous,
                     &agg.priorities,
                     &configs,
                     agg.max_fan_out,
@@ -2019,6 +2020,16 @@ impl Kakehashi {
     }
 }
 
+fn semantic_region_selects_servers(
+    contiguous: bool,
+    priorities: &[String],
+    configs: &[crate::lsp::bridge::ResolvedServerConfig],
+    max_fan_out: Option<usize>,
+) -> bool {
+    contiguous
+        && super::super::whole_document::request_selects_servers(priorities, configs, max_fan_out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2034,6 +2045,27 @@ mod tests {
             assert!(!token.is_cancelled());
         }
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn delta_reentry_excludes_non_contiguous_virtual_regions() {
+        let configs = vec![crate::lsp::bridge::ResolvedServerConfig {
+            server_name: "tokens".into(),
+            config: std::sync::Arc::new(crate::config::settings::BridgeServerConfig::default()),
+        }];
+        let priorities = [crate::config::settings::PRIORITIES_WILDCARD.into()];
+        assert!(!semantic_region_selects_servers(
+            false,
+            &priorities,
+            &configs,
+            None
+        ));
+        assert!(semantic_region_selects_servers(
+            true,
+            &priorities,
+            &configs,
+            None
+        ));
     }
 
     #[test]
