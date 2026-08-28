@@ -122,15 +122,17 @@ fn reconcile_overlapping_root_reports(
     let mut preferred_roots = BTreeMap::new();
     for item in &items {
         let uri = item_uri(&item.item);
-        let Some(depth) = containing_root_depth(item.spawn_root.as_deref(), uri) else {
-            continue;
-        };
         let key = (
             item.server.clone(),
             item.provider_identifiers.clone(),
             uri.to_owned(),
         );
-        let candidate = (depth, item.spawn_root.clone().unwrap_or_default());
+        let containing_depth = containing_root_depth(item.spawn_root.as_deref(), uri);
+        let candidate = (
+            containing_depth.is_some(),
+            containing_depth.unwrap_or_default(),
+            item.spawn_root.clone().unwrap_or_default(),
+        );
         preferred_roots
             .entry(key)
             .and_modify(|current| {
@@ -150,7 +152,7 @@ fn reconcile_overlapping_root_reports(
                     item.provider_identifiers.clone(),
                     uri.to_owned(),
                 ))
-                .is_none_or(|(_, root)| item.spawn_root.as_deref() == Some(root.as_str()))
+                .is_none_or(|(_, _, root)| item.spawn_root.as_deref().unwrap_or_default() == root)
         })
         .map(|item| WorkspaceDiagnosticReport {
             items: vec![item.item],
@@ -1056,6 +1058,7 @@ mod tests {
                     items: vec![
                         full("file:///workspace/root.rs", None, "parent-root"),
                         full("file:///workspace/nested/doc.rs", None, "parent-nested"),
+                        full("file:///generated/shared.rs", None, "parent-external"),
                     ],
                 },
             },
@@ -1064,7 +1067,10 @@ mod tests {
                 spawn_root: Some("file:///workspace/nested/".into()),
                 provider_identifiers,
                 report: WorkspaceDiagnosticReport {
-                    items: vec![full("file:///workspace/nested/doc.rs", None, "nested-root")],
+                    items: vec![
+                        full("file:///workspace/nested/doc.rs", None, "nested-root"),
+                        full("file:///generated/shared.rs", None, "nested-external"),
+                    ],
                 },
             },
         ]);
@@ -1087,6 +1093,7 @@ mod tests {
         assert_eq!(
             messages,
             [
+                ("file:///generated/shared.rs", "nested-external"),
                 ("file:///workspace/nested/doc.rs", "nested-root"),
                 ("file:///workspace/root.rs", "parent-root"),
             ]
