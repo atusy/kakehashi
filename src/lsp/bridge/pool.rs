@@ -2828,6 +2828,31 @@ impl LanguageServerPool {
         self.workspace_generation.load(Ordering::Acquire)
     }
 
+    fn same_workspace_root_sets<'a>(
+        expected: impl Iterator<Item = &'a str>,
+        actual: impl Iterator<Item = &'a str>,
+    ) -> bool {
+        let deduplicate = |roots: &mut Vec<&'a str>, root: &'a str| {
+            if !roots
+                .iter()
+                .any(|known| super::root_markers::same_root_uri(known, root))
+            {
+                roots.push(root);
+            }
+        };
+        let mut expected_roots = Vec::new();
+        expected.for_each(|root| deduplicate(&mut expected_roots, root));
+        let mut actual_roots = Vec::new();
+        actual.for_each(|root| deduplicate(&mut actual_roots, root));
+
+        expected_roots.len() == actual_roots.len()
+            && expected_roots.iter().all(|expected| {
+                actual_roots
+                    .iter()
+                    .any(|actual| super::root_markers::same_root_uri(expected, actual))
+            })
+    }
+
     fn workspace_handle_covers_roots(
         &self,
         handle: &ConnectionHandle,
@@ -2839,12 +2864,10 @@ impl LanguageServerPool {
         let Some(actual) = handle.workspace_folders().snapshot() else {
             return false;
         };
-        actual.len() == roots.len()
-            && roots.iter().all(|(expected, _)| {
-                actual.iter().any(|actual| {
-                    super::root_markers::same_root_uri(expected.as_str(), actual.uri.as_str())
-                })
-            })
+        Self::same_workspace_root_sets(
+            roots.iter().map(|(root, _)| root.as_str()),
+            actual.iter().map(|folder| folder.uri.as_str()),
+        )
     }
 
     pub(super) fn shared_serves_client_workspace(&self, handle: &ConnectionHandle) -> bool {
@@ -2858,17 +2881,10 @@ impl LanguageServerPool {
             let actual = handle.workspace_folders().snapshot();
             return match (expected, actual) {
                 (None, None) => true,
-                (Some(expected), Some(actual)) => {
-                    expected.len() == actual.len()
-                        && expected.iter().all(|expected| {
-                            actual.iter().any(|actual| {
-                                super::root_markers::same_root_uri(
-                                    expected.uri.as_str(),
-                                    actual.uri.as_str(),
-                                )
-                            })
-                        })
-                }
+                (Some(expected), Some(actual)) => Self::same_workspace_root_sets(
+                    expected.iter().map(|folder| folder.uri.as_str()),
+                    actual.iter().map(|folder| folder.uri.as_str()),
+                ),
                 _ => false,
             };
         }
@@ -4616,6 +4632,18 @@ mod tests {
     // Unit tests for ConnectionHandle, ConnectionState, GlobalShutdownTimeout,
     // and OpenedVirtualDoc live in their respective submodules.
     // This file contains integration tests that exercise cross-module behavior.
+
+    #[test]
+    fn workspace_root_sets_deduplicate_equivalent_spellings_before_comparison() {
+        assert!(LanguageServerPool::same_workspace_root_sets(
+            ["file:///repo", "file:///repo/"].into_iter(),
+            ["file:///repo"].into_iter(),
+        ));
+        assert!(!LanguageServerPool::same_workspace_root_sets(
+            ["file:///repo", "file:///repo/"].into_iter(),
+            ["file:///repo", "file:///other"].into_iter(),
+        ));
+    }
 
     /// A client `window/workDoneProgress/cancel` for a bridge-minted token is
     /// routed to the owning downstream with its ORIGINAL token restored.
