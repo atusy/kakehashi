@@ -691,12 +691,17 @@ type CapturesDelta = {
 client workspace, including servers that have not yet been started by opening a
 document. Results from all capable servers are combined in stable server-name
 order. Legacy `SymbolInformation` results are normalized to `WorkspaceSymbol`.
+For a `preferSharedInstance` server that cannot follow workspace-folder
+changes, searches use a client-root fallback instead of a shared process that
+may have been initialized from one document's marker root.
 
 When a downstream server supports `workspaceSymbol/resolve`, returned symbols
 carry opaque routing data so a later resolve reaches the same downstream
-process. The server's original `data` is preserved inside that envelope. If the
-producing process has been replaced or its configuration was removed, resolve
-fails soft by returning the unresolved symbol unchanged.
+process, provided the editor's
+`workspace.symbol.resolveSupport.properties` contains `location.range`. The
+server's original `data` is preserved inside that envelope. If the producing
+process has been replaced or its configuration was removed, resolve fails soft
+by returning the unresolved symbol unchanged.
 
 Partial-result and work-done tokens are not forwarded because one client token
 cannot identify several downstream producers; the client receives one final
