@@ -320,8 +320,10 @@ cross-layer priorities/strategy only — server-level `priorities`/
 
 Workspace diagnostic pulls start every explicitly configured, runnable server
 that supports them, including cold servers, and combine full reports for real
-workspace files. Equal-version reports for one URI are concatenated in stable
-server-name order; a higher document version replaces lower-version reports.
+workspace files. Reports for one URI are concatenated in stable server-name
+order. Because document versions are local to each downstream connection, a
+composite keeps its version only when all contributors agree and otherwise uses
+`null`.
 Downstream result IDs, provider identifiers, and progress tokens are not shared
 across producers, so workspace pulls currently return full, non-streamed
 reports. Internal virtual-document reports are filtered: open embedded regions

@@ -30,9 +30,10 @@ Send each producer an empty `previousResultIds` list, its own statically or
 dynamically declared provider identifier, and no progress tokens. If one server
 registers multiple workspace-diagnostic providers, query each provider with its
 own identifier. Aggregate only full reports and omit downstream result ids from
-the upstream response. For the same URI and version, concatenate
-diagnostics in stable server-name order. If versions differ, keep the higher
-document version. Sort final reports by URI for deterministic output.
+the upstream response. For the same URI, concatenate diagnostics in stable
+server-name order. Downstream document versions are connection-local rather
+than comparable revisions; retain a version only when every contributor agrees,
+otherwise report `null`. Sort final reports by URI for deterministic output.
 
 Do not expose reports or related-information links whose exact URI was issued
 to that producer generation as an internal virtual document. URI shape alone
