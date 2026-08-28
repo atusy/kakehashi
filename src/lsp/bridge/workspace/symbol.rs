@@ -576,6 +576,12 @@ impl LanguageServerPool {
                                 else {
                                     continue;
                                 };
+                                if !self
+                                    .workspace_symbol_producer_is_live(&handle, generation)
+                                    .await
+                                {
+                                    continue;
+                                }
                                 projection
                             } else {
                                 None
@@ -744,6 +750,12 @@ impl LanguageServerPool {
                     )
                     .await
                     .is_none()
+                {
+                    return fail_soft(symbol);
+                }
+                if !self
+                    .workspace_symbol_producer_is_live(&handle, envelope.connection_generation)
+                    .await
                 {
                     return fail_soft(symbol);
                 }
