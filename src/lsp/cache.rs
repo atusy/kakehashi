@@ -1,5 +1,5 @@
 //! `CacheCoordinator` unifies the semantic-token caches under one API:
-//! `SemanticTokenCache`, `SemanticTokenRangeCache`, `InjectionMap`,
+//! native and merged-wire `SemanticTokenCache`s, `SemanticTokenRangeCache`, `InjectionMap`,
 //! `InjectionTokenCache`, and `SemanticRequestTracker` (in-flight cancellation).
 //!
 //! The semantic-token cache is intentionally **not** invalidated on `didChange`
@@ -30,11 +30,16 @@ pub(crate) type RequestId = u64;
 
 /// Coordinates all cache structures for semantic token operations.
 ///
-/// This struct wraps five underlying caches (full tokens, range tokens, the
-/// injection map, injection-region tokens, and request tracking) and provides a
+/// This struct wraps six underlying caches (native full tokens, merged wire
+/// tokens, range tokens, the injection map, injection-region tokens, and
+/// request tracking) and provides a
 /// unified API for document lifecycle management, edit handling, and token operations.
 pub(crate) struct CacheCoordinator {
     semantic_cache: SemanticTokenCache,
+    /// Editor-visible full-token baselines after host/virtual/native overlay.
+    /// Kept separate from `semantic_cache`, which must remain a pure native
+    /// compute cache for unchanged-document reuse.
+    semantic_wire_cache: SemanticTokenCache,
     /// Most-recent `semanticTokens/range` result per URI (#535), keyed by viewport
     /// range + the same `cache_key` as `semantic_cache`. Cleared on a generation
     /// bump and evicted on `didClose` alongside `semantic_cache`.
@@ -97,6 +102,7 @@ impl CacheCoordinator {
     pub(crate) fn new() -> Self {
         Self {
             semantic_cache: SemanticTokenCache::new(),
+            semantic_wire_cache: SemanticTokenCache::new(),
             semantic_range_cache: SemanticTokenRangeCache::new(),
             injection_map: InjectionMap::new(),
             injection_token_cache: std::sync::Arc::new(InjectionTokenCache::new()),
@@ -130,6 +136,7 @@ impl CacheCoordinator {
         self.request_tracker.cancel_all_for_uri(uri);
         self.served_semantic_versions.remove(uri);
         self.semantic_cache.remove(uri);
+        self.semantic_wire_cache.remove(uri);
         self.semantic_range_cache.remove(uri);
         self.injection_map.clear(uri);
         self.injection_token_cache.clear_document(uri);
@@ -620,6 +627,27 @@ impl CacheCoordinator {
             .store(uri, tokens, language, cache_key, snapshot);
     }
 
+    pub(crate) fn store_wire_tokens(
+        &self,
+        uri: Url,
+        tokens: SemanticTokens,
+        language: String,
+        cache_key: u64,
+        snapshot: SemanticSnapshotIdentity,
+    ) {
+        self.semantic_wire_cache
+            .store(uri, tokens, language, cache_key, snapshot);
+    }
+
+    pub(crate) fn get_wire_tokens_if_valid(
+        &self,
+        uri: &Url,
+        expected_result_id: &str,
+    ) -> Option<std::sync::Arc<SemanticTokens>> {
+        self.semantic_wire_cache
+            .get_if_valid(uri, expected_result_id)
+    }
+
     /// Store the most-recent `semanticTokens/range` result for a document (#535),
     /// tagged with the viewport `range` and the `cache_key` it was computed under.
     pub(crate) fn store_range_tokens(
@@ -682,6 +710,7 @@ impl CacheCoordinator {
         self.semantic_token_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.semantic_cache.clear();
+        self.semantic_wire_cache.clear();
         // The injection token cache folds the same generation into its key, so
         // old-generation entries are already unreachable after the bump; clear
         // them too so a reload doesn't leak per-region entries until each
@@ -782,7 +811,20 @@ mod tests {
         };
         cache.store_tokens(
             uri.clone(),
-            tokens,
+            tokens.clone(),
+            "rust".to_string(),
+            0,
+            SemanticSnapshotIdentity {
+                parsed_version: 0,
+                incarnation: 0,
+                generation: 0,
+            },
+        );
+        let mut wire_tokens = tokens;
+        wire_tokens.result_id = Some("wire-id".to_string());
+        cache.store_wire_tokens(
+            uri.clone(),
+            wire_tokens,
             "rust".to_string(),
             0,
             SemanticSnapshotIdentity {
@@ -800,7 +842,63 @@ mod tests {
 
         // Verify all caches are cleared
         assert!(cache.get_tokens_if_valid(&uri, "test-id").is_none());
+        assert!(cache.get_wire_tokens_if_valid(&uri, "wire-id").is_none());
         assert!(cache.get_injections(&uri).is_none());
+    }
+
+    #[test]
+    fn native_and_wire_semantic_baselines_are_independent() {
+        let cache = CacheCoordinator::new();
+        let uri = create_test_uri("layered.rs");
+        let identity = SemanticSnapshotIdentity {
+            parsed_version: 1,
+            incarnation: 2,
+            generation: 3,
+        };
+        let tokens = |result_id: &str, token_type| SemanticTokens {
+            result_id: Some(result_id.to_string()),
+            data: vec![SemanticToken {
+                delta_line: 0,
+                delta_start: 0,
+                length: 5,
+                token_type,
+                token_modifiers_bitset: 0,
+            }],
+        };
+
+        cache.store_tokens(
+            uri.clone(),
+            tokens("native", 1),
+            "rust".to_string(),
+            4,
+            identity,
+        );
+        cache.store_wire_tokens(
+            uri.clone(),
+            tokens("wire", 17),
+            "rust".to_string(),
+            4,
+            identity,
+        );
+
+        assert_eq!(
+            cache
+                .get_tokens_if_valid(&uri, "native")
+                .expect("native baseline")
+                .data[0]
+                .token_type,
+            1
+        );
+        assert_eq!(
+            cache
+                .get_wire_tokens_if_valid(&uri, "wire")
+                .expect("wire baseline")
+                .data[0]
+                .token_type,
+            17
+        );
+        assert!(cache.get_tokens_if_valid(&uri, "wire").is_none());
+        assert!(cache.get_wire_tokens_if_valid(&uri, "native").is_none());
     }
 
     #[test]
