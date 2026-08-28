@@ -140,6 +140,22 @@ pub(crate) async fn create_handle_with_key(
     create_handle_with_state_and_pid_keyed(state, key).await.0
 }
 
+pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_symbols(
+    key: ConnectionKey,
+) -> Arc<ConnectionHandle> {
+    use tower_lsp_server::ls_types::{OneOf, ServerCapabilities, WorkspaceSymbolOptions};
+
+    let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+    handle.set_server_capabilities(ServerCapabilities {
+        workspace_symbol_provider: Some(OneOf::Right(WorkspaceSymbolOptions {
+            resolve_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
+        ..Default::default()
+    });
+    handle
+}
+
 pub(in crate::lsp::bridge) async fn create_handle_accepting_textless_did_save(
     key: ConnectionKey,
 ) -> Arc<ConnectionHandle> {

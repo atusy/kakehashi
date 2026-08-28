@@ -1,7 +1,9 @@
 //! `workspace/symbol` search and `workspaceSymbol/resolve` routing.
 
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse};
+use tower_lsp_server::ls_types::{
+    SymbolTag, WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+};
 
 use super::super::Kakehashi;
 
@@ -19,7 +21,7 @@ impl Kakehashi {
             .and_then(|capabilities| capabilities.workspace.as_ref())
             .and_then(|workspace| workspace.symbol.as_ref())
             .and_then(|symbol| symbol.tag_support.as_ref())
-            .is_some();
+            .is_some_and(|support| support.value_set.contains(&SymbolTag::DEPRECATED));
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let pool = self.bridge.pool_arc();
         let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
