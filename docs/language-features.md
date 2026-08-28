@@ -685,13 +685,26 @@ type CapturesDelta = {
   beyond `[A-Za-z0-9_-]+`) is a client error, returned as JSON-RPC
   `InvalidParams`.
 
+## Workspace symbols
+
+`workspace/symbol` searches every configured, runnable language server in the
+client workspace, including servers that have not yet been started by opening a
+document. Results from all capable servers are combined in stable server-name
+order. Legacy `SymbolInformation` results are normalized to `WorkspaceSymbol`.
+
+When a downstream server supports `workspaceSymbol/resolve`, returned symbols
+carry opaque routing data so a later resolve reaches the same downstream
+process. The server's original `data` is preserved inside that envelope. If the
+producing process has been replaced or its configuration was removed, resolve
+fails soft by returning the unresolved symbol unchanged.
+
+Partial-result and work-done tokens are not forwarded because one client token
+cannot identify several downstream producers; the client receives one final
+aggregate response.
+
 ---
 
-## Not currently provided
-
-kakehashi does not yet provide these LSP features:
-
-- Workspace symbol search (`workspace/symbol`)
+## Current limitations
 
 (The static code-action and execute-command providers are advertised only to
 clients with `codeActionLiteralSupport`. Palette command names are registered
