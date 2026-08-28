@@ -424,7 +424,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | diagnostics | ✅ Implemented | Push + pull with host translation |
 | semanticTokens/range | ✅ Implemented | Injection-contained requests use preferred virt/host/native layers; downstream legends and coordinates are translated, invalid tokens drop |
 | semanticTokens/full | ✅ Implemented | Current native baseline plus synchronous host/virt overlay; higher-priority spans replace overlaps and uncovered native spans remain |
-| semanticTokens/full/delta | ❌ Not bridged | Delta baselines can contain bridged full tokens, but downstream delta requests are not yet fetched |
+| semanticTokens/full/delta | ❌ Not bridged | A full request that attempts any bridge layer omits `resultId`, so its merged result cannot become a delta baseline; native-only full results retain their existing delta lineage |
 
 ### Original Implementation Priority
 
