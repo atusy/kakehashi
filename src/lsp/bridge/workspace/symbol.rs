@@ -2,6 +2,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,9 @@ use crate::config::settings::WorkspaceSettings;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::ConnectionKey;
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionState, LanguageServerPool, UpstreamId};
+use crate::lsp::bridge::pool::{
+    ConnectionHandle, ConnectionState, INIT_TIMEOUT_SECS, LanguageServerPool, UpstreamId,
+};
 use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
 
 const SYMBOL_METHOD: &str = "workspace/symbol";
@@ -193,7 +196,13 @@ impl LanguageServerPool {
             let upstream_id = upstream_id.clone();
             async move {
                 let handle = self
-                    .get_or_create_connection_admitted(&name, &config, None, admit)
+                    .get_or_create_connection_wait_ready_admitted(
+                        &name,
+                        &config,
+                        None,
+                        Duration::from_secs(INIT_TIMEOUT_SECS),
+                        admit,
+                    )
                     .await
                     .ok()?;
                 if !handle.has_capability(SYMBOL_METHOD) {
@@ -406,7 +415,9 @@ impl LanguageServerPool {
 mod tests {
     use super::*;
     use crate::lsp::bridge::pool::test_helpers::{
-        create_handle_advertising_workspace_symbols, create_handle_with_key,
+        create_handle_advertising_workspace_symbols,
+        create_handle_advertising_workspace_symbols_with_state, create_handle_with_key,
+        transition_handle_to_ready,
     };
     use crate::lsp::bridge::protocol::RequestId;
     use std::str::FromStr;
@@ -807,6 +818,73 @@ mod tests {
 
         let error = request.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn search_waits_for_an_existing_initializing_producer() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("symbols");
+        let producer = create_handle_advertising_workspace_symbols_with_state(
+            ConnectionState::Initializing,
+            key.clone(),
+        )
+        .await;
+        pool.connections().await.insert(key, Arc::clone(&producer));
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "symbols".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-symbols".into()]),
+                languages: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
+            "query": "initializing"
+        }))
+        .unwrap();
+        let pool_for_request = Arc::clone(&pool);
+        let request = tokio::spawn(async move {
+            pool_for_request
+                .dispatch_workspace_symbol(params, &settings, None, true, &|| true)
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !request.is_finished(),
+            "search must wait through initialization"
+        );
+        assert!(transition_handle_to_ready(&producer));
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !producer.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("search is sent after initialization");
+        let _ = producer.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": [{
+                "name": "ready",
+                "kind": 12,
+                "location": {
+                    "uri": "file:///workspace/main.rs",
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 5 }
+                    }
+                }
+            }]
+        }));
+
+        assert!(matches!(
+            request.await.unwrap(),
+            Some(WorkspaceSymbolResponse::Nested(symbols)) if symbols.len() == 1
+        ));
     }
 
     #[cfg(unix)]
