@@ -19,6 +19,7 @@
 //! `None` is preserved as a distinct "no folders / answer `null`" state, not
 //! collapsed into an empty list, matching the pre-#391 behavior.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tower_lsp_server::ls_types::WorkspaceFolder;
@@ -30,6 +31,7 @@ use crate::error::LockResultExt;
 #[derive(Clone)]
 pub(crate) struct WorkspaceFolderSet {
     inner: Arc<Mutex<Option<Vec<WorkspaceFolder>>>>,
+    generation: Arc<AtomicU64>,
 }
 
 impl WorkspaceFolderSet {
@@ -38,6 +40,7 @@ impl WorkspaceFolderSet {
     pub(crate) fn new(initial: Option<Vec<WorkspaceFolder>>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Self::deduplicate(initial))),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -62,13 +65,22 @@ impl WorkspaceFolderSet {
             .clone()
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     /// Replace the complete set, preserving the protocol distinction between
     /// `None` (`null`) and `Some(vec![])` (an explicitly empty folder list).
     pub(crate) fn replace(&self, folders: Option<Vec<WorkspaceFolder>>) {
-        *self
+        let next = Self::deduplicate(folders);
+        let mut current = self
             .inner
             .lock()
-            .recover_poison("WorkspaceFolderSet::replace") = Self::deduplicate(folders);
+            .recover_poison("WorkspaceFolderSet::replace");
+        if *current != next {
+            *current = next;
+            self.generation.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Whether the set contains the same path-normalized root as `folder`.
@@ -98,12 +110,16 @@ impl WorkspaceFolderSet {
         if guard.is_none() && added.is_empty() {
             return;
         }
+        let before = guard.clone();
         let folders = guard.get_or_insert_with(Vec::new);
         folders.retain(|existing| !removed.iter().any(|item| item.uri == existing.uri));
         for folder in added {
             if !folders.iter().any(|existing| existing.uri == folder.uri) {
                 folders.push(folder);
             }
+        }
+        if *guard != before {
+            self.generation.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -148,6 +164,7 @@ impl WorkspaceFolderSet {
             // Materialize the `None` set into `Some` ONLY on a committed add, so
             // a failed announce leaves the "answer null" state untouched.
             guard.get_or_insert_with(Vec::new).push(folder);
+            self.generation.fetch_add(1, Ordering::Release);
             true
         } else {
             false
