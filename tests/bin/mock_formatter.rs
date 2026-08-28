@@ -561,6 +561,7 @@ fn main() {
                     }),
                     "workspace-diagnostic-alpha" | "workspace-diagnostic-zeta" => json!({
                         "diagnosticProvider": {
+                            "identifier": mode.as_str(),
                             "interFileDependencies": true,
                             "workspaceDiagnostics": true
                         },
@@ -1330,7 +1331,7 @@ fn main() {
                     .get("previousResultIds")
                     .and_then(Value::as_array)
                     .is_some_and(Vec::is_empty)
-                    && params.get("identifier").is_none()
+                    && params.get("identifier").and_then(Value::as_str) == Some(mode.as_str())
                     && params.get("partialResultToken").is_none_or(Value::is_null)
                     && params.get("workDoneToken").is_none_or(Value::is_null);
                 let message = if isolated {

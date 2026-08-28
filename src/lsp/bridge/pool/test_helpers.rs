@@ -200,6 +200,27 @@ pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_symbols_
     handle
 }
 
+pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_diagnostics(
+    key: ConnectionKey,
+    identifier: Option<&str>,
+) -> Arc<ConnectionHandle> {
+    use tower_lsp_server::ls_types::{
+        DiagnosticOptions, DiagnosticServerCapabilities, ServerCapabilities,
+    };
+
+    let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+    handle.set_server_capabilities(ServerCapabilities {
+        diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
+            identifier: identifier.map(str::to_owned),
+            inter_file_dependencies: true,
+            workspace_diagnostics: true,
+            work_done_progress_options: Default::default(),
+        })),
+        ..Default::default()
+    });
+    handle
+}
+
 pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_symbols_with_state(
     state: ConnectionState,
     key: ConnectionKey,
