@@ -40,6 +40,10 @@
 //!   tail ticket at `call` time and run only once that ticket is done, so a
 //!   request observes every edit that preceded it on the wire — without
 //!   serializing its computation against later edits or other documents.
+//! - **Workspace diagnostics** run one at a time in wire order. A downstream
+//!   producer can exit after its contribution is accepted and request a refresh
+//!   before that response reaches the socket; serializing a refresh-induced pull
+//!   behind the accepted handler keeps the newer response from overtaking it.
 //!
 //! Everything else passes through untouched.
 
@@ -295,6 +299,8 @@ enum Role {
     },
     /// Reads the document tree; waits for writers that preceded it.
     Reader { uri: String },
+    /// Produces a workspace-wide diagnostic snapshot; serialized globally.
+    WorkspaceDiagnostic,
 }
 
 /// Classify a request and extract its `textDocument.uri`, both synchronously.
@@ -328,6 +334,7 @@ enum Role {
 fn classify(req: &Request) -> Option<Role> {
     let method = req.method();
     match method {
+        "workspace/diagnostic" => Some(Role::WorkspaceDiagnostic),
         "textDocument/didSave" => {
             // Cleanup for a missing save is signalled by the typed handler.
             // Decode the complete params before issuing a ticket so malformed
@@ -431,6 +438,7 @@ pub(crate) fn normalize_uri(raw: &str) -> String {
 pub struct IngressOrderGate<S> {
     inner: S,
     sequencer: Arc<DocumentSequencer>,
+    workspace_diagnostic_sequencer: Arc<DocumentSequencer>,
 }
 
 impl<S> IngressOrderGate<S> {
@@ -438,6 +446,7 @@ impl<S> IngressOrderGate<S> {
         Self {
             inner,
             sequencer: Arc::new(DocumentSequencer::default()),
+            workspace_diagnostic_sequencer: Arc::new(DocumentSequencer::default()),
         }
     }
 }
@@ -463,6 +472,17 @@ where
         let inner_fut = self.inner.call(req);
         match role {
             None => Box::pin(inner_fut),
+            Some(Role::WorkspaceDiagnostic) => {
+                let mut gate = self
+                    .workspace_diagnostic_sequencer
+                    .issue_writer_ticket("workspace/diagnostic");
+                Box::pin(async move {
+                    gate.wait_turn().await;
+                    let result = inner_fut.await;
+                    drop(gate);
+                    result
+                })
+            }
             Some(Role::Writer {
                 uri,
                 close,
@@ -783,6 +803,11 @@ mod tests {
 
     #[test]
     fn classify_routes_methods() {
+        assert!(matches!(
+            classify(&notification("workspace/diagnostic", URI)),
+            Some(Role::WorkspaceDiagnostic)
+        ));
+
         let writer = classify(&notification("textDocument/didChange", URI));
         assert!(matches!(writer, Some(Role::Writer { close: false, .. })));
 
@@ -1040,8 +1065,9 @@ mod tests {
         fn call(&mut self, req: Request) -> Self::Future {
             let log = Arc::clone(&self.log);
             let label = mock_label(req.method());
-            if req.method() == self.stall_method {
-                let release = self.release.take().expect("one stalled call expected");
+            if req.method() == self.stall_method
+                && let Some(release) = self.release.take()
+            {
                 Box::pin(async move {
                     let _ = release.await;
                     log.lock().recover_poison("MockInner::call").push(label);
@@ -1087,6 +1113,36 @@ mod tests {
         assert_eq!(
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["change", "reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_serializes_workspace_diagnostic_responses() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "workspace/diagnostic",
+            release: Some(release_rx),
+        });
+
+        let first_fut = gate.call(notification("workspace/diagnostic", URI));
+        let second_fut = gate.call(notification("workspace/diagnostic", URI));
+        let mut first = tokio_test::task::spawn(first_fut);
+        let mut second = tokio_test::task::spawn(second_fut);
+
+        assert!(first.poll().is_pending());
+        assert!(
+            second.poll().is_pending(),
+            "a refresh-induced pull must not complete before the accepted response"
+        );
+        release_tx.send(()).expect("first pull is waiting");
+        assert!(first.poll().is_ready());
+        assert!(second.is_woken());
+        assert!(second.poll().is_ready());
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["reader", "reader"]
         );
     }
 
