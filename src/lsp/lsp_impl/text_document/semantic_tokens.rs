@@ -982,12 +982,23 @@ impl Kakehashi {
                 .pool_arc()
                 .servers_known_incapable(&candidates, METHOD)
                 .await;
+            let suppressed = ctx
+                .configs
+                .iter()
+                .filter(|config| {
+                    self.bridge
+                        .pool()
+                        .host_routing_by_server(uri, &config.server_name)
+                        == Some(false)
+                })
+                .map(|config| config.server_name.clone())
+                .collect::<std::collections::HashSet<_>>();
             if semantic_configs_select_servers(
                 &ctx.priorities,
                 &ctx.configs,
                 ctx.max_fan_out,
                 &incapable,
-                &std::collections::HashSet::new(),
+                &suppressed,
             ) {
                 return true;
             }
