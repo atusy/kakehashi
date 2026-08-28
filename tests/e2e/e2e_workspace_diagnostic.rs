@@ -1,5 +1,6 @@
 use crate::helpers::lsp_client::LspClient;
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 fn init_dynamic_workspace_diagnostic_client(
@@ -181,10 +182,16 @@ fn workspace_diagnostic_cancels_every_dynamic_provider_request() {
         init_dynamic_workspace_diagnostic_client("workspace-diagnostic-dynamic-cancel");
     let request_id =
         client.send_request_async("workspace/diagnostic", json!({ "previousResultIds": [] }));
+    let mut expected_cancel_ids = BTreeSet::new();
     for identifier in ["alpha", "zeta"] {
-        wait_for_file(&events.path().join(format!(
+        let request_event = events.path().join(format!(
             "workspace-diagnostic-dynamic-cancel.workspace-diagnostic-{identifier}.json"
-        )));
+        ));
+        wait_for_file(&request_event);
+        let request: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(request_event).expect("provider request event"))
+                .expect("provider request JSON");
+        expected_cancel_ids.insert(request["id"].to_string());
     }
 
     client.send_notification("$/cancelRequest", json!({ "id": request_id }));
@@ -196,6 +203,23 @@ fn workspace_diagnostic_cancels_every_dynamic_provider_request() {
         .join("workspace-diagnostic-dynamic-cancel.cancel.count");
     for _ in 0..200 {
         if std::fs::read_to_string(&cancel_count).ok().as_deref() == Some("2") {
+            let actual_cancel_ids = std::fs::read_dir(events.path())
+                .expect("cancel event directory")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("workspace-diagnostic-dynamic-cancel.cancel-id-")
+                })
+                .map(|entry| {
+                    let event: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(entry.path()).expect("cancel event"))
+                            .expect("cancel event JSON");
+                    event["params"]["id"].to_string()
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual_cancel_ids, expected_cancel_ids);
             return;
         }
         std::thread::sleep(Duration::from_millis(25));

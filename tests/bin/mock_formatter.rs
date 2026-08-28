@@ -835,6 +835,13 @@ fn main() {
             "$/cancelRequest" => {
                 record_mock_event(&mode, "cancel", &message);
                 if mode == "workspace-diagnostic-dynamic-cancel" {
+                    if let Some(id) = message.pointer("/params/id") {
+                        let id = match id {
+                            Value::String(id) => id.clone(),
+                            other => other.to_string(),
+                        };
+                        record_mock_event(&mode, &format!("cancel-id-{id}"), &message);
+                    }
                     increment_mock_event_count(&mode, "cancel");
                 }
             }
