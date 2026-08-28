@@ -384,6 +384,11 @@ impl LanguageServerPool {
                 "workspace diagnostic admission or provider plan expired after final aggregation",
             ));
         }
+        for (handle, _) in &provider_plans {
+            handle
+                .dynamic_capabilities()
+                .mark_workspace_diagnostic_contributed();
+        }
         Ok(result)
     }
 
@@ -1027,6 +1032,39 @@ mod tests {
             "the post-build admission fence must reject"
         );
         assert_eq!(checks.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn accepted_aggregation_marks_its_producer_as_contributing() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("diagnostics");
+        let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+        pool.connections()
+            .await
+            .insert(handle.key().clone(), Arc::clone(&handle));
+        let generation = pool.document_connection_generation(handle.key());
+        let virtual_uris =
+            Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
+
+        pool.aggregate_admitted_workspace_diagnostic_reports(
+            [std::future::ready(Some(CompletedDiagnosticProducer {
+                provider_plan: Vec::new(),
+                handle: Arc::clone(&handle),
+                generation,
+                report: WorkspaceDiagnosticReport::default(),
+                virtual_uris,
+            }))],
+            &|| true,
+        )
+        .await
+        .expect("accepted diagnostic aggregate");
+
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .has_workspace_diagnostic_contributed(),
+            "only an accepted contribution should arm the reader-exit refresh"
+        );
     }
 
     #[tokio::test]

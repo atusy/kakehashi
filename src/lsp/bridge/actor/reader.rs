@@ -377,6 +377,9 @@ impl Drop for ProgressPurgeGuard {
         if self
             .dynamic_capabilities
             .has_workspace_diagnostic_provider()
+            && self
+                .dynamic_capabilities
+                .has_workspace_diagnostic_contributed()
         {
             let _ = self
                 .upstream_tx
@@ -1595,6 +1598,7 @@ mod tests {
             progress_registry.register(conn, downstream_token.clone(), response_tx.clone());
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         dynamic_capabilities.set_static_workspace_diagnostic_provider(true);
+        dynamic_capabilities.mark_workspace_diagnostic_contributed();
 
         let handle = spawn_reader_task_for_server(
             reader,
@@ -1698,6 +1702,32 @@ mod tests {
         assert!(
             upstream_rx.try_recv().is_err(),
             "an unrelated server exit must not trigger a workspace diagnostic pull"
+        );
+    }
+
+    #[test]
+    fn unproductive_diagnostic_reader_exit_does_not_request_workspace_refresh() {
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let connection_id = progress_registry.new_connection_id();
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        dynamic_capabilities.set_static_workspace_diagnostic_provider(true);
+
+        drop(ProgressPurgeGuard {
+            registry: progress_registry,
+            connection_id,
+            upstream_tx,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            dynamic_capabilities,
+        });
+
+        assert!(matches!(
+            upstream_rx.try_recv(),
+            Ok(UpstreamNotification::EvictConnectionDiagnostics { .. })
+        ));
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "a diagnostic server that never completed a contribution must not create a refresh/respawn loop"
         );
     }
 
