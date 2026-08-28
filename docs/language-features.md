@@ -300,7 +300,8 @@ Returns monikers for the symbol under the cursor. Default combine strategy: `pre
 [`textDocument/diagnostic`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_diagnostic)
 (pull) and
 [`textDocument/publishDiagnostics`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_publishDiagnostics)
-(push)
+(push), and
+[`workspace/diagnostic`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_diagnostic)
 
 Reports errors and warnings from every embedded block, merged into the document.
 The default combine strategy here is **`concatenated`** (shared with code
@@ -316,6 +317,15 @@ pulled). When those cached pushes later answer a client PULL
 (`pushFallback`), only push-driven servers' slots fold in, under the
 cross-layer priorities/strategy only — server-level `priorities`/
 `maxFanOut` are not reapplied.
+
+Workspace diagnostic pulls start every explicitly configured, runnable server
+that supports them, including cold servers, and combine full reports for real
+workspace files. Equal-version reports for one URI are concatenated in stable
+server-name order; a higher document version replaces lower-version reports.
+Downstream result IDs, provider identifiers, and progress tokens are not shared
+across producers, so workspace pulls currently return full, non-streamed
+reports. Internal virtual-document reports are filtered: open embedded regions
+are already served through the range-aware `textDocument/diagnostic` path.
 
 ### Code actions
 
