@@ -134,7 +134,7 @@ impl Kakehashi {
         };
 
         // Get language for document
-        let Some(language_name) = self.document_language(&uri) else {
+        let Some(language_name) = self.document_bridge_language(&uri) else {
             return Ok(None);
         };
         let expected_settings_generation = self.cache.semantic_token_generation();
@@ -143,17 +143,19 @@ impl Kakehashi {
             layer_config.allows(LayerSource::Virt) || layer_config.allows(LayerSource::Native);
         let allows_host = layer_config.allows(LayerSource::Host);
         let host_attempted = layer_config.priorities.first() == Some(&LayerSource::Host);
+        let mut host_results = None;
         if host_attempted {
             let host = self
-                .selection_range_host_only(
+                .selection_range_host_pass(
                     &lsp_uri,
                     positions.clone(),
                     expected_settings_generation,
                 )
                 .await?;
-            if host.is_some() || !has_parse_layer {
-                return Ok(host);
+            if host.iter().all(Option::is_some) || !has_parse_layer {
+                return Ok(host.into_iter().collect());
             }
+            host_results = Some(host);
         } else if !has_parse_layer {
             return Ok(None);
         }
@@ -338,9 +340,14 @@ impl Kakehashi {
                 .unwrap_or(serde_json::Value::Null);
                 let virt =
                     self.selection_range_virt_layer(&lsp_uri, position, expected_incarnation);
+                let cached_host = host_results
+                    .as_ref()
+                    .and_then(|results| results.get(index))
+                    .cloned()
+                    .flatten();
                 let host = async {
                     if host_attempted {
-                        Ok(None)
+                        Ok(cached_host)
                     } else {
                         self.selection_range_host_layer(
                             &lsp_uri,
@@ -395,8 +402,21 @@ impl Kakehashi {
         positions: Vec<Position>,
         expected_settings_generation: u64,
     ) -> Result<Option<Vec<SelectionRange>>> {
+        Ok(self
+            .selection_range_host_pass(lsp_uri, positions, expected_settings_generation)
+            .await?
+            .into_iter()
+            .collect())
+    }
+
+    async fn selection_range_host_pass(
+        &self,
+        lsp_uri: &Uri,
+        positions: Vec<Position>,
+        expected_settings_generation: u64,
+    ) -> Result<Vec<Option<SelectionRange>>> {
         let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
-            return Ok(None);
+            return Ok(vec![None; positions.len()]);
         };
         let expected_incarnation = ctx.incarnation;
         let expected_version = ctx.content_version;
@@ -429,7 +449,7 @@ impl Kakehashi {
                     expected_incarnation,
                     expected_version,
                 );
-                let Some(selection) = self
+                let selection = self
                     .walk_layer_futures(
                         lsp_uri,
                         METHOD,
@@ -439,13 +459,10 @@ impl Kakehashi {
                         std::future::ready(Ok(None)),
                         |_| true,
                     )
-                    .await?
-                else {
-                    return Ok(None);
-                };
+                    .await?;
                 selected.push(selection);
             }
-            Ok(Some(selected))
+            Ok(selected)
         };
         let selected = tokio::select! {
             biased;

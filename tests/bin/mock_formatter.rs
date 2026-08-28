@@ -396,6 +396,7 @@ fn main() {
                     "selection-range-host"
                     | "selection-range-virt"
                     | "selection-range-empty"
+                    | "selection-range-mixed-empty"
                     | "selection-range-delayed" => json!({
                         "selectionRangeProvider": true,
                         "textDocumentSync": 1
@@ -1793,17 +1794,19 @@ fn main() {
                 if mode == "selection-range-delayed" {
                     wait_for_mock_release(&mode);
                 }
-                let result = (mode != "selection-range-empty")
-                    .then(|| {
-                        message
-                            .pointer("/params/textDocument/uri")
-                            .and_then(Value::as_str)
-                            .filter(|uri| documents.contains_key(*uri))
-                            .and_then(|_| message.pointer("/params/positions/0"))
-                            .map(|position| {
-                                let line = position["line"].as_u64().unwrap_or(0);
-                                let character = position["character"].as_u64().unwrap_or(0);
-                                json!([{
+                let result =
+                    (mode != "selection-range-empty")
+                        .then(|| {
+                            message
+                                .pointer("/params/textDocument/uri")
+                                .and_then(Value::as_str)
+                                .filter(|uri| documents.contains_key(*uri))
+                                .and_then(|_| message.pointer("/params/positions/0"))
+                                .and_then(|position| {
+                                    let line = position["line"].as_u64().unwrap_or(0);
+                                    let character = position["character"].as_u64().unwrap_or(0);
+                                    (mode != "selection-range-mixed-empty" || character != 1)
+                                    .then(|| json!([{
                                     "range": {
                                         "start": { "line": line, "character": character },
                                         "end": { "line": line, "character": character + 1 }
@@ -1814,11 +1817,11 @@ fn main() {
                                             "end": { "line": line, "character": 4 }
                                         }
                                     }
-                                }])
-                            })
-                    })
-                    .flatten()
-                    .unwrap_or(Value::Null);
+                                }]))
+                                })
+                        })
+                        .flatten()
+                        .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }
             "documentLink/resolve" => {
