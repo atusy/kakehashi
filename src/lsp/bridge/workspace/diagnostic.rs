@@ -284,11 +284,15 @@ impl LanguageServerPool {
         &self,
         requests: impl IntoIterator<Item = F>,
         admit: &(dyn Fn() -> bool + Sync),
-    ) -> WorkspaceDiagnosticReportResult
+    ) -> io::Result<WorkspaceDiagnosticReportResult>
     where
         F: Future<Output = Option<CompletedDiagnosticProducer>>,
     {
-        let reports: Vec<_> = join_all(requests).await.into_iter().flatten().collect();
+        let reports = join_all(requests)
+            .await
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| io::Error::other("workspace diagnostic producer set was incomplete"))?;
         self.aggregate_admitted_completed_workspace_diagnostic_reports(reports, admit)
             .await
     }
@@ -297,27 +301,45 @@ impl LanguageServerPool {
         &self,
         reports: impl IntoIterator<Item = CompletedDiagnosticProducer>,
         admit: &(dyn Fn() -> bool + Sync),
-    ) -> WorkspaceDiagnosticReportResult {
+    ) -> io::Result<WorkspaceDiagnosticReportResult> {
         let connections = self.connections().await;
         if !admit() {
-            return aggregate_reports(std::iter::empty());
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "workspace diagnostic admission expired before final aggregation",
+            ));
         }
-        let admitted: Vec<_> = reports
+        let admitted = reports
             .into_iter()
-            .filter(|completed| {
+            .map(|completed| {
                 let key = completed.handle.key();
-                connections.get(key).is_some_and(|live| {
-                    Arc::ptr_eq(live, &completed.handle)
-                        && live.state() == ConnectionState::Ready
-                        && self.document_connection_generation(key) == completed.generation
-                })
+                connections
+                    .get(key)
+                    .is_some_and(|live| {
+                        Arc::ptr_eq(live, &completed.handle)
+                            && live.state() == ConnectionState::Ready
+                            && self.document_connection_generation(key) == completed.generation
+                    })
+                    .then_some(completed)
             })
-            .collect();
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "workspace diagnostic producer changed before final aggregation",
+                )
+            })?;
         drop(connections);
+        if !admit() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "workspace diagnostic admission expired during final aggregation",
+            ));
+        }
         let reports = admitted
             .into_iter()
             .map(|completed| sanitize_report(completed.report, &completed.virtual_uris));
-        aggregate_reports(reports)
+        Ok(aggregate_reports(reports))
     }
 
     async fn workspace_diagnostic_producer_is_live(
@@ -342,7 +364,10 @@ impl LanguageServerPool {
         request_workspace_generation: u64,
     ) -> io::Result<WorkspaceDiagnosticReportResult> {
         if request_workspace_generation & 1 != 0 {
-            return Ok(aggregate_reports(std::iter::empty()));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "workspace diagnostic snapshot is not stable",
+            ));
         }
         // Provider result IDs, identifiers, and progress tokens are scoped to
         // one server. The bridge aggregates several producers into one full
@@ -456,9 +481,8 @@ impl LanguageServerPool {
         let workspace_admit =
             || admit() && self.workspace_generation() == request_workspace_generation;
         let reports = collect_complete_server_contributions(join_all(requests).await)?;
-        Ok(self
-            .aggregate_admitted_completed_workspace_diagnostic_reports(reports, &workspace_admit)
-            .await)
+        self.aggregate_admitted_completed_workspace_diagnostic_reports(reports, &workspace_admit)
+            .await
     }
 
     async fn send_workspace_diagnostic_request(
@@ -792,10 +816,7 @@ mod tests {
         admitted.store(false, Ordering::SeqCst);
         release_slow.send(()).unwrap();
 
-        let WorkspaceDiagnosticReportResult::Report(report) = request.await.unwrap() else {
-            panic!("full report")
-        };
-        assert!(report.items.is_empty());
+        assert!(request.await.unwrap().is_err());
     }
 
     #[tokio::test]
@@ -859,7 +880,8 @@ mod tests {
         virtual_uris.insert(leaked_uri.into());
         release_slow.send(()).unwrap();
 
-        let WorkspaceDiagnosticReportResult::Report(report) = request.await.unwrap() else {
+        let WorkspaceDiagnosticReportResult::Report(report) = request.await.unwrap().unwrap()
+        else {
             panic!("full report")
         };
         assert!(
@@ -869,7 +891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_aggregation_discards_a_replaced_producer() {
+    async fn final_aggregation_rejects_a_replaced_producer() {
         let pool = LanguageServerPool::new();
         let stale_key = ConnectionKey::for_server("alpha");
         let live_key = ConnectionKey::for_server("zeta");
@@ -911,14 +933,7 @@ mod tests {
                 &|| true,
             )
             .await;
-        let WorkspaceDiagnosticReportResult::Report(report) = result else {
-            panic!("full report")
-        };
-        assert_eq!(report.items.len(), 1);
-        let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
-            panic!("full report")
-        };
-        assert_eq!(report.uri.as_str(), "file:///workspace/live.rs");
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1747,7 +1762,7 @@ mod tests {
             "previousResultIds": []
         }))
         .unwrap();
-        let response = pool
+        let error = pool
             .dispatch_workspace_diagnostic(
                 params,
                 &settings,
@@ -1756,11 +1771,8 @@ mod tests {
                 pool.workspace_generation(),
             )
             .await
-            .unwrap();
-        assert_eq!(
-            response,
-            WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport::default())
-        );
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(
             !producer.router().is_sent(RequestId::new(2)),
             "an in-progress workspace snapshot must not reach the wire"
