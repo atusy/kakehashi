@@ -443,6 +443,48 @@ impl Kakehashi {
         params: SemanticTokensParams,
         tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
     ) -> Result<Option<SemanticFullComputation>> {
+        let uri = uri_to_url(&params.text_document.uri).ok();
+        let absent_identity = uri.as_ref().and_then(|uri| {
+            let view = self.documents.latest_snapshot(uri)?;
+            view.slot.snapshot.is_none().then_some((
+                view.slot.current_incarnation,
+                view.content_version,
+                self.cache.semantic_token_generation(),
+            ))
+        });
+        let retry_params = params.clone();
+        let retry_tracking = tracking.clone();
+        let outcome = self
+            .semantic_tokens_full_impl_with_tracking_once(params, tracking)
+            .await?;
+        if outcome.is_some() {
+            return Ok(outcome);
+        }
+        let retry_after_snapshot_publication = uri.as_ref().is_some_and(|uri| {
+            absent_identity.is_some_and(|(incarnation, content_version, generation)| {
+                self.cache.semantic_token_generation() == generation
+                    && self.documents.latest_snapshot(uri).is_some_and(|view| {
+                        view.slot.current_incarnation == incarnation
+                            && view.content_version == content_version
+                            && view.slot.snapshot.is_some()
+                    })
+                    && retry_tracking.as_ref().is_none_or(|(request_id, cancel)| {
+                        !cancel.is_cancelled() && self.cache.is_request_active(uri, *request_id)
+                    })
+            })
+        });
+        if !retry_after_snapshot_publication {
+            return Ok(None);
+        }
+        self.semantic_tokens_full_impl_with_tracking_once(retry_params, retry_tracking)
+            .await
+    }
+
+    async fn semantic_tokens_full_impl_with_tracking_once(
+        &self,
+        params: SemanticTokensParams,
+        tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
+    ) -> Result<Option<SemanticFullComputation>> {
         const METHOD: &str = "textDocument/semanticTokens/full";
         let lsp_uri = params.text_document.uri.clone();
         let Ok(uri) = uri_to_url(&lsp_uri) else {
