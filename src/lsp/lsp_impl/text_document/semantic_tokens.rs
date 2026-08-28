@@ -1450,6 +1450,14 @@ impl Kakehashi {
             );
             return Ok(None);
         };
+        let Some(commit_identity) = self
+            .documents
+            .get(&uri)
+            .map(|document| (document.incarnation(), document.content_version()))
+        else {
+            return Ok(None);
+        };
+        let commit_generation = self.cache.semantic_token_generation();
         let upstream_id = current_upstream_id();
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let (request_id, cancel_token) = self.cache.start_request(&uri);
@@ -1482,7 +1490,45 @@ impl Kakehashi {
                 }
             }
         };
-        if let Ok(Some(computed)) = &mut outcome
+        let edit_lock = self.documents.edit_lock(&uri);
+        let commit_guard = if matches!(outcome, Ok(Some(_))) {
+            let lock = edit_lock.lock();
+            match cancel_rx.as_mut() {
+                Some(cancel_rx) => tokio::select! {
+                    biased;
+                    _ = cancel_rx => {
+                        cancel_token.cancel();
+                        outcome = Err(Error::request_cancelled());
+                        None
+                    }
+                    _ = cancel_token.cancelled() => {
+                        outcome = Ok(None);
+                        None
+                    }
+                    guard = lock => Some(guard),
+                },
+                None => tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        outcome = Ok(None);
+                        None
+                    }
+                    guard = lock => Some(guard),
+                },
+            }
+        } else {
+            None
+        };
+        let document_current = self.cache.semantic_token_generation() == commit_generation
+            && self.documents.get(&uri).is_some_and(|document| {
+                document.incarnation() == commit_identity.0
+                    && document.content_version() == commit_identity.1
+            });
+        if commit_guard.is_some() && !document_current && matches!(outcome, Ok(Some(_))) {
+            outcome = Ok(None);
+        }
+        if commit_guard.is_some()
+            && let Ok(Some(computed)) = &mut outcome
             && self
                 .cache
                 .with_active_request(&uri, request_id, || {
