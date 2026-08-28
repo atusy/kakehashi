@@ -336,10 +336,10 @@ mod tests {
             ],
         };
         let response = json!({ "result": { "data": [
+            0, 0, 4, 0, 5,
             0, 0, 4, 2, 5,
             1, 0, 4, 1, 1,
-            0, 999, 1, 1, 0,
-            1, 0, 1, 0, 0
+            0, 999, 1, 1, 0
         ] } });
         let tokens = transform_semantic_tokens_response_to_host(
             response,
