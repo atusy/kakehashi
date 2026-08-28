@@ -20,7 +20,7 @@ use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::injection::effective_offset_for_pattern;
 use crate::language::injection::{
     self, InjectionOffset, compute_included_ranges, compute_included_ranges_clipped,
-    has_include_children_for_pattern, parse_with_ranges,
+    has_include_children_for_pattern, parse_with_ranges_cancellable,
 };
 use crate::text::{PositionMapper, ceil_char_boundary, floor_char_boundary};
 
@@ -129,12 +129,13 @@ fn effective_window_for(
 fn parse_with_included_ranges(
     parser: &mut Parser,
     text: &str,
-    content_text: &str,
     content_node: &Node,
     effective_window: std::ops::Range<usize>,
     include_children: bool,
     lang_name: &str,
+    cancel_token: &crate::cancel::CancelToken,
 ) -> Option<Tree> {
+    let content_text = &text[effective_window.clone()];
     // The offset-free window equals the node span; the node-anchored variant
     // then gives the same gaps while reusing tree-sitter's cached node Points
     // instead of scanning text for the window's Points.
@@ -144,12 +145,13 @@ fn parse_with_included_ranges(
         compute_included_ranges_clipped(content_node, include_children, text, effective_window)
     };
 
-    parse_with_ranges(
+    parse_with_ranges_cancellable(
         parser,
         content_text,
         included_ranges.as_deref(),
         "kakehashi::selection",
         lang_name,
+        Some(cancel_token),
     )
 }
 
@@ -163,7 +165,11 @@ pub fn build(
     doc_ctx: &DocumentContext,
     inj_ctx: &mut InjectionContext,
     cursor_byte: usize,
+    cancel_token: &crate::cancel::CancelToken,
 ) -> SelectionRange {
+    if cancel_token.is_cancelled() {
+        return build_from_node(node, doc_ctx.mapper);
+    }
     let injection_query = inj_ctx.injection_query(doc_ctx.base_language);
     let injection_query_ref = injection_query.as_ref().map(|q| q.as_ref());
 
@@ -178,6 +184,9 @@ pub fn build(
     let Some((hierarchy, content_node, pattern_index, offset_from_query)) = injection_info else {
         return build_from_node(node, doc_ctx.mapper);
     };
+    if cancel_token.is_cancelled() {
+        return build_from_node(node, doc_ctx.mapper);
+    }
 
     if hierarchy.len() < 2 {
         return build_from_node(node, doc_ctx.mapper);
@@ -216,15 +225,19 @@ pub fn build(
     let Some(injected_tree) = parse_with_included_ranges(
         &mut parser,
         doc_ctx.text,
-        content_text,
         &content_node,
         effective_window,
         include_children,
         injected_lang,
+        cancel_token,
     ) else {
         inj_ctx.release_parser(injected_lang.to_string(), parser);
         return build_fallback();
     };
+    if cancel_token.is_cancelled() {
+        inj_ctx.release_parser(injected_lang.to_string(), parser);
+        return build_fallback();
+    }
 
     let relative_byte = cursor_byte.saturating_sub(effective_start_byte);
     let injected_root = injected_tree.root_node();
@@ -270,6 +283,7 @@ pub fn build(
                     inj_ctx,
                     relative_byte,
                     effective_start_byte,
+                    cancel_token,
                 )
             } else {
                 build_from_node_in_injection(injected_node, effective_start_byte, doc_ctx.mapper)
@@ -302,7 +316,11 @@ fn build_nested_injection(
     inj_ctx: &mut InjectionContext,
     cursor_byte: usize,
     parent_start_byte: usize,
+    cancel_token: &crate::cancel::CancelToken,
 ) -> SelectionRange {
+    if cancel_token.is_cancelled() {
+        return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
+    }
     if inj_ctx.increment_depth().is_none() {
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     }
@@ -318,6 +336,9 @@ fn build_nested_injection(
     let Some((hierarchy, content_node, pattern_index, offset)) = injection_info else {
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     };
+    if cancel_token.is_cancelled() {
+        return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
+    }
 
     if hierarchy.len() < 2 {
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
@@ -342,15 +363,19 @@ fn build_nested_injection(
     let Some(nested_tree) = parse_with_included_ranges(
         &mut nested_parser,
         text,
-        nested_text,
         &content_node,
         nested_window,
         include_children,
         &nested_lang,
+        cancel_token,
     ) else {
         inj_ctx.release_parser(nested_lang.to_string(), nested_parser);
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     };
+    if cancel_token.is_cancelled() {
+        inj_ctx.release_parser(nested_lang.to_string(), nested_parser);
+        return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
+    }
 
     // Relative to the snapped window start so it stays consistent with the
     // sliced `nested_text`.
@@ -380,6 +405,7 @@ fn build_nested_injection(
             inj_ctx,
             nested_relative_byte,
             nested_effective_start_byte,
+            cancel_token,
         )
     } else {
         build_from_node_in_injection(nested_node, nested_effective_start_byte, doc_ctx.mapper)
@@ -606,14 +632,15 @@ mod tests {
         rust_parser
             .set_language(&rust_language)
             .expect("set rust language");
+        let cancel_token = crate::cancel::CancelToken::default();
         let tree = parse_with_included_ranges(
             &mut rust_parser,
             text,
-            content_text,
             &content_node,
             effective.start..effective.end,
             regions[0].include_children,
             "rust",
+            &cancel_token,
         )
         .expect("parse injected content");
 

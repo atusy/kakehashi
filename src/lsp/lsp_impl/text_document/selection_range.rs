@@ -67,13 +67,17 @@ impl Kakehashi {
         &self,
         params: SelectionRangeParams,
     ) -> Result<Option<Vec<SelectionRange>>> {
+        let cancel_token = crate::cancel::CancelToken::default();
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(current_upstream_id().as_ref());
-        let request = self.selection_range_inner(params);
+        let request = self.selection_range_inner(params, cancel_token.clone());
         match cancel_rx {
             Some(mut cancel_rx) => {
                 tokio::select! {
                     biased;
-                    _ = &mut cancel_rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                    _ = &mut cancel_rx => {
+                        cancel_token.cancel();
+                        Err(tower_lsp_server::jsonrpc::Error::request_cancelled())
+                    },
                     result = request => result,
                 }
             }
@@ -84,6 +88,7 @@ impl Kakehashi {
     async fn selection_range_inner(
         &self,
         params: SelectionRangeParams,
+        cancel_token: crate::cancel::CancelToken,
     ) -> Result<Option<Vec<SelectionRange>>> {
         let lsp_uri = params.text_document.uri;
         let positions = params.positions;
@@ -179,9 +184,10 @@ impl Kakehashi {
         let language = std::sync::Arc::clone(&self.language);
         let native_positions = positions.clone();
         let native_snapshot = std::sync::Arc::clone(&snapshot);
+        let compute_cancel = cancel_token.clone();
         let result = self
             .compute_pool
-            .run(None, move || {
+            .run(Some(cancel_token), move || {
                 let mut pool = language.create_document_parser_pool();
                 handle_selection_range(
                     &native_snapshot.text,
@@ -190,6 +196,7 @@ impl Kakehashi {
                     &native_positions,
                     &language,
                     &mut pool,
+                    &compute_cancel,
                 )
             })
             .await;
