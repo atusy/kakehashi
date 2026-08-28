@@ -393,8 +393,15 @@ fn main() {
                         },
                         "textDocumentSync": 1
                     }),
-                    "selection-range-host" | "selection-range-virt" => json!({
+                    "selection-range-host"
+                    | "selection-range-virt"
+                    | "selection-range-empty"
+                    | "selection-range-delayed" => json!({
                         "selectionRangeProvider": true,
+                        "textDocumentSync": 1
+                    }),
+                    "selection-range-disabled" => json!({
+                        "selectionRangeProvider": false,
                         "textDocumentSync": 1
                     }),
                     "inlay-hint-resolve"
@@ -1779,27 +1786,37 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "textDocument/selectionRange" => {
-                let result = message
-                    .pointer("/params/textDocument/uri")
-                    .and_then(Value::as_str)
-                    .filter(|uri| documents.contains_key(*uri))
-                    .and_then(|_| message.pointer("/params/positions/0"))
-                    .map(|position| {
-                        let line = position["line"].as_u64().unwrap_or(0);
-                        let character = position["character"].as_u64().unwrap_or(0);
-                        json!([{
-                            "range": {
-                                "start": { "line": line, "character": character },
-                                "end": { "line": line, "character": character + 1 }
-                            },
-                            "parent": {
-                                "range": {
-                                    "start": { "line": line, "character": 0 },
-                                    "end": { "line": line, "character": 4 }
-                                }
-                            }
-                        }])
+                if mode.starts_with("selection-range-") {
+                    record_mock_event(&mode, "request", &message);
+                }
+                if mode == "selection-range-delayed" {
+                    wait_for_mock_release(&mode);
+                }
+                let result = (mode != "selection-range-empty")
+                    .then(|| {
+                        message
+                            .pointer("/params/textDocument/uri")
+                            .and_then(Value::as_str)
+                            .filter(|uri| documents.contains_key(*uri))
+                            .and_then(|_| message.pointer("/params/positions/0"))
+                            .map(|position| {
+                                let line = position["line"].as_u64().unwrap_or(0);
+                                let character = position["character"].as_u64().unwrap_or(0);
+                                json!([{
+                                    "range": {
+                                        "start": { "line": line, "character": character },
+                                        "end": { "line": line, "character": character + 1 }
+                                    },
+                                    "parent": {
+                                        "range": {
+                                            "start": { "line": line, "character": 0 },
+                                            "end": { "line": line, "character": 4 }
+                                        }
+                                    }
+                                }])
+                            })
                     })
+                    .flatten()
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }
