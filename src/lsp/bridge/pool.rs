@@ -3958,6 +3958,15 @@ impl LanguageServerPool {
                 return Ok(handle);
             }
             ConnectionAction::FailFast(err) => {
+                if err.is_initializing()
+                    && let (Some(on_acquired), Some(handle)) = (on_acquired, existing.cloned())
+                {
+                    // The detached handshake already owns this handle. Publish
+                    // acquisition ownership under the original pool lock so a
+                    // cancelled waiter cannot disappear before attaching its
+                    // cleanup guard.
+                    on_acquired(&handle);
+                }
                 // Log once when server is disabled due to repeated panics
                 if matches!(err, BridgeError::Disabled) {
                     log::error!(
@@ -9831,6 +9840,40 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(observed.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn acquisition_observer_sees_initializing_handle_under_the_original_lock() {
+        let pool = LanguageServerPool::new();
+        let config = devnull_config();
+        let key = ConnectionKey::for_server("observed-initializing");
+        let handle = create_handle_with_key(ConnectionState::Initializing, key.clone()).await;
+        handle.record_launch_config(&config);
+        pool.connections
+            .lock()
+            .await
+            .insert(key.clone(), Arc::clone(&handle));
+        let observed = std::sync::Mutex::new(Vec::new());
+        let on_acquired = |handle: &Arc<ConnectionHandle>| {
+            observed.lock().unwrap().push(Arc::clone(handle));
+        };
+
+        let result = pool
+            .get_or_create_connection_resolved(
+                "observed-initializing",
+                &config,
+                key,
+                None,
+                Duration::from_secs(1),
+                false,
+                None,
+                Some(&on_acquired),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(observed.lock().unwrap().len(), 1);
+        assert!(Arc::ptr_eq(&observed.lock().unwrap()[0], &handle));
     }
 
     /// Test that ensure_server_ready is idempotent - calling twice doesn't spawn a second server.

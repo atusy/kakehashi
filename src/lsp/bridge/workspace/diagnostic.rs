@@ -1144,6 +1144,14 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, key);
         }
         let response = response?;
+        if response_has_jsonrpc_error(&response, DIAGNOSTIC_METHOD) {
+            if let Some(error) =
+                crate::error::WorkspaceDiagnosticServerCancelled::from_response(&response)
+            {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, error));
+            }
+            return Ok(None);
+        }
         if !self
             .workspace_diagnostic_producer_is_live(handle, expected_generation)
             .await
@@ -1164,14 +1172,6 @@ impl LanguageServerPool {
                 io::ErrorKind::Interrupted,
                 "workspace diagnostic provider changed before response acceptance",
             ));
-        }
-        if response_has_jsonrpc_error(&response, DIAGNOSTIC_METHOD) {
-            if let Some(error) =
-                crate::error::WorkspaceDiagnosticServerCancelled::from_response(&response)
-            {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, error));
-            }
-            return Ok(None);
         }
         let Some(result) = response.get("result") else {
             return Err(io::Error::new(
@@ -2966,6 +2966,62 @@ mod tests {
 
         let error = request.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn sender_preserves_server_cancelled_after_producer_replacement() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("diagnostics");
+        let producer = create_handle_advertising_workspace_diagnostics(key.clone(), None).await;
+        pool.connections()
+            .await
+            .insert(key.clone(), Arc::clone(&producer));
+        let generation = pool.document_connection_generation(&key);
+        let pool_for_request = Arc::clone(&pool);
+        let producer_for_request = Arc::clone(&producer);
+        let request = tokio::spawn(async move {
+            pool_for_request
+                .send_workspace_diagnostic_request(
+                    &producer_for_request,
+                    generation,
+                    serde_json::json!({ "previousResultIds": [] }),
+                    None,
+                    DiagnosticProvider {
+                        identifier: None,
+                        has_static_provider: true,
+                        dynamic_registration_ids: vec![],
+                    },
+                    None,
+                    None,
+                )
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !producer.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace diagnostic reaches Sent state");
+
+        let replacement = create_handle_advertising_workspace_diagnostics(key.clone(), None).await;
+        pool.connections().await.insert(key, replacement);
+        let _ = producer.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {
+                "code": -32802,
+                "message": "retry after replacement",
+                "data": { "retriggerRequest": true }
+            }
+        }));
+
+        let error = request.await.unwrap().unwrap_err();
+        assert!(error.get_ref().is_some_and(|error| {
+            error.is::<crate::error::WorkspaceDiagnosticServerCancelled>()
+        }));
     }
 
     #[tokio::test]
