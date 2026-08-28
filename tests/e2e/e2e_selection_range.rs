@@ -722,6 +722,82 @@ enabled = true
 }
 
 #[test]
+fn e2e_virtual_selection_reuses_the_inflight_host_ancestor_request() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("selection_range_virt_host.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/selectionRange"]
+priorities = ["virt", "host"]
+
+[languages.markdown.bridge._self]
+enabled = true
+"#,
+    )
+    .expect("write config");
+    let events = tempfile::TempDir::new().expect("events");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("UTF-8 config path"))
+        .env("MOCK_LSP_CANCEL_DIR", events.path().to_string_lossy())
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-selection-range-virt": {
+                        "cmd": [mock_bin(), "selection-range-virt"],
+                        "languages": ["lua"]
+                    },
+                    "mock-selection-range-host": {
+                        "cmd": [mock_bin(), "selection-range-host"],
+                        "languages": ["markdown"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///selection_range_virt_host.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "```lua\ncode\n```\n"
+            }
+        }),
+    );
+    let request = json!({
+        "textDocument": { "uri": uri },
+        "positions": [{ "line": 1, "character": 1 }]
+    });
+    let _ = selection_range_when_parsed(&mut client, request.clone());
+    std::fs::write(
+        events.path().join("selection-range-host.request.count"),
+        b"0",
+    )
+    .expect("reset host request count");
+
+    let response = client.send_request("textDocument/selectionRange", request);
+    assert!(response["result"].is_array(), "{response:?}");
+    assert_eq!(
+        std::fs::read_to_string(events.path().join("selection-range-host.request.count"))
+            .expect("host request count")
+            .trim(),
+        "1",
+        "the host request raced for layer selection must be reused for ancestors"
+    );
+}
+
+#[test]
 fn e2e_empty_host_is_not_retried_before_native_fallback() {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir.path().join("selection_range_host_empty.toml");
