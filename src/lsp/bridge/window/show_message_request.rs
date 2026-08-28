@@ -53,7 +53,8 @@ pub(in crate::lsp::bridge) fn handle(
                     id,
                     jsonrpc::Error::invalid_params(format!("Invalid params: {e}")),
                 );
-                send_server_response(&response_tx, response, &server_prefix_owned, METHOD).await;
+                let _ = send_server_response(&response_tx, response, &server_prefix_owned, METHOD)
+                    .await;
             });
             return;
         }
@@ -85,7 +86,7 @@ pub(in crate::lsp::bridge) fn handle(
         let action = reply_rx.await.unwrap_or(None);
         let result = serde_json::to_value(action).unwrap_or(serde_json::Value::Null);
         let response = jsonrpc::Response::from_ok(response_id, result);
-        send_server_response(&response_tx, response, &server_prefix_owned, METHOD).await;
+        let _ = send_server_response(&response_tx, response, &server_prefix_owned, METHOD).await;
     });
 
     if deps
