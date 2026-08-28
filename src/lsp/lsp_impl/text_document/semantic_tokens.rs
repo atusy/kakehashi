@@ -393,16 +393,7 @@ impl Kakehashi {
         };
         let native_result_id = native_tokens.result_id.clone();
         let native_data = native_tokens.data;
-        let native_data_for_overlay = snapshot.as_ref().map_or_else(
-            || native_data.clone(),
-            |snapshot| {
-                crate::lsp::bridge::split_multiline_semantic_tokens(
-                    native_data.clone(),
-                    &snapshot.text,
-                )
-            },
-        );
-        let native_data_for_comparison = native_data_for_overlay.clone();
+        let native_data_for_comparison = native_data.clone();
         let expected = Some(snapshot.as_ref().map_or_else(
             || super::super::whole_document::WholeDocumentSnapshotIdentity {
                 incarnation: live_identity.0,
@@ -416,7 +407,7 @@ impl Kakehashi {
             },
         ));
         let expected_incarnation = Some(live_identity.0);
-        let native = std::future::ready(Ok(Some(native_data_for_overlay)));
+        let native = std::future::ready(Ok(Some(native_data)));
         let bridge_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let virt_bridge_attempted = std::sync::Arc::clone(&bridge_attempted);
 
@@ -509,12 +500,10 @@ impl Kakehashi {
             // result deliberately has no resultId until the delta handler owns
             // a distinct merged-wire baseline; otherwise a later native cache
             // hit would resurrect downstream tokens that a server removed.
-            let bridge_attempted = bridge_attempted.load(std::sync::atomic::Ordering::Acquire);
-            let (result_id, data) = if !bridge_attempted && data == native_data_for_comparison {
-                (native_result_id, native_data)
-            } else {
-                (None, data)
-            };
+            let result_id = (!bridge_attempted.load(std::sync::atomic::Ordering::Acquire)
+                && data == native_data_for_comparison)
+                .then_some(native_result_id)
+                .flatten();
             Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id,
                 data,

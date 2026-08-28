@@ -399,43 +399,6 @@ pub(crate) fn merge_semantic_token_layers(
     merge_semantic_token_layers_with_observer(higher, lower, || {})
 }
 
-/// Split document-aware multiline tokens into single-line fragments before
-/// overlaying bridge layers. LSP encodes a multiline token's length as UTF-16
-/// units across the covered text, including one unit per line break.
-pub(crate) fn split_multiline_semantic_tokens(
-    tokens: Vec<SemanticToken>,
-    text: &str,
-) -> Vec<SemanticToken> {
-    let lines = text
-        .split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line))
-        .collect::<Vec<_>>();
-    let mut fragments = Vec::with_capacity(tokens.len());
-    for (mut line, mut start, length, token_type, modifiers) in decode_absolute_tokens(tokens) {
-        let mut remaining = length;
-        while remaining > 0 {
-            let Some(line_text) = lines.get(line as usize) else {
-                break;
-            };
-            let line_length = line_text.encode_utf16().count() as u32;
-            let fragment_length = remaining.min(line_length.saturating_sub(start));
-            if fragment_length > 0 {
-                fragments.push((line, start, fragment_length, token_type, modifiers));
-                remaining -= fragment_length;
-            }
-            if remaining == 0 || line as usize + 1 >= lines.len() {
-                break;
-            }
-            // A multiline semantic-token length includes the intervening line
-            // break, which cannot itself be represented by a single-line token.
-            remaining = remaining.saturating_sub(1);
-            line += 1;
-            start = 0;
-        }
-    }
-    encode_absolute_tokens(fragments)
-}
-
 fn merge_semantic_token_layers_with_observer(
     higher: Vec<SemanticToken>,
     lower: Vec<SemanticToken>,
@@ -623,37 +586,6 @@ mod tests {
                     token_modifiers_bitset: 0,
                 },
             ]
-        );
-    }
-
-    #[test]
-    fn multiline_native_tokens_are_split_before_later_line_overlay() {
-        let native = split_multiline_semantic_tokens(
-            vec![SemanticToken {
-                delta_line: 0,
-                delta_start: 0,
-                length: 7,
-                token_type: 2,
-                token_modifiers_bitset: 0,
-            }],
-            "abc\ndef",
-        );
-        let higher = vec![SemanticToken {
-            delta_line: 1,
-            delta_start: 1,
-            length: 1,
-            token_type: 1,
-            token_modifiers_bitset: 0,
-        }];
-
-        assert_eq!(
-            merge_semantic_token_layers(higher, native),
-            encode_absolute_tokens(vec![
-                (0, 0, 3, 2, 0),
-                (1, 0, 1, 2, 0),
-                (1, 1, 1, 1, 0),
-                (1, 2, 1, 2, 0),
-            ])
         );
     }
 
