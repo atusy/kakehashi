@@ -66,6 +66,7 @@ fn normalize_position(text: &str, position: Position) -> Option<Position> {
 
 fn selection_chain_is_valid(selection: &SelectionRange, position: Position, text: &str) -> bool {
     let mapper = crate::text::PositionMapper::new(text);
+    let document_end = mapper.byte_to_position(text.len());
     let mut child = None;
     let mut current = Some(selection);
     while let Some(selection) = current {
@@ -81,7 +82,9 @@ fn selection_chain_is_valid(selection: &SelectionRange, position: Position, text
         }
         if child.is_none()
             && !((range.start == position && range.end == position)
-                || (range.start <= position && position < range.end))
+                || (range.start <= position
+                    && (position < range.end
+                        || (Some(position) == document_end && position == range.end))))
         {
             return false;
         }
@@ -971,5 +974,19 @@ mod tests {
             normalize_position("a\nb", Position::new(99, 99)),
             Some(Position::new(1, 1))
         );
+    }
+
+    #[test]
+    fn host_selection_range_accepts_a_nonempty_range_ending_at_requested_eof() {
+        let text = "abc";
+        let position = Position::new(0, 3);
+        let value = json!([{
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 3 }
+            }
+        }]);
+
+        assert!(parse_single_host_selection_range(value, position, text).is_some());
     }
 }
