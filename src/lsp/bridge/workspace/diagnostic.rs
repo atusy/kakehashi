@@ -388,6 +388,7 @@ mod tests {
     use crate::lsp::bridge::pool::test_helpers::{
         create_handle_advertising_workspace_diagnostics, create_handle_with_key,
     };
+    use crate::lsp::bridge::protocol::RequestId;
     use crate::lsp::bridge::protocol::VirtualDocumentUri;
 
     fn full(uri: &str, version: Option<i64>, message: &str) -> WorkspaceDocumentDiagnosticReport {
@@ -612,6 +613,50 @@ mod tests {
             panic!("full document report")
         };
         assert_eq!(report.full_document_diagnostic_report.items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sender_rejects_an_old_response_after_producer_replacement() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("diagnostics");
+        let producer = create_handle_advertising_workspace_diagnostics(key.clone(), None).await;
+        pool.connections()
+            .await
+            .insert(key.clone(), Arc::clone(&producer));
+        let generation = pool.document_connection_generation(&key);
+        let pool_for_request = Arc::clone(&pool);
+        let producer_for_request = Arc::clone(&producer);
+        let request = tokio::spawn(async move {
+            pool_for_request
+                .send_workspace_diagnostic_request(
+                    &producer_for_request,
+                    generation,
+                    serde_json::json!({ "previousResultIds": [] }),
+                    None,
+                    DiagnosticProvider::Static { identifier: None },
+                )
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !producer.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace diagnostic reaches Sent state");
+
+        let replacement = create_handle_advertising_workspace_diagnostics(key.clone(), None).await;
+        pool.connections().await.insert(key, replacement);
+        let _ = producer.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "items": [] }
+        }));
+
+        let error = request.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
     }
 
     #[test]
