@@ -29,6 +29,10 @@ impl HostSelectionPass {
     fn matches_snapshot(&self, incarnation: u64, content_version: u64) -> bool {
         self.incarnation == incarnation && self.content_version == content_version
     }
+
+    fn into_complete(self) -> Option<Vec<SelectionRange>> {
+        self.results.into_iter().collect()
+    }
 }
 
 fn parse_single_host_selection_range(
@@ -109,7 +113,7 @@ impl Drop for SelectionComputeCancelGuard {
 }
 
 async fn race_native_producer<T>(
-    native_producer: impl std::future::Future<Output = Result<bool>>,
+    native_producer: impl std::future::Future<Output = Result<()>>,
     layer_walk: impl std::future::Future<Output = Result<Option<T>>>,
 ) -> Result<Option<T>> {
     tokio::pin!(native_producer);
@@ -118,11 +122,8 @@ async fn race_native_producer<T>(
         biased;
         result = &mut layer_walk => result,
         produced = &mut native_producer => {
-            if !produced? {
-                Ok(None)
-            } else {
-                layer_walk.await
-            }
+            produced?;
+            layer_walk.await
         }
     }
 }
@@ -185,7 +186,7 @@ impl Kakehashi {
                 .await?;
             if let Some(host) = host {
                 if host.results.iter().all(Option::is_some) || !has_parse_layer {
-                    return Ok(host.results.into_iter().collect());
+                    return Ok(host.into_complete());
                 }
                 host_results = Some(host);
             } else if !has_parse_layer {
@@ -201,7 +202,9 @@ impl Kakehashi {
             .ensure_language_loaded_async(&language_name)
             .await;
         if !load_result.success {
-            return if allows_host {
+            return if let Some(host) = host_results.take() {
+                Ok(host.into_complete())
+            } else if allows_host {
                 self.selection_range_host_only(&lsp_uri, positions, expected_settings_generation)
                     .await
             } else {
@@ -245,7 +248,9 @@ impl Kakehashi {
                         // snapshot at all (first parse still running) → the
                         // pre-snapshot behavior: null.
                         Err(_elapsed) => {
-                            return if allows_host {
+                            return if let Some(host) = host_results.take() {
+                                Ok(host.into_complete())
+                            } else if allows_host {
                                 self.selection_range_host_only(
                                     &lsp_uri,
                                     positions,
@@ -269,7 +274,9 @@ impl Kakehashi {
         // the wait above breaks on that placeholder and answers `null` instead
         // of settling for its reparse (#923).
         if snapshot.tree.is_none() {
-            return if allows_host {
+            return if let Some(host) = host_results.take() {
+                Ok(host.into_complete())
+            } else if allows_host {
                 self.selection_range_host_only(&lsp_uri, positions, expected_settings_generation)
                     .await
             } else {
@@ -352,10 +359,11 @@ impl Kakehashi {
             }
             let result = result.unwrap_or_default();
             if result.len() != native_position_count {
-                return Ok(false);
+                let _ = native_tx.send(Some(std::sync::Arc::new(Vec::new())));
+                return Ok(());
             }
             let _ = native_tx.send(Some(std::sync::Arc::new(result)));
-            Ok(true)
+            Ok(())
         };
 
         // SelectionRange is position-aligned: choosing one winning layer for
@@ -464,7 +472,7 @@ impl Kakehashi {
         else {
             return Ok(None);
         };
-        Ok(pass.results.into_iter().collect())
+        Ok(pass.into_complete())
     }
 
     async fn selection_range_host_pass(
@@ -708,7 +716,7 @@ mod tests {
             let _drop_flag = DropFlag(producer_dropped);
             producer_started.notify_one();
             std::future::pending::<()>().await;
-            Ok(false)
+            Ok(())
         };
         let layer = async {
             started.notified().await;
@@ -720,6 +728,17 @@ mod tests {
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "a winning higher-priority layer must cancel its native competitor"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_native_producer_still_waits_for_a_bridge_layer() {
+        let native = std::future::ready(Ok(()));
+        let layer = async {
+            tokio::task::yield_now().await;
+            Ok(Some(7_u8))
+        };
+
+        assert_eq!(race_native_producer(native, layer).await.unwrap(), Some(7));
     }
 
     #[tokio::test]
@@ -762,6 +781,21 @@ mod tests {
         assert!(pass.matches_snapshot(4, 9));
         assert!(!pass.matches_snapshot(4, 10));
         assert!(!pass.matches_snapshot(5, 9));
+    }
+
+    #[test]
+    fn partial_host_pass_cannot_form_a_protocol_response() {
+        let selection = SelectionRange {
+            range: tower_lsp_server::ls_types::Range::new(Position::new(0, 0), Position::new(0, 1)),
+            parent: None,
+        };
+        let pass = HostSelectionPass {
+            results: vec![Some(selection), None],
+            incarnation: 1,
+            content_version: 1,
+        };
+
+        assert!(pass.into_complete().is_none());
     }
 
     #[tokio::test]
