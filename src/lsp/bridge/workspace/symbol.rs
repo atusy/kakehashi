@@ -200,7 +200,7 @@ impl LanguageServerPool {
             let params = params.clone();
             let upstream_id = upstream_id.clone();
             async move {
-                let handle = self
+                let (handle, workspace_generation) = self
                     .get_or_create_workspace_connection_wait_ready_admitted(
                         &name,
                         &config,
@@ -209,6 +209,8 @@ impl LanguageServerPool {
                     )
                     .await
                     .ok()?;
+                let workspace_admit =
+                    || admit() && self.workspace_generation() == workspace_generation;
                 if !handle.has_capability(SYMBOL_METHOD) {
                     return None;
                 }
@@ -222,7 +224,7 @@ impl LanguageServerPool {
                         upstream_id,
                         WorkspaceRequestFence {
                             expected_generation: Some(generation),
-                            admit: Some(admit),
+                            admit: Some(&workspace_admit),
                         },
                     )
                     .await
@@ -452,7 +454,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tower_lsp_server::ls_types::{
-        Location, Position, Range, SymbolKind, Uri, WorkspaceLocation,
+        Location, Position, Range, SymbolKind, Uri, WorkspaceFolder, WorkspaceLocation,
     };
 
     fn location() -> Location {
@@ -1074,6 +1076,136 @@ mod tests {
             "result": []
         }));
         assert!(request.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn search_does_not_trust_folders_unsupported_by_an_incapable_shared_producer() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let folder_a = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/a").unwrap(),
+            name: "a".into(),
+        };
+        let folder_b = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/b").unwrap(),
+            name: "b".into(),
+        };
+        pool.set_workspace_folders(Some(vec![folder_b.clone(), folder_a.clone()]));
+        seed_test_client_root(&pool, "file:///workspace/b");
+        let shared =
+            create_handle_advertising_workspace_symbols(ConnectionKey::shared("symbols")).await;
+        record_test_spawn_root(&shared, "file:///workspace/a");
+        shared
+            .workspace_folders()
+            .replace(Some(vec![folder_a, folder_b]));
+        let fallback =
+            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+        pool.connections().await.extend([
+            (shared.key().clone(), Arc::clone(&shared)),
+            (fallback.key().clone(), Arc::clone(&fallback)),
+        ]);
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "symbols".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-symbols".into()]),
+                languages: Some(Vec::new()),
+                prefer_shared_instance: Some(true),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
+            "query": "workspace"
+        }))
+        .unwrap();
+        let pool_for_request = Arc::clone(&pool);
+        let request = tokio::spawn(async move {
+            pool_for_request
+                .dispatch_workspace_symbol(params, &settings, None, true, &|| true)
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !fallback.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace search reaches the current client-root fallback");
+        assert!(
+            !shared.router().is_sent(request_id),
+            "an unsupported initialize folder snapshot does not prove workspace coverage"
+        );
+        let _ = fallback.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": []
+        }));
+        assert!(request.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn search_sender_rejects_workspace_change_after_producer_selection() {
+        let pool = Arc::new(LanguageServerPool::new());
+        seed_test_client_root(&pool, "file:///workspace");
+        let shared =
+            create_handle_advertising_workspace_symbols(ConnectionKey::shared("symbols")).await;
+        record_test_spawn_root(&shared, "file:///workspace");
+        pool.connections()
+            .await
+            .insert(shared.key().clone(), Arc::clone(&shared));
+        let config = crate::config::settings::BridgeServerConfig {
+            cmd: Some(vec!["mock-symbols".into()]),
+            languages: Some(Vec::new()),
+            prefer_shared_instance: Some(true),
+            ..Default::default()
+        };
+        let (producer, workspace_generation) = pool
+            .get_or_create_workspace_connection_wait_ready_admitted(
+                "symbols",
+                &config,
+                Duration::from_secs(1),
+                &|| true,
+            )
+            .await
+            .unwrap();
+        let generation = pool.document_connection_generation(producer.key());
+
+        assert!(
+            pool.apply_workspace_folder_change(
+                vec![WorkspaceFolder {
+                    uri: Uri::from_str("file:///replacement").unwrap(),
+                    name: "replacement".into(),
+                }],
+                &[],
+            )
+            .await
+        );
+        let workspace_admit = || pool.workspace_generation() == workspace_generation;
+        let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
+            "query": "stale workspace"
+        }))
+        .unwrap();
+        let error = pool
+            .send_workspace_request::<_, Value>(
+                &producer,
+                WorkspaceCapability::Search,
+                SYMBOL_METHOD,
+                params,
+                None,
+                WorkspaceRequestFence {
+                    expected_generation: Some(generation),
+                    admit: Some(&workspace_admit),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            !producer.router().is_sent(RequestId::new(2)),
+            "a stale workspace producer must be rejected before wire send"
+        );
     }
 
     #[cfg(unix)]
