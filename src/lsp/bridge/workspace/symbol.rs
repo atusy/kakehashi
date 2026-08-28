@@ -70,19 +70,72 @@ fn flatten_symbol(symbol: SymbolInformation) -> WorkspaceSymbol {
     }
 }
 
-fn normalize_response(response: WorkspaceSymbolResponse) -> Vec<WorkspaceSymbol> {
-    match response {
+fn normalize_response(
+    response: WorkspaceSymbolResponse,
+    supports_tags: bool,
+) -> Vec<WorkspaceSymbol> {
+    let mut symbols = match response {
         WorkspaceSymbolResponse::Flat(symbols) => symbols.into_iter().map(flatten_symbol).collect(),
         WorkspaceSymbolResponse::Nested(symbols) => symbols,
+    };
+    if !supports_tags {
+        for symbol in &mut symbols {
+            symbol.tags = None;
+        }
     }
+    symbols
+}
+
+#[derive(Clone, Copy)]
+enum WorkspaceCapability {
+    Search,
+    Resolve,
+}
+
+fn has_static_capability(handle: &ConnectionHandle, capability: WorkspaceCapability) -> bool {
+    matches!(
+        (handle.server_capabilities(), capability),
+        (
+            Some(tower_lsp_server::ls_types::ServerCapabilities {
+                workspace_symbol_provider: Some(OneOf::Left(true) | OneOf::Right(_)),
+                ..
+            }),
+            WorkspaceCapability::Search,
+        ) | (
+            Some(tower_lsp_server::ls_types::ServerCapabilities {
+                workspace_symbol_provider: Some(OneOf::Right(
+                    tower_lsp_server::ls_types::WorkspaceSymbolOptions {
+                        resolve_provider: Some(true),
+                        ..
+                    }
+                )),
+                ..
+            }),
+            WorkspaceCapability::Resolve,
+        )
+    )
 }
 
 impl LanguageServerPool {
+    async fn workspace_symbol_producer_is_live(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        expected_generation: u64,
+    ) -> bool {
+        let key = handle.key();
+        let connections = self.connections().await;
+        connections
+            .get(key)
+            .is_some_and(|live| Arc::ptr_eq(live, handle) && live.state() == ConnectionState::Ready)
+            && self.document_connection_generation(key) == expected_generation
+    }
+
     pub(crate) async fn dispatch_workspace_symbol(
         &self,
         mut params: WorkspaceSymbolParams,
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
+        supports_tags: bool,
     ) -> Option<WorkspaceSymbolResponse> {
         // A partial-result token cannot be shared by several downstream producers.
         // Return one deterministic aggregate in the final response instead.
@@ -119,10 +172,17 @@ impl LanguageServerPool {
                 let generation = self.document_connection_generation(handle.key());
                 let resolves = handle.has_capability(RESOLVE_METHOD);
                 let response = self
-                    .send_workspace_request(&handle, SYMBOL_METHOD, params, upstream_id)
+                    .send_workspace_request(
+                        &handle,
+                        WorkspaceCapability::Search,
+                        SYMBOL_METHOD,
+                        params,
+                        upstream_id,
+                        None,
+                    )
                     .await
                     .ok()??;
-                let mut symbols = normalize_response(response);
+                let mut symbols = normalize_response(response, supports_tags);
                 if resolves {
                     for symbol in &mut symbols {
                         let inner = symbol.data.take();
@@ -192,9 +252,11 @@ impl LanguageServerPool {
         match self
             .send_workspace_request::<_, WorkspaceSymbol>(
                 &handle,
+                WorkspaceCapability::Resolve,
                 RESOLVE_METHOD,
                 symbol.clone(),
                 upstream_id,
+                Some(envelope.connection_generation),
             )
             .await
         {
@@ -209,9 +271,11 @@ impl LanguageServerPool {
     async fn send_workspace_request<P, R>(
         &self,
         handle: &Arc<ConnectionHandle>,
+        capability: WorkspaceCapability,
         method: &'static str,
         params: P,
         upstream_id: Option<UpstreamId>,
+        expected_generation: Option<u64>,
     ) -> io::Result<Option<R>>
     where
         P: Serialize,
@@ -237,7 +301,9 @@ impl LanguageServerPool {
             let connections = self.connections().await;
             if !connections.get(key).is_some_and(|live| {
                 Arc::ptr_eq(live, handle) && live.state() == ConnectionState::Ready
-            }) {
+            }) || expected_generation
+                .is_some_and(|expected| self.document_connection_generation(key) != expected)
+            {
                 if let Some(id) = &upstream_id {
                     self.unregister_upstream_request(id, key);
                 }
@@ -246,7 +312,32 @@ impl LanguageServerPool {
                     "connection replaced",
                 ));
             }
-            if let Err(error) = handle.send_request(request, request_id) {
+            let send_result = if has_static_capability(handle, capability) {
+                Some(handle.send_request(request, request_id))
+            } else {
+                match capability {
+                    WorkspaceCapability::Search => handle
+                        .dynamic_capabilities()
+                        .with_registration(SYMBOL_METHOD, || {
+                            handle.send_request(request, request_id)
+                        }),
+                    WorkspaceCapability::Resolve => handle
+                        .dynamic_capabilities()
+                        .with_registration_options_flag(SYMBOL_METHOD, "resolveProvider", || {
+                            handle.send_request(request, request_id)
+                        }),
+                }
+            };
+            let Some(send_result) = send_result else {
+                if let Some(id) = &upstream_id {
+                    self.unregister_upstream_request(id, key);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "workspace symbol capability was unregistered before request send",
+                ));
+            };
+            if let Err(error) = send_result {
                 if let Some(id) = &upstream_id {
                     self.unregister_upstream_request(id, key);
                 }
@@ -259,6 +350,16 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, key);
         }
         let response = response?;
+        if let Some(expected) = expected_generation
+            && !self
+                .workspace_symbol_producer_is_live(handle, expected)
+                .await
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "workspace symbol producer was replaced before its response was accepted",
+            ));
+        }
         if response_has_jsonrpc_error(&response, method) {
             return Ok(None);
         }
@@ -270,6 +371,7 @@ impl LanguageServerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::bridge::pool::test_helpers::create_handle_with_key;
     use std::str::FromStr;
     use tower_lsp_server::ls_types::{Location, Position, Range, SymbolKind, Uri};
 
@@ -283,17 +385,37 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn flat_symbols_are_normalized_and_preserve_deprecation() {
-        let symbols = normalize_response(WorkspaceSymbolResponse::Flat(vec![SymbolInformation {
-            name: "main".into(),
-            kind: SymbolKind::FUNCTION,
-            tags: None,
-            deprecated: Some(true),
-            location: location(),
-            container_name: Some("crate".into()),
-        }]));
+        let symbols = normalize_response(
+            WorkspaceSymbolResponse::Flat(vec![SymbolInformation {
+                name: "main".into(),
+                kind: SymbolKind::FUNCTION,
+                tags: None,
+                deprecated: Some(true),
+                location: location(),
+                container_name: Some("crate".into()),
+            }]),
+            true,
+        );
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].location, OneOf::Left(location()));
         assert_eq!(symbols[0].tags, Some(vec![SymbolTag::DEPRECATED]));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn tags_are_suppressed_for_clients_without_tag_support() {
+        let symbols = normalize_response(
+            WorkspaceSymbolResponse::Flat(vec![SymbolInformation {
+                name: "old".into(),
+                kind: SymbolKind::FUNCTION,
+                tags: Some(vec![SymbolTag::DEPRECATED]),
+                deprecated: Some(true),
+                location: location(),
+                container_name: None,
+            }]),
+            false,
+        );
+        assert_eq!(symbols[0].tags, None);
     }
 
     #[test]
@@ -320,5 +442,29 @@ mod tests {
         assert_eq!(envelope.origin, "rust-analyzer");
         assert_eq!(envelope.connection_generation, 3);
         assert_eq!(symbol.data, Some(serde_json::json!({"server": 7})));
+    }
+
+    #[tokio::test]
+    async fn response_fence_rejects_a_replacement_under_the_same_key() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("symbols");
+        let producer = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.connections()
+            .await
+            .insert(key.clone(), Arc::clone(&producer));
+        let generation = pool.document_connection_generation(&key);
+        assert!(
+            pool.workspace_symbol_producer_is_live(&producer, generation)
+                .await
+        );
+
+        let replacement = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.connections().await.insert(key, replacement);
+        assert!(
+            !pool
+                .workspace_symbol_producer_is_live(&producer, generation)
+                .await,
+            "a queued response from the old producer must be rejected"
+        );
     }
 }

@@ -432,17 +432,28 @@ fn merge_upstream_capabilities(
     // The bridge can route workspaceSymbol/resolve, but a downstream may omit
     // `location.range` only when the editor will actually issue that resolve.
     // Preserve the editor's exact property declaration rather than overclaiming.
-    if let Some(resolve_support) = upstream
+    if let Some(upstream_symbol) = upstream
         .workspace
         .as_ref()
         .and_then(|workspace| workspace.symbol.as_ref())
-        .and_then(|symbol| symbol.resolve_support.clone())
     {
-        base.workspace
+        let base_symbol = base
+            .workspace
             .get_or_insert_with(Default::default)
             .symbol
-            .get_or_insert_with(Default::default)
-            .resolve_support = Some(resolve_support);
+            .get_or_insert_with(Default::default);
+        merge_option(
+            &mut base_symbol.symbol_kind,
+            upstream_symbol.symbol_kind.clone(),
+        );
+        merge_option(
+            &mut base_symbol.tag_support,
+            upstream_symbol.tag_support.clone(),
+        );
+        merge_option(
+            &mut base_symbol.resolve_support,
+            upstream_symbol.resolve_support.clone(),
+        );
     }
 
     // --- workspace.applyEdit (gated on real upstream support) ---
@@ -586,8 +597,8 @@ mod tests {
     #[test]
     fn workspace_symbol_resolve_support_is_gated_by_the_editor() {
         use tower_lsp_server::ls_types::{
-            WorkspaceClientCapabilities, WorkspaceSymbolClientCapabilities,
-            WorkspaceSymbolResolveSupportCapability,
+            SymbolKind, SymbolKindCapability, SymbolTag, TagSupport, WorkspaceClientCapabilities,
+            WorkspaceSymbolClientCapabilities, WorkspaceSymbolResolveSupportCapability,
         };
 
         let baseline = build_bridge_client_capabilities(None, true, false);
@@ -605,6 +616,12 @@ mod tests {
         let upstream = ClientCapabilities {
             workspace: Some(WorkspaceClientCapabilities {
                 symbol: Some(WorkspaceSymbolClientCapabilities {
+                    symbol_kind: Some(SymbolKindCapability {
+                        value_set: Some(vec![SymbolKind::TYPE_PARAMETER]),
+                    }),
+                    tag_support: Some(TagSupport {
+                        value_set: vec![SymbolTag::DEPRECATED],
+                    }),
                     resolve_support: Some(resolve_support.clone()),
                     ..Default::default()
                 }),
@@ -616,9 +633,22 @@ mod tests {
         assert_eq!(
             merged
                 .workspace
-                .and_then(|workspace| workspace.symbol)
-                .and_then(|symbol| symbol.resolve_support),
+                .as_ref()
+                .unwrap()
+                .symbol
+                .as_ref()
+                .unwrap()
+                .resolve_support,
             Some(resolve_support)
+        );
+        let symbol = merged.workspace.unwrap().symbol.unwrap();
+        assert_eq!(
+            symbol.symbol_kind.unwrap().value_set,
+            Some(vec![SymbolKind::TYPE_PARAMETER])
+        );
+        assert_eq!(
+            symbol.tag_support.unwrap().value_set,
+            vec![SymbolTag::DEPRECATED]
         );
     }
 
