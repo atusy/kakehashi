@@ -1492,14 +1492,6 @@ impl Kakehashi {
             );
             return Ok(None);
         };
-        let Some(commit_identity) = self
-            .documents
-            .get(&uri)
-            .map(|document| (document.incarnation(), document.content_version()))
-        else {
-            return Ok(None);
-        };
-        let commit_generation = self.cache.semantic_token_generation();
         let upstream_id = current_upstream_id();
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let (request_id, cancel_token) = self.cache.start_request(&uri);
@@ -1532,45 +1524,7 @@ impl Kakehashi {
                 }
             }
         };
-        let edit_lock = self.documents.edit_lock(&uri);
-        let commit_guard = if matches!(outcome, Ok(Some(_))) {
-            let lock = edit_lock.lock();
-            match cancel_rx.as_mut() {
-                Some(cancel_rx) => tokio::select! {
-                    biased;
-                    _ = cancel_rx => {
-                        cancel_token.cancel();
-                        outcome = Err(Error::request_cancelled());
-                        None
-                    }
-                    _ = cancel_token.cancelled() => {
-                        outcome = Ok(None);
-                        None
-                    }
-                    guard = lock => Some(guard),
-                },
-                None => tokio::select! {
-                    biased;
-                    _ = cancel_token.cancelled() => {
-                        outcome = Ok(None);
-                        None
-                    }
-                    guard = lock => Some(guard),
-                },
-            }
-        } else {
-            None
-        };
-        let document_current = self.cache.semantic_token_generation() == commit_generation
-            && self.documents.get(&uri).is_some_and(|document| {
-                document.incarnation() == commit_identity.0
-                    && document.content_version() == commit_identity.1
-            });
-        if commit_guard.is_some() && !document_current && matches!(outcome, Ok(Some(_))) {
-            outcome = Ok(None);
-        }
-        if commit_guard.is_some()
-            && let Ok(Some(computed)) = &mut outcome
+        if let Ok(Some(computed)) = &mut outcome
             && self
                 .cache
                 .with_active_request(&uri, request_id, || {
@@ -1692,8 +1646,8 @@ impl Kakehashi {
         else {
             return Ok(None);
         };
-        let pending_native = current.pending_native;
-        let pending_wire = current.pending_wire;
+        let mut pending_native = current.pending_native;
+        let mut pending_wire = current.pending_wire;
         let current = match current.result {
             SemanticTokensResult::Tokens(tokens) => tokens,
             SemanticTokensResult::Partial(partial) => SemanticTokens {
@@ -1711,13 +1665,29 @@ impl Kakehashi {
         let _edit_guard = edit_lock.lock().await;
         if cancel_token.is_cancelled()
             || !self.cache.is_request_active(&uri, request_id)
-            || !self.semantic_full_response_is_current(
-                &uri,
-                request_identity,
-                request_generation,
-                None,
-                &edit_lock,
-            )
+            || self.cache.semantic_token_generation() != request_generation
+            || !self.documents.get(&uri).is_some_and(|document| {
+                document.incarnation() == request_identity.0
+                    && document.content_version() == request_identity.1
+            })
+        {
+            return Ok(None);
+        }
+
+        // Commit the newly served baseline while the document edit lock and
+        // this request's tracker entry are both still held. A didChange cannot
+        // slip between the freshness check and either cache write.
+        if self
+            .cache
+            .with_active_request(&uri, request_id, || {
+                if let Some(pending) = pending_native.take() {
+                    pending.commit(&self.cache);
+                }
+                if let Some(pending) = pending_wire.take() {
+                    pending.commit(&self.cache);
+                }
+            })
+            .is_none()
         {
             return Ok(None);
         }
