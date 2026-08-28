@@ -315,17 +315,30 @@ impl Kakehashi {
         let generation = native_layer.generation;
         let native_tokens = native_layer.tokens;
         let snapshot = native_layer.snapshot;
+        let Some(live_identity) = self
+            .documents
+            .get(&uri)
+            .map(|document| (document.incarnation(), document.content_version()))
+        else {
+            self.cache.finish_request(&uri, request_id);
+            return Ok(None);
+        };
         let native_result_id = native_tokens.result_id.clone();
         let native_data = native_tokens.data;
         let native_data_for_comparison = native_data.clone();
-        let expected = snapshot.as_ref().map(|snapshot| {
-            super::super::whole_document::WholeDocumentSnapshotIdentity {
+        let expected = Some(snapshot.as_ref().map_or_else(
+            || super::super::whole_document::WholeDocumentSnapshotIdentity {
+                incarnation: live_identity.0,
+                parsed_version: live_identity.1,
+                generation,
+            },
+            |snapshot| super::super::whole_document::WholeDocumentSnapshotIdentity {
                 incarnation: snapshot.incarnation,
                 parsed_version: snapshot.parsed_version,
                 generation,
-            }
-        });
-        let expected_incarnation = snapshot.as_ref().map(|snapshot| snapshot.incarnation);
+            },
+        ));
+        let expected_incarnation = Some(live_identity.0);
         let native = std::future::ready(Ok(Some(native_data)));
         let bridge_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -407,7 +420,10 @@ impl Kakehashi {
                         &edit_lock,
                     )
                 })
-                || snapshot.is_none() && self.documents.get(&uri).is_none()
+                || !self.documents.get(&uri).is_some_and(|document| {
+                    document.incarnation() == live_identity.0
+                        && document.content_version() == live_identity.1
+                })
             {
                 return Ok(None);
             }
