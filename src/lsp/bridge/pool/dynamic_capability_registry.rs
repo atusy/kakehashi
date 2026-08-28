@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{RwLock, RwLockReadGuard};
 
 use tower_lsp_server::ls_types::{Registration, Unregistration};
 
@@ -25,6 +25,7 @@ pub(crate) struct DynamicCapabilityRegistry {
     changes: tokio::sync::watch::Sender<u64>,
     diagnostic_registration_settled: tokio::sync::OnceCell<()>,
     static_workspace_diagnostic_provider: AtomicBool,
+    workspace_diagnostic_pull_completed: AtomicBool,
     workspace_diagnostic_contributed: AtomicBool,
     workspace_diagnostic_registration_refresh_pending: AtomicBool,
 }
@@ -41,6 +42,7 @@ impl DynamicCapabilityRegistry {
             changes,
             diagnostic_registration_settled: tokio::sync::OnceCell::new(),
             static_workspace_diagnostic_provider: AtomicBool::new(false),
+            workspace_diagnostic_pull_completed: AtomicBool::new(false),
             workspace_diagnostic_contributed: AtomicBool::new(false),
             workspace_diagnostic_registration_refresh_pending: AtomicBool::new(false),
         }
@@ -97,6 +99,12 @@ impl DynamicCapabilityRegistry {
     pub(crate) fn mark_workspace_diagnostic_contributed(&self) -> bool {
         self.workspace_diagnostic_contributed
             .store(true, Ordering::Release);
+        self.mark_workspace_diagnostic_pull_completed()
+    }
+
+    pub(crate) fn mark_workspace_diagnostic_pull_completed(&self) -> bool {
+        self.workspace_diagnostic_pull_completed
+            .store(true, Ordering::Release);
         self.take_workspace_diagnostic_registration_refresh()
     }
 
@@ -111,12 +119,16 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn request_or_defer_workspace_diagnostic_registration_refresh(&self) -> bool {
-        if self.has_workspace_diagnostic_contributed() {
+        if self
+            .workspace_diagnostic_pull_completed
+            .load(Ordering::Acquire)
+        {
             return true;
         }
         self.workspace_diagnostic_registration_refresh_pending
             .store(true, Ordering::Release);
-        self.has_workspace_diagnostic_contributed()
+        self.workspace_diagnostic_pull_completed
+            .load(Ordering::Acquire)
             && self
                 .workspace_diagnostic_registration_refresh_pending
                 .swap(false, Ordering::AcqRel)
@@ -152,6 +164,12 @@ impl DynamicCapabilityRegistry {
             .filter(|registration| registration.method == method)
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn registrations_read(&self) -> RwLockReadGuard<'_, HashMap<String, Registration>> {
+        self.registrations
+            .read()
+            .recover_poison("DynamicCapabilityRegistry::registrations_read")
     }
 
     /// Run `f` with every still-live registration from `ids`, while all of
@@ -455,6 +473,41 @@ mod tests {
         assert!(registry.take_workspace_diagnostic_registration_refresh());
         assert!(!registry.has_workspace_diagnostic_contributed());
         assert!(!registry.take_workspace_diagnostic_registration_refresh());
+    }
+
+    #[test]
+    fn empty_pull_releases_registration_refresh_without_arming_exit_refresh() {
+        let registry = DynamicCapabilityRegistry::new();
+
+        assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
+        assert!(registry.mark_workspace_diagnostic_pull_completed());
+        assert!(!registry.has_workspace_diagnostic_contributed());
+        assert!(registry.request_or_defer_workspace_diagnostic_registration_refresh());
+    }
+
+    #[test]
+    fn registration_read_lease_blocks_unregistration() {
+        let registry = std::sync::Arc::new(DynamicCapabilityRegistry::new());
+        registry.register(vec![make_registration("diag-1", "textDocument/diagnostic")]);
+        let lease = registry.registrations_read();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::sync::Arc::clone(&registry);
+        let task = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            writer.unregister(vec![make_unregistration(
+                "diag-1",
+                "textDocument/diagnostic",
+            )]);
+            done_tx.send(()).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(done_rx.try_recv().is_err());
+        drop(lease);
+        done_rx.recv().unwrap();
+        task.join().unwrap();
+        assert!(!registry.has_registration("textDocument/diagnostic"));
     }
 
     #[test]
