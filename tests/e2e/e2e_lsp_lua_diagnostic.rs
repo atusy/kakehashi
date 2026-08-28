@@ -48,8 +48,8 @@ fn e2e_diagnostic_capability_advertised() {
     let provider = diagnostic_provider.unwrap();
     assert_eq!(
         provider.get("interFileDependencies"),
-        Some(&json!(false)),
-        "interFileDependencies should be false per pull-first-diagnostic-forwarding"
+        Some(&json!(true)),
+        "workspace-wide downstream diagnostics can have inter-file dependencies"
     );
     assert_eq!(
         provider.get("workspaceDiagnostics"),
