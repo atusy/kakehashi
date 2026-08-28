@@ -23,8 +23,9 @@ fn build_baseline_capabilities(
         DiagnosticWorkspaceClientCapabilities, DocumentLinkClientCapabilities,
         DocumentSymbolClientCapabilities, DynamicRegistrationClientCapabilities,
         GeneralClientCapabilities, GotoCapability, HoverClientCapabilities,
-        InlayHintClientCapabilities, PositionEncodingKind, SignatureHelpClientCapabilities,
-        TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities,
+        InlayHintClientCapabilities, PositionEncodingKind, SemanticTokensClientCapabilities,
+        SemanticTokensClientCapabilitiesRequests, SignatureHelpClientCapabilities,
+        TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities, TokenFormat,
         WorkspaceClientCapabilities,
     };
 
@@ -86,6 +87,20 @@ fn build_baseline_capabilities(
         }),
         inline_value: Some(DynamicRegistrationClientCapabilities {
             dynamic_registration: Some(false),
+        }),
+        semantic_tokens: Some(SemanticTokensClientCapabilities {
+            dynamic_registration: Some(false),
+            requests: SemanticTokensClientCapabilitiesRequests {
+                range: Some(true),
+                full: None,
+            },
+            token_types: crate::analysis::LEGEND_TYPES.to_vec(),
+            token_modifiers: crate::analysis::LEGEND_MODIFIERS.to_vec(),
+            formats: vec![TokenFormat::RELATIVE],
+            overlapping_token_support: Some(false),
+            multiline_token_support: Some(false),
+            server_cancel_support: Some(true),
+            augments_syntax_tokens: Some(true),
         }),
         // Without codeActionLiteralSupport, older servers fall back to
         // returning bare Commands only (issue #568). `dataSupport` +
@@ -641,6 +656,29 @@ mod tests {
         };
         let merged = build_bridge_client_capabilities(Some(&upstream_false), true, false);
         assert_eq!(merged.workspace.as_ref().and_then(|w| w.apply_edit), None);
+    }
+
+    #[test]
+    fn baseline_requests_range_tokens_in_the_bridge_legend() {
+        let capability = build_baseline_capabilities(true, false)
+            .text_document
+            .and_then(|text_document| text_document.semantic_tokens)
+            .expect("semantic token client capability");
+
+        assert_eq!(capability.dynamic_registration, Some(false));
+        assert_eq!(capability.requests.range, Some(true));
+        assert_eq!(capability.requests.full, None);
+        assert_eq!(capability.token_types, crate::analysis::LEGEND_TYPES);
+        assert_eq!(
+            capability.token_modifiers,
+            crate::analysis::LEGEND_MODIFIERS
+        );
+        assert_eq!(
+            capability.formats,
+            vec![tower_lsp_server::ls_types::TokenFormat::RELATIVE]
+        );
+        assert_eq!(capability.overlapping_token_support, Some(false));
+        assert_eq!(capability.multiline_token_support, Some(false));
     }
 
     #[test]
