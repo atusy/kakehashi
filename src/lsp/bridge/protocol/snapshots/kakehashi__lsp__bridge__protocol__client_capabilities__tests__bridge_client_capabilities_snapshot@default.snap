@@ -91,7 +91,8 @@ expression: capabilities
     "semanticTokens": {
       "dynamicRegistration": false,
       "requests": {
-        "range": true
+        "range": true,
+        "full": true
       },
       "tokenTypes": [
         "comment",
