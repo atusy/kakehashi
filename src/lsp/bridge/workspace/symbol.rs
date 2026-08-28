@@ -463,7 +463,7 @@ mod tests {
     };
     use crate::lsp::bridge::protocol::RequestId;
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tower_lsp_server::ls_types::{
         Location, Position, Range, SymbolKind, Uri, WorkspaceFolder, WorkspaceLocation,
     };
@@ -1248,16 +1248,16 @@ mod tests {
             .unwrap();
         let generation = pool.document_connection_generation(producer.key());
 
-        assert!(
-            pool.apply_workspace_folder_change(
-                vec![WorkspaceFolder {
-                    uri: Uri::from_str("file:///replacement").unwrap(),
-                    name: "replacement".into(),
-                }],
-                &[],
-            )
-            .await
-        );
+        pool.apply_workspace_folder_change(
+            vec![WorkspaceFolder {
+                uri: Uri::from_str("file:///replacement").unwrap(),
+                name: "replacement".into(),
+            }],
+            &[],
+        )
+        .await
+        .expect("non-empty change")
+        .finish();
         let workspace_admit = || pool.workspace_generation() == workspace_generation;
         let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
             "query": "stale workspace"
@@ -1311,7 +1311,7 @@ mod tests {
         let connections = pool.connections().await;
         let updating_pool = Arc::clone(&pool);
         let update = tokio::spawn(async move {
-            updating_pool
+            let change = updating_pool
                 .apply_workspace_folder_change(
                     vec![WorkspaceFolder {
                         uri: Uri::from_str("file:///replacement").unwrap(),
@@ -1320,6 +1320,9 @@ mod tests {
                     &[],
                 )
                 .await
+                .expect("non-empty change");
+            change.finish();
+            true
         });
         tokio::time::timeout(Duration::from_secs(1), async {
             while pool.workspace_generation() & 1 == 0 {
@@ -1346,6 +1349,137 @@ mod tests {
         drop(connections);
         assert!(update.await.unwrap());
         assert_eq!(pool.workspace_generation() & 1, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_workspace_update_remains_inadmissible() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let connections = pool.connections().await;
+        let updating_pool = Arc::clone(&pool);
+        let update = tokio::spawn(async move {
+            let _change = updating_pool
+                .apply_workspace_folder_change(
+                    vec![WorkspaceFolder {
+                        uri: Uri::from_str("file:///replacement").unwrap(),
+                        name: "replacement".into(),
+                    }],
+                    &[],
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.workspace_generation() & 1 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace update enters its in-progress epoch");
+
+        update.abort();
+        assert!(update.await.unwrap_err().is_cancelled());
+        drop(connections);
+        assert_eq!(
+            pool.workspace_generation() & 1,
+            1,
+            "cancellation must not publish a partially applied workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_discards_completed_contributions_when_workspace_changes_during_fanout() {
+        let pool = Arc::new(LanguageServerPool::new());
+        seed_test_client_root(&pool, "file:///workspace");
+        let first =
+            create_handle_advertising_workspace_symbols(ConnectionKey::shared("first")).await;
+        let second =
+            create_handle_advertising_workspace_symbols(ConnectionKey::shared("second")).await;
+        record_test_spawn_root(&first, "file:///workspace");
+        record_test_spawn_root(&second, "file:///workspace");
+        pool.connections().await.extend([
+            (first.key().clone(), Arc::clone(&first)),
+            (second.key().clone(), Arc::clone(&second)),
+        ]);
+        let mut settings = WorkspaceSettings::default();
+        for name in ["first", "second"] {
+            settings.language_servers.insert(
+                name.into(),
+                crate::config::settings::BridgeServerConfig {
+                    cmd: Some(vec![format!("mock-{name}")]),
+                    languages: Some(Vec::new()),
+                    prefer_shared_instance: Some(true),
+                    ..Default::default()
+                },
+            );
+        }
+        let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
+            "query": "fanout"
+        }))
+        .unwrap();
+        let admit_calls = Arc::new(AtomicUsize::new(0));
+        let request_pool = Arc::clone(&pool);
+        let request_admit_calls = Arc::clone(&admit_calls);
+        let request = tokio::spawn(async move {
+            let admit = || {
+                request_admit_calls.fetch_add(1, Ordering::AcqRel);
+                true
+            };
+            request_pool
+                .dispatch_workspace_symbol(params, &settings, None, true, &admit)
+                .await
+        });
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !first.router().is_sent(request_id) || !second.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both workspace producers receive the request");
+
+        let admits_before_first_response = admit_calls.load(Ordering::Acquire);
+        let _ = first.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": [{
+                "name": "stale",
+                "kind": 12,
+                "location": {
+                    "uri": "file:///workspace/main.rs",
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 5 }
+                    }
+                }
+            }]
+        }));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while admit_calls.load(Ordering::Acquire) == admits_before_first_response {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first producer contribution passes its response fence");
+
+        pool.apply_workspace_folder_change(
+            vec![WorkspaceFolder {
+                uri: Uri::from_str("file:///replacement").unwrap(),
+                name: "replacement".into(),
+            }],
+            &[],
+        )
+        .await
+        .expect("non-empty change")
+        .finish();
+        let _ = second.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": []
+        }));
+
+        assert!(
+            request.await.unwrap().is_none(),
+            "a completed old-workspace contribution must not survive final aggregation"
+        );
     }
 
     #[cfg(unix)]
