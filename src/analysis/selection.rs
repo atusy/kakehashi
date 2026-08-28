@@ -28,14 +28,18 @@ pub fn handle_selection_range(
     positions: &[Position],
     coordinator: &LanguageCoordinator,
     parser_pool: &mut DocumentParserPool,
+    cancel_token: &crate::cancel::CancelToken,
 ) -> Vec<SelectionRange> {
     let mapper = crate::text::PositionMapper::new(text);
     let root = tree.map(|t| t.root_node());
     let lang = language_id;
 
-    positions
-        .iter()
-        .map(|pos| {
+    let mut ranges = Vec::with_capacity(positions.len());
+    for pos in positions {
+        if cancel_token.is_cancelled() {
+            break;
+        }
+        ranges.push(
             if let Some(root) = root
                 && let Some(cursor_byte_offset) = mapper.position_to_byte(*pos)
                 && let Some(node) =
@@ -44,15 +48,22 @@ pub fn handle_selection_range(
             {
                 let doc_ctx = DocumentContext::new(text, &mapper, root, lang);
                 let mut inj_ctx = InjectionContext::new(coordinator, parser_pool);
-                range_builder::build(node, &doc_ctx, &mut inj_ctx, cursor_byte_offset)
+                range_builder::build(
+                    node,
+                    &doc_ctx,
+                    &mut inj_ctx,
+                    cursor_byte_offset,
+                    cancel_token,
+                )
             } else {
                 SelectionRange {
                     range: Range::new(*pos, *pos),
                     parent: None,
                 }
-            }
-        })
-        .collect()
+            },
+        );
+    }
+    ranges
 }
 
 #[cfg(test)]
@@ -231,7 +242,9 @@ mod tests {
 
         let doc_ctx = DocumentContext::new(text, &mapper, root, "rust");
         let mut inj_ctx = InjectionContext::new(&coordinator, &mut parser_pool);
-        let selection = range_builder::build(node, &doc_ctx, &mut inj_ctx, cursor_byte);
+        let cancel_token = crate::cancel::CancelToken::default();
+        let selection =
+            range_builder::build(node, &doc_ctx, &mut inj_ctx, cursor_byte, &cancel_token);
 
         let mut ranges: Vec<Range> = Vec::new();
         let mut curr = Some(&selection);
@@ -314,7 +327,9 @@ array: ["xxxx"]"#;
 
         let doc_ctx = DocumentContext::new(text, &mapper, root, "rust");
         let mut inj_ctx = InjectionContext::new(&coordinator, &mut parser_pool);
-        let selection = range_builder::build(node, &doc_ctx, &mut inj_ctx, cursor_byte);
+        let cancel_token = crate::cancel::CancelToken::default();
+        let selection =
+            range_builder::build(node, &doc_ctx, &mut inj_ctx, cursor_byte, &cancel_token);
 
         let mut level_count = 0;
         let mut curr = Some(&selection);
@@ -568,8 +583,14 @@ array: ["xxxx"]"#;
 
         let doc_ctx = DocumentContext::new(text, &mapper, root, "rust");
         let mut inj_ctx = InjectionContext::new(&coordinator, &mut parser_pool);
-        let selection =
-            range_builder::build(content_node, &doc_ctx, &mut inj_ctx, zero_byte_in_host);
+        let cancel_token = crate::cancel::CancelToken::default();
+        let selection = range_builder::build(
+            content_node,
+            &doc_ctx,
+            &mut inj_ctx,
+            zero_byte_in_host,
+            &cancel_token,
+        );
 
         // Find small range in injected content, verify UTF-16 column < 19 (byte offset)
         let mut found_small_range = false;
@@ -635,6 +656,7 @@ array: ["xxxx"]"#;
 
         let coordinator = LanguageCoordinator::new();
         let mut parser_pool = coordinator.create_document_parser_pool();
+        let cancel_token = crate::cancel::CancelToken::default();
         let document = store.get(&url).expect("document should exist");
         let ranges = handle_selection_range(
             document.text(),
@@ -643,6 +665,7 @@ array: ["xxxx"]"#;
             &positions,
             &coordinator,
             &mut parser_pool,
+            &cancel_token,
         );
 
         assert_eq!(ranges.len(), positions.len());
@@ -650,6 +673,40 @@ array: ["xxxx"]"#;
         assert_eq!(ranges[1].range.start, ranges[1].range.end); // invalid → empty
         assert!(ranges[1].parent.is_none());
         assert!(ranges[2].range.start.line == 1);
+    }
+
+    #[test]
+    fn test_selection_range_stops_native_walk_after_cancellation() {
+        let mut parser = tree_sitter::Parser::new();
+        let language = tree_sitter_rust::LANGUAGE.into();
+        parser.set_language(&language).expect("load rust grammar");
+
+        let text = "let x = 1;\nlet y = 2;";
+        let tree = parser.parse(text, None).expect("parse rust");
+        let positions = vec![
+            Position::new(0, 4),
+            Position::new(1, 4),
+            Position::new(1, 8),
+        ];
+        let coordinator = LanguageCoordinator::new();
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let cancel_token = crate::cancel::CancelToken::default();
+        // The first poll enters the first position; the second checkpoint
+        // cancels inside its native build before later positions are walked.
+        cancel_token.cancel_after_polls(2);
+
+        let ranges = handle_selection_range(
+            text,
+            Some(&tree),
+            Some("rust"),
+            &positions,
+            &coordinator,
+            &mut parser_pool,
+            &cancel_token,
+        );
+
+        assert_eq!(ranges.len(), 1);
+        assert!(cancel_token.is_cancelled());
     }
 
     /// Helper to collect all ranges in a selection hierarchy for debugging
@@ -727,7 +784,9 @@ array: ["xxxx"]"#;
 
         let doc_ctx = DocumentContext::new(text, &mapper, root, "markdown");
         let mut inj_ctx = InjectionContext::new(&coordinator, &mut parser_pool);
-        let selection = range_builder::build(node, &doc_ctx, &mut inj_ctx, cursor_byte);
+        let cancel_token = crate::cancel::CancelToken::default();
+        let selection =
+            range_builder::build(node, &doc_ctx, &mut inj_ctx, cursor_byte, &cancel_token);
         let ranges = collect_ranges(&selection);
 
         // --- Reference case: same YAML without blockquote ---
@@ -748,8 +807,13 @@ array: ["xxxx"]"#;
 
         let ref_doc_ctx = DocumentContext::new(ref_text, &ref_mapper, ref_root, "markdown");
         let mut ref_inj_ctx = InjectionContext::new(&coordinator, &mut parser_pool);
-        let ref_selection =
-            range_builder::build(ref_node, &ref_doc_ctx, &mut ref_inj_ctx, ref_cursor_byte);
+        let ref_selection = range_builder::build(
+            ref_node,
+            &ref_doc_ctx,
+            &mut ref_inj_ctx,
+            ref_cursor_byte,
+            &cancel_token,
+        );
         let ref_ranges = collect_ranges(&ref_selection);
 
         // The innermost range must be on the same line as the cursor (line 2).
@@ -814,6 +878,7 @@ array: ["xxxx"]"#;
 
         let coordinator = LanguageCoordinator::new();
         let mut parser_pool = coordinator.create_document_parser_pool();
+        let cancel_token = crate::cancel::CancelToken::default();
         let document = store.get(&url).expect("document should exist");
         let ranges = handle_selection_range(
             document.text(),
@@ -822,6 +887,7 @@ array: ["xxxx"]"#;
             &positions,
             &coordinator,
             &mut parser_pool,
+            &cancel_token,
         );
 
         assert_eq!(ranges.len(), 1);

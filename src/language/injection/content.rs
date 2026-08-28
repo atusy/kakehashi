@@ -174,6 +174,18 @@ pub(crate) fn parse_with_ranges(
     log_target: &str,
     lang_name: &str,
 ) -> Option<tree_sitter::Tree> {
+    parse_with_ranges_cancellable(parser, text, included_ranges, log_target, lang_name, None)
+}
+
+/// [`parse_with_ranges`] with cooperative cancellation during the parse.
+pub(crate) fn parse_with_ranges_cancellable(
+    parser: &mut tree_sitter::Parser,
+    text: &str,
+    included_ranges: Option<&[tree_sitter::Range]>,
+    log_target: &str,
+    lang_name: &str,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<tree_sitter::Tree> {
     // Tree-sitter treats an empty included-range slice like a reset to the
     // default whole-document range.  Here it means child/parent exclusions
     // removed every byte, so there is intentionally nothing to parse.
@@ -195,11 +207,11 @@ pub(crate) fn parse_with_ranges(
     }
 
     let deadline = std::time::Instant::now() + NATIVE_PARSE_BUDGET;
-    let tree = parse_with_deadline(parser, text, None, deadline);
+    let tree = parse_with_deadline_cancellable(parser, text, None, deadline, cancel);
     if tree.is_none() {
         log::warn!(
             target: log_target,
-            "Injected parse for {} yielded no tree (aborted at the {}s budget or failed)",
+            "Injected parse for {} yielded no tree (cancelled, aborted at the {}s budget, or failed)",
             lang_name,
             NATIVE_PARSE_BUDGET.as_secs()
         );
