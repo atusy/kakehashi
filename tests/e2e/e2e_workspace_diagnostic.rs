@@ -59,15 +59,19 @@ fn workspace_diagnostic_starts_and_aggregates_cold_producers() {
     let items = response["result"]["items"]
         .as_array()
         .expect("report items");
-    assert_eq!(items.len(), 2, "internal virtual reports must be filtered");
-    assert_eq!(items[0]["uri"], "file:///workspace/shared.rs");
-    assert_eq!(items[0]["version"], 4);
-    assert!(items[0].get("resultId").is_none());
+    assert_eq!(items.len(), 3);
     assert_eq!(
-        items[0]["items"][0]["message"],
+        items[0]["uri"], "file:///workspace/kakehashi-virtual-uri-region-0.lua",
+        "an unopened real URI must not be filtered merely because its name looks virtual"
+    );
+    assert_eq!(items[1]["uri"], "file:///workspace/shared.rs");
+    assert_eq!(items[1]["version"], 4);
+    assert!(items[1].get("resultId").is_none());
+    assert_eq!(
+        items[1]["items"][0]["message"],
         "workspace-diagnostic-alpha"
     );
-    assert_eq!(items[0]["items"][1]["message"], "workspace-diagnostic-zeta");
-    assert_eq!(items[1]["uri"], "file:///workspace/zeta.rs");
-    assert!(items[1].get("resultId").is_none());
+    assert_eq!(items[1]["items"][1]["message"], "workspace-diagnostic-zeta");
+    assert_eq!(items[2]["uri"], "file:///workspace/zeta.rs");
+    assert!(items[2].get("resultId").is_none());
 }

@@ -32,7 +32,10 @@ from the upstream response. For the same URI and version, concatenate
 diagnostics in stable server-name order. If versions differ, keep the higher
 document version. Sort final reports by URI for deterministic output.
 
-Do not expose internal virtual-document reports or related-information links.
+Do not expose reports or related-information links whose exact URI was issued
+to that producer generation as an internal virtual document. URI shape alone
+is not evidence: a real workspace file that happens to match Kakehashi's
+virtual filename pattern still passes through.
 Open embedded documents remain covered by `textDocument/diagnostic`, whose
 region-aware path can translate current ranges to the host. Real workspace URIs
 pass through unchanged, including unopened files.
@@ -43,7 +46,8 @@ pass through unchanged, including unopened files.
   boundaries.
 - An `unchanged` report is never interpreted without the exact baseline it
   names.
-- Internal virtual URIs are never returned as editor workspace documents.
+- URIs issued internally to the exact producer generation are never returned
+  as editor workspace documents.
 - A stale settings snapshot cannot start a removed or reconfigured producer.
 - A response from a replaced producer generation is discarded.
 
