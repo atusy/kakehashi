@@ -236,21 +236,21 @@ impl LanguageServerPool {
         if !admit() {
             return aggregate_reports(std::iter::empty());
         }
-        let reports: Vec<_> = reports
+        let admitted: Vec<_> = reports
             .into_iter()
-            .filter_map(|completed| {
+            .filter(|completed| {
                 let key = completed.handle.key();
-                connections
-                    .get(key)
-                    .is_some_and(|live| {
-                        Arc::ptr_eq(live, &completed.handle)
-                            && live.state() == ConnectionState::Ready
-                            && self.document_connection_generation(key) == completed.generation
-                    })
-                    .then(|| sanitize_report(completed.report, &completed.virtual_uris))
+                connections.get(key).is_some_and(|live| {
+                    Arc::ptr_eq(live, &completed.handle)
+                        && live.state() == ConnectionState::Ready
+                        && self.document_connection_generation(key) == completed.generation
+                })
             })
             .collect();
         drop(connections);
+        let reports = admitted
+            .into_iter()
+            .map(|completed| sanitize_report(completed.report, &completed.virtual_uris));
         aggregate_reports(reports)
     }
 
