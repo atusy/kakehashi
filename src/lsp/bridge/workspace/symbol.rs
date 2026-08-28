@@ -1,5 +1,6 @@
 //! Workspace-symbol fan-out and origin-preserving resolve routing.
 
+use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -119,6 +120,18 @@ fn decode_response(
         serde_json::from_value(response)?
     };
     Ok(normalize_response(response, supports_tags))
+}
+
+fn deduplicate_symbols(symbols: impl IntoIterator<Item = WorkspaceSymbol>) -> Vec<WorkspaceSymbol> {
+    let mut seen = HashSet::new();
+    symbols
+        .into_iter()
+        .filter(|symbol| {
+            let mut identity = symbol.clone();
+            identity.data = None;
+            serde_json::to_vec(&identity).map_or(true, |identity| seen.insert(identity))
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -282,7 +295,7 @@ impl LanguageServerPool {
             }
         });
 
-        let symbols: Vec<_> = join_all(requests).await.into_iter().flatten().collect();
+        let symbols = deduplicate_symbols(join_all(requests).await.into_iter().flatten());
         if !admit() || self.workspace_generation() != request_workspace_generation {
             return None;
         }
@@ -580,6 +593,28 @@ mod tests {
         assert_eq!(envelope.origin, "rust-analyzer");
         assert_eq!(envelope.connection_generation, 3);
         assert_eq!(symbol.data, Some(serde_json::json!({"server": 7})));
+    }
+
+    #[test]
+    fn duplicate_symbols_keep_the_first_resolve_route() {
+        let symbol = WorkspaceSymbol {
+            name: "main".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: Some("crate".into()),
+            location: OneOf::Left(location()),
+            data: Some(serde_json::json!({"producer": "first"})),
+        };
+        let mut duplicate = symbol.clone();
+        duplicate.data = Some(serde_json::json!({"producer": "second"}));
+
+        let symbols = deduplicate_symbols([symbol, duplicate]);
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(
+            symbols[0].data,
+            Some(serde_json::json!({"producer": "first"}))
+        );
     }
 
     #[test]
@@ -1158,7 +1193,17 @@ mod tests {
         let _ = secondary.router().route(serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
-            "result": null
+            "result": [{
+                "name": "from-a",
+                "kind": 12,
+                "location": {
+                    "uri": "file:///workspace/a/main.rs",
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 6 }
+                    }
+                }
+            }]
         }));
         assert!(matches!(
             request.await.unwrap(),
