@@ -511,8 +511,10 @@ impl Kakehashi {
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let supersession = tracking.as_ref().map(|(_, cancel)| cancel.clone());
         let settings_generation = self.settings_manager.settings_generation();
-        let only_layer = self.document_language(&uri).and_then(|language| {
-            let layers = self.resolve_layer_config(&language, METHOD);
+        let layer_config = self
+            .document_language(&uri)
+            .map(|language| self.resolve_layer_config(&language, METHOD));
+        let only_layer = layer_config.as_ref().and_then(|layers| {
             layers
                 .priorities
                 .first()
@@ -530,6 +532,9 @@ impl Kakehashi {
                 self.semantic_tokens_full_has_potential_virtual_producer(language)
             });
         let virt_only = only_layer == Some(LayerSource::Virt);
+        let non_native_only = layer_config.as_ref().is_some_and(|layers| {
+            !layers.priorities.is_empty() && !layers.allows(LayerSource::Native)
+        });
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
         // supersession, and cancellation contract. A current snapshot makes
@@ -672,15 +677,14 @@ impl Kakehashi {
                 )
                 .await?;
 
+            let bridge_was_attempted = bridge_attempted.load(std::sync::atomic::Ordering::Acquire);
             let data = match data {
                 Some(data) => data,
-                None if virt_only
-                    && !bridge_attempted.load(std::sync::atomic::Ordering::Acquire) =>
-                {
-                    // The selected virtual overlay was recomputed successfully,
-                    // but no injection regions remain. Keep a wire lineage for
-                    // the empty overlay so delta can delete the previous region
-                    // tokens instead of returning null forever.
+                None if non_native_only && (bridge_was_attempted || virt_only) => {
+                    // A selected non-native overlay recomputed to no tokens:
+                    // either its server returned null/empty, or a virt-only
+                    // document has no regions left. Keep an empty wire lineage
+                    // so delta deletes the previous downstream classifications.
                     bridge_attempted.store(true, std::sync::atomic::Ordering::Release);
                     Vec::new()
                 }
