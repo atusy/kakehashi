@@ -1212,6 +1212,18 @@ priorities = ["virt", "native"]
         .and_then(Value::as_str)
         .expect("an incapable virtual server must preserve the native delta lineage");
     assert!(!result_id.is_empty());
+    let delta = client.send_request(
+        "textDocument/semanticTokens/full/delta",
+        json!({
+            "textDocument": { "uri": uri },
+            "previousResultId": result_id
+        }),
+    );
+    assert!(delta.get("error").is_none(), "{delta:?}");
+    assert!(
+        delta.pointer("/result/edits").is_some() && delta.pointer("/result/data").is_none(),
+        "a known-incapable virtual server must not force the native lineage back through full aggregation: {delta:?}"
+    );
     shutdown(&mut client);
 }
 
