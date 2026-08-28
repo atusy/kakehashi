@@ -704,6 +704,9 @@ Details:
   wildcard (same convention as `bridge.<lang>.aggregation`).
 - **Formatting**: `textDocument/rangeFormatting` shares the
   `textDocument/formatting` key.
+- **Semantic tokens**: `textDocument/semanticTokens/full/delta` recomputes the
+  current overlay and therefore shares the `textDocument/semanticTokens/full`
+  key.
 - **Diagnostics**: two keys, mirroring their aggregation keying — pull
   diagnostics under `textDocument/diagnostic`, push diagnostics under
   `textDocument/publishDiagnostics`. Each layer is gated independently by

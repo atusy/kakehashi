@@ -65,7 +65,9 @@ affects how we handle features that can return cross-file results.
 
 ### Strategy 1: Semantic Token Aggregation
 
-**Applies to**: `textDocument/semanticTokens/full`, `textDocument/semanticTokens/range`
+**Applies to**: `textDocument/semanticTokens/full` (including
+`textDocument/semanticTokens/full/delta`, which shares the full aggregation
+key), `textDocument/semanticTokens/range`
 
 **Full behavior**:
 1. Establish the native serve-current baseline, preserving cancellation,

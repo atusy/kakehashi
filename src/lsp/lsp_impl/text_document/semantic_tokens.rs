@@ -530,23 +530,26 @@ impl Kakehashi {
                 return Ok(None);
             }
 
-            let result_id = if bridge_attempted.load(std::sync::atomic::Ordering::Acquire) {
+            let bridge_attempted = bridge_attempted.load(std::sync::atomic::Ordering::Acquire);
+            let result_id = if bridge_attempted {
                 Some(next_result_id())
             } else {
                 native_result_id
             };
             let tokens = SemanticTokens { result_id, data };
-            self.cache.store_wire_tokens(
-                uri.clone(),
-                tokens.clone(),
-                snapshot.language.clone().unwrap_or_default(),
-                self.cache.cache_key_for(&snapshot.text, generation),
-                SemanticSnapshotIdentity {
-                    parsed_version: snapshot.parsed_version,
-                    incarnation: snapshot.incarnation,
-                    generation,
-                },
-            );
+            if bridge_attempted {
+                self.cache.store_wire_tokens(
+                    uri.clone(),
+                    tokens.clone(),
+                    snapshot.language.clone().unwrap_or_default(),
+                    self.cache.cache_key_for(&snapshot.text, generation),
+                    SemanticSnapshotIdentity {
+                        parsed_version: snapshot.parsed_version,
+                        incarnation: snapshot.incarnation,
+                        generation,
+                    },
+                );
+            }
             Ok(Some(SemanticTokensResult::Tokens(tokens)))
         };
         let outcome = match cancel_rx.as_mut() {
@@ -1292,10 +1295,6 @@ impl Kakehashi {
             return Ok(None);
         };
         let previous_result_id = params.previous_result_id.clone();
-        let previous = self
-            .cache
-            .get_wire_tokens_if_valid(&uri, &previous_result_id)
-            .or_else(|| self.cache.get_tokens_if_valid(&uri, &previous_result_id));
         let full_params = SemanticTokensParams {
             text_document: params.text_document,
             work_done_progress_params: params.work_done_progress_params,
@@ -1311,6 +1310,13 @@ impl Kakehashi {
                 data: partial.data,
             },
         };
+        // Resolve the baseline only after the nested full request has established
+        // and fenced the current document incarnation. Baseline history retains
+        // the requested ID when that request stores its new result.
+        let previous = self
+            .cache
+            .get_wire_tokens_if_valid(&uri, &previous_result_id)
+            .or_else(|| self.cache.get_tokens_if_valid(&uri, &previous_result_id));
 
         Ok(Some(match previous {
             Some(previous) => calculate_delta_or_full(&previous, &current, &previous_result_id),
@@ -3462,6 +3468,13 @@ mod tests {
             SemanticTokensResult::Tokens(t) => t.result_id.expect("should have result_id"),
             _ => panic!("expected Tokens variant"),
         };
+        assert!(
+            server
+                .cache
+                .get_wire_tokens_if_valid(&uri, &baseline_id)
+                .is_none(),
+            "a native-only full result should not duplicate its baseline in the wire cache"
+        );
 
         // Delta on the UNCHANGED document with the matching baseline: empty delta,
         // same result_id (the fast path).
