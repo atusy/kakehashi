@@ -50,7 +50,13 @@ struct CompletedDiagnosticProducer {
     handle: Arc<ConnectionHandle>,
     generation: u64,
     report: WorkspaceDiagnosticReport,
+    provider_reports: Option<Vec<ProviderDiagnosticReport>>,
     virtual_uris: Arc<VirtualUriObserver>,
+}
+
+struct ProviderDiagnosticReport {
+    identifier: Option<String>,
+    report: WorkspaceDiagnosticReport,
 }
 
 struct RootedDiagnosticReport {
@@ -340,6 +346,7 @@ fn aggregate_reports(
     })
 }
 
+#[cfg(test)]
 fn combine_producer_reports(
     reports: impl IntoIterator<Item = WorkspaceDiagnosticReport>,
 ) -> WorkspaceDiagnosticReport {
@@ -379,20 +386,25 @@ fn combine_producer_reports(
 }
 
 fn combine_complete_provider_reports(
-    reports: impl IntoIterator<Item = io::Result<Option<WorkspaceDiagnosticReport>>>,
-) -> Option<WorkspaceDiagnosticReport> {
+    reports: impl IntoIterator<
+        Item = (
+            Option<String>,
+            io::Result<Option<WorkspaceDiagnosticReport>>,
+        ),
+    >,
+) -> Option<Vec<ProviderDiagnosticReport>> {
     let reports: Option<Vec<_>> = reports
         .into_iter()
-        .map(|report| {
+        .map(|(identifier, report)| {
             let report = report.ok().flatten()?;
             report
                 .items
                 .iter()
                 .all(|item| matches!(item, WorkspaceDocumentDiagnosticReport::Full(_)))
-                .then_some(report)
+                .then_some(ProviderDiagnosticReport { identifier, report })
         })
         .collect();
-    reports.map(combine_producer_reports)
+    reports
 }
 
 fn collect_complete_server_contributions<T>(
@@ -520,19 +532,34 @@ impl LanguageServerPool {
             .iter()
             .map(|observer| observer.provenance_revision())
             .collect::<Vec<_>>();
-        let reports = admitted.into_iter().map(|completed| {
-            let mut provider_identifiers = completed
-                .provider_plan
-                .iter()
-                .map(|provider| provider.identifier.clone())
-                .collect::<Vec<_>>();
-            provider_identifiers.sort();
-            provider_identifiers.dedup();
-            RootedDiagnosticReport {
-                server: completed.handle.key().server().to_owned(),
-                spawn_root: completed.handle.spawn_root().map(str::to_owned),
-                provider_identifiers,
-                report: sanitize_report(completed.report, &completed.virtual_uris),
+        let reports = admitted.into_iter().flat_map(|completed| {
+            let server = completed.handle.key().server().to_owned();
+            let spawn_root = completed.handle.spawn_root().map(str::to_owned);
+            match completed.provider_reports {
+                Some(provider_reports) => provider_reports
+                    .into_iter()
+                    .map(|provider_report| RootedDiagnosticReport {
+                        server: server.clone(),
+                        spawn_root: spawn_root.clone(),
+                        provider_identifiers: vec![provider_report.identifier],
+                        report: sanitize_report(provider_report.report, &completed.virtual_uris),
+                    })
+                    .collect::<Vec<_>>(),
+                None => {
+                    let mut provider_identifiers = completed
+                        .provider_plan
+                        .iter()
+                        .map(|provider| provider.identifier.clone())
+                        .collect::<Vec<_>>();
+                    provider_identifiers.sort();
+                    provider_identifiers.dedup();
+                    vec![RootedDiagnosticReport {
+                        server,
+                        spawn_root,
+                        provider_identifiers,
+                        report: sanitize_report(completed.report, &completed.virtual_uris),
+                    }]
+                }
             }
         });
         let reports = reconcile_overlapping_root_reports(reports);
@@ -760,22 +787,27 @@ impl LanguageServerPool {
                         .await;
                         let requests = providers.iter().cloned().map(|provider| {
                             let params = params_for_provider(params.clone(), &provider);
+                            let identifier = provider.identifier.clone();
                             let upstream_id = upstream_id.clone();
                             let handle = Arc::clone(&handle);
                             async move {
-                                self.send_workspace_diagnostic_request(
-                                    &handle,
-                                    generation,
-                                    params,
-                                    upstream_id,
-                                    provider,
-                                    Some(&workspace_admit),
-                                    cancel_forwarder,
+                                (
+                                    identifier,
+                                    self.send_workspace_diagnostic_request(
+                                        &handle,
+                                        generation,
+                                        params,
+                                        upstream_id,
+                                        provider,
+                                        Some(&workspace_admit),
+                                        cancel_forwarder,
+                                    )
+                                    .await,
                                 )
-                                .await
                             }
                         });
-                        let report = combine_complete_provider_reports(join_all(requests).await)?;
+                        let provider_reports =
+                            combine_complete_provider_reports(join_all(requests).await)?;
                         if !self
                             .workspace_diagnostic_producer_is_live(&handle, generation)
                             .await
@@ -787,7 +819,8 @@ impl LanguageServerPool {
                             provider_plan: providers,
                             handle,
                             generation,
-                            report,
+                            report: WorkspaceDiagnosticReport::default(),
+                            provider_reports: Some(provider_reports),
                             virtual_uris,
                         })
                     }
@@ -1151,19 +1184,27 @@ mod tests {
 
         assert!(
             combine_complete_provider_reports([
-                Ok(Some(successful())),
-                Err(io::Error::other("provider failed")),
+                (Some("alpha".into()), Ok(Some(successful()))),
+                (
+                    Some("zeta".into()),
+                    Err(io::Error::other("provider failed")),
+                ),
             ])
             .is_none()
         );
-        assert!(combine_complete_provider_reports([Ok(Some(successful())), Ok(None)]).is_none());
-        assert_eq!(
-            combine_complete_provider_reports([Ok(Some(successful()))])
-                .expect("complete provider set")
-                .items
-                .len(),
-            1
+        assert!(
+            combine_complete_provider_reports([
+                (Some("alpha".into()), Ok(Some(successful()))),
+                (Some("zeta".into()), Ok(None)),
+            ])
+            .is_none()
         );
+        let reports =
+            combine_complete_provider_reports([(Some("alpha".into()), Ok(Some(successful())))])
+                .expect("complete provider set");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].identifier.as_deref(), Some("alpha"));
+        assert_eq!(reports[0].report.items.len(), 1);
     }
 
     #[test]
@@ -1240,6 +1281,7 @@ mod tests {
                         report: WorkspaceDiagnosticReport {
                             items: vec![full("file:///workspace/fast.rs", Some(1), "stale")],
                         },
+                        provider_reports: None,
                         virtual_uris,
                     })
                 })
@@ -1254,6 +1296,7 @@ mod tests {
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport { items: Vec::new() },
+                        provider_reports: None,
                         virtual_uris,
                     })
                 })
@@ -1309,6 +1352,7 @@ mod tests {
                         report: WorkspaceDiagnosticReport {
                             items: vec![full(leaked_uri, None, "must not escape")],
                         },
+                        provider_reports: None,
                         virtual_uris,
                     })
                 })
@@ -1323,6 +1367,7 @@ mod tests {
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport::default(),
+                        provider_reports: None,
                         virtual_uris,
                     })
                 })
@@ -1372,6 +1417,7 @@ mod tests {
                     report: WorkspaceDiagnosticReport {
                         items: vec![full("file:///workspace/live.rs", None, "live")],
                     },
+                    provider_reports: None,
                     virtual_uris,
                 }))],
                 &|| checks.fetch_add(1, Ordering::SeqCst) < 2,
@@ -1407,6 +1453,7 @@ mod tests {
                     report: WorkspaceDiagnosticReport {
                         items: vec![full("file:///workspace/stale.rs", None, "stale")],
                     },
+                    provider_reports: None,
                     virtual_uris,
                 }))],
                 &|| {
@@ -1443,6 +1490,7 @@ mod tests {
                 handle: Arc::clone(&handle),
                 generation,
                 report: WorkspaceDiagnosticReport::default(),
+                provider_reports: None,
                 virtual_uris,
             }))],
             &|| true,
@@ -1490,6 +1538,7 @@ mod tests {
                     handle: Arc::clone(&handle),
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
+                    provider_reports: None,
                     virtual_uris,
                 }))],
                 &|| true,
@@ -1566,6 +1615,7 @@ mod tests {
                     handle,
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
+                    provider_reports: None,
                     virtual_uris: Arc::clone(&virtual_uris),
                 }))],
                 &|| {
@@ -1615,6 +1665,7 @@ mod tests {
                         report: WorkspaceDiagnosticReport {
                             items: vec![full("file:///workspace/stale.rs", Some(1), "stale")],
                         },
+                        provider_reports: None,
                         virtual_uris: stale_virtual_uris,
                     })),
                     std::future::ready(Some(CompletedDiagnosticProducer {
@@ -1624,6 +1675,7 @@ mod tests {
                         report: WorkspaceDiagnosticReport {
                             items: vec![full("file:///workspace/live.rs", Some(1), "live")],
                         },
+                        provider_reports: None,
                         virtual_uris: live_virtual_uris,
                     })),
                 ],
@@ -1666,6 +1718,7 @@ mod tests {
                     handle,
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
+                    provider_reports: None,
                     virtual_uris,
                 }))],
                 &|| true,
@@ -1697,6 +1750,7 @@ mod tests {
                     handle,
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
+                    provider_reports: None,
                     virtual_uris,
                 }))],
                 &|| true,
@@ -1735,6 +1789,7 @@ mod tests {
                 handle: Arc::clone(handle),
                 generation,
                 report: WorkspaceDiagnosticReport::default(),
+                provider_reports: None,
                 virtual_uris: Arc::new(
                     pool.observe_virtual_uris_for_connection(handle.key(), generation),
                 ),
@@ -1787,6 +1842,7 @@ mod tests {
                     handle: Arc::clone(&handle),
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
+                    provider_reports: None,
                     virtual_uris,
                 }))],
                 &|| {
@@ -2485,7 +2541,7 @@ mod tests {
             )],
         };
 
-        assert!(combine_complete_provider_reports([Ok(Some(report))]).is_none());
+        assert!(combine_complete_provider_reports([(None, Ok(Some(report)))]).is_none());
     }
 
     #[tokio::test]
