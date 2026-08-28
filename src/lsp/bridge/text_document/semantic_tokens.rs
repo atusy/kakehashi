@@ -394,34 +394,63 @@ pub(crate) fn merge_semantic_token_layers(
 ) -> Vec<SemanticToken> {
     let higher = decode_absolute_tokens(higher);
     let lower = decode_absolute_tokens(lower);
-    let mut merged = higher.clone();
+    let mut lower_fragments = Vec::with_capacity(lower.len());
+    let mut higher_index = 0;
 
     for (line, start, length, token_type, modifiers) in lower {
         let end = start.saturating_add(length);
-        let mut covered = higher
-            .iter()
-            .filter_map(|&(other_line, other_start, other_length, _, _)| {
-                (other_line == line).then_some((
-                    other_start.max(start),
-                    other_start.saturating_add(other_length).min(end),
-                ))
-            })
-            .filter(|(from, to)| from < to)
-            .collect::<Vec<_>>();
-        covered.sort_unstable();
+        while higher_index < higher.len() {
+            let (higher_line, higher_start, higher_length, ..) = higher[higher_index];
+            if higher_line < line
+                || (higher_line == line && higher_start.saturating_add(higher_length) <= start)
+            {
+                higher_index += 1;
+            } else {
+                break;
+            }
+        }
+
         let mut cursor = start;
-        for (from, to) in covered {
+        let mut scan = higher_index;
+        while let Some(&(higher_line, higher_start, higher_length, ..)) = higher.get(scan) {
+            if higher_line > line || (higher_line == line && higher_start >= end) {
+                break;
+            }
+            if higher_line < line {
+                scan += 1;
+                continue;
+            }
+            let from = higher_start.max(start);
+            let to = higher_start.saturating_add(higher_length).min(end);
             if cursor < from {
-                merged.push((line, cursor, from - cursor, token_type, modifiers));
+                lower_fragments.push((line, cursor, from - cursor, token_type, modifiers));
             }
             cursor = cursor.max(to);
+            scan += 1;
         }
         if cursor < end {
-            merged.push((line, cursor, end - cursor, token_type, modifiers));
+            lower_fragments.push((line, cursor, end - cursor, token_type, modifiers));
         }
     }
 
-    merged.sort_unstable_by_key(|&(line, start, ..)| (line, start));
+    let mut higher = higher.into_iter().peekable();
+    let mut lower_fragments = lower_fragments.into_iter().peekable();
+    let mut merged = Vec::with_capacity(higher.len() + lower_fragments.len());
+    while higher.peek().is_some() || lower_fragments.peek().is_some() {
+        let take_higher = match (higher.peek(), lower_fragments.peek()) {
+            (Some(&(higher_line, higher_start, ..)), Some(&(lower_line, lower_start, ..))) => {
+                (higher_line, higher_start) <= (lower_line, lower_start)
+            }
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        merged.push(if take_higher {
+            higher.next().expect("peeked higher token")
+        } else {
+            lower_fragments.next().expect("peeked lower token")
+        });
+    }
     encode_absolute_tokens(merged)
 }
 
@@ -544,6 +573,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn semantic_layer_overlay_scales_across_large_ordered_streams() {
+        let stream = |token_type| {
+            (0..10_000)
+                .map(|_| SemanticToken {
+                    delta_line: 1,
+                    delta_start: 0,
+                    length: 1,
+                    token_type,
+                    token_modifiers_bitset: 0,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let merged = merge_semantic_token_layers(stream(1), stream(2));
+
+        assert_eq!(merged.len(), 10_000);
+        assert!(merged.iter().all(|token| token.token_type == 1));
     }
 
     #[test]
