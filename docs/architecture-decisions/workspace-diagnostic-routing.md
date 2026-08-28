@@ -21,10 +21,12 @@ that minted its result id.
 
 ## Decision
 
-Query one document-free client-workspace connection for every explicitly
-configured, runnable server. Start cold connections when needed, admit startup
-only while the captured settings generation is current, and accept responses
-only from the same live connection generation.
+For every explicitly configured, runnable server, query document-free
+client-workspace connections that cover every explicit workspace root. A server
+that follows workspace-folder changes can use one shared connection; otherwise
+each root has its own producer. Start cold connections when needed, admit
+startup only while the captured settings generation is current, and accept
+responses only from the same live connection generation.
 
 Use the same client-workspace scope proof as `workspace/symbol`: an incapable
 `preferSharedInstance` process seeded from a marker root is not a workspace
