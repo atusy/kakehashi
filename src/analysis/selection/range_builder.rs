@@ -173,20 +173,20 @@ pub fn build(
     let injection_query = inj_ctx.injection_query(doc_ctx.base_language);
     let injection_query_ref = injection_query.as_ref().map(|q| q.as_ref());
 
-    let injection_info = injection::detect_injection(
+    let injection_info = injection::detect_injection_cancellable(
         &doc_ctx.root,
         doc_ctx.text,
         cursor_byte,
         injection_query_ref,
         doc_ctx.base_language,
+        Some(cancel_token),
     );
-
-    let Some((hierarchy, content_node, pattern_index, offset_from_query)) = injection_info else {
-        return build_from_node(node, doc_ctx.mapper);
-    };
     if cancel_token.is_cancelled() {
         return build_from_node(node, doc_ctx.mapper);
     }
+    let Some((hierarchy, content_node, pattern_index, offset_from_query)) = injection_info else {
+        return build_from_node(node, doc_ctx.mapper);
+    };
 
     if hierarchy.len() < 2 {
         return build_from_node(node, doc_ctx.mapper);
@@ -325,20 +325,20 @@ fn build_nested_injection(
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     }
 
-    let injection_info = injection::detect_injection(
+    let injection_info = injection::detect_injection_cancellable(
         root,
         text,
         cursor_byte,
         Some(injection_query),
         base_language,
+        Some(cancel_token),
     );
-
-    let Some((hierarchy, content_node, pattern_index, offset)) = injection_info else {
-        return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
-    };
     if cancel_token.is_cancelled() {
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     }
+    let Some((hierarchy, content_node, pattern_index, offset)) = injection_info else {
+        return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
+    };
 
     if hierarchy.len() < 2 {
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
