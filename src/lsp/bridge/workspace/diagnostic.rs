@@ -37,6 +37,7 @@ struct CompletedDiagnosticProducer {
     handle: Arc<ConnectionHandle>,
     generation: u64,
     report: WorkspaceDiagnosticReport,
+    virtual_uris: Arc<VirtualUriObserver>,
 }
 
 impl DiagnosticProvider {
@@ -246,7 +247,7 @@ impl LanguageServerPool {
                             && live.state() == ConnectionState::Ready
                             && self.document_connection_generation(key) == completed.generation
                     })
-                    .then_some(completed.report)
+                    .then(|| sanitize_report(completed.report, &completed.virtual_uris))
             })
             .collect();
         drop(connections);
@@ -330,6 +331,8 @@ impl LanguageServerPool {
                 let workspace_admit =
                     || admit() && self.workspace_generation() == workspace_generation;
                 let generation = self.document_connection_generation(handle.key());
+                let virtual_uris =
+                    Arc::new(self.observe_virtual_uris_for_connection(handle.key(), generation));
                 let requests = diagnostic_providers(&handle).into_iter().map(|provider| {
                     let params = params_for_provider(params.clone(), &provider);
                     let upstream_id = upstream_id.clone();
@@ -361,6 +364,7 @@ impl LanguageServerPool {
                     handle,
                     generation,
                     report,
+                    virtual_uris,
                 })
             }
         });
@@ -381,7 +385,6 @@ impl LanguageServerPool {
         admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> io::Result<Option<WorkspaceDiagnosticReport>> {
         let key = handle.key();
-        let virtual_uris = self.observe_virtual_uris_for_connection(key, expected_generation);
         let (request_id, response_rx) =
             match self.register_request_for_handle_with_upstream(upstream_id.clone(), handle) {
                 Ok(request) => request,
@@ -484,7 +487,6 @@ impl LanguageServerPool {
             return Ok(None);
         }
         serde_json::from_value(result.clone())
-            .map(|report| sanitize_report(report, &virtual_uris))
             .map(Some)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
@@ -493,11 +495,12 @@ impl LanguageServerPool {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use tower_lsp_server::ls_types::{
         Diagnostic, DiagnosticRelatedInformation, FullDocumentDiagnosticReport, Location, Position,
-        Range, UnchangedDocumentDiagnosticReport, Uri, WorkspaceUnchangedDocumentDiagnosticReport,
+        Range, UnchangedDocumentDiagnosticReport, Uri, WorkspaceFolder,
+        WorkspaceUnchangedDocumentDiagnosticReport,
     };
 
     use super::*;
@@ -622,6 +625,8 @@ mod tests {
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
         pool.connections().await.insert(key, Arc::clone(&handle));
         let generation = pool.document_connection_generation(handle.key());
+        let virtual_uris =
+            Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
         let admitted = Arc::new(AtomicBool::new(true));
         let fast_completed = Arc::new(AtomicBool::new(false));
         let (release_slow, slow_released) = tokio::sync::oneshot::channel();
@@ -631,6 +636,7 @@ mod tests {
             {
                 let fast_completed = Arc::clone(&fast_completed);
                 let handle = Arc::clone(&handle);
+                let virtual_uris = Arc::clone(&virtual_uris);
                 Box::pin(async move {
                     fast_completed.store(true, Ordering::SeqCst);
                     Some(CompletedDiagnosticProducer {
@@ -639,17 +645,20 @@ mod tests {
                         report: WorkspaceDiagnosticReport {
                             items: vec![full("file:///workspace/fast.rs", Some(1), "stale")],
                         },
+                        virtual_uris,
                     })
                 })
             },
             {
                 let handle = Arc::clone(&handle);
+                let virtual_uris = Arc::clone(&virtual_uris);
                 Box::pin(async move {
                     let _ = slow_released.await;
                     Some(CompletedDiagnosticProducer {
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport { items: Vec::new() },
+                        virtual_uris,
                     })
                 })
             },
@@ -676,6 +685,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_aggregation_resanitizes_virtual_uris_issued_after_a_fast_response() {
+        use std::pin::Pin;
+
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("diagnostics");
+        let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+        pool.connections()
+            .await
+            .insert(handle.key().clone(), Arc::clone(&handle));
+        let generation = pool.document_connection_generation(handle.key());
+        let virtual_uris =
+            Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
+        let leaked_uri = "kakehashi-virt:///late.lua";
+        let fast_completed = Arc::new(AtomicBool::new(false));
+        let (release_slow, slow_released) = tokio::sync::oneshot::channel();
+        let requests: Vec<
+            Pin<Box<dyn Future<Output = Option<CompletedDiagnosticProducer>> + Send>>,
+        > = vec![
+            {
+                let handle = Arc::clone(&handle);
+                let virtual_uris = Arc::clone(&virtual_uris);
+                let fast_completed = Arc::clone(&fast_completed);
+                Box::pin(async move {
+                    fast_completed.store(true, Ordering::Release);
+                    Some(CompletedDiagnosticProducer {
+                        handle,
+                        generation,
+                        report: WorkspaceDiagnosticReport {
+                            items: vec![full(leaked_uri, None, "must not escape")],
+                        },
+                        virtual_uris,
+                    })
+                })
+            },
+            {
+                let handle = Arc::clone(&handle);
+                let virtual_uris = Arc::clone(&virtual_uris);
+                Box::pin(async move {
+                    let _ = slow_released.await;
+                    Some(CompletedDiagnosticProducer {
+                        handle,
+                        generation,
+                        report: WorkspaceDiagnosticReport::default(),
+                        virtual_uris,
+                    })
+                })
+            },
+        ];
+        let request_pool = Arc::clone(&pool);
+        let request = tokio::spawn(async move {
+            request_pool
+                .aggregate_admitted_workspace_diagnostic_reports(requests, &|| true)
+                .await
+        });
+        while !fast_completed.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        virtual_uris.insert(leaked_uri.into());
+        release_slow.send(()).unwrap();
+
+        let WorkspaceDiagnosticReportResult::Report(report) = request.await.unwrap() else {
+            panic!("full report")
+        };
+        assert!(
+            report.items.is_empty(),
+            "final provenance must include virtual URIs issued after an early response"
+        );
+    }
+
+    #[tokio::test]
     async fn final_aggregation_discards_a_replaced_producer() {
         let pool = LanguageServerPool::new();
         let stale_key = ConnectionKey::for_server("alpha");
@@ -688,6 +767,10 @@ mod tests {
         ]);
         let stale_generation = pool.document_connection_generation(&stale_key);
         let live_generation = pool.document_connection_generation(live.key());
+        let stale_virtual_uris =
+            Arc::new(pool.observe_virtual_uris_for_connection(&stale_key, stale_generation));
+        let live_virtual_uris =
+            Arc::new(pool.observe_virtual_uris_for_connection(live.key(), live_generation));
         let replacement = create_handle_with_key(ConnectionState::Ready, stale_key.clone()).await;
         pool.connections().await.insert(stale_key, replacement);
 
@@ -700,6 +783,7 @@ mod tests {
                         report: WorkspaceDiagnosticReport {
                             items: vec![full("file:///workspace/stale.rs", Some(1), "stale")],
                         },
+                        virtual_uris: stale_virtual_uris,
                     })),
                     std::future::ready(Some(CompletedDiagnosticProducer {
                         handle: live,
@@ -707,6 +791,7 @@ mod tests {
                         report: WorkspaceDiagnosticReport {
                             items: vec![full("file:///workspace/live.rs", Some(1), "live")],
                         },
+                        virtual_uris: live_virtual_uris,
                     })),
                 ],
                 &|| true,
@@ -1292,6 +1377,182 @@ mod tests {
         assert_eq!(
             request.await.unwrap(),
             WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport::default())
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_a_workspace_update_in_progress_before_send() {
+        let pool = Arc::new(LanguageServerPool::new());
+        seed_test_client_root(&pool, "file:///workspace");
+        let producer = create_handle_advertising_workspace_diagnostics(
+            ConnectionKey::shared("diagnostics"),
+            None,
+        )
+        .await;
+        record_test_spawn_root(&producer, "file:///workspace");
+        pool.connections()
+            .await
+            .insert(producer.key().clone(), Arc::clone(&producer));
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "diagnostics".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-diagnostics".into()]),
+                languages: Some(Vec::new()),
+                prefer_shared_instance: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let connections = pool.connections().await;
+        let updating_pool = Arc::clone(&pool);
+        let update = tokio::spawn(async move {
+            let change = updating_pool
+                .apply_workspace_folder_change(
+                    vec![WorkspaceFolder {
+                        uri: Uri::from_str("file:///replacement").unwrap(),
+                        name: "replacement".into(),
+                    }],
+                    &[],
+                )
+                .await
+                .expect("non-empty change");
+            change.finish();
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.workspace_generation() & 1 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace update publishes its in-progress generation");
+        let params: WorkspaceDiagnosticParams = serde_json::from_value(serde_json::json!({
+            "previousResultIds": []
+        }))
+        .unwrap();
+        let response = pool
+            .dispatch_workspace_diagnostic(
+                params,
+                &settings,
+                None,
+                &|| true,
+                pool.workspace_generation(),
+            )
+            .await;
+        assert_eq!(
+            response,
+            WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport::default())
+        );
+        assert!(
+            !producer.router().is_sent(RequestId::new(2)),
+            "an in-progress workspace snapshot must not reach the wire"
+        );
+
+        drop(connections);
+        update.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_discards_completed_reports_when_workspace_changes_during_fanout() {
+        let pool = Arc::new(LanguageServerPool::new());
+        seed_test_client_root(&pool, "file:///workspace");
+        let first =
+            create_handle_advertising_workspace_diagnostics(ConnectionKey::shared("alpha"), None)
+                .await;
+        let second =
+            create_handle_advertising_workspace_diagnostics(ConnectionKey::shared("zeta"), None)
+                .await;
+        record_test_spawn_root(&first, "file:///workspace");
+        record_test_spawn_root(&second, "file:///workspace");
+        pool.connections().await.extend([
+            (first.key().clone(), Arc::clone(&first)),
+            (second.key().clone(), Arc::clone(&second)),
+        ]);
+        let mut settings = WorkspaceSettings::default();
+        for name in ["alpha", "zeta"] {
+            settings.language_servers.insert(
+                name.into(),
+                crate::config::settings::BridgeServerConfig {
+                    cmd: Some(vec![format!("mock-{name}")]),
+                    languages: Some(Vec::new()),
+                    prefer_shared_instance: Some(true),
+                    ..Default::default()
+                },
+            );
+        }
+        let params: WorkspaceDiagnosticParams = serde_json::from_value(serde_json::json!({
+            "previousResultIds": []
+        }))
+        .unwrap();
+        let request_generation = pool.workspace_generation();
+        let admit_calls = Arc::new(AtomicUsize::new(0));
+        let request_pool = Arc::clone(&pool);
+        let request_admit_calls = Arc::clone(&admit_calls);
+        let request = tokio::spawn(async move {
+            let admit = || {
+                request_admit_calls.fetch_add(1, Ordering::AcqRel);
+                true
+            };
+            request_pool
+                .dispatch_workspace_diagnostic(params, &settings, None, &admit, request_generation)
+                .await
+        });
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !first.router().is_sent(request_id) || !second.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both workspace producers receive the request");
+
+        let admits_before_first_response = admit_calls.load(Ordering::Acquire);
+        let _ = first.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "items": [{
+                "kind": "full",
+                "uri": "file:///workspace/stale.rs",
+                "version": 1,
+                "items": [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 1 }
+                    },
+                    "message": "stale"
+                }]
+            }] }
+        }));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while admit_calls.load(Ordering::Acquire) == admits_before_first_response {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first producer report passes its response fence");
+
+        pool.apply_workspace_folder_change(
+            vec![WorkspaceFolder {
+                uri: Uri::from_str("file:///replacement").unwrap(),
+                name: "replacement".into(),
+            }],
+            &[],
+        )
+        .await
+        .expect("non-empty change")
+        .finish();
+        let _ = second.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "items": [] }
+        }));
+
+        let WorkspaceDiagnosticReportResult::Report(report) = request.await.unwrap() else {
+            panic!("full report")
+        };
+        assert!(
+            report.items.is_empty(),
+            "a completed old-workspace report must not survive final aggregation"
         );
     }
 
