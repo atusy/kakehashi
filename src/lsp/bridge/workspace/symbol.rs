@@ -1407,11 +1407,20 @@ mod tests {
             ConnectionKey::shared("symbols"),
         )
         .await;
+        let fallback = create_handle_advertising_workspace_symbols_with_folder_changes(
+            ConnectionKey::new("fallback-symbols", None),
+        )
+        .await;
         record_test_spawn_root(&producer, "file:///workspace/a");
-        producer.workspace_folders().replace(Some(vec![folder_a]));
-        pool.connections()
-            .await
-            .insert(producer.key().clone(), Arc::clone(&producer));
+        record_test_spawn_root(&fallback, "file:///workspace/a");
+        producer
+            .workspace_folders()
+            .replace(Some(vec![folder_a.clone()]));
+        fallback.workspace_folders().replace(Some(vec![folder_a]));
+        pool.connections().await.extend([
+            (producer.key().clone(), Arc::clone(&producer)),
+            (fallback.key().clone(), Arc::clone(&fallback)),
+        ]);
         let connections = pool.connections().await;
         let updating_pool = Arc::clone(&pool);
         let update = tokio::spawn(async move {
@@ -1456,6 +1465,10 @@ mod tests {
         assert!(
             !pool.connections().await.contains_key(producer.key()),
             "recovery must recycle a shared producer that may have missed the cancelled delta"
+        );
+        assert!(
+            !pool.connections().await.contains_key(fallback.key()),
+            "recovery must recycle a client fallback that may have missed the cancelled delta"
         );
     }
 

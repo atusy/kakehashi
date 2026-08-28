@@ -707,6 +707,14 @@ Partial-result and work-done tokens are not forwarded because one client token
 cannot identify several downstream producers; the client receives one final
 aggregate response.
 
+The aggregate is also bound to one stable workspace-folder and settings
+snapshot. Snapshot capture waits for a normal folder update already underway.
+If the workspace or settings generation changes after capture, or a previous
+update was interrupted before becoming stable, search returns transient `null`
+instead of mixing results from different workspace scopes. Searches resume
+after a complete folder update reconciles any downstream processes that could
+have missed the interrupted change.
+
 ---
 
 ## Current limitations
