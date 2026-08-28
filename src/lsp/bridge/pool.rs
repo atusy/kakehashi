@@ -824,8 +824,11 @@ impl LanguageServerPool {
 
         let change_lock = self.workspace_change_lock.lock().await;
         // A dropped transaction leaves the generation odd. The next complete
-        // update reconciles from that partial state within the same epoch.
-        if self.workspace_generation.load(Ordering::Acquire) & 1 == 0 {
+        // update owns that dirty epoch and recycles every client-workspace
+        // producer below, because replaying only this event could not repair a
+        // delta missed by the cancelled update.
+        let recovering = self.workspace_generation.load(Ordering::Acquire) & 1 != 0;
+        if !recovering {
             self.workspace_generation.fetch_add(1, Ordering::AcqRel);
         }
         self.workspace_folders.apply_change(added.clone(), removed);
@@ -838,6 +841,10 @@ impl LanguageServerPool {
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
             let follows_client_workspace = key.is_client_fallback();
+            if recovering && (follows_client_workspace || key.is_shared()) {
+                invalidated.push(key.clone());
+                continue;
+            }
             if !follows_client_workspace {
                 // Marker-owned connections derive their folders from the
                 // marker-root walk, not this client snapshot. A shared
@@ -2648,7 +2655,7 @@ impl LanguageServerPool {
         Ok((handle, workspace_generation))
     }
 
-    pub(super) fn workspace_generation(&self) -> u64 {
+    pub(crate) fn workspace_generation(&self) -> u64 {
         self.workspace_generation.load(Ordering::Acquire)
     }
 

@@ -12,10 +12,13 @@ impl Kakehashi {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<WorkspaceSymbolResponse>> {
-        let _reload = lock_settings_reload().await;
+        let reload = lock_settings_reload().await;
         let settings_snapshot = self.settings_manager.load_settings_pair();
         let settings = std::sync::Arc::clone(&settings_snapshot.settings);
         let settings_generation = settings_snapshot.generation;
+        let pool = self.bridge.pool_arc();
+        let workspace_generation = pool.workspace_generation();
+        drop(reload);
         let upstream_id = crate::lsp::current_upstream_id();
         let supports_tags = self
             .settings_manager
@@ -26,14 +29,19 @@ impl Kakehashi {
             .and_then(|symbol| symbol.tag_support.as_ref())
             .is_some_and(|support| support.value_set.contains(&SymbolTag::DEPRECATED));
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
-        let pool = self.bridge.pool_arc();
         let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
             std::sync::Arc::clone(&pool),
             upstream_id.clone(),
         );
         let admit = || self.settings_manager.settings_generation() == settings_generation;
-        let dispatch =
-            pool.dispatch_workspace_symbol(params, &settings, upstream_id, supports_tags, &admit);
+        let dispatch = pool.dispatch_workspace_symbol(
+            params,
+            &settings,
+            upstream_id,
+            supports_tags,
+            &admit,
+            workspace_generation,
+        );
         match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
