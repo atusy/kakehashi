@@ -1505,8 +1505,6 @@ impl Kakehashi {
             .is_none()
             .then(|| self.cache.get_tokens_if_valid(&uri, &previous_result_id))
             .flatten();
-        let settings = self.settings_manager.load_settings();
-
         // Preserve the native-only idle fast path. A wire baseline or any
         // eligible bridge layer must still execute the full fan-out because a
         // downstream server may change its answer without a document edit.
@@ -1516,26 +1514,15 @@ impl Kakehashi {
             && snapshot.incarnation == view.slot.current_incarnation
             && snapshot.parsed_version == view.content_version
             && let Some(language) = snapshot.language.as_deref()
-            && {
-                let layers =
-                    crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
-                        &settings,
-                        language,
-                        "textDocument/semanticTokens/full",
-                    );
-                let has_spawnable_server = settings.language_servers.keys().any(|name| {
-                    name != crate::config::WILDCARD_KEY
-                        && crate::config::resolve_with_wildcard(
-                            &settings.language_servers,
-                            name,
-                            crate::config::merge_bridge_server_configs,
-                        )
-                        .is_some_and(|config| config.is_spawnable())
-                });
-                layers.allows(LayerSource::Native)
-                    && (!has_spawnable_server
-                        || (!layers.allows(LayerSource::Virt) && !layers.allows(LayerSource::Host)))
-            }
+            && crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+                &self.settings_manager.load_settings(),
+                language,
+                "textDocument/semanticTokens/full",
+            )
+            .allows(LayerSource::Native)
+            && !self
+                .semantic_delta_has_applicable_bridge(&lsp_uri, &uri, snapshot, language)
+                .await
             && self.cache.semantic_token_generation() == request_generation
             && let Some(current) = self.cache.get_current_tokens_for_snapshot(
                 &uri,
@@ -3932,6 +3919,19 @@ mod tests {
         let server = service.inner();
         let uri = Url::parse("file:///delta_noop.lua").expect("should construct test uri");
 
+        let mut settings = crate::config::WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "unrelated".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["unrelated-server".into()]),
+                languages: Some(vec!["python".into()]),
+                ..Default::default()
+            },
+        );
+        server
+            .apply_raw_settings(crate::config::RawWorkspaceSettings::default(), settings)
+            .await;
+
         server.documents.insert(
             uri.clone(),
             "local x = 1".to_string(),
@@ -3992,7 +3992,7 @@ mod tests {
                 );
                 assert!(
                     d.edits.is_empty(),
-                    "an unchanged document should yield an empty delta"
+                    "an unchanged document should yield an empty delta even when an unrelated server is configured"
                 );
             }
             other => panic!("expected an empty TokensDelta, got {:?}", other),
