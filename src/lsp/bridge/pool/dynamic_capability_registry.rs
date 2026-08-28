@@ -97,6 +97,10 @@ impl DynamicCapabilityRegistry {
     pub(crate) fn mark_workspace_diagnostic_contributed(&self) -> bool {
         self.workspace_diagnostic_contributed
             .store(true, Ordering::Release);
+        self.take_workspace_diagnostic_registration_refresh()
+    }
+
+    pub(crate) fn take_workspace_diagnostic_registration_refresh(&self) -> bool {
         self.workspace_diagnostic_registration_refresh_pending
             .swap(false, Ordering::AcqRel)
     }
@@ -441,6 +445,16 @@ mod tests {
             !registry.mark_workspace_diagnostic_contributed(),
             "an immediate retry must not leave duplicate deferred work"
         );
+    }
+
+    #[test]
+    fn rejected_cold_pull_can_release_its_deferred_registration_refresh() {
+        let registry = DynamicCapabilityRegistry::new();
+
+        assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
+        assert!(registry.take_workspace_diagnostic_registration_refresh());
+        assert!(!registry.has_workspace_diagnostic_contributed());
+        assert!(!registry.take_workspace_diagnostic_registration_refresh());
     }
 
     #[test]

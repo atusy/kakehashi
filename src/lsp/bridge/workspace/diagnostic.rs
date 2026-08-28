@@ -287,6 +287,25 @@ fn collect_complete_server_contributions<T>(
 }
 
 impl LanguageServerPool {
+    fn release_changed_provider_refreshes<'a>(
+        &self,
+        providers: impl Iterator<Item = (&'a Arc<ConnectionHandle>, &'a Vec<DiagnosticProvider>)>,
+    ) {
+        let refresh = providers.fold(false, |refresh, (handle, expected)| {
+            let changed = diagnostic_providers(handle) != *expected;
+            let released = changed
+                && handle
+                    .dynamic_capabilities()
+                    .take_workspace_diagnostic_registration_refresh();
+            refresh || released
+        });
+        if refresh {
+            let _ = self
+                .upstream_tx()
+                .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
+        }
+    }
+
     #[cfg(test)]
     async fn aggregate_admitted_workspace_diagnostic_reports<F>(
         &self,
@@ -342,6 +361,11 @@ impl LanguageServerPool {
             .iter()
             .any(|completed| diagnostic_providers(&completed.handle) != completed.provider_plan)
         {
+            self.release_changed_provider_refreshes(
+                admitted
+                    .iter()
+                    .map(|completed| (&completed.handle, &completed.provider_plan)),
+            );
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "workspace diagnostic provider plan changed before final aggregation",
@@ -394,6 +418,11 @@ impl LanguageServerPool {
             })
         });
         if producers_stale || !admit() {
+            self.release_changed_provider_refreshes(
+                provider_plans
+                    .iter()
+                    .map(|(handle, _, plan)| (handle, plan)),
+            );
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "workspace diagnostic producer or admission expired after final aggregation",
@@ -726,8 +755,8 @@ mod tests {
 
     use tower_lsp_server::ls_types::{
         Diagnostic, DiagnosticRelatedInformation, FullDocumentDiagnosticReport, Location, Position,
-        Range, UnchangedDocumentDiagnosticReport, Unregistration, Uri, WorkspaceFolder,
-        WorkspaceUnchangedDocumentDiagnosticReport,
+        Range, Registration, UnchangedDocumentDiagnosticReport, Unregistration, Uri,
+        WorkspaceFolder, WorkspaceUnchangedDocumentDiagnosticReport,
     };
 
     use super::*;
@@ -1124,6 +1153,61 @@ mod tests {
                 .dynamic_capabilities()
                 .has_workspace_diagnostic_contributed(),
             "only an accepted contribution should arm the reader-exit refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_provider_plan_releases_a_deferred_cold_refresh() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("diagnostics");
+        let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+        pool.connections()
+            .await
+            .insert(handle.key().clone(), Arc::clone(&handle));
+        let generation = pool.document_connection_generation(handle.key());
+        let virtual_uris =
+            Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "late".into(),
+            method: "textDocument/diagnostic".into(),
+            register_options: Some(serde_json::json!({
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
+        }]);
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .request_or_defer_workspace_diagnostic_registration_refresh()
+        );
+
+        let result = pool
+            .aggregate_admitted_workspace_diagnostic_reports(
+                [std::future::ready(Some(CompletedDiagnosticProducer {
+                    provider_plan: Vec::new(),
+                    handle: Arc::clone(&handle),
+                    generation,
+                    report: WorkspaceDiagnosticReport::default(),
+                    virtual_uris,
+                }))],
+                &|| true,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the changed provider plan rejects this pull"
+        );
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .has_workspace_diagnostic_contributed()
+        );
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .take_workspace_diagnostic_registration_refresh(),
+            "the rejection must consume the deferred refresh for immediate delivery"
         );
     }
 
