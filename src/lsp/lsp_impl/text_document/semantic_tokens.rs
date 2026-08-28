@@ -168,6 +168,19 @@ struct SemanticFullComputation {
     pending_wire: Option<PendingWireBaseline>,
 }
 
+fn commit_direct_wire_baseline(
+    cache: &crate::lsp::cache::CacheCoordinator,
+    direct_request: bool,
+    outcome: &mut Result<Option<SemanticFullComputation>>,
+) {
+    if direct_request
+        && let Ok(Some(computed)) = outcome
+        && let Some(pending) = computed.pending_wire.take()
+    {
+        pending.commit(cache);
+    }
+}
+
 /// Owns a semantic request's tracker entry through its complete native + bridge
 /// pipeline. Async cancellation drops the handler future, so explicit cleanup
 /// branches alone cannot reclaim an already-started blocking compute. A nested
@@ -470,7 +483,7 @@ impl Kakehashi {
         // backstop expires instead, the no-snapshot path carries the live
         // incarnation/content version through fan-out and revalidates that
         // identity before returning.
-        let defer_wire_commit = tracking.is_some();
+        let direct_request = tracking.is_none();
         let Some(native_layer) = self
             .semantic_tokens_full_native_layer(
                 params,
@@ -632,7 +645,7 @@ impl Kakehashi {
                 native_result_id
             };
             let tokens = SemanticTokens { result_id, data };
-            let mut pending_wire = bridge_attempted.then(|| PendingWireBaseline {
+            let pending_wire = bridge_attempted.then(|| PendingWireBaseline {
                 uri: uri.clone(),
                 tokens: tokens.clone(),
                 language: snapshot
@@ -653,16 +666,13 @@ impl Kakehashi {
                     },
                 ),
             });
-            if !defer_wire_commit && let Some(pending) = pending_wire.take() {
-                pending.commit(&self.cache);
-            }
             Ok(Some(SemanticFullComputation {
                 result: SemanticTokensResult::Tokens(tokens),
                 pending_native,
                 pending_wire,
             }))
         };
-        let outcome = match cancel_rx.as_mut() {
+        let mut outcome = match cancel_rx.as_mut() {
             Some(cancel_rx) => {
                 tokio::select! {
                     biased;
@@ -682,6 +692,12 @@ impl Kakehashi {
                 }
             }
         };
+        // The biased select above is the cancellation/supersession commit
+        // boundary. Never publish a wire result ID from inside `fan_out`: that
+        // future can finish concurrently with a cancellation which wins here,
+        // and caching a response the client never receives can evict its last
+        // usable delta baseline.
+        commit_direct_wire_baseline(&self.cache, direct_request, &mut outcome);
         request_guard.finish();
         outcome
     }
@@ -2770,13 +2786,29 @@ mod tests {
                 .is_none(),
             "a nested full baseline must remain private before the delta fence"
         );
-        pending.commit(&server.cache);
+        let mut outcome = Ok(Some(SemanticFullComputation {
+            result: SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: Some(result_id.clone()),
+                data: Vec::new(),
+            }),
+            pending_native: None,
+            pending_wire: Some(pending),
+        }));
+        commit_direct_wire_baseline(&server.cache, false, &mut outcome);
+        assert!(
+            server
+                .cache
+                .get_wire_tokens_if_valid(&uri, &result_id)
+                .is_none(),
+            "a nested full must leave the baseline for the outer delta fence"
+        );
+        commit_direct_wire_baseline(&server.cache, true, &mut outcome);
         assert!(
             server
                 .cache
                 .get_wire_tokens_if_valid(&uri, &result_id)
                 .is_some(),
-            "a successful outer delta fence must publish its baseline"
+            "a direct full must publish only after its outer select accepts the response"
         );
     }
 
