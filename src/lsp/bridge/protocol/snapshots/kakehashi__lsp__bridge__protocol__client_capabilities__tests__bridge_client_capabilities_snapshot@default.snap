@@ -137,9 +137,7 @@ expression: capabilities
         "relative"
       ],
       "overlappingTokenSupport": false,
-      "multilineTokenSupport": false,
-      "serverCancelSupport": true,
-      "augmentsSyntaxTokens": true
+      "multilineTokenSupport": false
     },
     "moniker": {
       "dynamicRegistration": false
