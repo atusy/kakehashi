@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::join_all;
 use serde_json::Value;
@@ -16,7 +17,8 @@ use crate::config::settings::WorkspaceSettings;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::pool::{
-    ConnectionHandle, ConnectionState, LanguageServerPool, UpstreamId, VirtualUriObserver,
+    ConnectionHandle, ConnectionState, INIT_TIMEOUT_SECS, LanguageServerPool, UpstreamId,
+    VirtualUriObserver,
 };
 use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
 
@@ -234,7 +236,13 @@ impl LanguageServerPool {
             let upstream_id = upstream_id.clone();
             async move {
                 let handle = self
-                    .get_or_create_connection_admitted(&name, &config, None, admit)
+                    .get_or_create_connection_wait_ready_admitted(
+                        &name,
+                        &config,
+                        None,
+                        Duration::from_secs(INIT_TIMEOUT_SECS),
+                        admit,
+                    )
                     .await
                     .ok()?;
                 let generation = self.document_connection_generation(handle.key());
@@ -249,6 +257,7 @@ impl LanguageServerPool {
                             params,
                             upstream_id,
                             provider,
+                            Some(admit),
                         )
                         .await
                         .ok()
@@ -275,6 +284,7 @@ impl LanguageServerPool {
         params: Value,
         upstream_id: Option<UpstreamId>,
         provider: DiagnosticProvider,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> io::Result<Option<WorkspaceDiagnosticReport>> {
         let key = handle.key();
         let virtual_uris = self.observe_virtual_uris_for_connection(key, expected_generation);
@@ -305,6 +315,15 @@ impl LanguageServerPool {
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "workspace diagnostic producer was replaced before admission",
+                ));
+            }
+            if admit.is_some_and(|admit| !admit()) {
+                if let Some(id) = &upstream_id {
+                    self.unregister_upstream_request(id, key);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "workspace diagnostic settings changed before request send",
                 ));
             }
             let admitted = match &provider {
@@ -355,6 +374,12 @@ impl LanguageServerPool {
                 "workspace diagnostic producer was replaced before response acceptance",
             ));
         }
+        if admit.is_some_and(|admit| !admit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "workspace diagnostic settings changed before response acceptance",
+            ));
+        }
         if response_has_jsonrpc_error(&response, DIAGNOSTIC_METHOD) {
             return Ok(None);
         }
@@ -377,6 +402,7 @@ impl LanguageServerPool {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use tower_lsp_server::ls_types::{
         Diagnostic, DiagnosticRelatedInformation, FullDocumentDiagnosticReport, Location, Position,
@@ -386,7 +412,9 @@ mod tests {
     use super::*;
     use crate::lsp::bridge::ConnectionKey;
     use crate::lsp::bridge::pool::test_helpers::{
-        create_handle_advertising_workspace_diagnostics, create_handle_with_key,
+        create_handle_advertising_workspace_diagnostics,
+        create_handle_advertising_workspace_diagnostics_with_state, create_handle_with_key,
+        transition_handle_to_ready,
     };
     use crate::lsp::bridge::protocol::RequestId;
     use crate::lsp::bridge::protocol::VirtualDocumentUri;
@@ -634,6 +662,7 @@ mod tests {
                     serde_json::json!({ "previousResultIds": [] }),
                     None,
                     DiagnosticProvider::Static { identifier: None },
+                    None,
                 )
                 .await
         });
@@ -657,6 +686,110 @@ mod tests {
 
         let error = request.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn sender_rejects_a_response_after_settings_change() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("diagnostics");
+        let producer = create_handle_advertising_workspace_diagnostics(key.clone(), None).await;
+        pool.connections()
+            .await
+            .insert(key.clone(), Arc::clone(&producer));
+        let generation = pool.document_connection_generation(&key);
+        let admitted = Arc::new(AtomicBool::new(true));
+        let pool_for_request = Arc::clone(&pool);
+        let producer_for_request = Arc::clone(&producer);
+        let admitted_for_request = Arc::clone(&admitted);
+        let request = tokio::spawn(async move {
+            let admit = || admitted_for_request.load(Ordering::Acquire);
+            pool_for_request
+                .send_workspace_diagnostic_request(
+                    &producer_for_request,
+                    generation,
+                    serde_json::json!({ "previousResultIds": [] }),
+                    None,
+                    DiagnosticProvider::Static { identifier: None },
+                    Some(&admit),
+                )
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !producer.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace diagnostic reaches Sent state");
+
+        admitted.store(false, Ordering::Release);
+        let _ = producer.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "items": [] }
+        }));
+
+        let error = request.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn dispatch_waits_for_an_existing_initializing_producer() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("diagnostics");
+        let producer = create_handle_advertising_workspace_diagnostics_with_state(
+            ConnectionState::Initializing,
+            key.clone(),
+            None,
+        )
+        .await;
+        pool.connections().await.insert(key, Arc::clone(&producer));
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "diagnostics".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-diagnostics".into()]),
+                languages: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceDiagnosticParams = serde_json::from_value(serde_json::json!({
+            "previousResultIds": []
+        }))
+        .unwrap();
+        let pool_for_request = Arc::clone(&pool);
+        let request = tokio::spawn(async move {
+            pool_for_request
+                .dispatch_workspace_diagnostic(params, &settings, None, &|| true)
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !request.is_finished(),
+            "workspace pull must wait through initialization"
+        );
+        assert!(transition_handle_to_ready(&producer));
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !producer.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace diagnostic is sent after initialization");
+        let _ = producer.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "items": [] }
+        }));
+
+        assert_eq!(
+            request.await.unwrap(),
+            WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport::default())
+        );
     }
 
     #[test]
@@ -746,22 +879,19 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn stale_settings_refuse_workspace_diagnostic_producer_admission() {
         let pool = LanguageServerPool::new();
-        let temp = tempfile::tempdir().unwrap();
-        let sentinel = temp.path().join("stale-diagnostic-producer-started");
         let mut settings = WorkspaceSettings::default();
         settings.language_servers.insert(
             "stale-diagnostics".into(),
             crate::config::settings::BridgeServerConfig {
                 cmd: Some(vec![
-                    "sh".into(),
-                    "-c".into(),
-                    "touch \"$1\"".into(),
-                    "workspace-diagnostic-admission".into(),
-                    sentinel.to_string_lossy().into_owned(),
+                    std::env::current_exe()
+                        .expect("current test executable")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "--help".into(),
                 ]),
                 languages: Some(Vec::new()),
                 ..Default::default()
@@ -780,9 +910,6 @@ mod tests {
             response,
             WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport::default())
         );
-        assert!(
-            !sentinel.exists(),
-            "a superseded settings snapshot must not spawn its producer"
-        );
+        assert!(pool.connections().await.is_empty());
     }
 }
