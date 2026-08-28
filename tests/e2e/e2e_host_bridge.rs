@@ -1244,6 +1244,12 @@ priorities = ["host"]
             "KAKEHASHI_E2E_WHOLE_DOCUMENT_HOST_BARRIER_DIR",
             barrier_dir.path().to_string_lossy(),
         )
+        // Park only documentColor: the post-reopen barrier request below is a
+        // whole-document host request too, and must not wait on this barrier.
+        .env(
+            "KAKEHASHI_E2E_WHOLE_DOCUMENT_HOST_BARRIER_METHOD",
+            "textDocument/documentColor",
+        )
         .build();
     let _init = client.send_request(
         "initialize",

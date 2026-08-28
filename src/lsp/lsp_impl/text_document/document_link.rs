@@ -4,6 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams};
 
 use super::super::Kakehashi;
+use super::super::bridge_context::parse_host_verbatim;
 use crate::lsp::bridge::{envelope_host_document_links, extract_document_link_envelope};
 use crate::lsp::current_upstream_id;
 
@@ -20,6 +21,9 @@ impl Kakehashi {
             // documentLink is fast; not advertised for client progress (#437), so
             // no token is carried.
             None,
+            false,
+            false,
+            std::future::ready(Ok(None)),
             |t| async move {
                 t.pool
                     .send_document_link_request(
@@ -34,6 +38,7 @@ impl Kakehashi {
                     )
                     .await
             },
+            parse_host_verbatim::<Vec<DocumentLink>>,
             |mut won| {
                 let server_resolves = won.handle.has_capability("documentLink/resolve");
                 envelope_host_document_links(
@@ -46,6 +51,10 @@ impl Kakehashi {
                     server_resolves,
                 );
                 Some(won.items)
+            },
+            |mut acc, next| {
+                acc.extend(next);
+                acc
             },
         )
         .await
