@@ -1126,10 +1126,11 @@ impl BridgeCoordinator {
         &self,
         uri: &Url,
         incarnation: u64,
+        content_version: u64,
         injections: &[BridgeInjection],
     ) {
         self.pool
-            .forward_didchange_to_opened_docs(uri, incarnation, injections)
+            .forward_didchange_to_opened_docs(uri, incarnation, content_version, injections)
             .await;
     }
 

@@ -61,6 +61,7 @@ impl LanguageServerPool {
         &self,
         host_uri: &Url,
         incarnation: u64,
+        content_version: u64,
         injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
     ) {
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
@@ -71,6 +72,7 @@ impl LanguageServerPool {
             self.record_latest_virtual_content(
                 host_uri,
                 incarnation,
+                content_version,
                 &injection.language,
                 &injection.region_id,
                 &injection.content,
@@ -128,6 +130,7 @@ impl LanguageServerPool {
                             &connection_key,
                             &injection.content,
                             version,
+                            Some((incarnation, content_version)),
                         )
                         .await;
                     }
@@ -262,7 +265,7 @@ mod tests {
             VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
         pool.register_opened_document(&host_uri, &virtual_uri, &key)
             .await;
-        pool.record_sent_content_fingerprint(&virtual_uri, &key, &injection.content, 1)
+        pool.record_sent_content_fingerprint(&virtual_uri, &key, &injection.content, 1, None)
             .await;
 
         let transition = pool.open_transition_lock(&virtual_uri, &key);
@@ -272,7 +275,7 @@ mod tests {
         let task_uri = host_uri.clone();
         let task = tokio::spawn(async move {
             task_pool
-                .sync_and_forward_did_save_to_virtual_docs(&task_uri, 1, &[task_injection])
+                .sync_and_forward_did_save_to_virtual_docs(&task_uri, 1, 0, &[task_injection])
                 .await;
         });
 

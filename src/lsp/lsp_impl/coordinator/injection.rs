@@ -227,7 +227,11 @@ impl InjectionCoordinator {
         let edit_lock = self.documents.edit_lock(uri);
         let _lifecycle_guard = edit_lock.lock().await;
         after_lifecycle_lock.await;
-        let Some(incarnation) = self.documents.get(uri).map(|doc| doc.incarnation()) else {
+        let Some((incarnation, content_version)) = self
+            .documents
+            .get(uri)
+            .map(|doc| (doc.incarnation(), doc.content_version()))
+        else {
             self.bridge.cancel_eager_open(uri);
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
             return false;
@@ -258,7 +262,7 @@ impl InjectionCoordinator {
 
         if forward_did_change {
             self.bridge
-                .forward_didchange_to_opened_docs(uri, incarnation, &injections)
+                .forward_didchange_to_opened_docs(uri, incarnation, content_version, &injections)
                 .await;
         }
 

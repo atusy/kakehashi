@@ -127,8 +127,13 @@ impl Kakehashi {
         if current_lineage == Some((saved_incarnation, saved_content_version))
             && let Some((_, injections)) = self.injection_coordinator().bridge_injections(uri)
         {
-            pool.sync_and_forward_did_save_to_virtual_docs(uri, saved_incarnation, &injections)
-                .await;
+            pool.sync_and_forward_did_save_to_virtual_docs(
+                uri,
+                saved_incarnation,
+                saved_content_version,
+                &injections,
+            )
+            .await;
         }
         drop(edit_guard);
         // `edit_lock` get-or-inserts, so a close during the settle leaves this

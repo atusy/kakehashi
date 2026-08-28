@@ -35,6 +35,7 @@ impl LanguageServerPool {
         &self,
         host_uri: &Url,
         incarnation: u64,
+        content_version: u64,
         injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
     ) {
         // Convert host_uri to lsp_types::Uri for bridge protocol functions
@@ -61,6 +62,7 @@ impl LanguageServerPool {
             self.record_latest_virtual_content(
                 host_uri,
                 incarnation,
+                content_version,
                 &injection.language,
                 &injection.region_id,
                 &injection.content,
@@ -115,6 +117,13 @@ impl LanguageServerPool {
                     )
                     .await
                 else {
+                    self.refresh_confirmed_host_identity_if_content_unchanged(
+                        &virtual_uri,
+                        &connection_key,
+                        &injection.content,
+                        (incarnation, content_version),
+                    )
+                    .await;
                     continue;
                 };
 
@@ -135,6 +144,7 @@ impl LanguageServerPool {
                         &connection_key,
                         &injection.content,
                         version,
+                        Some((incarnation, content_version)),
                     )
                     .await;
                 }
