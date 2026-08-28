@@ -392,6 +392,14 @@ pub(crate) fn merge_semantic_token_layers(
     higher: Vec<SemanticToken>,
     lower: Vec<SemanticToken>,
 ) -> Vec<SemanticToken> {
+    merge_semantic_token_layers_with_observer(higher, lower, || {})
+}
+
+fn merge_semantic_token_layers_with_observer(
+    higher: Vec<SemanticToken>,
+    lower: Vec<SemanticToken>,
+    mut inspect_higher: impl FnMut(),
+) -> Vec<SemanticToken> {
     let higher = decode_absolute_tokens(higher);
     let lower = decode_absolute_tokens(lower);
     let mut lower_fragments = Vec::with_capacity(lower.len());
@@ -400,6 +408,7 @@ pub(crate) fn merge_semantic_token_layers(
     for (line, start, length, token_type, modifiers) in lower {
         let end = start.saturating_add(length);
         while higher_index < higher.len() {
+            inspect_higher();
             let (higher_line, higher_start, higher_length, ..) = higher[higher_index];
             if higher_line < line
                 || (higher_line == line && higher_start.saturating_add(higher_length) <= start)
@@ -413,6 +422,7 @@ pub(crate) fn merge_semantic_token_layers(
         let mut cursor = start;
         let mut scan = higher_index;
         while let Some(&(higher_line, higher_start, higher_length, ..)) = higher.get(scan) {
+            inspect_higher();
             if higher_line > line || (higher_line == line && higher_start >= end) {
                 break;
             }
@@ -589,10 +599,17 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let merged = merge_semantic_token_layers(stream(1), stream(2));
+        let mut inspections = 0usize;
+        let merged = merge_semantic_token_layers_with_observer(stream(1), stream(2), || {
+            inspections += 1;
+        });
 
         assert_eq!(merged.len(), 10_000);
         assert!(merged.iter().all(|token| token.token_type == 1));
+        assert!(
+            inspections <= 40_000,
+            "ordered overlay must inspect higher tokens linearly, got {inspections} visits"
+        );
     }
 
     #[test]
