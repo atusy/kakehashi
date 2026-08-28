@@ -51,6 +51,19 @@ fn re_envelope(symbol: &mut WorkspaceSymbol, envelope: &WorkspaceSymbolEnvelope)
     envelope_symbol(symbol, restored);
 }
 
+fn merge_resolved_range(original: &mut WorkspaceSymbol, resolved: WorkspaceSymbol) {
+    let OneOf::Left(resolved_location) = resolved.location else {
+        return;
+    };
+    let same_uri = match &original.location {
+        OneOf::Left(location) => location.uri == resolved_location.uri,
+        OneOf::Right(location) => location.uri == resolved_location.uri,
+    };
+    if same_uri {
+        original.location = OneOf::Left(resolved_location);
+    }
+}
+
 #[allow(deprecated)]
 fn flatten_symbol(symbol: SymbolInformation) -> WorkspaceSymbol {
     let mut tags = symbol.tags;
@@ -259,9 +272,10 @@ impl LanguageServerPool {
             )
             .await
         {
-            Ok(Some((mut resolved, _))) => {
-                re_envelope(&mut resolved, &envelope);
-                resolved
+            Ok(Some((resolved, _))) => {
+                merge_resolved_range(&mut symbol, resolved);
+                re_envelope(&mut symbol, &envelope);
+                symbol
             }
             Ok(None) | Err(_) => fail_soft(symbol),
         }
@@ -379,7 +393,9 @@ mod tests {
     };
     use crate::lsp::bridge::protocol::RequestId;
     use std::str::FromStr;
-    use tower_lsp_server::ls_types::{Location, Position, Range, SymbolKind, Uri};
+    use tower_lsp_server::ls_types::{
+        Location, Position, Range, SymbolKind, Uri, WorkspaceLocation,
+    };
 
     fn location() -> Location {
         Location {
@@ -470,6 +486,85 @@ mod tests {
         assert_eq!(envelope.origin, "rust-analyzer");
         assert_eq!(envelope.connection_generation, 3);
         assert_eq!(symbol.data, Some(serde_json::json!({"server": 7})));
+    }
+
+    #[test]
+    fn resolved_symbol_only_supplies_the_lazy_range() {
+        let mut original = WorkspaceSymbol {
+            name: "original".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: Some(vec![SymbolTag::DEPRECATED]),
+            container_name: Some("module".into()),
+            location: OneOf::Right(WorkspaceLocation {
+                uri: location().uri,
+            }),
+            data: Some(serde_json::json!({"owner": "original"})),
+        };
+        let resolved = WorkspaceSymbol {
+            name: "changed".into(),
+            kind: SymbolKind::CLASS,
+            tags: None,
+            container_name: None,
+            location: OneOf::Left(Location {
+                uri: location().uri,
+                range: Range::new(Position::new(9, 0), Position::new(9, 8)),
+            }),
+            data: None,
+        };
+
+        merge_resolved_range(&mut original, resolved);
+
+        assert_eq!(original.name, "original");
+        assert_eq!(original.kind, SymbolKind::FUNCTION);
+        assert_eq!(original.tags, Some(vec![SymbolTag::DEPRECATED]));
+        assert_eq!(original.container_name.as_deref(), Some("module"));
+        assert_eq!(
+            original.data,
+            Some(serde_json::json!({"owner": "original"}))
+        );
+        assert_eq!(
+            original.location,
+            OneOf::Left(Location {
+                uri: location().uri,
+                range: Range::new(Position::new(9, 0), Position::new(9, 8)),
+            })
+        );
+    }
+
+    #[test]
+    fn resolved_symbol_cannot_change_the_original_uri() {
+        let mut original = WorkspaceSymbol {
+            name: "original".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Right(WorkspaceLocation {
+                uri: location().uri,
+            }),
+            data: Some(serde_json::json!({"owner": "original"})),
+        };
+        let original_location = original.location.clone();
+        let resolved = WorkspaceSymbol {
+            name: "changed".into(),
+            kind: SymbolKind::CLASS,
+            tags: None,
+            container_name: None,
+            location: OneOf::Left(Location {
+                uri: Uri::from_str("file:///workspace/other.rs").unwrap(),
+                range: Range::new(Position::new(9, 0), Position::new(9, 8)),
+            }),
+            data: None,
+        };
+
+        merge_resolved_range(&mut original, resolved);
+
+        assert_eq!(original.location, original_location);
+        assert_eq!(original.name, "original");
+        assert_eq!(original.kind, SymbolKind::FUNCTION);
+        assert_eq!(
+            original.data,
+            Some(serde_json::json!({"owner": "original"}))
+        );
     }
 
     #[tokio::test]
