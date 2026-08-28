@@ -164,6 +164,12 @@ use super::protocol::{
 /// server that doesn't respond within this window fails with a timeout error.
 pub(crate) const INIT_TIMEOUT_SECS: u64 = 30;
 
+struct WaitReadyOptions<'a> {
+    timeout: Duration,
+    rootless: bool,
+    admit: Option<&'a (dyn Fn() -> bool + Sync)>,
+}
+
 use super::actor::{
     OUTBOUND_QUEUE_CAPACITY, OutboundMessage, ResponseRouter, ServerRequestDeps,
     UpstreamNotification, UpstreamRequest, spawn_reader_task_for_server,
@@ -1970,8 +1976,11 @@ impl LanguageServerPool {
                 config,
                 key.clone(),
                 marker,
-                Duration::from_secs(INIT_TIMEOUT_SECS),
-                false,
+                WaitReadyOptions {
+                    timeout: Duration::from_secs(INIT_TIMEOUT_SECS),
+                    rootless: false,
+                    admit: None,
+                },
             )
             .await
         {
@@ -2513,6 +2522,42 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        self.get_or_create_connection_wait_ready_with_admit(
+            server_name,
+            server_config,
+            document_uri,
+            timeout,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn get_or_create_connection_wait_ready_admitted(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+        timeout: Duration,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<Arc<ConnectionHandle>> {
+        self.get_or_create_connection_wait_ready_with_admit(
+            server_name,
+            server_config,
+            document_uri,
+            timeout,
+            Some(admit),
+        )
+        .await
+    }
+
+    async fn get_or_create_connection_wait_ready_with_admit(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+        timeout: Duration,
+        admit: Option<&(dyn Fn() -> bool + Sync)>,
+    ) -> io::Result<Arc<ConnectionHandle>> {
         // `timeout` is the caller's overall budget; the incapable-shared divert
         // below acquires a second connection, so track elapsed time and hand it
         // only the remaining budget rather than a fresh full `timeout`.
@@ -2535,8 +2580,11 @@ impl LanguageServerPool {
                 server_config,
                 connection_key,
                 marker.clone(),
-                timeout,
-                rootless,
+                WaitReadyOptions {
+                    timeout,
+                    rootless,
+                    admit,
+                },
             )
             .await?;
 
@@ -2582,8 +2630,11 @@ impl LanguageServerPool {
                         server_config,
                         per_root_key,
                         marker,
-                        remaining,
-                        false,
+                        WaitReadyOptions {
+                            timeout: remaining,
+                            rootless: false,
+                            admit,
+                        },
                     )
                     .await;
             }
@@ -2610,9 +2661,13 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         connection_key: ConnectionKey,
         marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
-        timeout: Duration,
-        rootless: bool,
+        options: WaitReadyOptions<'_>,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        let WaitReadyOptions {
+            timeout,
+            rootless,
+            admit,
+        } = options;
         match self
             .get_or_create_connection_resolved(
                 server_name,
@@ -2625,12 +2680,20 @@ impl LanguageServerPool {
                 // stays within `timeout` overall.
                 timeout,
                 rootless,
-                None,
+                admit,
             )
             .await
         {
             Ok(handle) => {
                 handle.wait_for_ready(timeout).await?;
+                if admit.is_some_and(|admit| !admit()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        format!(
+                            "bridge: acquire for {connection_key} was superseded while waiting"
+                        ),
+                    ));
+                }
                 Ok(handle)
             }
             Err(e) => {
@@ -2653,6 +2716,14 @@ impl LanguageServerPool {
                         })?
                 };
                 handle.wait_for_ready(timeout).await?;
+                if admit.is_some_and(|admit| !admit()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        format!(
+                            "bridge: acquire for {connection_key} was superseded while waiting"
+                        ),
+                    ));
+                }
                 Ok(handle)
             }
         }
