@@ -35,6 +35,10 @@ pub(crate) struct WorkspaceFolderSet {
 }
 
 impl WorkspaceFolderSet {
+    fn same_root(left: &WorkspaceFolder, right: &WorkspaceFolder) -> bool {
+        crate::lsp::bridge::root_markers::same_root_uri(left.uri.as_str(), right.uri.as_str())
+    }
+
     /// Seed the set with the connection's initialize-time folders (`None` when
     /// the connection has no folders to advertise).
     pub(crate) fn new(initial: Option<Vec<WorkspaceFolder>>) -> Self {
@@ -48,7 +52,10 @@ impl WorkspaceFolderSet {
         folders.map(|folders| {
             let mut unique = Vec::<WorkspaceFolder>::with_capacity(folders.len());
             for folder in folders {
-                if !unique.iter().any(|existing| existing.uri == folder.uri) {
+                if !unique
+                    .iter()
+                    .any(|existing| Self::same_root(existing, &folder))
+                {
                     unique.push(folder);
                 }
             }
@@ -90,18 +97,15 @@ impl WorkspaceFolderSet {
             .recover_poison("WorkspaceFolderSet::contains")
             .as_ref()
             .is_some_and(|folders| {
-                folders.iter().any(|existing| {
-                    crate::lsp::bridge::root_markers::same_root_uri(
-                        existing.uri.as_str(),
-                        folder.uri.as_str(),
-                    )
-                })
+                folders
+                    .iter()
+                    .any(|existing| Self::same_root(existing, folder))
             })
     }
 
     /// Apply an upstream workspace-folder change atomically. Removals match by
-    /// URI (folder names are display metadata), then additions append in event
-    /// order while preserving URI uniqueness.
+    /// normalized root (folder names are display metadata), then additions
+    /// append in event order while preserving normalized-root uniqueness.
     pub(crate) fn apply_change(&self, added: Vec<WorkspaceFolder>, removed: &[WorkspaceFolder]) {
         let mut guard = self
             .inner
@@ -112,9 +116,12 @@ impl WorkspaceFolderSet {
         }
         let before = guard.clone();
         let folders = guard.get_or_insert_with(Vec::new);
-        folders.retain(|existing| !removed.iter().any(|item| item.uri == existing.uri));
+        folders.retain(|existing| !removed.iter().any(|item| Self::same_root(item, existing)));
         for folder in added {
-            if !folders.iter().any(|existing| existing.uri == folder.uri) {
+            if !folders
+                .iter()
+                .any(|existing| Self::same_root(existing, &folder))
+            {
                 folders.push(folder);
             }
         }
@@ -319,6 +326,19 @@ mod tests {
             set.snapshot(),
             Some(vec![folder("file:///b"), folder("file:///c")])
         );
+    }
+
+    #[test]
+    fn apply_change_removes_an_equivalent_normalized_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        let plain = url::Url::from_file_path(&root).unwrap();
+        let slashed = url::Url::from_directory_path(&root).unwrap();
+        let set = WorkspaceFolderSet::new(Some(vec![folder(slashed.as_str())]));
+
+        set.apply_change(Vec::new(), &[folder(plain.as_str())]);
+
+        assert_eq!(set.snapshot(), Some(Vec::new()));
     }
 
     #[test]
