@@ -269,12 +269,17 @@ mod tests {
 
     #[test]
     fn contains_matches_by_normalized_root() {
-        let set = WorkspaceFolderSet::new(Some(vec![folder("file:///a")]));
-        assert!(set.contains(&folder("file:///a")));
-        assert!(set.contains(&folder("file:///a/")));
-        assert!(!set.contains(&folder("file:///b")));
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let plain = url::Url::from_file_path(&a).unwrap();
+        let slashed = url::Url::from_directory_path(&a).unwrap();
+        let b = url::Url::from_file_path(tmp.path().join("b")).unwrap();
+        let set = WorkspaceFolderSet::new(Some(vec![folder(plain.as_str())]));
+        assert!(set.contains(&folder(plain.as_str())));
+        assert!(set.contains(&folder(slashed.as_str())));
+        assert!(!set.contains(&folder(b.as_str())));
         // A None set contains nothing.
-        assert!(!WorkspaceFolderSet::new(None).contains(&folder("file:///a")));
+        assert!(!WorkspaceFolderSet::new(None).contains(&folder(plain.as_str())));
     }
 
     #[test]
