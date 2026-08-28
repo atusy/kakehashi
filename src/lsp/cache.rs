@@ -742,6 +742,15 @@ impl CacheCoordinator {
         self.request_tracker.is_active(uri, request_id)
     }
 
+    pub(crate) fn with_active_request<R>(
+        &self,
+        uri: &Url,
+        request_id: RequestId,
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        self.request_tracker.with_active(uri, request_id, commit)
+    }
+
     /// Finish a request, removing it from tracking if it's still the active one.
     pub(crate) fn finish_request(&self, uri: &Url, request_id: RequestId) {
         self.request_tracker.finish_request(uri, request_id);

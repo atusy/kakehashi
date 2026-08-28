@@ -1474,13 +1474,20 @@ impl Kakehashi {
                 }
             }
         };
-        if let Ok(Some(computed)) = &mut outcome {
-            if let Some(pending) = computed.pending_native.take() {
-                pending.commit(&self.cache);
-            }
-            if let Some(pending) = computed.pending_wire.take() {
-                pending.commit(&self.cache);
-            }
+        if let Ok(Some(computed)) = &mut outcome
+            && self
+                .cache
+                .with_active_request(&uri, request_id, || {
+                    if let Some(pending) = computed.pending_native.take() {
+                        pending.commit(&self.cache);
+                    }
+                    if let Some(pending) = computed.pending_wire.take() {
+                        pending.commit(&self.cache);
+                    }
+                })
+                .is_none()
+        {
+            outcome = Ok(None);
         }
         request_guard.finish();
         outcome.map(|outcome| outcome.map(|computed| computed.result))
