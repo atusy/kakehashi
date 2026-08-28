@@ -349,6 +349,7 @@ pub(crate) struct HostVirtualContents {
 
 type LatestVirtualContents = DashMap<Url, HostVirtualContents>;
 type LatestVirtualContentSnapshot = (Option<Arc<str>>, (u64, u64));
+type ConnectionAcquiredObserver = dyn Fn(&Arc<ConnectionHandle>) + Sync;
 
 impl OpenClaimGuard {
     fn disarm(&mut self) {
@@ -2070,6 +2071,7 @@ impl LanguageServerPool {
                     rootless: false,
                     admit: None,
                 },
+                None,
             )
             .await
         {
@@ -2886,6 +2888,7 @@ impl LanguageServerPool {
             document_uri,
             timeout,
             None,
+            None,
         )
         .await
     }
@@ -2903,6 +2906,24 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         timeout: Duration,
         admit: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<(Arc<ConnectionHandle>, u64)> {
+        self.get_or_create_workspace_connection_wait_ready_admitted_inner(
+            server_name,
+            server_config,
+            timeout,
+            admit,
+            None,
+        )
+        .await
+    }
+
+    async fn get_or_create_workspace_connection_wait_ready_admitted_inner(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        timeout: Duration,
+        admit: &(dyn Fn() -> bool + Sync),
+        on_acquired: Option<&ConnectionAcquiredObserver>,
     ) -> io::Result<(Arc<ConnectionHandle>, u64)> {
         let workspace_generation = self.workspace_generation.load(Ordering::Acquire);
         if workspace_generation & 1 != 0 {
@@ -2922,6 +2943,7 @@ impl LanguageServerPool {
                     rootless: false,
                     admit: Some(admit),
                 },
+                on_acquired,
             )
             .await?;
         if !admit()
@@ -2949,6 +2971,24 @@ impl LanguageServerPool {
         timeout: Duration,
         admit: &(dyn Fn() -> bool + Sync),
     ) -> io::Result<(Vec<Arc<ConnectionHandle>>, u64)> {
+        self.get_or_create_workspace_connections_wait_ready_admitted_observed(
+            server_name,
+            server_config,
+            timeout,
+            admit,
+            &|_| {},
+        )
+        .await
+    }
+
+    pub(super) async fn get_or_create_workspace_connections_wait_ready_admitted_observed(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        timeout: Duration,
+        admit: &(dyn Fn() -> bool + Sync),
+        on_acquired: &ConnectionAcquiredObserver,
+    ) -> io::Result<(Vec<Arc<ConnectionHandle>>, u64)> {
         let initial_workspace_generation = self.workspace_generation.load(Ordering::Acquire);
         if initial_workspace_generation & 1 != 0 || !admit() {
             return Err(io::Error::new(
@@ -2967,11 +3007,12 @@ impl LanguageServerPool {
             return Ok((Vec::new(), initial_workspace_generation));
         }
         let primary = self
-            .get_or_create_workspace_connection_wait_ready_admitted(
+            .get_or_create_workspace_connection_wait_ready_admitted_inner(
                 server_name,
                 server_config,
                 timeout,
                 admit,
+                Some(on_acquired),
             )
             .await;
         let Some(folders) = self.workspace_folders() else {
@@ -3067,18 +3108,21 @@ impl LanguageServerPool {
         // instead of inheriting an exhausted primary budget.
         let secondary_timeout = timeout;
         let acquisitions = targets.map(|(key, root, folder)| async move {
-            self.acquire_resolved_wait_ready(
-                server_name,
-                server_config,
-                key,
-                Some((root, folder)),
-                WaitReadyOptions {
-                    timeout: secondary_timeout,
-                    rootless: false,
-                    admit: Some(&workspace_admit),
-                },
-            )
-            .await
+            let handle = self
+                .acquire_resolved_wait_ready(
+                    server_name,
+                    server_config,
+                    key,
+                    Some((root, folder)),
+                    WaitReadyOptions {
+                        timeout: secondary_timeout,
+                        rootless: false,
+                        admit: Some(&workspace_admit),
+                    },
+                    Some(on_acquired),
+                )
+                .await?;
+            Ok::<_, io::Error>(handle)
         });
         for handle in futures::future::join_all(acquisitions)
             .await
@@ -3179,6 +3223,7 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
         admit: Option<&(dyn Fn() -> bool + Sync)>,
+        on_acquired: Option<&ConnectionAcquiredObserver>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         // `timeout` is the caller's overall budget; the incapable-shared divert
         // below acquires a second connection, so track elapsed time and hand it
@@ -3207,6 +3252,7 @@ impl LanguageServerPool {
                     rootless,
                     admit,
                 },
+                on_acquired,
             )
             .await?;
 
@@ -3257,6 +3303,7 @@ impl LanguageServerPool {
                             rootless: false,
                             admit,
                         },
+                        on_acquired,
                     )
                     .await;
             }
@@ -3284,6 +3331,7 @@ impl LanguageServerPool {
         connection_key: ConnectionKey,
         marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         options: WaitReadyOptions<'_>,
+        on_acquired: Option<&ConnectionAcquiredObserver>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         let WaitReadyOptions {
             timeout,
@@ -3303,6 +3351,7 @@ impl LanguageServerPool {
                 timeout,
                 rootless,
                 admit,
+                on_acquired,
             )
             .await
         {
@@ -3337,6 +3386,9 @@ impl LanguageServerPool {
                             io::Error::other("bridge: connection disappeared during wait")
                         })?
                 };
+                if let Some(on_acquired) = on_acquired {
+                    on_acquired(&handle);
+                }
                 handle.wait_for_ready(timeout).await?;
                 if admit.is_some_and(|admit| !admit()) {
                     return Err(io::Error::new(
@@ -3797,6 +3849,7 @@ impl LanguageServerPool {
             timeout,
             rootless,
             admit,
+            None,
         )
         .await
     }
@@ -3822,6 +3875,7 @@ impl LanguageServerPool {
         timeout: Duration,
         rootless: bool,
         admit: Option<&(dyn Fn() -> bool + Sync)>,
+        on_acquired: Option<&ConnectionAcquiredObserver>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         let mut connections = self.connections.lock().await;
 
@@ -3890,6 +3944,9 @@ impl LanguageServerPool {
                 let handle = existing.cloned().ok_or_else(|| {
                     io::Error::other("bridge: connection disappeared before ReturnExisting")
                 })?;
+                if let Some(on_acquired) = on_acquired {
+                    on_acquired(&handle);
+                }
                 // Release the pool lock before announcing: `announce_shared_root`
                 // re-locks `connections` itself for its Arc::ptr_eq liveness
                 // check, so it must not be held here (the tokio mutex is not
@@ -4091,6 +4148,9 @@ impl LanguageServerPool {
 
         // Insert into pool immediately so concurrent requests see Initializing state
         connections.insert(connection_key.clone(), Arc::clone(&handle));
+        if let Some(on_acquired) = on_acquired {
+            on_acquired(&handle);
+        }
 
         // Release lock before spawning handshake task
         drop(connections);
@@ -7844,6 +7904,7 @@ mod tests {
                 Duration::from_millis(100),
                 true,
                 None,
+                None,
             )
             .await;
 
@@ -9709,6 +9770,67 @@ mod tests {
             // - May be Initializing if timeout hasn't elapsed yet
             // - May be Failed if handshake timed out
         }
+    }
+
+    #[tokio::test]
+    async fn acquisition_observer_runs_before_the_detached_handshake_wait() {
+        let pool = LanguageServerPool::new();
+        let config = devnull_config();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_handles = Arc::clone(&observed);
+        let on_acquired = move |handle: &Arc<ConnectionHandle>| {
+            observed_handles.lock().unwrap().push(Arc::clone(handle));
+        };
+        let admit = || true;
+        let acquire = pool.get_or_create_connection_wait_ready_with_admit(
+            "observed",
+            &config,
+            None,
+            Duration::from_secs(1),
+            Some(&admit),
+            Some(&on_acquired),
+        );
+        tokio::pin!(acquire);
+
+        assert!(futures::poll!(acquire.as_mut()).is_pending());
+        assert_eq!(
+            observed.lock().unwrap().len(),
+            1,
+            "the handle must be observable before cancellation can drop the handshake wait"
+        );
+        drop(acquire);
+    }
+
+    #[tokio::test]
+    async fn acquisition_observer_retains_a_handle_when_later_admission_fails() {
+        let pool = LanguageServerPool::new();
+        let config = devnull_config();
+        let key = ConnectionKey::for_server("observed-existing");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.record_launch_config(&config);
+        pool.connections
+            .lock()
+            .await
+            .insert(key, Arc::clone(&handle));
+        let admitted = AtomicBool::new(true);
+        let observed = std::sync::Mutex::new(Vec::new());
+        let on_acquired = |handle: &Arc<ConnectionHandle>| {
+            observed.lock().unwrap().push(Arc::clone(handle));
+            admitted.store(false, Ordering::Release);
+        };
+
+        let result = pool
+            .get_or_create_workspace_connections_wait_ready_admitted_observed(
+                "observed-existing",
+                &config,
+                Duration::from_secs(1),
+                &|| admitted.load(Ordering::Acquire),
+                &on_acquired,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(observed.lock().unwrap().len(), 1);
     }
 
     /// Test that ensure_server_ready is idempotent - calling twice doesn't spawn a second server.

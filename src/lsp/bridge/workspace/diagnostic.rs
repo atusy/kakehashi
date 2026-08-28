@@ -432,29 +432,47 @@ fn combine_complete_provider_reports(
     >,
 ) -> io::Result<Option<Vec<ProviderDiagnosticReport>>> {
     let mut completed = Vec::new();
+    let mut incomplete = false;
+    let mut server_cancelled = None;
     for (identifier, report) in reports {
         let report = match report {
             Ok(Some(report)) => report,
-            Ok(None) => return Ok(None),
+            Ok(None) => {
+                incomplete = true;
+                continue;
+            }
             Err(error)
                 if error.get_ref().is_some_and(|error| {
                     error.is::<crate::error::WorkspaceDiagnosticServerCancelled>()
                 }) =>
             {
-                return Err(error);
+                if server_cancelled.is_none() {
+                    server_cancelled = Some(error);
+                }
+                continue;
             }
-            Err(_) => return Ok(None),
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
         };
         if !report
             .items
             .iter()
             .all(|item| matches!(item, WorkspaceDocumentDiagnosticReport::Full(_)))
         {
-            return Ok(None);
+            incomplete = true;
+            continue;
         }
         completed.push(ProviderDiagnosticReport { identifier, report });
     }
-    Ok(Some(completed))
+    if let Some(error) = server_cancelled {
+        Err(error)
+    } else if incomplete {
+        Ok(None)
+    } else {
+        Ok(Some(completed))
+    }
 }
 
 #[cfg(test)]
@@ -493,14 +511,24 @@ impl LanguageServerPool {
     ) -> io::Result<Vec<CompletedDiagnosticProducer>> {
         let mut completed = Vec::new();
         let mut first_error = None;
+        let mut server_cancelled = None;
         for contribution in contributions {
             match contribution {
                 Ok(mut contribution) => completed.append(&mut contribution),
+                Err(error)
+                    if error.get_ref().is_some_and(|error| {
+                        error.is::<crate::error::WorkspaceDiagnosticServerCancelled>()
+                    }) =>
+                {
+                    if server_cancelled.is_none() {
+                        server_cancelled = Some(error);
+                    }
+                }
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
             }
         }
-        if let Some(error) = first_error {
+        if let Some(error) = server_cancelled.or(first_error) {
             self.mark_workspace_diagnostic_pulls_completed(
                 completed.iter().map(|producer| &producer.handle),
             );
@@ -870,12 +898,33 @@ impl LanguageServerPool {
             let params = params.clone();
             let upstream_id = upstream_id.clone();
             async move {
+                let pull_attempts = Arc::new(std::sync::Mutex::new(Vec::<
+                    WorkspaceDiagnosticPullAttempt,
+                >::new()));
+                let observed_attempts = Arc::clone(&pull_attempts);
+                let upstream_tx = self.upstream_tx();
+                let on_acquired = move |handle: &Arc<ConnectionHandle>| {
+                    let mut attempts = observed_attempts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if attempts
+                        .iter()
+                        .any(|attempt| Arc::ptr_eq(&attempt.handle, handle))
+                    {
+                        return;
+                    }
+                    attempts.push(WorkspaceDiagnosticPullAttempt {
+                        handle: Arc::clone(handle),
+                        upstream_tx: upstream_tx.clone(),
+                    });
+                };
                 let (handles, workspace_generation) = self
-                    .get_or_create_workspace_connections_wait_ready_admitted(
+                    .get_or_create_workspace_connections_wait_ready_admitted_observed(
                         &name,
                         &config,
                         Duration::from_secs(INIT_TIMEOUT_SECS),
                         admit,
+                        &on_acquired,
                     )
                     .await?;
                 if workspace_generation != request_workspace_generation {
@@ -889,10 +938,17 @@ impl LanguageServerPool {
                 let producers = handles.into_iter().map(|handle| {
                     let params = params.clone();
                     let upstream_id = upstream_id.clone();
+                    let pull_attempts = Arc::clone(&pull_attempts);
                     async move {
-                        let pull_attempt = WorkspaceDiagnosticPullAttempt {
-                            handle: Arc::clone(&handle),
-                            upstream_tx: self.upstream_tx(),
+                        let pull_attempt = {
+                            let mut attempts = pull_attempts
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let index = attempts
+                                .iter()
+                                .position(|attempt| Arc::ptr_eq(&attempt.handle, &handle))
+                                .expect("every acquired diagnostic handle has an attempt guard");
+                            attempts.swap_remove(index)
                         };
                         let generation = self.document_connection_generation(handle.key());
                         let virtual_uris = Arc::new(
@@ -1677,6 +1733,43 @@ mod tests {
             assert_eq!(upstream.code.code(), -32802);
             assert_eq!(upstream.data, data);
         }
+        let typed =
+            crate::error::WorkspaceDiagnosticServerCancelled::from_response(&response(None))
+                .unwrap();
+        let provider_error = combine_complete_provider_reports([
+            (None, Err(io::Error::other("ordinary failure"))),
+            (None, Err(io::Error::new(io::ErrorKind::Interrupted, typed))),
+        ]);
+        let provider_error = match provider_error {
+            Err(error) => error,
+            Ok(_) => panic!("later ServerCancelled must win provider aggregation"),
+        };
+        assert_eq!(
+            crate::error::map_workspace_diagnostic_error(provider_error)
+                .code
+                .code(),
+            -32802
+        );
+
+        let typed =
+            crate::error::WorkspaceDiagnosticServerCancelled::from_response(&response(None))
+                .unwrap();
+        let pool = LanguageServerPool::new();
+        let server_error: io::Result<Vec<CompletedDiagnosticProducer>> = pool
+            .collect_completed_workspace_diagnostic_requests([
+                Err(io::Error::other("ordinary failure")),
+                Err(io::Error::new(io::ErrorKind::Interrupted, typed)),
+            ]);
+        let server_error = match server_error {
+            Err(error) => error,
+            Ok(_) => panic!("later ServerCancelled must win server aggregation"),
+        };
+        assert_eq!(
+            crate::error::map_workspace_diagnostic_error(server_error)
+                .code
+                .code(),
+            -32802
+        );
         assert!(
             crate::error::WorkspaceDiagnosticServerCancelled::from_response(&response(Some(
                 serde_json::json!({ "retriggerRequest": false })
