@@ -569,9 +569,11 @@ fn main() {
                         },
                         "textDocumentSync": 1
                     }),
-                    "workspace-diagnostic-dynamic" => json!({
-                        "textDocumentSync": 1
-                    }),
+                    "workspace-diagnostic-dynamic" | "workspace-diagnostic-dynamic-cancel" => {
+                        json!({
+                            "textDocumentSync": 1
+                        })
+                    }
                     _ => json!({
                         "documentFormattingProvider": true,
                         "textDocumentSync": 1
@@ -604,7 +606,12 @@ fn main() {
                     );
                 }
             }
-            "initialized" if mode == "workspace-diagnostic-dynamic" => {
+            "initialized"
+                if matches!(
+                    mode.as_str(),
+                    "workspace-diagnostic-dynamic" | "workspace-diagnostic-dynamic-cancel"
+                ) =>
+            {
                 request_with_params(
                     &mut writer,
                     json!(900),
@@ -633,7 +640,11 @@ fn main() {
                     }),
                 );
             }
-            "" if mode == "workspace-diagnostic-dynamic" && id == Some(json!(900)) => {
+            "" if matches!(
+                mode.as_str(),
+                "workspace-diagnostic-dynamic" | "workspace-diagnostic-dynamic-cancel"
+            ) && id == Some(json!(900)) =>
+            {
                 notify(
                     &mut writer,
                     "window/logMessage",
@@ -823,6 +834,9 @@ fn main() {
             }
             "$/cancelRequest" => {
                 record_mock_event(&mode, "cancel", &message);
+                if mode == "workspace-diagnostic-dynamic-cancel" {
+                    increment_mock_event_count(&mode, "cancel");
+                }
             }
             "textDocument/willSaveWaitUntil" => {
                 // `will-save-slow` stalls past kakehashi's 5s save budget so the
@@ -1368,7 +1382,10 @@ fn main() {
             }
             "workspace/diagnostic" => {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
-                if mode == "workspace-diagnostic-dynamic" {
+                if matches!(
+                    mode.as_str(),
+                    "workspace-diagnostic-dynamic" | "workspace-diagnostic-dynamic-cancel"
+                ) {
                     let identifier = params
                         .get("identifier")
                         .and_then(Value::as_str)
@@ -1378,6 +1395,9 @@ fn main() {
                         &format!("workspace-diagnostic-{identifier}"),
                         &message,
                     );
+                    if mode == "workspace-diagnostic-dynamic-cancel" {
+                        continue;
+                    }
                     let isolated = matches!(identifier, "alpha" | "zeta")
                         && params
                             .get("previousResultIds")
