@@ -29,7 +29,9 @@ only from the same live connection generation.
 Send each producer an empty `previousResultIds` list, its own statically or
 dynamically declared provider identifier, and no progress tokens. If one server
 registers multiple workspace-diagnostic providers, query each provider with its
-own identifier. Aggregate only full reports and omit downstream result ids from
+own identifier. Registrations that share an identifier (including an omitted
+identifier) describe the same wire-addressable provider and are queried once.
+Aggregate only full reports and omit downstream result ids from
 the upstream response. For the same URI, concatenate diagnostics in stable
 server-name order. Downstream document versions are connection-local rather
 than comparable revisions; retain a version only when every contributor agrees,
