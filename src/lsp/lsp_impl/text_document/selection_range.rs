@@ -166,11 +166,12 @@ impl Kakehashi {
         };
 
         // Get language for document
-        let Some(language_name) = self.document_bridge_language(&uri) else {
+        let Some(bridge_language) = self.document_bridge_language(&uri) else {
             return Ok(None);
         };
+        let parser_language = self.document_language(&uri);
         let expected_settings_generation = self.cache.semantic_token_generation();
-        let layer_config = self.resolve_layer_config(&language_name, METHOD);
+        let layer_config = self.resolve_layer_config(&bridge_language, METHOD);
         let has_parse_layer =
             layer_config.allows(LayerSource::Virt) || layer_config.allows(LayerSource::Native);
         let allows_host = layer_config.allows(LayerSource::Host);
@@ -197,11 +198,16 @@ impl Kakehashi {
         }
 
         // Ensure language is loaded (handles race condition with didOpen)
-        let load_result = self
-            .language
-            .ensure_language_loaded_async(&language_name)
-            .await;
-        if !load_result.success {
+        let parser_ready = match parser_language {
+            Some(language) => {
+                self.language
+                    .ensure_language_loaded_async(&language)
+                    .await
+                    .success
+            }
+            None => false,
+        };
+        if !parser_ready {
             return if let Some(host) = host_results.take() {
                 Ok(host.into_complete())
             } else if allows_host {
@@ -768,6 +774,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selected, Some(7));
+    }
+
+    #[tokio::test]
+    async fn explicit_host_language_keeps_path_detected_native_selection() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let uri = url::Url::parse("file:///test/host-routed-native.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() { value }\n".to_string(),
+            Some("hostonly".to_string()),
+            None,
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("rust grammar");
+        let text = "fn main() { value }\n";
+        let tree = parser.parse(text, None).expect("rust tree");
+        let incarnation = server
+            .documents
+            .latest_snapshot(&uri)
+            .expect("document must be open")
+            .slot
+            .current_incarnation;
+        let published = server.documents.get(&uri).is_some_and(|document| {
+            document.publish_snapshot(std::sync::Arc::new(
+                crate::document::snapshot::ParseSnapshot {
+                    text: std::sync::Arc::from(text),
+                    tree: Some(tree),
+                    language: Some("rust".to_string()),
+                    parsed_version: 0,
+                    incarnation,
+                    injection_regions: None,
+                    bridge_regions: None,
+                    resolved_regions: None,
+                    layer_trees: std::sync::OnceLock::new(),
+                },
+            ))
+        });
+        assert!(published);
+        assert_eq!(server.document_language(&uri).as_deref(), Some("rust"));
+        assert_eq!(
+            server.document_bridge_language(&uri).as_deref(),
+            Some("hostonly")
+        );
+
+        let result = server
+            .selection_range_impl(SelectionRangeParams {
+                text_document: TextDocumentIdentifier {
+                    uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("LSP URI"),
+                },
+                positions: vec![Position::new(0, 14)],
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .expect("selectionRange should succeed");
+        assert!(
+            result.is_some_and(|ranges| ranges.len() == 1),
+            "native selection must remain available through the path-detected rust parser"
+        );
     }
 
     #[test]
