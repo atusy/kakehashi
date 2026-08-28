@@ -1,5 +1,6 @@
 //! Selection range method for Kakehashi.
 
+use futures::FutureExt;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     PartialResultParams, Position, SelectionRange, SelectionRangeParams, TextDocumentIdentifier,
@@ -453,7 +454,9 @@ impl Kakehashi {
                         .await
                     }?;
                     Ok(selection.map(|selection| (selection, SelectionLayer::Host)))
-                };
+                }
+                .boxed()
+                .shared();
                 let native = async {
                     if !native_enabled {
                         Ok(None)
@@ -473,7 +476,15 @@ impl Kakehashi {
                     }
                 };
                 let result = self
-                    .walk_layer_futures(&lsp_uri, METHOD, METHOD, virt, host, native, |_| true)
+                    .walk_layer_futures(
+                        &lsp_uri,
+                        METHOD,
+                        METHOD,
+                        virt,
+                        host.clone(),
+                        native,
+                        |_| true,
+                    )
                     .await?;
                 let Some((mut result, source)) = result else {
                     // The protocol requires one result for every input position;
@@ -500,20 +511,7 @@ impl Kakehashi {
                                 }
                             }
                             LayerSource::Host => {
-                                if reusable_host_results.is_some() {
-                                    reusable_host_results
-                                        .and_then(|host| host.results.get(index))
-                                        .cloned()
-                                        .flatten()
-                                } else {
-                                    self.selection_range_host_layer(
-                                        &lsp_uri,
-                                        position,
-                                        expected_incarnation,
-                                        expected_version,
-                                    )
-                                    .await?
-                                }
+                                host.clone().await?.map(|(selection, _)| selection)
                             }
                             _ => None,
                         };
