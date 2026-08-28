@@ -2332,6 +2332,7 @@ impl LanguageServerPool {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn record_latest_virtual_content(
         &self,
         host_uri: &Url,
@@ -2340,6 +2341,42 @@ impl LanguageServerPool {
         language: &str,
         region_id: &str,
         content: &str,
+    ) {
+        self.record_latest_virtual_content_batch(
+            host_uri,
+            incarnation,
+            content_version,
+            std::iter::once((language, region_id, content)),
+        );
+    }
+
+    pub(crate) fn record_latest_virtual_contents(
+        &self,
+        host_uri: &Url,
+        incarnation: u64,
+        content_version: u64,
+        injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
+    ) {
+        self.record_latest_virtual_content_batch(
+            host_uri,
+            incarnation,
+            content_version,
+            injections.iter().map(|injection| {
+                (
+                    injection.language.as_str(),
+                    injection.region_id.as_str(),
+                    injection.content.as_str(),
+                )
+            }),
+        );
+    }
+
+    fn record_latest_virtual_content_batch<'a>(
+        &self,
+        host_uri: &Url,
+        incarnation: u64,
+        content_version: u64,
+        contents: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
     ) {
         let Some(host) = self.latest_virtual_contents.get(host_uri) else {
             return;
@@ -2351,22 +2388,27 @@ impl LanguageServerPool {
             .publication
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (language, region_id, content) in contents {
+            if let Some(regions) = host.contents.get(language) {
+                if regions
+                    .get(region_id)
+                    .is_some_and(|cached| cached.as_ref() == content)
+                {
+                    continue;
+                }
+                regions.insert(region_id.to_string(), Arc::<str>::from(content));
+            } else {
+                host.contents
+                    .entry(language.to_string())
+                    .or_default()
+                    .insert(region_id.to_string(), Arc::<str>::from(content));
+            }
+        }
+        // Publish the host revision only after every region from this edit is
+        // visible. Readers take the matching read lock and therefore cannot
+        // pair this revision with a partially updated injection batch.
         host.content_version
             .store(content_version, Ordering::Release);
-        if let Some(regions) = host.contents.get(language) {
-            if regions
-                .get(region_id)
-                .is_some_and(|cached| cached.as_ref() == content)
-            {
-                return;
-            }
-            regions.insert(region_id.to_string(), Arc::<str>::from(content));
-            return;
-        }
-        host.contents
-            .entry(language.to_string())
-            .or_default()
-            .insert(region_id.to_string(), Arc::<str>::from(content));
     }
 
     /// The document's lifecycle lock, created on first use. Transitions lock it
@@ -6943,6 +6985,56 @@ mod tests {
                 content.as_deref(),
                 Some(format!("revision-{revision}").as_str())
             );
+            tokio::task::yield_now().await;
+        }
+        writer.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn latest_virtual_content_batch_publishes_all_regions_with_one_revision() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/cache-batch-publication.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let batch = |revision: u64| {
+            [TEST_ULID_LUA_0, TEST_ULID_LUA_1]
+                .into_iter()
+                .map(|region_id| super::super::coordinator::BridgeInjection {
+                    language: "lua".to_string(),
+                    region_id: region_id.to_string(),
+                    content: format!("{region_id}-revision-{revision}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        pool.record_latest_virtual_contents(&host_uri, 1, 0, &batch(0));
+
+        let writer_pool = Arc::clone(&pool);
+        let writer_uri = host_uri.clone();
+        let writer = tokio::spawn(async move {
+            for revision in 1..=10_000 {
+                writer_pool.record_latest_virtual_contents(
+                    &writer_uri,
+                    1,
+                    revision,
+                    &batch(revision),
+                );
+                tokio::task::yield_now().await;
+            }
+        });
+
+        while !writer.is_finished() {
+            let host = pool.latest_virtual_contents.get(&host_uri).unwrap();
+            let _publication = host
+                .publication
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let revision = host.content_version.load(Ordering::Acquire);
+            let regions = host.contents.get("lua").unwrap();
+            for region_id in [TEST_ULID_LUA_0, TEST_ULID_LUA_1] {
+                assert_eq!(
+                    regions.get(region_id).as_deref().map(Arc::as_ref),
+                    Some(format!("{region_id}-revision-{revision}").as_str())
+                );
+            }
             tokio::task::yield_now().await;
         }
         writer.await.unwrap();

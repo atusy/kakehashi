@@ -68,15 +68,9 @@ impl LanguageServerPool {
             return;
         };
 
+        self.record_latest_virtual_contents(host_uri, incarnation, content_version, injections);
+
         for injection in injections {
-            self.record_latest_virtual_content(
-                host_uri,
-                incarnation,
-                content_version,
-                &injection.language,
-                &injection.region_id,
-                &injection.content,
-            );
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
             let connection_keys = self.connections_opening_or_opened(&virtual_uri);
