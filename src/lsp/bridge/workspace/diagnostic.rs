@@ -391,24 +391,38 @@ impl LanguageServerPool {
                 )
             })
             .collect::<Vec<_>>();
-        // Acquire the final producer snapshot before fencing provenance so no
-        // non-Send std read guard crosses an await. Everything from URI
-        // sanitization through response acceptance is synchronous below.
-        let connections = self.connections().await;
         let _provenance_guards = provenance_observers
             .iter()
             .map(|observer| observer.provenance_read_guard())
+            .collect::<Vec<_>>();
+        let provenance_revisions = provenance_observers
+            .iter()
+            .map(|observer| observer.provenance_revision())
             .collect::<Vec<_>>();
         let reports = admitted
             .into_iter()
             .map(|completed| sanitize_report(completed.report, &completed.virtual_uris));
         let result = aggregate_reports(reports);
+        drop(_provenance_guards);
         if !admit() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "workspace diagnostic admission expired after final aggregation",
             ));
         }
+        // Report processing above can be linear in the complete workspace
+        // payload, so do not retain the pool-wide connection lock through it.
+        // Reacquire both short final fences afterward: a provenance revision
+        // change rejects the already-sanitized result instead of leaking a URI.
+        let connections = self.connections().await;
+        let _provenance_guards = provenance_observers
+            .iter()
+            .map(|observer| observer.provenance_read_guard())
+            .collect::<Vec<_>>();
+        let provenance_stale = provenance_observers
+            .iter()
+            .zip(provenance_revisions)
+            .any(|(observer, revision)| observer.provenance_revision() != revision);
         let producers_stale = provider_plans.iter().any(|(handle, generation, plan)| {
             connections.get(handle.key()).is_none_or(|live| {
                 !Arc::ptr_eq(live, handle)
@@ -417,7 +431,7 @@ impl LanguageServerPool {
                     || diagnostic_providers(handle) != *plan
             })
         });
-        if producers_stale || !admit() {
+        if provenance_stale || producers_stale || !admit() {
             self.release_changed_provider_refreshes(
                 provider_plans
                     .iter()
@@ -1245,7 +1259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_acceptance_keeps_the_provenance_fence_after_sanitizing() {
+    async fn final_acceptance_rejects_provenance_changed_after_sanitizing() {
         let pool = LanguageServerPool::new();
         let key = ConnectionKey::for_server("diagnostics");
         let handle = create_handle_with_key(ConnectionState::Ready, key).await;
@@ -1256,52 +1270,31 @@ mod tests {
         let virtual_uris =
             Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
         let checks = AtomicUsize::new(0);
-        let writer = std::sync::Mutex::new(None);
-        let finished = std::sync::Mutex::new(None);
 
-        pool.aggregate_admitted_workspace_diagnostic_reports(
-            [std::future::ready(Some(CompletedDiagnosticProducer {
-                provider_plan: Vec::new(),
-                handle,
-                generation,
-                report: WorkspaceDiagnosticReport::default(),
-                virtual_uris: Arc::clone(&virtual_uris),
-            }))],
-            &|| {
-                if checks.fetch_add(1, Ordering::SeqCst) == 2 {
-                    let observer = Arc::clone(&virtual_uris);
-                    let (started_tx, started_rx) = std::sync::mpsc::channel();
-                    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
-                    *writer.lock().unwrap() = Some(std::thread::spawn(move || {
-                        started_tx.send(()).unwrap();
-                        observer.insert_provenance_for_test(
+        let result = pool
+            .aggregate_admitted_workspace_diagnostic_reports(
+                [std::future::ready(Some(CompletedDiagnosticProducer {
+                    provider_plan: Vec::new(),
+                    handle,
+                    generation,
+                    report: WorkspaceDiagnosticReport::default(),
+                    virtual_uris: Arc::clone(&virtual_uris),
+                }))],
+                &|| {
+                    if checks.fetch_add(1, Ordering::SeqCst) == 2 {
+                        virtual_uris.insert_provenance_for_test(
                             "kakehashi-virt:///after-sanitize.lua".into(),
                         );
-                        finished_tx.send(()).unwrap();
-                    }));
-                    started_rx.recv().unwrap();
-                    assert!(
-                        finished_rx
-                            .recv_timeout(std::time::Duration::from_millis(20))
-                            .is_err(),
-                        "virtual URI issuance must remain fenced through final acceptance"
-                    );
-                    *finished.lock().unwrap() = Some(finished_rx);
-                }
-                true
-            },
-        )
-        .await
-        .expect("aggregate should be accepted");
+                    }
+                    true
+                },
+            )
+            .await;
 
-        finished
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap()
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("URI issuance resumes after response acceptance");
-        writer.lock().unwrap().take().unwrap().join().unwrap();
+        assert!(
+            result.is_err(),
+            "a provenance change after sanitization must reject the response"
+        );
     }
 
     #[tokio::test]
