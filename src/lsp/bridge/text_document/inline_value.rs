@@ -15,6 +15,7 @@ use super::super::protocol::{
     host_position_within_region_bounds, response_has_jsonrpc_error,
     translate_host_range_to_virtual, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
+use crate::text::PositionMapper;
 
 impl LanguageServerPool {
     #[allow(clippy::too_many_arguments)]
@@ -80,7 +81,12 @@ impl LanguageServerPool {
                 )
             },
             |response, ctx| {
-                transform_inline_value_response_to_host(response, ctx.offset, region_end)
+                transform_inline_value_response_to_host(
+                    response,
+                    ctx.offset,
+                    region_end,
+                    virtual_content,
+                )
             },
             None,
         )
@@ -119,6 +125,7 @@ fn transform_inline_value_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     region_end: Position,
+    virtual_content: &str,
 ) -> Option<Vec<InlineValue>> {
     if response_has_jsonrpc_error(&response, "textDocument/inlineValue") {
         return None;
@@ -128,15 +135,21 @@ fn transform_inline_value_response_to_host(
         return None;
     }
     let mut values: Vec<InlineValue> = serde_json::from_value(result).ok()?;
+    let mapper = PositionMapper::new(virtual_content);
     values.retain_mut(|value| {
         let range = match value {
             InlineValue::Text(value) => &mut value.range,
             InlineValue::VariableLookup(value) => &mut value.range,
             InlineValue::EvaluatableExpression(value) => &mut value.range,
         };
+        if range.start > range.end
+            || mapper.position_to_byte_strict(range.start).is_none()
+            || mapper.position_to_byte_strict(range.end).is_none()
+        {
+            return false;
+        }
         translate_virtual_range_to_host(range, offset);
-        range.start <= range.end
-            && host_position_within_region_bounds(range.start, offset, region_end)
+        host_position_within_region_bounds(range.start, offset, region_end)
             && host_position_within_region_bounds(range.end, offset, region_end)
     });
     (!values.is_empty()).then_some(values)
@@ -185,12 +198,14 @@ mod tests {
             { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 4 } }, "text": "text" },
             { "range": { "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 3 } }, "variableName": "x", "caseSensitiveLookup": true },
             { "range": { "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 3 } }, "expression": "x" },
-            { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } }, "text": "escape" }
+            { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 0 } }, "text": "escape" },
+            { "range": { "start": { "line": 0, "character": 999 }, "end": { "line": 1, "character": 4 } }, "text": "overlong" }
         ] });
         let values = transform_inline_value_response_to_host(
             response,
-            &RegionOffset::new(3, 2),
-            Position::new(3, 6),
+            &RegionOffset::with_per_line_offsets(3, vec![2, 2]),
+            Position::new(4, 6),
+            "code\nnext",
         )
         .unwrap();
         assert_eq!(values.len(), 3);
