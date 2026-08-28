@@ -680,14 +680,14 @@ impl Kakehashi {
     /// so an explicit LSP `languageId` remains routable while parser loading has
     /// failed or is still in progress.
     pub(super) fn document_bridge_language(&self, uri: &Url) -> Option<String> {
-        self.document_language(uri).or_else(|| {
-            let document = self.documents.get(uri)?;
-            let language_id = document.language_id()?;
-            Some(
-                self.language
-                    .canonical_injection_language(language_id, document.text()),
-            )
-        })
+        let document = self.documents.get(uri)?;
+        let language = self
+            .document_language(uri)
+            .or_else(|| document.language_id().map(str::to_owned))?;
+        Some(
+            self.language
+                .canonical_injection_language(&language, document.text()),
+        )
     }
 
     pub(super) fn bridge_configs_for_injection_language(

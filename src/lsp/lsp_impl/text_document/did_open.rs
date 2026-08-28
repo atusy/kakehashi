@@ -1296,6 +1296,67 @@ print("hello")
         assert_eq!(context.configs.len(), 1);
     }
 
+    #[tokio::test]
+    async fn parser_backed_alias_keeps_the_canonical_host_language() {
+        use std::str::FromStr;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language_servers = HashMap::from([(
+            "python_ls".to_string(),
+            BridgeServerConfig {
+                cmd: Some(vec!["python-ls".to_string()]),
+                languages: Some(vec!["python".to_string()]),
+                ..Default::default()
+            },
+        )]);
+        let languages = HashMap::from([(
+            "python".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::from([(
+                    HOST_BRIDGE_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        aggregation: None,
+                    },
+                )])),
+                ..Default::default()
+            },
+        )]);
+        let settings = WorkspaceSettings {
+            auto_install: false,
+            language_servers,
+            languages,
+            ..Default::default()
+        };
+        server.language.load_settings(&settings);
+        server.settings_manager.apply_settings(settings);
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("py".to_string(), tree_sitter_python::LANGUAGE.into());
+
+        let uri = Url::parse("file:///test/alias.py").unwrap();
+        let lsp_uri = tower_lsp_server::ls_types::Uri::from_str(uri.as_str()).unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "value = 1\n".to_string(),
+            Some("py".to_string()),
+            None,
+        );
+
+        assert_eq!(server.document_language(&uri).as_deref(), Some("py"));
+        assert_eq!(
+            server.document_bridge_language(&uri).as_deref(),
+            Some("python")
+        );
+        let context = server
+            .resolve_host_bridge_context(&lsp_uri, "textDocument/selectionRange")
+            .expect("a parser-backed alias must route through its canonical language");
+        assert_eq!(context.language_id, "python");
+        assert_eq!(context.configs.len(), 1);
+    }
+
     /// The shared freshness helper never parses inline (parse-snapshot ADR
     /// §3: the reader on-demand parse was a resurrection vector). With no
     /// reparse scheduled for a cleared tree, it returns within its bounded
