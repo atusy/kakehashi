@@ -447,14 +447,7 @@ impl Kakehashi {
         let progress_token = params.work_done_progress_params.work_done_token.clone();
         let upstream_id = current_upstream_id();
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
-        let host_only = self.document_language(&uri).is_some_and(|language| {
-            let layers = self.resolve_layer_config(&language, METHOD);
-            !layers.priorities.is_empty()
-                && layers
-                    .priorities
-                    .iter()
-                    .all(|source| *source == LayerSource::Host)
-        });
+        let host_only = self.semantic_tokens_full_is_host_only(&uri);
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
         // supersession, and cancellation contract. A current snapshot makes
@@ -1194,6 +1187,60 @@ impl Kakehashi {
         has_configured_region(regions)
     }
 
+    fn semantic_tokens_full_is_host_only(&self, uri: &Url) -> bool {
+        const METHOD: &str = "textDocument/semanticTokens/full";
+        self.document_language(uri).is_some_and(|language| {
+            let layers = self.resolve_layer_config(&language, METHOD);
+            !layers.priorities.is_empty()
+                && layers
+                    .priorities
+                    .iter()
+                    .all(|source| *source == LayerSource::Host)
+        })
+    }
+
+    async fn semantic_tokens_delta_reenter_full(
+        &self,
+        uri: &Url,
+        full_params: SemanticTokensParams,
+        request_id: crate::lsp::cache::RequestId,
+        cancel_token: crate::cancel::CancelToken,
+        cancel_rx: &mut Option<crate::lsp::request_id::CancelReceiver>,
+    ) -> Result<Option<SemanticTokensFullDeltaResult>> {
+        let full = self.semantic_tokens_full_impl_with_tracking(
+            full_params,
+            Some((request_id, cancel_token.clone())),
+        );
+        let result = match cancel_rx.as_mut() {
+            Some(cancel_rx) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx => {
+                        cancel_token.cancel();
+                        self.cache.finish_request(uri, request_id);
+                        return Err(Error::request_cancelled());
+                    },
+                    result = full => result,
+                }
+            }
+            None => full.await,
+        };
+        self.cache.finish_request(uri, request_id);
+        result.map(|result| {
+            result.map(|result| match result {
+                SemanticTokensResult::Tokens(tokens) => {
+                    SemanticTokensFullDeltaResult::Tokens(tokens)
+                }
+                SemanticTokensResult::Partial(partial) => {
+                    SemanticTokensFullDeltaResult::Tokens(SemanticTokens {
+                        result_id: None,
+                        data: partial.data,
+                    })
+                }
+            })
+        })
+    }
+
     pub(crate) async fn semantic_tokens_full_delta_impl(
         &self,
         params: SemanticTokensDeltaParams,
@@ -1242,6 +1289,22 @@ impl Kakehashi {
                 uri, request_id
             );
             return Ok(None);
+        }
+
+        // A host-only full request is parser-independent. Re-enter it before
+        // waiting for a native snapshot so a configuration reload cannot make
+        // a client carrying a native resultId take a different path from a
+        // direct full request.
+        if self.semantic_tokens_full_is_host_only(&uri) {
+            return self
+                .semantic_tokens_delta_reenter_full(
+                    &uri,
+                    full_params,
+                    request_id,
+                    cancel_token,
+                    &mut cancel_rx,
+                )
+                .await;
         }
 
         // Serve-current (ADR §3, revised): park until the snapshot matches the
@@ -1310,38 +1373,15 @@ impl Kakehashi {
                 )
                 .await
         {
-            let full = self.semantic_tokens_full_impl_with_tracking(
-                full_params,
-                Some((request_id, cancel_token.clone())),
-            );
-            let result = match cancel_rx.as_mut() {
-                Some(cancel_rx) => {
-                    tokio::select! {
-                        biased;
-                        _ = cancel_rx => {
-                            cancel_token.cancel();
-                            self.cache.finish_request(&uri, request_id);
-                            return Err(Error::request_cancelled());
-                        },
-                        result = full => result,
-                    }
-                }
-                None => full.await,
-            };
-            self.cache.finish_request(&uri, request_id);
-            return result.map(|result| {
-                result.map(|result| match result {
-                    SemanticTokensResult::Tokens(tokens) => {
-                        SemanticTokensFullDeltaResult::Tokens(tokens)
-                    }
-                    SemanticTokensResult::Partial(partial) => {
-                        SemanticTokensFullDeltaResult::Tokens(SemanticTokens {
-                            result_id: None,
-                            data: partial.data,
-                        })
-                    }
-                })
-            });
+            return self
+                .semantic_tokens_delta_reenter_full(
+                    &uri,
+                    full_params,
+                    request_id,
+                    cancel_token,
+                    &mut cancel_rx,
+                )
+                .await;
         }
 
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
@@ -2492,6 +2532,68 @@ mod tests {
         .await
         .expect("host-only semantic tokens must not wait for the first-parse backstop")
         .expect("semantic tokens full should return without error");
+        assert!(result.is_none(), "no host server is configured: {result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn host_only_delta_reentry_does_not_wait_for_a_native_snapshot() {
+        use crate::config::WorkspaceSettings;
+        use crate::config::settings::{LanguageSettings, LayerAggregationConfig, LayersConfig};
+        use std::collections::HashMap;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let mut aggregation = HashMap::new();
+        aggregation.insert(
+            "textDocument/semanticTokens/full".to_string(),
+            LayerAggregationConfig {
+                priorities: Some(vec![LayerSource::Host]),
+                strategy: None,
+            },
+        );
+        let mut languages = HashMap::new();
+        languages.insert(
+            "python".to_string(),
+            LanguageSettings {
+                layers: Some(LayersConfig {
+                    aggregation: Some(aggregation),
+                }),
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            languages,
+            auto_install: false,
+            ..Default::default()
+        });
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("python".to_string(), tree_sitter_python::LANGUAGE.into());
+
+        let uri = Url::parse("file:///semantic_delta_host_only.py").expect("valid test URI");
+        server.documents.insert(
+            uri.clone(),
+            "unparsed".to_string(),
+            Some("py".to_string()),
+            None,
+        );
+        let params = SemanticTokensDeltaParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+            },
+            previous_result_id: "native-before-reload".into(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            server.semantic_tokens_full_delta_impl(params),
+        )
+        .await
+        .expect("host-only delta re-entry must not wait for the first-parse backstop")
+        .expect("semantic tokens delta should return without error");
         assert!(result.is_none(), "no host server is configured: {result:?}");
     }
 
