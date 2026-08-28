@@ -17,9 +17,9 @@ fn build_baseline_capabilities(advertise_configuration: bool) -> ClientCapabilit
         DocumentSymbolClientCapabilities, DynamicRegistrationClientCapabilities,
         GeneralClientCapabilities, GotoCapability, HoverClientCapabilities,
         InlayHintClientCapabilities, PositionEncodingKind, SemanticTokensClientCapabilities,
-        SemanticTokensClientCapabilitiesRequests, SignatureHelpClientCapabilities,
-        TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities, TokenFormat,
-        WorkspaceClientCapabilities,
+        SemanticTokensClientCapabilitiesRequests, SemanticTokensFullOptions,
+        SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
+        TextDocumentSyncClientCapabilities, TokenFormat, WorkspaceClientCapabilities,
     };
 
     let goto_link = Some(GotoCapability {
@@ -85,7 +85,7 @@ fn build_baseline_capabilities(advertise_configuration: bool) -> ClientCapabilit
             dynamic_registration: Some(false),
             requests: SemanticTokensClientCapabilitiesRequests {
                 range: Some(true),
-                full: None,
+                full: Some(SemanticTokensFullOptions::Bool(true)),
             },
             token_types: crate::analysis::LEGEND_TYPES.to_vec(),
             token_modifiers: crate::analysis::LEGEND_MODIFIERS.to_vec(),
@@ -643,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn baseline_requests_range_tokens_in_the_bridge_legend() {
+    fn baseline_requests_range_and_full_tokens_in_the_bridge_legend() {
         let capability = build_baseline_capabilities(true)
             .text_document
             .and_then(|text_document| text_document.semantic_tokens)
@@ -651,7 +651,12 @@ mod tests {
 
         assert_eq!(capability.dynamic_registration, Some(false));
         assert_eq!(capability.requests.range, Some(true));
-        assert_eq!(capability.requests.full, None);
+        assert_eq!(
+            capability.requests.full,
+            Some(tower_lsp_server::ls_types::SemanticTokensFullOptions::Bool(
+                true
+            ))
+        );
         assert_eq!(capability.token_types, crate::analysis::LEGEND_TYPES);
         assert_eq!(
             capability.token_modifiers,
