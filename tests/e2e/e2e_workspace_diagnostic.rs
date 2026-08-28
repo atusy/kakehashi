@@ -126,7 +126,7 @@ fn workspace_diagnostic_starts_and_aggregates_cold_producers() {
         "an unopened real URI must not be filtered merely because its name looks virtual"
     );
     assert_eq!(items[1]["uri"], "file:///workspace/shared.rs");
-    assert_eq!(items[1]["version"], 4);
+    assert_eq!(items[1]["version"], serde_json::Value::Null);
     assert!(items[1].get("resultId").is_none());
     assert_eq!(
         items[1]["items"][0]["message"],

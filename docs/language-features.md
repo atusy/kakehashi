@@ -321,10 +321,10 @@ cross-layer priorities/strategy only — server-level `priorities`/
 Workspace diagnostic pulls start every explicitly configured, runnable server
 that supports them, including cold servers, and combine full reports for real
 workspace files. Reports for one URI are concatenated in stable server-name
-order. Providers on one exact downstream connection are first reconciled using
-that connection's version namespace, so an older provider result is discarded.
-The remaining numeric versions are bridge-local rather than editor document
-versions, so the upstream composite always uses `null`.
+order. Every provider contribution is retained because provider requests can
+cross a document close/reopen and downstream version counters can reset. Those
+numeric versions are also bridge-local rather than editor document versions, so
+the upstream composite always uses `null`.
 Downstream result IDs, provider identifiers, and progress tokens are not shared
 across producers, so workspace pulls currently return full, non-streamed
 reports. Internal virtual-document reports are filtered: open embedded regions
