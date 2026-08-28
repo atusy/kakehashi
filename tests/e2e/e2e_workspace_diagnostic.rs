@@ -2,6 +2,56 @@ use crate::helpers::lsp_client::LspClient;
 use serde_json::json;
 use std::time::Duration;
 
+fn init_dynamic_workspace_diagnostic_client(
+    mode: &str,
+) -> (LspClient, tempfile::TempDir, tempfile::TempDir) {
+    let config_dir = tempfile::TempDir::new().expect("config temp dir");
+    let config_path = config_dir.path().join("workspace_diagnostic_dynamic.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let events = tempfile::TempDir::new().expect("mock event dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("UTF-8 config path"))
+        .env(
+            "MOCK_LSP_CANCEL_DIR",
+            events.path().to_string_lossy().into_owned(),
+        )
+        .build();
+    let initialize = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": "file:///workspace",
+            "capabilities": {
+                "textDocument": { "diagnostic": {} },
+                "workspace": { "diagnostics": { "refreshSupport": true } }
+            },
+            "initializationOptions": {
+                "languageServers": {
+                    "dynamic-diagnostic": {
+                        "cmd": [env!("CARGO_BIN_EXE_mock-lsp-formatter"), mode],
+                        "languages": [],
+                        "forceStart": true
+                    }
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        initialize["result"]["capabilities"]["diagnosticProvider"]["workspaceDiagnostics"],
+        json!(true)
+    );
+    client.send_notification("initialized", json!({}));
+    client
+        .wait_for_notification_where(&["window/logMessage"], Duration::from_secs(10), |params| {
+            params["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("dynamic-diagnostics-registered"))
+        })
+        .expect("dynamic diagnostic registrations are acknowledged");
+    (client, config_dir, events)
+}
+
 #[test]
 fn workspace_diagnostic_starts_and_aggregates_cold_producers() {
     let config_dir = tempfile::TempDir::new().expect("config temp dir");
@@ -79,51 +129,8 @@ fn workspace_diagnostic_starts_and_aggregates_cold_producers() {
 
 #[test]
 fn workspace_diagnostic_sends_each_dynamic_provider_its_own_wire_params() {
-    let config_dir = tempfile::TempDir::new().expect("config temp dir");
-    let config_path = config_dir.path().join("workspace_diagnostic_dynamic.toml");
-    std::fs::write(&config_path, "").expect("write config");
-    let events = tempfile::TempDir::new().expect("mock event dir");
-    let mut client = LspClient::builder()
-        .arg("--config-file")
-        .arg(config_path.to_str().expect("UTF-8 config path"))
-        .env(
-            "MOCK_LSP_CANCEL_DIR",
-            events.path().to_string_lossy().into_owned(),
-        )
-        .build();
-
-    let initialize = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": "file:///workspace",
-            "capabilities": {
-                "textDocument": { "diagnostic": {} },
-                "workspace": { "diagnostics": { "refreshSupport": true } }
-            },
-            "initializationOptions": {
-                "languageServers": {
-                    "dynamic-diagnostic": {
-                        "cmd": [env!("CARGO_BIN_EXE_mock-lsp-formatter"), "workspace-diagnostic-dynamic"],
-                        "languages": [],
-                        "forceStart": true
-                    }
-                }
-            }
-        }),
-    );
-    assert_eq!(
-        initialize["result"]["capabilities"]["diagnosticProvider"]["workspaceDiagnostics"],
-        json!(true)
-    );
-    client.send_notification("initialized", json!({}));
-    client
-        .wait_for_notification_where(&["window/logMessage"], Duration::from_secs(10), |params| {
-            params["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("dynamic-diagnostics-registered"))
-        })
-        .expect("dynamic diagnostic registrations are acknowledged");
+    let (mut client, _config_dir, events) =
+        init_dynamic_workspace_diagnostic_client("workspace-diagnostic-dynamic");
 
     let response = client.send_request(
         "workspace/diagnostic",
