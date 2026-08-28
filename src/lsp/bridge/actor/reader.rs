@@ -1153,7 +1153,11 @@ async fn handle_server_request(
                 .send(UpstreamNotification::DiagnosticProviderChanged);
         }
     }
-    if workspace_diagnostics_unregistered {
+    if workspace_diagnostics_unregistered
+        && deps
+            .dynamic_capabilities
+            .has_workspace_diagnostic_contributed()
+    {
         let _ = deps
             .upstream_tx
             .send(UpstreamNotification::DiagnosticProviderChanged);
@@ -2263,6 +2267,7 @@ mod tests {
                 "interFileDependencies": true
             })),
         }]);
+        let _ = dynamic_capabilities.mark_workspace_diagnostic_contributed();
         assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
 
         let deps = ServerRequestDeps {
@@ -2334,6 +2339,7 @@ mod tests {
                 "interFileDependencies": true
             })),
         }]);
+        let _ = dynamic_capabilities.mark_workspace_diagnostic_contributed();
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
@@ -2375,6 +2381,57 @@ mod tests {
             upstream_rx.try_recv().expect("provider removal retry"),
             UpstreamNotification::DiagnosticProviderChanged
         );
+    }
+
+    #[tokio::test]
+    async fn unregister_cold_workspace_diagnostic_provider_does_not_refresh() {
+        let router = ResponseRouter::new();
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        dynamic_capabilities.register(vec![tower_lsp_server::ls_types::Registration {
+            id: "diag-1".into(),
+            method: "textDocument/diagnostic".into(),
+            register_options: Some(json!({ "workspaceDiagnostics": true })),
+        }]);
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let deps = ServerRequestDeps {
+            settings: Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
+            response_tx,
+            dynamic_capabilities: Arc::clone(&dynamic_capabilities),
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+        };
+
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "client/unregisterCapability",
+                "params": {
+                    "unregisterations": [{
+                        "id": "diag-1",
+                        "method": "textDocument/diagnostic"
+                    }]
+                }
+            }),
+            &router,
+            "",
+            &deps,
+        )
+        .await;
+
+        let _response = response_rx.recv().await.expect("unregistration response");
+        assert!(!dynamic_capabilities.has_registration("textDocument/diagnostic"));
+        assert!(upstream_rx.try_recv().is_err());
     }
 
     /// A downstream `window/workDoneProgress/create` is acknowledged to the
