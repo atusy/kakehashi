@@ -100,6 +100,19 @@ impl SemanticRequestTracker {
             .unwrap_or(false)
     }
 
+    /// Run a synchronous commit while this request still owns the URI entry.
+    /// A concurrent `start_request` must wait for the DashMap shard read guard,
+    /// making the ownership check and cache publication one atomic admission.
+    pub(crate) fn with_active<R>(
+        &self,
+        uri: &Url,
+        request_id: u64,
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let active = self.active_requests.get(uri)?;
+        (active.id == request_id).then(commit)
+    }
+
     /// Finishes a request, removing it from tracking if it's still the active one.
     /// This prevents memory leaks from completed requests.
     pub fn finish_request(&self, uri: &Url, request_id: u64) {
@@ -184,6 +197,25 @@ mod tests {
             !token2.is_cancelled(),
             "New request's token must stay active"
         );
+    }
+
+    #[test]
+    fn superseded_request_cannot_enter_an_atomic_commit() {
+        let tracker = SemanticRequestTracker::new();
+        let uri = Url::parse("file:///atomic-commit.rs").unwrap();
+        let (older, _) = tracker.start_request(&uri);
+        let (newer, _) = tracker.start_request(&uri);
+        let committed = std::sync::atomic::AtomicBool::new(false);
+
+        assert!(
+            tracker
+                .with_active(&uri, older, || {
+                    committed.store(true, Ordering::SeqCst);
+                })
+                .is_none()
+        );
+        assert!(!committed.load(Ordering::SeqCst));
+        assert!(tracker.with_active(&uri, newer, || ()).is_some());
     }
 
     #[test]
