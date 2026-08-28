@@ -459,6 +459,12 @@ impl DocumentTracker {
         if newly_opened {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
+        self.confirmed_document_versions
+            .lock()
+            .await
+            .entry(connection_key.clone())
+            .or_default()
+            .insert(uri_string.clone(), 1);
         drop(versions);
         notify.notify_waiters();
         true
@@ -619,7 +625,6 @@ impl DocumentTracker {
         Some(version)
     }
 
-    #[cfg(test)]
     pub(super) async fn confirmed_document_versions_for_connection(
         &self,
         connection_key: &ConnectionKey,
@@ -798,6 +803,14 @@ impl DocumentTracker {
         {
             docs.remove(&uri_string);
         }
+        if let Some(docs) = self
+            .confirmed_document_versions
+            .lock()
+            .await
+            .get_mut(connection_key)
+        {
+            docs.remove(&uri_string);
+        }
 
         self.decrement_opened(&uri_string);
         self.remove_from_reverse_index(&uri_string, connection_key);
@@ -844,6 +857,10 @@ impl DocumentTracker {
         self.document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::document_fingerprints")
+            .remove(connection_key);
+        self.confirmed_document_versions
+            .lock()
+            .await
             .remove(connection_key);
         for uri in &uris {
             self.decrement_opened(uri);
@@ -947,6 +964,14 @@ impl DocumentTracker {
             .document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::rollback_open_claim_if")
+            .get_mut(connection_key)
+        {
+            docs.remove(&uri_string);
+        }
+        if let Some(docs) = self
+            .confirmed_document_versions
+            .lock()
+            .await
             .get_mut(connection_key)
         {
             docs.remove(&uri_string);
