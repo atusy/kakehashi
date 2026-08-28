@@ -366,11 +366,11 @@ impl Kakehashi {
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
-        // supersession, and cancellation contract. Once it resolves, the shared
-        // A current snapshot makes whole-document bridge discovery immediate.
-        // When the first parse backstop expires, the no-snapshot path instead
-        // carries the live incarnation/content version through fan-out and
-        // revalidates that identity before returning.
+        // supersession, and cancellation contract. A current snapshot makes
+        // whole-document bridge discovery immediate. When the first-parse
+        // backstop expires instead, the no-snapshot path carries the live
+        // incarnation/content version through fan-out and revalidates that
+        // identity before returning.
         let Some(native_layer) = self
             .semantic_tokens_full_native_layer(params, &mut cancel_rx)
             .await?

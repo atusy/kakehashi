@@ -63,46 +63,26 @@ affects how we handle features that can return cross-file results.
 
 **Implement different bridge strategies based on LSP method characteristics, with careful handling of cross-file results and edit operations.**
 
-### Strategy 1: Parallel Fetch with Progressive Refinement
+### Strategy 1: Semantic Token Aggregation
 
 **Applies to**: `textDocument/semanticTokens/full`, `textDocument/semanticTokens/range`
 
-```
-                    ┌─────────────────────────────┐
- Request ──────────▶│      kakehashi          │
-                    │  ┌─────────────────────┐    │
-                    │  │ Tree-sitter tokens  │────│───▶ Immediate response
-                    │  │ (local, fast)       │    │     (use if bridge slow)
-                    │  └─────────────────────┘    │
-                    │           ▼                 │
-                    │  ┌─────────────────────┐    │
-                    │  │ Bridge to server    │────│───▶ rust-analyzer
-                    │  │ (async)             │    │
-                    │  └─────────────────────┘    │
-                    │           │                 │
-                    │           ▼                 │
-                    │  ┌─────────────────────┐    │
-                    │  │ Merge results       │────│───▶ Final response
-                    │  │ (prefer bridged)    │    │     (replaces initial)
-                    │  └─────────────────────┘    │
-                    └─────────────────────────────┘
-```
+**Full behavior**:
+1. Establish the native serve-current baseline, preserving cancellation,
+   supersession, and delta-cache semantics.
+2. Fan out to the selected host and virtual bridge layers and wait for the
+   barrier to settle.
+3. Return one synchronous merged response. Higher-priority spans replace
+   overlapping lower-priority spans; uncovered lower-layer fragments remain.
 
-**Behavior**:
-1. Fetch Tree-sitter tokens and bridged tokens **in parallel**
-2. If bridged response arrives first → use it directly
-3. If Tree-sitter response arrives first → return it immediately as provisional response
-4. When bridged response arrives → send updated tokens (via `textDocument/semanticTokens/full` refresh mechanism)
+**Range behavior**: For a range contained in an injection, query the selected
+virtual, host, and native layers with the `preferred` strategy. Remap downstream
+legends and coordinates, reject invalid transformations, and retain native
+tokens as the fallback.
 
-**Rationale**: Users see instant syntax highlighting from Tree-sitter while richer type-aware tokens arrive asynchronously.
-
-**Implemented refinement**: `semanticTokens/full` returns one synchronously
-merged response instead of trying to answer one JSON-RPC request twice. It
-first establishes the native serve-current baseline (preserving cancellation,
-supersession, and delta-cache semantics), then performs a barrier fan-out over
-the selected bridge layers. Higher-priority spans replace overlapping lower
-spans; uncovered lower-layer fragments remain. A later refresh-based temporal
-refinement can optimize latency without changing that merge result.
+**Rationale**: One JSON-RPC request has one response. Full requests therefore
+merge all selected layers before responding; range requests retain the
+lower-latency preferred-layer path appropriate to their bounded viewport.
 
 ### Strategy 2: Full Delegation with Response Filtering
 
@@ -358,7 +338,7 @@ When multiple servers are configured for a language:
 
 | Method | Merging Strategy (as implemented; rows marked *aspirational* never shipped) |
 |--------|------------------|
-| Semantic Tokens | Range: `preferred` for injection-contained requests, with legend remapping and native fallback. Full/delta progressive merge remains aspirational |
+| Semantic Tokens | Range: `preferred` for injection-contained requests, with legend remapping and native fallback. Full: synchronous native/host/virtual overlay. Full/delta bridging remains aspirational |
 | Go-to-Definition | `preferred`: first non-empty result (query in `priorities` order) |
 | Find References | `preferred` by default (first non-empty); *concatenate + dedupe is aspirational* |
 | Completion | `preferred` by default (first non-empty); *list merging is aspirational* |
