@@ -92,8 +92,12 @@ fn build_baseline_capabilities(advertise_configuration: bool) -> ClientCapabilit
             formats: vec![TokenFormat::RELATIVE],
             overlapping_token_support: Some(false),
             multiline_token_support: Some(false),
-            server_cancel_support: Some(true),
-            augments_syntax_tokens: Some(true),
+            // We neither retry ServerCancelled responses nor merge downstream
+            // tokens with native syntax tokens yet. Advertising either feature
+            // would let a conforming server omit data that this preferred-layer
+            // bridge cannot reconstruct.
+            server_cancel_support: None,
+            augments_syntax_tokens: None,
         }),
         // Without codeActionLiteralSupport, older servers fall back to
         // returning bare Commands only (issue #568). `dataSupport` +
@@ -659,6 +663,8 @@ mod tests {
         );
         assert_eq!(capability.overlapping_token_support, Some(false));
         assert_eq!(capability.multiline_token_support, Some(false));
+        assert_eq!(capability.server_cancel_support, None);
+        assert_eq!(capability.augments_syntax_tokens, None);
     }
 
     #[test]
