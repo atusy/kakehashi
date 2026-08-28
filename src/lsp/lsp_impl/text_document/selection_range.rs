@@ -35,6 +35,17 @@ impl HostSelectionPass {
     }
 }
 
+fn settle_timed_out_selection(
+    host: Option<Vec<SelectionRange>>,
+    has_stale_snapshot: bool,
+) -> Result<Option<Vec<SelectionRange>>> {
+    if host.is_some() || !has_stale_snapshot {
+        Ok(host)
+    } else {
+        Err(crate::error::content_modified_error())
+    }
+}
+
 fn parse_single_host_selection_range(
     value: serde_json::Value,
     position: Position,
@@ -254,20 +265,19 @@ impl Kakehashi {
                         // snapshot at all (first parse still running) → the
                         // pre-snapshot behavior: null.
                         Err(_elapsed) => {
-                            return if let Some(host) = host_results.take() {
-                                Ok(host.into_complete())
+                            let host = if let Some(host) = host_results.take() {
+                                host.into_complete()
                             } else if allows_host {
                                 self.selection_range_host_only(
                                     &lsp_uri,
                                     positions,
                                     expected_settings_generation,
                                 )
-                                .await
-                            } else if view.slot.snapshot.is_some() {
-                                Err(crate::error::content_modified_error())
+                                .await?
                             } else {
-                                Ok(None)
+                                None
                             };
+                            return settle_timed_out_selection(host, view.slot.snapshot.is_some());
                         }
                     }
                 }
@@ -868,6 +878,17 @@ mod tests {
         };
 
         assert!(pass.into_complete().is_none());
+    }
+
+    #[test]
+    fn stale_snapshot_keeps_content_modified_when_host_fallback_is_empty() {
+        let error = settle_timed_out_selection(None, true)
+            .expect_err("a stale snapshot must remain retryable when the host has no result");
+        assert_eq!(
+            error.code,
+            tower_lsp_server::jsonrpc::ErrorCode::ServerError(-32801)
+        );
+        assert!(settle_timed_out_selection(None, false).unwrap().is_none());
     }
 
     #[tokio::test]
