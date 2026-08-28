@@ -1,7 +1,6 @@
 //! Workspace-symbol fan-out and origin-preserving resolve routing.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -200,17 +199,19 @@ fn needs_resolve_envelope(symbol: &NormalizedSymbol, resolves: bool) -> bool {
 fn deduplicate_symbols(
     symbols: impl IntoIterator<Item = IdentifiedSymbol>,
 ) -> Vec<NormalizedSymbol> {
-    let mut seen = HashSet::new();
-    symbols
-        .into_iter()
-        .filter_map(|(symbol, identity)| {
-            if identity.is_none_or(|identity| seen.insert(identity)) {
-                Some(symbol)
-            } else {
-                None
+    let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut deduplicated: Vec<NormalizedSymbol> = Vec::new();
+    for (symbol, identity) in symbols {
+        if let Some(identity) = identity {
+            if let Some(index) = seen.get(&identity).copied() {
+                deduplicated[index].legacy_deprecated |= symbol.legacy_deprecated;
+                continue;
             }
-        })
-        .collect()
+            seen.insert(identity, deduplicated.len());
+        }
+        deduplicated.push(symbol);
+    }
+    deduplicated
 }
 
 #[allow(deprecated)]
@@ -233,6 +234,13 @@ fn restore_legacy_flat_response(symbols: Vec<NormalizedSymbol>) -> WorkspaceSymb
             })
             .collect(),
     )
+}
+
+fn can_restore_flat_response(symbols: &[NormalizedSymbol], supports_tags: bool) -> bool {
+    !supports_tags
+        && symbols.iter().all(|normalized| {
+            normalized.symbol.data.is_none() && matches!(normalized.symbol.location, OneOf::Left(_))
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -568,13 +576,7 @@ impl LanguageServerPool {
         if symbols.is_empty() {
             return None;
         }
-        if !supports_tags
-            && symbols.iter().all(|normalized| {
-                normalized.legacy_flat
-                    && normalized.symbol.data.is_none()
-                    && matches!(normalized.symbol.location, OneOf::Left(_))
-            })
-        {
+        if can_restore_flat_response(&symbols, supports_tags) {
             return Some(restore_legacy_flat_response(symbols));
         }
         Some(WorkspaceSymbolResponse::Nested(
@@ -1022,6 +1024,65 @@ mod tests {
             prepare_symbol_for_aggregation(symbol, needs_envelope.then(|| unreachable!()));
         assert_eq!(symbol.data, None);
         assert!(symbol.legacy_deprecated);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn mixed_eager_symbols_restore_legacy_deprecation_for_tag_incapable_clients() {
+        let mut symbols = normalize_response(
+            WorkspaceSymbolResponse::Flat(vec![SymbolInformation {
+                name: "old".into(),
+                kind: SymbolKind::FUNCTION,
+                tags: None,
+                deprecated: Some(true),
+                location: location(),
+                container_name: None,
+            }]),
+            false,
+        );
+        symbols.push(
+            WorkspaceSymbol {
+                name: "new".into(),
+                kind: SymbolKind::FUNCTION,
+                tags: None,
+                container_name: None,
+                location: OneOf::Left(location()),
+                data: None,
+            }
+            .into(),
+        );
+        assert!(can_restore_flat_response(&symbols, false));
+        let WorkspaceSymbolResponse::Flat(symbols) = restore_legacy_flat_response(symbols) else {
+            panic!("eager mixed responses should preserve the legacy response shape");
+        };
+        assert_eq!(symbols[0].deprecated, Some(true));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn duplicate_legacy_symbols_merge_the_deprecation_bit() {
+        let symbol = SymbolInformation {
+            name: "old".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            deprecated: Some(false),
+            location: location(),
+            container_name: None,
+        };
+        let mut deprecated = symbol.clone();
+        deprecated.deprecated = Some(true);
+        let first = normalize_response(WorkspaceSymbolResponse::Flat(vec![symbol]), false)
+            .pop()
+            .unwrap();
+        let second = normalize_response(WorkspaceSymbolResponse::Flat(vec![deprecated]), false)
+            .pop()
+            .unwrap();
+        let symbols = deduplicate_symbols([
+            prepare_symbol_for_aggregation(first, None),
+            prepare_symbol_for_aggregation(second, None),
+        ]);
+        assert_eq!(symbols.len(), 1);
+        assert!(symbols[0].legacy_deprecated);
     }
 
     #[test]
