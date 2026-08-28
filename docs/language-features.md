@@ -121,7 +121,10 @@ kakehashi exposes; capture names can be remapped via
 [`textDocument/selectionRange`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_selectionRange)
 
 Expands or shrinks the selection along the syntax tree, including the structure of
-embedded blocks. Works for any grammar, no setup required.
+embedded blocks. Works for any grammar, no setup required. When bridge layers are
+configured, each requested position independently uses the first available
+`virt`, `host`, or built-in `native` result in layer-priority order. Virtual
+selection hierarchies are translated back into host-document coordinates.
 
 ---
 

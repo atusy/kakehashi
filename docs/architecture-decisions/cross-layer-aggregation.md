@@ -306,6 +306,10 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   ordinary preferred walk because one injection wholly owns their bridged
   range. Full/delta recomputes the same overlay before diffing its merged
   editor-visible baseline.
+- **Selection range**: multi-position requests resolve the preferred layer per
+  input position rather than once for the whole array. This preserves the LSP
+  one-result-per-position alignment when cursors fall in different virtual and
+  native regions.
 
 ## Consequences
 
