@@ -2643,10 +2643,7 @@ impl LanguageServerPool {
                 admit,
             )
             .await?;
-        let handle = if !handle.key().is_shared()
-            || handle.supports_workspace_folder_changes()
-            || self.incapable_shared_serves_client_workspace(&handle)
-        {
+        let handle = if !handle.key().is_shared() || self.shared_serves_client_workspace(&handle) {
             handle
         } else {
             self.acquire_resolved_wait_ready(
@@ -2839,22 +2836,30 @@ impl LanguageServerPool {
             })
     }
 
-    fn incapable_shared_serves_client_workspace(&self, handle: &ConnectionHandle) -> bool {
-        if let Some(expected) = self.workspace_folders()
-            && handle.supports_initial_workspace_folders()
-        {
-            let Some(actual) = handle.workspace_folders().snapshot() else {
-                return false;
+    pub(super) fn shared_serves_client_workspace(&self, handle: &ConnectionHandle) -> bool {
+        if handle.supports_initial_workspace_folders() {
+            let expected = self.workspace_folders().or_else(|| {
+                self.root_uri()
+                    .and_then(|root| Url::parse(&root).ok())
+                    .and_then(super::root_markers::workspace_at_root)
+                    .map(|(_root, folder)| vec![folder])
+            });
+            let actual = handle.workspace_folders().snapshot();
+            return match (expected, actual) {
+                (None, None) => true,
+                (Some(expected), Some(actual)) => {
+                    expected.len() == actual.len()
+                        && expected.iter().all(|expected| {
+                            actual.iter().any(|actual| {
+                                super::root_markers::same_root_uri(
+                                    expected.uri.as_str(),
+                                    actual.uri.as_str(),
+                                )
+                            })
+                        })
+                }
+                _ => false,
             };
-            return expected.len() == actual.len()
-                && expected.iter().all(|expected| {
-                    actual.iter().any(|actual| {
-                        super::root_markers::same_root_uri(
-                            expected.uri.as_str(),
-                            actual.uri.as_str(),
-                        )
-                    })
-                });
         }
         match (self.root_uri(), handle.spawn_root()) {
             (Some(expected), Some(actual)) => super::root_markers::same_root_uri(&expected, actual),

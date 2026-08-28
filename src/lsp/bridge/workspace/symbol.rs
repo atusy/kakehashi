@@ -15,6 +15,7 @@ use tower_lsp_server::ls_types::{
 
 use crate::config::settings::WorkspaceSettings;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
+use crate::error::LockResultExt;
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::pool::{
     ConnectionHandle, ConnectionState, INIT_TIMEOUT_SECS, LanguageServerPool, UpstreamId,
@@ -466,10 +467,12 @@ impl LanguageServerPool {
             })
             .collect();
         servers.sort_by(|a, b| a.0.cmp(&b.0));
+        let producer_scopes = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let requests = servers.into_iter().map(|(name, config)| {
             let params = params.clone();
             let upstream_id = upstream_id.clone();
+            let producer_scopes = Arc::clone(&producer_scopes);
             async move {
                 let Ok((handles, workspace_generation)) = self
                     .get_or_create_workspace_connections_wait_ready_admitted(
@@ -491,9 +494,22 @@ impl LanguageServerPool {
                     let params = params.clone();
                     let upstream_id = upstream_id.clone();
                     let name = name.clone();
+                    let producer_scopes = Arc::clone(&producer_scopes);
                     async move {
                         if !handle.has_capability(SYMBOL_METHOD) {
                             return Err(());
+                        }
+                        if handle.key().is_shared() {
+                            let scope_generation = handle.workspace_folders().generation();
+                            if !self.shared_serves_client_workspace(&handle)
+                                || handle.workspace_folders().generation() != scope_generation
+                            {
+                                return Err(());
+                            }
+                            producer_scopes
+                                .lock()
+                                .recover_poison("workspace symbol producer scopes")
+                                .push((Arc::clone(&handle), scope_generation));
                         }
                         let generation = self.document_connection_generation(handle.key());
                         let virtual_uri_observer =
@@ -571,6 +587,14 @@ impl LanguageServerPool {
 
         let symbols: Vec<_> = join_all(requests).await.into_iter().flatten().collect();
         if !admit() || self.workspace_generation() != request_workspace_generation {
+            return None;
+        }
+        if producer_scopes
+            .lock()
+            .recover_poison("workspace symbol producer scopes")
+            .iter()
+            .any(|(handle, expected)| handle.workspace_folders().generation() != *expected)
+        {
             return None;
         }
         if symbols.is_empty() {
@@ -1857,11 +1881,9 @@ mod tests {
                 uri: Uri::from_str("file:///outside").unwrap(),
                 name: "outside".into(),
             }]));
-        let root_a = create_handle_advertising_workspace_symbols(ConnectionKey::new(
-            "symbols",
-            Some("file:///workspace/a".into()),
-        ))
-        .await;
+        let root_a =
+            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+        record_test_spawn_root(&root_a, "file:///workspace/a");
         let root_b = create_handle_advertising_workspace_symbols(ConnectionKey::new(
             "symbols",
             Some("file:///workspace/b".into()),
@@ -1893,6 +1915,133 @@ mod tests {
         assert!(handles.iter().any(|handle| Arc::ptr_eq(handle, &root_a)));
         assert!(handles.iter().any(|handle| Arc::ptr_eq(handle, &root_b)));
         assert!(!handles.iter().any(|handle| Arc::ptr_eq(handle, &shared)));
+    }
+
+    #[tokio::test]
+    async fn root_uri_fallback_excludes_a_shared_handle_with_an_unrelated_root() {
+        let pool = LanguageServerPool::new();
+        pool.set_root_uri(Some("file:///workspace/client".into()));
+        let shared = create_handle_advertising_workspace_symbols_with_folder_changes(
+            ConnectionKey::shared("symbols"),
+        )
+        .await;
+        shared
+            .workspace_folders()
+            .replace(Some(vec![WorkspaceFolder {
+                uri: Uri::from_str("file:///outside").unwrap(),
+                name: "outside".into(),
+            }]));
+        let fallback =
+            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+        record_test_spawn_root(&fallback, "file:///workspace/client");
+        pool.connections().await.extend([
+            (shared.key().clone(), Arc::clone(&shared)),
+            (fallback.key().clone(), Arc::clone(&fallback)),
+        ]);
+        let config = crate::config::settings::BridgeServerConfig {
+            cmd: Some(vec!["mock-symbols".into()]),
+            languages: Some(Vec::new()),
+            prefer_shared_instance: Some(true),
+            ..Default::default()
+        };
+
+        let (handles, _) = pool
+            .get_or_create_workspace_connections_wait_ready_admitted(
+                "symbols",
+                &config,
+                Duration::from_secs(1),
+                &|| true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(handles.len(), 1);
+        assert!(Arc::ptr_eq(&handles[0], &fallback));
+        assert!(!handles.iter().any(|handle| Arc::ptr_eq(handle, &shared)));
+    }
+
+    #[tokio::test]
+    async fn search_discards_a_shared_producer_that_expands_its_folder_scope() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let client_folder = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/client").unwrap(),
+            name: "client".into(),
+        };
+        pool.set_root_uri(Some(client_folder.uri.to_string()));
+        pool.set_workspace_folders(Some(vec![client_folder.clone()]));
+        let shared = create_handle_advertising_workspace_symbols_with_folder_changes(
+            ConnectionKey::shared("symbols"),
+        )
+        .await;
+        shared
+            .workspace_folders()
+            .replace(Some(vec![client_folder.clone()]));
+        pool.connections()
+            .await
+            .insert(shared.key().clone(), Arc::clone(&shared));
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "symbols".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-symbols".into()]),
+                languages: Some(Vec::new()),
+                prefer_shared_instance: Some(true),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
+            "query": "workspace"
+        }))
+        .unwrap();
+        let request_pool = Arc::clone(&pool);
+        let request = tokio::spawn(async move {
+            request_pool
+                .dispatch_workspace_symbol(
+                    params,
+                    &settings,
+                    None,
+                    true,
+                    &|| true,
+                    request_pool.workspace_generation(),
+                )
+                .await
+        });
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !shared.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shared producer receives the request before its scope expands");
+
+        shared.workspace_folders().replace(Some(vec![
+            client_folder,
+            WorkspaceFolder {
+                uri: Uri::from_str("file:///outside").unwrap(),
+                name: "outside".into(),
+            },
+        ]));
+        let _ = shared.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": [{
+                "name": "stale",
+                "kind": 12,
+                "location": {
+                    "uri": "file:///workspace/client/main.rs",
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 5 }
+                    }
+                }
+            }]
+        }));
+
+        assert!(
+            request.await.unwrap().is_none(),
+            "a producer that gained an unrelated marker root must not contribute results"
+        );
     }
 
     #[tokio::test]
