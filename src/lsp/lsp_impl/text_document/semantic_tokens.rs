@@ -1061,6 +1061,12 @@ impl Kakehashi {
         const METHOD: &str = "textDocument/semanticTokens/range";
         let lsp_uri = params.text_document.uri.clone();
         let range = params.range;
+        if (range.start.line, range.start.character) >= (range.end.line, range.end.character) {
+            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: Vec::new(),
+            })));
+        }
         let progress_token = params.work_done_progress_params.work_done_token.clone();
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let virt = self.semantic_tokens_range_virt_layer(&lsp_uri, range, progress_token);
