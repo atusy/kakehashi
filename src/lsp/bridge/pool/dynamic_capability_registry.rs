@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{RwLock, RwLockReadGuard};
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
 use tower_lsp_server::ls_types::{Registration, Unregistration};
 
@@ -26,8 +26,28 @@ pub(crate) struct DynamicCapabilityRegistry {
     diagnostic_registration_settled: tokio::sync::OnceCell<()>,
     static_workspace_diagnostic_provider: AtomicBool,
     workspace_diagnostic_pull_completed: AtomicBool,
-    workspace_diagnostic_lifecycle: AtomicU8,
+    workspace_diagnostic_lifecycle: Mutex<WorkspaceDiagnosticLifecycle>,
     workspace_diagnostic_registration_refresh_pending: AtomicBool,
+}
+
+#[derive(Default)]
+struct WorkspaceDiagnosticLifecycle {
+    contributed: bool,
+    reader_exited: bool,
+}
+
+pub(crate) struct WorkspaceDiagnosticLifecycleGuard<'a>(
+    MutexGuard<'a, WorkspaceDiagnosticLifecycle>,
+);
+
+impl WorkspaceDiagnosticLifecycleGuard<'_> {
+    pub(crate) fn reader_exited(&self) -> bool {
+        self.0.reader_exited
+    }
+
+    pub(crate) fn mark_contributed(&mut self) {
+        self.0.contributed = true;
+    }
 }
 
 impl DynamicCapabilityRegistry {
@@ -43,7 +63,7 @@ impl DynamicCapabilityRegistry {
             diagnostic_registration_settled: tokio::sync::OnceCell::new(),
             static_workspace_diagnostic_provider: AtomicBool::new(false),
             workspace_diagnostic_pull_completed: AtomicBool::new(false),
-            workspace_diagnostic_lifecycle: AtomicU8::new(0),
+            workspace_diagnostic_lifecycle: Mutex::new(WorkspaceDiagnosticLifecycle::default()),
             workspace_diagnostic_registration_refresh_pending: AtomicBool::new(false),
         }
     }
@@ -96,41 +116,38 @@ impl DynamicCapabilityRegistry {
             || self.registration_options_flag("textDocument/diagnostic", "workspaceDiagnostics")
     }
 
+    #[cfg(test)]
     pub(crate) fn try_mark_workspace_diagnostic_contributed(&self) -> Option<bool> {
-        const CONTRIBUTED: u8 = 1;
-        const READER_EXITED: u8 = 2;
-        let mut lifecycle = self.workspace_diagnostic_lifecycle.load(Ordering::Acquire);
-        loop {
-            if lifecycle & READER_EXITED != 0 {
-                return None;
-            }
-            if lifecycle & CONTRIBUTED != 0 {
-                return Some(self.mark_workspace_diagnostic_pull_completed());
-            }
-            match self.workspace_diagnostic_lifecycle.compare_exchange_weak(
-                lifecycle,
-                lifecycle | CONTRIBUTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(self.mark_workspace_diagnostic_pull_completed()),
-                Err(current) => lifecycle = current,
-            }
+        let mut lifecycle = self.workspace_diagnostic_lifecycle_lock();
+        if lifecycle.reader_exited() {
+            return None;
         }
+        lifecycle.mark_contributed();
+        drop(lifecycle);
+        Some(self.mark_workspace_diagnostic_pull_completed())
     }
 
     pub(crate) fn mark_workspace_diagnostic_reader_exited(&self) -> bool {
-        const CONTRIBUTED: u8 = 1;
-        const READER_EXITED: u8 = 2;
-        self.workspace_diagnostic_lifecycle
-            .fetch_or(READER_EXITED, Ordering::AcqRel)
-            & CONTRIBUTED
-            != 0
+        let mut lifecycle = self
+            .workspace_diagnostic_lifecycle
+            .lock()
+            .recover_poison("DynamicCapabilityRegistry::mark_workspace_diagnostic_reader_exited");
+        lifecycle.reader_exited = true;
+        lifecycle.contributed
     }
 
     pub(crate) fn has_workspace_diagnostic_reader_exited(&self) -> bool {
-        const READER_EXITED: u8 = 2;
-        self.workspace_diagnostic_lifecycle.load(Ordering::Acquire) & READER_EXITED != 0
+        self.workspace_diagnostic_lifecycle_lock().reader_exited()
+    }
+
+    pub(crate) fn workspace_diagnostic_lifecycle_lock(
+        &self,
+    ) -> WorkspaceDiagnosticLifecycleGuard<'_> {
+        WorkspaceDiagnosticLifecycleGuard(
+            self.workspace_diagnostic_lifecycle
+                .lock()
+                .recover_poison("DynamicCapabilityRegistry::workspace_diagnostic_lifecycle_lock"),
+        )
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_completed(&self) -> bool {
@@ -145,8 +162,10 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn has_workspace_diagnostic_contributed(&self) -> bool {
-        const CONTRIBUTED: u8 = 1;
-        self.workspace_diagnostic_lifecycle.load(Ordering::Acquire) & CONTRIBUTED != 0
+        self.workspace_diagnostic_lifecycle
+            .lock()
+            .recover_poison("DynamicCapabilityRegistry::has_workspace_diagnostic_contributed")
+            .contributed
     }
 
     pub(crate) fn request_or_defer_workspace_diagnostic_registration_refresh(&self) -> bool {
