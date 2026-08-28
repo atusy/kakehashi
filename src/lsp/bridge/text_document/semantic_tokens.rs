@@ -109,6 +109,7 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
         client_progress_token: Option<NumberOrString>,
         expected_incarnation: Option<u64>,
+        attempted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> io::Result<Option<SemanticTokens>> {
         let handle = self
             .get_or_create_virtual_connection(
@@ -125,6 +126,9 @@ impl LanguageServerPool {
         let Some(legend) = handle.semantic_tokens_legend().cloned() else {
             return Ok(None);
         };
+        if let Some(attempted) = attempted {
+            attempted.store(true, std::sync::atomic::Ordering::Release);
+        }
         let host_range = Range::new(
             Position::new(offset.line(), offset.column_for_line(0)),
             region_end,
