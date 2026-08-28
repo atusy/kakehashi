@@ -62,6 +62,30 @@ fn selection_chain_is_valid(selection: &SelectionRange, position: Position, text
 /// `ContentModified`.
 const SELECTION_RANGE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Cancels blocking selection work when its async owner is dropped.
+struct SelectionComputeCancelGuard {
+    token: crate::cancel::CancelToken,
+    armed: bool,
+}
+
+impl SelectionComputeCancelGuard {
+    fn new(token: crate::cancel::CancelToken) -> Self {
+        Self { token, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SelectionComputeCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.token.cancel();
+        }
+    }
+}
+
 impl Kakehashi {
     pub(crate) async fn selection_range_impl(
         &self,
@@ -171,6 +195,13 @@ impl Kakehashi {
         let expected_version = snapshot.parsed_version;
         let expected_incarnation = snapshot.incarnation;
         let expected_settings_generation = self.cache.semantic_token_generation();
+        let Some(version_cancel) = self.documents.get(&uri).and_then(|document| {
+            (document.incarnation() == expected_incarnation
+                && document.content_version() == expected_version)
+                .then(|| document.version_cancel_token())
+        }) else {
+            return Err(crate::error::content_modified_error());
+        };
 
         // Run the synchronous injection-aware walk as one work-unit on the
         // compute pool against the snapshot's consistent (text, tree). The
@@ -185,9 +216,11 @@ impl Kakehashi {
         let native_positions = positions.clone();
         let native_snapshot = std::sync::Arc::clone(&snapshot);
         let compute_cancel = cancel_token.clone();
-        let result = self
+        let worker_cancel = compute_cancel.clone();
+        let mut compute_guard = SelectionComputeCancelGuard::new(compute_cancel.clone());
+        let compute = self
             .compute_pool
-            .run(Some(cancel_token), move || {
+            .run(Some(compute_cancel.clone()), move || {
                 let mut pool = language.create_document_parser_pool();
                 handle_selection_range(
                     &native_snapshot.text,
@@ -196,10 +229,17 @@ impl Kakehashi {
                     &native_positions,
                     &language,
                     &mut pool,
-                    &compute_cancel,
+                    &worker_cancel,
                 )
-            })
-            .await;
+            });
+        let result = tokio::select! {
+            result = compute => result,
+            _ = version_cancel.cancelled() => {
+                compute_cancel.cancel();
+                return Err(crate::error::content_modified_error());
+            }
+        };
+        compute_guard.disarm();
 
         let still_current = self.documents.latest_snapshot(&uri).is_some_and(|view| {
             view.content_version == expected_version
@@ -382,6 +422,26 @@ mod tests {
     use super::*;
     use crate::lsp::bridge::{LanguageServerPool, UpstreamId};
     use crate::lsp::request_id::CancelForwarder;
+
+    #[tokio::test]
+    async fn aborting_selection_compute_owner_cancels_blocking_work() {
+        let token = crate::cancel::CancelToken::default();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_by_owner = Arc::clone(&started);
+        let owner_token = token.clone();
+        let notified = started.notified();
+        let owner = tokio::spawn(async move {
+            let _guard = SelectionComputeCancelGuard::new(owner_token);
+            started_by_owner.notify_one();
+            std::future::pending::<()>().await;
+        });
+
+        notified.await;
+        owner.abort();
+        let _ = owner.await;
+
+        assert!(token.is_cancelled());
+    }
 
     #[tokio::test]
     async fn cancellation_covers_the_native_snapshot_wait() {

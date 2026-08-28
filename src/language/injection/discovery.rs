@@ -473,7 +473,25 @@ pub(crate) fn detect_injection<'a>(
     injection_query: Option<&Query>,
     base_language: &str,
 ) -> Option<(Vec<String>, Node<'a>, usize, Option<InjectionOffset>)> {
-    let injections = collect_injection_regions(root, text, cursor_byte, injection_query)?;
+    detect_injection_cancellable(
+        root,
+        text,
+        cursor_byte,
+        injection_query,
+        base_language,
+        None,
+    )
+}
+
+pub(crate) fn detect_injection_cancellable<'a>(
+    root: &Node<'a>,
+    text: &str,
+    cursor_byte: usize,
+    injection_query: Option<&Query>,
+    base_language: &str,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<(Vec<String>, Node<'a>, usize, Option<InjectionOffset>)> {
+    let injections = collect_injection_regions(root, text, cursor_byte, injection_query, cancel)?;
 
     if injections.is_empty() {
         return None;
@@ -543,6 +561,7 @@ fn collect_injection_regions<'a>(
     text: &str,
     cursor_byte: usize,
     injection_query: Option<&Query>,
+    cancel: Option<&crate::cancel::CancelToken>,
 ) -> Option<Vec<RawInjectionRegion<'a>>> {
     let query = injection_query?;
 
@@ -554,8 +573,12 @@ fn collect_injection_regions<'a>(
     // Deduplicate by node range and language so alternate language layers on
     // the same node remain discoverable.
     let mut injections_map = std::collections::HashMap::new();
+    let mut work_items = 0;
 
     while let Some(match_) = matches.next() {
+        if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+            return None;
+        }
         if let Some((content_node, language, pattern_index, offset, start_byte, end_byte)) =
             extract_content_and_language(cursor_byte, match_, query, text)
         {
@@ -3971,6 +3994,38 @@ local y = "duplicate"
             cancel.is_cancelled(),
             "cancellation must occur during the walk"
         );
+    }
+
+    #[test]
+    fn positional_injection_detection_stops_during_cancelled_query_scan() {
+        let text = (0..80)
+            .map(|i| format!("```lua\nprint({i})\n```\n"))
+            .collect::<String>();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(&text, None).unwrap();
+        let query = Query::new(
+            &language,
+            r#"(fenced_code_block
+                  (info_string (language) @injection.language)
+                  (code_fence_content) @injection.content)"#,
+        )
+        .unwrap();
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel_after_polls(1);
+
+        let injection = detect_injection_cancellable(
+            &tree.root_node(),
+            &text,
+            text.len() - 5,
+            Some(&query),
+            "markdown",
+            Some(&cancel),
+        );
+
+        assert!(injection.is_none());
+        assert!(cancel.is_cancelled());
     }
 
     #[test]
