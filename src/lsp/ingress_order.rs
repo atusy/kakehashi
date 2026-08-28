@@ -364,6 +364,7 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/documentColor"
         | "textDocument/colorPresentation"
         | "textDocument/inlineValue"
+        | "textDocument/selectionRange"
         | "textDocument/prepareCallHierarchy"
         | "textDocument/prepareTypeHierarchy"
         | "textDocument/diagnostic"
@@ -816,6 +817,7 @@ mod tests {
             "textDocument/documentColor",
             "textDocument/colorPresentation",
             "textDocument/inlineValue",
+            "textDocument/selectionRange",
             "textDocument/diagnostic",
             "kakehashi/captures/full",
             "kakehashi/captures/full/delta",
@@ -1185,6 +1187,35 @@ mod tests {
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["change", "reader"]
         );
+    }
+
+    #[tokio::test]
+    async fn gate_runs_selection_range_only_after_preceding_change_or_close() {
+        async fn assert_order(writer_method: &'static str, expected: Vec<&'static str>) {
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let mut gate = IngressOrderGate::new(MockInner {
+                log: Arc::clone(&log),
+                stall_method: writer_method,
+                release: Some(release_rx),
+            });
+            let writer_fut = gate.call(notification(writer_method, URI));
+            let selection_fut = gate.call(notification("textDocument/selectionRange", URI));
+            let mut writer = tokio_test::task::spawn(writer_fut);
+            let mut selection = tokio_test::task::spawn(selection_fut);
+
+            assert!(selection.poll().is_pending());
+            assert!(writer.poll().is_pending());
+            assert!(selection.poll().is_pending());
+            release_tx.send(()).expect("writer is waiting");
+            assert!(writer.poll().is_ready());
+            assert!(selection.is_woken());
+            assert!(selection.poll().is_ready());
+            assert_eq!(*log.lock().recover_poison("ingress_order::tests"), expected);
+        }
+
+        assert_order("textDocument/didChange", vec!["change", "reader"]).await;
+        assert_order("textDocument/didClose", vec!["close", "reader"]).await;
     }
 
     #[tokio::test]

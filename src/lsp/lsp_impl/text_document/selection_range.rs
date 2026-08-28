@@ -7,7 +7,11 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::analysis::handle_selection_range;
-use crate::lsp::aggregation::server::dispatch_preferred;
+use crate::lsp::aggregation::server::{
+    HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
+};
+use crate::lsp::bridge::HostDocument;
+use crate::lsp::current_upstream_id;
 use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
 
 use super::super::{Kakehashi, uri_to_url};
@@ -17,27 +21,25 @@ const METHOD: &str = "textDocument/selectionRange";
 fn parse_single_host_selection_range(
     value: serde_json::Value,
     position: Position,
-    document_end: Position,
+    text: &str,
 ) -> Option<SelectionRange> {
     let mut ranges = parse_host_verbatim::<Vec<SelectionRange>>(value)?;
     if ranges.len() != 1 {
         return None;
     }
     let selection = ranges.pop().expect("length checked");
-    selection_chain_is_valid(&selection, position, document_end).then_some(selection)
+    selection_chain_is_valid(&selection, position, text).then_some(selection)
 }
 
-fn selection_chain_is_valid(
-    selection: &SelectionRange,
-    position: Position,
-    document_end: Position,
-) -> bool {
+fn selection_chain_is_valid(selection: &SelectionRange, position: Position, text: &str) -> bool {
+    let mapper = crate::text::PositionMapper::new(text);
     let mut child = None;
     let mut current = Some(selection);
     while let Some(selection) = current {
         let range = selection.range;
         if range.start > range.end
-            || range.end > document_end
+            || mapper.position_to_byte_strict(range.start).is_none()
+            || mapper.position_to_byte_strict(range.end).is_none()
             || child.is_some_and(|child: tower_lsp_server::ls_types::Range| {
                 range.start > child.start || range.end < child.end
             })
@@ -62,6 +64,24 @@ const SELECTION_RANGE_WAIT: std::time::Duration = std::time::Duration::from_mill
 
 impl Kakehashi {
     pub(crate) async fn selection_range_impl(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(current_upstream_id().as_ref());
+        let request = self.selection_range_inner(params);
+        match cancel_rx {
+            Some(mut cancel_rx) => {
+                tokio::select! {
+                    biased;
+                    _ = &mut cancel_rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                    result = request => result,
+                }
+            }
+            None => request.await,
+        }
+    }
+
+    async fn selection_range_inner(
         &self,
         params: SelectionRangeParams,
     ) -> Result<Option<Vec<SelectionRange>>> {
@@ -146,9 +166,6 @@ impl Kakehashi {
         let expected_version = snapshot.parsed_version;
         let expected_incarnation = snapshot.incarnation;
         let expected_settings_generation = self.cache.semantic_token_generation();
-        let document_end = crate::text::PositionMapper::new(&snapshot.text)
-            .byte_to_position(snapshot.text.len())
-            .unwrap_or_default();
 
         // Run the synchronous injection-aware walk as one work-unit on the
         // compute pool against the snapshot's consistent (text, tree). The
@@ -161,14 +178,15 @@ impl Kakehashi {
         // cross-request reuse here.
         let language = std::sync::Arc::clone(&self.language);
         let native_positions = positions.clone();
+        let native_snapshot = std::sync::Arc::clone(&snapshot);
         let result = self
             .compute_pool
             .run(None, move || {
                 let mut pool = language.create_document_parser_pool();
                 handle_selection_range(
-                    &snapshot.text,
-                    snapshot.tree.as_ref(),
-                    snapshot.language.as_deref(),
+                    &native_snapshot.text,
+                    native_snapshot.tree.as_ref(),
+                    native_snapshot.language.as_deref(),
                     &native_positions,
                     &language,
                     &mut pool,
@@ -211,19 +229,17 @@ impl Kakehashi {
                 partial_result_params: PartialResultParams::default(),
             })
             .unwrap_or(serde_json::Value::Null);
-            let virt = self.selection_range_virt_layer(&lsp_uri, position);
+            let virt = self.selection_range_virt_layer(&lsp_uri, position, expected_incarnation);
+            let host = self.selection_range_host_layer(
+                &lsp_uri,
+                raw_params,
+                position,
+                expected_incarnation,
+                expected_version,
+            );
             let native = std::future::ready(Ok(native_ranges.get(index).cloned()));
             let result = self
-                .walk_layers_with_native(
-                    &lsp_uri,
-                    METHOD,
-                    METHOD,
-                    raw_params,
-                    virt,
-                    native,
-                    |value| parse_single_host_selection_range(value, position, document_end),
-                    |_| true,
-                )
+                .walk_layer_futures(&lsp_uri, METHOD, METHOD, virt, host, native, |_| true)
                 .await?;
             let Some(result) = result else {
                 // The protocol requires one result for every input position;
@@ -253,6 +269,7 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         position: Position,
+        expected_incarnation: u64,
     ) -> Result<Option<SelectionRange>> {
         let Some(ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
@@ -260,6 +277,9 @@ impl Kakehashi {
         else {
             return Ok(None);
         };
+        if ctx.incarnation != expected_incarnation {
+            return Ok(None);
+        }
         let (cancel_rx, _cancel_guard) =
             self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
@@ -279,6 +299,7 @@ impl Kakehashi {
                         task.offset,
                         &task.virtual_content,
                         task.upstream_id,
+                        expected_incarnation,
                     )
                     .await
             },
@@ -289,5 +310,129 @@ impl Kakehashi {
         result
             .handle(&self.notifier(), "selectionRange", None, Ok)
             .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn selection_range_host_layer(
+        &self,
+        lsp_uri: &Uri,
+        raw_params: serde_json::Value,
+        position: Position,
+        expected_incarnation: u64,
+        expected_version: u64,
+    ) -> Result<Option<SelectionRange>> {
+        let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
+            return Ok(None);
+        };
+        if ctx.incarnation != expected_incarnation || ctx.content_version != expected_version {
+            return Ok(None);
+        }
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        let result = dispatch_host_preferred(
+            &ctx,
+            self.bridge.pool_arc(),
+            move |task: HostFanOutTask| {
+                let params = raw_params.clone();
+                async move {
+                    let raw = task
+                        .pool
+                        .send_host_raw_request_for_incarnation(
+                            &task.server_name,
+                            &task.server_config,
+                            &HostDocument {
+                                uri: &task.uri,
+                                language_id: &task.language_id,
+                                text: &task.text,
+                            },
+                            METHOD,
+                            params,
+                            task.upstream_id,
+                            expected_incarnation,
+                        )
+                        .await?;
+                    Ok(raw.and_then(|raw| {
+                        parse_single_host_selection_range(raw.value, position, &task.text)
+                    }))
+                }
+            },
+            |result| result.is_some(),
+            cancel_rx,
+        )
+        .await;
+        self.host_layer_result(result, METHOD, |won| won).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio::time::sleep;
+    use tower_lsp_server::LspService;
+
+    use super::*;
+    use crate::lsp::bridge::{LanguageServerPool, UpstreamId};
+    use crate::lsp::request_id::CancelForwarder;
+
+    #[tokio::test]
+    async fn cancellation_covers_the_native_snapshot_wait() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let cancel_forwarder = CancelForwarder::new(Arc::clone(&pool));
+        let (service, _socket) = LspService::new(|client| {
+            Kakehashi::with_cancel_forwarder(client, pool, cancel_forwarder.clone())
+        });
+        let server = service.inner();
+        let uri = url::Url::parse("file:///selection_range_cancel.lua").expect("test URI");
+        server.documents.insert(
+            uri.clone(),
+            "local value = 1\n".to_string(),
+            Some("lua".to_string()),
+            None,
+        );
+        let loaded = server.language.ensure_language_loaded("lua");
+        if !loaded.success {
+            eprintln!("Skipping: lua language parser not available");
+            return;
+        }
+
+        let notifier = cancel_forwarder.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(1)).await;
+            notifier.notify_cancel(&UpstreamId::Number(71));
+        });
+        let params = SelectionRangeParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("LSP URI"),
+            },
+            positions: vec![Position::new(0, 1)],
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let result = crate::lsp::request_id::CURRENT_REQUEST_ID
+            .scope(
+                Some(tower_lsp_server::jsonrpc::Id::Number(71)),
+                server.selection_range_impl(params),
+            )
+            .await;
+
+        assert_eq!(
+            result
+                .expect_err("the parked request should be cancelled")
+                .code,
+            tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled
+        );
+    }
+
+    #[test]
+    fn host_selection_range_rejects_an_overlong_intermediate_line_column() {
+        let value = json!([{
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 999 }
+            }
+        }]);
+        assert!(parse_single_host_selection_range(value, Position::new(0, 0), "a\nb").is_none());
     }
 }
