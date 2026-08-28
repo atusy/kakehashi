@@ -1708,7 +1708,7 @@ priorities = ["virt", "native"]
 }
 
 #[test]
-fn e2e_semantic_tokens_full_delta_rejects_an_edit_before_commit() {
+fn e2e_semantic_tokens_full_delta_rejects_stale_commits() {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir
         .path()
@@ -1814,6 +1814,7 @@ priorities = ["virt", "native"]
         Value::Null,
         "a delta computed before didChange must not commit afterwards: {response:?}"
     );
+
     shutdown(&mut client);
 }
 
