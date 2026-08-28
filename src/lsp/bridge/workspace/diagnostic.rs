@@ -235,17 +235,22 @@ impl LanguageServerPool {
         if !admit() {
             return aggregate_reports(std::iter::empty());
         }
-        aggregate_reports(reports.into_iter().filter_map(|completed| {
-            let key = completed.handle.key();
-            connections
-                .get(key)
-                .is_some_and(|live| {
-                    Arc::ptr_eq(live, &completed.handle)
-                        && live.state() == ConnectionState::Ready
-                        && self.document_connection_generation(key) == completed.generation
-                })
-                .then_some(completed.report)
-        }))
+        let reports: Vec<_> = reports
+            .into_iter()
+            .filter_map(|completed| {
+                let key = completed.handle.key();
+                connections
+                    .get(key)
+                    .is_some_and(|live| {
+                        Arc::ptr_eq(live, &completed.handle)
+                            && live.state() == ConnectionState::Ready
+                            && self.document_connection_generation(key) == completed.generation
+                    })
+                    .then_some(completed.report)
+            })
+            .collect();
+        drop(connections);
+        aggregate_reports(reports)
     }
 
     async fn workspace_diagnostic_producer_is_live(
