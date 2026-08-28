@@ -632,6 +632,15 @@ impl ConnectionHandle {
     /// Called once after successful LSP handshake, before transitioning to Ready.
     /// Subsequent calls are ignored (OnceLock semantics).
     pub(super) fn set_server_capabilities(&self, capabilities: ServerCapabilities) {
+        let workspace_diagnostics = match capabilities.diagnostic_provider.as_ref() {
+            Some(DiagnosticServerCapabilities::Options(options)) => options.workspace_diagnostics,
+            Some(DiagnosticServerCapabilities::RegistrationOptions(options)) => {
+                options.diagnostic_options.workspace_diagnostics
+            }
+            None => false,
+        };
+        self.dynamic_capabilities
+            .set_static_workspace_diagnostic_provider(workspace_diagnostics);
         // OnceLock::set() returns Err if already set - ignore since handshake
         // happens exactly once per connection.
         let _ = self.server_capabilities.set(capabilities);

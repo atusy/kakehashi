@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use tower_lsp_server::ls_types::{Registration, Unregistration};
 
@@ -24,6 +24,7 @@ pub(crate) struct DynamicCapabilityRegistry {
     revision: AtomicU64,
     changes: tokio::sync::watch::Sender<u64>,
     diagnostic_registration_settled: tokio::sync::OnceCell<()>,
+    static_workspace_diagnostic_provider: AtomicBool,
 }
 
 impl DynamicCapabilityRegistry {
@@ -37,6 +38,7 @@ impl DynamicCapabilityRegistry {
             revision: AtomicU64::new(0),
             changes,
             diagnostic_registration_settled: tokio::sync::OnceCell::new(),
+            static_workspace_diagnostic_provider: AtomicBool::new(false),
         }
     }
 
@@ -75,6 +77,17 @@ impl DynamicCapabilityRegistry {
 
     pub(crate) fn diagnostic_registration_settle(&self) -> &tokio::sync::OnceCell<()> {
         &self.diagnostic_registration_settled
+    }
+
+    pub(crate) fn set_static_workspace_diagnostic_provider(&self, supported: bool) {
+        self.static_workspace_diagnostic_provider
+            .store(supported, Ordering::Release);
+    }
+
+    pub(crate) fn has_workspace_diagnostic_provider(&self) -> bool {
+        self.static_workspace_diagnostic_provider
+            .load(Ordering::Acquire)
+            || self.registration_options_flag("textDocument/diagnostic", "workspaceDiagnostics")
     }
 
     pub(crate) fn has_registration(&self, method: &str) -> bool {
