@@ -165,7 +165,7 @@
 //!   Used by
 //!   `tests/e2e/e2e_shared_instance.rs` (#391) to prove the shared-instance opt-in
 //!   grows one downstream process's folder set across roots.
-//! - `workspace-symbol` — advertises workspace symbol search and resolve;
+//! - `workspace-symbol-alpha` / `workspace-symbol-zeta` — advertise workspace symbol search and resolve;
 //!   search returns one lazy symbol and resolve fills its location range.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
@@ -550,7 +550,7 @@ fn main() {
                         "hoverProvider": true,
                         "textDocumentSync": 1
                     }),
-                    "workspace-symbol" => json!({
+                    "workspace-symbol-alpha" | "workspace-symbol-zeta" => json!({
                         "workspaceSymbolProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -1275,20 +1275,25 @@ fn main() {
                     &mut writer,
                     id,
                     json!([{
-                        "name": format!("mock:{query}"),
+                        "name": format!("{mode}:{query}"),
                         "kind": 12,
-                        "location": { "uri": "file:///workspace/main.rs" },
-                        "data": { "mock": query }
+                        "location": { "uri": format!("file:///workspace/{mode}.rs") },
+                        "data": { "mock": query, "producer": mode }
                     }]),
                 );
             }
             "workspaceSymbol/resolve" => {
                 let mut symbol = message.get("params").cloned().unwrap_or(Value::Null);
+                let line = if mode == "workspace-symbol-alpha" {
+                    4
+                } else {
+                    8
+                };
                 symbol["location"] = json!({
-                    "uri": "file:///workspace/main.rs",
+                    "uri": format!("file:///workspace/{mode}.rs"),
                     "range": {
-                        "start": { "line": 4, "character": 1 },
-                        "end": { "line": 4, "character": 8 }
+                        "start": { "line": line, "character": 1 },
+                        "end": { "line": line, "character": 8 }
                     }
                 });
                 respond(&mut writer, id, symbol);
