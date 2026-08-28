@@ -94,7 +94,6 @@ impl Kakehashi {
         R: Fn(Vec<T>, Vec<T>) -> Vec<T> + Copy + Send,
         M: Fn(Vec<T>, Vec<T>) -> Vec<T>,
     {
-        let virt_bridge_attempted = bridge_attempted.clone();
         let host_bridge_attempted = bridge_attempted;
         let virt = async {
             // Convert ls_types::Uri to url::Url for internal use
@@ -241,9 +240,6 @@ impl Kakehashi {
                 );
                 if !request_selects_servers(&agg.priorities, &configs, agg.max_fan_out) {
                     continue;
-                }
-                if let Some(attempted) = &virt_bridge_attempted {
-                    attempted.store(true, std::sync::atomic::Ordering::Release);
                 }
                 let region_ctx = DocumentRequestContext {
                     uri: uri.clone(),

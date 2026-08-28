@@ -409,6 +409,7 @@ impl Kakehashi {
         let expected_incarnation = Some(live_identity.0);
         let native = std::future::ready(Ok(Some(native_data)));
         let bridge_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let virt_bridge_attempted = std::sync::Arc::clone(&bridge_attempted);
 
         let fan_out = async {
             let data = self
@@ -423,24 +424,28 @@ impl Kakehashi {
                     true,
                     true,
                     native,
-                    move |task| async move {
-                        let region_end = task.region_end();
-                        task.pool
-                            .send_semantic_tokens_full_request(
-                                &task.server_name,
-                                &task.server_config,
-                                &task.uri,
-                                region_end,
-                                &task.injection_language,
-                                &task.region_id,
-                                task.offset,
-                                &task.virtual_content,
-                                task.upstream_id,
-                                task.client_progress_token,
-                                expected_incarnation,
-                            )
-                            .await
-                            .map(|tokens| tokens.map(|tokens| tokens.data))
+                    move |task| {
+                        let attempted = std::sync::Arc::clone(&virt_bridge_attempted);
+                        async move {
+                            let region_end = task.region_end();
+                            task.pool
+                                .send_semantic_tokens_full_request(
+                                    &task.server_name,
+                                    &task.server_config,
+                                    &task.uri,
+                                    region_end,
+                                    &task.injection_language,
+                                    &task.region_id,
+                                    task.offset,
+                                    &task.virtual_content,
+                                    task.upstream_id,
+                                    task.client_progress_token,
+                                    expected_incarnation,
+                                    Some(attempted),
+                                )
+                                .await
+                                .map(|tokens| tokens.map(|tokens| tokens.data))
+                        }
                     },
                     |value| {
                         serde_json::from_value::<SemanticTokensResult>(value)
