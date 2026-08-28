@@ -722,7 +722,7 @@ priorities = ["virt", "native"]
     let uri = "file:///test_semantic_delta_reentry.md";
     open_inline_value_document(&mut client, uri, 1, "# heading\n");
 
-    let previous_result_id = (0..300)
+    let (previous_result_id, previous_data) = (0..300)
         .find_map(|_| {
             let response = client.send_request(
                 "textDocument/semanticTokens/full",
@@ -731,7 +731,16 @@ priorities = ["virt", "native"]
             response
                 .pointer("/result/resultId")
                 .and_then(Value::as_str)
-                .map(str::to_string)
+                .map(|id| {
+                    (
+                        id.to_string(),
+                        response
+                            .pointer("/result/data")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
                 .or_else(|| {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     None
@@ -760,11 +769,26 @@ priorities = ["virt", "native"]
                     || response.pointer("/error/code") == Some(&json!(-32801)),
                 "{response:?}"
             );
-            response
+            let data = response
                 .pointer("/result/data")
                 .and_then(Value::as_array)
-                .filter(|data| data.chunks_exact(5).any(|token| token == [1, 0, 4, 17, 8]))
                 .cloned()
+                .or_else(|| {
+                    let edits = response.pointer("/result/edits")?.as_array()?;
+                    let mut data = previous_data.clone();
+                    for edit in edits {
+                        let start = edit.get("start")?.as_u64()? as usize;
+                        let delete_count = edit.get("deleteCount")?.as_u64()? as usize;
+                        let replacement = edit
+                            .get("data")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        data.splice(start..start + delete_count, replacement);
+                    }
+                    Some(data)
+                });
+            data.filter(|data| data.chunks_exact(5).any(|token| token == [1, 0, 4, 17, 8]))
                 .or_else(|| {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     None
