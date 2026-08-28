@@ -316,7 +316,7 @@ impl ConnectionHandle {
     }
 
     /// The root this connection's `initialize` was rooted at, when recorded.
-    pub(super) fn spawn_root(&self) -> Option<&str> {
+    pub(crate) fn spawn_root(&self) -> Option<&str> {
         self.spawn_root.get().and_then(|root| root.as_deref())
     }
 
