@@ -58,8 +58,7 @@ mod rename;
 mod save;
 mod semantic_tokens;
 pub(crate) use semantic_tokens::{
-    merge_semantic_token_layers, split_multiline_semantic_tokens,
-    transform_semantic_tokens_result_to_host,
+    merge_semantic_token_layers, transform_semantic_tokens_result_to_host,
 };
 mod signature_help;
 #[cfg(test)]
