@@ -97,32 +97,34 @@ impl DynamicCapabilityRegistry {
             })
     }
 
-    /// Run `f` while a matching registration with a true boolean option stays
-    /// protected from unregistration. Resolve sub-capabilities are registered
-    /// through their parent method, so admission must test the option and hold
-    /// the same read lease through enqueue.
-    pub(crate) fn with_registration_options_flag<R>(
+    /// Snapshot whether a method is registered and whether any matching
+    /// registration enables `flag`, then run `f` while both facts remain
+    /// protected from registration changes.
+    pub(crate) fn with_registration_snapshot<R>(
         &self,
         method: &str,
         flag: &str,
-        f: impl FnOnce() -> R,
-    ) -> Option<R> {
+        f: impl FnOnce(bool, bool) -> R,
+    ) -> R {
         let guard = self
             .registrations
             .read()
-            .recover_poison("DynamicCapabilityRegistry::with_registration_options_flag");
-        guard
+            .recover_poison("DynamicCapabilityRegistry::with_registration_snapshot");
+        let mut registered = false;
+        let mut flag_enabled = false;
+        for registration in guard
             .values()
             .filter(|registration| registration.method == method)
-            .any(|registration| {
-                registration
-                    .register_options
-                    .as_ref()
-                    .and_then(|options| options.get(flag))
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-            })
-            .then(f)
+        {
+            registered = true;
+            flag_enabled |= registration
+                .register_options
+                .as_ref()
+                .and_then(|options| options.get(flag))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+        }
+        f(registered, flag_enabled)
     }
 
     pub(crate) fn store_log_message_level(&self, level: crate::config::settings::LogMessageLevel) {
@@ -204,18 +206,25 @@ mod tests {
     }
 
     #[test]
-    fn registration_option_read_lease_orders_unregistration_after_admission() {
+    fn registration_snapshot_keeps_resolve_state_stable_during_admission() {
         let registry = DynamicCapabilityRegistry::new();
         registry.register(vec![Registration {
             id: "1".into(),
             method: "workspace/symbol".into(),
             register_options: Some(serde_json::json!({ "resolveProvider": true })),
         }]);
-        let write_is_excluded =
-            registry.with_registration_options_flag("workspace/symbol", "resolveProvider", || {
-                registry.registrations.try_write().is_err()
-            });
-        assert_eq!(write_is_excluded, Some(true));
+        let snapshot = registry.with_registration_snapshot(
+            "workspace/symbol",
+            "resolveProvider",
+            |registered, resolves| {
+                (
+                    registered,
+                    resolves,
+                    registry.registrations.try_write().is_err(),
+                )
+            },
+        );
+        assert_eq!(snapshot, (true, true, true));
     }
 
     #[test]

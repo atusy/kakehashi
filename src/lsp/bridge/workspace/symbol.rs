@@ -170,8 +170,7 @@ impl LanguageServerPool {
                     return None;
                 }
                 let generation = self.document_connection_generation(handle.key());
-                let resolves = handle.has_capability(RESOLVE_METHOD);
-                let response = self
+                let (response, resolves) = self
                     .send_workspace_request(
                         &handle,
                         WorkspaceCapability::Search,
@@ -260,7 +259,7 @@ impl LanguageServerPool {
             )
             .await
         {
-            Ok(Some(mut resolved)) => {
+            Ok(Some((mut resolved, _))) => {
                 re_envelope(&mut resolved, &envelope);
                 resolved
             }
@@ -276,7 +275,7 @@ impl LanguageServerPool {
         params: P,
         upstream_id: Option<UpstreamId>,
         expected_generation: Option<u64>,
-    ) -> io::Result<Option<R>>
+    ) -> io::Result<Option<(R, bool)>>
     where
         P: Serialize,
         R: serde::de::DeserializeOwned,
@@ -297,7 +296,7 @@ impl LanguageServerPool {
             };
         let mut guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
         let request = JsonRpcRequest::new(request_id.into(), method, params);
-        {
+        let resolves_at_admission = {
             let connections = self.connections().await;
             if !connections.get(key).is_some_and(|live| {
                 Arc::ptr_eq(live, handle) && live.state() == ConnectionState::Ready
@@ -312,23 +311,25 @@ impl LanguageServerPool {
                     "connection replaced",
                 ));
             }
-            let send_result = if has_static_capability(handle, capability) {
-                Some(handle.send_request(request, request_id))
-            } else {
-                match capability {
-                    WorkspaceCapability::Search => handle
-                        .dynamic_capabilities()
-                        .with_registration(SYMBOL_METHOD, || {
-                            handle.send_request(request, request_id)
-                        }),
-                    WorkspaceCapability::Resolve => handle
-                        .dynamic_capabilities()
-                        .with_registration_options_flag(SYMBOL_METHOD, "resolveProvider", || {
-                            handle.send_request(request, request_id)
-                        }),
-                }
-            };
-            let Some(send_result) = send_result else {
+            let static_admitted = has_static_capability(handle, capability);
+            let static_resolves = has_static_capability(handle, WorkspaceCapability::Resolve);
+            let admitted = handle.dynamic_capabilities().with_registration_snapshot(
+                SYMBOL_METHOD,
+                "resolveProvider",
+                |dynamic_search, dynamic_resolves| {
+                    let dynamic_admitted = match capability {
+                        WorkspaceCapability::Search => dynamic_search,
+                        WorkspaceCapability::Resolve => dynamic_resolves,
+                    };
+                    (static_admitted || dynamic_admitted).then(|| {
+                        (
+                            handle.send_request(request, request_id),
+                            static_resolves || dynamic_resolves,
+                        )
+                    })
+                },
+            );
+            let Some((send_result, resolves_at_admission)) = admitted else {
                 if let Some(id) = &upstream_id {
                     self.unregister_upstream_request(id, key);
                 }
@@ -343,7 +344,8 @@ impl LanguageServerPool {
                 }
                 return Err(error.into());
             }
-        }
+            resolves_at_admission
+        };
         let response = handle.wait_for_response(request_id, response_rx).await;
         guard.disarm();
         if let Some(id) = &upstream_id {
@@ -364,6 +366,7 @@ impl LanguageServerPool {
             return Ok(None);
         }
         serde_json::from_value(response.get("result").cloned().unwrap_or(Value::Null))
+            .map(|result| Some((result, resolves_at_admission)))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 }
@@ -371,7 +374,10 @@ impl LanguageServerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsp::bridge::pool::test_helpers::create_handle_with_key;
+    use crate::lsp::bridge::pool::test_helpers::{
+        create_handle_advertising_workspace_symbols, create_handle_with_key,
+    };
+    use crate::lsp::bridge::protocol::RequestId;
     use std::str::FromStr;
     use tower_lsp_server::ls_types::{Location, Position, Range, SymbolKind, Uri};
 
@@ -414,6 +420,28 @@ mod tests {
                 container_name: None,
             }]),
             false,
+        );
+        assert_eq!(symbols[0].tags, None);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn empty_supported_tag_set_does_not_imply_deprecated_support() {
+        let supports_deprecated = tower_lsp_server::ls_types::TagSupport::<SymbolTag> {
+            value_set: Vec::new(),
+        }
+        .value_set
+        .contains(&SymbolTag::DEPRECATED);
+        let symbols = normalize_response(
+            WorkspaceSymbolResponse::Flat(vec![SymbolInformation {
+                name: "old".into(),
+                kind: SymbolKind::FUNCTION,
+                tags: None,
+                deprecated: Some(true),
+                location: location(),
+                container_name: None,
+            }]),
+            supports_deprecated,
         );
         assert_eq!(symbols[0].tags, None);
     }
@@ -466,5 +494,79 @@ mod tests {
                 .await,
             "a queued response from the old producer must be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_sender_rejects_an_old_response_after_replacement() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("symbols");
+        let producer = create_handle_advertising_workspace_symbols(key.clone()).await;
+        pool.connections()
+            .await
+            .insert(key.clone(), Arc::clone(&producer));
+
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "symbols".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-symbols".into()]),
+                languages: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        let mut symbol = WorkspaceSymbol {
+            name: "lazy".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Left(location()),
+            data: None,
+        };
+        envelope_symbol(
+            &mut symbol,
+            WorkspaceSymbolEnvelope {
+                origin: "symbols".into(),
+                connection_key: key.clone(),
+                connection_generation: pool.document_connection_generation(&key),
+                inner: Some(serde_json::json!({ "owner": "old" })),
+            },
+        );
+        let unresolved = symbol.clone();
+        let pool_for_request = Arc::clone(&pool);
+        let request = tokio::spawn(async move {
+            pool_for_request
+                .dispatch_workspace_symbol_resolve(symbol, &settings, None)
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !producer.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolve request reaches Sent state");
+
+        let replacement = create_handle_advertising_workspace_symbols(key.clone()).await;
+        pool.connections().await.insert(key, replacement);
+        let _ = producer.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "name": "resolved",
+                "kind": 12,
+                "location": {
+                    "uri": "file:///workspace/main.rs",
+                    "range": {
+                        "start": { "line": 9, "character": 0 },
+                        "end": { "line": 9, "character": 8 }
+                    }
+                },
+                "data": { "owner": "old" }
+            }
+        }));
+
+        assert_eq!(request.await.unwrap(), unresolved);
     }
 }
