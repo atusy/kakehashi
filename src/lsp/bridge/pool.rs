@@ -139,6 +139,27 @@ fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHan
     });
 }
 
+struct WorkspaceChangeGenerationGuard<'a>(&'a AtomicU64);
+
+impl WorkspaceChangeGenerationGuard<'_> {
+    fn begin(generation: &AtomicU64) -> WorkspaceChangeGenerationGuard<'_> {
+        let previous = generation.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(previous & 1, 0, "workspace changes must be serialized");
+        WorkspaceChangeGenerationGuard(generation)
+    }
+}
+
+impl Drop for WorkspaceChangeGenerationGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.0.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(
+            previous & 1,
+            1,
+            "workspace change must finish from odd state"
+        );
+    }
+}
+
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -475,6 +496,7 @@ pub struct LanguageServerPool {
     /// through wire admission so an incapable shared process cannot outlive
     /// the client-workspace proof used to select it.
     workspace_generation: AtomicU64,
+    workspace_change_lock: Mutex<()>,
     /// Client capabilities forwarded from upstream client.
     ///
     /// Set once via `set_client_capabilities()` after receiving the upstream initialize request.
@@ -583,6 +605,7 @@ impl LanguageServerPool {
             root_uri: arc_swap::ArcSwap::new(Arc::new(None)),
             workspace_folders: super::WorkspaceFolderSet::new(None),
             workspace_generation: AtomicU64::new(0),
+            workspace_change_lock: Mutex::new(()),
             client_capabilities: OnceLock::new(),
             log_message_level: AtomicU8::new(
                 crate::config::settings::LogMessageLevel::Info.as_u8(),
@@ -801,11 +824,12 @@ impl LanguageServerPool {
             return false;
         }
 
-        // Publish the invalidation before changing either workspace snapshot.
-        // A request that already selected a producer will therefore fail its
-        // exact-send fence even while this async update is still recycling
-        // connections or awaiting notification queues.
-        self.workspace_generation.fetch_add(1, Ordering::AcqRel);
+        let _change_lock = self.workspace_change_lock.lock().await;
+        // Odd means update in progress and is never admissible. The RAII guard
+        // publishes the next even generation only after snapshots and every
+        // downstream notification/replacement have been committed; cancellation
+        // still restores an admissible even state.
+        let _generation = WorkspaceChangeGenerationGuard::begin(&self.workspace_generation);
         self.workspace_folders.apply_change(added.clone(), removed);
         self.set_root_uri(
             self.workspace_folders()
@@ -2576,6 +2600,12 @@ impl LanguageServerPool {
         admit: &(dyn Fn() -> bool + Sync),
     ) -> io::Result<(Arc<ConnectionHandle>, u64)> {
         let workspace_generation = self.workspace_generation.load(Ordering::Acquire);
+        if workspace_generation & 1 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "client workspace update is in progress",
+            ));
+        }
         let start = std::time::Instant::now();
         let handle = self
             .get_or_create_connection_wait_ready_admitted(
@@ -2605,7 +2635,10 @@ impl LanguageServerPool {
             )
             .await?
         };
-        if !admit() || self.workspace_generation.load(Ordering::Acquire) != workspace_generation {
+        if !admit()
+            || self.workspace_generation.load(Ordering::Acquire) != workspace_generation
+            || workspace_generation & 1 != 0
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "client workspace changed while selecting a producer",
@@ -2619,28 +2652,26 @@ impl LanguageServerPool {
     }
 
     fn incapable_shared_serves_client_workspace(&self, handle: &ConnectionHandle) -> bool {
-        match (
-            self.workspace_folders(),
-            handle.workspace_folders().snapshot(),
-        ) {
-            (Some(expected), Some(actual)) if handle.supports_initial_workspace_folders() => {
-                expected.len() == actual.len()
-                    && expected.iter().all(|expected| {
-                        actual.iter().any(|actual| {
-                            super::root_markers::same_root_uri(
-                                expected.uri.as_str(),
-                                actual.uri.as_str(),
-                            )
-                        })
+        if let Some(expected) = self.workspace_folders()
+            && handle.supports_initial_workspace_folders()
+        {
+            let Some(actual) = handle.workspace_folders().snapshot() else {
+                return false;
+            };
+            return expected.len() == actual.len()
+                && expected.iter().all(|expected| {
+                    actual.iter().any(|actual| {
+                        super::root_markers::same_root_uri(
+                            expected.uri.as_str(),
+                            actual.uri.as_str(),
+                        )
                     })
-            }
-            _ => match (self.root_uri(), handle.spawn_root()) {
-                (Some(expected), Some(actual)) => {
-                    super::root_markers::same_root_uri(&expected, actual)
-                }
-                (None, None) => true,
-                _ => false,
-            },
+                });
+        }
+        match (self.root_uri(), handle.spawn_root()) {
+            (Some(expected), Some(actual)) => super::root_markers::same_root_uri(&expected, actual),
+            (None, None) => true,
+            _ => false,
         }
     }
 

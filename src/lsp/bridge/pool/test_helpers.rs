@@ -148,6 +148,32 @@ pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_symbols(
     create_handle_advertising_workspace_symbols_with_state(ConnectionState::Ready, key).await
 }
 
+pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_symbols_with_initial_folders(
+    key: ConnectionKey,
+) -> Arc<ConnectionHandle> {
+    use tower_lsp_server::ls_types::{
+        OneOf, ServerCapabilities, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+        WorkspaceSymbolOptions,
+    };
+
+    let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+    handle.set_server_capabilities(ServerCapabilities {
+        workspace_symbol_provider: Some(OneOf::Right(WorkspaceSymbolOptions {
+            resolve_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
+        workspace: Some(WorkspaceServerCapabilities {
+            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                change_notifications: None,
+            }),
+            file_operations: None,
+        }),
+        ..Default::default()
+    });
+    handle
+}
+
 pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_symbols_with_state(
     state: ConnectionState,
     key: ConnectionKey,
