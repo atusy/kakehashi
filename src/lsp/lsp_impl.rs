@@ -682,7 +682,11 @@ impl Kakehashi {
     pub(super) fn document_bridge_language(&self, uri: &Url) -> Option<String> {
         self.document_language(uri).or_else(|| {
             let document = self.documents.get(uri)?;
-            document.language_id().map(str::to_owned)
+            let language_id = document.language_id()?;
+            Some(
+                self.language
+                    .canonical_injection_language(language_id, document.text()),
+            )
         })
     }
 

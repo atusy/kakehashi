@@ -1230,6 +1230,72 @@ print("hello")
         assert_eq!(context.configs.len(), 1);
     }
 
+    #[tokio::test]
+    async fn parserless_host_context_uses_the_configured_base_language() {
+        use std::str::FromStr;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language_servers = HashMap::from([(
+            "markdown_ls".to_string(),
+            BridgeServerConfig {
+                cmd: Some(vec!["markdown-ls".to_string()]),
+                languages: Some(vec!["markdown".to_string()]),
+                ..Default::default()
+            },
+        )]);
+        let languages = HashMap::from([
+            (
+                "markdown".to_string(),
+                LanguageSettings {
+                    bridge: Some(HashMap::from([(
+                        HOST_BRIDGE_KEY.to_string(),
+                        BridgeLanguageConfig {
+                            enabled: Some(true),
+                            aggregation: None,
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            ),
+            (
+                "rmd".to_string(),
+                LanguageSettings {
+                    base: Some("markdown".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let settings = WorkspaceSettings {
+            auto_install: false,
+            language_servers,
+            languages,
+            ..Default::default()
+        };
+        server.language.load_settings(&settings);
+        server.settings_manager.apply_settings(settings);
+
+        let uri = Url::parse("file:///test/no_parser.rmd").unwrap();
+        let lsp_uri = tower_lsp_server::ls_types::Uri::from_str(uri.as_str()).unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "text\n".to_string(),
+            Some("rmd".to_string()),
+            None,
+        );
+
+        assert!(!server.language.has_parser_available("markdown"));
+        assert_eq!(
+            server.document_bridge_language(&uri).as_deref(),
+            Some("markdown")
+        );
+        let context = server
+            .resolve_host_bridge_context(&lsp_uri, "textDocument/selectionRange")
+            .expect("a parser-less derived language must route through its base");
+        assert_eq!(context.language_id, "markdown");
+        assert_eq!(context.configs.len(), 1);
+    }
+
     /// The shared freshness helper never parses inline (parse-snapshot ADR
     /// §3: the reader on-demand parse was a resurrection vector). With no
     /// reparse scheduled for a cleared tree, it returns within its bounded
