@@ -427,107 +427,113 @@ impl Kakehashi {
         // belong to different virtual regions. Resolve preferred layers once
         // per position and preserve the editor's input order.
         let layer_walk = async {
-            let mut selected = Vec::with_capacity(positions.len());
-            for (index, position) in positions.into_iter().enumerate() {
-                let virt = async {
-                    self.selection_range_virt_layer(&lsp_uri, position, expected_incarnation)
-                        .await
-                        .map(|selection| {
-                            selection.map(|selection| (selection, SelectionLayer::Virt))
-                        })
-                };
-                let cached_host = reusable_host_results
-                    .map(|host| &host.results)
-                    .and_then(|results| results.get(index))
-                    .cloned()
-                    .flatten();
-                let host = async {
-                    let selection = if reusable_host_results.is_some() {
-                        Ok(cached_host)
-                    } else {
-                        self.selection_range_host_layer(
-                            &lsp_uri,
-                            position,
-                            expected_incarnation,
-                            expected_version,
-                        )
-                        .await
-                    }?;
-                    Ok(selection.map(|selection| (selection, SelectionLayer::Host)))
-                }
-                .boxed()
-                .shared();
-                let native = async {
-                    if !native_enabled {
-                        Ok(None)
-                    } else {
-                        let mut receiver = native_rx.clone();
-                        loop {
-                            if let Some(ranges) = receiver.borrow().as_ref() {
-                                break Ok(ranges
-                                    .get(index)
-                                    .cloned()
-                                    .map(|selection| (selection, SelectionLayer::Native)));
-                            }
-                            if receiver.changed().await.is_err() {
-                                break Ok(None);
-                            }
-                        }
+            let priorities = &layer_config.priorities;
+            let walks = positions.into_iter().enumerate().map(|(index, position)| {
+                let native_rx = native_rx.clone();
+                let lsp_uri = lsp_uri.clone();
+                async move {
+                    let virt = async {
+                        self.selection_range_virt_layer(&lsp_uri, position, expected_incarnation)
+                            .await
+                            .map(|selection| {
+                                selection.map(|selection| (selection, SelectionLayer::Virt))
+                            })
+                    };
+                    let cached_host = reusable_host_results
+                        .map(|host| &host.results)
+                        .and_then(|results| results.get(index))
+                        .cloned()
+                        .flatten();
+                    let host = async {
+                        let selection = if reusable_host_results.is_some() {
+                            Ok(cached_host)
+                        } else {
+                            self.selection_range_host_layer(
+                                &lsp_uri,
+                                position,
+                                expected_incarnation,
+                                expected_version,
+                            )
+                            .await
+                        }?;
+                        Ok(selection.map(|selection| (selection, SelectionLayer::Host)))
                     }
-                };
-                let result = self
-                    .walk_layer_futures(
-                        &lsp_uri,
-                        METHOD,
-                        METHOD,
-                        virt,
-                        host.clone(),
-                        native,
-                        |_| true,
-                    )
-                    .await?;
-                let Some((mut result, source)) = result else {
-                    // The protocol requires one result for every input position;
-                    // never surface a shorter, index-shifted response.
-                    return Ok(None);
-                };
-                if source == SelectionLayer::Virt {
-                    let lower_layers = layer_config
-                        .priorities
-                        .iter()
-                        .skip_while(|source| **source != LayerSource::Virt)
-                        .skip(1);
-                    for source in lower_layers {
-                        let ancestors = match source {
-                            LayerSource::Native if native_enabled => {
-                                let mut receiver = native_rx.clone();
-                                loop {
-                                    if let Some(ranges) = receiver.borrow().as_ref() {
-                                        break ranges.get(index).cloned();
-                                    }
-                                    if receiver.changed().await.is_err() {
-                                        break None;
-                                    }
+                    .boxed()
+                    .shared();
+                    let native = async {
+                        if !native_enabled {
+                            Ok(None)
+                        } else {
+                            let mut receiver = native_rx.clone();
+                            loop {
+                                if let Some(ranges) = receiver.borrow().as_ref() {
+                                    break Ok(ranges
+                                        .get(index)
+                                        .cloned()
+                                        .map(|selection| (selection, SelectionLayer::Native)));
+                                }
+                                if receiver.changed().await.is_err() {
+                                    break Ok(None);
                                 }
                             }
-                            LayerSource::Host => {
-                                host.clone().await?.map(|(selection, _)| selection)
-                            }
-                            _ => None,
-                        };
-                        if let Some(ancestors) = ancestors {
-                            let (extended, appended) =
-                                append_containing_selection_ancestors(result, ancestors);
-                            result = extended;
-                            if appended {
-                                break;
+                        }
+                    };
+                    let result = self
+                        .walk_layer_futures(
+                            &lsp_uri,
+                            METHOD,
+                            METHOD,
+                            virt,
+                            host.clone(),
+                            native,
+                            |_| true,
+                        )
+                        .await?;
+                    let Some((mut result, source)) = result else {
+                        // The protocol requires one result for every input position;
+                        // never surface a shorter, index-shifted response.
+                        return Ok(None);
+                    };
+                    if source == SelectionLayer::Virt {
+                        let lower_layers = priorities
+                            .iter()
+                            .skip_while(|source| **source != LayerSource::Virt)
+                            .skip(1);
+                        for source in lower_layers {
+                            let ancestors = match source {
+                                LayerSource::Native if native_enabled => {
+                                    let mut receiver = native_rx.clone();
+                                    loop {
+                                        if let Some(ranges) = receiver.borrow().as_ref() {
+                                            break ranges.get(index).cloned();
+                                        }
+                                        if receiver.changed().await.is_err() {
+                                            break None;
+                                        }
+                                    }
+                                }
+                                LayerSource::Host => {
+                                    host.clone().await?.map(|(selection, _)| selection)
+                                }
+                                _ => None,
+                            };
+                            if let Some(ancestors) = ancestors {
+                                let (extended, appended) =
+                                    append_containing_selection_ancestors(result, ancestors);
+                                result = extended;
+                                if appended {
+                                    break;
+                                }
                             }
                         }
                     }
+                    Ok(Some(result))
                 }
-                selected.push(result);
-            }
-            Ok(Some(selected))
+            });
+            Ok(futures::future::try_join_all(walks)
+                .await?
+                .into_iter()
+                .collect())
         };
         let layer_race = race_native_producer(native_producer, layer_walk);
         let selected = tokio::select! {
