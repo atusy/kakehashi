@@ -970,13 +970,14 @@ impl Kakehashi {
         lsp_uri: &tower_lsp_server::ls_types::Uri,
         uri: &Url,
         snapshot: &crate::document::snapshot::ParseSnapshot,
-        language_name: &str,
+        bridge_language: &str,
+        parser_language: Option<&str>,
     ) -> bool {
         const METHOD: &str = "textDocument/semanticTokens/full";
         let settings = self.settings_manager.load_settings();
         let layers = super::super::bridge_context::resolve_layer_config_from_settings(
             &settings,
-            language_name,
+            bridge_language,
             METHOD,
         );
         if layers.priorities.contains(&LayerSource::Host)
@@ -1016,6 +1017,9 @@ impl Kakehashi {
         if !layers.priorities.contains(&LayerSource::Virt) {
             return false;
         }
+        let Some(parser_language) = parser_language else {
+            return false;
+        };
 
         let generation = self.cache.semantic_token_generation();
         let owned_regions;
@@ -1026,7 +1030,7 @@ impl Kakehashi {
         } else {
             let (Some(tree), Some(query)) = (
                 snapshot.tree.as_ref(),
-                self.language.injection_query(language_name),
+                self.language.injection_query(parser_language),
             ) else {
                 return false;
             };
@@ -1043,7 +1047,7 @@ impl Kakehashi {
         };
         let incapable = self
             .incapable_virt_servers(
-                language_name,
+                bridge_language,
                 regions
                     .iter()
                     .map(|region| region.injection_language.as_str()),
@@ -1053,11 +1057,11 @@ impl Kakehashi {
         let has_configured_region = |regions: &[ResolvedInjection]| {
             regions.iter().any(|region| {
                 let configs = self.bridge_configs_for_injection_language(
-                    language_name,
+                    bridge_language,
                     &region.injection_language,
                 );
                 let agg = self.resolve_aggregation_config(
-                    language_name,
+                    bridge_language,
                     &region.injection_language,
                     METHOD,
                 );
@@ -1197,6 +1201,50 @@ impl Kakehashi {
                 return Ok(None);
             }
         };
+        // Host full aggregation does not require a parser tree. Check bridge
+        // applicability before the native-only tree gate so a tree-less
+        // current snapshot can still re-enter its configured host layer.
+        let parser_language = snapshot.language.as_deref();
+        if let Some(bridge_language) = snapshot.language.as_deref()
+            && self
+                .semantic_delta_has_applicable_bridge(
+                    &lsp_uri,
+                    &uri,
+                    &snapshot,
+                    bridge_language,
+                    parser_language,
+                )
+                .await
+        {
+            let full = self.semantic_tokens_full_impl_with_tracking(
+                full_params,
+                Some((request_id, cancel_token.clone())),
+            );
+            let result = match cancel_rx.as_mut() {
+                Some(cancel_rx) => {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_rx => return Err(Error::request_cancelled()),
+                        result = full => result,
+                    }
+                }
+                None => full.await,
+            };
+            return result.map(|result| {
+                result.map(|result| match result {
+                    SemanticTokensResult::Tokens(tokens) => {
+                        SemanticTokensFullDeltaResult::Tokens(tokens)
+                    }
+                    SemanticTokensResult::Partial(partial) => {
+                        SemanticTokensFullDeltaResult::Tokens(SemanticTokens {
+                            result_id: None,
+                            data: partial.data,
+                        })
+                    }
+                })
+            });
+        }
+
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
             self.cache
@@ -1226,48 +1274,6 @@ impl Kakehashi {
                     data: vec![],
                 },
             )));
-        }
-
-        // A native resultId is safe only while the current document still has
-        // no applicable bridge layer. An edit can add the first injection (or
-        // make a host layer applicable) after that lineage was advertised.
-        // Re-enter full aggregation in that case; a full response is legal for
-        // full/delta and prevents a native-only lineage from hiding the bridge.
-        if self
-            .semantic_delta_has_applicable_bridge(&lsp_uri, &uri, &snapshot, &language_name)
-            .await
-        {
-            // Keep this delta's tracker ownership through the nested full
-            // computation. Starting a fresh full request here would let an
-            // older delta supersede a newer request that arrived while bridge
-            // applicability was being resolved.
-            let full = self.semantic_tokens_full_impl_with_tracking(
-                full_params,
-                Some((request_id, cancel_token.clone())),
-            );
-            let result = match cancel_rx.as_mut() {
-                Some(cancel_rx) => {
-                    tokio::select! {
-                        biased;
-                        _ = cancel_rx => return Err(Error::request_cancelled()),
-                        result = full => result,
-                    }
-                }
-                None => full.await,
-            };
-            return result.map(|result| {
-                result.map(|result| match result {
-                    SemanticTokensResult::Tokens(tokens) => {
-                        SemanticTokensFullDeltaResult::Tokens(tokens)
-                    }
-                    SemanticTokensResult::Partial(partial) => {
-                        SemanticTokensFullDeltaResult::Tokens(SemanticTokens {
-                            result_id: None,
-                            data: partial.data,
-                        })
-                    }
-                })
-            });
         }
 
         // Early exit check after loading language
