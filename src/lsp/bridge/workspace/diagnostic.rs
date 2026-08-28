@@ -7,9 +7,9 @@ use std::sync::Arc;
 use futures::future::join_all;
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
-    DiagnosticServerCapabilities, WorkspaceDiagnosticParams, WorkspaceDiagnosticReport,
-    WorkspaceDiagnosticReportResult, WorkspaceDocumentDiagnosticReport,
-    WorkspaceFullDocumentDiagnosticReport,
+    DiagnosticRegistrationOptions, DiagnosticServerCapabilities, Registration,
+    WorkspaceDiagnosticParams, WorkspaceDiagnosticReport, WorkspaceDiagnosticReportResult,
+    WorkspaceDocumentDiagnosticReport, WorkspaceFullDocumentDiagnosticReport,
 };
 
 use crate::config::settings::WorkspaceSettings;
@@ -21,18 +21,82 @@ use crate::lsp::bridge::pool::{
 use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
 
 const DIAGNOSTIC_METHOD: &str = "workspace/diagnostic";
+const DIAGNOSTIC_REGISTRATION_METHOD: &str = "textDocument/diagnostic";
 
-fn has_static_workspace_diagnostics(handle: &ConnectionHandle) -> bool {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DiagnosticProvider {
+    Static {
+        identifier: Option<String>,
+    },
+    Dynamic {
+        registration_id: String,
+        identifier: Option<String>,
+    },
+}
+
+impl DiagnosticProvider {
+    fn identifier(&self) -> Option<&str> {
+        match self {
+            Self::Static { identifier } | Self::Dynamic { identifier, .. } => identifier.as_deref(),
+        }
+    }
+}
+
+fn static_workspace_diagnostic_provider(handle: &ConnectionHandle) -> Option<DiagnosticProvider> {
     match handle
         .server_capabilities()
         .and_then(|capabilities| capabilities.diagnostic_provider.as_ref())
     {
-        Some(DiagnosticServerCapabilities::Options(options)) => options.workspace_diagnostics,
-        Some(DiagnosticServerCapabilities::RegistrationOptions(options)) => {
-            options.diagnostic_options.workspace_diagnostics
+        Some(DiagnosticServerCapabilities::Options(options)) if options.workspace_diagnostics => {
+            Some(DiagnosticProvider::Static {
+                identifier: options.identifier.clone(),
+            })
         }
-        None => false,
+        Some(DiagnosticServerCapabilities::RegistrationOptions(options)) => options
+            .diagnostic_options
+            .workspace_diagnostics
+            .then(|| DiagnosticProvider::Static {
+                identifier: options.diagnostic_options.identifier.clone(),
+            }),
+        _ => None,
     }
+}
+
+fn dynamic_workspace_diagnostic_provider(
+    registration: &Registration,
+) -> Option<DiagnosticProvider> {
+    let options: DiagnosticRegistrationOptions =
+        serde_json::from_value(registration.register_options.clone()?).ok()?;
+    options
+        .diagnostic_options
+        .workspace_diagnostics
+        .then(|| DiagnosticProvider::Dynamic {
+            registration_id: registration.id.clone(),
+            identifier: options.diagnostic_options.identifier,
+        })
+}
+
+fn diagnostic_providers(handle: &ConnectionHandle) -> Vec<DiagnosticProvider> {
+    let mut providers = static_workspace_diagnostic_provider(handle)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut registrations = handle
+        .dynamic_capabilities()
+        .registrations_for_method(DIAGNOSTIC_REGISTRATION_METHOD);
+    registrations.sort_by(|left, right| left.id.cmp(&right.id));
+    providers.extend(
+        registrations
+            .iter()
+            .filter_map(dynamic_workspace_diagnostic_provider),
+    );
+    providers
+}
+
+fn params_for_provider(mut params: Value, provider: &DiagnosticProvider) -> Value {
+    if let (Some(params), Some(identifier)) = (params.as_object_mut(), provider.identifier()) {
+        params.insert("identifier".into(), Value::String(identifier.into()));
+    }
+    params
 }
 
 fn sanitize_diagnostics(
@@ -174,13 +238,34 @@ impl LanguageServerPool {
                     .await
                     .ok()?;
                 let generation = self.document_connection_generation(handle.key());
-                self.send_workspace_diagnostic_request(&handle, generation, params, upstream_id)
-                    .await
-                    .ok()?
+                let requests = diagnostic_providers(&handle).into_iter().map(|provider| {
+                    let params = params_for_provider(params.clone(), &provider);
+                    let upstream_id = upstream_id.clone();
+                    let handle = Arc::clone(&handle);
+                    async move {
+                        self.send_workspace_diagnostic_request(
+                            &handle,
+                            generation,
+                            params,
+                            upstream_id,
+                            provider,
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                    }
+                });
+                Some(
+                    join_all(requests)
+                        .await
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>(),
+                )
             }
         });
 
-        aggregate_reports(join_all(requests).await.into_iter().flatten())
+        aggregate_reports(join_all(requests).await.into_iter().flatten().flatten())
     }
 
     async fn send_workspace_diagnostic_request(
@@ -189,6 +274,7 @@ impl LanguageServerPool {
         expected_generation: u64,
         params: Value,
         upstream_id: Option<UpstreamId>,
+        provider: DiagnosticProvider,
     ) -> io::Result<Option<WorkspaceDiagnosticReport>> {
         let key = handle.key();
         let virtual_uris = self.observe_virtual_uris_for_connection(key, expected_generation);
@@ -221,15 +307,26 @@ impl LanguageServerPool {
                     "workspace diagnostic producer was replaced before admission",
                 ));
             }
-            let static_admitted = has_static_workspace_diagnostics(handle);
-            let admitted = handle.dynamic_capabilities().with_registration_snapshot(
-                "textDocument/diagnostic",
-                "workspaceDiagnostics",
-                |dynamic_diagnostics, dynamic_workspace| {
-                    (static_admitted || (dynamic_diagnostics && dynamic_workspace))
+            let admitted = match &provider {
+                DiagnosticProvider::Static { .. } => {
+                    (static_workspace_diagnostic_provider(handle).as_ref() == Some(&provider))
                         .then(|| handle.send_request(request, request_id))
-                },
-            );
+                }
+                DiagnosticProvider::Dynamic {
+                    registration_id, ..
+                } => handle
+                    .dynamic_capabilities()
+                    .with_registration_by_id(
+                        registration_id,
+                        DIAGNOSTIC_REGISTRATION_METHOD,
+                        |registration| {
+                            (dynamic_workspace_diagnostic_provider(registration).as_ref()
+                                == Some(&provider))
+                            .then(|| handle.send_request(request, request_id))
+                        },
+                    )
+                    .flatten(),
+            };
             let Some(send_result) = admitted else {
                 if let Some(id) = &upstream_id {
                     self.unregister_upstream_request(id, key);
@@ -288,6 +385,9 @@ mod tests {
 
     use super::*;
     use crate::lsp::bridge::ConnectionKey;
+    use crate::lsp::bridge::pool::test_helpers::{
+        create_handle_advertising_workspace_diagnostics, create_handle_with_key,
+    };
     use crate::lsp::bridge::protocol::VirtualDocumentUri;
 
     fn full(uri: &str, version: Option<i64>, message: &str) -> WorkspaceDocumentDiagnosticReport {
@@ -353,6 +453,165 @@ mod tests {
             report.full_document_diagnostic_report.items[0].message,
             "new"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_plan_preserves_static_and_each_dynamic_identifier() {
+        let handle = create_handle_advertising_workspace_diagnostics(
+            ConnectionKey::for_server("diagnostics"),
+            Some("static"),
+        )
+        .await;
+        handle.dynamic_capabilities().register(vec![
+            Registration {
+                id: "z-registration".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+                register_options: Some(serde_json::json!({
+                    "identifier": "zeta",
+                    "workspaceDiagnostics": true,
+                    "interFileDependencies": true
+                })),
+            },
+            Registration {
+                id: "a-registration".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+                register_options: Some(serde_json::json!({
+                    "identifier": "alpha",
+                    "workspaceDiagnostics": true,
+                    "interFileDependencies": true
+                })),
+            },
+            Registration {
+                id: "document-only".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+                register_options: Some(serde_json::json!({
+                    "identifier": "document",
+                    "workspaceDiagnostics": false,
+                    "interFileDependencies": false
+                })),
+            },
+        ]);
+
+        let providers = diagnostic_providers(&handle);
+        assert_eq!(
+            providers,
+            vec![
+                DiagnosticProvider::Static {
+                    identifier: Some("static".into())
+                },
+                DiagnosticProvider::Dynamic {
+                    registration_id: "a-registration".into(),
+                    identifier: Some("alpha".into())
+                },
+                DiagnosticProvider::Dynamic {
+                    registration_id: "z-registration".into(),
+                    identifier: Some("zeta".into())
+                },
+            ]
+        );
+        let identifiers: Vec<_> = providers
+            .iter()
+            .map(|provider| {
+                params_for_provider(serde_json::json!({ "previousResultIds": [] }), provider)
+                    ["identifier"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(identifiers, ["static", "alpha", "zeta"]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_sends_one_request_for_each_dynamic_provider() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("diagnostics");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.dynamic_capabilities().register(vec![
+            Registration {
+                id: "alpha".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+                register_options: Some(serde_json::json!({
+                    "identifier": "alpha",
+                    "workspaceDiagnostics": true,
+                    "interFileDependencies": true
+                })),
+            },
+            Registration {
+                id: "zeta".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+                register_options: Some(serde_json::json!({
+                    "identifier": "zeta",
+                    "workspaceDiagnostics": true,
+                    "interFileDependencies": true
+                })),
+            },
+        ]);
+        pool.connections().await.insert(key, Arc::clone(&handle));
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "diagnostics".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-diagnostics".into()]),
+                languages: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceDiagnosticParams = serde_json::from_value(serde_json::json!({
+            "previousResultIds": []
+        }))
+        .unwrap();
+        let upstream_id = UpstreamId::Number(42);
+        let pool_for_request = Arc::clone(&pool);
+        let upstream_for_request = upstream_id.clone();
+        let request = tokio::spawn(async move {
+            pool_for_request
+                .dispatch_workspace_diagnostic(
+                    params,
+                    &settings,
+                    Some(upstream_for_request),
+                    &|| true,
+                )
+                .await
+        });
+
+        let downstream_ids = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let ids = handle.router().lookup_downstream_ids(&upstream_id);
+                if ids.len() == 2 && ids.iter().all(|id| handle.router().is_sent(*id)) {
+                    break ids;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both provider requests reach Sent state");
+        for (index, request_id) in downstream_ids.into_iter().enumerate() {
+            let _ = handle.router().route(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request_id.as_i64(),
+                "result": { "items": [{
+                    "kind": "full",
+                    "uri": "file:///workspace/shared.rs",
+                    "version": 1,
+                    "items": [{
+                        "range": {
+                            "start": { "line": 0, "character": index },
+                            "end": { "line": 0, "character": index + 1 }
+                        },
+                        "message": format!("provider-{index}")
+                    }]
+                }] }
+            }));
+        }
+
+        let WorkspaceDiagnosticReportResult::Report(report) = request.await.unwrap() else {
+            panic!("full report")
+        };
+        let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
+            panic!("full document report")
+        };
+        assert_eq!(report.full_document_diagnostic_report.items.len(), 2);
     }
 
     #[test]

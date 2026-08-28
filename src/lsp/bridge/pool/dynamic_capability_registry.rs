@@ -75,6 +75,34 @@ impl DynamicCapabilityRegistry {
             .then(f)
     }
 
+    pub(crate) fn registrations_for_method(&self, method: &str) -> Vec<Registration> {
+        self.registrations
+            .read()
+            .recover_poison("DynamicCapabilityRegistry::registrations_for_method")
+            .values()
+            .filter(|registration| registration.method == method)
+            .cloned()
+            .collect()
+    }
+
+    /// Run `f` with one exact registration while its ID remains protected from
+    /// unregistration or replacement.
+    pub(crate) fn with_registration_by_id<R>(
+        &self,
+        id: &str,
+        method: &str,
+        f: impl FnOnce(&Registration) -> R,
+    ) -> Option<R> {
+        let guard = self
+            .registrations
+            .read()
+            .recover_poison("DynamicCapabilityRegistry::with_registration_by_id");
+        guard
+            .get(id)
+            .filter(|registration| registration.method == method)
+            .map(f)
+    }
+
     /// Whether any dynamic registration of `method` sets the boolean
     /// `registerOptions.<flag>`.
     ///
@@ -203,6 +231,67 @@ mod tests {
         );
         registry.unregister(vec![make_unregistration("1", "textDocument/completion")]);
         assert!(!registry.has_registration("textDocument/completion"));
+    }
+
+    #[test]
+    fn exact_registration_read_lease_exposes_options_and_orders_unregistration() {
+        let registry = DynamicCapabilityRegistry::new();
+        registry.register(vec![Registration {
+            id: "diagnostics".into(),
+            method: "textDocument/diagnostic".into(),
+            register_options: Some(serde_json::json!({
+                "identifier": "rust",
+                "workspaceDiagnostics": true
+            })),
+        }]);
+
+        let snapshot = registry.with_registration_by_id(
+            "diagnostics",
+            "textDocument/diagnostic",
+            |registration| {
+                (
+                    registration.register_options.clone(),
+                    registry.registrations.try_write().is_err(),
+                )
+            },
+        );
+
+        assert_eq!(
+            snapshot,
+            Some((
+                Some(serde_json::json!({
+                    "identifier": "rust",
+                    "workspaceDiagnostics": true
+                })),
+                true
+            ))
+        );
+    }
+
+    #[test]
+    fn registrations_for_method_returns_each_provider_registration() {
+        let registry = DynamicCapabilityRegistry::new();
+        registry.register(vec![
+            Registration {
+                id: "rust".into(),
+                method: "textDocument/diagnostic".into(),
+                register_options: Some(serde_json::json!({ "identifier": "rust" })),
+            },
+            Registration {
+                id: "lua".into(),
+                method: "textDocument/diagnostic".into(),
+                register_options: Some(serde_json::json!({ "identifier": "lua" })),
+            },
+            make_registration("hover", "textDocument/hover"),
+        ]);
+
+        let mut ids: Vec<_> = registry
+            .registrations_for_method("textDocument/diagnostic")
+            .into_iter()
+            .map(|registration| registration.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["lua", "rust"]);
     }
 
     #[test]
