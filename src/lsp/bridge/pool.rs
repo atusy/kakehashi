@@ -139,19 +139,17 @@ fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHan
     });
 }
 
-struct WorkspaceChangeGenerationGuard<'a>(&'a AtomicU64);
-
-impl WorkspaceChangeGenerationGuard<'_> {
-    fn begin(generation: &AtomicU64) -> WorkspaceChangeGenerationGuard<'_> {
-        let previous = generation.fetch_add(1, Ordering::AcqRel);
-        debug_assert_eq!(previous & 1, 0, "workspace changes must be serialized");
-        WorkspaceChangeGenerationGuard(generation)
-    }
+pub(crate) struct WorkspaceFolderChange<'a> {
+    generation: &'a AtomicU64,
+    _lock: tokio::sync::MutexGuard<'a, ()>,
 }
 
-impl Drop for WorkspaceChangeGenerationGuard<'_> {
-    fn drop(&mut self) {
-        let previous = self.0.fetch_add(1, Ordering::AcqRel);
+impl WorkspaceFolderChange<'_> {
+    /// Publish the workspace/settings transaction as stable. Dropping without
+    /// finishing deliberately leaves it odd: a cancelled handler may have
+    /// reconciled only part of the downstream state.
+    pub(crate) fn finish(self) {
+        let previous = self.generation.fetch_add(1, Ordering::AcqRel);
         debug_assert_eq!(
             previous & 1,
             1,
@@ -803,15 +801,15 @@ impl LanguageServerPool {
     /// Update the upstream client workspace snapshot used by future
     /// client-fallback downstream connections.
     ///
-    /// Returns whether the event described a change at all, so the caller
+    /// Returns a transaction token when the event described a change, so the caller
     /// (`did_change_workspace_folders_impl`) can skip the settings reload it
-    /// owns for an event this function already found to be a no-op, instead
-    /// of duplicating the emptiness check.
+    /// owns for an event this function already found to be a no-op. The caller
+    /// finishes it only after root-relative settings are published.
     pub(crate) async fn apply_workspace_folder_change(
         &self,
         added: Vec<tower_lsp_server::ls_types::WorkspaceFolder>,
         removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
-    ) -> bool {
+    ) -> Option<WorkspaceFolderChange<'_>> {
         // An event naming neither an addition nor a removal describes no
         // change: `WorkspaceFolderSet::apply_change` is a no-op for it, so the
         // client workspace snapshot cannot move. Returning here rather than
@@ -821,15 +819,15 @@ impl LanguageServerPool {
         // invalidated, recycled, and armed for re-open over a notification
         // that named nothing.
         if added.is_empty() && removed.is_empty() {
-            return false;
+            return None;
         }
 
-        let _change_lock = self.workspace_change_lock.lock().await;
-        // Odd means update in progress and is never admissible. The RAII guard
-        // publishes the next even generation only after snapshots and every
-        // downstream notification/replacement have been committed; cancellation
-        // still restores an admissible even state.
-        let _generation = WorkspaceChangeGenerationGuard::begin(&self.workspace_generation);
+        let change_lock = self.workspace_change_lock.lock().await;
+        // A dropped transaction leaves the generation odd. The next complete
+        // update reconciles from that partial state within the same epoch.
+        if self.workspace_generation.load(Ordering::Acquire) & 1 == 0 {
+            self.workspace_generation.fetch_add(1, Ordering::AcqRel);
+        }
         self.workspace_folders.apply_change(added.clone(), removed);
         self.set_root_uri(
             self.workspace_folders()
@@ -906,7 +904,10 @@ impl LanguageServerPool {
         for (key, handle) in stale_handles {
             shutdown_invalidated_connection(key, handle);
         }
-        true
+        Some(WorkspaceFolderChange {
+            generation: &self.workspace_generation,
+            _lock: change_lock,
+        })
     }
 
     /// Set the upstream client capabilities.
@@ -4570,7 +4571,9 @@ mod tests {
         pool.set_workspace_folders(Some(vec![original.clone()]));
 
         pool.apply_workspace_folder_change(vec![replacement.clone()], &[original])
-            .await;
+            .await
+            .expect("non-empty change")
+            .finish();
 
         assert_eq!(pool.root_uri().as_deref(), Some("file:///replacement"));
         assert_eq!(pool.workspace_folders(), Some(vec![replacement]));
@@ -4597,7 +4600,9 @@ mod tests {
         };
 
         pool.apply_workspace_folder_change(vec![added.clone()], &[])
-            .await;
+            .await
+            .expect("non-empty change")
+            .finish();
 
         assert_eq!(capable.workspace_folders().snapshot(), Some(vec![added]));
         assert!(
@@ -4617,7 +4622,10 @@ mod tests {
             name: "added".to_string(),
         };
 
-        pool.apply_workspace_folder_change(vec![added], &[]).await;
+        pool.apply_workspace_folder_change(vec![added], &[])
+            .await
+            .expect("non-empty change")
+            .finish();
 
         assert!(
             !pool.connections.lock().await.contains_key(&key),
@@ -4651,7 +4659,10 @@ mod tests {
             name: "added".to_string(),
         };
 
-        pool.apply_workspace_folder_change(vec![added], &[]).await;
+        pool.apply_workspace_folder_change(vec![added], &[])
+            .await
+            .expect("non-empty change")
+            .finish();
 
         assert!(
             pool.pending_reopen.claim(&incapable_key).is_some(),
@@ -4689,7 +4700,11 @@ mod tests {
         pool.set_root_uri(Some(original.uri.to_string()));
         pool.set_workspace_folders(Some(vec![original.clone()]));
 
-        pool.apply_workspace_folder_change(Vec::new(), &[]).await;
+        assert!(
+            pool.apply_workspace_folder_change(Vec::new(), &[])
+                .await
+                .is_none()
+        );
 
         assert!(
             pool.connections.lock().await.contains_key(&key),
@@ -4722,7 +4737,9 @@ mod tests {
             }],
             &[],
         )
-        .await;
+        .await
+        .expect("non-empty change")
+        .finish();
 
         assert!(pool.connections.lock().await.contains_key(&key));
         assert_eq!(handle.workspace_folders().snapshot(), None);
@@ -4753,7 +4770,9 @@ mod tests {
                 name: "repo".to_string(),
             }],
         )
-        .await;
+        .await
+        .expect("non-empty change")
+        .finish();
 
         assert!(pool.connections.lock().await.contains_key(&key));
         assert_eq!(handle.workspace_folders().snapshot(), Some(vec![marker]));
