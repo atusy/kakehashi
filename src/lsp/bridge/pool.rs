@@ -2774,7 +2774,10 @@ impl LanguageServerPool {
                 admit,
             )
             .await?;
-        if !handle.key().is_shared() || handle.supports_workspace_folder_changes() {
+        if !handle.key().is_shared()
+            || handle.supports_workspace_folder_changes()
+            || self.incapable_shared_serves_client_workspace(&handle)
+        {
             return Ok(handle);
         }
 
@@ -2790,6 +2793,32 @@ impl LanguageServerPool {
             },
         )
         .await
+    }
+
+    fn incapable_shared_serves_client_workspace(&self, handle: &ConnectionHandle) -> bool {
+        match (
+            self.workspace_folders(),
+            handle.workspace_folders().snapshot(),
+        ) {
+            (Some(expected), Some(actual)) => {
+                expected.len() == actual.len()
+                    && expected.iter().all(|expected| {
+                        actual.iter().any(|actual| {
+                            super::root_markers::same_root_uri(
+                                expected.uri.as_str(),
+                                actual.uri.as_str(),
+                            )
+                        })
+                    })
+            }
+            _ => match (self.root_uri(), handle.spawn_root()) {
+                (Some(expected), Some(actual)) => {
+                    super::root_markers::same_root_uri(&expected, actual)
+                }
+                (None, None) => true,
+                _ => false,
+            },
+        }
     }
 
     async fn get_or_create_connection_wait_ready_with_admit(
