@@ -604,8 +604,10 @@ Each entry in the `bridge` map configures bridging for one injection language:
 The reserved `_self` key makes the host language its own bridge target: with
 it enabled, requests on the host document are forwarded to servers whose
 `languages` matches the **host** language (including a `"*"` server), with the real URI and no
-coordinate translation. Semantic-token `full` and `range` requests are wired too;
-`textDocument/semanticTokens/full/delta` remains native-only. By default the host layer is
+coordinate translation. Semantic-token `full` and `range` requests are wired too.
+A `textDocument/semanticTokens/full/delta` request with a native lineage re-enters
+full aggregation when a bridge becomes applicable, but the merged full response
+does not establish a delta lineage. By default the host layer is
 tried after
 `virt` (see `layers` above), so for `preferred` methods injections keep
 winning inside code fences while the host server answers everywhere else —
@@ -733,7 +735,9 @@ Details:
   Full and range semantic tokens also consume the selected bridge layers.
   Full requests always overlay all selected layers: omitting `native` removes
   built-in Tree-sitter coverage, while including it preserves every uncovered
-  native span. Only `textDocument/semanticTokens/full/delta` stays native-only.
+  native span. A `textDocument/semanticTokens/full/delta` request re-enters that
+  full overlay when a bridge becomes applicable; merged responses omit a delta
+  lineage.
 
 > **Migration note**: the layer list was renamed `order` →
 > `priorities` (and, one change earlier, the method map moved under
