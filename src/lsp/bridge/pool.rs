@@ -1784,12 +1784,12 @@ impl LanguageServerPool {
             .await
     }
 
-    pub(super) async fn virtual_document_versions_for_connection(
+    pub(super) async fn confirmed_virtual_document_versions_for_connection(
         &self,
         connection_key: &ConnectionKey,
     ) -> HashMap<String, i32> {
         self.document_tracker
-            .document_versions_for_connection(connection_key)
+            .confirmed_document_versions_for_connection(connection_key)
             .await
     }
 

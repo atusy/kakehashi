@@ -158,6 +158,9 @@ pub(crate) struct DocumentTracker {
     /// Keyed by connection (not language) to enable process sharing while
     /// keeping per-root connections distinct.
     document_versions: Mutex<HashMap<ConnectionKey, HashMap<String, i32>>>,
+    /// Revisions whose didOpen/didChange was confirmed enqueued. Unlike
+    /// `document_versions`, this never advances for a dropped notification.
+    confirmed_document_versions: Mutex<HashMap<ConnectionKey, HashMap<String, i32>>>,
     /// Map of connection key → (virtual document URI → fingerprint of the content
     /// last sent to that connection). Lets the virt sync skip re-sending `didChange`
     /// when a host edit didn't change a region's extracted content (mirrors the
@@ -212,6 +215,7 @@ impl DocumentTracker {
     pub(crate) fn new() -> Self {
         Self {
             document_versions: Mutex::new(HashMap::new()),
+            confirmed_document_versions: Mutex::new(HashMap::new()),
             document_fingerprints: std::sync::Mutex::new(HashMap::new()),
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
@@ -448,6 +452,12 @@ impl DocumentTracker {
         if newly_opened {
             *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
         }
+        self.confirmed_document_versions
+            .lock()
+            .await
+            .entry(connection_key.clone())
+            .or_default()
+            .insert(uri_string.clone(), 1);
         drop(versions);
         notify.notify_waiters();
         true
@@ -606,11 +616,11 @@ impl DocumentTracker {
         Some(version)
     }
 
-    pub(super) async fn document_versions_for_connection(
+    pub(super) async fn confirmed_document_versions_for_connection(
         &self,
         connection_key: &ConnectionKey,
     ) -> HashMap<String, i32> {
-        self.document_versions
+        self.confirmed_document_versions
             .lock()
             .await
             .get(connection_key)
@@ -676,21 +686,39 @@ impl DocumentTracker {
         content: &str,
     ) {
         let uri_string = virtual_uri.to_uri_string();
-        let fp = content_fingerprint(content);
-        let mut fingerprints = self
-            .document_fingerprints
+        let Some(version) = self
+            .document_versions
             .lock()
-            .recover_poison("DocumentTracker::document_fingerprints");
-        // Clone the connection key only when first inserting it (common path: the
-        // connection is already present, so look up by borrow).
-        if let Some(docs) = fingerprints.get_mut(connection_key) {
-            docs.insert(uri_string, fp);
-        } else {
-            fingerprints
-                .entry(connection_key.clone())
-                .or_default()
-                .insert(uri_string, fp);
+            .await
+            .get(connection_key)
+            .and_then(|docs| docs.get(&uri_string))
+            .copied()
+        else {
+            return;
+        };
+        let fp = content_fingerprint(content);
+        {
+            let mut fingerprints = self
+                .document_fingerprints
+                .lock()
+                .recover_poison("DocumentTracker::document_fingerprints");
+            // Clone the connection key only when first inserting it (common path: the
+            // connection is already present, so look up by borrow).
+            if let Some(docs) = fingerprints.get_mut(connection_key) {
+                docs.insert(uri_string, fp);
+            } else {
+                fingerprints
+                    .entry(connection_key.clone())
+                    .or_default()
+                    .insert(uri_string, fp);
+            }
         }
+        self.confirmed_document_versions
+            .lock()
+            .await
+            .entry(connection_key.clone())
+            .or_default()
+            .insert(virtual_uri.to_uri_string(), version);
     }
 
     /// Remove a document from `document_versions` and `opened_documents`.
@@ -714,6 +742,14 @@ impl DocumentTracker {
             .document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::document_fingerprints")
+            .get_mut(connection_key)
+        {
+            docs.remove(&uri_string);
+        }
+        if let Some(docs) = self
+            .confirmed_document_versions
+            .lock()
+            .await
             .get_mut(connection_key)
         {
             docs.remove(&uri_string);
@@ -764,6 +800,10 @@ impl DocumentTracker {
         self.document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::document_fingerprints")
+            .remove(connection_key);
+        self.confirmed_document_versions
+            .lock()
+            .await
             .remove(connection_key);
         for uri in &uris {
             self.decrement_opened(uri);
@@ -867,6 +907,14 @@ impl DocumentTracker {
             .document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::rollback_open_claim_if")
+            .get_mut(connection_key)
+        {
+            docs.remove(&uri_string);
+        }
+        if let Some(docs) = self
+            .confirmed_document_versions
+            .lock()
+            .await
             .get_mut(connection_key)
         {
             docs.remove(&uri_string);
