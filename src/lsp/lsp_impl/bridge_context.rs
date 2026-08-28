@@ -273,7 +273,7 @@ pub(crate) struct RangeRequestContext {
 struct PreambleResult {
     uri: Url,
     resolved: ResolvedInjection,
-    language_name: String,
+    bridge_language_name: String,
     upstream_request_id: Option<UpstreamId>,
     /// End-of-content derived for the bounds precheck, carried so no later
     /// stage re-derives it.
@@ -922,6 +922,9 @@ impl Kakehashi {
             log::debug!("kakehashi::{}: No language detected", method_name);
             return None;
         };
+        let bridge_language_name = self
+            .document_bridge_language(&uri)
+            .unwrap_or_else(|| language_name.clone());
 
         // Get injection query to detect injection regions
         let injection_query = self.language.injection_query(&language_name)?;
@@ -1003,7 +1006,7 @@ impl Kakehashi {
             PreambleResult {
                 uri,
                 resolved,
-                language_name,
+                bridge_language_name,
                 upstream_request_id,
                 region_end,
                 incarnation: snapshot.incarnation(),
@@ -1097,17 +1100,17 @@ impl Kakehashi {
         preamble: PreambleResult,
         method_name: &str,
     ) -> Option<DocumentRequestContext> {
-        if !self.virt_layer_enabled(&preamble.language_name, method_name) {
+        if !self.virt_layer_enabled(&preamble.bridge_language_name, method_name) {
             log::debug!(
                 "{}: virt layer disabled for {} via layers.aggregation priorities",
                 method_name,
-                preamble.language_name
+                preamble.bridge_language_name
             );
             return None;
         }
 
         let mut configs = self.bridge_configs_for_injection_language(
-            &preamble.language_name,
+            &preamble.bridge_language_name,
             &preamble.resolved.injection_language,
         );
 
@@ -1115,7 +1118,7 @@ impl Kakehashi {
             log::debug!(
                 "No bridge server configured for language: {} (host: {})",
                 preamble.resolved.injection_language,
-                preamble.language_name
+                preamble.bridge_language_name
             );
             return None;
         }
@@ -1126,7 +1129,7 @@ impl Kakehashi {
         // (capability-prefilter-fanout).
         let incapable = self
             .incapable_virt_servers(
-                &preamble.language_name,
+                &preamble.bridge_language_name,
                 std::iter::once(preamble.resolved.injection_language.as_str()),
                 method_name,
             )
@@ -1179,7 +1182,7 @@ impl Kakehashi {
         }
 
         let agg = self.resolve_aggregation_config(
-            &preamble.language_name,
+            &preamble.bridge_language_name,
             &preamble.resolved.injection_language,
             method_name,
         );
@@ -1735,6 +1738,9 @@ impl Kakehashi {
         let Some(language_name) = self.document_language(&uri) else {
             return Vec::new();
         };
+        let bridge_language_name = self
+            .document_bridge_language(&uri)
+            .unwrap_or_else(|| language_name.clone());
         let Some(injection_query) = self.language.injection_query(&language_name) else {
             return Vec::new();
         };
@@ -1789,7 +1795,7 @@ impl Kakehashi {
                     ),
                 ),
                 resolved,
-                language_name: language_name.clone(),
+                bridge_language_name: bridge_language_name.clone(),
                 upstream_request_id: upstream_request_id.clone(),
                 incarnation: snapshot.incarnation(),
                 content_version: snapshot.content_version(),
