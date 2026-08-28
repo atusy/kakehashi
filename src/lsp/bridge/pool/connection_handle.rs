@@ -13,9 +13,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
     CodeActionOptions, CodeActionProviderCapability, ColorProviderCapability,
-    DeclarationCapability, FoldingRangeProviderCapability, HoverProviderCapability,
-    ImplementationProviderCapability, LinkedEditingRangeServerCapabilities, OneOf, RenameOptions,
-    SaveOptions, SelectionRangeProviderCapability, SemanticTokensFullOptions, SemanticTokensLegend,
+    DeclarationCapability, DiagnosticServerCapabilities, FoldingRangeProviderCapability,
+    HoverProviderCapability, ImplementationProviderCapability,
+    LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, SaveOptions,
+    SelectionRangeProviderCapability, SemanticTokensFullOptions, SemanticTokensLegend,
     SemanticTokensServerCapabilities, ServerCapabilities, TextDocumentSyncCapability,
     TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
 };
@@ -756,11 +757,27 @@ impl ConnectionHandle {
         {
             return true;
         }
+        if method == "workspace/diagnostic"
+            && self
+                .dynamic_capabilities()
+                .registration_options_flag("textDocument/diagnostic", "workspaceDiagnostics")
+        {
+            return true;
+        }
         // Fall back to static capabilities from initialize response
         let Some(caps) = self.server_capabilities() else {
             return false;
         };
         match method {
+            "workspace/diagnostic" => match caps.diagnostic_provider.as_ref() {
+                Some(DiagnosticServerCapabilities::Options(options)) => {
+                    options.workspace_diagnostics
+                }
+                Some(DiagnosticServerCapabilities::RegistrationOptions(options)) => {
+                    options.diagnostic_options.workspace_diagnostics
+                }
+                None => false,
+            },
             "textDocument/diagnostic" => caps.diagnostic_provider.is_some(),
             "textDocument/hover" => matches!(
                 caps.hover_provider,
@@ -2340,6 +2357,42 @@ mod tests {
             register_options: None,
         }]);
         assert!(handle.has_capability("textDocument/diagnostic"));
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostic_requires_the_provider_subcapability() {
+        use tower_lsp_server::ls_types::{
+            DiagnosticOptions, DiagnosticServerCapabilities, Registration,
+        };
+
+        let static_handle = spawn_sink_handle().await;
+        static_handle.set_server_capabilities(ServerCapabilities {
+            diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
+                workspace_diagnostics: true,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        assert!(static_handle.has_capability("workspace/diagnostic"));
+
+        let document_only = spawn_sink_handle().await;
+        document_only.set_server_capabilities(ServerCapabilities {
+            diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                DiagnosticOptions::default(),
+            )),
+            ..Default::default()
+        });
+        assert!(!document_only.has_capability("workspace/diagnostic"));
+
+        let dynamic_handle = spawn_sink_handle().await;
+        dynamic_handle
+            .dynamic_capabilities()
+            .register(vec![Registration {
+                id: "workspace-diag".into(),
+                method: "textDocument/diagnostic".into(),
+                register_options: Some(serde_json::json!({ "workspaceDiagnostics": true })),
+            }]);
+        assert!(dynamic_handle.has_capability("workspace/diagnostic"));
     }
 
     /// Test has_capability returns true when both static and dynamic.

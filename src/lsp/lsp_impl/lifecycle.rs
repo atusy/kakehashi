@@ -722,7 +722,7 @@ impl Kakehashi {
                 diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
                     DiagnosticOptions {
                         inter_file_dependencies: false,
-                        workspace_diagnostics: false,
+                        workspace_diagnostics: true,
                         ..Default::default()
                     },
                 )),

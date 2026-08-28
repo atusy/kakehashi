@@ -167,6 +167,9 @@
 //!   grows one downstream process's folder set across roots.
 //! - `workspace-symbol-alpha` / `workspace-symbol-zeta` — advertise workspace symbol search and resolve;
 //!   search returns one lazy symbol and resolve fills its location range.
+//! - `workspace-diagnostic-alpha` / `workspace-diagnostic-zeta` — advertise workspace diagnostics;
+//!   return overlapping full reports so bridge aggregation and provider-private state stripping
+//!   can be verified without opening a document.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -554,6 +557,13 @@ fn main() {
                     | "workspace-symbol-zeta"
                     | "workspace-symbol-virtual" => json!({
                         "workspaceSymbolProvider": { "resolveProvider": true },
+                        "textDocumentSync": 1
+                    }),
+                    "workspace-diagnostic-alpha" | "workspace-diagnostic-zeta" => json!({
+                        "diagnosticProvider": {
+                            "interFileDependencies": true,
+                            "workspaceDiagnostics": true
+                        },
                         "textDocumentSync": 1
                     }),
                     _ => json!({
@@ -1313,6 +1323,50 @@ fn main() {
                     }
                 });
                 respond(&mut writer, id, symbol);
+            }
+            "workspace/diagnostic" => {
+                let params = message.get("params").cloned().unwrap_or(Value::Null);
+                let isolated = params
+                    .get("previousResultIds")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                    && params.get("identifier").is_none_or(Value::is_null)
+                    && params.get("partialResultToken").is_none_or(Value::is_null)
+                    && params.get("workDoneToken").is_none_or(Value::is_null);
+                let message = if isolated {
+                    mode.as_str()
+                } else {
+                    "leaked-state"
+                };
+                let mut items = vec![json!({
+                    "kind": "full",
+                    "uri": "file:///workspace/shared.rs",
+                    "version": 4,
+                    "resultId": format!("private-{mode}"),
+                    "items": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 1 }
+                        },
+                        "message": message
+                    }]
+                })];
+                if mode == "workspace-diagnostic-zeta" {
+                    items.push(json!({
+                        "kind": "full",
+                        "uri": "file:///workspace/zeta.rs",
+                        "version": null,
+                        "resultId": "private-zeta",
+                        "items": []
+                    }));
+                    items.push(json!({
+                        "kind": "full",
+                        "uri": "file:///workspace/kakehashi-virtual-uri-region-0.lua",
+                        "version": 1,
+                        "items": []
+                    }));
+                }
+                respond(&mut writer, id, json!({ "items": items }));
             }
             "textDocument/diagnostic" => {
                 if mode == "diagnostics-save" {

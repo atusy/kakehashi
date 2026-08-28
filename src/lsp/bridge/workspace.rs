@@ -16,6 +16,7 @@
 
 pub(in crate::lsp::bridge) mod apply_edit;
 pub(in crate::lsp::bridge) mod configuration;
+pub(in crate::lsp::bridge) mod diagnostic;
 pub(in crate::lsp::bridge) mod diagnostic_refresh;
 // The one OUTBOUND method in this namespace (editor → bridge → downstream):
 // routes a bridged command back to its origin server. Kept here so the
