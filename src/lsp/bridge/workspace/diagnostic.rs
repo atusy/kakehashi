@@ -104,7 +104,41 @@ fn reconcile_overlapping_root_reports(
             .then_some(root_segments.len())
     }
 
-    let items = reports
+    let reports = reports.into_iter().collect::<Vec<_>>();
+    let mut preferred_roots = BTreeMap::new();
+    for report in &reports {
+        for item in &report.report.items {
+            let uri = item_uri(item);
+            let key = (
+                report.server.clone(),
+                report.provider_identifiers.clone(),
+                uri.to_owned(),
+            );
+            // Coverage belongs to every matching producer, including one that
+            // returned no item for this URI. Otherwise an empty child-root
+            // report cannot suppress a stale parent-root diagnostic.
+            for producer in reports.iter().filter(|producer| {
+                producer.server == report.server
+                    && producer.provider_identifiers == report.provider_identifiers
+            }) {
+                let containing_depth = containing_root_depth(producer.spawn_root.as_deref(), uri);
+                let candidate = (
+                    containing_depth.is_some(),
+                    containing_depth.unwrap_or_default(),
+                    producer.spawn_root.clone().unwrap_or_default(),
+                );
+                preferred_roots
+                    .entry(key.clone())
+                    .and_modify(|current| {
+                        if candidate > *current {
+                            *current = candidate.clone();
+                        }
+                    })
+                    .or_insert(candidate);
+            }
+        }
+    }
+    reports
         .into_iter()
         .flat_map(|report| {
             report
@@ -118,32 +152,6 @@ fn reconcile_overlapping_root_reports(
                     item,
                 })
         })
-        .collect::<Vec<_>>();
-    let mut preferred_roots = BTreeMap::new();
-    for item in &items {
-        let uri = item_uri(&item.item);
-        let key = (
-            item.server.clone(),
-            item.provider_identifiers.clone(),
-            uri.to_owned(),
-        );
-        let containing_depth = containing_root_depth(item.spawn_root.as_deref(), uri);
-        let candidate = (
-            containing_depth.is_some(),
-            containing_depth.unwrap_or_default(),
-            item.spawn_root.clone().unwrap_or_default(),
-        );
-        preferred_roots
-            .entry(key)
-            .and_modify(|current| {
-                if candidate > *current {
-                    *current = candidate.clone();
-                }
-            })
-            .or_insert(candidate);
-    }
-    items
-        .into_iter()
         .filter(|item| {
             let uri = item_uri(&item.item);
             preferred_roots
@@ -409,6 +417,7 @@ fn combine_complete_provider_reports(
     reports
 }
 
+#[cfg(test)]
 fn collect_complete_server_contributions<T>(
     contributions: impl IntoIterator<Item = io::Result<Vec<T>>>,
 ) -> io::Result<Vec<T>> {
@@ -421,6 +430,37 @@ fn collect_complete_server_contributions<T>(
 }
 
 impl LanguageServerPool {
+    fn collect_completed_workspace_diagnostic_requests(
+        &self,
+        contributions: impl IntoIterator<Item = io::Result<Vec<CompletedDiagnosticProducer>>>,
+    ) -> io::Result<Vec<CompletedDiagnosticProducer>> {
+        let mut completed = Vec::new();
+        let mut first_error = None;
+        for contribution in contributions {
+            match contribution {
+                Ok(mut contribution) => completed.append(&mut contribution),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = first_error {
+            let mut refresh = false;
+            for producer in &completed {
+                refresh |= producer
+                    .handle
+                    .dynamic_capabilities()
+                    .mark_workspace_diagnostic_pull_completed();
+            }
+            if refresh {
+                let _ = self
+                    .upstream_tx()
+                    .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
+            }
+            return Err(error);
+        }
+        Ok(completed)
+    }
+
     fn release_changed_provider_refreshes<'a>(
         &self,
         providers: impl Iterator<Item = (&'a Arc<ConnectionHandle>, &'a Vec<DiagnosticProvider>)>,
@@ -839,7 +879,8 @@ impl LanguageServerPool {
 
         let workspace_admit =
             || admit() && self.workspace_generation() == request_workspace_generation;
-        let reports = collect_complete_server_contributions(join_all(requests).await)?;
+        let reports =
+            self.collect_completed_workspace_diagnostic_requests(join_all(requests).await)?;
         self.aggregate_admitted_completed_workspace_diagnostic_reports(reports, &workspace_admit)
             .await
     }
@@ -1101,6 +1142,39 @@ mod tests {
     }
 
     #[test]
+    fn empty_nested_report_clears_the_parent_diagnostic_in_its_coverage() {
+        let provider_identifiers = vec![Some("rust".to_owned())];
+        let reports = reconcile_overlapping_root_reports([
+            RootedDiagnosticReport {
+                server: "diagnostics".into(),
+                spawn_root: Some("file:///workspace".into()),
+                provider_identifiers: provider_identifiers.clone(),
+                report: WorkspaceDiagnosticReport {
+                    items: vec![full(
+                        "file:///workspace/nested/clean.rs",
+                        None,
+                        "stale-parent",
+                    )],
+                },
+            },
+            RootedDiagnosticReport {
+                server: "diagnostics".into(),
+                spawn_root: Some("file:///workspace/nested".into()),
+                provider_identifiers,
+                report: WorkspaceDiagnosticReport::default(),
+            },
+        ]);
+
+        let WorkspaceDiagnosticReportResult::Report(report) = aggregate_reports(reports) else {
+            panic!("final report")
+        };
+        assert!(
+            report.items.is_empty(),
+            "the empty nested producer owns and clears diagnostics below its root"
+        );
+    }
+
+    #[test]
     fn overlapping_root_reconciliation_preserves_independent_providers() {
         let uri = "file:///workspace/nested/doc.rs";
         let reports = reconcile_overlapping_root_reports([
@@ -1224,6 +1298,59 @@ mod tests {
         assert_eq!(
             collect_complete_server_contributions([Ok(vec!["alpha"]), Ok(vec!["beta"])]).unwrap(),
             ["alpha", "beta"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_server_releases_a_successful_cold_producers_deferred_refresh() {
+        let pool = LanguageServerPool::new();
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("successful"),
+        )
+        .await;
+        let generation = pool.document_connection_generation(handle.key());
+        let virtual_uris =
+            Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "late".into(),
+            method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
+        }]);
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .request_or_defer_workspace_diagnostic_registration_refresh()
+        );
+        let successful = CompletedDiagnosticProducer {
+            provider_plan: Vec::new(),
+            handle: Arc::clone(&handle),
+            generation,
+            report: WorkspaceDiagnosticReport::default(),
+            provider_reports: None,
+            virtual_uris,
+        };
+
+        let result = pool.collect_completed_workspace_diagnostic_requests([
+            Ok(vec![successful]),
+            Err(io::Error::other("another server failed")),
+        ]);
+
+        assert!(result.is_err());
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .take_workspace_diagnostic_registration_refresh(),
+            "the rejected aggregate must consume the deferred refresh"
+        );
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .request_or_defer_workspace_diagnostic_registration_refresh(),
+            "the rejected cold pull must be marked complete"
         );
     }
 
