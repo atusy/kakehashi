@@ -1,0 +1,324 @@
+//! Workspace-symbol fan-out and origin-preserving resolve routing.
+
+use std::io;
+use std::sync::Arc;
+
+use futures::future::join_all;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tower_lsp_server::ls_types::{
+    OneOf, SymbolInformation, SymbolTag, WorkspaceSymbol, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
+};
+
+use crate::config::settings::WorkspaceSettings;
+use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
+use crate::lsp::bridge::ConnectionKey;
+use crate::lsp::bridge::actor::RouterCleanupGuard;
+use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionState, LanguageServerPool, UpstreamId};
+use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
+
+const SYMBOL_METHOD: &str = "workspace/symbol";
+const RESOLVE_METHOD: &str = "workspaceSymbol/resolve";
+const ENVELOPE_KEY: &str = "kakehashi";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct WorkspaceSymbolEnvelope {
+    origin: String,
+    connection_key: ConnectionKey,
+    connection_generation: u64,
+    inner: Option<Value>,
+}
+
+fn envelope_symbol(symbol: &mut WorkspaceSymbol, envelope: WorkspaceSymbolEnvelope) {
+    symbol.data = Some(serde_json::json!({ ENVELOPE_KEY: { "workspaceSymbol": envelope } }));
+}
+
+fn strip_envelope(symbol: &mut WorkspaceSymbol) -> Option<WorkspaceSymbolEnvelope> {
+    let envelope = symbol
+        .data
+        .as_ref()?
+        .get(ENVELOPE_KEY)?
+        .get("workspaceSymbol")?;
+    let mut envelope: WorkspaceSymbolEnvelope = serde_json::from_value(envelope.clone()).ok()?;
+    symbol.data = envelope.inner.take();
+    Some(envelope)
+}
+
+fn re_envelope(symbol: &mut WorkspaceSymbol, envelope: &WorkspaceSymbolEnvelope) {
+    let mut restored = envelope.clone();
+    restored.inner = symbol.data.take();
+    envelope_symbol(symbol, restored);
+}
+
+#[allow(deprecated)]
+fn flatten_symbol(symbol: SymbolInformation) -> WorkspaceSymbol {
+    let mut tags = symbol.tags;
+    if symbol.deprecated == Some(true) {
+        let tags = tags.get_or_insert_with(Vec::new);
+        if !tags.contains(&SymbolTag::DEPRECATED) {
+            tags.push(SymbolTag::DEPRECATED);
+        }
+    }
+    WorkspaceSymbol {
+        name: symbol.name,
+        kind: symbol.kind,
+        tags,
+        container_name: symbol.container_name,
+        location: OneOf::Left(symbol.location),
+        data: None,
+    }
+}
+
+fn normalize_response(response: WorkspaceSymbolResponse) -> Vec<WorkspaceSymbol> {
+    match response {
+        WorkspaceSymbolResponse::Flat(symbols) => symbols.into_iter().map(flatten_symbol).collect(),
+        WorkspaceSymbolResponse::Nested(symbols) => symbols,
+    }
+}
+
+impl LanguageServerPool {
+    pub(crate) async fn dispatch_workspace_symbol(
+        &self,
+        mut params: WorkspaceSymbolParams,
+        settings: &WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<WorkspaceSymbolResponse> {
+        // A partial-result token cannot be shared by several downstream producers.
+        // Return one deterministic aggregate in the final response instead.
+        params.partial_result_params.partial_result_token = None;
+        params.work_done_progress_params.work_done_token = None;
+
+        let mut servers: Vec<_> = settings
+            .language_servers
+            .keys()
+            .filter(|name| name.as_str() != crate::config::WILDCARD_KEY)
+            .filter(|name| crate::config::is_server_spawnable(&settings.language_servers, name))
+            .filter_map(|name| {
+                resolve_with_wildcard(
+                    &settings.language_servers,
+                    name,
+                    merge_bridge_server_configs,
+                )
+                .map(|config| (name.clone(), config))
+            })
+            .collect();
+        servers.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let requests = servers.into_iter().map(|(name, config)| {
+            let params = params.clone();
+            let upstream_id = upstream_id.clone();
+            async move {
+                let handle = self
+                    .get_or_create_connection(&name, &config, None)
+                    .await
+                    .ok()?;
+                if !handle.has_capability(SYMBOL_METHOD) {
+                    return None;
+                }
+                let generation = self.document_connection_generation(handle.key());
+                let resolves = handle.has_capability(RESOLVE_METHOD);
+                let response = self
+                    .send_workspace_request(&handle, SYMBOL_METHOD, params, upstream_id)
+                    .await
+                    .ok()??;
+                let mut symbols = normalize_response(response);
+                if resolves {
+                    for symbol in &mut symbols {
+                        let inner = symbol.data.take();
+                        envelope_symbol(
+                            symbol,
+                            WorkspaceSymbolEnvelope {
+                                origin: name.clone(),
+                                connection_key: handle.key().clone(),
+                                connection_generation: generation,
+                                inner,
+                            },
+                        );
+                    }
+                }
+                Some(symbols)
+            }
+        });
+
+        let symbols: Vec<_> = join_all(requests)
+            .await
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        (!symbols.is_empty()).then_some(WorkspaceSymbolResponse::Nested(symbols))
+    }
+
+    pub(crate) async fn dispatch_workspace_symbol_resolve(
+        &self,
+        mut symbol: WorkspaceSymbol,
+        settings: &WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+    ) -> WorkspaceSymbol {
+        let Some(envelope) = strip_envelope(&mut symbol) else {
+            return symbol;
+        };
+        let fail_soft = |mut symbol: WorkspaceSymbol| {
+            re_envelope(&mut symbol, &envelope);
+            symbol
+        };
+        if envelope.connection_key.server() != envelope.origin
+            || !crate::config::is_server_spawnable(&settings.language_servers, &envelope.origin)
+        {
+            return fail_soft(symbol);
+        }
+        let Some(config) = resolve_with_wildcard(
+            &settings.language_servers,
+            &envelope.origin,
+            merge_bridge_server_configs,
+        ) else {
+            return fail_soft(symbol);
+        };
+        if self.document_connection_generation(&envelope.connection_key)
+            != envelope.connection_generation
+        {
+            return fail_soft(symbol);
+        }
+        let Some(handle) = self
+            .ready_connection_by_key_for_config(&envelope.connection_key, Some(&config))
+            .await
+        else {
+            return fail_soft(symbol);
+        };
+        if !handle.has_capability(RESOLVE_METHOD) {
+            return fail_soft(symbol);
+        }
+        match self
+            .send_workspace_request::<_, WorkspaceSymbol>(
+                &handle,
+                RESOLVE_METHOD,
+                symbol.clone(),
+                upstream_id,
+            )
+            .await
+        {
+            Ok(Some(mut resolved)) => {
+                re_envelope(&mut resolved, &envelope);
+                resolved
+            }
+            Ok(None) | Err(_) => fail_soft(symbol),
+        }
+    }
+
+    async fn send_workspace_request<P, R>(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        method: &'static str,
+        params: P,
+        upstream_id: Option<UpstreamId>,
+    ) -> io::Result<Option<R>>
+    where
+        P: Serialize,
+        R: serde::de::DeserializeOwned,
+    {
+        let key = handle.key();
+        if let Some(id) = &upstream_id {
+            self.register_upstream_request_for_handle(id.clone(), handle);
+        }
+        let (request_id, response_rx) =
+            match handle.register_request_with_upstream(upstream_id.clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    if let Some(id) = &upstream_id {
+                        self.unregister_upstream_request(id, key);
+                    }
+                    return Err(error);
+                }
+            };
+        let mut guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
+        let request = JsonRpcRequest::new(request_id.into(), method, params);
+        {
+            let connections = self.connections().await;
+            if !connections.get(key).is_some_and(|live| {
+                Arc::ptr_eq(live, handle) && live.state() == ConnectionState::Ready
+            }) {
+                if let Some(id) = &upstream_id {
+                    self.unregister_upstream_request(id, key);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "connection replaced",
+                ));
+            }
+            if let Err(error) = handle.send_request(request, request_id) {
+                if let Some(id) = &upstream_id {
+                    self.unregister_upstream_request(id, key);
+                }
+                return Err(error.into());
+            }
+        }
+        let response = handle.wait_for_response(request_id, response_rx).await;
+        guard.disarm();
+        if let Some(id) = &upstream_id {
+            self.unregister_upstream_request(id, key);
+        }
+        let response = response?;
+        if response_has_jsonrpc_error(&response, method) {
+            return Ok(None);
+        }
+        serde_json::from_value(response.get("result").cloned().unwrap_or(Value::Null))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+    use tower_lsp_server::ls_types::{Location, Position, Range, SymbolKind, Uri};
+
+    fn location() -> Location {
+        Location {
+            uri: Uri::from_str("file:///workspace/main.rs").unwrap(),
+            range: Range::new(Position::new(1, 2), Position::new(1, 5)),
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn flat_symbols_are_normalized_and_preserve_deprecation() {
+        let symbols = normalize_response(WorkspaceSymbolResponse::Flat(vec![SymbolInformation {
+            name: "main".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            deprecated: Some(true),
+            location: location(),
+            container_name: Some("crate".into()),
+        }]));
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].location, OneOf::Left(location()));
+        assert_eq!(symbols[0].tags, Some(vec![SymbolTag::DEPRECATED]));
+    }
+
+    #[test]
+    fn envelope_round_trip_preserves_origin_and_inner_data() {
+        let mut symbol = WorkspaceSymbol {
+            name: "main".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Left(location()),
+            data: Some(serde_json::json!({"server": 7})),
+        };
+        let inner = symbol.data.take();
+        envelope_symbol(
+            &mut symbol,
+            WorkspaceSymbolEnvelope {
+                origin: "rust-analyzer".into(),
+                connection_key: ConnectionKey::for_server("rust-analyzer"),
+                connection_generation: 3,
+                inner,
+            },
+        );
+        let envelope = strip_envelope(&mut symbol).unwrap();
+        assert_eq!(envelope.origin, "rust-analyzer");
+        assert_eq!(envelope.connection_generation, 3);
+        assert_eq!(symbol.data, Some(serde_json::json!({"server": 7})));
+    }
+}

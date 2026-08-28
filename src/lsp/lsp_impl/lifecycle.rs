@@ -20,7 +20,7 @@ use tower_lsp_server::ls_types::{
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
-    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities, WorkspaceSymbolOptions,
 };
 use url::Url;
 
@@ -607,6 +607,15 @@ impl Kakehashi {
                     work_done_progress_options: WorkDoneProgressOptions {
                         work_done_progress: Some(true),
                     },
+                })),
+                workspace_symbol_provider: Some(OneOf::Right(WorkspaceSymbolOptions {
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        // A single client token cannot identify several
+                        // downstream producers. The fan-out returns one final
+                        // aggregate instead of streaming ambiguous progress.
+                        work_done_progress: Some(false),
+                    },
+                    resolve_provider: Some(true),
                 })),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 // codeLens/resolve is routed to the origin downstream server

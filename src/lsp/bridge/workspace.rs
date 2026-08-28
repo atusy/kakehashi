@@ -22,6 +22,7 @@ pub(in crate::lsp::bridge) mod diagnostic_refresh;
 // `workspace/*` surface stays in one directory.
 pub(in crate::lsp::bridge) mod execute_command;
 mod folder_set;
+pub(in crate::lsp::bridge) mod symbol;
 pub(in crate::lsp::bridge) mod workspace_folders;
 
 pub(crate) use folder_set::WorkspaceFolderSet;
