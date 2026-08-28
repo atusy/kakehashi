@@ -272,7 +272,11 @@ impl LanguageServerPool {
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
         admit: &(dyn Fn() -> bool + Sync),
+        request_workspace_generation: u64,
     ) -> WorkspaceDiagnosticReportResult {
+        if request_workspace_generation & 1 != 0 {
+            return aggregate_reports(std::iter::empty());
+        }
         // Provider result IDs, identifiers, and progress tokens are scoped to
         // one server. The bridge aggregates several producers into one full
         // response, so none can be forwarded across that boundary.
@@ -311,16 +315,20 @@ impl LanguageServerPool {
             let params = params.clone();
             let upstream_id = upstream_id.clone();
             async move {
-                let handle = self
-                    .get_or_create_connection_wait_ready_admitted(
+                let (handle, workspace_generation) = self
+                    .get_or_create_workspace_connection_wait_ready_admitted(
                         &name,
                         &config,
-                        None,
                         Duration::from_secs(INIT_TIMEOUT_SECS),
                         admit,
                     )
                     .await
                     .ok()?;
+                if workspace_generation != request_workspace_generation {
+                    return None;
+                }
+                let workspace_admit =
+                    || admit() && self.workspace_generation() == workspace_generation;
                 let generation = self.document_connection_generation(handle.key());
                 let requests = diagnostic_providers(&handle).into_iter().map(|provider| {
                     let params = params_for_provider(params.clone(), &provider);
@@ -333,7 +341,7 @@ impl LanguageServerPool {
                             params,
                             upstream_id,
                             provider,
-                            Some(admit),
+                            Some(&workspace_admit),
                         )
                         .await
                         .ok()
@@ -345,7 +353,7 @@ impl LanguageServerPool {
                 if !self
                     .workspace_diagnostic_producer_is_live(&handle, generation)
                     .await
-                    || !admit()
+                    || !workspace_admit()
                 {
                     return None;
                 }
@@ -357,7 +365,9 @@ impl LanguageServerPool {
             }
         });
 
-        self.aggregate_admitted_workspace_diagnostic_reports(requests, admit)
+        let workspace_admit =
+            || admit() && self.workspace_generation() == request_workspace_generation;
+        self.aggregate_admitted_workspace_diagnostic_reports(requests, &workspace_admit)
             .await
     }
 
@@ -495,7 +505,7 @@ mod tests {
     use crate::lsp::bridge::pool::test_helpers::{
         create_handle_advertising_workspace_diagnostics,
         create_handle_advertising_workspace_diagnostics_with_state, create_handle_with_key,
-        transition_handle_to_ready,
+        record_test_spawn_root, seed_test_client_root, transition_handle_to_ready,
     };
     use crate::lsp::bridge::protocol::RequestId;
     use crate::lsp::bridge::protocol::VirtualDocumentUri;
@@ -872,6 +882,7 @@ mod tests {
                     &settings,
                     Some(upstream_for_request),
                     &|| true,
+                    pool_for_request.workspace_generation(),
                 )
                 .await
         });
@@ -967,6 +978,7 @@ mod tests {
                     &settings,
                     Some(upstream_for_request),
                     &|| true,
+                    pool_for_request.workspace_generation(),
                 )
                 .await
         });
@@ -1150,7 +1162,13 @@ mod tests {
         let pool_for_request = Arc::clone(&pool);
         let request = tokio::spawn(async move {
             pool_for_request
-                .dispatch_workspace_diagnostic(params, &settings, None, &|| true)
+                .dispatch_workspace_diagnostic(
+                    params,
+                    &settings,
+                    None,
+                    &|| true,
+                    pool_for_request.workspace_generation(),
+                )
                 .await
         });
 
@@ -1205,6 +1223,76 @@ mod tests {
             panic!("full report")
         };
         assert_eq!(report.uri.as_str(), lookalike_uri);
+    }
+
+    #[tokio::test]
+    async fn dispatch_uses_client_fallback_when_shared_producer_cannot_follow_workspace() {
+        let pool = Arc::new(LanguageServerPool::new());
+        seed_test_client_root(&pool, "file:///workspace");
+        let shared = create_handle_advertising_workspace_diagnostics(
+            ConnectionKey::shared("diagnostics"),
+            None,
+        )
+        .await;
+        record_test_spawn_root(&shared, "file:///workspace/project-a");
+        let fallback = create_handle_advertising_workspace_diagnostics(
+            ConnectionKey::new("diagnostics", None),
+            None,
+        )
+        .await;
+        pool.connections().await.extend([
+            (shared.key().clone(), Arc::clone(&shared)),
+            (fallback.key().clone(), Arc::clone(&fallback)),
+        ]);
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "diagnostics".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-diagnostics".into()]),
+                languages: Some(Vec::new()),
+                prefer_shared_instance: Some(true),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceDiagnosticParams = serde_json::from_value(serde_json::json!({
+            "previousResultIds": []
+        }))
+        .unwrap();
+        let request_pool = Arc::clone(&pool);
+        let request = tokio::spawn(async move {
+            request_pool
+                .dispatch_workspace_diagnostic(
+                    params,
+                    &settings,
+                    None,
+                    &|| true,
+                    request_pool.workspace_generation(),
+                )
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !fallback.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace pull reaches the client-root fallback");
+        assert!(
+            !shared.router().is_sent(request_id),
+            "a marker-rooted incapable shared producer must not own a workspace pull"
+        );
+        let _ = fallback.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "items": [] }
+        }));
+
+        assert_eq!(
+            request.await.unwrap(),
+            WorkspaceDiagnosticReportResult::Report(WorkspaceDiagnosticReport::default())
+        );
     }
 
     #[tokio::test]
@@ -1291,7 +1379,13 @@ mod tests {
         .unwrap();
 
         let response = pool
-            .dispatch_workspace_diagnostic(params, &settings, None, &|| false)
+            .dispatch_workspace_diagnostic(
+                params,
+                &settings,
+                None,
+                &|| false,
+                pool.workspace_generation(),
+            )
             .await;
 
         assert_eq!(
