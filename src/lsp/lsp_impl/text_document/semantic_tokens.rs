@@ -2225,14 +2225,18 @@ fn semantic_configs_select_servers(
     incapable: &std::collections::HashSet<String>,
     suppressed: &std::collections::HashSet<String>,
 ) -> bool {
-    let configs = configs
-        .iter()
-        .filter(|config| {
-            !incapable.contains(&config.server_name) && !suppressed.contains(&config.server_name)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    super::super::whole_document::request_selects_servers(priorities, &configs, max_fan_out)
+    use crate::lsp::aggregation::server::priority::PriorityEntry;
+
+    crate::lsp::aggregation::server::truncate_entries(
+        crate::lsp::aggregation::server::expand_priorities(priorities, configs),
+        max_fan_out,
+    )
+    .iter()
+    .flat_map(|entry| match entry {
+        PriorityEntry::Server(name) => std::slice::from_ref(name),
+        PriorityEntry::Rest(names) => names.as_slice(),
+    })
+    .any(|name| !incapable.contains(name) && !suppressed.contains(name))
 }
 
 #[cfg(test)]
@@ -2290,6 +2294,34 @@ mod tests {
             None,
             &std::collections::HashSet::new(),
             &std::collections::HashSet::from(["tokens".into()]),
+        ));
+    }
+
+    #[test]
+    fn delta_reentry_applies_fanout_cap_before_availability_filters() {
+        let configs = ["suppressed", "available"]
+            .into_iter()
+            .map(|server_name| crate::lsp::bridge::ResolvedServerConfig {
+                server_name: server_name.into(),
+                config: std::sync::Arc::new(crate::config::settings::BridgeServerConfig::default()),
+            })
+            .collect::<Vec<_>>();
+        let priorities = [crate::config::settings::PRIORITIES_WILDCARD.into()];
+        let suppressed = std::collections::HashSet::from(["suppressed".into()]);
+
+        assert!(!semantic_configs_select_servers(
+            &priorities,
+            &configs,
+            Some(1),
+            &std::collections::HashSet::new(),
+            &suppressed,
+        ));
+        assert!(semantic_configs_select_servers(
+            &priorities,
+            &configs,
+            None,
+            &std::collections::HashSet::new(),
+            &suppressed,
         ));
     }
 
