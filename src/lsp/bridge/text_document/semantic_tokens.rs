@@ -209,6 +209,9 @@ pub(crate) fn transform_semantic_tokens_result_to_host(
             token.delta_start
         };
         let start = Position::new(absolute_line, absolute_start);
+        if token.length == 0 {
+            continue;
+        }
         let end = Position::new(absolute_line, absolute_start.checked_add(token.length)?);
         if mapper.position_to_byte_strict(start).is_none()
             || mapper.position_to_byte_strict(end).is_none()
@@ -337,6 +340,7 @@ mod tests {
         };
         let response = json!({ "result": { "data": [
             0, 0, 4, 0, 5,
+            0, 0, 0, 2, 0,
             0, 0, 4, 2, 5,
             1, 0, 4, 1, 1,
             0, 999, 1, 1, 0
