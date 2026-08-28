@@ -116,5 +116,12 @@ mod tests {
 
         assert_eq!(result.unwrap_err().code, ErrorCode::RequestCancelled);
         assert_eq!(pool.upstream_request_count(&upstream_id), 0);
+        assert_eq!(handle.router().pending_count(), 0);
+        assert!(
+            handle
+                .router()
+                .lookup_downstream_ids(&upstream_id)
+                .is_empty()
+        );
     }
 }
