@@ -207,7 +207,7 @@ impl LanguageServerPool {
                         SYMBOL_METHOD,
                         params,
                         upstream_id,
-                        None,
+                        Some(generation),
                     )
                     .await
                     .ok()??;
@@ -758,6 +758,55 @@ mod tests {
         }));
 
         assert_eq!(request.await.unwrap(), unresolved);
+    }
+
+    #[tokio::test]
+    async fn search_sender_rejects_an_old_response_after_replacement() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("symbols");
+        let producer = create_handle_advertising_workspace_symbols(key.clone()).await;
+        pool.connections()
+            .await
+            .insert(key.clone(), Arc::clone(&producer));
+        let generation = pool.document_connection_generation(&key);
+        let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
+            "query": "stale"
+        }))
+        .unwrap();
+        let pool_for_request = Arc::clone(&pool);
+        let producer_for_request = Arc::clone(&producer);
+        let request = tokio::spawn(async move {
+            pool_for_request
+                .send_workspace_request::<_, Value>(
+                    &producer_for_request,
+                    WorkspaceCapability::Search,
+                    SYMBOL_METHOD,
+                    params,
+                    None,
+                    Some(generation),
+                )
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !producer.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("search request reaches Sent state");
+
+        let replacement = create_handle_advertising_workspace_symbols(key.clone()).await;
+        pool.connections().await.insert(key, replacement);
+        let _ = producer.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": []
+        }));
+
+        let error = request.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
     }
 
     #[cfg(unix)]
