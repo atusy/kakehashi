@@ -71,18 +71,20 @@ impl WorkspaceFolderSet {
             .recover_poison("WorkspaceFolderSet::replace") = Self::deduplicate(folders);
     }
 
-    /// Whether a folder with `folder`'s URI is already in the set. Test-only:
-    /// the incapable-shared divert compares path-normalized roots against
-    /// `snapshot()` (raw URI equality would fake mismatches), and production
-    /// membership checks during announce live inside `add_and_announce`'s
-    /// atomic section.
-    #[cfg(test)]
+    /// Whether the set contains the same path-normalized root as `folder`.
     pub(crate) fn contains(&self, folder: &WorkspaceFolder) -> bool {
         self.inner
             .lock()
             .recover_poison("WorkspaceFolderSet::contains")
             .as_ref()
-            .is_some_and(|folders| folders.iter().any(|existing| existing.uri == folder.uri))
+            .is_some_and(|folders| {
+                folders.iter().any(|existing| {
+                    crate::lsp::bridge::root_markers::same_root_uri(
+                        existing.uri.as_str(),
+                        folder.uri.as_str(),
+                    )
+                })
+            })
     }
 
     /// Apply an upstream workspace-folder change atomically. Removals match by
@@ -266,9 +268,10 @@ mod tests {
     }
 
     #[test]
-    fn contains_matches_by_uri() {
+    fn contains_matches_by_normalized_root() {
         let set = WorkspaceFolderSet::new(Some(vec![folder("file:///a")]));
         assert!(set.contains(&folder("file:///a")));
+        assert!(set.contains(&folder("file:///a/")));
         assert!(!set.contains(&folder("file:///b")));
         // A None set contains nothing.
         assert!(!WorkspaceFolderSet::new(None).contains(&folder("file:///a")));

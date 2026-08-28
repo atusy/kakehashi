@@ -841,7 +841,17 @@ impl LanguageServerPool {
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
             let follows_client_workspace = key.is_client_fallback();
-            if recovering && (follows_client_workspace || key.is_shared()) {
+            // A shared producer can have learned a client folder either from
+            // initialize or a later marker-less acquisition. Its folder set
+            // intentionally has no per-source provenance, so forwarding a
+            // removal could discard a root that an open marker-owned document
+            // still needs. Recycle only when the removed folder is actually
+            // present; re-open then re-announces every still-live marker root.
+            let shared_lost_folder = key.is_shared()
+                && removed
+                    .iter()
+                    .any(|folder| handle.workspace_folders().contains(folder));
+            if shared_lost_folder || recovering && (follows_client_workspace || key.is_shared()) {
                 invalidated.push(key.clone());
                 continue;
             }
@@ -4783,6 +4793,36 @@ mod tests {
 
         assert!(pool.connections.lock().await.contains_key(&key));
         assert_eq!(handle.workspace_folders().snapshot(), Some(vec![marker]));
+    }
+
+    #[tokio::test]
+    async fn workspace_folder_removal_recycles_shared_producer_that_served_it() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::shared("shared");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(capable_workspace_folders_caps());
+        let removed = tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: "file:///removed".parse().unwrap(),
+            name: "removed".to_string(),
+        };
+        handle
+            .workspace_folders()
+            .replace(Some(vec![removed.clone()]));
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        pool.apply_workspace_folder_change(Vec::new(), &[removed])
+            .await
+            .expect("non-empty change")
+            .finish();
+
+        assert!(
+            !pool.connections.lock().await.contains_key(&key),
+            "a shared producer that served a removed client folder must not be reused"
+        );
+        assert!(
+            pool.pending_reopen.claim(&key).is_some(),
+            "the replacement must reopen documents so marker-owned roots are announced again"
+        );
     }
 
     /// Capabilities of a server that accepts initialize-supplied workspace
