@@ -52,14 +52,15 @@ fn re_envelope(symbol: &mut WorkspaceSymbol, envelope: &WorkspaceSymbolEnvelope)
 }
 
 fn merge_resolved_range(original: &mut WorkspaceSymbol, resolved: WorkspaceSymbol) {
+    let OneOf::Right(original_location) = &original.location else {
+        return;
+    };
     let OneOf::Left(resolved_location) = resolved.location else {
         return;
     };
-    let same_uri = match &original.location {
-        OneOf::Left(location) => location.uri == resolved_location.uri,
-        OneOf::Right(location) => location.uri == resolved_location.uri,
-    };
-    if same_uri {
+    if original_location.uri == resolved_location.uri
+        && resolved_location.range.start <= resolved_location.range.end
+    {
         original.location = OneOf::Left(resolved_location);
     }
 }
@@ -565,6 +566,64 @@ mod tests {
             original.data,
             Some(serde_json::json!({"owner": "original"}))
         );
+    }
+
+    #[test]
+    fn resolved_symbol_cannot_replace_an_existing_range() {
+        let mut original = WorkspaceSymbol {
+            name: "original".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Left(location()),
+            data: None,
+        };
+        let original_location = original.location.clone();
+        let resolved = WorkspaceSymbol {
+            name: "original".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Left(Location {
+                uri: location().uri,
+                range: Range::new(Position::new(9, 0), Position::new(9, 8)),
+            }),
+            data: None,
+        };
+
+        merge_resolved_range(&mut original, resolved);
+
+        assert_eq!(original.location, original_location);
+    }
+
+    #[test]
+    fn resolved_symbol_rejects_an_inverted_range() {
+        let mut original = WorkspaceSymbol {
+            name: "original".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Right(WorkspaceLocation {
+                uri: location().uri,
+            }),
+            data: None,
+        };
+        let original_location = original.location.clone();
+        let resolved = WorkspaceSymbol {
+            name: "original".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Left(Location {
+                uri: location().uri,
+                range: Range::new(Position::new(9, 8), Position::new(9, 0)),
+            }),
+            data: None,
+        };
+
+        merge_resolved_range(&mut original, resolved);
+
+        assert_eq!(original.location, original_location);
     }
 
     #[tokio::test]
