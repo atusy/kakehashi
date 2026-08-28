@@ -21,6 +21,7 @@ impl Kakehashi {
             None,
             false,
             false,
+            false,
             std::future::ready(Ok(None)),
             |t| async move {
                 let colors = t
