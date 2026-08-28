@@ -341,9 +341,9 @@ are already served through the range-aware `textDocument/diagnostic` path.
 For a shared server that cannot follow workspace-folder changes, the pull uses
 the client-root fallback rather than a process seeded from one marker root.
 Each aggregate is bound to one workspace/settings snapshot: capture waits for
-a normal folder update, while a generation crossed after capture or left
-unstable by an interrupted update yields an empty full report instead of mixed
-workspace scopes.
+a normal folder update. A generation that is unstable at capture or crosses
+after capture fails the request instead of returning mixed workspace scopes or
+an empty replacement composite.
 
 ### Code actions
 
