@@ -94,6 +94,8 @@ impl Kakehashi {
         R: Fn(Vec<T>, Vec<T>) -> Vec<T> + Copy + Send,
         M: Fn(Vec<T>, Vec<T>) -> Vec<T>,
     {
+        let virt_bridge_attempted = bridge_attempted.clone();
+        let host_bridge_attempted = bridge_attempted;
         let virt = async {
             // Convert ls_types::Uri to url::Url for internal use
             let Ok(uri) = uri_to_url(lsp_uri) else {
@@ -240,7 +242,7 @@ impl Kakehashi {
                 if !request_selects_servers(&agg.priorities, &configs, agg.max_fan_out) {
                     continue;
                 }
-                if let Some(attempted) = &bridge_attempted {
+                if let Some(attempted) = &virt_bridge_attempted {
                     attempted.store(true, std::sync::atomic::Ordering::Release);
                 }
                 let region_ctx = DocumentRequestContext {
@@ -335,9 +337,6 @@ impl Kakehashi {
             if !request_selects_servers(&ctx.priorities, &ctx.configs, ctx.max_fan_out) {
                 return Ok(None);
             }
-            if let Some(attempted) = &bridge_attempted {
-                attempted.store(true, std::sync::atomic::Ordering::Release);
-            }
             let (cancel_rx, _cancel_guard) =
                 self.subscribe_cancel(ctx.upstream_request_id.as_ref());
             let incarnation = ctx.incarnation;
@@ -351,23 +350,45 @@ impl Kakehashi {
                     let params = raw_params.clone();
                     let parse_host = parse_host.clone();
                     let on_host_winner = on_host_winner.clone();
+                    let attempted = host_bridge_attempted.clone();
                     async move {
-                        let raw = t
-                            .pool
-                            .send_host_raw_request_for_incarnation(
-                                &t.server_name,
-                                &t.server_config,
-                                &HostDocument {
-                                    uri: &t.uri,
-                                    language_id: &t.language_id,
-                                    text: &t.text,
-                                },
-                                method_name,
-                                params,
-                                t.upstream_id,
-                                incarnation,
-                            )
-                            .await?;
+                        let raw = match attempted {
+                            Some(attempted) => {
+                                t.pool
+                                    .send_host_raw_request_for_incarnation_with_attempt_marker(
+                                        &t.server_name,
+                                        &t.server_config,
+                                        &HostDocument {
+                                            uri: &t.uri,
+                                            language_id: &t.language_id,
+                                            text: &t.text,
+                                        },
+                                        method_name,
+                                        params,
+                                        t.upstream_id,
+                                        incarnation,
+                                        attempted,
+                                    )
+                                    .await?
+                            }
+                            None => {
+                                t.pool
+                                    .send_host_raw_request_for_incarnation(
+                                        &t.server_name,
+                                        &t.server_config,
+                                        &HostDocument {
+                                            uri: &t.uri,
+                                            language_id: &t.language_id,
+                                            text: &t.text,
+                                        },
+                                        method_name,
+                                        params,
+                                        t.upstream_id,
+                                        incarnation,
+                                    )
+                                    .await?
+                            }
+                        };
                         let Some(raw) = raw else {
                             return Ok(None);
                         };
