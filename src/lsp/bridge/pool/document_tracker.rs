@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::{DashMap, DashSet};
 use tokio::sync::Mutex;
@@ -27,6 +27,7 @@ struct VirtualUriProvenance {
     queued: DashSet<String>,
     reservations: DashSet<String>,
     admitted: AtomicUsize,
+    revision: AtomicU64,
     mutation: std::sync::RwLock<()>,
 }
 
@@ -76,6 +77,7 @@ impl VirtualUriProvenance {
             .recover_poison("VirtualUriProvenance::mutation");
         self.insert_issued(uri.clone());
         self.reservations.remove(&uri);
+        self.revision.fetch_add(1, Ordering::AcqRel);
     }
 
     fn insert_queued(&self, uri: String) {
@@ -84,12 +86,14 @@ impl VirtualUriProvenance {
             .write()
             .recover_poison("VirtualUriProvenance::mutation");
         self.queued.insert(uri);
+        self.revision.fetch_add(1, Ordering::AcqRel);
     }
 
     #[cfg(test)]
     fn remove_issued(&self, uri: &str) {
         if self.issued.remove(uri).is_some() {
             self.admitted.fetch_sub(1, Ordering::AcqRel);
+            self.revision.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -101,10 +105,16 @@ pub(crate) struct VirtualUriObserver {
 
 impl VirtualUriObserver {
     pub(crate) fn insert(&self, uri: String) {
+        let _mutation = self
+            .provenance
+            .mutation
+            .write()
+            .recover_poison("VirtualUriProvenance::mutation");
         self.explicit_uris
             .lock()
             .recover_poison("VirtualUriObserver::explicit_uris")
             .insert(uri);
+        self.provenance.revision.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(crate) fn contains(&self, uri: &str) -> bool {
@@ -124,6 +134,10 @@ impl VirtualUriObserver {
             .mutation
             .read()
             .recover_poison("VirtualUriProvenance::mutation")
+    }
+
+    pub(crate) fn provenance_revision(&self) -> u64 {
+        self.provenance.revision.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
