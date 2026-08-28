@@ -154,8 +154,7 @@ fn aggregate_reports(
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     // A downstream version belongs to Kakehashi's synthetic
                     // synchronization stream, not the editor's document
-                    // version namespace. It is useful while reconciling one
-                    // exact producer below, but cannot cross the bridge.
+                    // version namespace and cannot cross the bridge.
                     incoming.version = None;
                     entry.insert(incoming);
                 }
@@ -303,9 +302,16 @@ impl LanguageServerPool {
                         .flatten()
                     }
                 });
-                Some(combine_producer_reports(
-                    join_all(requests).await.into_iter().flatten(),
-                ))
+                let report =
+                    combine_producer_reports(join_all(requests).await.into_iter().flatten());
+                if !admit()
+                    || !self
+                        .workspace_diagnostic_producer_is_live(&handle, generation)
+                        .await
+                {
+                    return None;
+                }
+                Some(report)
             }
         });
 
@@ -756,6 +762,113 @@ mod tests {
         };
         assert_eq!(report.version, None);
         assert_eq!(report.full_document_diagnostic_report.items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dispatch_discards_completed_provider_after_producer_replacement() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("diagnostics");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.dynamic_capabilities().register(vec![
+            Registration {
+                id: "alpha".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+                register_options: Some(serde_json::json!({
+                    "identifier": "alpha",
+                    "workspaceDiagnostics": true,
+                    "interFileDependencies": true
+                })),
+            },
+            Registration {
+                id: "zeta".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+                register_options: Some(serde_json::json!({
+                    "identifier": "zeta",
+                    "workspaceDiagnostics": true,
+                    "interFileDependencies": true
+                })),
+            },
+        ]);
+        pool.connections()
+            .await
+            .insert(key.clone(), Arc::clone(&handle));
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "diagnostics".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-diagnostics".into()]),
+                languages: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceDiagnosticParams = serde_json::from_value(serde_json::json!({
+            "previousResultIds": []
+        }))
+        .unwrap();
+        let upstream_id = UpstreamId::Number(43);
+        let pool_for_request = Arc::clone(&pool);
+        let upstream_for_request = upstream_id.clone();
+        let request = tokio::spawn(async move {
+            pool_for_request
+                .dispatch_workspace_diagnostic(
+                    params,
+                    &settings,
+                    Some(upstream_for_request),
+                    &|| true,
+                )
+                .await
+        });
+
+        let downstream_ids = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let ids = handle.router().lookup_downstream_ids(&upstream_id);
+                if ids.len() == 2 && ids.iter().all(|id| handle.router().is_sent(*id)) {
+                    break ids;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both provider requests reach Sent state");
+        let _ = handle.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": downstream_ids[0].as_i64(),
+            "result": { "items": [{
+                "kind": "full",
+                "uri": "file:///workspace/shared.rs",
+                "version": 1,
+                "items": [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 1 }
+                    },
+                    "message": "completed-before-replacement"
+                }]
+            }] }
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while pool.upstream_request_count(&upstream_id) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first provider response is accepted before replacement");
+
+        let replacement = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.connections().await.insert(key, replacement);
+        let _ = handle.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": downstream_ids[1].as_i64(),
+            "result": { "items": [] }
+        }));
+
+        let WorkspaceDiagnosticReportResult::Report(report) = request.await.unwrap() else {
+            panic!("full report")
+        };
+        assert!(
+            report.items.is_empty(),
+            "a completed sibling report must not survive producer replacement"
+        );
     }
 
     #[tokio::test]
