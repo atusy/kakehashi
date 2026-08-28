@@ -107,6 +107,9 @@ fn decode_response(
     response: Value,
     supports_tags: bool,
 ) -> serde_json::Result<Vec<WorkspaceSymbol>> {
+    if response.is_null() {
+        return Ok(Vec::new());
+    }
     let response = if response
         .as_array()
         .is_some_and(|symbols| symbols.iter().any(|symbol| symbol.get("data").is_some()))
@@ -204,63 +207,82 @@ impl LanguageServerPool {
             let params = params.clone();
             let upstream_id = upstream_id.clone();
             async move {
-                let (handle, workspace_generation) = self
-                    .get_or_create_workspace_connection_wait_ready_admitted(
+                let Ok((handles, workspace_generation)) = self
+                    .get_or_create_workspace_connections_wait_ready_admitted(
                         &name,
                         &config,
                         Duration::from_secs(INIT_TIMEOUT_SECS),
                         admit,
                     )
                     .await
-                    .ok()?;
+                else {
+                    return Vec::new();
+                };
                 if workspace_generation != request_workspace_generation {
-                    return None;
+                    return Vec::new();
                 }
                 let workspace_admit =
                     || admit() && self.workspace_generation() == workspace_generation;
-                if !handle.has_capability(SYMBOL_METHOD) {
-                    return None;
-                }
-                let generation = self.document_connection_generation(handle.key());
-                let (response, resolves) = self
-                    .send_workspace_request(
-                        &handle,
-                        WorkspaceCapability::Search,
-                        SYMBOL_METHOD,
-                        params,
-                        upstream_id,
-                        WorkspaceRequestFence {
-                            expected_generation: Some(generation),
-                            admit: Some(&workspace_admit),
-                        },
-                    )
-                    .await
-                    .ok()??;
-                let mut symbols = decode_response(response, supports_tags).ok()?;
-                if resolves {
-                    for symbol in &mut symbols {
-                        let inner = symbol.data.take();
-                        envelope_symbol(
-                            symbol,
-                            WorkspaceSymbolEnvelope {
-                                origin: name.clone(),
-                                connection_key: handle.key().clone(),
-                                connection_generation: generation,
-                                inner,
-                            },
-                        );
+                let requests = handles.into_iter().map(|handle| {
+                    let params = params.clone();
+                    let upstream_id = upstream_id.clone();
+                    let name = name.clone();
+                    async move {
+                        if !handle.has_capability(SYMBOL_METHOD) {
+                            return Err(());
+                        }
+                        let generation = self.document_connection_generation(handle.key());
+                        let Some((response, resolves)) = self
+                            .send_workspace_request(
+                                &handle,
+                                WorkspaceCapability::Search,
+                                SYMBOL_METHOD,
+                                params,
+                                upstream_id,
+                                WorkspaceRequestFence {
+                                    expected_generation: Some(generation),
+                                    admit: Some(&workspace_admit),
+                                },
+                            )
+                            .await
+                            .map_err(|_| ())?
+                        else {
+                            // `Ok(None)` is a downstream JSON-RPC error. A
+                            // successful LSP `result: null` remains
+                            // `Some((Value::Null, _))` and decodes as empty.
+                            return Err(());
+                        };
+                        let mut symbols =
+                            decode_response(response, supports_tags).map_err(|_| ())?;
+                        if resolves {
+                            for symbol in &mut symbols {
+                                let inner = symbol.data.take();
+                                envelope_symbol(
+                                    symbol,
+                                    WorkspaceSymbolEnvelope {
+                                        origin: name.clone(),
+                                        connection_key: handle.key().clone(),
+                                        connection_generation: generation,
+                                        inner,
+                                    },
+                                );
+                            }
+                        }
+                        Ok(symbols)
                     }
-                }
-                Some(symbols)
+                });
+                let Ok(symbols) = join_all(requests)
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, ()>>()
+                else {
+                    return Vec::new();
+                };
+                symbols.into_iter().flatten().collect()
             }
         });
 
-        let symbols: Vec<_> = join_all(requests)
-            .await
-            .into_iter()
-            .flatten()
-            .flatten()
-            .collect();
+        let symbols: Vec<_> = join_all(requests).await.into_iter().flatten().collect();
         if !admit() || self.workspace_generation() != request_workspace_generation {
             return None;
         }
@@ -1057,6 +1079,243 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_queries_every_client_root_when_producer_lacks_workspace_folders() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let folder_a = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/a").unwrap(),
+            name: "a".into(),
+        };
+        let folder_b = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/b").unwrap(),
+            name: "b".into(),
+        };
+        pool.set_root_uri(Some(folder_a.uri.to_string()));
+        pool.set_workspace_folders(Some(vec![folder_a, folder_b]));
+        let fallback =
+            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+        record_test_spawn_root(&fallback, "file:///workspace/a");
+        let secondary = create_handle_advertising_workspace_symbols(ConnectionKey::new(
+            "symbols",
+            Some("file:///workspace/b/".into()),
+        ))
+        .await;
+        record_test_spawn_root(&secondary, "file:///workspace/b/");
+        pool.connections().await.extend([
+            (fallback.key().clone(), Arc::clone(&fallback)),
+            (secondary.key().clone(), Arc::clone(&secondary)),
+        ]);
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "symbols".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-symbols".into()]),
+                languages: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
+            "query": "workspace"
+        }))
+        .unwrap();
+        let request_pool = Arc::clone(&pool);
+        let request = tokio::spawn(async move {
+            request_pool
+                .dispatch_workspace_symbol(
+                    params,
+                    &settings,
+                    None,
+                    true,
+                    &|| true,
+                    request_pool.workspace_generation(),
+                )
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !fallback.router().is_sent(request_id) || !secondary.router().is_sent(request_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace search reaches every client-root producer");
+        let _ = fallback.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": [{
+                "name": "from-a",
+                "kind": 12,
+                "location": {
+                    "uri": "file:///workspace/a/main.rs",
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 6 }
+                    }
+                }
+            }]
+        }));
+        let _ = secondary.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": null
+        }));
+        assert!(matches!(
+            request.await.unwrap(),
+            Some(WorkspaceSymbolResponse::Nested(symbols)) if symbols.len() == 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_producers_exclude_a_shared_handle_with_extra_roots() {
+        let pool = LanguageServerPool::new();
+        let folder_a = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/a").unwrap(),
+            name: "a".into(),
+        };
+        let folder_b = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/b").unwrap(),
+            name: "b".into(),
+        };
+        pool.set_root_uri(Some(folder_a.uri.to_string()));
+        pool.set_workspace_folders(Some(vec![folder_a, folder_b]));
+        let shared = create_handle_advertising_workspace_symbols_with_folder_changes(
+            ConnectionKey::shared("symbols"),
+        )
+        .await;
+        shared
+            .workspace_folders()
+            .replace(Some(vec![WorkspaceFolder {
+                uri: Uri::from_str("file:///outside").unwrap(),
+                name: "outside".into(),
+            }]));
+        let root_a = create_handle_advertising_workspace_symbols(ConnectionKey::new(
+            "symbols",
+            Some("file:///workspace/a".into()),
+        ))
+        .await;
+        let root_b = create_handle_advertising_workspace_symbols(ConnectionKey::new(
+            "symbols",
+            Some("file:///workspace/b".into()),
+        ))
+        .await;
+        pool.connections().await.extend([
+            (shared.key().clone(), Arc::clone(&shared)),
+            (root_a.key().clone(), Arc::clone(&root_a)),
+            (root_b.key().clone(), Arc::clone(&root_b)),
+        ]);
+        let config = crate::config::settings::BridgeServerConfig {
+            cmd: Some(vec!["mock-symbols".into()]),
+            languages: Some(Vec::new()),
+            prefer_shared_instance: Some(true),
+            ..Default::default()
+        };
+
+        let (handles, _) = pool
+            .get_or_create_workspace_connections_wait_ready_admitted(
+                "symbols",
+                &config,
+                Duration::from_secs(1),
+                &|| true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(handles.len(), 2);
+        assert!(handles.iter().any(|handle| Arc::ptr_eq(handle, &root_a)));
+        assert!(handles.iter().any(|handle| Arc::ptr_eq(handle, &root_b)));
+        assert!(!handles.iter().any(|handle| Arc::ptr_eq(handle, &shared)));
+    }
+
+    #[tokio::test]
+    async fn search_drops_a_server_when_one_workspace_root_fails() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let folder_a = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/a").unwrap(),
+            name: "a".into(),
+        };
+        let folder_b = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/b").unwrap(),
+            name: "b".into(),
+        };
+        pool.set_root_uri(Some(folder_a.uri.to_string()));
+        pool.set_workspace_folders(Some(vec![folder_a, folder_b]));
+        let root_a =
+            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+        record_test_spawn_root(&root_a, "file:///workspace/a");
+        let root_b = create_handle_advertising_workspace_symbols(ConnectionKey::new(
+            "symbols",
+            Some("file:///workspace/b".into()),
+        ))
+        .await;
+        record_test_spawn_root(&root_b, "file:///workspace/b");
+        pool.connections().await.extend([
+            (root_a.key().clone(), Arc::clone(&root_a)),
+            (root_b.key().clone(), Arc::clone(&root_b)),
+        ]);
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "symbols".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["mock-symbols".into()]),
+                languages: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
+            "query": "workspace"
+        }))
+        .unwrap();
+        let request_pool = Arc::clone(&pool);
+        let request = tokio::spawn(async move {
+            request_pool
+                .dispatch_workspace_symbol(
+                    params,
+                    &settings,
+                    None,
+                    true,
+                    &|| true,
+                    request_pool.workspace_generation(),
+                )
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !root_a.router().is_sent(request_id) || !root_b.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace search reaches both roots");
+        let _ = root_a.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": [{
+                "name": "partial",
+                "kind": 12,
+                "location": {
+                    "uri": "file:///workspace/a/main.rs",
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 7 }
+                    }
+                }
+            }]
+        }));
+        let _ = root_b.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "malformed": true }
+        }));
+
+        assert!(
+            request.await.unwrap().is_none(),
+            "one failed root must discard the server's otherwise partial contribution"
+        );
+    }
+
+    #[tokio::test]
     async fn search_reuses_an_incapable_shared_producer_seeded_from_client_root() {
         let pool = Arc::new(LanguageServerPool::new());
         seed_test_client_root(&pool, "file:///workspace");
@@ -1132,9 +1391,17 @@ mod tests {
             .replace(Some(vec![folder_a, folder_b]));
         let fallback =
             create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+        record_test_spawn_root(&fallback, "file:///workspace/b");
+        let secondary = create_handle_advertising_workspace_symbols(ConnectionKey::new(
+            "symbols",
+            Some("file:///workspace/a".into()),
+        ))
+        .await;
+        record_test_spawn_root(&secondary, "file:///workspace/a");
         pool.connections().await.extend([
             (shared.key().clone(), Arc::clone(&shared)),
             (fallback.key().clone(), Arc::clone(&fallback)),
+            (secondary.key().clone(), Arc::clone(&secondary)),
         ]);
         let mut settings = WorkspaceSettings::default();
         settings.language_servers.insert(
@@ -1166,21 +1433,24 @@ mod tests {
 
         let request_id = RequestId::new(2);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while !fallback.router().is_sent(request_id) {
+            while !fallback.router().is_sent(request_id) || !secondary.router().is_sent(request_id)
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("workspace search reaches the current client-root fallback");
+        .expect("workspace search reaches every current client root");
         assert!(
             !shared.router().is_sent(request_id),
             "an unsupported initialize folder snapshot does not prove workspace coverage"
         );
-        let _ = fallback.router().route(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "result": []
-        }));
+        for handle in [&fallback, &secondary] {
+            let _ = handle.router().route(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": []
+            }));
+        }
         assert!(request.await.unwrap().is_none());
     }
 
@@ -1195,7 +1465,7 @@ mod tests {
             uri: Uri::from_str("file:///workspace/b").unwrap(),
             name: "b".into(),
         };
-        pool.set_workspace_folders(Some(vec![folder_a, folder_b]));
+        pool.set_workspace_folders(Some(vec![folder_a.clone(), folder_b.clone()]));
         seed_test_client_root(&pool, "file:///workspace/a");
         let shared = create_handle_advertising_workspace_symbols_with_initial_folders(
             ConnectionKey::shared("symbols"),
@@ -1203,8 +1473,14 @@ mod tests {
         .await;
         record_test_spawn_root(&shared, "file:///workspace/a");
         assert_eq!(shared.workspace_folders().snapshot(), None);
-        let fallback =
-            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+        let fallback = create_handle_advertising_workspace_symbols_with_initial_folders(
+            ConnectionKey::new("symbols", None),
+        )
+        .await;
+        record_test_spawn_root(&fallback, "file:///workspace/a");
+        fallback
+            .workspace_folders()
+            .replace(Some(vec![folder_a, folder_b]));
         pool.connections().await.extend([
             (shared.key().clone(), Arc::clone(&shared)),
             (fallback.key().clone(), Arc::clone(&fallback)),

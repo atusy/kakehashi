@@ -118,6 +118,36 @@ pub(crate) fn same_root_uri(a: &str, b: &str) -> bool {
     }
 }
 
+/// Normalize a known workspace-root URL to the spelling marker discovery uses
+/// for connection keys. File URLs are rebuilt from normalized path components;
+/// non-file URLs retain their protocol spelling.
+pub(crate) fn normalized_root_url(root: &Url) -> Url {
+    let Some(path) = root.to_file_path().ok() else {
+        return root.clone();
+    };
+    let normalized: PathBuf = path.components().collect();
+    let rebuilt = Url::from_file_path(normalized).unwrap_or_else(|_| root.clone());
+    normalize_windows_drive_letter(rebuilt)
+}
+
+#[cfg(not(windows))]
+fn normalize_windows_drive_letter(root: Url) -> Url {
+    root
+}
+
+#[cfg(windows)]
+fn normalize_windows_drive_letter(root: Url) -> Url {
+    let mut spelling = root.to_string();
+    let bytes = spelling.as_bytes();
+    if spelling.starts_with("file:///")
+        && bytes.get(8).is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(9) == Some(&b':')
+    {
+        spelling[8..9].make_ascii_uppercase();
+    }
+    Url::parse(&spelling).unwrap_or(root)
+}
+
 /// Filesystem-path identity, platform-aware without touching the filesystem
 /// (`fs::canonicalize` would resolve symlinks and fail on paths that do not
 /// exist yet — both wrong for a root-identity question). On Windows the drive
@@ -177,6 +207,7 @@ pub(crate) fn resolve_marker_workspace(
 /// it names, so reconnecting to that connection rebuilds the same workspace
 /// this would have produced at spawn time (execute-command-routing-token).
 pub(crate) fn workspace_at_root(root: Url) -> Option<(Url, WorkspaceFolder)> {
+    let root = normalized_root_url(&root);
     // `WorkspaceFolder.uri` is `ls_types::Uri`, not `url::Url` — the string
     // parse IS the type conversion, not a redundant round-trip. A root that does
     // not parse yields `None`, so the key falls back too (consistency above).
@@ -562,6 +593,15 @@ mod tests {
         assert_eq!(folders, Some(vec![fallback_folder]));
     }
 
+    #[test]
+    fn normalized_root_url_matches_marker_key_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        let slashed = Url::from_directory_path(temp.path()).unwrap();
+        let marker_spelling = Url::from_file_path(temp.path()).unwrap();
+
+        assert_eq!(normalized_root_url(&slashed), marker_spelling);
+    }
+
     /// Windows drive letters are case-insensitive: two equally valid URL
     /// spellings of one directory decode to `C:\\repo` and `c:\\repo`, and
     /// treating them as distinct re-announces folders or forks per-root
@@ -578,6 +618,15 @@ mod tests {
         assert!(
             !same_root_uri("file:///C:/Repo", "file:///C:/repo"),
             "non-drive components must not fold"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalized_root_url_uppercases_the_windows_drive_letter() {
+        assert_eq!(
+            normalized_root_url(&Url::parse("file:///c:/repo").unwrap()).as_str(),
+            "file:///C:/repo"
         );
     }
 }
