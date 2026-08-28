@@ -746,6 +746,7 @@ impl ConnectionHandle {
             "codeLens/resolve" => Some("textDocument/codeLens"),
             "documentLink/resolve" => Some("textDocument/documentLink"),
             "inlayHint/resolve" => Some("textDocument/inlayHint"),
+            "workspaceSymbol/resolve" => Some("workspace/symbol"),
             _ => None,
         };
         if let Some(parent) = dynamic_resolve_parent
@@ -944,6 +945,19 @@ impl ConnectionHandle {
             // only forwards commands it surfaced FROM this server's actions, so
             // provider presence is the right gate (#568 PR 6).
             "workspace/executeCommand" => caps.execute_command_provider.is_some(),
+            "workspace/symbol" => matches!(
+                caps.workspace_symbol_provider,
+                Some(OneOf::Left(true) | OneOf::Right(_))
+            ),
+            "workspaceSymbol/resolve" => matches!(
+                caps.workspace_symbol_provider,
+                Some(OneOf::Right(
+                    tower_lsp_server::ls_types::WorkspaceSymbolOptions {
+                        resolve_provider: Some(true),
+                        ..
+                    }
+                ))
+            ),
             // willSave/willSaveWaitUntil live in `textDocumentSync`, and only its
             // `Options` form carries the flags — the bare `Kind` number form
             // advertises neither, so it correctly falls through to false. These
