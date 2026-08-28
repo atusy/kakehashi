@@ -36,6 +36,7 @@ struct DiagnosticProvider {
 }
 
 struct CompletedDiagnosticProducer {
+    provider_plan: Vec<DiagnosticProvider>,
     handle: Arc<ConnectionHandle>,
     generation: u64,
     report: WorkspaceDiagnosticReport,
@@ -336,6 +337,15 @@ impl LanguageServerPool {
                 )
             })?;
         drop(connections);
+        if admitted
+            .iter()
+            .any(|completed| diagnostic_providers(&completed.handle) != completed.provider_plan)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "workspace diagnostic provider plan changed before final aggregation",
+            ));
+        }
         if !admit() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -442,7 +452,7 @@ impl LanguageServerPool {
                             &workspace_admit,
                         )
                         .await;
-                        let requests = providers.into_iter().map(|provider| {
+                        let requests = providers.iter().cloned().map(|provider| {
                             let params = params_for_provider(params.clone(), &provider);
                             let upstream_id = upstream_id.clone();
                             let handle = Arc::clone(&handle);
@@ -467,6 +477,7 @@ impl LanguageServerPool {
                             return None;
                         }
                         Some(CompletedDiagnosticProducer {
+                            provider_plan: providers,
                             handle,
                             generation,
                             report,
@@ -582,6 +593,12 @@ impl LanguageServerPool {
                 "workspace diagnostic settings changed before response acceptance",
             ));
         }
+        if !diagnostic_providers(handle).contains(&provider) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "workspace diagnostic provider changed before response acceptance",
+            ));
+        }
         if response_has_jsonrpc_error(&response, DIAGNOSTIC_METHOD) {
             return Ok(None);
         }
@@ -607,7 +624,7 @@ mod tests {
 
     use tower_lsp_server::ls_types::{
         Diagnostic, DiagnosticRelatedInformation, FullDocumentDiagnosticReport, Location, Position,
-        Range, UnchangedDocumentDiagnosticReport, Uri, WorkspaceFolder,
+        Range, UnchangedDocumentDiagnosticReport, Unregistration, Uri, WorkspaceFolder,
         WorkspaceUnchangedDocumentDiagnosticReport,
     };
 
@@ -784,6 +801,7 @@ mod tests {
                 Box::pin(async move {
                     fast_completed.store(true, Ordering::SeqCst);
                     Some(CompletedDiagnosticProducer {
+                        provider_plan: Vec::new(),
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport {
@@ -799,6 +817,7 @@ mod tests {
                 Box::pin(async move {
                     let _ = slow_released.await;
                     Some(CompletedDiagnosticProducer {
+                        provider_plan: Vec::new(),
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport { items: Vec::new() },
@@ -851,6 +870,7 @@ mod tests {
                 Box::pin(async move {
                     fast_completed.store(true, Ordering::Release);
                     Some(CompletedDiagnosticProducer {
+                        provider_plan: Vec::new(),
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport {
@@ -866,6 +886,7 @@ mod tests {
                 Box::pin(async move {
                     let _ = slow_released.await;
                     Some(CompletedDiagnosticProducer {
+                        provider_plan: Vec::new(),
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport::default(),
@@ -920,6 +941,7 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [
                     std::future::ready(Some(CompletedDiagnosticProducer {
+                        provider_plan: Vec::new(),
                         handle: stale,
                         generation: stale_generation,
                         report: WorkspaceDiagnosticReport {
@@ -928,6 +950,7 @@ mod tests {
                         virtual_uris: stale_virtual_uris,
                     })),
                     std::future::ready(Some(CompletedDiagnosticProducer {
+                        provider_plan: Vec::new(),
                         handle: live,
                         generation: live_generation,
                         report: WorkspaceDiagnosticReport {
@@ -940,6 +963,49 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn final_aggregation_rejects_a_changed_provider_plan() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("diagnostics");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "alpha-registration".into(),
+            method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "identifier": "alpha",
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
+        }]);
+        let provider_plan = diagnostic_providers(&handle);
+        pool.connections().await.insert(key, Arc::clone(&handle));
+        let generation = pool.document_connection_generation(handle.key());
+        let virtual_uris =
+            Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
+        handle
+            .dynamic_capabilities()
+            .unregister(vec![Unregistration {
+                id: "alpha-registration".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+            }]);
+
+        let result = pool
+            .aggregate_admitted_workspace_diagnostic_reports(
+                [std::future::ready(Some(CompletedDiagnosticProducer {
+                    provider_plan,
+                    handle,
+                    generation,
+                    report: WorkspaceDiagnosticReport::default(),
+                    virtual_uris,
+                }))],
+                &|| true,
+            )
+            .await;
+
+        let error = result.expect_err("a completed stale plan must not be aggregated");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 
     #[tokio::test]
@@ -1425,6 +1491,67 @@ mod tests {
 
         let error = request.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn sender_rejects_a_response_after_provider_unregistration() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("diagnostics");
+        let producer = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        producer.dynamic_capabilities().register(vec![Registration {
+            id: "alpha-registration".into(),
+            method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "identifier": "alpha",
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
+        }]);
+        let provider = diagnostic_providers(&producer)
+            .into_iter()
+            .next()
+            .expect("dynamic provider");
+        pool.connections()
+            .await
+            .insert(key.clone(), Arc::clone(&producer));
+        let generation = pool.document_connection_generation(&key);
+        let pool_for_request = Arc::clone(&pool);
+        let producer_for_request = Arc::clone(&producer);
+        let request = tokio::spawn(async move {
+            pool_for_request
+                .send_workspace_diagnostic_request(
+                    &producer_for_request,
+                    generation,
+                    serde_json::json!({ "previousResultIds": [] }),
+                    None,
+                    provider,
+                    None,
+                )
+                .await
+        });
+
+        let request_id = RequestId::new(2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !producer.router().is_sent(request_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workspace diagnostic reaches Sent state");
+        producer
+            .dynamic_capabilities()
+            .unregister(vec![Unregistration {
+                id: "alpha-registration".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+            }]);
+        let _ = producer.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "items": [] }
+        }));
+
+        let error = request.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 
     #[tokio::test]
