@@ -303,9 +303,8 @@ impl Kakehashi {
         }
         // LSP defaults an overlong character to the line end. Normalize once
         // against the exact snapshot and feed the same defended positions to
-        // native and virtual layers; host params remain verbatim below.
-        let raw_positions = positions;
-        let Some(positions) = raw_positions
+        // every layer, including the host request's outbound params.
+        let Some(positions) = positions
             .iter()
             .map(|position| normalize_position(&snapshot.text, *position))
             .collect::<Option<Vec<_>>>()
@@ -390,20 +389,7 @@ impl Kakehashi {
         // per position and preserve the editor's input order.
         let layer_walk = async {
             let mut selected = Vec::with_capacity(positions.len());
-            for (index, (raw_position, position)) in
-                raw_positions.into_iter().zip(positions).enumerate()
-            {
-                let raw_params = serde_json::to_value(SelectionRangeParams {
-                    text_document: TextDocumentIdentifier {
-                        uri: lsp_uri.clone(),
-                    },
-                    positions: vec![raw_position],
-                    // One upstream progress token cannot be forwarded to multiple
-                    // independent downstream requests without token collisions.
-                    work_done_progress_params: WorkDoneProgressParams::default(),
-                    partial_result_params: PartialResultParams::default(),
-                })
-                .unwrap_or(serde_json::Value::Null);
+            for (index, position) in positions.into_iter().enumerate() {
                 let virt =
                     self.selection_range_virt_layer(&lsp_uri, position, expected_incarnation);
                 let cached_host = reusable_host_results
@@ -417,7 +403,6 @@ impl Kakehashi {
                     } else {
                         self.selection_range_host_layer(
                             &lsp_uri,
-                            raw_params,
                             position,
                             expected_incarnation,
                             expected_version,
@@ -517,18 +502,8 @@ impl Kakehashi {
         let request = async {
             let mut selected = Vec::with_capacity(positions.len());
             for position in positions {
-                let raw_params = serde_json::to_value(SelectionRangeParams {
-                    text_document: TextDocumentIdentifier {
-                        uri: lsp_uri.clone(),
-                    },
-                    positions: vec![position],
-                    work_done_progress_params: WorkDoneProgressParams::default(),
-                    partial_result_params: PartialResultParams::default(),
-                })
-                .unwrap_or(serde_json::Value::Null);
                 let host = self.selection_range_host_layer(
                     lsp_uri,
-                    raw_params,
                     position,
                     expected_incarnation,
                     expected_version,
@@ -622,7 +597,6 @@ impl Kakehashi {
     async fn selection_range_host_layer(
         &self,
         lsp_uri: &Uri,
-        raw_params: serde_json::Value,
         position: Position,
         expected_incarnation: u64,
         expected_version: u64,
@@ -635,16 +609,24 @@ impl Kakehashi {
         }
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
         let documents = std::sync::Arc::clone(&self.documents);
+        let lsp_uri = lsp_uri.clone();
         let result = dispatch_host_preferred(
             &ctx,
             self.bridge.pool_arc(),
             move |task: HostFanOutTask| {
-                let params = raw_params.clone();
                 let documents = std::sync::Arc::clone(&documents);
+                let lsp_uri = lsp_uri.clone();
                 async move {
                     let Some(position) = normalize_position(&task.text, position) else {
                         return Ok(None);
                     };
+                    let params = serde_json::to_value(SelectionRangeParams {
+                        text_document: TextDocumentIdentifier { uri: lsp_uri },
+                        positions: vec![position],
+                        work_done_progress_params: WorkDoneProgressParams::default(),
+                        partial_result_params: PartialResultParams::default(),
+                    })
+                    .unwrap_or(serde_json::Value::Null);
                     let host_uri = task.uri.clone();
                     let revision_text_reader: crate::lsp::bridge::HostTextReader =
                         std::sync::Arc::new(move || {
