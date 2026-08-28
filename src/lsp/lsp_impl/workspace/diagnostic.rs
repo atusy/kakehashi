@@ -24,12 +24,13 @@ impl Kakehashi {
             upstream_id.clone(),
         );
         let admit = || self.settings_manager.settings_generation() == settings_generation;
-        let dispatch = pool.dispatch_workspace_diagnostic(
+        let dispatch = pool.dispatch_workspace_diagnostic_cancellable(
             params,
             &settings,
             upstream_id,
             &admit,
             workspace_generation,
+            self.bridge.cancel_forwarder(),
         );
         match cancel_rx {
             Some(rx) => tokio::select! {
@@ -91,6 +92,7 @@ mod tests {
             Kakehashi::with_cancel_forwarder(client, Arc::clone(&pool), cancel_forwarder.clone())
         });
         let server = service.inner();
+        let request_generation = cancel_forwarder.register_request_for_test(upstream_id.clone());
         let mut settings = WorkspaceSettings::default();
         settings.language_servers.insert(
             "diagnostics".into(),
@@ -134,6 +136,7 @@ mod tests {
                 .lookup_downstream_ids(&upstream_id)
                 .is_empty()
         );
+        cancel_forwarder.unregister_request_for_test(&upstream_id, request_generation);
     }
 
     #[tokio::test]
