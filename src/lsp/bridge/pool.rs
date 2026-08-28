@@ -2665,8 +2665,152 @@ impl LanguageServerPool {
         Ok((handle, workspace_generation))
     }
 
+    /// Acquire the complete producer set for a document-free workspace request.
+    ///
+    /// One process is sufficient only when its live folder snapshot proves it
+    /// serves the complete client workspace. A server without workspace-folder
+    /// support is scoped to its initialize `rootUri`, so secondary client roots
+    /// need exact-root processes of their own.
+    pub(super) async fn get_or_create_workspace_connections_wait_ready_admitted(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        timeout: Duration,
+        admit: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<(Vec<Arc<ConnectionHandle>>, u64)> {
+        let start = std::time::Instant::now();
+        let (primary, workspace_generation) = self
+            .get_or_create_workspace_connection_wait_ready_admitted(
+                server_name,
+                server_config,
+                timeout,
+                admit,
+            )
+            .await?;
+        let Some(folders) = self.workspace_folders() else {
+            return Ok((vec![primary], workspace_generation));
+        };
+        let mut roots = Vec::with_capacity(folders.len());
+        for folder in folders {
+            let root = Url::parse(folder.uri.as_str()).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid workspace folder URI: {error}"),
+                )
+            })?;
+            let root = super::root_markers::normalized_root_url(&root);
+            if roots.iter().any(|(existing, _): &(Url, _)| {
+                super::root_markers::same_root_uri(existing.as_str(), root.as_str())
+            }) {
+                continue;
+            }
+            roots.push((root, folder));
+        }
+        if roots.is_empty() || self.workspace_handle_covers_roots(&primary, &roots) {
+            return Ok((vec![primary], workspace_generation));
+        }
+
+        let workspace_admit = || {
+            admit()
+                && self.workspace_generation.load(Ordering::Acquire) == workspace_generation
+                && workspace_generation & 1 == 0
+        };
+        let primary_root = primary.spawn_root().map(str::to_owned);
+        let primary_covers_spawn_root = !primary.supports_initial_workspace_folders()
+            && primary_root.as_deref().is_some_and(|spawn_root| {
+                roots
+                    .iter()
+                    .any(|(root, _)| super::root_markers::same_root_uri(spawn_root, root.as_str()))
+            });
+        let mut handles = primary_covers_spawn_root
+            .then_some(primary)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let uncovered: Vec<_> = roots
+            .into_iter()
+            .filter(|(root, _)| {
+                !primary_covers_spawn_root
+                    || !primary_root.as_deref().is_some_and(|spawn_root| {
+                        super::root_markers::same_root_uri(spawn_root, root.as_str())
+                    })
+            })
+            .collect();
+        // Reuse an equivalent marker key already in the pool. ConnectionKey's
+        // hash identity preserves the original URI spelling, while root scope
+        // treats trailing-slash and percent-encoding variants as one path.
+        let existing_keys: Vec<_> = {
+            let connections = self.connections.lock().await;
+            connections
+                .keys()
+                .filter(|key| key.server() == server_name && key.marker_root().is_some())
+                .cloned()
+                .collect()
+        };
+        let targets = uncovered.into_iter().map(|(root, folder)| {
+            let key = existing_keys
+                .iter()
+                .find(|key| {
+                    key.marker_root().is_some_and(|existing| {
+                        super::root_markers::same_root_uri(existing, root.as_str())
+                    })
+                })
+                .cloned()
+                .unwrap_or_else(|| ConnectionKey::new(server_name, Some(root.as_str().to_owned())));
+            (key, root, folder)
+        });
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let acquisitions = targets.map(|(key, root, folder)| async move {
+            self.acquire_resolved_wait_ready(
+                server_name,
+                server_config,
+                key,
+                Some((root, folder)),
+                WaitReadyOptions {
+                    timeout: remaining,
+                    rootless: false,
+                    admit: Some(&workspace_admit),
+                },
+            )
+            .await
+        });
+        for handle in futures::future::try_join_all(acquisitions).await? {
+            if !handles
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, &handle))
+            {
+                handles.push(handle);
+            }
+        }
+        if !workspace_admit() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "client workspace changed while selecting producers",
+            ));
+        }
+        Ok((handles, workspace_generation))
+    }
+
     pub(crate) fn workspace_generation(&self) -> u64 {
         self.workspace_generation.load(Ordering::Acquire)
+    }
+
+    fn workspace_handle_covers_roots(
+        &self,
+        handle: &ConnectionHandle,
+        roots: &[(Url, tower_lsp_server::ls_types::WorkspaceFolder)],
+    ) -> bool {
+        if !handle.supports_initial_workspace_folders() {
+            return false;
+        }
+        let Some(actual) = handle.workspace_folders().snapshot() else {
+            return false;
+        };
+        actual.len() == roots.len()
+            && roots.iter().all(|(expected, _)| {
+                actual.iter().any(|actual| {
+                    super::root_markers::same_root_uri(expected.as_str(), actual.uri.as_str())
+                })
+            })
     }
 
     fn incapable_shared_serves_client_workspace(&self, handle: &ConnectionHandle) -> bool {
