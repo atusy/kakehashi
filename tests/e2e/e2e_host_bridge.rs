@@ -927,6 +927,13 @@ priorities = ["virt"]
         "textDocument/semanticTokens/full",
         json!({ "textDocument": { "uri": uri } }),
     );
+
+    let first = client.receive_response_for_id_public(first_id);
+    assert_eq!(
+        first["result"],
+        Value::Null,
+        "the superseded bridge response must be dropped without waiting for downstream: {first:?}"
+    );
     std::fs::write(
         event_dir
             .path()
@@ -934,18 +941,86 @@ priorities = ["virt"]
         b"release",
     )
     .expect("release delayed full semantic token responses");
-
-    let first = client.receive_response_for_id_public(first_id);
-    assert_eq!(
-        first["result"],
-        Value::Null,
-        "the superseded bridge response must not commit: {first:?}"
-    );
     let second = client.receive_response_for_id_public(second_id);
     assert!(
         second.pointer("/result/data").is_some(),
         "the newer request should own the final response: {second:?}"
     );
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_semantic_tokens_full_cancels_while_waiting_on_the_bridge() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("semantic_tokens_full_cancel.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.layers.aggregation."textDocument/semanticTokens/full"]
+priorities = ["virt"]
+"#,
+    )
+    .expect("write config");
+    let event_dir = tempfile::TempDir::new().expect("event dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env("MOCK_LSP_CANCEL_DIR", event_dir.path().to_string_lossy())
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-virt-semantic-full": {
+                        "cmd": [mock_bin(), "semantic-tokens-full-delayed"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    let uri = "file:///test_semantic_tokens_full_cancel.md";
+    open_inline_value_document(&mut client, uri, 1, "> ```lua\n> code\n> ```\n");
+
+    let request_id = client.send_request_async(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let request_marker = event_dir
+        .path()
+        .join("semantic-tokens-full-delayed.request.json");
+    assert!(
+        (0..60).any(|_| {
+            if request_marker.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                false
+            }
+        }),
+        "the request should wait inside the bridge"
+    );
+    client.send_notification("$/cancelRequest", json!({ "id": request_id }));
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response.pointer("/error/code").and_then(Value::as_i64),
+        Some(-32800),
+        "cancellation must cross the native-to-bridge handoff without waiting for downstream: {response:?}"
+    );
+
+    std::fs::write(
+        event_dir
+            .path()
+            .join("semantic-tokens-full-delayed.release"),
+        b"release",
+    )
+    .expect("release delayed server before shutdown");
     shutdown(&mut client);
 }
 
