@@ -128,7 +128,7 @@ fn deduplicate_symbols(symbols: impl IntoIterator<Item = WorkspaceSymbol>) -> Ve
         .into_iter()
         .filter(|symbol| {
             let mut identity = symbol.clone();
-            identity.data = None;
+            strip_envelope(&mut identity);
             serde_json::to_vec(&identity).map_or(true, |identity| seen.insert(identity))
         })
         .collect()
@@ -291,11 +291,11 @@ impl LanguageServerPool {
                 else {
                     return Vec::new();
                 };
-                symbols.into_iter().flatten().collect()
+                deduplicate_symbols(symbols.into_iter().flatten())
             }
         });
 
-        let symbols = deduplicate_symbols(join_all(requests).await.into_iter().flatten());
+        let symbols: Vec<_> = join_all(requests).await.into_iter().flatten().collect();
         if !admit() || self.workspace_generation() != request_workspace_generation {
             return None;
         }
@@ -597,24 +597,56 @@ mod tests {
 
     #[test]
     fn duplicate_symbols_keep_the_first_resolve_route() {
-        let symbol = WorkspaceSymbol {
+        let mut symbol = WorkspaceSymbol {
             name: "main".into(),
             kind: SymbolKind::FUNCTION,
             tags: None,
             container_name: Some("crate".into()),
-            location: OneOf::Left(location()),
-            data: Some(serde_json::json!({"producer": "first"})),
+            location: OneOf::Right(WorkspaceLocation {
+                uri: Uri::from_str("file:///workspace/main.rs").unwrap(),
+            }),
+            data: None,
         };
-        let mut duplicate = symbol.clone();
-        duplicate.data = Some(serde_json::json!({"producer": "second"}));
-
-        let symbols = deduplicate_symbols([symbol, duplicate]);
-
-        assert_eq!(symbols.len(), 1);
-        assert_eq!(
-            symbols[0].data,
-            Some(serde_json::json!({"producer": "first"}))
+        envelope_symbol(
+            &mut symbol,
+            WorkspaceSymbolEnvelope {
+                origin: "symbols".into(),
+                connection_key: ConnectionKey::new("symbols", Some("file:///workspace".into())),
+                connection_generation: 1,
+                inner: Some(serde_json::json!({"symbol": 7})),
+            },
         );
+        let mut duplicate = symbol.clone();
+        envelope_symbol(
+            &mut duplicate,
+            WorkspaceSymbolEnvelope {
+                origin: "symbols".into(),
+                connection_key: ConnectionKey::new(
+                    "symbols",
+                    Some("file:///workspace/nested".into()),
+                ),
+                connection_generation: 1,
+                inner: Some(serde_json::json!({"symbol": 7})),
+            },
+        );
+        let mut distinct = duplicate.clone();
+        envelope_symbol(
+            &mut distinct,
+            WorkspaceSymbolEnvelope {
+                origin: "symbols".into(),
+                connection_key: ConnectionKey::new(
+                    "symbols",
+                    Some("file:///workspace/nested".into()),
+                ),
+                connection_generation: 1,
+                inner: Some(serde_json::json!({"symbol": 8})),
+            },
+        );
+
+        let symbols = deduplicate_symbols([symbol.clone(), duplicate, distinct]);
+
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].data, symbol.data);
     }
 
     #[test]
@@ -1116,25 +1148,30 @@ mod tests {
     #[tokio::test]
     async fn search_queries_every_client_root_when_producer_lacks_workspace_folders() {
         let pool = Arc::new(LanguageServerPool::new());
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = url::Url::from_file_path(temp.path().join("a")).unwrap();
+        let root_b = url::Url::from_file_path(temp.path().join("b")).unwrap();
+        let root_b_slash = format!("{}/", root_b.as_str().trim_end_matches('/'));
+        let symbol_uri = root_a.join("main.rs").unwrap().to_string();
         let folder_a = WorkspaceFolder {
-            uri: Uri::from_str("file:///workspace/a").unwrap(),
+            uri: Uri::from_str(root_a.as_str()).unwrap(),
             name: "a".into(),
         };
         let folder_b = WorkspaceFolder {
-            uri: Uri::from_str("file:///workspace/b").unwrap(),
+            uri: Uri::from_str(root_b.as_str()).unwrap(),
             name: "b".into(),
         };
         pool.set_root_uri(Some(folder_a.uri.to_string()));
         pool.set_workspace_folders(Some(vec![folder_a, folder_b]));
         let fallback =
             create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
-        record_test_spawn_root(&fallback, "file:///workspace/a");
+        record_test_spawn_root(&fallback, root_a.as_str());
         let secondary = create_handle_advertising_workspace_symbols(ConnectionKey::new(
             "symbols",
-            Some("file:///workspace/b/".into()),
+            Some(root_b_slash.clone()),
         ))
         .await;
-        record_test_spawn_root(&secondary, "file:///workspace/b/");
+        record_test_spawn_root(&secondary, &root_b_slash);
         pool.connections().await.extend([
             (fallback.key().clone(), Arc::clone(&fallback)),
             (secondary.key().clone(), Arc::clone(&secondary)),
@@ -1182,7 +1219,7 @@ mod tests {
                 "name": "from-a",
                 "kind": 12,
                 "location": {
-                    "uri": "file:///workspace/a/main.rs",
+                    "uri": symbol_uri.clone(),
                     "range": {
                         "start": { "line": 0, "character": 0 },
                         "end": { "line": 0, "character": 6 }
@@ -1197,7 +1234,7 @@ mod tests {
                 "name": "from-a",
                 "kind": 12,
                 "location": {
-                    "uri": "file:///workspace/a/main.rs",
+                    "uri": symbol_uri,
                     "range": {
                         "start": { "line": 0, "character": 0 },
                         "end": { "line": 0, "character": 6 }

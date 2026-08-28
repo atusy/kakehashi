@@ -20,11 +20,21 @@ routing can search the same client workspace repeatedly and duplicate results.
 
 ## Decision
 
-For each configured, runnable server, workspace symbol search uses one
-document-free client-workspace connection. It starts that connection when
-needed and combines every capable server's result in server-name order. Flat
-`SymbolInformation` responses are normalized to `WorkspaceSymbol`, so results
-from old and new servers have one response shape.
+For each configured, runnable server, workspace symbol search uses
+document-free client-workspace connections that cover every explicit workspace
+root. A server that follows workspace-folder changes can use one shared
+connection; otherwise each root has its own producer. Kakehashi starts those
+connections when needed and combines every capable server's result in
+server-name and workspace-root order. Flat `SymbolInformation` responses are
+normalized to `WorkspaceSymbol`, so results from old and new servers have one
+response shape.
+
+Overlapping roots can make two producers for the same configured server return
+the same symbol. Those per-server contributions are stably deduplicated after
+removing only Kakehashi's routing envelope from the identity. The downstream
+server's original `data` remains part of that identity, and the first duplicate
+keeps its exact resolve route. Contributions from different configured servers
+are not deduplicated.
 
 If a `preferSharedInstance` process was initialized from a document's marker
 root and cannot follow workspace-folder changes, search uses the client-root

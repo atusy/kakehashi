@@ -695,6 +695,12 @@ For a `preferSharedInstance` server that cannot follow workspace-folder
 changes, searches use a client-root fallback instead of a shared process that
 may have been initialized from one document's marker root.
 
+Servers that cannot follow workspace-folder changes are queried once per
+explicit root. If overlapping roots return the same symbol from that server,
+Kakehashi removes exact duplicates while treating the server's original opaque
+`data` as part of symbol identity; the first duplicate's resolve route is kept.
+Results from different configured servers remain distinct.
+
 When a downstream server supports `workspaceSymbol/resolve`, returned symbols
 carry opaque routing data so a later resolve reaches the same downstream
 process, provided the editor's
