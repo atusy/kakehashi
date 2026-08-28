@@ -1143,7 +1143,11 @@ async fn handle_server_request(
         // Publishing the registry only after its acknowledgement preserves
         // writer FIFO, then this capability-gated upstream path schedules a
         // fresh pull that plans against the committed provider set.
-        if workspace_diagnostics_registered {
+        if workspace_diagnostics_registered
+            && deps
+                .dynamic_capabilities
+                .request_or_defer_workspace_diagnostic_registration_refresh()
+        {
             let _ = deps
                 .upstream_tx
                 .send(UpstreamNotification::DiagnosticProviderChanged);
@@ -1598,7 +1602,7 @@ mod tests {
             progress_registry.register(conn, downstream_token.clone(), response_tx.clone());
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         dynamic_capabilities.set_static_workspace_diagnostic_provider(true);
-        dynamic_capabilities.mark_workspace_diagnostic_contributed();
+        let _ = dynamic_capabilities.mark_workspace_diagnostic_contributed();
 
         let handle = spawn_reader_task_for_server(
             reader,
@@ -2121,6 +2125,7 @@ mod tests {
         let router = ResponseRouter::new();
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        let _ = dynamic_capabilities.mark_workspace_diagnostic_contributed();
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
@@ -2185,6 +2190,7 @@ mod tests {
             .await
             .unwrap();
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        let _ = dynamic_capabilities.mark_workspace_diagnostic_contributed();
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {

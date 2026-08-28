@@ -26,6 +26,7 @@ pub(crate) struct DynamicCapabilityRegistry {
     diagnostic_registration_settled: tokio::sync::OnceCell<()>,
     static_workspace_diagnostic_provider: AtomicBool,
     workspace_diagnostic_contributed: AtomicBool,
+    workspace_diagnostic_registration_refresh_pending: AtomicBool,
 }
 
 impl DynamicCapabilityRegistry {
@@ -41,6 +42,7 @@ impl DynamicCapabilityRegistry {
             diagnostic_registration_settled: tokio::sync::OnceCell::new(),
             static_workspace_diagnostic_provider: AtomicBool::new(false),
             workspace_diagnostic_contributed: AtomicBool::new(false),
+            workspace_diagnostic_registration_refresh_pending: AtomicBool::new(false),
         }
     }
 
@@ -92,14 +94,28 @@ impl DynamicCapabilityRegistry {
             || self.registration_options_flag("textDocument/diagnostic", "workspaceDiagnostics")
     }
 
-    pub(crate) fn mark_workspace_diagnostic_contributed(&self) {
+    pub(crate) fn mark_workspace_diagnostic_contributed(&self) -> bool {
         self.workspace_diagnostic_contributed
             .store(true, Ordering::Release);
+        self.workspace_diagnostic_registration_refresh_pending
+            .swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn has_workspace_diagnostic_contributed(&self) -> bool {
         self.workspace_diagnostic_contributed
             .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn request_or_defer_workspace_diagnostic_registration_refresh(&self) -> bool {
+        if self.has_workspace_diagnostic_contributed() {
+            return true;
+        }
+        self.workspace_diagnostic_registration_refresh_pending
+            .store(true, Ordering::Release);
+        self.has_workspace_diagnostic_contributed()
+            && self
+                .workspace_diagnostic_registration_refresh_pending
+                .swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn has_registration(&self, method: &str) -> bool {
@@ -403,6 +419,28 @@ mod tests {
 
         // "diag-2" should still be registered
         assert!(registry.has_registration("textDocument/diagnostic"));
+    }
+
+    #[test]
+    fn diagnostic_registration_refresh_waits_for_an_accepted_aggregate() {
+        let registry = DynamicCapabilityRegistry::new();
+
+        assert!(
+            !registry.request_or_defer_workspace_diagnostic_registration_refresh(),
+            "a cold registration must not immediately trigger another pull"
+        );
+        assert!(
+            registry.mark_workspace_diagnostic_contributed(),
+            "the first accepted aggregate must release the deferred retry"
+        );
+        assert!(
+            registry.request_or_defer_workspace_diagnostic_registration_refresh(),
+            "later registrations invalidate an already accepted aggregate immediately"
+        );
+        assert!(
+            !registry.mark_workspace_diagnostic_contributed(),
+            "an immediate retry must not leave duplicate deferred work"
+        );
     }
 
     #[test]
