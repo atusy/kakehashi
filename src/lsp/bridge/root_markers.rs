@@ -118,17 +118,6 @@ pub(crate) fn same_root_uri(a: &str, b: &str) -> bool {
     }
 }
 
-/// Whether `outer` is the same filesystem root as `inner` or an ancestor of it.
-/// Non-file URIs stay conservative and compare only by exact root identity.
-pub(crate) fn root_uri_contains(outer: &Url, inner: &Url) -> bool {
-    let outer = normalized_root_url(outer);
-    let inner = normalized_root_url(inner);
-    match (outer.to_file_path(), inner.to_file_path()) {
-        (Ok(outer), Ok(inner)) => inner.starts_with(outer),
-        _ => same_root_uri(outer.as_str(), inner.as_str()),
-    }
-}
-
 /// Normalize a known workspace-root URL to the spelling marker discovery uses
 /// for connection keys. File URLs are rebuilt from normalized path components;
 /// non-file URLs retain their protocol spelling.
@@ -611,19 +600,6 @@ mod tests {
         let marker_spelling = Url::from_file_path(temp.path()).unwrap();
 
         assert_eq!(normalized_root_url(&slashed), marker_spelling);
-    }
-
-    #[test]
-    fn root_uri_contains_nested_file_roots_only() {
-        let temp = tempfile::tempdir().unwrap();
-        let outer = Url::from_directory_path(temp.path()).unwrap();
-        let nested = Url::from_directory_path(temp.path().join("sub/project")).unwrap();
-        let sibling = Url::from_directory_path(temp.path().with_extension("sibling")).unwrap();
-
-        assert!(root_uri_contains(&outer, &nested));
-        assert!(root_uri_contains(&outer, &outer));
-        assert!(!root_uri_contains(&nested, &outer));
-        assert!(!root_uri_contains(&outer, &sibling));
     }
 
     /// Windows drive letters are case-insensitive: two equally valid URL
