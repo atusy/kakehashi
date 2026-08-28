@@ -88,6 +88,9 @@ expression: capabilities
     "colorProvider": {
       "dynamicRegistration": false
     },
+    "selectionRange": {
+      "dynamicRegistration": false
+    },
     "callHierarchy": {
       "dynamicRegistration": false
     },

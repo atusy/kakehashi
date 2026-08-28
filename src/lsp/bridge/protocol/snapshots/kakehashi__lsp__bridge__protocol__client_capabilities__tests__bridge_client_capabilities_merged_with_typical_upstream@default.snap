@@ -143,6 +143,9 @@ expression: merged
     "colorProvider": {
       "dynamicRegistration": false
     },
+    "selectionRange": {
+      "dynamicRegistration": false
+    },
     "callHierarchy": {
       "dynamicRegistration": false
     },
