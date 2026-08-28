@@ -154,16 +154,17 @@ fn aggregate_reports(
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
                     let current = entry.get_mut();
-                    match incoming.version.cmp(&current.version) {
-                        std::cmp::Ordering::Greater => {
-                            entry.insert(incoming);
-                        }
-                        std::cmp::Ordering::Equal => current
-                            .full_document_diagnostic_report
-                            .items
-                            .extend(incoming.full_document_diagnostic_report.items),
-                        std::cmp::Ordering::Less => {}
+                    if incoming.version != current.version {
+                        // Document versions are local to each downstream
+                        // connection. Preserve every producer's diagnostics but
+                        // do not attach their composite to one producer's
+                        // incomparable version.
+                        current.version = None;
                     }
+                    current
+                        .full_document_diagnostic_report
+                        .items
+                        .extend(incoming.full_document_diagnostic_report.items);
                 }
             }
         }
@@ -459,13 +460,16 @@ mod tests {
     }
 
     #[test]
-    fn aggregation_prefers_the_highest_document_version() {
+    fn aggregation_preserves_reports_with_incomparable_versions() {
         let result = aggregate_reports([
             WorkspaceDiagnosticReport {
                 items: vec![full("file:///workspace/a.rs", Some(3), "old")],
             },
             WorkspaceDiagnosticReport {
                 items: vec![full("file:///workspace/a.rs", Some(4), "new")],
+            },
+            WorkspaceDiagnosticReport {
+                items: vec![full("file:///workspace/a.rs", None, "not-open")],
             },
         ]);
         let WorkspaceDiagnosticReportResult::Report(report) = result else {
@@ -474,10 +478,15 @@ mod tests {
         let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
             panic!("full report")
         };
-        assert_eq!(report.version, Some(4));
+        assert_eq!(report.version, None);
         assert_eq!(
-            report.full_document_diagnostic_report.items[0].message,
-            "new"
+            report
+                .full_document_diagnostic_report
+                .items
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["old", "new", "not-open"]
         );
     }
 
