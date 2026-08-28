@@ -100,6 +100,7 @@ fn region_boundary_for_method(method: &str) -> crate::language::injection::Regio
         "textDocument/completion"
         | "textDocument/signatureHelp"
         | "textDocument/linkedEditingRange"
+        | "textDocument/selectionRange"
         | "textDocument/onTypeFormatting" => RegionBoundary::CaretEndFallback,
         _ => RegionBoundary::HalfOpen,
     }
@@ -3304,6 +3305,7 @@ mod tests {
             "textDocument/completion",
             "textDocument/signatureHelp",
             "textDocument/linkedEditingRange",
+            "textDocument/selectionRange",
             // onTypeFormatting has no point-invocation mode at all: its
             // position is the caret right after the typed trigger character.
             "textDocument/onTypeFormatting",
