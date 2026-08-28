@@ -622,10 +622,8 @@ impl Kakehashi {
                     },
                 ),
             });
-            if !defer_wire_commit {
-                if let Some(pending) = pending_wire.take() {
-                    pending.commit(&self.cache);
-                }
+            if !defer_wire_commit && let Some(pending) = pending_wire.take() {
+                pending.commit(&self.cache);
             }
             Ok(Some(SemanticFullComputation {
                 result: SemanticTokensResult::Tokens(tokens),
