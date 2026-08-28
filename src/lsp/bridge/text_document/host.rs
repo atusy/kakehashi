@@ -724,9 +724,6 @@ impl LanguageServerPool {
                 format!("failed to apply host routing workspace folders: {error}"),
             ));
         }
-        if let Some(attempted) = attempted {
-            attempted.store(true, std::sync::atomic::Ordering::Release);
-        }
         if let Some(ref id) = upstream_request_id {
             self.register_upstream_request_for_handle(id.clone(), &handle);
         }
@@ -820,6 +817,9 @@ impl LanguageServerPool {
                     self.unregister_upstream_request(id, connection_key);
                 }
                 return Err(e.into());
+            }
+            if let Some(attempted) = attempted {
+                attempted.store(true, std::sync::atomic::Ordering::Release);
             }
             self.document_connection_generation(connection_key)
         };
