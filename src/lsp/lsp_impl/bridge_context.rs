@@ -70,6 +70,7 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
             | "textDocument/onTypeFormatting"
             | "textDocument/prepareRename"
             | "textDocument/rename"
+            | "textDocument/selectionRange"
             | "textDocument/semanticTokens/range"
     )
 }
@@ -3223,6 +3224,7 @@ mod tests {
             "textDocument/onTypeFormatting",
             "textDocument/prepareRename",
             "textDocument/rename",
+            "textDocument/selectionRange",
             "textDocument/semanticTokens/range",
         ] {
             assert!(method_requires_contiguous_injection(method), "{method}");

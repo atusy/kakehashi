@@ -2379,10 +2379,11 @@ mod tests {
             CallHierarchyServerCapability, ColorProviderCapability, ColorProviderOptions,
             CompletionOptions, DeclarationCapability, DeclarationOptions,
             DeclarationRegistrationOptions, DocumentLinkOptions, HoverProviderCapability,
-            ImplementationProviderCapability, OneOf, SemanticTokensLegend, SemanticTokensOptions,
-            SemanticTokensServerCapabilities, SignatureHelpOptions,
-            StaticTextDocumentColorProviderOptions, TextDocumentRegistrationOptions,
-            TextDocumentSyncCapability, TextDocumentSyncOptions, TypeDefinitionProviderCapability,
+            ImplementationProviderCapability, OneOf, SelectionRangeProviderCapability,
+            SemanticTokensLegend, SemanticTokensOptions, SemanticTokensServerCapabilities,
+            SignatureHelpOptions, StaticTextDocumentColorProviderOptions,
+            TextDocumentRegistrationOptions, TextDocumentSyncCapability, TextDocumentSyncOptions,
+            TypeDefinitionProviderCapability,
         };
 
         type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
@@ -2489,6 +2490,13 @@ mod tests {
                 "textDocument/inlineValue",
                 Box::new(|c| {
                     c.inline_value_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/selectionRange",
+                Box::new(|c| {
+                    c.selection_range_provider =
+                        Some(SelectionRangeProviderCapability::Simple(true));
                 }),
             ),
             (
@@ -2665,9 +2673,9 @@ mod tests {
     async fn has_capability_returns_false_for_explicitly_disabled() {
         use tower_lsp_server::ls_types::{
             CallHierarchyServerCapability, ColorProviderCapability, DeclarationCapability,
-            HoverProviderCapability, ImplementationProviderCapability, OneOf, SemanticTokensLegend,
-            SemanticTokensOptions, SemanticTokensServerCapabilities,
-            TypeDefinitionProviderCapability,
+            HoverProviderCapability, ImplementationProviderCapability, OneOf,
+            SelectionRangeProviderCapability, SemanticTokensLegend, SemanticTokensOptions,
+            SemanticTokensServerCapabilities, TypeDefinitionProviderCapability,
         };
 
         type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
@@ -2751,6 +2759,13 @@ mod tests {
                 "textDocument/inlineValue",
                 Box::new(|c| {
                     c.inline_value_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/selectionRange",
+                Box::new(|c| {
+                    c.selection_range_provider =
+                        Some(SelectionRangeProviderCapability::Simple(false));
                 }),
             ),
             (
