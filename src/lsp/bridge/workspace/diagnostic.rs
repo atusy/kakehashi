@@ -177,7 +177,7 @@ fn aggregate_reports(
     })
 }
 
-fn reconcile_producer_reports(
+fn combine_producer_reports(
     reports: impl IntoIterator<Item = WorkspaceDiagnosticReport>,
 ) -> WorkspaceDiagnosticReport {
     let mut by_uri: BTreeMap<String, WorkspaceFullDocumentDiagnosticReport> = BTreeMap::new();
@@ -187,28 +187,22 @@ fn reconcile_producer_reports(
                 continue;
             };
             incoming.full_document_diagnostic_report.result_id = None;
+            incoming.version = None;
             let key = incoming.uri.as_str().to_owned();
             match by_uri.entry(key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(incoming);
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    let current = entry.get_mut();
-                    match (current.version, incoming.version) {
-                        (Some(current_version), Some(incoming_version))
-                            if incoming_version > current_version =>
-                        {
-                            *current = incoming;
-                        }
-                        (Some(current_version), Some(incoming_version))
-                            if incoming_version < current_version => {}
-                        (None, Some(_)) => *current = incoming,
-                        (Some(_), None) => {}
-                        _ => current
-                            .full_document_diagnostic_report
-                            .items
-                            .extend(incoming.full_document_diagnostic_report.items),
-                    }
+                    // Provider requests are not serialized with each URI's
+                    // close/reopen lifecycle. Downstream versions reset on
+                    // reopen, so even two concrete numbers are not enough to
+                    // prove that one report supersedes another.
+                    entry
+                        .get_mut()
+                        .full_document_diagnostic_report
+                        .items
+                        .extend(incoming.full_document_diagnostic_report.items);
                 }
             }
         }
@@ -309,7 +303,7 @@ impl LanguageServerPool {
                         .flatten()
                     }
                 });
-                Some(reconcile_producer_reports(
+                Some(combine_producer_reports(
                     join_all(requests).await.into_iter().flatten(),
                 ))
             }
@@ -501,25 +495,22 @@ mod tests {
     }
 
     #[test]
-    fn producer_reconciliation_prefers_highest_version_within_one_handle() {
-        let report = reconcile_producer_reports([
+    fn producer_combination_preserves_reports_across_version_resets() {
+        let report = combine_producer_reports([
             WorkspaceDiagnosticReport {
-                items: vec![full("file:///workspace/a.rs", Some(3), "old")],
+                items: vec![full("file:///workspace/a.rs", Some(100), "old-incarnation")],
             },
             WorkspaceDiagnosticReport {
-                items: vec![full("file:///workspace/a.rs", None, "not-open")],
+                items: vec![full("file:///workspace/a.rs", Some(1), "new-incarnation")],
             },
             WorkspaceDiagnosticReport {
-                items: vec![full("file:///workspace/a.rs", Some(4), "new-a")],
-            },
-            WorkspaceDiagnosticReport {
-                items: vec![full("file:///workspace/a.rs", Some(4), "new-b")],
+                items: vec![full("file:///workspace/a.rs", None, "closed")],
             },
         ]);
         let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
             panic!("full report")
         };
-        assert_eq!(report.version, Some(4));
+        assert_eq!(report.version, None);
         assert_eq!(report.full_document_diagnostic_report.result_id, None);
         assert_eq!(
             report
@@ -528,7 +519,7 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
-            ["new-a", "new-b"]
+            ["old-incarnation", "new-incarnation", "closed"]
         );
     }
 
