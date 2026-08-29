@@ -2423,7 +2423,7 @@ impl LanguageServerPool {
         host_uri: &Url,
     ) -> bool {
         if handle.key().is_workspace()
-            && handle.supports_workspace_folder_changes()
+            && handle.supports_initial_workspace_folders()
             && let Some(folders) = handle.workspace_folders().snapshot()
         {
             return folders.iter().any(|folder| {
@@ -6933,7 +6933,7 @@ mod tests {
         assert!(!secondary_revisions.contains_key(&outside_uri));
 
         let folder_capable_key = ConnectionKey::workspace("folder-lua");
-        let folder_capable = create_handle_advertising_workspace_symbols_with_folder_changes(
+        let folder_capable = create_handle_advertising_workspace_symbols_with_initial_folders(
             folder_capable_key.clone(),
         )
         .await;
