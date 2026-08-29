@@ -1776,7 +1776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropped_cold_pull_guard_preserves_the_deferred_refresh() {
+    async fn dropped_cold_pull_guard_suppresses_the_deferred_refresh() {
         let handle = create_handle_with_key(
             ConnectionState::Ready,
             ConnectionKey::for_server("aborted-cold"),
@@ -1796,10 +1796,16 @@ mod tests {
         });
 
         assert!(
-            handle
+            !handle
                 .dynamic_capabilities()
                 .take_workspace_diagnostic_registration_refresh(),
-            "an aborted pull must not consume the deferred registration refresh"
+            "an aborted pull must resolve its deferred registration without refreshing"
+        );
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .request_or_defer_workspace_diagnostic_registration_refresh(),
+            "later warm registrations must still refresh"
         );
     }
 

@@ -6,6 +6,10 @@ use tower_lsp_server::ls_types::{Registration, Unregistration};
 
 use crate::error::LockResultExt;
 
+const WORKSPACE_DIAGNOSTIC_PULL_IDLE: u8 = 0;
+const WORKSPACE_DIAGNOSTIC_PULL_ACTIVE: u8 = 1;
+const WORKSPACE_DIAGNOSTIC_PULL_ABORTED: u8 = 2;
+
 /// Thread-safe store for dynamically registered LSP capabilities.
 ///
 /// Downstream language servers (e.g., Pyright) register capabilities dynamically
@@ -26,7 +30,7 @@ pub(crate) struct DynamicCapabilityRegistry {
     changes: tokio::sync::watch::Sender<u64>,
     diagnostic_registration_settled: tokio::sync::OnceCell<()>,
     static_workspace_diagnostic_provider: AtomicBool,
-    workspace_diagnostic_pull_active: AtomicBool,
+    workspace_diagnostic_pull_state: AtomicU8,
     workspace_diagnostic_lifecycle: Mutex<WorkspaceDiagnosticLifecycle>,
     workspace_diagnostic_registration_refresh_pending: AtomicBool,
 }
@@ -74,7 +78,7 @@ impl DynamicCapabilityRegistry {
             changes,
             diagnostic_registration_settled: tokio::sync::OnceCell::new(),
             static_workspace_diagnostic_provider: AtomicBool::new(false),
-            workspace_diagnostic_pull_active: AtomicBool::new(false),
+            workspace_diagnostic_pull_state: AtomicU8::new(WORKSPACE_DIAGNOSTIC_PULL_IDLE),
             workspace_diagnostic_lifecycle: Mutex::new(WorkspaceDiagnosticLifecycle::default()),
             workspace_diagnostic_registration_refresh_pending: AtomicBool::new(false),
         }
@@ -184,19 +188,28 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_completed(&self) -> bool {
-        self.workspace_diagnostic_pull_active
-            .store(false, Ordering::Release);
+        self.workspace_diagnostic_pull_state
+            .store(WORKSPACE_DIAGNOSTIC_PULL_IDLE, Ordering::Release);
         self.take_workspace_diagnostic_registration_refresh()
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_active(&self) {
-        self.workspace_diagnostic_pull_active
-            .store(true, Ordering::Release);
+        self.workspace_diagnostic_pull_state
+            .store(WORKSPACE_DIAGNOSTIC_PULL_ACTIVE, Ordering::Release);
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_aborted(&self) {
-        self.workspace_diagnostic_pull_active
-            .store(false, Ordering::Release);
+        let deferred_registration = self
+            .workspace_diagnostic_registration_refresh_pending
+            .swap(false, Ordering::AcqRel);
+        self.workspace_diagnostic_pull_state.store(
+            if deferred_registration {
+                WORKSPACE_DIAGNOSTIC_PULL_IDLE
+            } else {
+                WORKSPACE_DIAGNOSTIC_PULL_ABORTED
+            },
+            Ordering::Release,
+        );
     }
 
     pub(crate) fn take_workspace_diagnostic_registration_refresh(&self) -> bool {
@@ -212,20 +225,56 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn request_or_defer_workspace_diagnostic_registration_refresh(&self) -> bool {
-        if !self
-            .workspace_diagnostic_pull_active
-            .load(Ordering::Acquire)
-        {
-            return true;
+        loop {
+            match self.workspace_diagnostic_pull_state.load(Ordering::Acquire) {
+                WORKSPACE_DIAGNOSTIC_PULL_IDLE => return true,
+                WORKSPACE_DIAGNOSTIC_PULL_ACTIVE => break,
+                WORKSPACE_DIAGNOSTIC_PULL_ABORTED => {
+                    if self
+                        .workspace_diagnostic_pull_state
+                        .compare_exchange(
+                            WORKSPACE_DIAGNOSTIC_PULL_ABORTED,
+                            WORKSPACE_DIAGNOSTIC_PULL_IDLE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return false;
+                    }
+                }
+                _ => unreachable!("workspace diagnostic pull state is valid"),
+            }
         }
         self.workspace_diagnostic_registration_refresh_pending
             .store(true, Ordering::Release);
-        !self
-            .workspace_diagnostic_pull_active
-            .load(Ordering::Acquire)
-            && self
-                .workspace_diagnostic_registration_refresh_pending
-                .swap(false, Ordering::AcqRel)
+        loop {
+            match self.workspace_diagnostic_pull_state.load(Ordering::Acquire) {
+                WORKSPACE_DIAGNOSTIC_PULL_ACTIVE => return false,
+                WORKSPACE_DIAGNOSTIC_PULL_IDLE => {
+                    return self
+                        .workspace_diagnostic_registration_refresh_pending
+                        .swap(false, Ordering::AcqRel);
+                }
+                WORKSPACE_DIAGNOSTIC_PULL_ABORTED => {
+                    if self
+                        .workspace_diagnostic_pull_state
+                        .compare_exchange(
+                            WORKSPACE_DIAGNOSTIC_PULL_ABORTED,
+                            WORKSPACE_DIAGNOSTIC_PULL_IDLE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.workspace_diagnostic_registration_refresh_pending
+                            .store(false, Ordering::Release);
+                        return false;
+                    }
+                }
+                _ => unreachable!("workspace diagnostic pull state is valid"),
+            }
+        }
     }
 
     pub(crate) fn has_registration(&self, method: &str) -> bool {
@@ -692,7 +741,27 @@ mod tests {
 
         registry.mark_workspace_diagnostic_pull_aborted();
 
-        assert!(registry.take_workspace_diagnostic_registration_refresh());
+        assert!(!registry.take_workspace_diagnostic_registration_refresh());
+        assert!(
+            registry.request_or_defer_workspace_diagnostic_registration_refresh(),
+            "the registration deferred before abort is resolved by the abort"
+        );
+    }
+
+    #[test]
+    fn aborted_cold_pull_suppresses_a_registration_observed_after_abort() {
+        let registry = DynamicCapabilityRegistry::new();
+        registry.mark_workspace_diagnostic_pull_active();
+        registry.mark_workspace_diagnostic_pull_aborted();
+
+        assert!(
+            !registry.request_or_defer_workspace_diagnostic_registration_refresh(),
+            "the first delayed registration belongs to the aborted cold pull"
+        );
+        assert!(
+            registry.request_or_defer_workspace_diagnostic_registration_refresh(),
+            "later warm registrations must refresh normally"
+        );
     }
 
     #[test]
