@@ -36,16 +36,25 @@ const DYNAMIC_REGISTRATION_SETTLE: Duration = Duration::from_millis(100);
 pub(crate) struct WorkspaceDiagnosticDispatchContext<'a> {
     cancel_forwarder: Option<&'a CancelForwarder>,
     language_for_uri: &'a (dyn Fn(&str) -> Option<String> + Sync),
+    open_documents: &'a [WorkspaceDiagnosticOpenDocument],
+}
+
+pub(crate) struct WorkspaceDiagnosticOpenDocument {
+    pub(crate) uri: url::Url,
+    pub(crate) language_id: String,
+    pub(crate) text: Arc<str>,
 }
 
 impl<'a> WorkspaceDiagnosticDispatchContext<'a> {
     pub(crate) fn cancellable(
         cancel_forwarder: &'a CancelForwarder,
         language_for_uri: &'a (dyn Fn(&str) -> Option<String> + Sync),
+        open_documents: &'a [WorkspaceDiagnosticOpenDocument],
     ) -> Self {
         Self {
             cancel_forwarder: Some(cancel_forwarder),
             language_for_uri,
+            open_documents,
         }
     }
 }
@@ -1266,6 +1275,7 @@ impl LanguageServerPool {
             WorkspaceDiagnosticDispatchContext {
                 cancel_forwarder: None,
                 language_for_uri: &|_| None,
+                open_documents: &[],
             },
         )
         .await
@@ -1401,6 +1411,17 @@ impl LanguageServerPool {
                                 &workspace_admit,
                             )
                             .await;
+                        if !providers.is_empty() {
+                            for document in context.open_documents {
+                                self.sync_workspace_document_to_handle(
+                                    &handle,
+                                    &document.uri,
+                                    &document.language_id,
+                                    &document.text,
+                                )
+                                .await?;
+                            }
+                        }
                         let requests = providers.iter().cloned().map(|provider| {
                             let params = params_for_provider(params.clone(), &provider);
                             let identifier = provider.identifier.clone();
