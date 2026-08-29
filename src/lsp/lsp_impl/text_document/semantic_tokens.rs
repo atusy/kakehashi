@@ -184,6 +184,13 @@ struct SemanticDeltaComputation {
     snapshot_tree_present: Option<bool>,
 }
 
+fn semantic_snapshot_state_advanced(initial: Option<bool>, current: Option<bool>) -> bool {
+    matches!(
+        (initial, current),
+        (None, Some(_)) | (Some(false), Some(true))
+    )
+}
+
 struct VirtualBridgeSelectionGuard {
     local_selected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     selected: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -572,11 +579,17 @@ impl Kakehashi {
             direct_request,
         );
         let tracking = Some((request_id, cancel_token));
-        let absent_identity = self.documents.latest_snapshot(&uri).and_then(|view| {
-            view.slot.snapshot.is_none().then_some((
+        let retryable_snapshot = self.documents.latest_snapshot(&uri).and_then(|view| {
+            let tree_present = view
+                .slot
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.tree.is_some());
+            (tree_present != Some(true)).then_some((
                 view.slot.current_incarnation,
                 view.content_version,
                 self.cache.semantic_token_generation(),
+                tree_present,
             ))
         });
         let retry_params = params.clone();
@@ -588,18 +601,25 @@ impl Kakehashi {
             request_guard.finish();
             return Ok(outcome);
         }
-        let retry_after_snapshot_publication =
-            absent_identity.is_some_and(|(incarnation, content_version, generation)| {
+        let retry_after_snapshot_publication = retryable_snapshot.is_some_and(
+            |(incarnation, content_version, generation, initial_tree_present)| {
                 self.cache.semantic_token_generation() == generation
                     && self.documents.latest_snapshot(&uri).is_some_and(|view| {
                         view.slot.current_incarnation == incarnation
                             && view.content_version == content_version
-                            && view.slot.snapshot.is_some()
+                            && semantic_snapshot_state_advanced(
+                                initial_tree_present,
+                                view.slot
+                                    .snapshot
+                                    .as_ref()
+                                    .map(|snapshot| snapshot.tree.is_some()),
+                            )
                     })
                     && retry_tracking.as_ref().is_some_and(|(request_id, cancel)| {
                         !cancel.is_cancelled() && self.cache.is_request_active(&uri, *request_id)
                     })
-            });
+            },
+        );
         if !retry_after_snapshot_publication {
             request_guard.finish();
             return Ok(None);
@@ -1617,91 +1637,21 @@ impl Kakehashi {
         }
         candidates.sort();
         candidates.dedup();
-        let plans = candidates
-            .into_iter()
-            .filter_map(|injection_language| {
-                let configs =
-                    self.bridge_configs_for_injection_language(host_language, &injection_language);
-                if configs.is_empty() {
-                    return None;
-                }
-                let aggregation =
-                    self.resolve_aggregation_config(host_language, &injection_language, METHOD);
-                Some((configs, aggregation))
-            })
-            .collect::<Vec<_>>();
-        let pool = self.bridge.pool();
-        let mut incapable = std::collections::HashSet::new();
-        let mut incapable_by_connection = std::collections::HashMap::new();
-        for (configs, _) in &plans {
-            for config in configs {
-                let key = pool
-                    .resolved_connection_key(&config.server_name, &config.config, host_uri)
-                    .await;
-                let known_incapable = match incapable_by_connection.get(&key) {
-                    Some(known_incapable) => *known_incapable,
-                    None => {
-                        let known_incapable = pool.connection_known_incapable(&key, METHOD).await;
-                        incapable_by_connection.insert(key, known_incapable);
-                        known_incapable
-                    }
-                };
-                if known_incapable {
-                    incapable.insert(config.server_name.clone());
-                }
+        candidates.into_iter().any(|injection_language| {
+            let configs =
+                self.bridge_configs_for_injection_language(host_language, &injection_language);
+            if configs.is_empty() {
+                return false;
             }
-        }
-        plans.into_iter().any(|(configs, aggregation)| {
-            semantic_region_selects_servers(
-                true,
+            let aggregation =
+                self.resolve_aggregation_config(host_language, &injection_language, METHOD);
+            semantic_configs_select_servers(
                 &aggregation.priorities,
                 &configs,
                 aggregation.max_fan_out,
                 &incapable,
                 &std::collections::HashSet::new(),
             )
-        })
-    }
-
-    async fn semantic_tokens_delta_reenter_full(
-        &self,
-        uri: &Url,
-        full_params: SemanticTokensParams,
-        request_id: crate::lsp::cache::RequestId,
-        cancel_token: crate::cancel::CancelToken,
-        cancel_rx: &mut Option<crate::lsp::request_id::CancelReceiver>,
-    ) -> Result<Option<SemanticTokensFullDeltaResult>> {
-        let full = self.semantic_tokens_full_impl_with_tracking(
-            full_params,
-            Some((request_id, cancel_token.clone())),
-        );
-        let result = match cancel_rx.as_mut() {
-            Some(cancel_rx) => {
-                tokio::select! {
-                    biased;
-                    _ = cancel_rx => {
-                        cancel_token.cancel();
-                        self.cache.finish_request(uri, request_id);
-                        return Err(Error::request_cancelled());
-                    },
-                    result = full => result,
-                }
-            }
-            None => full.await,
-        };
-        self.cache.finish_request(uri, request_id);
-        result.map(|result| {
-            result.map(|result| match result {
-                SemanticTokensResult::Tokens(tokens) => {
-                    SemanticTokensFullDeltaResult::Tokens(tokens)
-                }
-                SemanticTokensResult::Partial(partial) => {
-                    SemanticTokensFullDeltaResult::Tokens(SemanticTokens {
-                        result_id: None,
-                        data: partial.data,
-                    })
-                }
-            })
         })
     }
 
@@ -2538,6 +2488,16 @@ mod tests {
     use tokio::time::{Duration, sleep, timeout};
     use tower_lsp_server::LspService;
     use url::Url;
+
+    #[test]
+    fn semantic_retry_accepts_publication_and_same_version_tree_upgrade_only() {
+        assert!(semantic_snapshot_state_advanced(None, Some(false)));
+        assert!(semantic_snapshot_state_advanced(None, Some(true)));
+        assert!(semantic_snapshot_state_advanced(Some(false), Some(true)));
+        assert!(!semantic_snapshot_state_advanced(None, None));
+        assert!(!semantic_snapshot_state_advanced(Some(false), Some(false)));
+        assert!(!semantic_snapshot_state_advanced(Some(true), Some(true)));
+    }
 
     #[test]
     fn dropping_semantic_compute_owner_cancels_blocking_work() {
