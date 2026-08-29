@@ -24,6 +24,7 @@ impl Kakehashi {
             false,
             false,
             false,
+            true,
             std::future::ready(Ok(None)),
             |t| async move {
                 t.pool
