@@ -2261,8 +2261,17 @@ fn semantic_configs_select_servers(
 ) -> bool {
     use crate::lsp::aggregation::server::priority::PriorityEntry;
 
+    // Full virtual fan-out removes definitely incapable configs before it expands
+    // priorities and applies maxFanOut. Mirror that ordering so delta re-entry
+    // promotes the same lower-priority capable server. Routing suppression remains
+    // a post-cap filter, matching dispatch.
+    let capable_configs = configs
+        .iter()
+        .filter(|config| !incapable.contains(&config.server_name))
+        .cloned()
+        .collect::<Vec<_>>();
     crate::lsp::aggregation::server::truncate_entries(
-        crate::lsp::aggregation::server::expand_priorities(priorities, configs),
+        crate::lsp::aggregation::server::expand_priorities(priorities, &capable_configs),
         max_fan_out,
     )
     .iter()
@@ -2270,7 +2279,7 @@ fn semantic_configs_select_servers(
         PriorityEntry::Server(name) => std::slice::from_ref(name),
         PriorityEntry::Rest(names) => names.as_slice(),
     })
-    .any(|name| !incapable.contains(name) && !suppressed.contains(name))
+    .any(|name| !suppressed.contains(name))
 }
 
 #[cfg(test)]
@@ -2332,7 +2341,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_reentry_applies_fanout_cap_before_availability_filters() {
+    fn delta_reentry_matches_full_fanout_filter_order() {
         let configs = ["suppressed", "available"]
             .into_iter()
             .map(|server_name| crate::lsp::bridge::ResolvedServerConfig {
@@ -2357,6 +2366,18 @@ mod tests {
             &std::collections::HashSet::new(),
             &suppressed,
         ));
+
+        let incapable = std::collections::HashSet::from(["suppressed".into()]);
+        assert!(
+            semantic_configs_select_servers(
+                &priorities,
+                &configs,
+                Some(1),
+                &incapable,
+                &std::collections::HashSet::new(),
+            ),
+            "an incapable first server is removed before maxFanOut promotes the capable fallback"
+        );
     }
 
     #[test]
