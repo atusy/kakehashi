@@ -47,6 +47,7 @@ impl LanguageServerPool {
             host_range,
             upstream_request_id,
             expected_incarnation,
+            revision_text_reader,
         )
         .await
     }
@@ -62,6 +63,7 @@ impl LanguageServerPool {
         host_range: Range,
         upstream_request_id: Option<UpstreamId>,
         expected_incarnation: u64,
+        revision_text_reader: HostTextReader,
     ) -> io::Result<Option<SemanticTokens>> {
         let Some(raw) = self
             .send_host_raw_request_for_revision(
