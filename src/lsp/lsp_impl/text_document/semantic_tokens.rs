@@ -1857,21 +1857,40 @@ impl Kakehashi {
         // Preserve the native-only idle fast path. A wire baseline or any
         // eligible bridge layer must still execute the full fan-out because a
         // downstream server may change its answer without a document edit.
-        if let Some(previous) = previous_native.as_ref()
-            && let Some(view) = self.documents.latest_snapshot(&uri)
-            && let Some(snapshot) = view.slot.snapshot.as_ref()
-            && snapshot.incarnation == view.slot.current_incarnation
-            && snapshot.parsed_version == view.content_version
-            && let Some(language) = snapshot.language.as_deref()
-            && crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
-                &self.settings_manager.load_settings(),
-                language,
-                "textDocument/semanticTokens/full",
-            )
-            .allows(LayerSource::Native)
-            && !self
-                .semantic_delta_has_applicable_bridge(&lsp_uri, &uri, snapshot, language)
-                .await
+        let idle_candidate = previous_native.as_ref().and_then(|_| {
+            let view = self.documents.latest_snapshot(&uri)?;
+            let snapshot = view.slot.snapshot?;
+            (snapshot.incarnation == view.slot.current_incarnation
+                && snapshot.parsed_version == view.content_version)
+                .then_some(snapshot)
+                .and_then(|snapshot| {
+                    let language = snapshot.language.clone()?;
+                    crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+                        &self.settings_manager.load_settings(),
+                        &language,
+                        "textDocument/semanticTokens/full",
+                    )
+                    .allows(LayerSource::Native)
+                    .then_some((snapshot, language))
+                })
+        });
+        let idle_bridge_applicable = if let Some((snapshot, language)) = idle_candidate.as_ref() {
+            tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => return Ok(None),
+                applicable = self.semantic_delta_has_applicable_bridge(
+                    &lsp_uri,
+                    &uri,
+                    snapshot,
+                    language,
+                ) => applicable,
+            }
+        } else {
+            true
+        };
+        if let (Some(previous), Some((snapshot, language))) =
+            (previous_native.as_ref(), idle_candidate.as_ref())
+            && !idle_bridge_applicable
             && self.cache.semantic_token_generation() == request_generation
             && let Some(current) = self.cache.get_current_tokens_for_snapshot(
                 &uri,
