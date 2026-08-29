@@ -384,7 +384,12 @@ impl NormalizedDocumentFilter {
                 let Ok(base_uri) = url::Url::parse(base_uri) else {
                     return false;
                 };
-                if uri.scheme() != base_uri.scheme() {
+                if uri.scheme() != base_uri.scheme()
+                    || uri.username() != base_uri.username()
+                    || uri.password() != base_uri.password()
+                    || uri.host_str() != base_uri.host_str()
+                    || uri.port_or_known_default() != base_uri.port_or_known_default()
+                {
                     return false;
                 }
                 let base = base_uri.path().trim_end_matches('/');
@@ -3408,6 +3413,21 @@ mod tests {
         assert!(filter.applies_to("file:///workspace/nested/main.rs", Some("rust")));
         assert!(!filter.applies_to("file:///workspace/nested/deeper/main.rs", Some("rust")));
         assert!(!filter.applies_to("file:///workspace/other/main.rs", Some("rust")));
+
+        let remote_filter = NormalizedDocumentFilter {
+            language: Some("rust".into()),
+            scheme: Some("vscode-remote".into()),
+            pattern: Some("*.rs".into()),
+            pattern_base_uri: Some("vscode-remote://ssh-remote+one/workspace".into()),
+        };
+        assert!(remote_filter.applies_to(
+            "vscode-remote://ssh-remote+one/workspace/main.rs",
+            Some("rust")
+        ));
+        assert!(!remote_filter.applies_to(
+            "vscode-remote://ssh-remote+two/workspace/main.rs",
+            Some("rust")
+        ));
     }
 
     #[tokio::test]
