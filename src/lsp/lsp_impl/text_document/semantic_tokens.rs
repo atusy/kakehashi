@@ -170,6 +170,7 @@ struct SemanticFullComputation {
     generation: u64,
     settings_generation: u64,
     snapshot_present: bool,
+    snapshot_tree_present: Option<bool>,
 }
 
 struct SemanticDeltaComputation {
@@ -180,6 +181,7 @@ struct SemanticDeltaComputation {
     generation: u64,
     settings_generation: u64,
     snapshot_present: bool,
+    snapshot_tree_present: Option<bool>,
 }
 
 struct VirtualBridgeSelectionGuard {
@@ -336,6 +338,12 @@ impl Kakehashi {
                 view.slot.current_incarnation == computed.identity.0
                     && view.content_version == computed.identity.1
                     && view.slot.snapshot.is_some() == computed.snapshot_present
+                    && view
+                        .slot
+                        .snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.tree.is_some())
+                        == computed.snapshot_tree_present
             })
     }
 
@@ -350,6 +358,12 @@ impl Kakehashi {
                 view.slot.current_incarnation == computed.identity.0
                     && view.content_version == computed.identity.1
                     && view.slot.snapshot.is_some() == computed.snapshot_present
+                    && view
+                        .slot
+                        .snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.tree.is_some())
+                        == computed.snapshot_tree_present
             })
     }
 
@@ -661,6 +675,7 @@ impl Kakehashi {
             .documents
             .latest_snapshot(&uri)
             .is_some_and(|view| view.slot.snapshot.is_some());
+        let snapshot_tree_present = snapshot.as_ref().map(|snapshot| snapshot.tree.is_some());
         let Some((live_identity, live_text, live_language)) =
             self.documents.get(&uri).map(|document| {
                 (
@@ -873,6 +888,7 @@ impl Kakehashi {
                 generation,
                 settings_generation,
                 snapshot_present: live_snapshot_present,
+                snapshot_tree_present,
             }))
         };
         let mut outcome = match cancel_rx.as_mut() {
@@ -950,6 +966,7 @@ impl Kakehashi {
         params: SemanticTokensParams,
         cancel_rx: &mut Option<crate::lsp::request_id::CancelReceiver>,
         tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
+        compute_native: bool,
         require_snapshot: bool,
     ) -> Result<Option<NativeSemanticLayer>> {
         let lsp_uri = params.text_document.uri;
@@ -1069,6 +1086,17 @@ impl Kakehashi {
                 return Ok(None);
             }
         };
+        if !compute_native {
+            return Ok(Some(NativeSemanticLayer::new(
+                SemanticTokens {
+                    result_id: None,
+                    data: Vec::new(),
+                },
+                Some(snapshot),
+                request_guard,
+                token_generation,
+            )));
+        }
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
             // No detectable language, or resolved-but-tree-less (see
@@ -1843,6 +1871,7 @@ impl Kakehashi {
                     generation: request_generation,
                     settings_generation: request_settings_generation,
                     snapshot_present: true,
+                    snapshot_tree_present: Some(snapshot.tree.is_some()),
                 }));
             }
             return Ok(None);
@@ -1868,6 +1897,7 @@ impl Kakehashi {
         let pending_native = current.pending_native;
         let pending_wire = current.pending_wire;
         let snapshot_present = current.snapshot_present;
+        let snapshot_tree_present = current.snapshot_tree_present;
         let current = match current.result {
             SemanticTokensResult::Tokens(tokens) => tokens,
             SemanticTokensResult::Partial(partial) => SemanticTokens {
@@ -1891,6 +1921,12 @@ impl Kakehashi {
                 view.slot.current_incarnation == request_identity.0
                     && view.content_version == request_identity.1
                     && view.slot.snapshot.is_some() == snapshot_present
+                    && view
+                        .slot
+                        .snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.tree.is_some())
+                        == snapshot_tree_present
             })
         {
             return Ok(None);
@@ -1904,6 +1940,7 @@ impl Kakehashi {
             generation: request_generation,
             settings_generation: request_settings_generation,
             snapshot_present,
+            snapshot_tree_present,
         }))
     }
 
@@ -2574,6 +2611,7 @@ mod tests {
             generation,
             settings_generation,
             snapshot_present: false,
+            snapshot_tree_present: None,
         };
         let delta_computed = SemanticDeltaComputation {
             result: SemanticTokensFullDeltaResult::Tokens(SemanticTokens {
@@ -2586,6 +2624,7 @@ mod tests {
             generation,
             settings_generation,
             snapshot_present: false,
+            snapshot_tree_present: None,
         };
         assert!(server.semantic_full_computation_is_current(&uri, &computed));
         assert!(server.semantic_delta_computation_is_current(&uri, &delta_computed));
@@ -3137,6 +3176,7 @@ mod tests {
             generation: 1,
             settings_generation: 1,
             snapshot_present: true,
+            snapshot_tree_present: Some(true),
         };
         commit_full_baselines(&server.cache, &mut computed);
         assert!(
