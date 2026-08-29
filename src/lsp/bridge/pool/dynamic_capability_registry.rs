@@ -22,6 +22,7 @@ pub(crate) struct DynamicCapabilityRegistry {
     /// it before a suppressed log can consume bounded window-queue capacity.
     log_message_level: AtomicU8,
     revision: AtomicU64,
+    workspace_diagnostic_revision: AtomicU64,
     changes: tokio::sync::watch::Sender<u64>,
     diagnostic_registration_settled: tokio::sync::OnceCell<()>,
     static_workspace_diagnostic_provider: AtomicBool,
@@ -59,6 +60,7 @@ impl DynamicCapabilityRegistry {
                 crate::config::settings::LogMessageLevel::Info.as_u8(),
             ),
             revision: AtomicU64::new(0),
+            workspace_diagnostic_revision: AtomicU64::new(0),
             changes,
             diagnostic_registration_settled: tokio::sync::OnceCell::new(),
             static_workspace_diagnostic_provider: AtomicBool::new(false),
@@ -77,10 +79,19 @@ impl DynamicCapabilityRegistry {
             .registrations
             .write()
             .recover_poison("DynamicCapabilityRegistry::register");
+        let mut workspace_diagnostic_changed = false;
         for reg in registrations {
-            guard.insert(reg.id.clone(), reg);
+            let is_workspace_diagnostic = reg.method == "textDocument/diagnostic";
+            let replaced = guard.insert(reg.id.clone(), reg);
+            workspace_diagnostic_changed |= is_workspace_diagnostic
+                || replaced
+                    .is_some_and(|registration| registration.method == "textDocument/diagnostic");
         }
         let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        if workspace_diagnostic_changed {
+            self.workspace_diagnostic_revision
+                .fetch_add(1, Ordering::AcqRel);
+        }
         drop(guard);
         self.notify_change(revision);
     }
@@ -90,10 +101,18 @@ impl DynamicCapabilityRegistry {
             .registrations
             .write()
             .recover_poison("DynamicCapabilityRegistry::unregister");
+        let mut workspace_diagnostic_changed = false;
         for unreg in unregistrations {
-            guard.remove(&unreg.id);
+            let removed = guard.remove(&unreg.id);
+            workspace_diagnostic_changed |= unreg.method == "textDocument/diagnostic"
+                || removed
+                    .is_some_and(|registration| registration.method == "textDocument/diagnostic");
         }
         let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        if workspace_diagnostic_changed {
+            self.workspace_diagnostic_revision
+                .fetch_add(1, Ordering::AcqRel);
+        }
         drop(guard);
         self.notify_change(revision);
     }
@@ -234,12 +253,12 @@ impl DynamicCapabilityRegistry {
             .filter(|registration| registration.method == method)
             .cloned()
             .collect();
-        let revision = self.revision.load(Ordering::Acquire);
+        let revision = self.workspace_diagnostic_revision.load(Ordering::Acquire);
         (registrations, revision)
     }
 
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Acquire)
+    pub(crate) fn workspace_diagnostic_revision(&self) -> u64 {
+        self.workspace_diagnostic_revision.load(Ordering::Acquire)
     }
 
     pub(crate) fn registrations_read(&self) -> RwLockReadGuard<'_, HashMap<String, Registration>> {
@@ -456,6 +475,26 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, ["lua", "rust"]);
+    }
+
+    #[test]
+    fn workspace_diagnostic_revision_ignores_unrelated_capabilities() {
+        let registry = DynamicCapabilityRegistry::new();
+        let (_, initial_revision) =
+            registry.registrations_for_method_with_revision("textDocument/diagnostic");
+
+        registry.register(vec![make_registration("hover", "textDocument/hover")]);
+        let (_, unrelated_revision) =
+            registry.registrations_for_method_with_revision("textDocument/diagnostic");
+        assert_eq!(unrelated_revision, initial_revision);
+
+        registry.register(vec![make_registration(
+            "diagnostics",
+            "textDocument/diagnostic",
+        )]);
+        let (_, diagnostic_revision) =
+            registry.registrations_for_method_with_revision("textDocument/diagnostic");
+        assert!(diagnostic_revision > unrelated_revision);
     }
 
     #[test]

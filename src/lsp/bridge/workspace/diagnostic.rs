@@ -657,7 +657,7 @@ impl LanguageServerPool {
             .iter()
             .filter(|completed| {
                 let registry = completed.handle.dynamic_capabilities();
-                registry.revision() != completed.provider_revision
+                registry.workspace_diagnostic_revision() != completed.provider_revision
                     || diagnostic_providers(&completed.handle) != completed.provider_plan
             })
             .map(|completed| &completed.handle)
@@ -772,7 +772,10 @@ impl LanguageServerPool {
                             .dynamic_capabilities()
                             .has_workspace_diagnostic_reader_exited()
                         || self.document_connection_generation(handle.key()) != *generation
-                        || handle.dynamic_capabilities().revision() != *provider_revision
+                        || handle
+                            .dynamic_capabilities()
+                            .workspace_diagnostic_revision()
+                            != *provider_revision
                         || diagnostic_providers_from_registrations(handle, registrations.values())
                             != *plan
                 })
@@ -782,7 +785,10 @@ impl LanguageServerPool {
             .iter()
             .zip(&provider_guards)
             .filter(|((handle, _, provider_revision, plan), registrations)| {
-                handle.dynamic_capabilities().revision() != *provider_revision
+                handle
+                    .dynamic_capabilities()
+                    .workspace_diagnostic_revision()
+                    != *provider_revision
                     || diagnostic_providers_from_registrations(handle, registrations.values())
                         != *plan
             })
@@ -1519,7 +1525,9 @@ mod tests {
         );
         let successful = CompletedDiagnosticProducer {
             provider_plan: Vec::new(),
-            provider_revision: handle.dynamic_capabilities().revision(),
+            provider_revision: handle
+                .dynamic_capabilities()
+                .workspace_diagnostic_revision(),
             handle: Arc::clone(&handle),
             generation,
             report: WorkspaceDiagnosticReport::default(),
@@ -1601,7 +1609,9 @@ mod tests {
         let generation = pool.document_connection_generation(handle.key());
         let completed = CompletedDiagnosticProducer {
             provider_plan: Vec::new(),
-            provider_revision: handle.dynamic_capabilities().revision(),
+            provider_revision: handle
+                .dynamic_capabilities()
+                .workspace_diagnostic_revision(),
             handle: Arc::clone(&handle),
             generation,
             report: WorkspaceDiagnosticReport::default(),
@@ -1648,7 +1658,9 @@ mod tests {
         let generation = pool.document_connection_generation(handle.key());
         let completed = CompletedDiagnosticProducer {
             provider_plan: Vec::new(),
-            provider_revision: handle.dynamic_capabilities().revision(),
+            provider_revision: handle
+                .dynamic_capabilities()
+                .workspace_diagnostic_revision(),
             handle: Arc::clone(&handle),
             generation,
             report: WorkspaceDiagnosticReport::default(),
@@ -1818,7 +1830,9 @@ mod tests {
                     fast_completed.store(true, Ordering::SeqCst);
                     Some(CompletedDiagnosticProducer {
                         provider_plan: Vec::new(),
-                        provider_revision: handle.dynamic_capabilities().revision(),
+                        provider_revision: handle
+                            .dynamic_capabilities()
+                            .workspace_diagnostic_revision(),
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport {
@@ -1836,7 +1850,9 @@ mod tests {
                     let _ = slow_released.await;
                     Some(CompletedDiagnosticProducer {
                         provider_plan: Vec::new(),
-                        provider_revision: handle.dynamic_capabilities().revision(),
+                        provider_revision: handle
+                            .dynamic_capabilities()
+                            .workspace_diagnostic_revision(),
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport { items: Vec::new() },
@@ -1891,7 +1907,9 @@ mod tests {
                     fast_completed.store(true, Ordering::Release);
                     Some(CompletedDiagnosticProducer {
                         provider_plan: Vec::new(),
-                        provider_revision: handle.dynamic_capabilities().revision(),
+                        provider_revision: handle
+                            .dynamic_capabilities()
+                            .workspace_diagnostic_revision(),
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport {
@@ -1909,7 +1927,9 @@ mod tests {
                     let _ = slow_released.await;
                     Some(CompletedDiagnosticProducer {
                         provider_plan: Vec::new(),
-                        provider_revision: handle.dynamic_capabilities().revision(),
+                        provider_revision: handle
+                            .dynamic_capabilities()
+                            .workspace_diagnostic_revision(),
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport::default(),
@@ -1958,7 +1978,9 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
                     provider_plan: Vec::new(),
-                    provider_revision: handle.dynamic_capabilities().revision(),
+                    provider_revision: handle
+                        .dynamic_capabilities()
+                        .workspace_diagnostic_revision(),
                     handle,
                     generation,
                     report: WorkspaceDiagnosticReport {
@@ -1995,7 +2017,9 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
                     provider_plan: Vec::new(),
-                    provider_revision: handle.dynamic_capabilities().revision(),
+                    provider_revision: handle
+                        .dynamic_capabilities()
+                        .workspace_diagnostic_revision(),
                     handle: Arc::clone(&handle),
                     generation,
                     report: WorkspaceDiagnosticReport {
@@ -2056,7 +2080,9 @@ mod tests {
         pool.aggregate_admitted_workspace_diagnostic_reports(
             [std::future::ready(Some(CompletedDiagnosticProducer {
                 provider_plan,
-                provider_revision: handle.dynamic_capabilities().revision(),
+                provider_revision: handle
+                    .dynamic_capabilities()
+                    .workspace_diagnostic_revision(),
                 handle: Arc::clone(&handle),
                 generation,
                 report: WorkspaceDiagnosticReport::default(),
@@ -2114,7 +2140,9 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
                     provider_plan: Vec::new(),
-                    provider_revision: handle.dynamic_capabilities().revision(),
+                    provider_revision: handle
+                        .dynamic_capabilities()
+                        .workspace_diagnostic_revision(),
                     handle: Arc::clone(&handle),
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
@@ -2202,7 +2230,9 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
                     provider_plan: Vec::new(),
-                    provider_revision: handle.dynamic_capabilities().revision(),
+                    provider_revision: handle
+                        .dynamic_capabilities()
+                        .workspace_diagnostic_revision(),
                     handle,
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
@@ -2251,7 +2281,9 @@ mod tests {
                 [
                     std::future::ready(Some(CompletedDiagnosticProducer {
                         provider_plan: Vec::new(),
-                        provider_revision: stale.dynamic_capabilities().revision(),
+                        provider_revision: stale
+                            .dynamic_capabilities()
+                            .workspace_diagnostic_revision(),
                         handle: stale,
                         generation: stale_generation,
                         report: WorkspaceDiagnosticReport {
@@ -2262,7 +2294,9 @@ mod tests {
                     })),
                     std::future::ready(Some(CompletedDiagnosticProducer {
                         provider_plan: Vec::new(),
-                        provider_revision: live.dynamic_capabilities().revision(),
+                        provider_revision: live
+                            .dynamic_capabilities()
+                            .workspace_diagnostic_revision(),
                         handle: live,
                         generation: live_generation,
                         report: WorkspaceDiagnosticReport {
@@ -2346,7 +2380,9 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
                     provider_plan,
-                    provider_revision: handle.dynamic_capabilities().revision(),
+                    provider_revision: handle
+                        .dynamic_capabilities()
+                        .workspace_diagnostic_revision(),
                     handle,
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
@@ -2386,7 +2422,9 @@ mod tests {
             let generation = pool.document_connection_generation(handle.key());
             CompletedDiagnosticProducer {
                 provider_plan: diagnostic_providers(handle),
-                provider_revision: handle.dynamic_capabilities().revision(),
+                provider_revision: handle
+                    .dynamic_capabilities()
+                    .workspace_diagnostic_revision(),
                 handle: Arc::clone(handle),
                 generation,
                 report: WorkspaceDiagnosticReport::default(),
@@ -2440,7 +2478,9 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
                     provider_plan,
-                    provider_revision: handle.dynamic_capabilities().revision(),
+                    provider_revision: handle
+                        .dynamic_capabilities()
+                        .workspace_diagnostic_revision(),
                     handle: Arc::clone(&handle),
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
