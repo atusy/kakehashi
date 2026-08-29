@@ -233,6 +233,11 @@ impl LanguageServerPool {
     /// orphaned in downstream LSs. Matching docs are atomically removed from
     /// tracking and sent didClose (best effort); docs never opened are skipped.
     pub(crate) async fn close_invalidated_docs(&self, host_uri: &Url, invalidated_ulids: &[Ulid]) {
+        let lifecycle = self.existing_host_lifecycle_lock(host_uri);
+        let _lifecycle_guard = match lifecycle {
+            Some(lifecycle) => Some(lifecycle.lock_owned().await),
+            None => None,
+        };
         self.clear_invalidated_virtual_contents(host_uri, invalidated_ulids);
         // Atomically remove matching docs from host_to_virtual
         let to_close = self
