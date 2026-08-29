@@ -1104,16 +1104,22 @@ impl Kakehashi {
             // instead of silently dropping streamed semantic-token chunks.
             params.remove("partialResultToken");
         }
-        let Some((incarnation, content_version)) = uri_to_url(&lsp_uri)
-            .ok()
-            .and_then(|uri| self.documents.get(&uri))
-            .map(|document| (document.incarnation(), document.content_version()))
-        else {
-            return Ok(None);
-        };
-        let virt = self.semantic_tokens_range_virt_layer(&lsp_uri, range, progress_token);
-        let host = self.semantic_tokens_range_host_layer(&lsp_uri, range, raw_params);
-        let native = self.semantic_tokens_range_native_layer(params);
+        let request_identity = std::sync::Arc::new(std::sync::OnceLock::new());
+        let virt = self.observe_semantic_range_identity(
+            &lsp_uri,
+            std::sync::Arc::clone(&request_identity),
+            self.semantic_tokens_range_virt_layer(&lsp_uri, range, progress_token),
+        );
+        let host = self.observe_semantic_range_identity(
+            &lsp_uri,
+            std::sync::Arc::clone(&request_identity),
+            self.semantic_tokens_range_host_layer(&lsp_uri, range, raw_params),
+        );
+        let native = self.observe_semantic_range_identity(
+            &lsp_uri,
+            std::sync::Arc::clone(&request_identity),
+            self.semantic_tokens_range_native_layer(params),
+        );
 
         let result = self
             .walk_layer_futures(
@@ -1129,10 +1135,39 @@ impl Kakehashi {
                 },
             )
             .await?;
+        let Some(&(incarnation, content_version)) = request_identity.get() else {
+            return Ok(None);
+        };
         if !self.semantic_range_snapshot_is_current(&lsp_uri, incarnation, content_version) {
             return Ok(None);
         }
         Ok(result)
+    }
+
+    async fn observe_semantic_range_identity<F>(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        request_identity: std::sync::Arc<std::sync::OnceLock<(u64, u64)>>,
+        layer: F,
+    ) -> Result<Option<SemanticTokensRangeResult>>
+    where
+        F: std::future::Future<Output = Result<Option<SemanticTokensRangeResult>>>,
+    {
+        let identity = uri_to_url(lsp_uri)
+            .ok()
+            .and_then(|uri| self.documents.get(&uri))
+            .map(|document| (document.incarnation(), document.content_version()));
+        let result = layer.await;
+        let identity = identity.or_else(|| {
+            uri_to_url(lsp_uri)
+                .ok()
+                .and_then(|uri| self.documents.get(&uri))
+                .map(|document| (document.incarnation(), document.content_version()))
+        });
+        if let Some(identity) = identity {
+            let _ = request_identity.set(identity);
+        }
+        result
     }
 
     async fn semantic_tokens_range_host_layer(
