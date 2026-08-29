@@ -168,6 +168,7 @@ struct SemanticFullComputation {
     pending_wire: Option<PendingWireBaseline>,
     identity: (u64, u64),
     generation: u64,
+    settings_generation: u64,
     snapshot_present: bool,
 }
 
@@ -177,6 +178,7 @@ struct SemanticDeltaComputation {
     pending_wire: Option<PendingWireBaseline>,
     identity: (u64, u64),
     generation: u64,
+    settings_generation: u64,
     snapshot_present: bool,
 }
 
@@ -282,7 +284,8 @@ impl Kakehashi {
         uri: &Url,
         computed: &SemanticFullComputation,
     ) -> bool {
-        self.cache.semantic_token_generation() == computed.generation
+        self.settings_manager.settings_generation() == computed.settings_generation
+            && self.cache.semantic_token_generation() == computed.generation
             && self.documents.latest_snapshot(uri).is_some_and(|view| {
                 view.slot.current_incarnation == computed.identity.0
                     && view.content_version == computed.identity.1
@@ -295,7 +298,8 @@ impl Kakehashi {
         uri: &Url,
         computed: &SemanticDeltaComputation,
     ) -> bool {
-        self.cache.semantic_token_generation() == computed.generation
+        self.settings_manager.settings_generation() == computed.settings_generation
+            && self.cache.semantic_token_generation() == computed.generation
             && self.documents.latest_snapshot(uri).is_some_and(|view| {
                 view.slot.current_incarnation == computed.identity.0
                     && view.content_version == computed.identity.1
@@ -828,6 +832,7 @@ impl Kakehashi {
                 pending_wire,
                 identity: live_identity,
                 generation,
+                settings_generation,
                 snapshot_present: live_snapshot_present,
             }))
         };
@@ -1741,6 +1746,7 @@ impl Kakehashi {
             return Ok(None);
         };
         let request_generation = self.cache.semantic_token_generation();
+        let request_settings_generation = self.settings_manager.settings_generation();
         // Hold the requested baseline across the nested full request. The wire
         // cache is byte-bounded, so looking it up afterwards can lose the exact
         // lineage when the newly computed full result evicts older entries.
@@ -1788,7 +1794,7 @@ impl Kakehashi {
                 && self.semantic_full_response_is_current(
                     &uri,
                     request_identity,
-                    request_generation,
+                    (request_generation, request_settings_generation),
                     Some(snapshot),
                     true,
                     &edit_lock,
@@ -1805,6 +1811,7 @@ impl Kakehashi {
                     pending_wire: None,
                     identity: request_identity,
                     generation: request_generation,
+                    settings_generation: request_settings_generation,
                     snapshot_present: true,
                 }));
             }
@@ -1825,6 +1832,9 @@ impl Kakehashi {
         else {
             return Ok(None);
         };
+        if current.settings_generation != request_settings_generation {
+            return Ok(None);
+        }
         let pending_native = current.pending_native;
         let pending_wire = current.pending_wire;
         let snapshot_present = current.snapshot_present;
@@ -1846,6 +1856,7 @@ impl Kakehashi {
         if cancel_token.is_cancelled()
             || !self.cache.is_request_active(&uri, request_id)
             || self.cache.semantic_token_generation() != request_generation
+            || self.settings_manager.settings_generation() != request_settings_generation
             || !self.documents.latest_snapshot(&uri).is_some_and(|view| {
                 view.slot.current_incarnation == request_identity.0
                     && view.content_version == request_identity.1
@@ -1861,6 +1872,7 @@ impl Kakehashi {
             pending_wire,
             identity: request_identity,
             generation: request_generation,
+            settings_generation: request_settings_generation,
             snapshot_present,
         }))
     }
@@ -2585,6 +2597,7 @@ mod tests {
             pending_wire: None,
             identity,
             generation,
+            settings_generation,
             snapshot_present: false,
         };
         let delta_computed = SemanticDeltaComputation {
@@ -2596,6 +2609,7 @@ mod tests {
             pending_wire: None,
             identity,
             generation,
+            settings_generation,
             snapshot_present: false,
         };
         assert!(server.semantic_full_computation_is_current(&uri, &computed));
@@ -2623,6 +2637,8 @@ mod tests {
             ),
             "a settings reload must invalidate the captured host-only plan"
         );
+        assert!(!server.semantic_full_computation_is_current(&uri, &computed));
+        assert!(!server.semantic_delta_computation_is_current(&uri, &delta_computed));
         let settings_generation = server.settings_manager.settings_generation();
         publish_treeless(server, &uri, "old", 0);
         assert!(
@@ -3109,6 +3125,7 @@ mod tests {
             pending_wire: Some(pending),
             identity: (1, 1),
             generation: 1,
+            settings_generation: 1,
             snapshot_present: true,
         };
         commit_full_baselines(&server.cache, &mut computed);
