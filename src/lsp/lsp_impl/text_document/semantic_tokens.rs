@@ -1382,17 +1382,30 @@ impl Kakehashi {
         // applicability before the native-only tree gate so a tree-less
         // current snapshot can still re-enter its configured host layer.
         let parser_language = snapshot.language.as_deref();
-        if let Some(bridge_language) = snapshot.language.as_deref()
-            && self
-                .semantic_delta_has_applicable_bridge(
-                    &lsp_uri,
-                    &uri,
-                    &snapshot,
-                    bridge_language,
-                    parser_language,
-                )
-                .await
-        {
+        let bridge_applicable = if let Some(bridge_language) = snapshot.language.as_deref() {
+            let applicability = self.semantic_delta_has_applicable_bridge(
+                &lsp_uri,
+                &uri,
+                &snapshot,
+                bridge_language,
+                parser_language,
+            );
+            match cancel_rx.as_mut() {
+                Some(cancel_rx) => tokio::select! {
+                    biased;
+                    _ = cancel_rx => {
+                        cancel_token.cancel();
+                        self.cache.finish_request(&uri, request_id);
+                        return Err(Error::request_cancelled());
+                    }
+                    applicable = applicability => applicable,
+                },
+                None => applicability.await,
+            }
+        } else {
+            false
+        };
+        if bridge_applicable {
             return self
                 .semantic_tokens_delta_reenter_full(
                     &uri,
