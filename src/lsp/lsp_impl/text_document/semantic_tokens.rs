@@ -1092,7 +1092,7 @@ impl Kakehashi {
                 })
                 .map(|config| config.server_name.clone())
                 .collect::<std::collections::HashSet<_>>();
-            if semantic_configs_select_servers(
+            if semantic_host_configs_select_servers(
                 &ctx.priorities,
                 &ctx.configs,
                 ctx.max_fan_out,
@@ -2249,10 +2249,10 @@ fn semantic_region_selects_servers(
     if !contiguous {
         return false;
     }
-    semantic_configs_select_servers(priorities, configs, max_fan_out, incapable, suppressed)
+    semantic_virt_configs_select_servers(priorities, configs, max_fan_out, incapable, suppressed)
 }
 
-fn semantic_configs_select_servers(
+fn semantic_virt_configs_select_servers(
     priorities: &[String],
     configs: &[crate::lsp::bridge::ResolvedServerConfig],
     max_fan_out: Option<usize>,
@@ -2280,6 +2280,27 @@ fn semantic_configs_select_servers(
         PriorityEntry::Rest(names) => names.as_slice(),
     })
     .any(|name| !suppressed.contains(name))
+}
+
+fn semantic_host_configs_select_servers(
+    priorities: &[String],
+    configs: &[crate::lsp::bridge::ResolvedServerConfig],
+    max_fan_out: Option<usize>,
+    incapable: &std::collections::HashSet<String>,
+    suppressed: &std::collections::HashSet<String>,
+) -> bool {
+    use crate::lsp::aggregation::server::priority::PriorityEntry;
+
+    crate::lsp::aggregation::server::truncate_entries(
+        crate::lsp::aggregation::server::expand_priorities(priorities, configs),
+        max_fan_out,
+    )
+    .iter()
+    .flat_map(|entry| match entry {
+        PriorityEntry::Server(name) => std::slice::from_ref(name),
+        PriorityEntry::Rest(names) => names.as_slice(),
+    })
+    .any(|name| !incapable.contains(name) && !suppressed.contains(name))
 }
 
 #[cfg(test)]
@@ -2352,14 +2373,14 @@ mod tests {
         let priorities = [crate::config::settings::PRIORITIES_WILDCARD.into()];
         let suppressed = std::collections::HashSet::from(["suppressed".into()]);
 
-        assert!(!semantic_configs_select_servers(
+        assert!(!semantic_virt_configs_select_servers(
             &priorities,
             &configs,
             Some(1),
             &std::collections::HashSet::new(),
             &suppressed,
         ));
-        assert!(semantic_configs_select_servers(
+        assert!(semantic_virt_configs_select_servers(
             &priorities,
             &configs,
             None,
@@ -2369,7 +2390,7 @@ mod tests {
 
         let incapable = std::collections::HashSet::from(["suppressed".into()]);
         assert!(
-            semantic_configs_select_servers(
+            semantic_virt_configs_select_servers(
                 &priorities,
                 &configs,
                 Some(1),
@@ -2377,6 +2398,16 @@ mod tests {
                 &std::collections::HashSet::new(),
             ),
             "an incapable first server is removed before maxFanOut promotes the capable fallback"
+        );
+        assert!(
+            !semantic_host_configs_select_servers(
+                &priorities,
+                &configs,
+                Some(1),
+                &incapable,
+                &std::collections::HashSet::new(),
+            ),
+            "host fan-out caps before its per-request capability gate"
         );
     }
 

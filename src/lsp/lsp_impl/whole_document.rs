@@ -206,13 +206,17 @@ impl Kakehashi {
             // support this method before the per-region fan-out spawns their
             // tasks (capability-prefilter-fanout). One pool query for the whole
             // request; the resulting set is a cheap per-region lookup.
-            let incapable_servers = self
-                .incapable_virt_servers(
+            let exact_semantic_capabilities = method_name == "textDocument/semanticTokens/full";
+            let incapable_servers = if exact_semantic_capabilities {
+                std::collections::HashSet::new()
+            } else {
+                self.incapable_virt_servers(
                     &language_name,
                     all_regions.iter().map(|r| r.injection_language.as_str()),
                     method_name,
                 )
-                .await;
+                .await
+            };
 
             for (region_index, resolved) in all_regions.iter().enumerate() {
                 // A combined injection concatenates disjoint host spans into one
@@ -227,7 +231,32 @@ impl Kakehashi {
                     &language_name,
                     &resolved.injection_language,
                 );
-                if !incapable_servers.is_empty() {
+                if exact_semantic_capabilities {
+                    let Ok(routing_uri) = url::Url::parse(
+                        &crate::lsp::bridge::VirtualDocumentUri::new(
+                            lsp_uri,
+                            &resolved.injection_language,
+                            &resolved.region.region_id,
+                        )
+                        .to_uri_string(),
+                    ) else {
+                        continue;
+                    };
+                    let mut exact_incapable = std::collections::HashSet::new();
+                    for config in &configs {
+                        let key = pool
+                            .resolved_connection_key(
+                                &config.server_name,
+                                &config.config,
+                                &routing_uri,
+                            )
+                            .await;
+                        if pool.connection_known_incapable(&key, method_name).await {
+                            exact_incapable.insert(config.server_name.clone());
+                        }
+                    }
+                    configs.retain(|config| !exact_incapable.contains(&config.server_name));
+                } else if !incapable_servers.is_empty() {
                     configs.retain(|c| !incapable_servers.contains(&c.server_name));
                 }
                 if configs.is_empty() {
