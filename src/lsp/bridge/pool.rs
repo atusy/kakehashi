@@ -848,7 +848,7 @@ impl LanguageServerPool {
         let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
-            let follows_client_workspace = key.is_client_fallback();
+            let follows_client_workspace = key.is_client_fallback() || key.is_workspace();
             // A shared producer can have learned a client folder either from
             // initialize or a later marker-less acquisition. Its folder set
             // intentionally has no per-source provenance, so forwarding a
@@ -2728,13 +2728,11 @@ impl LanguageServerPool {
 
     /// Acquire one producer for a document-free client-workspace request.
     ///
-    /// Even for `preferSharedInstance`, use the client-fallback key rather than
-    /// the shared document producer. Marker-less documents deliberately join
-    /// the shared process, including documents outside the client workspace;
-    /// letting a workspace-wide request reuse that process would make its
-    /// results depend on document-open history. The fallback key is otherwise
-    /// unused by shared routing, so it remains an isolated client-workspace
-    /// producer and cannot acquire indexed documents while the request runs.
+    /// Use a document-free workspace key rather than any document-routing key.
+    /// Marker-less documents join either the shared process or the client
+    /// fallback, including documents outside the client workspace. Only a
+    /// distinct key guarantees that workspace-wide results cannot depend on
+    /// document-open history.
     pub(super) async fn get_or_create_workspace_connection_wait_ready_admitted(
         &self,
         server_name: &str,
@@ -2753,7 +2751,7 @@ impl LanguageServerPool {
             .acquire_resolved_wait_ready(
                 server_name,
                 server_config,
-                ConnectionKey::new(server_name, None),
+                ConnectionKey::workspace(server_name),
                 None,
                 WaitReadyOptions {
                     timeout,
