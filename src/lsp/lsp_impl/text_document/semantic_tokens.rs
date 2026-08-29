@@ -211,11 +211,10 @@ impl Drop for VirtualBridgeSelectionGuard {
 
 fn should_publish_empty_non_native_result(
     non_native_only: bool,
-    virt_only: bool,
     bridge_work_selected: bool,
     bridge_succeeded: bool,
 ) -> bool {
-    non_native_only && (bridge_succeeded || (virt_only && !bridge_work_selected))
+    non_native_only && (bridge_succeeded || !bridge_work_selected)
 }
 
 fn commit_full_baselines(
@@ -582,13 +581,6 @@ impl Kakehashi {
         let layer_config = self
             .document_language(&uri)
             .map(|language| self.resolve_layer_config(&language, METHOD));
-        let only_layer = layer_config.as_ref().and_then(|layers| {
-            layers
-                .priorities
-                .first()
-                .copied()
-                .filter(|first| layers.priorities.iter().all(|source| source == first))
-        });
         let native_enabled = self.semantic_tokens_full_includes_native(&uri);
         let document_language = self.document_language(&uri);
         let virtual_enabled = document_language.as_ref().is_some_and(|language| {
@@ -599,7 +591,6 @@ impl Kakehashi {
             && document_language.as_ref().is_some_and(|language| {
                 self.semantic_tokens_full_has_potential_virtual_producer(language)
             });
-        let virt_only = only_layer == Some(LayerSource::Virt);
         let non_native_only = layer_config.as_ref().is_some_and(|layers| {
             !layers.priorities.is_empty() && !layers.allows(LayerSource::Native)
         });
@@ -792,14 +783,13 @@ impl Kakehashi {
                 Some(data) => data,
                 None if should_publish_empty_non_native_result(
                     non_native_only,
-                    virt_only,
                     bridge_work_selected,
                     bridge_succeeded,
                 ) =>
                 {
                     // A selected non-native overlay recomputed to no tokens:
-                    // either its server returned null/empty, or a virt-only
-                    // document has no regions left. Keep an empty wire lineage
+                    // either its server returned null/empty, or the document has
+                    // no eligible non-native work left. Keep an empty wire lineage
                     // so delta deletes the previous downstream classifications.
                     bridge_attempted.store(true, std::sync::atomic::Ordering::Release);
                     Vec::new()
@@ -2651,19 +2641,15 @@ mod tests {
 
     #[test]
     fn non_native_empty_result_requires_success_or_no_virtual_request() {
-        assert!(should_publish_empty_non_native_result(
-            true, false, true, true,
-        ));
-        assert!(should_publish_empty_non_native_result(
-            true, true, false, false,
-        ));
+        assert!(should_publish_empty_non_native_result(true, true, true));
+        assert!(should_publish_empty_non_native_result(true, false, false));
         assert!(
-            !should_publish_empty_non_native_result(true, false, true, false),
+            !should_publish_empty_non_native_result(true, true, false),
             "a failed host or virtual request must not clear highlighting"
         );
         assert!(
-            !should_publish_empty_non_native_result(true, true, true, false),
-            "virt-only request failures differ from a document with no virtual request"
+            !should_publish_empty_non_native_result(false, false, false),
+            "native-only results are not authoritative bridge overlays"
         );
     }
 
