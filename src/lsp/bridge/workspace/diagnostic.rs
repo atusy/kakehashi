@@ -33,6 +33,23 @@ const DIAGNOSTIC_METHOD: &str = "workspace/diagnostic";
 const DIAGNOSTIC_REGISTRATION_METHOD: &str = "textDocument/diagnostic";
 const DYNAMIC_REGISTRATION_SETTLE: Duration = Duration::from_millis(100);
 
+pub(crate) struct WorkspaceDiagnosticDispatchContext<'a> {
+    cancel_forwarder: Option<&'a CancelForwarder>,
+    language_for_uri: &'a (dyn Fn(&str) -> Option<String> + Sync),
+}
+
+impl<'a> WorkspaceDiagnosticDispatchContext<'a> {
+    pub(crate) fn cancellable(
+        cancel_forwarder: &'a CancelForwarder,
+        language_for_uri: &'a (dyn Fn(&str) -> Option<String> + Sync),
+    ) -> Self {
+        Self {
+            cancel_forwarder: Some(cancel_forwarder),
+            language_for_uri,
+        }
+    }
+}
+
 fn workspace_diagnostic_cancel(request_id: RequestId) -> JsonRpcNotification<Value> {
     JsonRpcNotification::new(
         "$/cancelRequest",
@@ -1104,8 +1121,10 @@ impl LanguageServerPool {
             upstream_id,
             admit,
             request_workspace_generation,
-            None,
-            &|_| None,
+            WorkspaceDiagnosticDispatchContext {
+                cancel_forwarder: None,
+                language_for_uri: &|_| None,
+            },
         )
         .await
     }
@@ -1117,8 +1136,7 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
         admit: &(dyn Fn() -> bool + Sync),
         request_workspace_generation: u64,
-        cancel_forwarder: &CancelForwarder,
-        language_for_uri: &(dyn Fn(&str) -> Option<String> + Sync),
+        context: WorkspaceDiagnosticDispatchContext<'_>,
     ) -> io::Result<WorkspaceDiagnosticReportResult> {
         self.dispatch_workspace_diagnostic_inner(
             params,
@@ -1126,8 +1144,7 @@ impl LanguageServerPool {
             upstream_id,
             admit,
             request_workspace_generation,
-            Some(cancel_forwarder),
-            language_for_uri,
+            context,
         )
         .await
     }
@@ -1139,8 +1156,7 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
         admit: &(dyn Fn() -> bool + Sync),
         request_workspace_generation: u64,
-        cancel_forwarder: Option<&CancelForwarder>,
-        language_for_uri: &(dyn Fn(&str) -> Option<String> + Sync),
+        context: WorkspaceDiagnosticDispatchContext<'_>,
     ) -> io::Result<WorkspaceDiagnosticReportResult> {
         if request_workspace_generation & 1 != 0 {
             return Err(io::Error::new(
@@ -1250,7 +1266,7 @@ impl LanguageServerPool {
                                         upstream_id,
                                         provider,
                                         Some(&workspace_admit),
-                                        cancel_forwarder,
+                                        context.cancel_forwarder,
                                     )
                                     .await,
                                 )
@@ -1292,7 +1308,7 @@ impl LanguageServerPool {
         self.aggregate_admitted_completed_workspace_diagnostic_reports(
             reports,
             &workspace_admit,
-            language_for_uri,
+            context.language_for_uri,
         )
         .await
     }

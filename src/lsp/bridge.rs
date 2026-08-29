@@ -97,6 +97,7 @@ pub(crate) use text_document::{
 };
 pub(crate) use text_document::{OpenExpectation, OpenOutcome};
 pub(crate) use workspace::WorkspaceFolderSet;
+pub(crate) use workspace::diagnostic::WorkspaceDiagnosticDispatchContext;
 
 /// Integration tests for the bridge module.
 ///
