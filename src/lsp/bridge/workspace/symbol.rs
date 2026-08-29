@@ -461,12 +461,39 @@ impl LanguageServerPool {
         expected_generation: u64,
         expected_revisions: &HashMap<String, ConfirmedDocumentRevision>,
     ) -> bool {
-        self.workspace_symbol_producer_is_live(handle, expected_generation)
+        self.workspace_symbol_projection_fence_is_live_after_revision_read(
+            handle,
+            expected_generation,
+            expected_revisions,
+            std::future::ready(()),
+        )
+        .await
+    }
+
+    async fn workspace_symbol_projection_fence_is_live_after_revision_read<F>(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        expected_generation: u64,
+        expected_revisions: &HashMap<String, ConfirmedDocumentRevision>,
+        after_revision_read: F,
+    ) -> bool
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        if !self
+            .workspace_symbol_producer_is_live(handle, expected_generation)
             .await
+        {
+            return false;
+        }
+        let revisions = self
+            .confirmed_virtual_document_revisions_for_connection(handle.key())
+            .await;
+        after_revision_read.await;
+        revisions == *expected_revisions
             && self
-                .confirmed_virtual_document_revisions_for_connection(handle.key())
+                .workspace_symbol_producer_is_live(handle, expected_generation)
                 .await
-                == *expected_revisions
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1135,6 +1162,53 @@ mod tests {
             !pool
                 .workspace_symbol_projection_fence_is_live(&handle, generation, &revisions)
                 .await
+        );
+    }
+
+    #[tokio::test]
+    async fn final_projection_fence_rechecks_producer_after_reading_revisions() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("symbols");
+        let handle = create_handle_advertising_workspace_symbols(key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host = url::Url::parse("file:///workspace/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "lua",
+            "01ARZ3NDEKTSV4RRFFQ69G5ABA",
+        );
+        pool.register_opened_document(&host, &virtual_uri, &key)
+            .await;
+        pool.record_sent_content_fingerprint(&virtual_uri, &key, "same", 1, Some((1, 1)))
+            .await;
+        let generation = pool.document_connection_generation(&key);
+        let revisions = pool
+            .confirmed_virtual_document_revisions_for_connection(&key)
+            .await;
+        let replacement = create_handle_advertising_workspace_symbols(key.clone()).await;
+
+        assert!(
+            !pool
+                .workspace_symbol_projection_fence_is_live_after_revision_read(
+                    &handle,
+                    generation,
+                    &revisions,
+                    async {
+                        pool.insert_connection(Arc::clone(&replacement)).await;
+                        pool.register_opened_document(&host, &virtual_uri, &key)
+                            .await;
+                        pool.record_sent_content_fingerprint(
+                            &virtual_uri,
+                            &key,
+                            "same",
+                            1,
+                            Some((1, 1)),
+                        )
+                        .await;
+                    },
+                )
+                .await,
+            "identical revisions on a replacement must not validate the stale producer"
         );
     }
 
