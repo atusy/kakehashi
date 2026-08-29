@@ -203,15 +203,20 @@ impl DynamicCapabilityRegistry {
             .active = true;
     }
 
-    pub(crate) fn mark_workspace_diagnostic_pull_aborted(&self) {
+    pub(crate) fn mark_workspace_diagnostic_pull_aborted(&self) -> bool {
+        let contributed = self.has_workspace_diagnostic_contributed();
         let mut pull = self
             .workspace_diagnostic_pull
             .lock()
             .recover_poison("DynamicCapabilityRegistry::mark_workspace_diagnostic_pull_aborted");
         if pull.active {
             pull.active = false;
+            if contributed {
+                return std::mem::take(&mut pull.registration_refresh_pending);
+            }
             pull.registration_refresh_pending = false;
         }
+        false
     }
 
     pub(crate) fn take_workspace_diagnostic_registration_refresh(&self) -> bool {
@@ -707,7 +712,7 @@ mod tests {
         registry.mark_workspace_diagnostic_pull_active();
         assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
 
-        registry.mark_workspace_diagnostic_pull_aborted();
+        assert!(!registry.mark_workspace_diagnostic_pull_aborted());
 
         assert!(!registry.take_workspace_diagnostic_registration_refresh());
         assert!(
@@ -726,6 +731,20 @@ mod tests {
             registry.request_or_defer_workspace_diagnostic_registration_refresh(),
             "a registration not observed during the pull must refresh normally"
         );
+    }
+
+    #[test]
+    fn aborted_warm_pull_releases_its_deferred_refresh() {
+        let registry = DynamicCapabilityRegistry::new();
+        assert_eq!(
+            registry.try_mark_workspace_diagnostic_contributed(),
+            Some(false)
+        );
+        registry.mark_workspace_diagnostic_pull_active();
+        assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
+
+        assert!(registry.mark_workspace_diagnostic_pull_aborted());
+        assert!(!registry.take_workspace_diagnostic_registration_refresh());
     }
 
     #[test]
