@@ -309,18 +309,6 @@ impl DiagnosticPublisher {
         });
     }
 
-    /// Forward a downstream refresh without letting open-document prefetch
-    /// absorb changes that exist only in workspace reports for unopened files.
-    pub(crate) fn request_forwarded_workspace_diagnostic_refresh(&self) {
-        if self.diagnostic_refresh_supported() {
-            self.request_pull_diagnostic_refresh(true);
-        } else {
-            // Preserve pullFallback cache warming even when the editor cannot
-            // accept the workspace-wide refresh request.
-            self.request_forwarded_diagnostic_refresh();
-        }
-    }
-
     /// Complete one scheduled downstream-refresh cycle: refresh every proactive
     /// pullFallback cache entry first, then notify the editor — but only when
     /// the prefetch either changed something or could not stand in for the

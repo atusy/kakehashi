@@ -2097,16 +2097,16 @@ async fn deliver_upstream_notification(
     match notification {
         UpstreamNotification::DiagnosticRefresh => {
             // A downstream server asked the editor to re-pull diagnostics.
-            // Force the editor refresh when supported: open-document prefetch
-            // cannot prove that workspace reports for unopened files are
-            // unchanged. Clients without refresh support still receive the
-            // pullFallback cache-warming cycle. A `None` publisher (test loop)
-            // has no settings to gate on, so the forward is dropped; production
-            // always has one (#521, #789).
+            // Route it through the forwarded-refresh cycle so open-document
+            // prefetch can absorb refreshes induced by the editor's preceding
+            // workspace pull. Forcing every downstream event closes a feedback
+            // loop with servers that emit refresh after each pull. A `None`
+            // publisher (test loop) has no settings to gate on, so the forward
+            // is dropped; production always has one (#521, #789).
             if let Some(publisher) =
                 delivery_context.map(|context| context.diagnostic_publisher.as_ref())
             {
-                publisher.request_forwarded_workspace_diagnostic_refresh();
+                publisher.request_forwarded_diagnostic_refresh();
             }
         }
         UpstreamNotification::DiagnosticProviderChanged => {
@@ -3996,6 +3996,53 @@ mod tests {
                 .await
                 .is_err(),
             "missing policy context must not bypass the global log gate"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn downstream_diagnostic_refresh_uses_the_loop_suppressing_cycle() {
+        use tower_lsp_server::LspService;
+        use tower_lsp_server::ls_types::{
+            ClientCapabilities, DiagnosticWorkspaceClientCapabilities, WorkspaceClientCapabilities,
+        };
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let publisher = Arc::new(crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(
+            server,
+        ));
+        let delivery_context = UpstreamDeliveryContext {
+            diagnostic_publisher: Arc::clone(&publisher),
+            settings_manager: Arc::clone(&server.settings_manager),
+            injection: server.injection_coordinator(),
+        };
+
+        deliver_upstream_notification(
+            &server.client,
+            crate::lsp::bridge::UpstreamNotification::DiagnosticRefresh,
+            &mut std::collections::HashSet::new(),
+            &mut std::collections::HashSet::new(),
+            Some(&delivery_context),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let metrics = server.diagnostics.metrics_snapshot();
+        assert_eq!(metrics.refreshes_requested, 1);
+        assert_eq!(
+            metrics.refreshes_sent, 0,
+            "an unchanged covering prefetch must absorb a downstream refresh"
         );
     }
 
