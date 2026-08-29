@@ -609,7 +609,7 @@ impl Kakehashi {
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
-        apply_shared_settings_locked(
+        let invalidated = apply_shared_settings_locked(
             reload,
             &self.client,
             ReloadLanguageState {
@@ -627,9 +627,18 @@ impl Kakehashi {
                 settings,
             },
         )
-        .await
-        .into_iter()
-        .for_each(|uri| self.schedule_reparse(uri, None));
+        .await;
+        for uri in &invalidated {
+            self.schedule_reparse(uri.clone(), None);
+        }
+        // didChangeConfiguration is a workspace-wide ordering barrier. Keep it
+        // open until every reparse it triggered has completed injection/host
+        // synchronization, so a following workspace diagnostic cannot observe
+        // the prior virtual-document graph when no server-candidate change emits
+        // a provider refresh.
+        for uri in &invalidated {
+            self.parse_scheduler.wait_until_idle(uri).await;
+        }
     }
 
     async fn apply_initial_settings(
