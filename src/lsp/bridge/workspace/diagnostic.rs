@@ -47,6 +47,7 @@ struct DiagnosticProvider {
 
 struct CompletedDiagnosticProducer {
     provider_plan: Vec<DiagnosticProvider>,
+    provider_revision: u64,
     handle: Arc<ConnectionHandle>,
     generation: u64,
     report: WorkspaceDiagnosticReport,
@@ -282,10 +283,20 @@ fn diagnostic_providers(handle: &ConnectionHandle) -> Vec<DiagnosticProvider> {
     diagnostic_providers_from_registrations(handle, registrations.iter())
 }
 
+fn diagnostic_provider_snapshot(handle: &ConnectionHandle) -> (Vec<DiagnosticProvider>, u64) {
+    let (registrations, revision) = handle
+        .dynamic_capabilities()
+        .registrations_for_method_with_revision(DIAGNOSTIC_REGISTRATION_METHOD);
+    (
+        diagnostic_providers_from_registrations(handle, registrations.iter()),
+        revision,
+    )
+}
+
 async fn diagnostic_providers_after_registration_settle(
     handle: &ConnectionHandle,
     admit: &(dyn Fn() -> bool + Sync),
-) -> Vec<DiagnosticProvider> {
+) -> (Vec<DiagnosticProvider>, u64) {
     // Subscribe before the first snapshot so a registration committed between
     // the read and `changed()` cannot be missed. LSP has no "registration set
     // complete" signal, so every connection's first provider plan gets one
@@ -311,7 +322,7 @@ async fn diagnostic_providers_after_registration_settle(
             }
         })
         .await;
-    diagnostic_providers(handle)
+    diagnostic_provider_snapshot(handle)
 }
 
 fn params_for_provider(mut params: Value, provider: &DiagnosticProvider) -> Value {
@@ -533,6 +544,23 @@ fn collect_complete_root_producers(
 }
 
 impl LanguageServerPool {
+    fn release_invalidated_provider_refreshes<'a>(
+        &self,
+        handles: impl Iterator<Item = &'a Arc<ConnectionHandle>>,
+    ) {
+        let mut refresh = false;
+        for handle in handles {
+            refresh |= handle
+                .dynamic_capabilities()
+                .take_workspace_diagnostic_registration_refresh();
+        }
+        if refresh {
+            let _ = self
+                .upstream_tx()
+                .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
+        }
+    }
+
     fn collect_completed_workspace_diagnostic_requests(
         &self,
         contributions: impl IntoIterator<Item = io::Result<Vec<CompletedDiagnosticProducer>>>,
@@ -625,10 +653,17 @@ impl LanguageServerPool {
                 )
             })?;
         drop(connections);
-        if admitted
+        let invalidated_provider_plans = admitted
             .iter()
-            .any(|completed| diagnostic_providers(&completed.handle) != completed.provider_plan)
-        {
+            .filter(|completed| {
+                let registry = completed.handle.dynamic_capabilities();
+                registry.revision() != completed.provider_revision
+                    || diagnostic_providers(&completed.handle) != completed.provider_plan
+            })
+            .map(|completed| &completed.handle)
+            .collect::<Vec<_>>();
+        if !invalidated_provider_plans.is_empty() {
+            self.release_invalidated_provider_refreshes(invalidated_provider_plans.into_iter());
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "workspace diagnostic provider plan changed before final aggregation",
@@ -650,11 +685,12 @@ impl LanguageServerPool {
                 (
                     Arc::clone(&completed.handle),
                     completed.generation,
+                    completed.provider_revision,
                     completed.provider_plan.clone(),
                 )
             })
             .collect::<Vec<_>>();
-        provider_plans.sort_by_key(|(handle, _, _)| handle.key().to_string());
+        provider_plans.sort_by_key(|(handle, _, _, _)| handle.key().to_string());
         let _provenance_guards = provenance_observers
             .iter()
             .map(|observer| observer.provenance_read_guard())
@@ -721,14 +757,14 @@ impl LanguageServerPool {
             .collect::<Vec<_>>();
         let provider_guards = provider_plans
             .iter()
-            .map(|(handle, _, _)| handle.dynamic_capabilities().registrations_read())
+            .map(|(handle, _, _, _)| handle.dynamic_capabilities().registrations_read())
             .collect::<Vec<_>>();
         let provenance_stale = provenance_observers
             .iter()
             .zip(provenance_revisions)
             .any(|(observer, revision)| observer.provenance_revision() != revision);
         let producers_stale = provider_plans.iter().zip(&provider_guards).any(
-            |((handle, generation, plan), registrations)| {
+            |((handle, generation, provider_revision, plan), registrations)| {
                 connections.get(handle.key()).is_none_or(|live| {
                     !Arc::ptr_eq(live, handle)
                         || live.state() != ConnectionState::Ready
@@ -736,21 +772,36 @@ impl LanguageServerPool {
                             .dynamic_capabilities()
                             .has_workspace_diagnostic_reader_exited()
                         || self.document_connection_generation(handle.key()) != *generation
+                        || handle.dynamic_capabilities().revision() != *provider_revision
                         || diagnostic_providers_from_registrations(handle, registrations.values())
                             != *plan
                 })
             },
         );
+        let invalidated_provider_handles = provider_plans
+            .iter()
+            .zip(&provider_guards)
+            .filter(|((handle, _, provider_revision, plan), registrations)| {
+                handle.dynamic_capabilities().revision() != *provider_revision
+                    || diagnostic_providers_from_registrations(handle, registrations.values())
+                        != *plan
+            })
+            .map(|((handle, _, _, _), _)| Arc::clone(handle))
+            .collect::<Vec<_>>();
+        let provider_plans_stale = !invalidated_provider_handles.is_empty();
         if provenance_stale || producers_stale || !admit() {
             drop(provider_guards);
             drop(connections);
+            if provider_plans_stale {
+                self.release_invalidated_provider_refreshes(invalidated_provider_handles.iter());
+            }
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "workspace diagnostic producer or admission expired after final aggregation",
             ));
         }
         let mut contribution_states = Vec::<(Arc<ConnectionHandle>, bool)>::new();
-        for (handle, _, _) in &provider_plans {
+        for (handle, _, _, _) in &provider_plans {
             let is_visible = visible_producers.contains(&(
                 handle.key().server().to_owned(),
                 handle.spawn_root().map(str::to_owned),
@@ -785,7 +836,7 @@ impl LanguageServerPool {
             guard.set_contributed(*contributed);
         }
         drop(contribution_guards);
-        for (handle, _, _) in &provider_plans {
+        for (handle, _, _, _) in &provider_plans {
             let refresh_deferred_registration = handle
                 .dynamic_capabilities()
                 .mark_workspace_diagnostic_pull_completed();
@@ -928,11 +979,12 @@ impl LanguageServerPool {
                         let virtual_uris = Arc::new(
                             self.observe_virtual_uris_for_connection(handle.key(), generation),
                         );
-                        let providers = diagnostic_providers_after_registration_settle(
-                            &handle,
-                            &workspace_admit,
-                        )
-                        .await;
+                        let (providers, provider_revision) =
+                            diagnostic_providers_after_registration_settle(
+                                &handle,
+                                &workspace_admit,
+                            )
+                            .await;
                         let requests = providers.iter().cloned().map(|provider| {
                             let params = params_for_provider(params.clone(), &provider);
                             let identifier = provider.identifier.clone();
@@ -970,6 +1022,7 @@ impl LanguageServerPool {
                         }
                         Ok(Some(CompletedDiagnosticProducer {
                             provider_plan: providers,
+                            provider_revision,
                             handle,
                             generation,
                             report: WorkspaceDiagnosticReport::default(),
@@ -1466,6 +1519,7 @@ mod tests {
         );
         let successful = CompletedDiagnosticProducer {
             provider_plan: Vec::new(),
+            provider_revision: handle.dynamic_capabilities().revision(),
             handle: Arc::clone(&handle),
             generation,
             report: WorkspaceDiagnosticReport::default(),
@@ -1547,6 +1601,7 @@ mod tests {
         let generation = pool.document_connection_generation(handle.key());
         let completed = CompletedDiagnosticProducer {
             provider_plan: Vec::new(),
+            provider_revision: handle.dynamic_capabilities().revision(),
             handle: Arc::clone(&handle),
             generation,
             report: WorkspaceDiagnosticReport::default(),
@@ -1593,6 +1648,7 @@ mod tests {
         let generation = pool.document_connection_generation(handle.key());
         let completed = CompletedDiagnosticProducer {
             provider_plan: Vec::new(),
+            provider_revision: handle.dynamic_capabilities().revision(),
             handle: Arc::clone(&handle),
             generation,
             report: WorkspaceDiagnosticReport::default(),
@@ -1762,6 +1818,7 @@ mod tests {
                     fast_completed.store(true, Ordering::SeqCst);
                     Some(CompletedDiagnosticProducer {
                         provider_plan: Vec::new(),
+                        provider_revision: handle.dynamic_capabilities().revision(),
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport {
@@ -1779,6 +1836,7 @@ mod tests {
                     let _ = slow_released.await;
                     Some(CompletedDiagnosticProducer {
                         provider_plan: Vec::new(),
+                        provider_revision: handle.dynamic_capabilities().revision(),
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport { items: Vec::new() },
@@ -1833,6 +1891,7 @@ mod tests {
                     fast_completed.store(true, Ordering::Release);
                     Some(CompletedDiagnosticProducer {
                         provider_plan: Vec::new(),
+                        provider_revision: handle.dynamic_capabilities().revision(),
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport {
@@ -1850,6 +1909,7 @@ mod tests {
                     let _ = slow_released.await;
                     Some(CompletedDiagnosticProducer {
                         provider_plan: Vec::new(),
+                        provider_revision: handle.dynamic_capabilities().revision(),
                         handle,
                         generation,
                         report: WorkspaceDiagnosticReport::default(),
@@ -1898,6 +1958,7 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
                     provider_plan: Vec::new(),
+                    provider_revision: handle.dynamic_capabilities().revision(),
                     handle,
                     generation,
                     report: WorkspaceDiagnosticReport {
@@ -1934,6 +1995,7 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
                     provider_plan: Vec::new(),
+                    provider_revision: handle.dynamic_capabilities().revision(),
                     handle: Arc::clone(&handle),
                     generation,
                     report: WorkspaceDiagnosticReport {
@@ -1994,6 +2056,7 @@ mod tests {
         pool.aggregate_admitted_workspace_diagnostic_reports(
             [std::future::ready(Some(CompletedDiagnosticProducer {
                 provider_plan,
+                provider_revision: handle.dynamic_capabilities().revision(),
                 handle: Arc::clone(&handle),
                 generation,
                 report: WorkspaceDiagnosticReport::default(),
@@ -2020,8 +2083,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_provider_plan_keeps_a_deferred_cold_refresh_pending() {
+    async fn changed_provider_plan_releases_a_deferred_cold_refresh() {
         let pool = LanguageServerPool::new();
+        let mut upstream_rx = pool
+            .take_upstream_rx()
+            .expect("test owns upstream receiver");
         let key = ConnectionKey::for_server("diagnostics");
         let handle = create_handle_with_key(ConnectionState::Ready, key).await;
         pool.connections()
@@ -2048,6 +2114,7 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
                     provider_plan: Vec::new(),
+                    provider_revision: handle.dynamic_capabilities().revision(),
                     handle: Arc::clone(&handle),
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
@@ -2068,11 +2135,15 @@ mod tests {
                 .has_workspace_diagnostic_contributed()
         );
         assert!(
-            handle
+            !handle
                 .dynamic_capabilities()
                 .take_workspace_diagnostic_registration_refresh(),
-            "the rejected pull must leave the deferred refresh pending"
+            "the rejected pull must drain the deferred refresh"
         );
+        assert!(matches!(
+            upstream_rx.try_recv(),
+            Ok(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged)
+        ));
         assert!(
             !handle
                 .dynamic_capabilities()
@@ -2131,6 +2202,7 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
                     provider_plan: Vec::new(),
+                    provider_revision: handle.dynamic_capabilities().revision(),
                     handle,
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
@@ -2179,6 +2251,7 @@ mod tests {
                 [
                     std::future::ready(Some(CompletedDiagnosticProducer {
                         provider_plan: Vec::new(),
+                        provider_revision: stale.dynamic_capabilities().revision(),
                         handle: stale,
                         generation: stale_generation,
                         report: WorkspaceDiagnosticReport {
@@ -2189,6 +2262,7 @@ mod tests {
                     })),
                     std::future::ready(Some(CompletedDiagnosticProducer {
                         provider_plan: Vec::new(),
+                        provider_revision: live.dynamic_capabilities().revision(),
                         handle: live,
                         generation: live_generation,
                         report: WorkspaceDiagnosticReport {
@@ -2205,11 +2279,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_aggregation_rejects_a_changed_provider_plan() {
+    async fn final_aggregation_rejects_a_provider_plan_aba_change() {
         let pool = LanguageServerPool::new();
         let key = ConnectionKey::for_server("diagnostics");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
-        handle.dynamic_capabilities().register(vec![Registration {
+        let registration = Registration {
             id: "alpha-registration".into(),
             method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
             register_options: Some(serde_json::json!({
@@ -2217,8 +2291,11 @@ mod tests {
                 "workspaceDiagnostics": true,
                 "interFileDependencies": true
             })),
-        }]);
-        let provider_plan = diagnostic_providers(&handle);
+        };
+        handle
+            .dynamic_capabilities()
+            .register(vec![registration.clone()]);
+        let (provider_plan, provider_revision) = diagnostic_provider_snapshot(&handle);
         pool.connections().await.insert(key, Arc::clone(&handle));
         let generation = pool.document_connection_generation(handle.key());
         let virtual_uris =
@@ -2229,11 +2306,14 @@ mod tests {
                 id: "alpha-registration".into(),
                 method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
             }]);
+        handle.dynamic_capabilities().register(vec![registration]);
+        assert_eq!(diagnostic_providers(&handle), provider_plan);
 
         let result = pool
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
                     provider_plan,
+                    provider_revision,
                     handle,
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
@@ -2244,7 +2324,7 @@ mod tests {
             )
             .await;
 
-        let error = result.expect_err("a completed stale plan must not be aggregated");
+        let error = result.expect_err("an ABA provider plan must not be aggregated");
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 
@@ -2266,6 +2346,7 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
                     provider_plan,
+                    provider_revision: handle.dynamic_capabilities().revision(),
                     handle,
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
@@ -2305,6 +2386,7 @@ mod tests {
             let generation = pool.document_connection_generation(handle.key());
             CompletedDiagnosticProducer {
                 provider_plan: diagnostic_providers(handle),
+                provider_revision: handle.dynamic_capabilities().revision(),
                 handle: Arc::clone(handle),
                 generation,
                 report: WorkspaceDiagnosticReport::default(),
@@ -2358,6 +2440,7 @@ mod tests {
             .aggregate_admitted_workspace_diagnostic_reports(
                 [std::future::ready(Some(CompletedDiagnosticProducer {
                     provider_plan,
+                    provider_revision: handle.dynamic_capabilities().revision(),
                     handle: Arc::clone(&handle),
                     generation,
                     report: WorkspaceDiagnosticReport::default(),
@@ -2515,7 +2598,7 @@ mod tests {
         }]);
 
         assert_eq!(
-            providers.await,
+            providers.await.0,
             vec![DiagnosticProvider {
                 identifier: Some("dynamic".into()),
                 has_static_provider: false,
@@ -2557,7 +2640,7 @@ mod tests {
         tokio::time::advance(DYNAMIC_REGISTRATION_SETTLE / 2).await;
 
         assert_eq!(
-            providers.await,
+            providers.await.0,
             vec![
                 DiagnosticProvider {
                     identifier: Some("alpha".into()),
@@ -2584,13 +2667,14 @@ mod tests {
         assert!(
             diagnostic_providers_after_registration_settle(&handle, &|| true)
                 .await
+                .0
                 .is_empty()
         );
         let second = diagnostic_providers_after_registration_settle(&handle, &|| true);
         tokio::pin!(second);
         assert!(matches!(
             futures::poll!(second.as_mut()),
-            std::task::Poll::Ready(providers) if providers.is_empty()
+            std::task::Poll::Ready(providers) if providers.0.is_empty()
         ));
     }
 
@@ -2605,6 +2689,7 @@ mod tests {
         assert!(
             diagnostic_providers_after_registration_settle(&handle, &|| false)
                 .await
+                .0
                 .is_empty()
         );
         let providers = diagnostic_providers_after_registration_settle(&handle, &|| true);
@@ -2619,7 +2704,7 @@ mod tests {
                 "interFileDependencies": true
             })),
         }]);
-        assert_eq!(providers.await.len(), 1);
+        assert_eq!(providers.await.0.len(), 1);
     }
 
     #[tokio::test]
