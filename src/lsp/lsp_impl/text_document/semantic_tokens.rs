@@ -1104,23 +1104,35 @@ impl Kakehashi {
             // instead of silently dropping streamed semantic-token chunks.
             params.remove("partialResultToken");
         }
+        let Some((incarnation, content_version)) = uri_to_url(&lsp_uri)
+            .ok()
+            .and_then(|uri| self.documents.get(&uri))
+            .map(|document| (document.incarnation(), document.content_version()))
+        else {
+            return Ok(None);
+        };
         let virt = self.semantic_tokens_range_virt_layer(&lsp_uri, range, progress_token);
         let host = self.semantic_tokens_range_host_layer(&lsp_uri, range, raw_params);
         let native = self.semantic_tokens_range_native_layer(params);
 
-        self.walk_layer_futures(
-            &lsp_uri,
-            METHOD,
-            METHOD,
-            virt,
-            host,
-            native,
-            |tokens: &SemanticTokensRangeResult| match tokens {
-                SemanticTokensRangeResult::Tokens(tokens) => !tokens.data.is_empty(),
-                SemanticTokensRangeResult::Partial(partial) => !partial.data.is_empty(),
-            },
-        )
-        .await
+        let result = self
+            .walk_layer_futures(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                virt,
+                host,
+                native,
+                |tokens: &SemanticTokensRangeResult| match tokens {
+                    SemanticTokensRangeResult::Tokens(tokens) => !tokens.data.is_empty(),
+                    SemanticTokensRangeResult::Partial(partial) => !partial.data.is_empty(),
+                },
+            )
+            .await?;
+        if !self.semantic_range_snapshot_is_current(&lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
+        Ok(result)
     }
 
     async fn semantic_tokens_range_host_layer(
