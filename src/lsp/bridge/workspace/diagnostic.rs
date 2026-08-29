@@ -151,6 +151,46 @@ fn reconcile_overlapping_root_reports(
     reconcile_overlapping_root_reports_with_language(reports, |_| None, |_, _, _| {})
 }
 
+fn containing_root_depth(root: Option<&str>, document_uri: &str) -> Option<usize> {
+    let root = crate::lsp::bridge::root_markers::normalized_root_url(&url::Url::parse(root?).ok()?);
+    let document =
+        crate::lsp::bridge::root_markers::normalized_root_url(&url::Url::parse(document_uri).ok()?);
+    if root.scheme() != document.scheme()
+        || root.username() != document.username()
+        || root.password() != document.password()
+        || root.host_str() != document.host_str()
+        || root.port_or_known_default() != document.port_or_known_default()
+    {
+        return None;
+    }
+    let decoded_segments = |url: &url::Url| {
+        url.path_segments()?
+            .map(|segment| {
+                percent_encoding::percent_decode_str(segment)
+                    .decode_utf8()
+                    .ok()
+                    .map(|segment| segment.into_owned())
+            })
+            .collect::<Option<Vec<_>>>()
+    };
+    let mut root_segments = decoded_segments(&root)?;
+    while root_segments.last().is_some_and(String::is_empty) {
+        root_segments.pop();
+    }
+    let document_segments = decoded_segments(&document)?;
+    document_segments
+        .starts_with(&root_segments)
+        .then_some(root_segments.len())
+}
+
+fn document_is_in_producer_scope(handle: &ConnectionHandle, document_uri: &url::Url) -> bool {
+    document_is_in_root_scope(handle.spawn_root(), document_uri)
+}
+
+fn document_is_in_root_scope(root: Option<&str>, document_uri: &url::Url) -> bool {
+    root.is_none_or(|root| containing_root_depth(Some(root), document_uri.as_str()).is_some())
+}
+
 #[cfg(test)]
 fn reconcile_overlapping_root_reports_with_observer(
     reports: impl IntoIterator<Item = RootedDiagnosticReport>,
@@ -176,40 +216,6 @@ fn reconcile_overlapping_root_reports_with_language(
             WorkspaceDocumentDiagnosticReport::Full(report) => report.uri.as_str(),
             WorkspaceDocumentDiagnosticReport::Unchanged(report) => report.uri.as_str(),
         }
-    }
-
-    fn containing_root_depth(root: Option<&str>, document_uri: &str) -> Option<usize> {
-        let root =
-            crate::lsp::bridge::root_markers::normalized_root_url(&url::Url::parse(root?).ok()?);
-        let document = crate::lsp::bridge::root_markers::normalized_root_url(
-            &url::Url::parse(document_uri).ok()?,
-        );
-        if root.scheme() != document.scheme()
-            || root.username() != document.username()
-            || root.password() != document.password()
-            || root.host_str() != document.host_str()
-            || root.port_or_known_default() != document.port_or_known_default()
-        {
-            return None;
-        }
-        let decoded_segments = |url: &url::Url| {
-            url.path_segments()?
-                .map(|segment| {
-                    percent_encoding::percent_decode_str(segment)
-                        .decode_utf8()
-                        .ok()
-                        .map(|segment| segment.into_owned())
-                })
-                .collect::<Option<Vec<_>>>()
-        };
-        let mut root_segments = decoded_segments(&root)?;
-        while root_segments.last().is_some_and(String::is_empty) {
-            root_segments.pop();
-        }
-        let document_segments = decoded_segments(&document)?;
-        document_segments
-            .starts_with(&root_segments)
-            .then_some(root_segments.len())
     }
 
     fn provider_identities_for_uri(
@@ -1412,7 +1418,9 @@ impl LanguageServerPool {
                             )
                             .await;
                         if !providers.is_empty() {
-                            for document in context.open_documents {
+                            for document in context.open_documents.iter().filter(|document| {
+                                document_is_in_producer_scope(&handle, &document.uri)
+                            }) {
                                 self.sync_workspace_document_to_handle(
                                     &handle,
                                     &document.uri,
@@ -1762,6 +1770,18 @@ mod tests {
                 ("file:///workspace/root.rs", "parent-root"),
             ]
         );
+    }
+
+    #[test]
+    fn root_scoped_workspace_producer_accepts_only_its_documents() {
+        assert!(document_is_in_root_scope(
+            Some("file:///workspace-a"),
+            &url::Url::parse("file:///workspace-a/src/main.rs").unwrap()
+        ));
+        assert!(!document_is_in_root_scope(
+            Some("file:///workspace-a"),
+            &url::Url::parse("file:///workspace-b/src/main.rs").unwrap()
+        ));
     }
 
     #[test]
