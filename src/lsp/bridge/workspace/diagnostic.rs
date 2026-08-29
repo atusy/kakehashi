@@ -76,7 +76,7 @@ fn reconcile_overlapping_root_reports(
 
 fn reconcile_overlapping_root_reports_with_observer(
     reports: impl IntoIterator<Item = RootedDiagnosticReport>,
-    mut on_visible: impl FnMut(&str, Option<&str>, &WorkspaceDocumentDiagnosticReport),
+    mut on_contributing: impl FnMut(&str, Option<&str>, Option<&WorkspaceDocumentDiagnosticReport>),
 ) -> Vec<WorkspaceDiagnosticReport> {
     struct RootedDiagnosticItem {
         server: String,
@@ -162,6 +162,25 @@ fn reconcile_overlapping_root_reports_with_observer(
             }
         }
     }
+    let mut suppressing_producers = HashSet::new();
+    for (report, _) in &reports {
+        for item in &report.report.items {
+            let uri = item_uri(item);
+            let Some((_, _, preferred_root)) = preferred_roots.get(&(
+                report.server.clone(),
+                report.provider_identifiers.clone(),
+                uri.to_owned(),
+            )) else {
+                continue;
+            };
+            if report.spawn_root.as_deref().unwrap_or_default() != preferred_root {
+                suppressing_producers.insert((report.server.clone(), preferred_root.clone()));
+            }
+        }
+    }
+    for (server, root) in suppressing_producers {
+        on_contributing(&server, (!root.is_empty()).then_some(root.as_str()), None);
+    }
     reports
         .into_iter()
         .flat_map(|(report, _)| {
@@ -187,7 +206,7 @@ fn reconcile_overlapping_root_reports_with_observer(
                 .is_none_or(|(_, _, root)| item.spawn_root.as_deref().unwrap_or_default() == root)
         })
         .map(|item| {
-            on_visible(&item.server, item.spawn_root.as_deref(), &item.item);
+            on_contributing(&item.server, item.spawn_root.as_deref(), Some(&item.item));
             WorkspaceDiagnosticReport {
                 items: vec![item.item],
             }
@@ -729,12 +748,13 @@ impl LanguageServerPool {
                 }
             }
         });
-        let mut visible_producers = HashSet::<(String, Option<String>)>::new();
+        let mut contributing_producers = HashSet::<(String, Option<String>)>::new();
         let reports = reconcile_overlapping_root_reports_with_observer(
             reports,
             |server, spawn_root, item| {
-                if diagnostic_item_has_visible_output(item) {
-                    visible_producers.insert((server.to_owned(), spawn_root.map(str::to_owned)));
+                if item.is_none_or(diagnostic_item_has_visible_output) {
+                    contributing_producers
+                        .insert((server.to_owned(), spawn_root.map(str::to_owned)));
                 }
             },
         );
@@ -808,7 +828,7 @@ impl LanguageServerPool {
         }
         let mut contribution_states = Vec::<(Arc<ConnectionHandle>, bool)>::new();
         for (handle, _, _, _) in &provider_plans {
-            let is_visible = visible_producers.contains(&(
+            let is_visible = contributing_producers.contains(&(
                 handle.key().server().to_owned(),
                 handle.spawn_root().map(str::to_owned),
             ));
@@ -1313,26 +1333,34 @@ mod tests {
     #[test]
     fn empty_nested_report_clears_the_parent_diagnostic_in_its_coverage() {
         let provider_identifiers = vec![Some("rust".to_owned())];
-        let reports = reconcile_overlapping_root_reports([
-            RootedDiagnosticReport {
-                server: "diagnostics".into(),
-                spawn_root: Some("file:///workspace".into()),
-                provider_identifiers: provider_identifiers.clone(),
-                report: WorkspaceDiagnosticReport {
-                    items: vec![full(
-                        "file:///workspace/nested/clean.rs",
-                        None,
-                        "stale-parent",
-                    )],
+        let mut contributors = HashSet::new();
+        let reports = reconcile_overlapping_root_reports_with_observer(
+            [
+                RootedDiagnosticReport {
+                    server: "diagnostics".into(),
+                    spawn_root: Some("file:///workspace".into()),
+                    provider_identifiers: provider_identifiers.clone(),
+                    report: WorkspaceDiagnosticReport {
+                        items: vec![full(
+                            "file:///workspace/nested/clean.rs",
+                            None,
+                            "stale-parent",
+                        )],
+                    },
                 },
+                RootedDiagnosticReport {
+                    server: "diagnostics".into(),
+                    spawn_root: Some("file:///workspace/nested".into()),
+                    provider_identifiers,
+                    report: WorkspaceDiagnosticReport::default(),
+                },
+            ],
+            |server, root, item| {
+                if item.is_none_or(diagnostic_item_has_visible_output) {
+                    contributors.insert((server.to_owned(), root.map(str::to_owned)));
+                }
             },
-            RootedDiagnosticReport {
-                server: "diagnostics".into(),
-                spawn_root: Some("file:///workspace/nested".into()),
-                provider_identifiers,
-                report: WorkspaceDiagnosticReport::default(),
-            },
-        ]);
+        );
 
         let WorkspaceDiagnosticReportResult::Report(report) = aggregate_reports(reports) else {
             panic!("final report")
@@ -1340,6 +1368,13 @@ mod tests {
         assert!(
             report.items.is_empty(),
             "the empty nested producer owns and clears diagnostics below its root"
+        );
+        assert!(
+            contributors.contains(&(
+                "diagnostics".to_owned(),
+                Some("file:///workspace/nested".to_owned())
+            )),
+            "the suppressing nested producer must remain armed for reader-exit refresh"
         );
     }
 
