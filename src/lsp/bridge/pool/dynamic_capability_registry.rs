@@ -8,7 +8,6 @@ use crate::error::LockResultExt;
 
 const WORKSPACE_DIAGNOSTIC_PULL_IDLE: u8 = 0;
 const WORKSPACE_DIAGNOSTIC_PULL_ACTIVE: u8 = 1;
-const WORKSPACE_DIAGNOSTIC_PULL_ABORTED: u8 = 2;
 
 /// Thread-safe store for dynamically registered LSP capabilities.
 ///
@@ -199,17 +198,19 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_aborted(&self) {
-        let deferred_registration = self
-            .workspace_diagnostic_registration_refresh_pending
-            .swap(false, Ordering::AcqRel);
-        self.workspace_diagnostic_pull_state.store(
-            if deferred_registration {
-                WORKSPACE_DIAGNOSTIC_PULL_IDLE
-            } else {
-                WORKSPACE_DIAGNOSTIC_PULL_ABORTED
-            },
-            Ordering::Release,
-        );
+        if self
+            .workspace_diagnostic_pull_state
+            .compare_exchange(
+                WORKSPACE_DIAGNOSTIC_PULL_ACTIVE,
+                WORKSPACE_DIAGNOSTIC_PULL_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.workspace_diagnostic_registration_refresh_pending
+                .store(false, Ordering::Release);
+        }
     }
 
     pub(crate) fn take_workspace_diagnostic_registration_refresh(&self) -> bool {
@@ -229,20 +230,6 @@ impl DynamicCapabilityRegistry {
             match self.workspace_diagnostic_pull_state.load(Ordering::Acquire) {
                 WORKSPACE_DIAGNOSTIC_PULL_IDLE => return true,
                 WORKSPACE_DIAGNOSTIC_PULL_ACTIVE => break,
-                WORKSPACE_DIAGNOSTIC_PULL_ABORTED => {
-                    if self
-                        .workspace_diagnostic_pull_state
-                        .compare_exchange(
-                            WORKSPACE_DIAGNOSTIC_PULL_ABORTED,
-                            WORKSPACE_DIAGNOSTIC_PULL_IDLE,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        return false;
-                    }
-                }
                 _ => unreachable!("workspace diagnostic pull state is valid"),
             }
         }
@@ -255,22 +242,6 @@ impl DynamicCapabilityRegistry {
                     return self
                         .workspace_diagnostic_registration_refresh_pending
                         .swap(false, Ordering::AcqRel);
-                }
-                WORKSPACE_DIAGNOSTIC_PULL_ABORTED => {
-                    if self
-                        .workspace_diagnostic_pull_state
-                        .compare_exchange(
-                            WORKSPACE_DIAGNOSTIC_PULL_ABORTED,
-                            WORKSPACE_DIAGNOSTIC_PULL_IDLE,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        self.workspace_diagnostic_registration_refresh_pending
-                            .store(false, Ordering::Release);
-                        return false;
-                    }
                 }
                 _ => unreachable!("workspace diagnostic pull state is valid"),
             }
@@ -749,19 +720,26 @@ mod tests {
     }
 
     #[test]
-    fn aborted_cold_pull_suppresses_a_registration_observed_after_abort() {
+    fn aborted_cold_pull_does_not_suppress_a_later_registration() {
         let registry = DynamicCapabilityRegistry::new();
         registry.mark_workspace_diagnostic_pull_active();
         registry.mark_workspace_diagnostic_pull_aborted();
 
         assert!(
-            !registry.request_or_defer_workspace_diagnostic_registration_refresh(),
-            "the first delayed registration belongs to the aborted cold pull"
-        );
-        assert!(
             registry.request_or_defer_workspace_diagnostic_registration_refresh(),
-            "later warm registrations must refresh normally"
+            "a registration not observed during the pull must refresh normally"
         );
+    }
+
+    #[test]
+    fn completed_pull_is_not_reclassified_as_aborted_by_guard_cleanup() {
+        let registry = DynamicCapabilityRegistry::new();
+        registry.mark_workspace_diagnostic_pull_active();
+        assert!(!registry.mark_workspace_diagnostic_pull_completed());
+
+        registry.mark_workspace_diagnostic_pull_aborted();
+
+        assert!(registry.request_or_defer_workspace_diagnostic_registration_refresh());
     }
 
     #[test]

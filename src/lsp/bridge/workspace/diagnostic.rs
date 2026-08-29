@@ -194,7 +194,9 @@ fn reconcile_overlapping_root_reports_with_observer(
             )) else {
                 continue;
             };
-            if report.spawn_root.as_deref().unwrap_or_default() != preferred_root {
+            if report.spawn_root.as_deref().unwrap_or_default() != preferred_root
+                && diagnostic_item_has_visible_output(item)
+            {
                 suppressing_producers.insert((report.server.clone(), preferred_root.clone()));
             }
         }
@@ -1481,6 +1483,49 @@ mod tests {
                 Some("file:///workspace/nested".to_owned())
             )),
             "the suppressing nested producer must remain armed for reader-exit refresh"
+        );
+    }
+
+    #[test]
+    fn empty_nested_report_does_not_arm_for_suppressed_empty_parent_state() {
+        let provider_identifiers = vec![Some("rust".to_owned())];
+        let mut empty_parent = full("file:///workspace/nested/clean.rs", None, "empty-parent");
+        let WorkspaceDocumentDiagnosticReport::Full(parent) = &mut empty_parent else {
+            unreachable!("test helper returns a full report")
+        };
+        parent.full_document_diagnostic_report.items.clear();
+        let mut contributors = HashSet::new();
+        let reports = reconcile_overlapping_root_reports_with_observer(
+            [
+                RootedDiagnosticReport {
+                    server: "diagnostics".into(),
+                    spawn_root: Some("file:///workspace".into()),
+                    provider_identifiers: provider_identifiers.clone(),
+                    report: WorkspaceDiagnosticReport {
+                        items: vec![empty_parent],
+                    },
+                },
+                RootedDiagnosticReport {
+                    server: "diagnostics".into(),
+                    spawn_root: Some("file:///workspace/nested".into()),
+                    provider_identifiers,
+                    report: WorkspaceDiagnosticReport::default(),
+                },
+            ],
+            |server, root, item| {
+                if item.is_none_or(diagnostic_item_has_visible_output) {
+                    contributors.insert((server.to_owned(), root.map(str::to_owned)));
+                }
+            },
+        );
+
+        let WorkspaceDiagnosticReportResult::Report(report) = aggregate_reports(reports) else {
+            panic!("final report")
+        };
+        assert!(report.items.is_empty());
+        assert!(
+            contributors.is_empty(),
+            "suppressing an empty report must not arm reader-exit refreshes"
         );
     }
 
