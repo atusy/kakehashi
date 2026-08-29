@@ -653,14 +653,12 @@ impl LanguageServerPool {
                         Ok(prepared)
                     }
                 });
-                let Ok(symbols) = join_all(requests)
+                let symbols = join_all(requests)
                     .await
                     .into_iter()
-                    .collect::<Result<Vec<_>, ()>>()
-                else {
-                    return Vec::new();
-                };
-                deduplicate_symbols(symbols.into_iter().flatten())
+                    .filter_map(Result::ok)
+                    .flatten();
+                deduplicate_symbols(symbols)
             }
         });
 
@@ -2306,7 +2304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_drops_a_server_when_one_workspace_root_fails() {
+    async fn search_preserves_successful_roots_when_one_workspace_root_fails() {
         let pool = Arc::new(LanguageServerPool::new());
         let folder_a = WorkspaceFolder {
             uri: Uri::from_str("file:///workspace/a").unwrap(),
@@ -2387,10 +2385,15 @@ mod tests {
             "result": { "malformed": true }
         }));
 
-        assert!(
-            request.await.unwrap().is_none(),
-            "one failed root must discard the server's otherwise partial contribution"
-        );
+        let response = request
+            .await
+            .unwrap()
+            .expect("the successful root must still contribute");
+        let WorkspaceSymbolResponse::Nested(symbols) = response else {
+            panic!("resolve-capable producer should retain nested symbols");
+        };
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "partial");
     }
 
     #[tokio::test]
