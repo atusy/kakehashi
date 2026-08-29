@@ -33,6 +33,7 @@ struct SchedState {
 #[derive(Default)]
 pub(crate) struct ParseScheduler {
     states: DashMap<Url, SchedState>,
+    idle: tokio::sync::Notify,
 }
 
 impl ParseScheduler {
@@ -119,7 +120,7 @@ impl ParseScheduler {
     /// trapping the loop in an infinite, CPU-burning cycle.
     pub(crate) fn finish(&self, uri: &Url) -> bool {
         let mut continue_loop = false;
-        self.states.remove_if(uri, |_, state| {
+        let removed = self.states.remove_if(uri, |_, state| {
             if state.dirty {
                 // Keep the entry and loop again; the next `start_pass` clears dirty.
                 continue_loop = true;
@@ -129,6 +130,9 @@ impl ParseScheduler {
                 true
             }
         });
+        if removed.is_some() {
+            self.idle.notify_waiters();
+        }
         continue_loop
     }
 
@@ -139,7 +143,25 @@ impl ParseScheduler {
     /// would otherwise leave the entry stuck at `parsing: true` and wedge the URI
     /// (every later edit only marks it `dirty`, never re-spawning).
     pub(crate) fn clear(&self, uri: &Url) {
-        self.states.remove(uri);
+        if self.states.remove(uri).is_some() {
+            self.idle.notify_waiters();
+        }
+    }
+
+    /// Wait until the parse/downstream-sync loop currently scheduled for `uri`
+    /// has drained. Configuration reloads schedule every invalidated document
+    /// before calling this, so observing the state disappear is the completion
+    /// barrier for that reload's ticket-less reparses.
+    pub(crate) async fn wait_until_idle(&self, uri: &Url) {
+        loop {
+            // Register before checking so a loop that drains between the state
+            // probe and the await cannot lose its wake-up.
+            let idle = self.idle.notified();
+            if !self.states.contains_key(uri) {
+                return;
+            }
+            idle.await;
+        }
     }
 }
 
@@ -238,6 +260,27 @@ mod tests {
             !s.finish(&u),
             "dirty was cleared by start_pass → no redundant pass"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_until_idle_tracks_a_ticketless_configuration_reparse() {
+        let scheduler = Arc::new(ParseScheduler::default());
+        let uri = uri();
+        assert!(scheduler.schedule(&uri, None));
+        let waiting = {
+            let scheduler = Arc::clone(&scheduler);
+            let uri = uri.clone();
+            tokio::spawn(async move { scheduler.wait_until_idle(&uri).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "an active reload reparse must block"
+        );
+
+        assert_eq!(scheduler.start_pass(&uri), Some(None));
+        assert!(!scheduler.finish(&uri));
+        waiting.await.expect("idle waiter");
     }
 
     #[test]
