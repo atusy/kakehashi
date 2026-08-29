@@ -2097,16 +2097,16 @@ async fn deliver_upstream_notification(
     match notification {
         UpstreamNotification::DiagnosticRefresh => {
             // A downstream server asked the editor to re-pull diagnostics.
-            // Route it through the forwarded-refresh cycle so open-document
-            // prefetch can absorb refreshes induced by the editor's preceding
-            // workspace pull. Forcing every downstream event closes a feedback
-            // loop with servers that emit refresh after each pull. A `None`
-            // publisher (test loop) has no settings to gate on, so the forward
-            // is dropped; production always has one (#521, #789).
+            // Refreshes induced by kakehashi's active workspace pull were
+            // discarded at the per-connection reader. Anything surviving that
+            // pull-scoped loop breaker may represent a workspace-only change,
+            // so open-document prefetch must not absorb it. A `None` publisher
+            // (test loop) has no settings to gate on, so the forward is dropped;
+            // production always has one (#521, #789).
             if let Some(publisher) =
                 delivery_context.map(|context| context.diagnostic_publisher.as_ref())
             {
-                publisher.request_forwarded_diagnostic_refresh();
+                publisher.request_forwarded_workspace_diagnostic_refresh();
             }
         }
         UpstreamNotification::DiagnosticProviderChanged => {
@@ -4000,7 +4000,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn downstream_diagnostic_refresh_uses_the_loop_suppressing_cycle() {
+    async fn downstream_diagnostic_refresh_preserves_workspace_only_changes() {
         use tower_lsp_server::LspService;
         use tower_lsp_server::ls_types::{
             ClientCapabilities, DiagnosticWorkspaceClientCapabilities, WorkspaceClientCapabilities,
@@ -4041,8 +4041,8 @@ mod tests {
         let metrics = server.diagnostics.metrics_snapshot();
         assert_eq!(metrics.refreshes_requested, 1);
         assert_eq!(
-            metrics.refreshes_sent, 0,
-            "an unchanged covering prefetch must absorb a downstream refresh"
+            metrics.refreshes_sent, 1,
+            "a surviving downstream refresh may represent an unopened-file change"
         );
     }
 

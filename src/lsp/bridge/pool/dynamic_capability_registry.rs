@@ -205,6 +205,13 @@ impl DynamicCapabilityRegistry {
             .active = true;
     }
 
+    pub(crate) fn workspace_diagnostic_pull_active(&self) -> bool {
+        self.workspace_diagnostic_pull
+            .lock()
+            .recover_poison("DynamicCapabilityRegistry::workspace_diagnostic_pull_active")
+            .active
+    }
+
     pub(crate) fn mark_workspace_diagnostic_pull_aborted(&self, started_by_pull: bool) -> bool {
         let mut pull = self
             .workspace_diagnostic_pull
