@@ -1038,6 +1038,13 @@ async fn handle_server_request(
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
     let method = message.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    // Snapshot this at request arrival. A server that emits refresh while
+    // answering kakehashi's active workspace pull is describing the result the
+    // editor is already waiting for; forwarding it would make that pull trigger
+    // another identical pull. A refresh outside this scope may represent an
+    // unopened-file change and must still reach the editor.
+    let diagnostic_refresh_from_active_pull = method == "workspace/diagnostic/refresh"
+        && deps.dynamic_capabilities.workspace_diagnostic_pull_active();
 
     // Deferred request handlers forward to the editor (or, for a
     // workspace/applyEdit the editor never declared support for, answer
@@ -1164,7 +1171,7 @@ async fn handle_server_request(
     // A downstream server may wait for this response before answering the
     // diagnostic pull triggered by the refresh. Queue the acknowledgement
     // first so prefetch can never deadlock behind its own server request.
-    if method == "workspace/diagnostic/refresh" {
+    if method == "workspace/diagnostic/refresh" && !diagnostic_refresh_from_active_pull {
         let _ = deps
             .upstream_tx
             .send(UpstreamNotification::DiagnosticRefresh);
@@ -3101,6 +3108,63 @@ mod tests {
             .try_recv()
             .expect("should have upstream notification after response");
         assert_eq!(notification, UpstreamNotification::DiagnosticRefresh);
+    }
+
+    #[tokio::test]
+    async fn handle_message_diagnostic_refresh_from_active_pull_is_suppressed() {
+        let router = ResponseRouter::new();
+        let (response_tx, mut response_rx) = mpsc::channel(16);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        dynamic_capabilities.mark_workspace_diagnostic_pull_active();
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let deps = ServerRequestDeps {
+            settings: Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
+            response_tx,
+            dynamic_capabilities: Arc::clone(&dynamic_capabilities),
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+        };
+        let refresh = |id| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "workspace/diagnostic/refresh",
+                "params": null
+            })
+        };
+
+        handle_message(refresh(10), &router, "", &deps).await;
+
+        assert!(matches!(
+            response_rx.try_recv(),
+            Ok(OutboundMessage::Untracked(value)) if value["id"] == 10
+        ));
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "a refresh induced by the active workspace pull must not trigger another pull"
+        );
+
+        dynamic_capabilities.mark_workspace_diagnostic_pull_completed();
+        handle_message(refresh(11), &router, "", &deps).await;
+
+        assert!(matches!(
+            response_rx.try_recv(),
+            Ok(OutboundMessage::Untracked(value)) if value["id"] == 11
+        ));
+        assert_eq!(
+            upstream_rx.try_recv().expect("refresh outside pull scope"),
+            UpstreamNotification::DiagnosticRefresh,
+            "workspace-only changes outside the pull scope must remain visible"
+        );
     }
 
     /// workspace/workspaceFolders must be answered with the folders the
