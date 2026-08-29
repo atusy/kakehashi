@@ -36,6 +36,7 @@ struct WorkspaceDiagnosticPull {
     accepted_once: bool,
     registration_refresh_pending: bool,
     pending_request_ids: HashSet<crate::lsp::bridge::protocol::RequestId>,
+    workspace_diagnostic_response_received: bool,
 }
 
 #[derive(Default)]
@@ -201,10 +202,13 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_active(&self) {
-        self.workspace_diagnostic_pull
+        let mut pull = self
+            .workspace_diagnostic_pull
             .lock()
-            .recover_poison("DynamicCapabilityRegistry::mark_workspace_diagnostic_pull_active")
-            .active = true;
+            .recover_poison("DynamicCapabilityRegistry::mark_workspace_diagnostic_pull_active");
+        pull.active = true;
+        pull.pending_request_ids.clear();
+        pull.workspace_diagnostic_response_received = false;
     }
 
     pub(crate) fn mark_workspace_diagnostic_request_sent(
@@ -222,22 +226,20 @@ impl DynamicCapabilityRegistry {
         &self,
         request_id: crate::lsp::bridge::protocol::RequestId,
     ) {
-        self.workspace_diagnostic_pull
-            .lock()
-            .recover_poison(
-                "DynamicCapabilityRegistry::mark_workspace_diagnostic_response_received",
-            )
-            .pending_request_ids
-            .remove(&request_id);
+        let mut pull = self.workspace_diagnostic_pull.lock().recover_poison(
+            "DynamicCapabilityRegistry::mark_workspace_diagnostic_response_received",
+        );
+        if pull.pending_request_ids.remove(&request_id) {
+            pull.workspace_diagnostic_response_received = true;
+        }
     }
 
-    pub(crate) fn has_pending_workspace_diagnostic_request(&self) -> bool {
-        !self
+    pub(crate) fn workspace_diagnostic_refresh_is_covered(&self) -> bool {
+        let pull = self
             .workspace_diagnostic_pull
             .lock()
-            .recover_poison("DynamicCapabilityRegistry::has_pending_workspace_diagnostic_request")
-            .pending_request_ids
-            .is_empty()
+            .recover_poison("DynamicCapabilityRegistry::workspace_diagnostic_refresh_is_covered");
+        !pull.workspace_diagnostic_response_received && !pull.pending_request_ids.is_empty()
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_aborted(&self, started_by_pull: bool) -> bool {
@@ -733,17 +735,20 @@ mod tests {
         registry.mark_workspace_diagnostic_pull_active();
         registry.mark_workspace_diagnostic_request_sent(first);
         registry.mark_workspace_diagnostic_request_sent(second);
-        assert!(registry.has_pending_workspace_diagnostic_request());
+        assert!(registry.workspace_diagnostic_refresh_is_covered());
 
         registry.mark_workspace_diagnostic_response_received(first);
-        assert!(registry.has_pending_workspace_diagnostic_request());
+        assert!(
+            !registry.workspace_diagnostic_refresh_is_covered(),
+            "after any provider responds, another provider cannot cover its newer state"
+        );
         registry.mark_workspace_diagnostic_response_received(second);
-        assert!(!registry.has_pending_workspace_diagnostic_request());
+        assert!(!registry.workspace_diagnostic_refresh_is_covered());
 
         registry.mark_workspace_diagnostic_request_sent(first);
         registry.mark_workspace_diagnostic_pull_aborted(true);
         assert!(
-            !registry.has_pending_workspace_diagnostic_request(),
+            !registry.workspace_diagnostic_refresh_is_covered(),
             "cancellation must not suppress later independent refreshes"
         );
     }
