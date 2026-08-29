@@ -52,6 +52,16 @@ impl WorkspaceDiagnosticLifecycleGuard<'_> {
 }
 
 impl DynamicCapabilityRegistry {
+    fn registration_participates_in_workspace_diagnostics(registration: &Registration) -> bool {
+        registration.method == "textDocument/diagnostic"
+            && registration
+                .register_options
+                .as_ref()
+                .and_then(|options| options.get("workspaceDiagnostics"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    }
+
     pub(crate) fn new() -> Self {
         let (changes, _receiver) = tokio::sync::watch::channel(0);
         Self {
@@ -81,11 +91,13 @@ impl DynamicCapabilityRegistry {
             .recover_poison("DynamicCapabilityRegistry::register");
         let mut workspace_diagnostic_changed = false;
         for reg in registrations {
-            let is_workspace_diagnostic = reg.method == "textDocument/diagnostic";
+            let is_workspace_diagnostic =
+                Self::registration_participates_in_workspace_diagnostics(&reg);
             let replaced = guard.insert(reg.id.clone(), reg);
             workspace_diagnostic_changed |= is_workspace_diagnostic
                 || replaced
-                    .is_some_and(|registration| registration.method == "textDocument/diagnostic");
+                    .as_ref()
+                    .is_some_and(Self::registration_participates_in_workspace_diagnostics);
         }
         let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
         if workspace_diagnostic_changed {
@@ -104,9 +116,9 @@ impl DynamicCapabilityRegistry {
         let mut workspace_diagnostic_changed = false;
         for unreg in unregistrations {
             let removed = guard.remove(&unreg.id);
-            workspace_diagnostic_changed |= unreg.method == "textDocument/diagnostic"
-                || removed
-                    .is_some_and(|registration| registration.method == "textDocument/diagnostic");
+            workspace_diagnostic_changed |= removed
+                .as_ref()
+                .is_some_and(Self::registration_participates_in_workspace_diagnostics);
         }
         let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
         if workspace_diagnostic_changed {
@@ -488,13 +500,23 @@ mod tests {
             registry.registrations_for_method_with_revision("textDocument/diagnostic");
         assert_eq!(unrelated_revision, initial_revision);
 
-        registry.register(vec![make_registration(
-            "diagnostics",
-            "textDocument/diagnostic",
-        )]);
+        registry.register(vec![Registration {
+            id: "document-diagnostics".into(),
+            method: "textDocument/diagnostic".into(),
+            register_options: Some(serde_json::json!({ "workspaceDiagnostics": false })),
+        }]);
+        let (_, document_only_revision) =
+            registry.registrations_for_method_with_revision("textDocument/diagnostic");
+        assert_eq!(document_only_revision, unrelated_revision);
+
+        registry.register(vec![Registration {
+            id: "workspace-diagnostics".into(),
+            method: "textDocument/diagnostic".into(),
+            register_options: Some(serde_json::json!({ "workspaceDiagnostics": true })),
+        }]);
         let (_, diagnostic_revision) =
             registry.registrations_for_method_with_revision("textDocument/diagnostic");
-        assert!(diagnostic_revision > unrelated_revision);
+        assert!(diagnostic_revision > document_only_revision);
     }
 
     #[test]
