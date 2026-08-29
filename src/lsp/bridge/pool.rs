@@ -2749,7 +2749,9 @@ impl LanguageServerPool {
     /// results depend on document open history unless its existing folder set
     /// exactly serves the client workspace. Probe it without announcing client
     /// roots; a rejected producer must not be widened as a side effect of a
-    /// document-free request.
+    /// document-free request. A cold shared producer is different: it is
+    /// initialized from the current client workspace so the first process can
+    /// serve this request without spawning a redundant fallback.
     pub(super) async fn get_or_create_workspace_connection_wait_ready_admitted(
         &self,
         server_name: &str,
@@ -2766,14 +2768,16 @@ impl LanguageServerPool {
         }
         let start = std::time::Instant::now();
         let handle = if server_config.prefers_shared_instance() {
+            let shared_key = ConnectionKey::shared(server_name);
+            let shared_exists = self.connections.lock().await.contains_key(&shared_key);
             self.acquire_resolved_wait_ready(
                 server_name,
                 server_config,
-                ConnectionKey::shared(server_name),
+                shared_key,
                 None,
                 WaitReadyOptions {
                     timeout,
-                    rootless: true,
+                    rootless: shared_exists,
                     admit: Some(admit),
                 },
             )
