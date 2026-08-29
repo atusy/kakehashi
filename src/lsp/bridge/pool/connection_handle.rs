@@ -967,17 +967,18 @@ impl ConnectionHandle {
         }
     }
 
-    /// Begin graceful shutdown: transition to Closing (rejecting new requests) and
-    /// stop the liveness timer, since global shutdown (Tier 3) overrides liveness
-    /// (Tier 2) per ls-bridge-timeout-hierarchy. Only the timer is stopped — the reader task keeps
-    /// running to receive the shutdown response. Valid from Ready or Initializing
-    /// (ls-bridge-message-ordering/ls-bridge-graceful-shutdown).
+    /// Begin graceful shutdown: transition a live connection to Closing
+    /// (rejecting new requests) and stop the liveness timer. A Failed connection
+    /// stays Failed until shutdown completes so a still-mapped invalidated entry
+    /// remains retryable while detached teardown runs.
     pub(crate) fn begin_shutdown(&self) {
         // Stop the liveness timer (but not the reader task) per ls-bridge-timeout-hierarchy
         // Global shutdown (Tier 3) overrides liveness timeout (Tier 2)
         // Reader continues running to receive shutdown response
         self.reader_handle.stop_liveness_timer();
-        self.set_state(ConnectionState::Closing);
+        if self.state() != ConnectionState::Failed {
+            self.set_state(ConnectionState::Closing);
+        }
     }
 
     /// Complete the shutdown sequence.
