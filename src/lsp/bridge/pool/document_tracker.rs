@@ -759,14 +759,31 @@ impl DocumentTracker {
         if !unchanged {
             return false;
         }
-        let mut revisions = self.confirmed_document_versions.lock().await;
-        let Some(revision) = revisions
+        let confirmed_version = {
+            let mut revisions = self.confirmed_document_versions.lock().await;
+            let Some(revision) = revisions
+                .get_mut(connection_key)
+                .and_then(|documents| documents.get_mut(&uri))
+            else {
+                return false;
+            };
+            revision.host_identity = Some(host_identity);
+            revision.version
+        };
+
+        // A failed enqueue may have bumped the raw counter without advancing the
+        // downstream. If a later host edit restores the last confirmed content, no
+        // didChange is needed; discard that unused bump so response fences compare
+        // against the version the downstream actually has.
+        if let Some(version) = self
+            .document_versions
+            .lock()
+            .await
             .get_mut(connection_key)
             .and_then(|documents| documents.get_mut(&uri))
-        else {
-            return false;
-        };
-        revision.host_identity = Some(host_identity);
+        {
+            *version = confirmed_version;
+        }
         true
     }
 
@@ -1748,6 +1765,52 @@ mod tests {
                 version: 1,
                 host_identity: Some((7, 4)),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_sent_content_reconciles_a_version_bumped_by_a_dropped_change() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/reverted-after-drop.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+        tracker
+            .record_sent_content_fingerprint(&virtual_uri, &conn, "original", 1, Some((7, 1)))
+            .await;
+
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "dropped")
+                .await,
+            Some(2),
+        );
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "original")
+                .await,
+            None,
+            "the downstream already has the restored content"
+        );
+        assert!(
+            tracker
+                .refresh_confirmed_host_identity_if_content_unchanged(
+                    &virtual_uri,
+                    &conn,
+                    "original",
+                    (7, 3),
+                )
+                .await
+        );
+
+        assert_eq!(
+            tracker
+                .document_version(&virtual_uri.to_uri_string(), &conn)
+                .await,
+            Some(1),
+            "the unsent raw version must return to the downstream's confirmed version"
         );
     }
 
