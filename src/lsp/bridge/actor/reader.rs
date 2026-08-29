@@ -1050,7 +1050,7 @@ async fn handle_server_request(
     let diagnostic_refresh_covered_by_pending_pull = method == "workspace/diagnostic/refresh"
         && deps
             .dynamic_capabilities
-            .has_pending_workspace_diagnostic_request();
+            .workspace_diagnostic_refresh_is_covered();
 
     // Deferred request handlers forward to the editor (or, for a
     // workspace/applyEdit the editor never declared support for, answer
