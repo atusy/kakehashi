@@ -235,6 +235,19 @@ impl DocumentSequencer {
         (barrier, (tail > 0).then_some(tail))
     }
 
+    fn pending_writer_barriers(&self) -> Vec<ReaderBarrier> {
+        self.docs
+            .iter()
+            .filter_map(|entry| {
+                let done = *entry.completion.done.borrow();
+                (done < entry.tail).then(|| ReaderBarrier {
+                    target: entry.tail,
+                    rx: entry.completion.done.subscribe(),
+                })
+            })
+            .collect()
+    }
+
     /// Drop `uri`'s sequencing state after a close completed, unless later
     /// writers were already ticketed behind it. Dropping the entry also drops
     /// the `done` sender, waking any stragglers still subscribed.
@@ -488,6 +501,7 @@ where
         match role {
             None => Box::pin(inner_fut),
             Some(Role::WorkspaceDiagnostic) => {
+                let document_barriers = self.sequencer.pending_writer_barriers();
                 let mut gate = self
                     .workspace_diagnostic_sequencer
                     .issue_writer_ticket("workspace/diagnostic");
@@ -508,6 +522,26 @@ where
                 });
                 Box::pin(async move {
                     if let Some((forwarder, upstream_id, mut cancel_rx)) = cancellation {
+                        let wait_for_document_writers = async {
+                            for barrier in document_barriers {
+                                barrier.wait().await;
+                            }
+                        };
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancel_rx => {
+                                forwarder.unsubscribe(&upstream_id);
+                                drop(inner_fut);
+                                drop(gate);
+                                return Ok(request_id.map(|id| {
+                                    Response::from_error(
+                                        id,
+                                        tower_lsp_server::jsonrpc::Error::request_cancelled(),
+                                    )
+                                }));
+                            }
+                            _ = wait_for_document_writers => {}
+                        }
                         tokio::select! {
                             biased;
                             _ = &mut cancel_rx => {
@@ -534,6 +568,9 @@ where
                             }));
                         }
                     } else {
+                        for barrier in document_barriers {
+                            barrier.wait().await;
+                        }
                         gate.wait_turn().await;
                     }
                     let result = inner_fut.await;
@@ -1201,6 +1238,34 @@ mod tests {
         assert_eq!(
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["reader", "reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_runs_workspace_diagnostic_after_all_preceding_document_writes() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "textDocument/didChange",
+            release: Some(release_rx),
+        });
+
+        let writer_fut = gate.call(notification("textDocument/didChange", URI));
+        let diagnostic_fut = gate.call(notification("workspace/diagnostic", URI));
+        let mut writer = tokio_test::task::spawn(writer_fut);
+        let mut diagnostic = tokio_test::task::spawn(diagnostic_fut);
+
+        assert!(diagnostic.poll().is_pending());
+        assert!(writer.poll().is_pending());
+        assert!(diagnostic.poll().is_pending());
+        release_tx.send(()).expect("didChange is waiting");
+        assert!(writer.poll().is_ready());
+        assert!(diagnostic.is_woken());
+        assert!(diagnostic.poll().is_ready());
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["change", "reader"]
         );
     }
 
