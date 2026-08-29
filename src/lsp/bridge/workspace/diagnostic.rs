@@ -381,6 +381,7 @@ impl NormalizedDocumentFilter {
         let Ok(uri) = url::Url::parse(uri) else {
             return false;
         };
+        let uri = crate::lsp::bridge::root_markers::normalized_root_url(&uri);
         if self.language.as_deref().is_some_and(|expected| {
             language != Some(expected)
                 && crate::language::heuristic::detect_from_token(expected).as_deref() != language
@@ -400,6 +401,7 @@ impl NormalizedDocumentFilter {
                 let Ok(base_uri) = url::Url::parse(base_uri) else {
                     return false;
                 };
+                let base_uri = crate::lsp::bridge::root_markers::normalized_root_url(&base_uri);
                 if uri.scheme() != base_uri.scheme()
                     || uri.username() != base_uri.username()
                     || uri.password() != base_uri.password()
