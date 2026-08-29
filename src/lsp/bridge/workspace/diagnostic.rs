@@ -44,6 +44,7 @@ struct DiagnosticProvider {
     identifier: Option<String>,
     has_static_provider: bool,
     dynamic_registration_ids: Vec<String>,
+    dynamic_registration_options: Vec<String>,
 }
 
 struct CompletedDiagnosticProducer {
@@ -249,6 +250,15 @@ impl DiagnosticProvider {
     fn identifier(&self) -> Option<&str> {
         self.identifier.as_deref()
     }
+
+    fn reconciliation_key(&self) -> Option<String> {
+        serde_json::to_string(&(
+            &self.identifier,
+            self.has_static_provider,
+            &self.dynamic_registration_options,
+        ))
+        .ok()
+    }
 }
 
 fn static_workspace_diagnostic_identifier(handle: &ConnectionHandle) -> Option<Option<String>> {
@@ -285,6 +295,7 @@ fn diagnostic_providers_from_registrations<'a>(
             identifier,
             has_static_provider: true,
             dynamic_registration_ids: Vec::new(),
+            dynamic_registration_options: Vec::new(),
         })
         .into_iter()
         .collect::<Vec<_>>();
@@ -296,6 +307,8 @@ fn diagnostic_providers_from_registrations<'a>(
         let Some(identifier) = dynamic_workspace_diagnostic_identifier(registration) else {
             continue;
         };
+        let registration_options = serde_json::to_string(&registration.register_options)
+            .unwrap_or_else(|_| "null".to_owned());
         if let Some(provider) = providers
             .iter_mut()
             .find(|provider| provider.identifier == identifier)
@@ -303,13 +316,21 @@ fn diagnostic_providers_from_registrations<'a>(
             provider
                 .dynamic_registration_ids
                 .push(registration.id.clone());
+            provider
+                .dynamic_registration_options
+                .push(registration_options);
         } else {
             providers.push(DiagnosticProvider {
                 identifier,
                 has_static_provider: false,
                 dynamic_registration_ids: vec![registration.id.clone()],
+                dynamic_registration_options: vec![registration_options],
             });
         }
+    }
+    for provider in &mut providers {
+        provider.dynamic_registration_options.sort();
+        provider.dynamic_registration_options.dedup();
     }
     providers
 }
@@ -746,7 +767,14 @@ impl LanguageServerPool {
                     .map(|provider_report| RootedDiagnosticReport {
                         server: server.clone(),
                         spawn_root: spawn_root.clone(),
-                        provider_identifiers: vec![provider_report.identifier],
+                        provider_identifiers: completed
+                            .provider_plan
+                            .iter()
+                            .find(|provider| provider.identifier == provider_report.identifier)
+                            .and_then(DiagnosticProvider::reconciliation_key)
+                            .into_iter()
+                            .map(Some)
+                            .collect(),
                         report: sanitize_report(provider_report.report, &completed.virtual_uris),
                     })
                     .collect::<Vec<_>>(),
@@ -754,7 +782,8 @@ impl LanguageServerPool {
                     let mut provider_identifiers = completed
                         .provider_plan
                         .iter()
-                        .map(|provider| provider.identifier.clone())
+                        .filter_map(DiagnosticProvider::reconciliation_key)
+                        .map(Some)
                         .collect::<Vec<_>>();
                     provider_identifiers.sort();
                     provider_identifiers.dedup();
@@ -1413,6 +1442,41 @@ mod tests {
                 Some("file:///workspace/nested".to_owned())
             )),
             "the suppressing nested producer must remain armed for reader-exit refresh"
+        );
+    }
+
+    #[test]
+    fn empty_nested_report_does_not_clear_a_distinct_provider_selector() {
+        let reports = reconcile_overlapping_root_reports([
+            RootedDiagnosticReport {
+                server: "diagnostics".into(),
+                spawn_root: Some("file:///workspace".into()),
+                provider_identifiers: vec![Some("selector-a".to_owned())],
+                report: WorkspaceDiagnosticReport {
+                    items: vec![full(
+                        "file:///workspace/nested/reported.rs",
+                        None,
+                        "parent-selector",
+                    )],
+                },
+            },
+            RootedDiagnosticReport {
+                server: "diagnostics".into(),
+                spawn_root: Some("file:///workspace/nested".into()),
+                provider_identifiers: vec![Some("selector-b".to_owned())],
+                report: WorkspaceDiagnosticReport::default(),
+            },
+        ]);
+
+        let WorkspaceDiagnosticReportResult::Report(report) = aggregate_reports(reports) else {
+            panic!("final report")
+        };
+        let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
+            panic!("full report")
+        };
+        assert_eq!(
+            report.full_document_diagnostic_report.items[0].message,
+            "parent-selector"
         );
     }
 
@@ -2692,11 +2756,13 @@ mod tests {
                     identifier: Some("static".into()),
                     has_static_provider: true,
                     dynamic_registration_ids: vec!["static-registration".into()],
+                    dynamic_registration_options: providers[0].dynamic_registration_options.clone(),
                 },
                 DiagnosticProvider {
                     identifier: Some("alpha".into()),
                     has_static_provider: false,
                     dynamic_registration_ids: vec!["a-registration".into()],
+                    dynamic_registration_options: providers[1].dynamic_registration_options.clone(),
                 },
                 DiagnosticProvider {
                     identifier: None,
@@ -2705,11 +2771,13 @@ mod tests {
                         "no-identifier-a".into(),
                         "no-identifier-z".into()
                     ],
+                    dynamic_registration_options: providers[2].dynamic_registration_options.clone(),
                 },
                 DiagnosticProvider {
                     identifier: Some("zeta".into()),
                     has_static_provider: false,
                     dynamic_registration_ids: vec!["z-registration".into()],
+                    dynamic_registration_options: providers[3].dynamic_registration_options.clone(),
                 },
             ]
         );
@@ -2753,13 +2821,49 @@ mod tests {
             })),
         }]);
 
+        let providers = providers.await.0;
         assert_eq!(
-            providers.await.0,
+            providers,
             vec![DiagnosticProvider {
                 identifier: Some("dynamic".into()),
                 has_static_provider: false,
                 dynamic_registration_ids: vec!["dynamic".into()],
+                dynamic_registration_options: providers[0].dynamic_registration_options.clone(),
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_reconciliation_key_preserves_dynamic_document_selector() {
+        let rust_handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("diagnostics"),
+        )
+        .await;
+        let markdown_handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("diagnostics"),
+        )
+        .await;
+        for (handle, language) in [(&rust_handle, "rust"), (&markdown_handle, "markdown")] {
+            handle.dynamic_capabilities().register(vec![Registration {
+                id: "dynamic".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+                register_options: Some(serde_json::json!({
+                    "documentSelector": [{ "language": language }],
+                    "identifier": "shared",
+                    "workspaceDiagnostics": true,
+                    "interFileDependencies": true
+                })),
+            }]);
+        }
+
+        let rust_provider = diagnostic_providers(&rust_handle).remove(0);
+        let markdown_provider = diagnostic_providers(&markdown_handle).remove(0);
+        assert_ne!(
+            rust_provider.reconciliation_key(),
+            markdown_provider.reconciliation_key(),
+            "providers with the same identifier but distinct selectors must not suppress each other"
         );
     }
 
@@ -2795,18 +2899,21 @@ mod tests {
         assert!(futures::poll!(providers.as_mut()).is_pending());
         tokio::time::advance(DYNAMIC_REGISTRATION_SETTLE / 2).await;
 
+        let providers = providers.await.0;
         assert_eq!(
-            providers.await.0,
+            providers,
             vec![
                 DiagnosticProvider {
                     identifier: Some("alpha".into()),
                     has_static_provider: false,
                     dynamic_registration_ids: vec!["alpha".into()],
+                    dynamic_registration_options: providers[0].dynamic_registration_options.clone(),
                 },
                 DiagnosticProvider {
                     identifier: Some("beta".into()),
                     has_static_provider: false,
                     dynamic_registration_ids: vec!["beta".into()],
+                    dynamic_registration_options: providers[1].dynamic_registration_options.clone(),
                 },
             ]
         );
@@ -3082,6 +3189,7 @@ mod tests {
                         identifier: None,
                         has_static_provider: true,
                         dynamic_registration_ids: vec![],
+                        dynamic_registration_options: vec![],
                     },
                     None,
                     None,
@@ -3132,6 +3240,7 @@ mod tests {
                         identifier: None,
                         has_static_provider: true,
                         dynamic_registration_ids: vec![],
+                        dynamic_registration_options: vec![],
                     },
                     None,
                     None,
@@ -3253,6 +3362,7 @@ mod tests {
                         identifier: None,
                         has_static_provider: true,
                         dynamic_registration_ids: vec![],
+                        dynamic_registration_options: vec![],
                     },
                     Some(&admit),
                     None,
