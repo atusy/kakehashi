@@ -29,14 +29,17 @@ impl Kakehashi {
                 .ok()
                 .and_then(|uri| self.document_language(&uri))
         };
+        let context = crate::lsp::bridge::WorkspaceDiagnosticDispatchContext::cancellable(
+            self.bridge.cancel_forwarder(),
+            &language_for_uri,
+        );
         let dispatch = pool.dispatch_workspace_diagnostic_cancellable(
             params,
             &settings,
             upstream_id,
             &admit,
             workspace_generation,
-            self.bridge.cancel_forwarder(),
-            &language_for_uri,
+            context,
         );
         match cancel_rx {
             Some(rx) => tokio::select! {
