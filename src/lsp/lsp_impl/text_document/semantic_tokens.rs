@@ -1463,6 +1463,11 @@ impl Kakehashi {
         // applicability before the native-only tree gate so a tree-less
         // current snapshot can still re-enter its configured host layer.
         let parser_language = snapshot.language.as_deref();
+        let actionable_virtual = snapshot.language.as_deref().is_some_and(|language| {
+            self.resolve_layer_config(language, "textDocument/semanticTokens/full")
+                .allows(LayerSource::Virt)
+                && self.semantic_tokens_full_has_potential_virtual_producer(language)
+        });
         let bridge_applicable = if let Some(bridge_language) = snapshot.language.as_deref() {
             let applicability = self.semantic_delta_has_applicable_bridge(
                 &lsp_uri,
@@ -1486,7 +1491,7 @@ impl Kakehashi {
         } else {
             false
         };
-        if bridge_applicable {
+        if bridge_applicable || (snapshot.tree.is_none() && actionable_virtual) {
             return self
                 .semantic_tokens_delta_reenter_full(
                     &uri,
@@ -2794,6 +2799,102 @@ mod tests {
         .expect("inactive virtual work must not trigger the first-parse backstop")
         .expect("semantic tokens delta should return without error");
         assert!(result.is_none(), "no host server is configured: {result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn treeless_delta_with_actionable_virtual_work_preserves_previous_tokens() {
+        use crate::config::WorkspaceSettings;
+        use crate::config::settings::{
+            BridgeServerConfig, LanguageSettings, LayerAggregationConfig, LayersConfig,
+        };
+        use std::collections::HashMap;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let rust_language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let injection_query = tree_sitter::Query::new(
+            &rust_language,
+            r#"((string_literal (string_content) @injection.content)
+                (#set! injection.language "html"))"#,
+        )
+        .expect("valid injection query");
+        let mut aggregation = HashMap::new();
+        aggregation.insert(
+            "textDocument/semanticTokens/full".to_string(),
+            LayerAggregationConfig {
+                priorities: Some(vec![LayerSource::Virt, LayerSource::Native]),
+                strategy: None,
+            },
+        );
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rust".to_string(),
+            LanguageSettings {
+                layers: Some(LayersConfig {
+                    aggregation: Some(aggregation),
+                }),
+                ..Default::default()
+            },
+        );
+        let mut language_servers = HashMap::new();
+        language_servers.insert(
+            "html-ls".to_string(),
+            BridgeServerConfig {
+                cmd: Some(vec!["unused-test-server".into()]),
+                languages: Some(vec!["html".into()]),
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            languages,
+            language_servers,
+            auto_install: false,
+            ..Default::default()
+        });
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), rust_language.clone());
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".into(), std::sync::Arc::new(injection_query));
+        assert!(server.language.injection_query("rust").is_some());
+        assert!(
+            !server
+                .bridge_configs_for_injection_language("rust", "html")
+                .is_empty()
+        );
+        assert!(server.semantic_tokens_full_has_potential_virtual_producer("rust"));
+
+        let uri = Url::parse("file:///semantic_delta_treeless.rs").expect("valid test URI");
+        server.documents.insert(
+            uri.clone(),
+            "let html = \"<div>\";".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        publish_treeless(server, &uri, "let html = \"<div>\";", 0);
+        let direct_err = server
+            .semantic_tokens_full_impl(full_params(&uri))
+            .await
+            .expect_err("direct full must defer the same pending virtual work");
+        assert_eq!(direct_err.code, crate::error::content_modified_error().code);
+        let params = SemanticTokensDeltaParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+            },
+            previous_result_id: "previous-tokens".into(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let err = server
+            .semantic_tokens_full_delta_impl(params)
+            .await
+            .expect_err("pending virtual work must preserve the previous token baseline");
+        assert_eq!(err.code, crate::error::content_modified_error().code);
+        assert_eq!(server.cache.served_semantic_version(&uri), Some(0));
     }
 
     /// Publish a snapshot for `uri` built from `text` at `parsed_version`,
