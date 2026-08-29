@@ -2386,6 +2386,113 @@ impl LanguageServerPool {
         );
     }
 
+    fn uri_is_within_root(uri: &Url, root: &Url) -> bool {
+        if uri.scheme() != root.scheme()
+            || uri.username() != root.username()
+            || uri.password() != root.password()
+            || uri.host_str() != root.host_str()
+            || uri.port_or_known_default() != root.port_or_known_default()
+        {
+            return false;
+        }
+        let Some(mut root_segments) = root.path_segments().map(Iterator::collect::<Vec<_>>) else {
+            return uri == root;
+        };
+        while root_segments.last() == Some(&"") {
+            root_segments.pop();
+        }
+        uri.path_segments()
+            .is_some_and(|segments| segments.collect::<Vec<_>>().starts_with(&root_segments))
+    }
+
+    fn host_is_in_client_workspace(&self, host_uri: &Url) -> bool {
+        if let Some(folders) = self.workspace_folders() {
+            return folders.iter().any(|folder| {
+                Url::parse(folder.uri.as_str())
+                    .is_ok_and(|root| Self::uri_is_within_root(host_uri, &root))
+            });
+        }
+        self.root_uri().is_none_or(|root| {
+            Url::parse(&root).is_ok_and(|root| Self::uri_is_within_root(host_uri, &root))
+        })
+    }
+
+    pub(super) async fn open_recorded_workspace_virtual_documents(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        server_config: &crate::config::settings::BridgeServerConfig,
+    ) {
+        if !handle.key().is_workspace() {
+            return;
+        }
+        let languages = server_config.languages.as_deref().unwrap_or_default();
+        let accepts_all = languages
+            .iter()
+            .any(|language| language == crate::config::settings::LANGUAGES_WILDCARD);
+        let mut documents = Vec::new();
+        for host in &self.latest_virtual_contents {
+            if !self.host_is_in_client_workspace(host.key()) {
+                continue;
+            }
+            let _publication = host
+                .publication
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for language in &host.contents {
+                if !accepts_all && !languages.iter().any(|accepted| accepted == language.key()) {
+                    continue;
+                }
+                for region in language.value() {
+                    documents.push((
+                        host.key().clone(),
+                        host.incarnation,
+                        language.key().clone(),
+                        region.key().clone(),
+                        Arc::clone(region.value()),
+                    ));
+                }
+            }
+        }
+
+        for (host_uri, incarnation, language, region_id, content) in documents {
+            let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(&host_uri) else {
+                continue;
+            };
+            let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, &language, &region_id);
+            let Ok(routing_uri) = Url::parse(&virtual_uri.to_uri_string()) else {
+                continue;
+            };
+            if self
+                .host_routing_by_server(&routing_uri, handle.key().server())
+                .is_some_and(|enabled| !enabled)
+            {
+                continue;
+            }
+            let Some(lifecycle) = self.existing_host_lifecycle_lock(&host_uri) else {
+                continue;
+            };
+            let _lifecycle = lifecycle.lock().await;
+            if self.current_host_incarnation(&host_uri) != Some(incarnation) {
+                continue;
+            }
+            let connections = self.connections().await;
+            if !connections.get(handle.key()).is_some_and(|current| {
+                Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+            }) {
+                return;
+            }
+            let _ = self
+                .ensure_document_opened(
+                    &mut ConnectionHandleSender(handle),
+                    &host_uri,
+                    &virtual_uri,
+                    &content,
+                    handle.key(),
+                )
+                .await;
+        }
+    }
+
     fn record_latest_virtual_content_batch<'a>(
         &self,
         host_uri: &Url,
@@ -6704,6 +6811,58 @@ mod tests {
     // - Writing didOpen notification to downstream
     // - Post-condition: document marked as opened
     // - Rollback on send failure
+
+    #[tokio::test]
+    async fn workspace_producer_opens_only_recorded_virtual_documents_in_client_scope() {
+        let pool = LanguageServerPool::new();
+        pool.set_root_uri(Some("file:///workspace".to_owned()));
+        let inside_host = Url::parse("file:///workspace/inside.md").unwrap();
+        let outside_host = Url::parse("file:///outside/history.md").unwrap();
+        let inside = crate::lsp::bridge::coordinator::BridgeInjection {
+            language: "lua".to_owned(),
+            region_id: TEST_ULID_LUA_0.to_owned(),
+            content: "inside".to_owned(),
+        };
+        let outside = crate::lsp::bridge::coordinator::BridgeInjection {
+            language: "lua".to_owned(),
+            region_id: TEST_ULID_LUA_1.to_owned(),
+            content: "outside".to_owned(),
+        };
+        for (host, injection) in [(&inside_host, &inside), (&outside_host, &outside)] {
+            pool.open_host_incarnation(host, 1).await;
+            pool.record_latest_virtual_contents(host, 1, 0, std::slice::from_ref(injection));
+        }
+        let key = ConnectionKey::workspace("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.connections()
+            .await
+            .insert(key.clone(), Arc::clone(&handle));
+        let config = crate::config::settings::BridgeServerConfig {
+            languages: Some(vec!["lua".to_owned()]),
+            ..Default::default()
+        };
+
+        pool.open_recorded_workspace_virtual_documents(&handle, &config)
+            .await;
+
+        let revisions = pool
+            .confirmed_virtual_document_revisions_for_connection(&key)
+            .await;
+        let inside_uri = VirtualDocumentUri::new(
+            &url_to_uri(&inside_host),
+            &inside.language,
+            &inside.region_id,
+        )
+        .to_uri_string();
+        let outside_uri = VirtualDocumentUri::new(
+            &url_to_uri(&outside_host),
+            &outside.language,
+            &outside.region_id,
+        )
+        .to_uri_string();
+        assert_eq!(revisions[&inside_uri].host_identity, Some((1, 0)));
+        assert!(!revisions.contains_key(&outside_uri));
+    }
 
     /// Test that ensure_document_opened sends didOpen when document is not yet opened.
     ///
