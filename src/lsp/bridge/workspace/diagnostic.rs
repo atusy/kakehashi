@@ -411,32 +411,35 @@ fn normalize_document_selector(
     selector: Option<tower_lsp_server::ls_types::DocumentSelector>,
 ) -> Option<Vec<NormalizedDocumentFilter>> {
     selector.map(|selector| {
-        let mut filters = selector
-            .into_iter()
-            .map(|filter| NormalizedDocumentFilter {
-                language: filter.language,
-                scheme: filter.scheme,
-                pattern: filter.pattern,
-                pattern_base_uri: None,
-            })
-            .collect::<Vec<_>>();
-        filters.sort_by(|left, right| {
-            (
-                &left.language,
-                &left.scheme,
-                &left.pattern,
-                &left.pattern_base_uri,
-            )
-                .cmp(&(
-                    &right.language,
-                    &right.scheme,
-                    &right.pattern,
-                    &right.pattern_base_uri,
-                ))
-        });
-        filters.dedup();
-        filters
+        canonicalize_document_filters(selector.into_iter().map(|filter| NormalizedDocumentFilter {
+            language: filter.language,
+            scheme: filter.scheme,
+            pattern: filter.pattern,
+            pattern_base_uri: None,
+        }))
     })
+}
+
+fn canonicalize_document_filters(
+    filters: impl IntoIterator<Item = NormalizedDocumentFilter>,
+) -> Vec<NormalizedDocumentFilter> {
+    let mut filters = filters.into_iter().collect::<Vec<_>>();
+    filters.sort_by(|left, right| {
+        (
+            &left.language,
+            &left.scheme,
+            &left.pattern,
+            &left.pattern_base_uri,
+        )
+            .cmp(&(
+                &right.language,
+                &right.scheme,
+                &right.pattern,
+                &right.pattern_base_uri,
+            ))
+    });
+    filters.dedup();
+    filters
 }
 
 fn static_workspace_diagnostic_options(
@@ -484,12 +487,12 @@ fn dynamic_workspace_diagnostic_options(
     };
     let selector = match options.get("documentSelector") {
         None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::Array(filters)) => Some(
+        Some(serde_json::Value::Array(filters)) => Some(canonicalize_document_filters(
             filters
                 .iter()
                 .map(normalize_dynamic_document_filter)
                 .collect::<Option<Vec<_>>>()?,
-        ),
+        )),
         Some(_) => return None,
     };
     Some((identifier, selector))
