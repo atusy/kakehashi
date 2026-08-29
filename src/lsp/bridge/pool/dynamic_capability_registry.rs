@@ -33,6 +33,7 @@ pub(crate) struct DynamicCapabilityRegistry {
 #[derive(Default)]
 struct WorkspaceDiagnosticPull {
     active: bool,
+    accepted_once: bool,
     registration_refresh_pending: bool,
 }
 
@@ -193,6 +194,7 @@ impl DynamicCapabilityRegistry {
             .lock()
             .recover_poison("DynamicCapabilityRegistry::mark_workspace_diagnostic_pull_completed");
         pull.active = false;
+        pull.accepted_once = true;
         std::mem::take(&mut pull.registration_refresh_pending)
     }
 
@@ -204,14 +206,13 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_aborted(&self) -> bool {
-        let contributed = self.has_workspace_diagnostic_contributed();
         let mut pull = self
             .workspace_diagnostic_pull
             .lock()
             .recover_poison("DynamicCapabilityRegistry::mark_workspace_diagnostic_pull_aborted");
         if pull.active {
             pull.active = false;
-            if contributed {
+            if pull.accepted_once {
                 return std::mem::take(&mut pull.registration_refresh_pending);
             }
             pull.registration_refresh_pending = false;
@@ -740,6 +741,23 @@ mod tests {
             registry.try_mark_workspace_diagnostic_contributed(),
             Some(false)
         );
+        registry.mark_workspace_diagnostic_pull_active();
+        assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
+
+        assert!(registry.mark_workspace_diagnostic_pull_aborted());
+        assert!(!registry.take_workspace_diagnostic_registration_refresh());
+    }
+
+    #[test]
+    fn aborted_pull_after_an_accepted_empty_result_releases_its_deferred_refresh() {
+        let registry = DynamicCapabilityRegistry::new();
+        registry.mark_workspace_diagnostic_pull_active();
+        assert!(!registry.mark_workspace_diagnostic_pull_completed());
+        assert!(
+            !registry.has_workspace_diagnostic_contributed(),
+            "an accepted empty result must remain distinct from visible contribution"
+        );
+
         registry.mark_workspace_diagnostic_pull_active();
         assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
 
