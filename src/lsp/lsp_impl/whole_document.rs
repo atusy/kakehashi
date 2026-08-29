@@ -361,6 +361,8 @@ impl Kakehashi {
                 let pool = Arc::clone(&pool);
                 let send = send.clone();
                 let merge_order = region_merge_order[region_index];
+                let region_activity = bridge_activity.clone();
+                let activity_unit = format!("virt:{}", resolved.region.region_id);
 
                 outer_join_set.spawn(async move {
                     let is_nonempty =
@@ -382,6 +384,11 @@ impl Kakehashi {
                                 .await
                         }
                     };
+                    if whole_document_unit_succeeded(&result)
+                        && let Some(activity) = region_activity
+                    {
+                        activity.mark_succeeded(activity_unit);
+                    }
                     let items = match result {
                         FanInResult::Done(items) => items,
                         FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
@@ -587,6 +594,13 @@ impl Kakehashi {
             result.and_then(nonempty_whole_document_items)
         })
     }
+}
+
+fn whole_document_unit_succeeded<T>(result: &FanInResult<T>) -> bool {
+    matches!(
+        result,
+        FanInResult::Done(_) | FanInResult::NoResult { errors: 0 }
+    )
 }
 
 fn record_host_projection_success<T>(
@@ -799,6 +813,27 @@ mod tests {
             Some(vec![1])
         );
         assert!(succeeded.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn region_success_rejects_a_no_winner_outcome_with_failures() {
+        assert!(whole_document_unit_succeeded(&FanInResult::Done(Some(
+            vec![1]
+        ))));
+        assert!(whole_document_unit_succeeded(&FanInResult::<
+            Option<Vec<i32>>,
+        >::NoResult {
+            errors: 0
+        }));
+        assert!(
+            !whole_document_unit_succeeded(&FanInResult::<Option<Vec<i32>>>::NoResult {
+                errors: 1
+            }),
+            "a valid empty response plus a failed fallback must remain non-authoritative"
+        );
+        assert!(!whole_document_unit_succeeded(
+            &FanInResult::<Option<Vec<i32>>>::Cancelled
+        ));
     }
 
     #[test]

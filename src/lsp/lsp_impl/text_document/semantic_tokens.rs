@@ -681,7 +681,6 @@ impl Kakehashi {
         let bridge_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let virt_bridge_attempted = std::sync::Arc::clone(&bridge_attempted);
         let bridge_succeeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let virt_bridge_succeeded = std::sync::Arc::clone(&bridge_succeeded);
         let bridge_work_selected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let virt_bridge_work_selected = std::sync::Arc::clone(&bridge_work_selected);
         let bridge_activity =
@@ -707,7 +706,6 @@ impl Kakehashi {
                     native,
                     move |task| {
                         let attempted = std::sync::Arc::clone(&virt_bridge_attempted);
-                        let succeeded = std::sync::Arc::clone(&virt_bridge_succeeded);
                         let selected = std::sync::Arc::clone(&virt_bridge_work_selected);
                         let activity = std::sync::Arc::clone(&virt_bridge_activity);
                         async move {
@@ -746,10 +744,6 @@ impl Kakehashi {
                                 local_attempted.load(std::sync::atomic::Ordering::Acquire);
                             if was_attempted {
                                 attempted.store(true, std::sync::atomic::Ordering::Release);
-                                if result.is_ok() {
-                                    succeeded.store(true, std::sync::atomic::Ordering::Release);
-                                    activity.mark_succeeded(unit);
-                                }
                             }
                             result.map(|tokens| tokens.map(|tokens| tokens.data))
                         }
@@ -1467,11 +1461,8 @@ impl Kakehashi {
             }
             let configs = self
                 .bridge_configs_for_injection_language(language_name, &region.injection_language);
-            let agg = self.resolve_aggregation_config(
-                language_name,
-                &region.injection_language,
-                METHOD,
-            );
+            let agg =
+                self.resolve_aggregation_config(language_name, &region.injection_language, METHOD);
             let Ok(routing_uri) = url::Url::parse(
                 &crate::lsp::bridge::VirtualDocumentUri::new(
                     lsp_uri,
@@ -1506,8 +1497,7 @@ impl Kakehashi {
                 })
                 .map(|config| config.server_name.clone())
                 .collect::<std::collections::HashSet<_>>();
-            if semantic_region_selects_servers(
-                true,
+            if semantic_configs_select_servers(
                 &agg.priorities,
                 &configs,
                 agg.max_fan_out,
