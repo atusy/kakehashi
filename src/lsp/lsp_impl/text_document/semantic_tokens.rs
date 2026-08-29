@@ -2434,21 +2434,7 @@ impl Kakehashi {
     }
 }
 
-fn semantic_region_selects_servers(
-    contiguous: bool,
-    priorities: &[String],
-    configs: &[crate::lsp::bridge::ResolvedServerConfig],
-    max_fan_out: Option<usize>,
-    incapable: &std::collections::HashSet<String>,
-    suppressed: &std::collections::HashSet<String>,
-) -> bool {
-    if !contiguous {
-        return false;
-    }
-    semantic_virt_configs_select_servers(priorities, configs, max_fan_out, incapable, suppressed)
-}
-
-fn semantic_virt_configs_select_servers(
+fn semantic_configs_select_servers(
     priorities: &[String],
     configs: &[crate::lsp::bridge::ResolvedServerConfig],
     max_fan_out: Option<usize>,
@@ -2517,47 +2503,6 @@ mod tests {
     }
 
     #[test]
-    fn delta_reentry_excludes_non_contiguous_virtual_regions() {
-        let configs = vec![crate::lsp::bridge::ResolvedServerConfig {
-            server_name: "tokens".into(),
-            config: std::sync::Arc::new(crate::config::settings::BridgeServerConfig::default()),
-        }];
-        let priorities = [crate::config::settings::PRIORITIES_WILDCARD.into()];
-        assert!(!semantic_region_selects_servers(
-            false,
-            &priorities,
-            &configs,
-            None,
-            &std::collections::HashSet::new(),
-            &std::collections::HashSet::new(),
-        ));
-        assert!(semantic_region_selects_servers(
-            true,
-            &priorities,
-            &configs,
-            None,
-            &std::collections::HashSet::new(),
-            &std::collections::HashSet::new(),
-        ));
-        assert!(!semantic_region_selects_servers(
-            true,
-            &priorities,
-            &configs,
-            None,
-            &std::collections::HashSet::from(["tokens".into()]),
-            &std::collections::HashSet::new(),
-        ));
-        assert!(!semantic_region_selects_servers(
-            true,
-            &priorities,
-            &configs,
-            None,
-            &std::collections::HashSet::new(),
-            &std::collections::HashSet::from(["tokens".into()]),
-        ));
-    }
-
-    #[test]
     fn delta_reentry_matches_full_fanout_filter_order() {
         let configs = ["suppressed", "available"]
             .into_iter()
@@ -2569,14 +2514,14 @@ mod tests {
         let priorities = [crate::config::settings::PRIORITIES_WILDCARD.into()];
         let suppressed = std::collections::HashSet::from(["suppressed".into()]);
 
-        assert!(!semantic_virt_configs_select_servers(
+        assert!(!semantic_configs_select_servers(
             &priorities,
             &configs,
             Some(1),
             &std::collections::HashSet::new(),
             &suppressed,
         ));
-        assert!(semantic_virt_configs_select_servers(
+        assert!(semantic_configs_select_servers(
             &priorities,
             &configs,
             None,
@@ -2586,7 +2531,7 @@ mod tests {
 
         let incapable = std::collections::HashSet::from(["suppressed".into()]);
         assert!(
-            semantic_virt_configs_select_servers(
+            semantic_configs_select_servers(
                 &priorities,
                 &configs,
                 Some(1),
