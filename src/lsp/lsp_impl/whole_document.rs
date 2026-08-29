@@ -534,10 +534,7 @@ impl Kakehashi {
                         let Some(items) = parse_host(raw.value) else {
                             return Ok(None);
                         };
-                        if let Some(succeeded) = succeeded_after_parse {
-                            succeeded.store(true, std::sync::atomic::Ordering::Release);
-                        }
-                        Ok(on_host_winner(HostWholeDocumentResponse {
+                        let projected = on_host_winner(HostWholeDocumentResponse {
                             items,
                             server_name: t.server_name,
                             host_uri: t.uri,
@@ -545,7 +542,11 @@ impl Kakehashi {
                             incarnation: Some(expected_incarnation),
                             connection_generation: raw.connection_generation,
                             handle: raw.handle,
-                        }))
+                        });
+                        Ok(record_host_projection_success(
+                            projected,
+                            succeeded_after_parse.as_ref(),
+                        ))
                     }
                 },
                 |opt| matches!(opt, Some(items) if !items.is_empty()),
@@ -603,6 +604,18 @@ impl Kakehashi {
             result.and_then(nonempty_whole_document_items)
         })
     }
+}
+
+fn record_host_projection_success<T>(
+    projected: Option<Vec<T>>,
+    succeeded: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> Option<Vec<T>> {
+    if projected.is_some()
+        && let Some(succeeded) = succeeded
+    {
+        succeeded.store(true, std::sync::atomic::Ordering::Release);
+    }
+    projected
 }
 
 pub(super) fn request_selects_servers(
@@ -793,6 +806,25 @@ mod tests {
         assert!(!activity.is_authoritative());
         activity.mark_succeeded("virt:second");
         assert!(activity.is_authoritative());
+    }
+
+    #[test]
+    fn host_success_requires_a_projectable_winner() {
+        let succeeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert_eq!(
+            record_host_projection_success::<i32>(None, Some(&succeeded)),
+            None
+        );
+        assert!(
+            !succeeded.load(std::sync::atomic::Ordering::Acquire),
+            "a parsed but unprojectable host response must remain non-authoritative"
+        );
+
+        assert_eq!(
+            record_host_projection_success(Some(vec![1]), Some(&succeeded)),
+            Some(vec![1])
+        );
+        assert!(succeeded.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]
