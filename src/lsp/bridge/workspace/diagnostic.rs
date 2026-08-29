@@ -94,6 +94,7 @@ struct CompletedDiagnosticProducer {
 
 struct WorkspaceDiagnosticPullGuard {
     handles: Arc<std::sync::Mutex<Vec<Arc<ConnectionHandle>>>>,
+    upstream_tx: tokio::sync::mpsc::UnboundedSender<crate::lsp::bridge::UpstreamNotification>,
 }
 
 impl Drop for WorkspaceDiagnosticPullGuard {
@@ -102,10 +103,16 @@ impl Drop for WorkspaceDiagnosticPullGuard {
             .handles
             .lock()
             .recover_poison("WorkspaceDiagnosticPullGuard::drop");
+        let mut refresh = false;
         for handle in handles.iter() {
-            handle
+            refresh |= handle
                 .dynamic_capabilities()
                 .mark_workspace_diagnostic_pull_aborted();
+        }
+        if refresh {
+            let _ = self
+                .upstream_tx
+                .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
         }
     }
 }
@@ -1298,6 +1305,7 @@ impl LanguageServerPool {
         let acquired_handles = Arc::new(std::sync::Mutex::new(Vec::new()));
         let _pull_guard = WorkspaceDiagnosticPullGuard {
             handles: Arc::clone(&acquired_handles),
+            upstream_tx: self.upstream_tx(),
         };
         let on_acquired = |handle: &Arc<ConnectionHandle>| {
             let mut handles = acquired_handles
@@ -2075,6 +2083,7 @@ mod tests {
 
         drop(WorkspaceDiagnosticPullGuard {
             handles: Arc::new(std::sync::Mutex::new(vec![Arc::clone(&handle)])),
+            upstream_tx: LanguageServerPool::new().upstream_tx(),
         });
 
         assert!(
