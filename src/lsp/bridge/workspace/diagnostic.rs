@@ -17,6 +17,7 @@ use tower_lsp_server::ls_types::{
 
 use crate::config::settings::WorkspaceSettings;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
+use crate::error::LockResultExt;
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::pool::{
     ConnectionHandle, ConnectionState, INIT_TIMEOUT_SECS, LanguageServerPool, UpstreamId,
@@ -53,6 +54,30 @@ struct CompletedDiagnosticProducer {
     report: WorkspaceDiagnosticReport,
     provider_reports: Option<Vec<ProviderDiagnosticReport>>,
     virtual_uris: Arc<VirtualUriObserver>,
+}
+
+struct WorkspaceDiagnosticPullGuard {
+    handles: Arc<std::sync::Mutex<Vec<Arc<ConnectionHandle>>>>,
+    upstream_tx: tokio::sync::mpsc::UnboundedSender<crate::lsp::bridge::UpstreamNotification>,
+}
+
+impl Drop for WorkspaceDiagnosticPullGuard {
+    fn drop(&mut self) {
+        let handles = self
+            .handles
+            .lock()
+            .recover_poison("WorkspaceDiagnosticPullGuard::drop");
+        for handle in handles.iter() {
+            if handle
+                .dynamic_capabilities()
+                .mark_workspace_diagnostic_pull_completed()
+            {
+                let _ = self
+                    .upstream_tx
+                    .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
+            }
+        }
+    }
 }
 
 struct ProviderDiagnosticReport {
@@ -977,16 +1002,36 @@ impl LanguageServerPool {
             .collect();
         servers.sort_by(|left, right| left.0.cmp(&right.0));
 
+        let acquired_handles = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _pull_guard = WorkspaceDiagnosticPullGuard {
+            handles: Arc::clone(&acquired_handles),
+            upstream_tx: self.upstream_tx(),
+        };
+        let on_acquired = |handle: &Arc<ConnectionHandle>| {
+            let mut handles = acquired_handles
+                .lock()
+                .recover_poison("dispatch_workspace_diagnostic_inner::on_acquired");
+            if handles.iter().any(|existing| Arc::ptr_eq(existing, handle)) {
+                return;
+            }
+            handle
+                .dynamic_capabilities()
+                .mark_workspace_diagnostic_pull_active();
+            handles.push(Arc::clone(handle));
+        };
+
         let requests = servers.into_iter().map(|(name, config)| {
             let params = params.clone();
             let upstream_id = upstream_id.clone();
+            let on_acquired = &on_acquired;
             async move {
                 let (handles, workspace_generation) = self
-                    .get_or_create_workspace_connections_wait_ready_admitted(
+                    .get_or_create_complete_workspace_connections_wait_ready_admitted_observed(
                         &name,
                         &config,
                         Duration::from_secs(INIT_TIMEOUT_SECS),
                         admit,
+                        on_acquired,
                     )
                     .await?;
                 if workspace_generation != request_workspace_generation {
@@ -1542,6 +1587,9 @@ mod tests {
             ConnectionKey::for_server("successful"),
         )
         .await;
+        handle
+            .dynamic_capabilities()
+            .mark_workspace_diagnostic_pull_active();
         let generation = pool.document_connection_generation(handle.key());
         let virtual_uris =
             Arc::new(pool.observe_virtual_uris_for_connection(handle.key(), generation));
@@ -1596,6 +1644,9 @@ mod tests {
         let handle =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("failed"))
                 .await;
+        handle
+            .dynamic_capabilities()
+            .mark_workspace_diagnostic_pull_active();
         handle.dynamic_capabilities().register(vec![Registration {
             id: "late".into(),
             method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
@@ -1636,6 +1687,9 @@ mod tests {
             ConnectionKey::for_server("siblings"),
         )
         .await;
+        handle
+            .dynamic_capabilities()
+            .mark_workspace_diagnostic_pull_active();
         assert!(
             !handle
                 .dynamic_capabilities()
@@ -1682,6 +1736,9 @@ mod tests {
             ConnectionKey::for_server("final-fence"),
         )
         .await;
+        handle
+            .dynamic_capabilities()
+            .mark_workspace_diagnostic_pull_active();
         pool.connections()
             .await
             .insert(handle.key().clone(), Arc::clone(&handle));
@@ -2151,6 +2208,9 @@ mod tests {
             .expect("test owns upstream receiver");
         let key = ConnectionKey::for_server("diagnostics");
         let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+        handle
+            .dynamic_capabilities()
+            .mark_workspace_diagnostic_pull_active();
         pool.connections()
             .await
             .insert(handle.key().clone(), Arc::clone(&handle));
