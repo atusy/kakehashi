@@ -791,6 +791,16 @@ impl DocumentStore {
         });
     }
 
+    pub(crate) async fn wait_for_watermark(&self, uri: &Url, target: u64) {
+        let Some(mut watermark) = self.watermarks.get(uri).map(|sender| sender.subscribe()) else {
+            return;
+        };
+        if watermark.borrow().ticket >= target {
+            return;
+        }
+        let _ = watermark.wait_for(|current| current.ticket >= target).await;
+    }
+
     /// Advance the watermark to `ticket`, but only if the channel still belongs to
     /// `expected_incarnation` — the lifetime that issued the ticket.
     ///
@@ -1756,6 +1766,27 @@ mod tests {
             Some(7),
             "publish records the ticket"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_watermark_blocks_until_off_ingress_sync_completes() {
+        let store = Arc::new(DocumentStore::new());
+        let uri = Url::parse("file:///wm.rs").unwrap();
+        seed_document(&store, &uri);
+        let waiting_store = Arc::clone(&store);
+        let waiting_uri = uri.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_store.wait_for_watermark(&waiting_uri, 3).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        store.advance_watermark(&uri, 3);
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("watermark wait must wake")
+            .unwrap();
     }
 
     #[test]
