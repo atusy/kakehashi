@@ -445,6 +445,12 @@ fn transform_semantic_tokens_result_to_host_inner(
             }
             continue;
         }
+        if reject_invalid_coordinates && token.token_type as usize >= legend.token_types.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "semantic token type is outside the advertised legend",
+            ));
+        }
         let Some(token_type) = remap_token_type(token.token_type, legend) else {
             continue;
         };
@@ -814,6 +820,26 @@ mod tests {
                 .is_some()
         );
         assert!(transform(json!({ "result": { "data": "bad" } })).is_err());
+        assert!(
+            transform(json!({ "result": { "data": [0, 0, 1, 1, 0] } })).is_err(),
+            "a token type outside the advertised legend is malformed"
+        );
+        assert!(
+            transform_semantic_tokens_full_response_to_host(
+                json!({ "result": { "data": [0, 0, 1, 0, 0] } }),
+                &SemanticTokensLegend {
+                    token_types: vec![SemanticTokenType::new("custom")],
+                    token_modifiers: Vec::new(),
+                },
+                &RegionOffset::new(0, 0),
+                Position::new(0, 4),
+                "code",
+                Range::new(Position::new(0, 0), Position::new(0, 4)),
+            )
+            .unwrap()
+            .is_some_and(|tokens| tokens.data.is_empty()),
+            "an advertised custom token type remains a valid skipped token"
+        );
         assert!(
             transform(json!({
                 "result": { "data": [0, 5, 1, 0, 0] }
