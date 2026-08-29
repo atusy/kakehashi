@@ -798,9 +798,7 @@ fn combine_complete_provider_reports(
                     error.is::<crate::error::WorkspaceDiagnosticServerCancelled>()
                 }) =>
             {
-                if server_cancelled.is_none() {
-                    server_cancelled = Some(error);
-                }
+                combine_server_cancelled(&mut server_cancelled, error);
                 continue;
             }
             Err(_) => {
@@ -824,6 +822,26 @@ fn combine_complete_provider_reports(
         Ok(None)
     } else {
         Ok(Some(completed))
+    }
+}
+
+fn combine_server_cancelled(current: &mut Option<io::Error>, incoming: io::Error) {
+    let incoming_requires_retrigger = incoming
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<crate::error::WorkspaceDiagnosticServerCancelled>())
+        .is_some_and(crate::error::WorkspaceDiagnosticServerCancelled::retrigger_request);
+    let Some(current) = current else {
+        *current = Some(incoming);
+        return;
+    };
+    if incoming_requires_retrigger {
+        current
+            .get_mut()
+            .and_then(|error| {
+                error.downcast_mut::<crate::error::WorkspaceDiagnosticServerCancelled>()
+            })
+            .expect("combined workspace diagnostic cancellations must retain their typed error")
+            .require_retrigger_request();
     }
 }
 
@@ -855,9 +873,7 @@ fn collect_complete_root_producers(
                     error.is::<crate::error::WorkspaceDiagnosticServerCancelled>()
                 }) =>
             {
-                if server_cancelled.is_none() {
-                    server_cancelled = Some(error);
-                }
+                combine_server_cancelled(&mut server_cancelled, error);
             }
             Err(error) if first_error.is_none() => first_error = Some(error),
             Err(_) => {}
@@ -907,9 +923,7 @@ impl LanguageServerPool {
                         error.is::<crate::error::WorkspaceDiagnosticServerCancelled>()
                     }) =>
                 {
-                    if server_cancelled.is_none() {
-                        server_cancelled = Some(error);
-                    }
+                    combine_server_cancelled(&mut server_cancelled, error);
                 }
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
@@ -2292,6 +2306,58 @@ mod tests {
     }
 
     #[test]
+    fn server_cancelled_retrigger_policies_are_combined_across_aggregation_layers() {
+        let cancelled = |retrigger_request| {
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": -32802,
+                    "message": "cancelled",
+                    "data": { "retriggerRequest": retrigger_request }
+                }
+            });
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                crate::error::WorkspaceDiagnosticServerCancelled::from_response(&response)
+                    .expect("typed ServerCancelled"),
+            )
+        };
+        let assert_retrigger = |error| {
+            assert_eq!(
+                crate::error::map_workspace_diagnostic_error(error).data,
+                Some(serde_json::json!({ "retriggerRequest": true }))
+            );
+        };
+
+        let provider_error = match combine_complete_provider_reports([
+            (None, Err(cancelled(false))),
+            (None, Err(cancelled(true))),
+        ]) {
+            Err(error) => error,
+            Ok(_) => panic!("combined provider cancellation must remain an error"),
+        };
+        assert_retrigger(provider_error);
+
+        let pool = LanguageServerPool::new();
+        let server_error = match pool.collect_completed_workspace_diagnostic_requests([
+            Err(cancelled(false)),
+            Err(cancelled(true)),
+        ]) {
+            Err(error) => error,
+            Ok(_) => panic!("combined server cancellation must remain an error"),
+        };
+        assert_retrigger(server_error);
+
+        let root_error =
+            match collect_complete_root_producers([Err(cancelled(false)), Err(cancelled(true))]) {
+                Err(error) => error,
+                Ok(_) => panic!("combined root cancellation must remain an error"),
+            };
+        assert_retrigger(root_error);
+    }
+
+    #[test]
     fn aggregation_preserves_reports_with_incomparable_versions() {
         let result = aggregate_reports([
             WorkspaceDiagnosticReport {
@@ -3521,7 +3587,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_sends_one_request_for_each_dynamic_provider() {
         let pool = Arc::new(LanguageServerPool::new());
-        let key = ConnectionKey::for_server("diagnostics");
+        let key = ConnectionKey::workspace("diagnostics");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
         handle.dynamic_capabilities().register(vec![
             Registration {
@@ -3616,7 +3682,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_fails_after_producer_replacement() {
         let pool = Arc::new(LanguageServerPool::new());
-        let key = ConnectionKey::for_server("diagnostics");
+        let key = ConnectionKey::workspace("diagnostics");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
         handle.dynamic_capabilities().register(vec![
             Registration {
@@ -3944,7 +4010,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_waits_for_an_existing_initializing_producer() {
         let pool = Arc::new(LanguageServerPool::new());
-        let key = ConnectionKey::for_server("diagnostics");
+        let key = ConnectionKey::workspace("diagnostics");
         let producer = create_handle_advertising_workspace_diagnostics_with_state(
             ConnectionState::Initializing,
             key.clone(),
@@ -4036,7 +4102,7 @@ mod tests {
         .await;
         record_test_spawn_root(&shared, "file:///workspace/project-a");
         let fallback = create_handle_advertising_workspace_diagnostics(
-            ConnectionKey::new("diagnostics", None),
+            ConnectionKey::workspace("diagnostics"),
             None,
         )
         .await;
@@ -4109,7 +4175,7 @@ mod tests {
         pool.set_root_uri(Some(folder_a.uri.to_string()));
         pool.set_workspace_folders(Some(vec![folder_a, folder_b]));
         let fallback = create_handle_advertising_workspace_diagnostics(
-            ConnectionKey::new("diagnostics", None),
+            ConnectionKey::workspace("diagnostics"),
             None,
         )
         .await;
@@ -4187,7 +4253,7 @@ mod tests {
         pool.set_root_uri(Some(parent_folder.uri.to_string()));
         pool.set_workspace_folders(Some(vec![parent_folder, nested_folder]));
         let parent = create_handle_advertising_workspace_diagnostics(
-            ConnectionKey::new("diagnostics", None),
+            ConnectionKey::workspace("diagnostics"),
             None,
         )
         .await;
@@ -4336,12 +4402,12 @@ mod tests {
         let pool = Arc::new(LanguageServerPool::new());
         seed_test_client_root(&pool, "file:///workspace");
         let first = create_handle_advertising_workspace_diagnostics(
-            ConnectionKey::new("alpha", None),
+            ConnectionKey::workspace("alpha"),
             None,
         )
         .await;
         let second =
-            create_handle_advertising_workspace_diagnostics(ConnectionKey::new("zeta", None), None)
+            create_handle_advertising_workspace_diagnostics(ConnectionKey::workspace("zeta"), None)
                 .await;
         record_test_spawn_root(&first, "file:///workspace");
         record_test_spawn_root(&second, "file:///workspace");
