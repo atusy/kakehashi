@@ -177,6 +177,16 @@ struct SemanticDeltaComputation {
     pending_wire: Option<PendingWireBaseline>,
     identity: (u64, u64),
     generation: u64,
+    snapshot_present: bool,
+}
+
+fn should_publish_empty_non_native_result(
+    non_native_only: bool,
+    virt_only: bool,
+    bridge_attempted: bool,
+    bridge_succeeded: bool,
+) -> bool {
+    non_native_only && (bridge_succeeded || (virt_only && !bridge_attempted))
 }
 
 fn commit_full_baselines(
@@ -271,6 +281,19 @@ impl Kakehashi {
         &self,
         uri: &Url,
         computed: &SemanticFullComputation,
+    ) -> bool {
+        self.cache.semantic_token_generation() == computed.generation
+            && self.documents.latest_snapshot(uri).is_some_and(|view| {
+                view.slot.current_incarnation == computed.identity.0
+                    && view.content_version == computed.identity.1
+                    && view.slot.snapshot.is_some() == computed.snapshot_present
+            })
+    }
+
+    fn semantic_delta_computation_is_current(
+        &self,
+        uri: &Url,
+        computed: &SemanticDeltaComputation,
     ) -> bool {
         self.cache.semantic_token_generation() == computed.generation
             && self.documents.latest_snapshot(uri).is_some_and(|view| {
@@ -622,6 +645,8 @@ impl Kakehashi {
         let native = std::future::ready(Ok(Some(native_data)));
         let bridge_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let virt_bridge_attempted = std::sync::Arc::clone(&bridge_attempted);
+        let bridge_succeeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let virt_bridge_succeeded = std::sync::Arc::clone(&bridge_succeeded);
 
         let fan_out = async {
             let data = self
@@ -632,6 +657,7 @@ impl Kakehashi {
                     progress_token,
                     expected,
                     Some(std::sync::Arc::clone(&bridge_attempted)),
+                    Some(std::sync::Arc::clone(&bridge_succeeded)),
                     true,
                     true,
                     true,
@@ -639,9 +665,13 @@ impl Kakehashi {
                     native,
                     move |task| {
                         let attempted = std::sync::Arc::clone(&virt_bridge_attempted);
+                        let succeeded = std::sync::Arc::clone(&virt_bridge_succeeded);
                         async move {
                             let region_end = task.region_end();
-                            task.pool
+                            let local_attempted =
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let result = task
+                                .pool
                                 .send_semantic_tokens_full_request(
                                     &task.server_name,
                                     &task.server_config,
@@ -654,10 +684,18 @@ impl Kakehashi {
                                     task.upstream_id,
                                     task.client_progress_token,
                                     expected_incarnation,
-                                    Some(attempted),
+                                    Some(std::sync::Arc::clone(&local_attempted)),
                                 )
-                                .await
-                                .map(|tokens| tokens.map(|tokens| tokens.data))
+                                .await;
+                            let was_attempted =
+                                local_attempted.load(std::sync::atomic::Ordering::Acquire);
+                            if was_attempted {
+                                attempted.store(true, std::sync::atomic::Ordering::Release);
+                                if result.is_ok() {
+                                    succeeded.store(true, std::sync::atomic::Ordering::Release);
+                                }
+                            }
+                            result.map(|tokens| tokens.map(|tokens| tokens.data))
                         }
                     },
                     |value| {
@@ -692,9 +730,16 @@ impl Kakehashi {
                 .await?;
 
             let bridge_was_attempted = bridge_attempted.load(std::sync::atomic::Ordering::Acquire);
+            let bridge_succeeded = bridge_succeeded.load(std::sync::atomic::Ordering::Acquire);
             let data = match data {
                 Some(data) => data,
-                None if non_native_only && (bridge_was_attempted || virt_only) => {
+                None if should_publish_empty_non_native_result(
+                    non_native_only,
+                    virt_only,
+                    bridge_was_attempted,
+                    bridge_succeeded,
+                ) =>
+                {
                     // A selected non-native overlay recomputed to no tokens:
                     // either its server returned null/empty, or a virt-only
                     // document has no regions left. Keep an empty wire lineage
@@ -1622,11 +1667,7 @@ impl Kakehashi {
             if commit_guard.is_some()
                 && let Ok(Some(computed)) = &mut outcome
             {
-                let current = self.cache.semantic_token_generation() == computed.generation
-                    && self.documents.get(&uri).is_some_and(|document| {
-                        document.incarnation() == computed.identity.0
-                            && document.content_version() == computed.identity.1
-                    });
+                let current = self.semantic_delta_computation_is_current(&uri, computed);
                 if !current
                     || self
                         .cache
@@ -1735,6 +1776,7 @@ impl Kakehashi {
                     pending_wire: None,
                     identity: request_identity,
                     generation: request_generation,
+                    snapshot_present: true,
                 }));
             }
             return Ok(None);
@@ -1756,6 +1798,7 @@ impl Kakehashi {
         };
         let pending_native = current.pending_native;
         let pending_wire = current.pending_wire;
+        let snapshot_present = current.snapshot_present;
         let current = match current.result {
             SemanticTokensResult::Tokens(tokens) => tokens,
             SemanticTokensResult::Partial(partial) => SemanticTokens {
@@ -1774,9 +1817,10 @@ impl Kakehashi {
         if cancel_token.is_cancelled()
             || !self.cache.is_request_active(&uri, request_id)
             || self.cache.semantic_token_generation() != request_generation
-            || !self.documents.get(&uri).is_some_and(|document| {
-                document.incarnation() == request_identity.0
-                    && document.content_version() == request_identity.1
+            || !self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                view.slot.current_incarnation == request_identity.0
+                    && view.content_version == request_identity.1
+                    && view.slot.snapshot.is_some() == snapshot_present
             })
         {
             return Ok(None);
@@ -1788,6 +1832,7 @@ impl Kakehashi {
             pending_wire,
             identity: request_identity,
             generation: request_generation,
+            snapshot_present,
         }))
     }
 
@@ -2513,7 +2558,19 @@ mod tests {
             generation,
             snapshot_present: false,
         };
+        let delta_computed = SemanticDeltaComputation {
+            result: SemanticTokensFullDeltaResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: Vec::new(),
+            }),
+            pending_native: None,
+            pending_wire: None,
+            identity,
+            generation,
+            snapshot_present: false,
+        };
         assert!(server.semantic_full_computation_is_current(&uri, &computed));
+        assert!(server.semantic_delta_computation_is_current(&uri, &delta_computed));
         let edit_lock = server.documents.edit_lock(&uri);
         assert!(server.semantic_full_response_is_current(
             &uri,
@@ -2542,6 +2599,10 @@ mod tests {
         assert!(
             !server.semantic_full_computation_is_current(&uri, &computed),
             "the final publication fence must reject a newly published snapshot"
+        );
+        assert!(
+            !server.semantic_delta_computation_is_current(&uri, &delta_computed),
+            "the delta publication fence must reject a newly published snapshot"
         );
         assert!(
             !server.semantic_full_response_is_current(
@@ -2581,6 +2642,24 @@ mod tests {
             true,
             &edit_lock,
         ));
+    }
+
+    #[test]
+    fn non_native_empty_result_requires_success_or_no_virtual_request() {
+        assert!(should_publish_empty_non_native_result(
+            true, false, true, true,
+        ));
+        assert!(should_publish_empty_non_native_result(
+            true, true, false, false,
+        ));
+        assert!(
+            !should_publish_empty_non_native_result(true, false, true, false),
+            "a failed host or virtual request must not clear highlighting"
+        );
+        assert!(
+            !should_publish_empty_non_native_result(true, true, true, false),
+            "virt-only request failures differ from a document with no virtual request"
+        );
     }
 
     #[tokio::test(start_paused = true)]

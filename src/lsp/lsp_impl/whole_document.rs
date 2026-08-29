@@ -74,6 +74,7 @@ impl Kakehashi {
         client_progress_token: Option<NumberOrString>,
         expected_snapshot: Option<WholeDocumentSnapshotIdentity>,
         bridge_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
+        bridge_succeeded: Option<Arc<std::sync::atomic::AtomicBool>>,
         require_all_layers: bool,
         preserve_empty: bool,
         nested_regions_first: bool,
@@ -96,6 +97,7 @@ impl Kakehashi {
         M: Fn(Vec<T>, Vec<T>) -> Vec<T>,
     {
         let host_bridge_attempted = bridge_attempted;
+        let host_bridge_succeeded = bridge_succeeded;
         let virt = async {
             if !run_virtual_layer {
                 return Ok(None);
@@ -390,10 +392,14 @@ impl Kakehashi {
                     let parse_host = parse_host.clone();
                     let on_host_winner = on_host_winner.clone();
                     let attempted = host_bridge_attempted.clone();
+                    let succeeded = host_bridge_succeeded.clone();
                     async move {
                         let raw = match attempted {
                             Some(attempted) => {
-                                t.pool
+                                let local_attempted =
+                                    Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let result = t
+                                    .pool
                                     .send_host_raw_request_for_incarnation_with_attempt_marker(
                                         &t.server_name,
                                         &t.server_config,
@@ -406,9 +412,20 @@ impl Kakehashi {
                                         params,
                                         t.upstream_id,
                                         incarnation,
-                                        attempted,
+                                        Arc::clone(&local_attempted),
                                     )
-                                    .await?
+                                    .await;
+                                let was_attempted =
+                                    local_attempted.load(std::sync::atomic::Ordering::Acquire);
+                                if was_attempted {
+                                    attempted.store(true, std::sync::atomic::Ordering::Release);
+                                    if result.is_ok()
+                                        && let Some(succeeded) = succeeded
+                                    {
+                                        succeeded.store(true, std::sync::atomic::Ordering::Release);
+                                    }
+                                }
+                                result?
                             }
                             None => {
                                 t.pool

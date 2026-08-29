@@ -23,6 +23,7 @@ impl Kakehashi {
             work_done_token,
             None,
             None,
+            None,
             false,
             false,
             false,
