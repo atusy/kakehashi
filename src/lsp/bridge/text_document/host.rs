@@ -605,6 +605,7 @@ impl LanguageServerPool {
             Some(expected_incarnation),
             Some(revision_text_reader),
             None,
+            None,
         )
         .await
     }
