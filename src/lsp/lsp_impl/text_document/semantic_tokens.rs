@@ -1097,7 +1097,13 @@ impl Kakehashi {
             })));
         }
         let progress_token = params.work_done_progress_params.work_done_token.clone();
-        let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+        let mut raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+        if let Some(params) = raw_params.as_object_mut() {
+            // Downstream progress for the client's token is not aggregated or
+            // translated by the bridge reader. Force one complete final result
+            // instead of silently dropping streamed semantic-token chunks.
+            params.remove("partialResultToken");
+        }
         let virt = self.semantic_tokens_range_virt_layer(&lsp_uri, range, progress_token);
         let host = self.semantic_tokens_range_host_layer(&lsp_uri, range, raw_params);
         let native = self.semantic_tokens_range_native_layer(params);
