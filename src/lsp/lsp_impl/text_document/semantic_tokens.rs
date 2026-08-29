@@ -454,10 +454,17 @@ impl Kakehashi {
             self.resolve_layer_config(language, METHOD)
                 .allows(LayerSource::Virt)
         });
-        let actionable_virtual = virtual_enabled
-            && document_language.as_ref().is_some_and(|language| {
-                self.semantic_tokens_full_has_potential_virtual_producer(language)
-            });
+        let actionable_virtual = if virtual_enabled {
+            match document_language.as_deref() {
+                Some(language) => {
+                    self.semantic_tokens_full_has_potential_virtual_producer(language)
+                        .await
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
         // supersession, and cancellation contract. A current snapshot makes
@@ -1247,7 +1254,10 @@ impl Kakehashi {
         })
     }
 
-    fn semantic_tokens_full_has_potential_virtual_producer(&self, host_language: &str) -> bool {
+    async fn semantic_tokens_full_has_potential_virtual_producer(
+        &self,
+        host_language: &str,
+    ) -> bool {
         const METHOD: &str = "textDocument/semanticTokens/full";
         if self.language.injection_query(host_language).is_none() {
             return false;
@@ -1281,20 +1291,35 @@ impl Kakehashi {
         }
         candidates.sort();
         candidates.dedup();
-        candidates.into_iter().any(|injection_language| {
-            let configs =
-                self.bridge_configs_for_injection_language(host_language, &injection_language);
-            if configs.is_empty() {
-                return false;
-            }
-            let aggregation =
-                self.resolve_aggregation_config(host_language, &injection_language, METHOD);
+        let plans = candidates
+            .into_iter()
+            .filter_map(|injection_language| {
+                let configs =
+                    self.bridge_configs_for_injection_language(host_language, &injection_language);
+                if configs.is_empty() {
+                    return None;
+                }
+                let aggregation =
+                    self.resolve_aggregation_config(host_language, &injection_language, METHOD);
+                Some((configs, aggregation))
+            })
+            .collect::<Vec<_>>();
+        let server_names = plans
+            .iter()
+            .flat_map(|(configs, _)| configs.iter().map(|config| config.server_name.as_str()))
+            .collect::<std::collections::HashSet<_>>();
+        let incapable = self
+            .bridge
+            .pool()
+            .servers_known_incapable(&server_names, METHOD)
+            .await;
+        plans.into_iter().any(|(configs, aggregation)| {
             semantic_region_selects_servers(
                 true,
                 &aggregation.priorities,
                 &configs,
                 aggregation.max_fan_out,
-                &std::collections::HashSet::new(),
+                &incapable,
                 &std::collections::HashSet::new(),
             )
         })
@@ -1463,11 +1488,17 @@ impl Kakehashi {
         // applicability before the native-only tree gate so a tree-less
         // current snapshot can still re-enter its configured host layer.
         let parser_language = snapshot.language.as_deref();
-        let actionable_virtual = snapshot.language.as_deref().is_some_and(|language| {
-            self.resolve_layer_config(language, "textDocument/semanticTokens/full")
-                .allows(LayerSource::Virt)
-                && self.semantic_tokens_full_has_potential_virtual_producer(language)
-        });
+        let actionable_virtual = match snapshot.language.as_deref() {
+            Some(language)
+                if self
+                    .resolve_layer_config(language, "textDocument/semanticTokens/full")
+                    .allows(LayerSource::Virt) =>
+            {
+                self.semantic_tokens_full_has_potential_virtual_producer(language)
+                    .await
+            }
+            _ => false,
+        };
         let bridge_applicable = if let Some(bridge_language) = snapshot.language.as_deref() {
             let applicability = self.semantic_delta_has_applicable_bridge(
                 &lsp_uri,
@@ -2865,7 +2896,11 @@ mod tests {
                 .bridge_configs_for_injection_language("rust", "html")
                 .is_empty()
         );
-        assert!(server.semantic_tokens_full_has_potential_virtual_producer("rust"));
+        assert!(
+            server
+                .semantic_tokens_full_has_potential_virtual_producer("rust")
+                .await
+        );
 
         let uri = Url::parse("file:///semantic_delta_treeless.rs").expect("valid test URI");
         server.documents.insert(
