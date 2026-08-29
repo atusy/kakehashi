@@ -35,7 +35,6 @@ use crate::analysis::{
 };
 use crate::config::settings::LayerSource;
 use crate::language::InjectionResolver;
-use crate::language::injection::ResolvedInjection;
 use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
@@ -1134,59 +1133,56 @@ impl Kakehashi {
             );
             &owned_regions
         };
-        let incapable = self
-            .incapable_virt_servers(
+        let pool = self.bridge.pool_arc();
+        for region in regions {
+            if !region.contiguous {
+                continue;
+            }
+            let configs = self
+                .bridge_configs_for_injection_language(bridge_language, &region.injection_language);
+            let agg = self.resolve_aggregation_config(
                 bridge_language,
-                regions
-                    .iter()
-                    .map(|region| region.injection_language.as_str()),
+                &region.injection_language,
                 METHOD,
-            )
-            .await;
-        let has_configured_region = |regions: &[ResolvedInjection]| {
-            regions.iter().any(|region| {
-                let configs = self.bridge_configs_for_injection_language(
-                    bridge_language,
+            );
+            let Ok(routing_uri) = url::Url::parse(
+                &crate::lsp::bridge::VirtualDocumentUri::new(
+                    lsp_uri,
                     &region.injection_language,
-                );
-                let agg = self.resolve_aggregation_config(
-                    bridge_language,
-                    &region.injection_language,
-                    METHOD,
-                );
-                let suppressed = url::Url::parse(
-                    &crate::lsp::bridge::VirtualDocumentUri::new(
-                        lsp_uri,
-                        &region.injection_language,
-                        &region.region.region_id,
-                    )
-                    .to_uri_string(),
+                    &region.region.region_id,
                 )
-                .ok()
-                .map(|routing_uri| {
-                    configs
-                        .iter()
-                        .filter(|config| {
-                            self.bridge
-                                .pool()
-                                .host_routing_by_server(&routing_uri, &config.server_name)
-                                == Some(false)
-                        })
-                        .map(|config| config.server_name.clone())
-                        .collect::<std::collections::HashSet<_>>()
+                .to_uri_string(),
+            ) else {
+                continue;
+            };
+            let mut incapable = std::collections::HashSet::new();
+            for config in &configs {
+                let key = pool
+                    .resolved_connection_key(&config.server_name, &config.config, &routing_uri)
+                    .await;
+                if pool.connection_known_incapable(&key, METHOD).await {
+                    incapable.insert(config.server_name.clone());
+                }
+            }
+            let suppressed = configs
+                .iter()
+                .filter(|config| {
+                    pool.host_routing_by_server(&routing_uri, &config.server_name) == Some(false)
                 })
-                .unwrap_or_default();
-                semantic_region_selects_servers(
-                    region.contiguous,
-                    &agg.priorities,
-                    &configs,
-                    agg.max_fan_out,
-                    &incapable,
-                    &suppressed,
-                )
-            })
-        };
-        has_configured_region(regions)
+                .map(|config| config.server_name.clone())
+                .collect::<std::collections::HashSet<_>>();
+            if semantic_region_selects_servers(
+                true,
+                &agg.priorities,
+                &configs,
+                agg.max_fan_out,
+                &incapable,
+                &suppressed,
+            ) {
+                return true;
+            }
+        }
+        false
     }
 
     fn semantic_tokens_full_includes_native(&self, uri: &Url) -> bool {
