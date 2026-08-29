@@ -450,6 +450,12 @@ fn canonicalize_document_filters(
 fn static_workspace_diagnostic_options(
     handle: &ConnectionHandle,
 ) -> Option<(Option<String>, Option<Vec<NormalizedDocumentFilter>>)> {
+    if let Some(options) = handle
+        .raw_diagnostic_provider()
+        .and_then(raw_workspace_diagnostic_options)
+    {
+        return Some(options);
+    }
     match handle
         .server_capabilities()
         .and_then(|capabilities| capabilities.diagnostic_provider.as_ref())
@@ -477,7 +483,13 @@ fn static_workspace_diagnostic_options(
 fn dynamic_workspace_diagnostic_options(
     registration: &Registration,
 ) -> Option<(Option<String>, Option<Vec<NormalizedDocumentFilter>>)> {
-    let options = registration.register_options.as_ref()?.as_object()?;
+    raw_workspace_diagnostic_options(registration.register_options.as_ref()?)
+}
+
+fn raw_workspace_diagnostic_options(
+    value: &serde_json::Value,
+) -> Option<(Option<String>, Option<Vec<NormalizedDocumentFilter>>)> {
+    let options = value.as_object()?;
     if options
         .get("workspaceDiagnostics")
         .and_then(serde_json::Value::as_bool)
@@ -3428,6 +3440,33 @@ mod tests {
             "vscode-remote://ssh-remote+two/workspace/main.rs",
             Some("rust")
         ));
+    }
+
+    #[tokio::test]
+    async fn static_diagnostic_selector_accepts_raw_relative_patterns() {
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("diagnostics"),
+        )
+        .await;
+        handle.set_raw_diagnostic_provider(serde_json::json!({
+            "workspaceDiagnostics": true,
+            "interFileDependencies": true,
+            "documentSelector": [{
+                "language": "rust",
+                "scheme": "file",
+                "pattern": {
+                    "baseUri": "file:///workspace/nested",
+                    "pattern": "*.rs"
+                }
+            }]
+        }));
+
+        let (_, selector) = static_workspace_diagnostic_options(&handle)
+            .expect("raw static relative pattern must remain a provider");
+        let filter = &selector.expect("selector must be preserved")[0];
+        assert!(filter.applies_to("file:///workspace/nested/main.rs", Some("rust")));
+        assert!(!filter.applies_to("file:///workspace/other/main.rs", Some("rust")));
     }
 
     #[tokio::test]

@@ -143,6 +143,7 @@ pub(crate) struct ConnectionHandle {
     /// Server capabilities from the initialize response, used to skip unsupported
     /// requests. `OnceLock` for set-once/read-many.
     server_capabilities: OnceLock<ServerCapabilities>,
+    raw_diagnostic_provider: OnceLock<serde_json::Value>,
     /// Whether the downstream is currently eligible for Kakehashi's
     /// bridge-routing protocol. This starts false, is set from the initialize
     /// advertisement, and may be cleared after a downstream MethodNotFound.
@@ -275,6 +276,7 @@ impl ConnectionHandle {
             // which is pre-registered before spawning the reader task.
             next_request_id: AtomicI64::new(2),
             server_capabilities: OnceLock::new(),
+            raw_diagnostic_provider: OnceLock::new(),
             bridge_routing: AtomicBool::new(false),
             type_hierarchy_provider: AtomicBool::new(false),
             dynamic_capabilities,
@@ -662,6 +664,14 @@ impl ConnectionHandle {
     /// compile-time-safe capability checks.
     pub(crate) fn server_capabilities(&self) -> Option<&ServerCapabilities> {
         self.server_capabilities.get()
+    }
+
+    pub(crate) fn set_raw_diagnostic_provider(&self, provider: serde_json::Value) {
+        let _ = self.raw_diagnostic_provider.set(provider);
+    }
+
+    pub(crate) fn raw_diagnostic_provider(&self) -> Option<&serde_json::Value> {
+        self.raw_diagnostic_provider.get()
     }
 
     pub(crate) fn semantic_tokens_legend(&self) -> Option<&SemanticTokensLegend> {
