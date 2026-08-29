@@ -194,6 +194,11 @@ impl DynamicCapabilityRegistry {
             .store(true, Ordering::Release);
     }
 
+    pub(crate) fn mark_workspace_diagnostic_pull_aborted(&self) {
+        self.workspace_diagnostic_pull_active
+            .store(false, Ordering::Release);
+    }
+
     pub(crate) fn take_workspace_diagnostic_registration_refresh(&self) -> bool {
         self.workspace_diagnostic_registration_refresh_pending
             .swap(false, Ordering::AcqRel)
@@ -677,6 +682,17 @@ mod tests {
 
         assert!(registry.request_or_defer_workspace_diagnostic_registration_refresh());
         assert!(!registry.take_workspace_diagnostic_registration_refresh());
+    }
+
+    #[test]
+    fn aborted_cold_pull_does_not_release_its_deferred_refresh() {
+        let registry = DynamicCapabilityRegistry::new();
+        registry.mark_workspace_diagnostic_pull_active();
+        assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
+
+        registry.mark_workspace_diagnostic_pull_aborted();
+
+        assert!(registry.take_workspace_diagnostic_registration_refresh());
     }
 
     #[test]

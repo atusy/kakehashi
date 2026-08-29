@@ -58,7 +58,6 @@ struct CompletedDiagnosticProducer {
 
 struct WorkspaceDiagnosticPullGuard {
     handles: Arc<std::sync::Mutex<Vec<Arc<ConnectionHandle>>>>,
-    upstream_tx: tokio::sync::mpsc::UnboundedSender<crate::lsp::bridge::UpstreamNotification>,
 }
 
 impl Drop for WorkspaceDiagnosticPullGuard {
@@ -68,14 +67,9 @@ impl Drop for WorkspaceDiagnosticPullGuard {
             .lock()
             .recover_poison("WorkspaceDiagnosticPullGuard::drop");
         for handle in handles.iter() {
-            if handle
+            handle
                 .dynamic_capabilities()
-                .mark_workspace_diagnostic_pull_completed()
-            {
-                let _ = self
-                    .upstream_tx
-                    .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
-            }
+                .mark_workspace_diagnostic_pull_aborted();
         }
     }
 }
@@ -1005,7 +999,6 @@ impl LanguageServerPool {
         let acquired_handles = Arc::new(std::sync::Mutex::new(Vec::new()));
         let _pull_guard = WorkspaceDiagnosticPullGuard {
             handles: Arc::clone(&acquired_handles),
-            upstream_tx: self.upstream_tx(),
         };
         let on_acquired = |handle: &Arc<ConnectionHandle>| {
             let mut handles = acquired_handles
@@ -1676,6 +1669,34 @@ mod tests {
             !handle
                 .dynamic_capabilities()
                 .request_or_defer_workspace_diagnostic_registration_refresh()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_cold_pull_guard_preserves_the_deferred_refresh() {
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("aborted-cold"),
+        )
+        .await;
+        handle
+            .dynamic_capabilities()
+            .mark_workspace_diagnostic_pull_active();
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .request_or_defer_workspace_diagnostic_registration_refresh()
+        );
+
+        drop(WorkspaceDiagnosticPullGuard {
+            handles: Arc::new(std::sync::Mutex::new(vec![Arc::clone(&handle)])),
+        });
+
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .take_workspace_diagnostic_registration_refresh(),
+            "an aborted pull must not consume the deferred registration refresh"
         );
     }
 
