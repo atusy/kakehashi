@@ -1206,12 +1206,23 @@ impl Kakehashi {
             return Ok(None);
         }
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        let documents = std::sync::Arc::clone(&self.documents);
         let result = dispatch_host_preferred(
             &ctx,
             self.bridge.pool_arc(),
             move |task: HostFanOutTask| {
                 let params = raw_params.clone();
+                let documents = std::sync::Arc::clone(&documents);
                 async move {
+                    let host_uri = task.uri.clone();
+                    let revision_text_reader: crate::lsp::bridge::HostTextReader =
+                        std::sync::Arc::new(move || {
+                            documents.get(&host_uri).and_then(|document| {
+                                (document.incarnation() == incarnation
+                                    && document.content_version() == content_version)
+                                    .then(|| (document.text_arc(), content_version))
+                            })
+                        });
                     task.pool
                         .send_host_semantic_tokens_range_request(
                             &task.server_name,
@@ -1226,6 +1237,7 @@ impl Kakehashi {
                             range,
                             task.upstream_id,
                             incarnation,
+                            revision_text_reader,
                         )
                         .await
                 }
@@ -1238,7 +1250,9 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        let tokens = self.host_layer_result(result, &ctx, METHOD, |won| won).await?;
+        let tokens = self
+            .host_layer_result(result, &ctx, METHOD, |won| won)
+            .await?;
         if !self.semantic_range_snapshot_is_current(lsp_uri, incarnation, content_version) {
             return Ok(None);
         }

@@ -14,13 +14,13 @@ use crate::analysis::{LEGEND_MODIFIERS, LEGEND_TYPES};
 use crate::config::settings::BridgeServerConfig;
 use crate::text::PositionMapper;
 
-use super::super::HostDocument;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     host_position_within_region_bounds, response_has_jsonrpc_error,
     translate_host_range_to_virtual, translate_virtual_position_to_host, virtual_uri_to_lsp_uri,
 };
+use super::super::{HostDocument, HostTextReader};
 
 const RANGE_METHOD: &str = "textDocument/semanticTokens/range";
 
@@ -35,9 +35,10 @@ impl LanguageServerPool {
         host_range: Range,
         upstream_request_id: Option<UpstreamId>,
         expected_incarnation: u64,
+        revision_text_reader: HostTextReader,
     ) -> io::Result<Option<SemanticTokens>> {
         let Some(raw) = self
-            .send_host_raw_request_for_incarnation(
+            .send_host_raw_request_for_revision(
                 server_name,
                 server_config,
                 document,
@@ -45,6 +46,7 @@ impl LanguageServerPool {
                 params,
                 upstream_request_id,
                 expected_incarnation,
+                revision_text_reader,
             )
             .await?
         else {
