@@ -2900,6 +2900,7 @@ impl LanguageServerPool {
     /// fallback, including documents outside the client workspace. Only a
     /// distinct key guarantees that workspace-wide results cannot depend on
     /// document-open history.
+    #[cfg(test)]
     pub(super) async fn get_or_create_workspace_connection_wait_ready_admitted(
         &self,
         server_name: &str,
