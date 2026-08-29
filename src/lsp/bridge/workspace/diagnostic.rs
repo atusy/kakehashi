@@ -392,6 +392,7 @@ impl NormalizedDocumentFilter {
             return false;
         }
         self.pattern.as_deref().is_none_or(|pattern| {
+            let uri_path = percent_encoding::percent_decode_str(uri.path()).decode_utf8_lossy();
             let candidate = if let Some(base_uri) = self.pattern_base_uri.as_deref() {
                 let Ok(base_uri) = url::Url::parse(base_uri) else {
                     return false;
@@ -404,8 +405,10 @@ impl NormalizedDocumentFilter {
                 {
                     return false;
                 }
-                let base = base_uri.path().trim_end_matches('/');
-                let Some(relative) = uri.path().strip_prefix(base) else {
+                let base_path =
+                    percent_encoding::percent_decode_str(base_uri.path()).decode_utf8_lossy();
+                let base = base_path.trim_end_matches('/');
+                let Some(relative) = uri_path.strip_prefix(base) else {
                     return false;
                 };
                 let Some(relative) = relative.strip_prefix('/') else {
@@ -413,7 +416,7 @@ impl NormalizedDocumentFilter {
                 };
                 relative
             } else {
-                uri.path()
+                uri_path.as_ref()
             };
             globset::GlobBuilder::new(pattern)
                 .literal_separator(true)
@@ -3413,6 +3416,26 @@ mod tests {
 
         assert!(filter.applies_to("file:///workspace/nested/main.rs", Some("rust")));
         assert!(!filter.applies_to("file:///workspace/nested/deeper/main.rs", Some("rust")));
+    }
+
+    #[test]
+    fn document_selector_decodes_absolute_and_relative_uri_paths() {
+        let absolute = NormalizedDocumentFilter {
+            language: None,
+            scheme: Some("file".into()),
+            pattern: Some("**/my file.rs".into()),
+            pattern_base_uri: None,
+        };
+        let relative = NormalizedDocumentFilter {
+            language: None,
+            scheme: Some("file".into()),
+            pattern: Some("my file.rs".into()),
+            pattern_base_uri: Some("file:///workspace".into()),
+        };
+        let uri = "file:///workspace/my%20file.rs";
+
+        assert!(absolute.applies_to(uri, None));
+        assert!(relative.applies_to(uri, None));
     }
 
     #[test]
