@@ -24,6 +24,11 @@ impl Kakehashi {
             upstream_id.clone(),
         );
         let admit = || self.settings_manager.settings_generation() == settings_generation;
+        let language_for_uri = |uri: &str| {
+            url::Url::parse(uri)
+                .ok()
+                .and_then(|uri| self.document_language(&uri))
+        };
         let dispatch = pool.dispatch_workspace_diagnostic_cancellable(
             params,
             &settings,
@@ -31,6 +36,7 @@ impl Kakehashi {
             &admit,
             workspace_generation,
             self.bridge.cancel_forwarder(),
+            &language_for_uri,
         );
         match cancel_rx {
             Some(rx) => tokio::select! {
