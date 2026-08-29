@@ -21,7 +21,7 @@
 //! ```
 //!
 //! `root_tag` is the rooting mode; `root` is the marker root URI, empty for the
-//! two root-less modes; `command` is the downstream's own id, taken as the
+//! root-less modes; `command` is the downstream's own id, taken as the
 //! `splitn(4)` remainder so it needs no constraint at all.
 //!
 //! Encoding is stateless (no cross-request registry to populate or evict) and
@@ -77,6 +77,7 @@ const SEP: char = '|';
 /// workspace.
 const TAG_MARKER: &str = "m";
 const TAG_CLIENT_FALLBACK: &str = "c";
+const TAG_WORKSPACE: &str = "w";
 const TAG_SHARED: &str = "s";
 
 /// A decoded bridge command name: the connection to run on, and the
@@ -135,6 +136,8 @@ pub(crate) fn encode_command(key: &ConnectionKey, command: &str) -> String {
         (TAG_MARKER, root)
     } else if key.is_shared() {
         (TAG_SHARED, "")
+    } else if key.is_workspace() {
+        (TAG_WORKSPACE, "")
     } else {
         (TAG_CLIENT_FALLBACK, "")
     };
@@ -165,6 +168,7 @@ pub(crate) fn decode_command(name: &str) -> Option<CommandRoute<'_>> {
     let key = match tag {
         TAG_MARKER if !root.is_empty() => ConnectionKey::new(server, Some(root)),
         TAG_CLIENT_FALLBACK if root.is_empty() => ConnectionKey::new(server, None),
+        TAG_WORKSPACE if root.is_empty() => ConnectionKey::workspace(server),
         TAG_SHARED if root.is_empty() => ConnectionKey::shared(server),
         _ => return None,
     };
@@ -189,12 +193,13 @@ mod tests {
     }
 
     #[test]
-    fn the_three_rooting_modes_round_trip_distinctly() {
+    fn the_four_rooting_modes_round_trip_distinctly() {
         // Each mode is a different downstream process. Collapsing any pair would
         // run the command in the wrong workspace.
         for key in [
             marker_key("tsgo", "file:///repo/a"),
             ConnectionKey::new("tsgo", None),
+            ConnectionKey::workspace("tsgo"),
             ConnectionKey::shared("tsgo"),
         ] {
             let encoded = encode_command(&key, "cmd");
