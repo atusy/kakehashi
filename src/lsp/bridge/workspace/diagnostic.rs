@@ -1,6 +1,6 @@
 //! Workspace-diagnostic fan-out with deterministic full-report aggregation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 #[cfg(test)]
 use std::future::Future;
 use std::io;
@@ -104,9 +104,20 @@ fn reconcile_overlapping_root_reports(
             .then_some(root_segments.len())
     }
 
-    let reports = reports.into_iter().collect::<Vec<_>>();
+    let reports = reports
+        .into_iter()
+        .map(|report| {
+            let reported_uris = report
+                .report
+                .items
+                .iter()
+                .map(|item| item_uri(item).to_owned())
+                .collect::<HashSet<_>>();
+            (report, reported_uris)
+        })
+        .collect::<Vec<_>>();
     let mut preferred_roots = BTreeMap::new();
-    for report in &reports {
+    for (report, _) in &reports {
         for item in &report.report.items {
             let uri = item_uri(item);
             let key = (
@@ -117,16 +128,12 @@ fn reconcile_overlapping_root_reports(
             // Coverage belongs to every matching producer, including one that
             // returned no item for this URI. Otherwise an empty child-root
             // report cannot suppress a stale parent-root diagnostic.
-            for producer in reports.iter().filter(|producer| {
+            for (producer, reported_uris) in reports.iter().filter(|(producer, _)| {
                 producer.server == report.server
                     && producer.provider_identifiers == report.provider_identifiers
             }) {
                 let containing_depth = containing_root_depth(producer.spawn_root.as_deref(), uri);
-                let producer_reported_uri = producer
-                    .report
-                    .items
-                    .iter()
-                    .any(|item| item_uri(item) == uri);
+                let producer_reported_uri = reported_uris.contains(uri);
                 if containing_depth.is_none() && !producer_reported_uri {
                     continue;
                 }
@@ -148,7 +155,7 @@ fn reconcile_overlapping_root_reports(
     }
     reports
         .into_iter()
-        .flat_map(|report| {
+        .flat_map(|(report, _)| {
             report
                 .report
                 .items
