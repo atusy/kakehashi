@@ -18,8 +18,8 @@ use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::error::LockResultExt;
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::pool::{
-    ConnectionHandle, ConnectionState, INIT_TIMEOUT_SECS, LanguageServerPool, UpstreamId,
-    VirtualUriObserver,
+    ConfirmedDocumentRevision, ConnectionHandle, ConnectionState, INIT_TIMEOUT_SECS,
+    LanguageServerPool, UpstreamId, VirtualUriObserver,
 };
 use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
 use crate::lsp::bridge::{BridgeCoordinator, ConnectionKey};
@@ -455,6 +455,20 @@ impl LanguageServerPool {
             && self.document_connection_generation(key) == expected_generation
     }
 
+    async fn workspace_symbol_projection_fence_is_live(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        expected_generation: u64,
+        expected_revisions: &HashMap<String, ConfirmedDocumentRevision>,
+    ) -> bool {
+        self.workspace_symbol_producer_is_live(handle, expected_generation)
+            .await
+            && self
+                .confirmed_virtual_document_revisions_for_connection(handle.key())
+                .await
+                == *expected_revisions
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn dispatch_workspace_symbol_projected(
         &self,
@@ -519,11 +533,13 @@ impl LanguageServerPool {
             .collect();
         servers.sort_by(|a, b| a.0.cmp(&b.0));
         let producer_scopes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let projection_fences = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let requests = servers.into_iter().map(|(name, config)| {
             let params = params.clone();
             let upstream_id = upstream_id.clone();
             let producer_scopes = Arc::clone(&producer_scopes);
+            let projection_fences = Arc::clone(&projection_fences);
             async move {
                 let Ok((handles, workspace_generation)) = self
                     .get_or_create_workspace_connections_wait_ready_admitted(
@@ -546,6 +562,7 @@ impl LanguageServerPool {
                     let upstream_id = upstream_id.clone();
                     let name = name.clone();
                     let producer_scopes = Arc::clone(&producer_scopes);
+                    let projection_fences = Arc::clone(&projection_fences);
                     async move {
                         if !handle.has_capability(SYMBOL_METHOD) {
                             return Err(());
@@ -568,6 +585,16 @@ impl LanguageServerPool {
                         let confirmed_revisions = self
                             .confirmed_virtual_document_revisions_for_connection(handle.key())
                             .await;
+                        if projection_context.is_some() {
+                            projection_fences
+                                .lock()
+                                .recover_poison("workspace symbol projection fences")
+                                .push((
+                                    Arc::clone(&handle),
+                                    generation,
+                                    confirmed_revisions.clone(),
+                                ));
+                        }
                         let virtual_versions = confirmed_revisions
                             .iter()
                             .map(|(uri, revision)| (uri.clone(), revision.version))
@@ -662,6 +689,19 @@ impl LanguageServerPool {
             .any(|(handle, expected)| handle.workspace_folders().generation() != *expected)
         {
             return None;
+        }
+        let projection_fences = std::mem::take(
+            &mut *projection_fences
+                .lock()
+                .recover_poison("workspace symbol projection fences"),
+        );
+        for (handle, generation, revisions) in projection_fences {
+            if !self
+                .workspace_symbol_projection_fence_is_live(&handle, generation, &revisions)
+                .await
+            {
+                return None;
+            }
         }
         if symbols.is_empty() {
             return None;
@@ -1052,6 +1092,43 @@ mod tests {
             .await
             .is_none(),
             "a response from the prior virtual-document version must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_projection_fence_rejects_a_late_host_identity_change() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("symbols");
+        let handle = create_handle_advertising_workspace_symbols(key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host = url::Url::parse("file:///workspace/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "lua",
+            "01ARZ3NDEKTSV4RRFFQ69G5LATE",
+        );
+        pool.register_opened_document(&host, &virtual_uri, &key)
+            .await;
+        pool.record_sent_content_fingerprint(&virtual_uri, &key, "same", 1, Some((1, 1)))
+            .await;
+        let generation = pool.document_connection_generation(&key);
+        let revisions = pool
+            .confirmed_virtual_document_revisions_for_connection(&key)
+            .await;
+
+        assert!(
+            pool.refresh_confirmed_host_identity_if_content_unchanged(
+                &virtual_uri,
+                &key,
+                "same",
+                (1, 2),
+            )
+            .await
+        );
+        assert!(
+            !pool
+                .workspace_symbol_projection_fence_is_live(&handle, generation, &revisions)
+                .await
         );
     }
 
