@@ -88,8 +88,11 @@ impl VirtualUriProvenance {
             .mutation
             .write()
             .recover_poison("VirtualUriProvenance::mutation");
+        let was_visible = self.contains(&uri);
         self.queued.insert(uri);
-        self.revision.fetch_add(1, Ordering::AcqRel);
+        if !was_visible {
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     fn rollback_queued(&self, uri: &str) {
@@ -2874,6 +2877,23 @@ mod tests {
 
         assert!(observer.contains(&virtual_uri.to_uri_string()));
         assert_eq!(observer.provenance_revision(), queued_revision);
+    }
+
+    #[test]
+    fn requeueing_visible_provenance_does_not_advance_visibility_revision() {
+        let provenance = VirtualUriProvenance::default();
+        let uri = "file:///project/reopened.lua".to_owned();
+        provenance.insert_queued(uri.clone());
+        let queued_revision = provenance.revision.load(Ordering::Acquire);
+
+        provenance.insert_queued(uri.clone());
+        assert_eq!(provenance.revision.load(Ordering::Acquire), queued_revision);
+
+        provenance.confirm(uri.clone());
+        provenance.rollback_queued(&uri);
+        let issued_revision = provenance.revision.load(Ordering::Acquire);
+        provenance.insert_queued(uri);
+        assert_eq!(provenance.revision.load(Ordering::Acquire), issued_revision);
     }
 
     #[tokio::test]
