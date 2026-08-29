@@ -61,6 +61,25 @@ impl WorkspaceDiagnosticServerCancelled {
             data: self.data.clone(),
         }
     }
+
+    pub(crate) fn retrigger_request(&self) -> bool {
+        self.data
+            .as_ref()
+            .and_then(|data| data.get("retriggerRequest"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn require_retrigger_request(&mut self) {
+        match self.data.as_mut() {
+            Some(serde_json::Value::Object(data)) => {
+                data.insert("retriggerRequest".to_owned(), serde_json::Value::Bool(true));
+            }
+            _ => {
+                self.data = Some(serde_json::json!({ "retriggerRequest": true }));
+            }
+        }
+    }
 }
 
 pub(crate) fn map_workspace_diagnostic_error(
