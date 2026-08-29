@@ -596,31 +596,55 @@ impl Kakehashi {
         let retry_tracking = tracking.clone();
         let outcome = self
             .semantic_tokens_full_impl_with_tracking_once(params, tracking, direct_request)
-            .await?;
+            .await;
+        let retry_after_snapshot_publication = || {
+            retryable_snapshot.is_some_and(
+                |(incarnation, content_version, generation, initial_tree_present)| {
+                    self.cache.semantic_token_generation() == generation
+                        && self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                            view.slot.current_incarnation == incarnation
+                                && view.content_version == content_version
+                                && semantic_snapshot_state_advanced(
+                                    initial_tree_present,
+                                    view.slot
+                                        .snapshot
+                                        .as_ref()
+                                        .map(|snapshot| snapshot.tree.is_some()),
+                                )
+                        })
+                        && retry_tracking.as_ref().is_some_and(|(request_id, cancel)| {
+                            !cancel.is_cancelled()
+                                && self.cache.is_request_active(&uri, *request_id)
+                        })
+                },
+            )
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error)
+                if error.code == crate::error::content_modified_error().code
+                    && retry_after_snapshot_publication() =>
+            {
+                let outcome = self
+                    .semantic_tokens_full_impl_with_tracking_once(
+                        retry_params,
+                        retry_tracking,
+                        direct_request,
+                    )
+                    .await;
+                request_guard.finish();
+                return outcome;
+            }
+            Err(error) => {
+                request_guard.finish();
+                return Err(error);
+            }
+        };
         if outcome.is_some() {
             request_guard.finish();
             return Ok(outcome);
         }
-        let retry_after_snapshot_publication = retryable_snapshot.is_some_and(
-            |(incarnation, content_version, generation, initial_tree_present)| {
-                self.cache.semantic_token_generation() == generation
-                    && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                        view.slot.current_incarnation == incarnation
-                            && view.content_version == content_version
-                            && semantic_snapshot_state_advanced(
-                                initial_tree_present,
-                                view.slot
-                                    .snapshot
-                                    .as_ref()
-                                    .map(|snapshot| snapshot.tree.is_some()),
-                            )
-                    })
-                    && retry_tracking.as_ref().is_some_and(|(request_id, cancel)| {
-                        !cancel.is_cancelled() && self.cache.is_request_active(&uri, *request_id)
-                    })
-            },
-        );
-        if !retry_after_snapshot_publication {
+        if !retry_after_snapshot_publication() {
             request_guard.finish();
             return Ok(None);
         }
@@ -661,10 +685,17 @@ impl Kakehashi {
             self.resolve_layer_config(language, METHOD)
                 .allows(LayerSource::Virt)
         });
-        let actionable_virtual = virtual_enabled
-            && document_language.as_ref().is_some_and(|language| {
-                self.semantic_tokens_full_has_potential_virtual_producer(language)
-            });
+        let actionable_virtual = if virtual_enabled {
+            match document_language.as_deref() {
+                Some(language) => {
+                    self.semantic_tokens_full_has_potential_virtual_producer(language)
+                        .await
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
         let non_native_only = layer_config.as_ref().is_some_and(|layers| {
             !layers.priorities.is_empty() && !layers.allows(LayerSource::Native)
         });
@@ -1637,14 +1668,29 @@ impl Kakehashi {
         }
         candidates.sort();
         candidates.dedup();
-        candidates.into_iter().any(|injection_language| {
-            let configs =
-                self.bridge_configs_for_injection_language(host_language, &injection_language);
-            if configs.is_empty() {
-                return false;
-            }
-            let aggregation =
-                self.resolve_aggregation_config(host_language, &injection_language, METHOD);
+        let plans = candidates
+            .into_iter()
+            .filter_map(|injection_language| {
+                let configs =
+                    self.bridge_configs_for_injection_language(host_language, &injection_language);
+                if configs.is_empty() {
+                    return None;
+                }
+                let aggregation =
+                    self.resolve_aggregation_config(host_language, &injection_language, METHOD);
+                Some((configs, aggregation))
+            })
+            .collect::<Vec<_>>();
+        let server_names = plans
+            .iter()
+            .flat_map(|(configs, _)| configs.iter().map(|config| config.server_name.as_str()))
+            .collect::<std::collections::HashSet<_>>();
+        let incapable = self
+            .bridge
+            .pool()
+            .servers_known_incapable(&server_names, METHOD)
+            .await;
+        plans.into_iter().any(|(configs, aggregation)| {
             semantic_configs_select_servers(
                 &aggregation.priorities,
                 &configs,
