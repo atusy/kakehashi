@@ -2893,7 +2893,10 @@ mod tests {
         .await
         .expect("inactive virtual work must not trigger the first-parse backstop")
         .expect("semantic tokens delta should return without error");
-        assert!(result.is_none(), "no host server is configured: {result:?}");
+        assert!(
+            matches!(result, Some(SemanticTokensFullDeltaResult::Tokens(ref tokens)) if tokens.data.is_empty()),
+            "no eligible host producer must clear the previous overlay: {result:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
