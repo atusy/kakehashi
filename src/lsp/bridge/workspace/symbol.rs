@@ -2117,6 +2117,14 @@ mod tests {
         assert!(handles.iter().any(|handle| Arc::ptr_eq(handle, &root_a)));
         assert!(handles.iter().any(|handle| Arc::ptr_eq(handle, &root_b)));
         assert!(!handles.iter().any(|handle| Arc::ptr_eq(handle, &shared)));
+        assert_eq!(
+            shared.workspace_folders().snapshot().unwrap(),
+            vec![WorkspaceFolder {
+                uri: Uri::from_str("file:///outside").unwrap(),
+                name: "outside".into(),
+            }],
+            "rejecting the shared producer must not widen its folder scope"
+        );
     }
 
     #[tokio::test]
@@ -2160,6 +2168,14 @@ mod tests {
         assert_eq!(handles.len(), 1);
         assert!(Arc::ptr_eq(&handles[0], &fallback));
         assert!(!handles.iter().any(|handle| Arc::ptr_eq(handle, &shared)));
+        assert_eq!(
+            shared.workspace_folders().snapshot().unwrap(),
+            vec![WorkspaceFolder {
+                uri: Uri::from_str("file:///outside").unwrap(),
+                name: "outside".into(),
+            }],
+            "workspace search must not announce client roots onto a rejected producer"
+        );
     }
 
     #[tokio::test]
