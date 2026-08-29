@@ -1768,12 +1768,12 @@ async fn serve_lsp() {
     // 1. Capture upstream request IDs (for ls-bridge-server-pool-coordination bridge requests)
     // 2. Forward $/cancelRequest notifications to downstream servers
     let service = kakehashi::lsp::ProtocolResponsePatch::new(service);
-    let service = RequestIdCapture::with_cancel_forwarder(service, cancel_forwarder);
+    let service = RequestIdCapture::with_cancel_forwarder(service, cancel_forwarder.clone());
 
     // Outermost: assign per-document sequence tickets in wire order so
     // didChange/didClose apply strictly ordered and semanticTokens requests
     // observe every edit that preceded them on the wire (#342).
-    let service = IngressOrderGate::new(service);
+    let service = IngressOrderGate::with_cancel_forwarder(service, cancel_forwarder);
 
     // Lift tower-lsp's default 4-message `buffer_unordered` cap: editors fire
     // bursts of concurrent requests per keystroke (Neovim: semanticTokens +

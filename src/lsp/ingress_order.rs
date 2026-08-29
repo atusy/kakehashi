@@ -439,6 +439,7 @@ pub struct IngressOrderGate<S> {
     inner: S,
     sequencer: Arc<DocumentSequencer>,
     workspace_diagnostic_sequencer: Arc<DocumentSequencer>,
+    cancel_forwarder: Option<crate::lsp::request_id::CancelForwarder>,
 }
 
 impl<S> IngressOrderGate<S> {
@@ -447,6 +448,19 @@ impl<S> IngressOrderGate<S> {
             inner,
             sequencer: Arc::new(DocumentSequencer::default()),
             workspace_diagnostic_sequencer: Arc::new(DocumentSequencer::default()),
+            cancel_forwarder: None,
+        }
+    }
+
+    pub fn with_cancel_forwarder(
+        inner: S,
+        cancel_forwarder: crate::lsp::request_id::CancelForwarder,
+    ) -> Self {
+        Self {
+            inner,
+            sequencer: Arc::new(DocumentSequencer::default()),
+            workspace_diagnostic_sequencer: Arc::new(DocumentSequencer::default()),
+            cancel_forwarder: Some(cancel_forwarder),
         }
     }
 }
@@ -467,6 +481,7 @@ where
 
     fn call(&mut self, req: Request) -> Self::Future {
         let role = classify(&req);
+        let request_id = req.id().cloned();
         // The inner call must stay synchronous inside `call` so nested
         // middleware (e.g. RequestIdCapture) keeps seeing wire order too.
         let inner_fut = self.inner.call(req);
@@ -476,8 +491,41 @@ where
                 let mut gate = self
                     .workspace_diagnostic_sequencer
                     .issue_writer_ticket("workspace/diagnostic");
+                let cancellation = self.cancel_forwarder.as_ref().and_then(|forwarder| {
+                    let upstream_id = match request_id.as_ref()? {
+                        tower_lsp_server::jsonrpc::Id::Number(id) => {
+                            crate::lsp::bridge::UpstreamId::Number(*id)
+                        }
+                        tower_lsp_server::jsonrpc::Id::String(id) => {
+                            crate::lsp::bridge::UpstreamId::String(id.clone())
+                        }
+                        tower_lsp_server::jsonrpc::Id::Null => return None,
+                    };
+                    forwarder
+                        .subscribe(upstream_id.clone())
+                        .ok()
+                        .map(|receiver| (forwarder.clone(), upstream_id, receiver))
+                });
                 Box::pin(async move {
-                    gate.wait_turn().await;
+                    if let Some((forwarder, upstream_id, mut cancel_rx)) = cancellation {
+                        tokio::select! {
+                            _ = gate.wait_turn() => {}
+                            _ = &mut cancel_rx => {
+                                forwarder.unsubscribe(&upstream_id);
+                                drop(inner_fut);
+                                drop(gate);
+                                return Ok(request_id.map(|id| {
+                                    Response::from_error(
+                                        id,
+                                        tower_lsp_server::jsonrpc::Error::request_cancelled(),
+                                    )
+                                }));
+                            }
+                        }
+                        forwarder.unsubscribe(&upstream_id);
+                    } else {
+                        gate.wait_turn().await;
+                    }
                     let result = inner_fut.await;
                     drop(gate);
                     result
@@ -1144,6 +1192,61 @@ mod tests {
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["reader", "reader"]
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_workspace_diagnostic_leaves_the_ingress_queue() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let forwarder = crate::lsp::request_id::CancelForwarder::new(Arc::new(
+            crate::lsp::bridge::LanguageServerPool::new(),
+        ));
+        let inner = crate::lsp::request_id::RequestIdCapture::with_cancel_forwarder(
+            MockInner {
+                log,
+                stall_method: "workspace/diagnostic",
+                release: Some(release_rx),
+            },
+            forwarder.clone(),
+        );
+        let mut gate = IngressOrderGate::with_cancel_forwarder(inner, forwarder);
+
+        let first_fut = gate.call(
+            Request::build("workspace/diagnostic")
+                .id(1)
+                .params(serde_json::json!({}))
+                .finish(),
+        );
+        let second_fut = gate.call(
+            Request::build("workspace/diagnostic")
+                .id(2)
+                .params(serde_json::json!({}))
+                .finish(),
+        );
+        let mut first = tokio_test::task::spawn(first_fut);
+        let mut second = tokio_test::task::spawn(second_fut);
+        assert!(first.poll().is_pending());
+        assert!(second.poll().is_pending());
+
+        gate.call(
+            Request::build("$/cancelRequest")
+                .params(serde_json::json!({ "id": 2 }))
+                .finish(),
+        )
+        .await
+        .unwrap();
+
+        let Poll::Ready(Ok(Some(response))) = second.poll() else {
+            panic!("the cancelled request must retire without waiting for its predecessor");
+        };
+        assert_eq!(response.id(), &tower_lsp_server::jsonrpc::Id::Number(2));
+        assert_eq!(
+            response.error().expect("request must fail").code,
+            tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled
+        );
+
+        release_tx.send(()).expect("first pull is waiting");
+        assert!(first.poll().is_ready());
     }
 
     #[tokio::test]
