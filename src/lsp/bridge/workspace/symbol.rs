@@ -1884,7 +1884,7 @@ mod tests {
     #[tokio::test]
     async fn search_waits_for_an_existing_initializing_producer() {
         let pool = Arc::new(LanguageServerPool::new());
-        let key = ConnectionKey::for_server("symbols");
+        let key = ConnectionKey::workspace("symbols");
         let producer = create_handle_advertising_workspace_symbols_with_state(
             ConnectionState::Initializing,
             key.clone(),
@@ -1963,7 +1963,7 @@ mod tests {
             create_handle_advertising_workspace_symbols(ConnectionKey::shared("symbols")).await;
         record_test_spawn_root(&shared, "file:///workspace/project-a");
         let fallback =
-            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+            create_handle_advertising_workspace_symbols(ConnectionKey::workspace("symbols")).await;
         pool.connections().await.extend([
             (shared.key().clone(), Arc::clone(&shared)),
             (fallback.key().clone(), Arc::clone(&fallback)),
@@ -2035,7 +2035,7 @@ mod tests {
         pool.set_root_uri(Some(folder_a.uri.to_string()));
         pool.set_workspace_folders(Some(vec![folder_a, folder_b]));
         let fallback =
-            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+            create_handle_advertising_workspace_symbols(ConnectionKey::workspace("symbols")).await;
         record_test_spawn_root(&fallback, root_a.as_str());
         let secondary = create_handle_advertising_workspace_symbols(ConnectionKey::new(
             "symbols",
@@ -2143,7 +2143,7 @@ mod tests {
                 name: "outside".into(),
             }]));
         let root_a =
-            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+            create_handle_advertising_workspace_symbols(ConnectionKey::workspace("symbols")).await;
         record_test_spawn_root(&root_a, "file:///workspace/a");
         let root_b = create_handle_advertising_workspace_symbols(ConnectionKey::new(
             "symbols",
@@ -2201,7 +2201,7 @@ mod tests {
                 name: "outside".into(),
             }]));
         let fallback =
-            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+            create_handle_advertising_workspace_symbols(ConnectionKey::workspace("symbols")).await;
         record_test_spawn_root(&fallback, "file:///workspace/client");
         pool.connections().await.extend([
             (shared.key().clone(), Arc::clone(&shared)),
@@ -2294,7 +2294,7 @@ mod tests {
         pool.set_root_uri(Some(folder_a.uri.to_string()));
         pool.set_workspace_folders(Some(vec![folder_a, folder_b]));
         let root_a =
-            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+            create_handle_advertising_workspace_symbols(ConnectionKey::workspace("symbols")).await;
         record_test_spawn_root(&root_a, "file:///workspace/a");
         let root_b = create_handle_advertising_workspace_symbols(ConnectionKey::new(
             "symbols",
@@ -2416,18 +2416,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_isolates_workspace_results_from_shared_document_history() {
+    async fn search_isolates_workspace_results_from_markerless_document_history() {
         let pool = Arc::new(LanguageServerPool::new());
         seed_test_client_root(&pool, "file:///workspace");
-        let shared =
-            create_handle_advertising_workspace_symbols(ConnectionKey::shared("symbols")).await;
-        record_test_spawn_root(&shared, "file:///workspace");
-        let fallback =
+        let document_producer =
             create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
-        record_test_spawn_root(&fallback, "file:///workspace");
+        record_test_spawn_root(&document_producer, "file:///workspace");
+        let workspace_producer =
+            create_handle_advertising_workspace_symbols(ConnectionKey::workspace("symbols")).await;
+        record_test_spawn_root(&workspace_producer, "file:///workspace");
         pool.connections().await.extend([
-            (shared.key().clone(), Arc::clone(&shared)),
-            (fallback.key().clone(), Arc::clone(&fallback)),
+            (
+                document_producer.key().clone(),
+                Arc::clone(&document_producer),
+            ),
+            (
+                workspace_producer.key().clone(),
+                Arc::clone(&workspace_producer),
+            ),
         ]);
         let outside_host = url::Url::parse("file:///outside/history.md").unwrap();
         let outside_virtual = VirtualDocumentUri::new(
@@ -2435,7 +2441,7 @@ mod tests {
             "lua",
             "01ARZ3NDEKTSV4RRFFQ69G5OUT",
         );
-        pool.register_opened_document(&outside_host, &outside_virtual, shared.key())
+        pool.register_opened_document(&outside_host, &outside_virtual, document_producer.key())
             .await;
         let mut settings = WorkspaceSettings::default();
         settings.language_servers.insert(
@@ -2443,7 +2449,6 @@ mod tests {
             crate::config::settings::BridgeServerConfig {
                 cmd: Some(vec!["mock-symbols".into()]),
                 languages: Some(Vec::new()),
-                prefer_shared_instance: Some(true),
                 ..Default::default()
             },
         );
@@ -2467,17 +2472,17 @@ mod tests {
 
         let request_id = RequestId::new(2);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while !fallback.router().is_sent(request_id) {
+            while !workspace_producer.router().is_sent(request_id) {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("workspace search reaches the isolated client producer");
         assert!(
-            !shared.router().is_sent(request_id),
-            "a shared producer with outside document history must not receive the search"
+            !document_producer.router().is_sent(request_id),
+            "a marker-less producer with outside document history must not receive the search"
         );
-        let _ = fallback.router().route(serde_json::json!({
+        let _ = workspace_producer.router().route(serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
             "result": []
@@ -2505,7 +2510,7 @@ mod tests {
             .workspace_folders()
             .replace(Some(vec![folder_a, folder_b]));
         let fallback =
-            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+            create_handle_advertising_workspace_symbols(ConnectionKey::workspace("symbols")).await;
         record_test_spawn_root(&fallback, "file:///workspace/b");
         let secondary = create_handle_advertising_workspace_symbols(ConnectionKey::new(
             "symbols",
@@ -2589,7 +2594,7 @@ mod tests {
         record_test_spawn_root(&shared, "file:///workspace/a");
         assert_eq!(shared.workspace_folders().snapshot(), None);
         let fallback = create_handle_advertising_workspace_symbols_with_initial_folders(
-            ConnectionKey::new("symbols", None),
+            ConnectionKey::workspace("symbols"),
         )
         .await;
         record_test_spawn_root(&fallback, "file:///workspace/a");
@@ -2653,7 +2658,7 @@ mod tests {
         let pool = Arc::new(LanguageServerPool::new());
         seed_test_client_root(&pool, "file:///workspace");
         let fallback =
-            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+            create_handle_advertising_workspace_symbols(ConnectionKey::workspace("symbols")).await;
         record_test_spawn_root(&fallback, "file:///workspace");
         pool.connections()
             .await
@@ -2868,9 +2873,9 @@ mod tests {
         let pool = Arc::new(LanguageServerPool::new());
         seed_test_client_root(&pool, "file:///workspace");
         let first =
-            create_handle_advertising_workspace_symbols(ConnectionKey::new("first", None)).await;
+            create_handle_advertising_workspace_symbols(ConnectionKey::workspace("first")).await;
         let second =
-            create_handle_advertising_workspace_symbols(ConnectionKey::new("second", None)).await;
+            create_handle_advertising_workspace_symbols(ConnectionKey::workspace("second")).await;
         record_test_spawn_root(&first, "file:///workspace");
         record_test_spawn_root(&second, "file:///workspace");
         pool.connections().await.extend([
