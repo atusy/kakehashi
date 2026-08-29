@@ -2096,19 +2096,17 @@ async fn deliver_upstream_notification(
     use tower_lsp_server::ls_types::{ProgressParamsValue, WorkDoneProgress};
     match notification {
         UpstreamNotification::DiagnosticRefresh => {
-            // A downstream server asked the editor to re-pull diagnostics. Route it
-            // through `request_forwarded_diagnostic_refresh`, which runs the leading
-            // cycle immediately (prefetch, then a conditional editor forward — an
-            // unchanged covering prefetch absorbs the nudge) and debounces later
-            // burst activity, reusing the capability-gated, detached forced-refresh
-            // path when it does send. Detaching avoids blocking this delivery loop
-            // on the editor round-trip (head-of-line). A `None` publisher (test
-            // loop) has no settings to gate on, so the forward is dropped;
-            // production always has one (#521, #789).
+            // A downstream server asked the editor to re-pull diagnostics.
+            // Force the editor refresh when supported: open-document prefetch
+            // cannot prove that workspace reports for unopened files are
+            // unchanged. Clients without refresh support still receive the
+            // pullFallback cache-warming cycle. A `None` publisher (test loop)
+            // has no settings to gate on, so the forward is dropped; production
+            // always has one (#521, #789).
             if let Some(publisher) =
                 delivery_context.map(|context| context.diagnostic_publisher.as_ref())
             {
-                publisher.request_forwarded_diagnostic_refresh();
+                publisher.request_forwarded_workspace_diagnostic_refresh();
             }
         }
         UpstreamNotification::DiagnosticProviderChanged => {
