@@ -449,7 +449,7 @@ impl Kakehashi {
         let upstream_id = current_upstream_id();
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let settings_generation = self.settings_manager.settings_generation();
-        let host_only = self.semantic_tokens_full_is_host_only(&uri);
+        let native_enabled = self.semantic_tokens_full_includes_native(&uri);
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
         // supersession, and cancellation contract. A current snapshot makes
@@ -458,7 +458,7 @@ impl Kakehashi {
         // incarnation/content version through fan-out and revalidates that
         // identity before returning.
         let Some(native_layer) = self
-            .semantic_tokens_full_native_layer(params, &mut cancel_rx, tracking, !host_only)
+            .semantic_tokens_full_native_layer(params, &mut cancel_rx, tracking, native_enabled)
             .await?
         else {
             return Ok(None);
@@ -576,7 +576,7 @@ impl Kakehashi {
                     live_identity,
                     (generation, settings_generation),
                     snapshot.as_ref(),
-                    !host_only,
+                    native_enabled,
                     &edit_lock,
                 )
             {
@@ -1189,15 +1189,11 @@ impl Kakehashi {
         has_configured_region(regions)
     }
 
-    fn semantic_tokens_full_is_host_only(&self, uri: &Url) -> bool {
+    fn semantic_tokens_full_includes_native(&self, uri: &Url) -> bool {
         const METHOD: &str = "textDocument/semanticTokens/full";
-        self.document_language(uri).is_some_and(|language| {
+        self.document_language(uri).is_none_or(|language| {
             let layers = self.resolve_layer_config(&language, METHOD);
-            !layers.priorities.is_empty()
-                && layers
-                    .priorities
-                    .iter()
-                    .all(|source| *source == LayerSource::Host)
+            layers.allows(LayerSource::Native)
         })
     }
 
@@ -1293,11 +1289,11 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        // A host-only full request is parser-independent. Re-enter it before
+        // A full request without a native layer is parser-independent. Re-enter it before
         // waiting for a native snapshot so a configuration reload cannot make
         // a client carrying a native resultId take a different path from a
         // direct full request.
-        if self.semantic_tokens_full_is_host_only(&uri) {
+        if !self.semantic_tokens_full_includes_native(&uri) {
             return self
                 .semantic_tokens_delta_reenter_full(
                     &uri,
@@ -2511,7 +2507,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn host_only_full_does_not_wait_for_a_native_snapshot() {
+    async fn mixed_non_native_full_does_not_require_a_native_snapshot() {
         use crate::config::WorkspaceSettings;
         use crate::config::settings::{LanguageSettings, LayerAggregationConfig, LayersConfig};
         use std::collections::HashMap;
@@ -2522,7 +2518,7 @@ mod tests {
         aggregation.insert(
             "textDocument/semanticTokens/full".to_string(),
             LayerAggregationConfig {
-                priorities: Some(vec![LayerSource::Host]),
+                priorities: Some(vec![LayerSource::Host, LayerSource::Virt]),
                 strategy: None,
             },
         );
@@ -2555,11 +2551,11 @@ mod tests {
         );
 
         let result = tokio::time::timeout(
-            Duration::from_millis(100),
+            crate::lsp::lsp_impl::snapshot_read::FIRST_PARSE_BACKSTOP + Duration::from_millis(100),
             server.semantic_tokens_full_impl(full_params(&uri)),
         )
         .await
-        .expect("host-only semantic tokens must not wait for the first-parse backstop")
+        .expect("virtual discovery must stop at the first-parse backstop")
         .expect("semantic tokens full should return without error");
         assert!(result.is_none(), "no host server is configured: {result:?}");
     }
