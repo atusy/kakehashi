@@ -823,10 +823,11 @@ impl Kakehashi {
                 // work: process_injections / republish on a gone URI could re-publish
                 // diagnostics that `didClose` just cleared (resurrecting them in the
                 // editor) and act on removed state.
-                if documents.get(&uri).is_none() {
+                let Some(sync_incarnation) = documents.get(&uri).map(|doc| doc.incarnation())
+                else {
                     stop(&scheduler, &mut guard);
                     break;
-                }
+                };
 
                 // Re-check shutdown after the (awaited) parse and BEFORE the
                 // downstream work: shutdown could have been requested while parsing,
@@ -842,6 +843,9 @@ impl Kakehashi {
                 // (which re-anchors region push slots against the now-current
                 // injection geometry).
                 injection.process_injections(&uri, true).await;
+                if let Some(ticket) = ticket {
+                    documents.advance_watermark_for_incarnation(&uri, ticket, sync_incarnation);
+                }
                 // This gate is the geometry-deferral's retry backstop —
                 // `republish`'s `needs_geometry` is the same shared predicate
                 // (`has_live_region_slots`), so a deferred publish always has

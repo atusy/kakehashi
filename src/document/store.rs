@@ -42,19 +42,17 @@ pub struct DocumentStore {
     /// snapshot's incarnation against the URI's current one. See
     /// `Kakehashi::store_lineage` (captures-protocol §"Delta semantics").
     open_counter: std::sync::atomic::AtomicU64,
-    /// Per-document **parse watermark**: the highest ingress writer ticket whose
-    /// parse has reached a terminal outcome (a tree, or parsed-to-nothing). It is
-    /// monotonic per document and published by the parse path on resolution.
+    /// Per-document **downstream-sync watermark**: the highest ingress writer
+    /// ticket whose off-ingress parse and tree-dependent downstream document
+    /// synchronization have completed. It is monotonic per document and published
+    /// by the parse scheduler/open task after `process_injections` returns.
     ///
     /// This is deliberately a signal **distinct** from the `IngressOrderGate`
-    /// completion channel. Today the parse resolves *inline*, before its writer
-    /// ticket completes, so the watermark and ticket-completion move in lockstep;
-    /// a reader gated behind the ticket already observes a fresh tree. The
-    /// per-document parse scheduler (see `per-document-parse-scheduler` ADR) will run the
-    /// parse *off* the ingress ticket, at which point ticket-completion no longer
-    /// implies a fresh tree and this watermark — not the completion channel — is
-    /// what tells a virt/native reader the store reflects its tail edit. Keyed on
-    /// the ticket (the intra-lifetime wire order). The channel value carries the
+    /// completion channel. The per-document parse scheduler runs parse and
+    /// downstream synchronization *off* the ingress ticket, so ticket completion
+    /// alone implies neither a fresh tree nor current downstream server state. This
+    /// watermark tells workspace readers that both reflect their tail edit. Keyed
+    /// on the ticket (the intra-lifetime wire order). The channel value carries the
     /// lifetime's [`incarnation`](Watermark) too, so the off-ingress advance
     /// ([`advance_watermark_for_incarnation`](Self::advance_watermark_for_incarnation))
     /// gates on it atomically with the ticket write — a prior lifetime's parse
@@ -69,9 +67,9 @@ struct ParseState {
     has_tree: bool,
 }
 
-/// The value carried by a document's parse-watermark channel: the open
-/// `incarnation` the channel belongs to, and the highest `ticket` whose parse
-/// has resolved for that lifetime. Storing the incarnation **in the channel**
+/// The value carried by a document's downstream-sync watermark channel: the open
+/// `incarnation` the channel belongs to, and the highest `ticket` whose downstream
+/// synchronization has resolved for that lifetime. Storing the incarnation **in the channel**
 /// lets the off-ingress advance compare it against the parse's captured
 /// incarnation *atomically* with the ticket write (inside `send_if_modified`,
 /// under the watch's own lock), so a straggler parse from a prior lifetime can
@@ -760,10 +758,10 @@ impl DocumentStore {
         }
     }
 
-    /// Publish that the parse covering ingress writer `ticket` for `uri` has
-    /// reached a terminal outcome. The watermark only ever advances — a later
-    /// resolution for an earlier ticket (a parse superseded then completed out of
-    /// order) cannot regress it — so a reader's `>= target` wait is stable.
+    /// Publish that downstream synchronization covering ingress writer `ticket`
+    /// for `uri` has reached a terminal outcome. The watermark only ever advances
+    /// — a later resolution for an earlier ticket cannot regress it — so a reader's
+    /// `>= target` wait is stable.
     ///
     /// **Non-inserting**: it advances an existing entry but never creates one. The
     /// entry is seeded by [`insert`](Self::insert) when the document is registered

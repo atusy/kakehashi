@@ -465,14 +465,11 @@ impl ParseCoordinator {
     /// ticket: a `didClose` racing it stays closed, and a `didChange` / reopen landing
     /// mid-parse drops the now-stale tree rather than clobbering the newer state.
     ///
-    /// `ticket` is the ingress writer ticket of the mutation that scheduled this
-    /// parse, or `None` for a caller outside the ingress sequence. On every resolution
-    /// path that still observes this lifetime — a tree, a parsed-to-nothing, or no
-    /// detectable language — the parse advances the
-    /// store's per-document **watermark** to `ticket` (guarded by the open
-    /// incarnation), releasing a reader waiting on it. The one path that does **not**
-    /// advance is a document already gone (a `didClose` removed it): its watermark
-    /// channel is gone too, so its readers have already fallen back.
+    /// `ticket` is retained in the signature for callers that pair this parse with
+    /// downstream synchronization. The caller advances the document watermark only
+    /// after that synchronization completes; publishing it here would let a
+    /// workspace reader observe the tree before injected/host servers receive the
+    /// corresponding document notification.
     ///
     /// Returns `true` iff **this** call's CAS landed a tree (i.e. it is the parse
     /// whose tree is now current). The off-ingress open caller gates its
@@ -488,7 +485,7 @@ impl ParseCoordinator {
         &self,
         uri: Url,
         language_id: Option<&str>,
-        ticket: Option<u64>,
+        _ticket: Option<u64>,
     ) -> bool {
         let mut events = Vec::new();
 
@@ -514,18 +511,6 @@ impl ParseCoordinator {
             })
         else {
             return false;
-        };
-
-        // Publish the watermark on whichever path resolves the parse below, but
-        // **only if this lifetime is still current**: a close + reopen re-seeds the
-        // watermark at 0, and this (prior-lifetime) ticket must not inflate it. Same
-        // lifetime → advances (releasing a gated reader even on the no-language /
-        // no-tree paths, to the empty fallback). Mirrors `reparse_latest`.
-        let advance_watermark = || {
-            if let Some(ticket) = ticket {
-                self.documents
-                    .advance_watermark_for_incarnation(&uri, ticket, incarnation);
-            }
         };
 
         let parse_generation = self.documents.mark_parse_started(&uri);
@@ -640,7 +625,6 @@ impl ParseCoordinator {
                     self.documents
                         .mark_parse_finished(&uri, parse_generation, true);
                 }
-                advance_watermark();
                 self.notifier().log_language_events(&events).await;
                 // `stored` is exactly "this call's CAS landed the tree": false when a
                 // racing `didChange`/reopen moved the text or incarnation on and the
@@ -679,7 +663,6 @@ impl ParseCoordinator {
                     layer_trees: std::sync::OnceLock::new(),
                 },
             );
-            advance_watermark();
             self.notifier().log_language_events(&events).await;
             return false;
         }
@@ -710,7 +693,6 @@ impl ParseCoordinator {
                 layer_trees: std::sync::OnceLock::new(),
             },
         );
-        advance_watermark();
         self.notifier().log_language_events(&events).await;
         false
     }
@@ -949,14 +931,13 @@ impl ParseCoordinator {
     /// left gone (resurrection-safe), a text that moved on (a `didChange` landed
     /// while parsing) is dropped — the scheduler's `dirty` loop then reparses the
     /// newer text — and a reopen that changed the language is rejected (no
-    /// wrong-grammar tree). On **every** resolution path the parse
-    /// advances the store watermark to `ticket`, so a virt/native reader gated
-    /// behind the originating edit is released once its parse resolved.
+    /// wrong-grammar tree). The parse scheduler advances the store watermark only
+    /// after the tree-dependent downstream synchronization following this call.
     ///
     /// The semantic-token `full/delta` path is unaffected by the off-ingress move:
     /// it diffs cached token arrays by `result_id` (never `changed_ranges`), so as
     /// long as the seed keeps this reparse cheap the delta stays cheap too.
-    pub(crate) async fn reparse_latest(&self, uri: &Url, ticket: Option<u64>) {
+    pub(crate) async fn reparse_latest(&self, uri: &Url, _ticket: Option<u64>) {
         // Re-read the latest text + detect the language under one read guard. A
         // missing document means a `didClose` ran — stop without touching the
         // watermark (no resurrection). Advancing it here would be unsafe: the
@@ -998,24 +979,11 @@ impl ParseCoordinator {
             )
         };
 
-        // Post-read resolutions advance the watermark **only if this lifetime is
-        // still current** — a close+reopen re-seeds the watermark at 0, and this
-        // (prior-lifetime) ticket must not inflate it and prematurely release a
-        // new-lifetime reader. Same lifetime → advances (releasing readers even on
-        // the no-language / no-tree paths, to the empty fallback).
-        let advance_watermark = || {
-            if let Some(ticket) = ticket {
-                self.documents
-                    .advance_watermark_for_incarnation(uri, ticket, incarnation);
-            }
-        };
-
         let Some(language_name) = language_name else {
             // Give-up: release a parked first-parse waiter with a tree-less
             // snapshot (bootstrap-gated inside) rather than letting every
             // request burn the full first-parse backstop.
             self.documents.publish_giveup_snapshot(uri, incarnation);
-            advance_watermark();
             return;
         };
         let load_result = self
@@ -1024,7 +992,6 @@ impl ParseCoordinator {
             .await;
         if !load_result.success {
             self.documents.publish_giveup_snapshot(uri, incarnation);
-            advance_watermark();
             self.notifier()
                 .log_language_events(&load_result.events)
                 .await;
@@ -1160,7 +1127,6 @@ impl ParseCoordinator {
         // unavailable): a no-op after a successful publish (bootstrap gate),
         // otherwise it releases a parked first-parse waiter.
         self.documents.publish_giveup_snapshot(uri, incarnation);
-        advance_watermark();
         self.notifier().log_language_events(&events).await;
     }
 
