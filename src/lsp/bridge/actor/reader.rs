@@ -1122,27 +1122,36 @@ async fn handle_server_request(
         deps.dynamic_capabilities.unregister(unregistrations);
     }
 
+    let workspace_diagnostics_registered =
+        pending_registrations.as_ref().is_some_and(|registrations| {
+            registrations.iter().any(|registration| {
+                registration.method == "textDocument/diagnostic"
+                    && registration
+                        .register_options
+                        .as_ref()
+                        .and_then(|options| options.get("workspaceDiagnostics"))
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+            })
+        });
+    if let Some(registrations) = pending_registrations {
+        // Registration takes the registry write lease before its acknowledgement.
+        // An old-plan workspace pull already holding a provider read lease enters
+        // the writer FIFO first and cannot complete after the server sees the ack.
+        deps.dynamic_capabilities.register(registrations);
+    }
+
     let response = match body {
         Ok(result) => jsonrpc::Response::from_ok(id, result),
         Err(error) => jsonrpc::Response::from_error(id, error),
     };
     let response_queued =
         send_server_response(&deps.response_tx, response, server_prefix, method).await;
-    if response_queued && let Some(registrations) = pending_registrations {
-        let workspace_diagnostics_registered = registrations.iter().any(|registration| {
-            registration.method == "textDocument/diagnostic"
-                && registration
-                    .register_options
-                    .as_ref()
-                    .and_then(|options| options.get("workspaceDiagnostics"))
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-        });
-        deps.dynamic_capabilities.register(registrations);
+    if response_queued {
         // A first workspace pull can race the post-initialized registration.
-        // Publishing the registry only after its acknowledgement preserves
-        // writer FIFO, then this capability-gated upstream path schedules a
-        // fresh pull that plans against the committed provider set.
+        // The registry writer fence precedes the acknowledgement; this
+        // capability-gated upstream path then schedules a fresh pull against
+        // the committed provider set after the acknowledgement is queued.
         if workspace_diagnostics_registered
             && deps
                 .dynamic_capabilities
@@ -2186,7 +2195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_capability_is_published_only_after_its_ack_is_queued() {
+    async fn register_capability_fences_old_plans_before_its_ack_is_queued() {
         let router = ResponseRouter::new();
         let (response_tx, mut response_rx) = mpsc::channel(1);
         response_tx
@@ -2228,8 +2237,8 @@ mod tests {
         tokio::pin!(handling);
         assert!(futures::poll!(handling.as_mut()).is_pending());
         assert!(
-            !dynamic_capabilities.has_registration("textDocument/diagnostic"),
-            "a waiter must not observe the capability before its ack can enter writer FIFO"
+            dynamic_capabilities.has_registration("textDocument/diagnostic"),
+            "the registry writer fence must be established before the ack enters the queue"
         );
         assert!(
             upstream_rx.try_recv().is_err(),
