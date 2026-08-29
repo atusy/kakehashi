@@ -182,6 +182,33 @@ struct SemanticDeltaComputation {
     snapshot_present: bool,
 }
 
+struct VirtualBridgeSelectionGuard {
+    local_selected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    selected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    activity: std::sync::Arc<super::super::whole_document::WholeDocumentBridgeActivity>,
+    unit: Option<String>,
+}
+
+impl VirtualBridgeSelectionGuard {
+    fn propagate(&mut self) {
+        if self
+            .local_selected
+            .load(std::sync::atomic::Ordering::Acquire)
+            && let Some(unit) = self.unit.take()
+        {
+            self.selected
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.activity.mark_selected(unit);
+        }
+    }
+}
+
+impl Drop for VirtualBridgeSelectionGuard {
+    fn drop(&mut self) {
+        self.propagate();
+    }
+}
+
 fn should_publish_empty_non_native_result(
     non_native_only: bool,
     virt_only: bool,
@@ -690,6 +717,12 @@ impl Kakehashi {
                                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let local_selected =
                                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let mut selection_guard = VirtualBridgeSelectionGuard {
+                                local_selected: std::sync::Arc::clone(&local_selected),
+                                selected,
+                                activity: std::sync::Arc::clone(&activity),
+                                unit: Some(unit.clone()),
+                            };
                             let result = task
                                 .pool
                                 .send_semantic_tokens_full_request(
@@ -708,12 +741,9 @@ impl Kakehashi {
                                     Some(std::sync::Arc::clone(&local_selected)),
                                 )
                                 .await;
+                            selection_guard.propagate();
                             let was_attempted =
                                 local_attempted.load(std::sync::atomic::Ordering::Acquire);
-                            if local_selected.load(std::sync::atomic::Ordering::Acquire) {
-                                selected.store(true, std::sync::atomic::Ordering::Release);
-                                activity.mark_selected(unit.clone());
-                            }
                             if was_attempted {
                                 attempted.store(true, std::sync::atomic::Ordering::Release);
                                 if result.is_ok() {
@@ -1359,14 +1389,13 @@ impl Kakehashi {
         lsp_uri: &tower_lsp_server::ls_types::Uri,
         uri: &Url,
         snapshot: &crate::document::snapshot::ParseSnapshot,
-        bridge_language: &str,
-        parser_language: Option<&str>,
+        language_name: &str,
     ) -> bool {
         const METHOD: &str = "textDocument/semanticTokens/full";
         let settings = self.settings_manager.load_settings();
         let layers = super::super::bridge_context::resolve_layer_config_from_settings(
             &settings,
-            bridge_language,
+            language_name,
             METHOD,
         );
         if layers.priorities.contains(&LayerSource::Host)
@@ -1406,10 +1435,6 @@ impl Kakehashi {
         if !layers.priorities.contains(&LayerSource::Virt) {
             return false;
         }
-        let Some(parser_language) = parser_language else {
-            return false;
-        };
-
         let generation = self.cache.semantic_token_generation();
         let owned_regions;
         let regions = if let Some((stamped, regions)) = snapshot.resolved_regions.as_ref()
@@ -1419,7 +1444,7 @@ impl Kakehashi {
         } else {
             let (Some(tree), Some(query)) = (
                 snapshot.tree.as_ref(),
-                self.language.injection_query(parser_language),
+                self.language.injection_query(language_name),
             ) else {
                 return false;
             };
@@ -1441,9 +1466,9 @@ impl Kakehashi {
                 continue;
             }
             let configs = self
-                .bridge_configs_for_injection_language(bridge_language, &region.injection_language);
+                .bridge_configs_for_injection_language(language_name, &region.injection_language);
             let agg = self.resolve_aggregation_config(
-                bridge_language,
+                language_name,
                 &region.injection_language,
                 METHOD,
             );
@@ -2705,6 +2730,27 @@ mod tests {
             !should_publish_empty_non_native_result(true, true, true, false),
             "virt-only request failures differ from a document with no virtual request"
         );
+    }
+
+    #[test]
+    fn virtual_selection_guard_propagates_selection_on_unwind() {
+        let local_selected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let selected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let activity = std::sync::Arc::new(
+            super::super::super::whole_document::WholeDocumentBridgeActivity::new(),
+        );
+        let guard = VirtualBridgeSelectionGuard {
+            local_selected,
+            selected: std::sync::Arc::clone(&selected),
+            activity: std::sync::Arc::clone(&activity),
+            unit: Some("virt:panicked".into()),
+        };
+
+        drop(guard);
+
+        assert!(selected.load(std::sync::atomic::Ordering::Acquire));
+        assert!(activity.has_selected());
+        assert!(!activity.is_authoritative());
     }
 
     #[tokio::test(start_paused = true)]
