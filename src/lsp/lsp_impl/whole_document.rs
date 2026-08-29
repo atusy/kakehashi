@@ -77,6 +77,7 @@ impl Kakehashi {
         require_all_layers: bool,
         preserve_empty: bool,
         nested_regions_first: bool,
+        run_virtual_layer: bool,
         native: N,
         send: F,
         parse_host: P,
@@ -96,6 +97,9 @@ impl Kakehashi {
     {
         let host_bridge_attempted = bridge_attempted;
         let virt = async {
+            if !run_virtual_layer {
+                return Ok(None);
+            }
             // Convert ls_types::Uri to url::Url for internal use
             let Ok(uri) = uri_to_url(lsp_uri) else {
                 log::warn!("Invalid URI in {}: {}", method_name, lsp_uri.as_str());
