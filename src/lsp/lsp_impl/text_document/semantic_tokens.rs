@@ -189,10 +189,6 @@ fn should_publish_empty_non_native_result(
     non_native_only && (bridge_succeeded || (virt_only && !bridge_work_selected))
 }
 
-fn bridge_overlay_is_authoritative(work_selected: bool, succeeded: bool) -> bool {
-    !work_selected || succeeded
-}
-
 fn commit_full_baselines(
     cache: &crate::lsp::cache::CacheCoordinator,
     computed: &mut SemanticFullComputation,
@@ -657,6 +653,9 @@ impl Kakehashi {
         let virt_bridge_succeeded = std::sync::Arc::clone(&bridge_succeeded);
         let bridge_work_selected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let virt_bridge_work_selected = std::sync::Arc::clone(&bridge_work_selected);
+        let bridge_activity =
+            std::sync::Arc::new(super::super::whole_document::WholeDocumentBridgeActivity::new());
+        let virt_bridge_activity = std::sync::Arc::clone(&bridge_activity);
 
         let fan_out = async {
             let data = self
@@ -669,6 +668,7 @@ impl Kakehashi {
                     Some(std::sync::Arc::clone(&bridge_attempted)),
                     Some(std::sync::Arc::clone(&bridge_succeeded)),
                     Some(std::sync::Arc::clone(&bridge_work_selected)),
+                    Some(std::sync::Arc::clone(&bridge_activity)),
                     true,
                     true,
                     true,
@@ -678,9 +678,13 @@ impl Kakehashi {
                         let attempted = std::sync::Arc::clone(&virt_bridge_attempted);
                         let succeeded = std::sync::Arc::clone(&virt_bridge_succeeded);
                         let selected = std::sync::Arc::clone(&virt_bridge_work_selected);
+                        let activity = std::sync::Arc::clone(&virt_bridge_activity);
                         async move {
+                            let unit = format!("virt:{}", task.region_id);
                             let region_end = task.region_end();
                             let local_attempted =
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let local_selected =
                                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let result = task
                                 .pool
@@ -697,15 +701,20 @@ impl Kakehashi {
                                     task.client_progress_token,
                                     expected_incarnation,
                                     Some(std::sync::Arc::clone(&local_attempted)),
-                                    Some(selected),
+                                    Some(std::sync::Arc::clone(&local_selected)),
                                 )
                                 .await;
                             let was_attempted =
                                 local_attempted.load(std::sync::atomic::Ordering::Acquire);
+                            if local_selected.load(std::sync::atomic::Ordering::Acquire) {
+                                selected.store(true, std::sync::atomic::Ordering::Release);
+                                activity.mark_selected(unit.clone());
+                            }
                             if was_attempted {
                                 attempted.store(true, std::sync::atomic::Ordering::Release);
                                 if result.is_ok() {
                                     succeeded.store(true, std::sync::atomic::Ordering::Release);
+                                    activity.mark_succeeded(unit);
                                 }
                             }
                             result.map(|tokens| tokens.map(|tokens| tokens.data))
@@ -742,10 +751,10 @@ impl Kakehashi {
                 )
                 .await?;
 
-            let bridge_succeeded = bridge_succeeded.load(std::sync::atomic::Ordering::Acquire);
-            let bridge_work_selected =
-                bridge_work_selected.load(std::sync::atomic::Ordering::Acquire);
-            if !bridge_overlay_is_authoritative(bridge_work_selected, bridge_succeeded) {
+            let bridge_work_selected = bridge_activity.has_selected();
+            let bridge_is_authoritative = bridge_activity.is_authoritative();
+            let bridge_succeeded = bridge_work_selected && bridge_is_authoritative;
+            if !bridge_is_authoritative {
                 // Native data is only a partial overlay when a selected bridge
                 // producer failed. Preserve the previous merged wire baseline
                 // instead of publishing that incomplete result.
@@ -2679,12 +2688,6 @@ mod tests {
         assert!(
             !should_publish_empty_non_native_result(true, true, true, false),
             "virt-only request failures differ from a document with no virtual request"
-        );
-        assert!(bridge_overlay_is_authoritative(false, false));
-        assert!(bridge_overlay_is_authoritative(true, true));
-        assert!(
-            !bridge_overlay_is_authoritative(true, false),
-            "native data must not make a failed bridge overlay authoritative"
         );
     }
 

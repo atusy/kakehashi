@@ -12,6 +12,7 @@
 //! `preferred` returns the highest-priority non-empty layer, while
 //! `concatenated` merges every selected layer's list in priority order.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,7 @@ use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{NumberOrString, Uri};
 
+use crate::error::LockResultExt;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, dispatch_host_preferred, dispatch_preferred,
@@ -41,6 +43,54 @@ pub(super) struct HostWholeDocumentResponse<T> {
     pub(super) incarnation: Option<u64>,
     pub(super) connection_generation: u64,
     pub(super) handle: Arc<crate::lsp::bridge::ConnectionHandle>,
+}
+
+pub(super) struct WholeDocumentBridgeActivity {
+    selected: Mutex<HashSet<String>>,
+    succeeded: Mutex<HashSet<String>>,
+}
+
+impl WholeDocumentBridgeActivity {
+    pub(super) fn new() -> Self {
+        Self {
+            selected: Mutex::new(HashSet::new()),
+            succeeded: Mutex::new(HashSet::new()),
+        }
+    }
+
+    pub(super) fn mark_selected(&self, unit: impl Into<String>) {
+        self.selected
+            .lock()
+            .recover_poison("WholeDocumentBridgeActivity::mark_selected")
+            .insert(unit.into());
+    }
+
+    pub(super) fn mark_succeeded(&self, unit: impl Into<String>) {
+        self.succeeded
+            .lock()
+            .recover_poison("WholeDocumentBridgeActivity::mark_succeeded")
+            .insert(unit.into());
+    }
+
+    pub(super) fn has_selected(&self) -> bool {
+        !self
+            .selected
+            .lock()
+            .recover_poison("WholeDocumentBridgeActivity::has_selected")
+            .is_empty()
+    }
+
+    pub(super) fn is_authoritative(&self) -> bool {
+        let selected = self
+            .selected
+            .lock()
+            .recover_poison("WholeDocumentBridgeActivity::is_authoritative");
+        let succeeded = self
+            .succeeded
+            .lock()
+            .recover_poison("WholeDocumentBridgeActivity::is_authoritative");
+        selected.is_subset(&succeeded)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +126,7 @@ impl Kakehashi {
         bridge_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
         bridge_succeeded: Option<Arc<std::sync::atomic::AtomicBool>>,
         bridge_work_selected: Option<Arc<std::sync::atomic::AtomicBool>>,
+        bridge_activity: Option<Arc<WholeDocumentBridgeActivity>>,
         require_all_layers: bool,
         preserve_empty: bool,
         nested_regions_first: bool,
@@ -385,6 +436,10 @@ impl Kakehashi {
             #[cfg(feature = "e2e")]
             wait_for_host_admission_release().await;
             let pool = self.bridge.pool_arc();
+            let local_selected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let local_succeeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let request_selected = Arc::clone(&local_selected);
+            let request_succeeded = Arc::clone(&local_succeeded);
             let fan_in = dispatch_host_preferred(
                 &ctx,
                 pool.clone(),
@@ -393,12 +448,14 @@ impl Kakehashi {
                     let parse_host = parse_host.clone();
                     let on_host_winner = on_host_winner.clone();
                     let attempted = host_bridge_attempted.clone();
-                    let succeeded = host_bridge_succeeded.clone();
-                    let selected = bridge_work_selected.clone();
+                    let succeeded = Some(Arc::clone(&request_succeeded));
+                    let selected = Arc::clone(&request_selected);
                     async move {
                         let (raw, succeeded_after_parse) = match attempted {
                             Some(attempted) => {
                                 let local_attempted =
+                                    Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let valid_response =
                                     Arc::new(std::sync::atomic::AtomicBool::new(false));
                                 let result = t
                                     .pool
@@ -415,7 +472,8 @@ impl Kakehashi {
                                         t.upstream_id,
                                         incarnation,
                                         Arc::clone(&local_attempted),
-                                        selected.expect("activity markers are paired"),
+                                        selected,
+                                        Arc::clone(&valid_response),
                                     )
                                     .await;
                                 let was_attempted =
@@ -423,7 +481,14 @@ impl Kakehashi {
                                 if was_attempted {
                                     attempted.store(true, std::sync::atomic::Ordering::Release);
                                 }
-                                (result?, was_attempted.then_some(succeeded).flatten())
+                                let valid_response =
+                                    valid_response.load(std::sync::atomic::Ordering::Acquire);
+                                (
+                                    result?,
+                                    (was_attempted && valid_response)
+                                        .then_some(succeeded)
+                                        .flatten(),
+                                )
                             }
                             None => (
                                 t.pool
@@ -471,6 +536,22 @@ impl Kakehashi {
                 cancel_rx,
             )
             .await;
+            if local_selected.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(selected) = &bridge_work_selected {
+                    selected.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if let Some(activity) = &bridge_activity {
+                    activity.mark_selected("host");
+                }
+            }
+            if local_succeeded.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(succeeded) = &host_bridge_succeeded {
+                    succeeded.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if let Some(activity) = &bridge_activity {
+                    activity.mark_succeeded("host");
+                }
+            }
             self.host_layer_result(fan_in, method_name, |won| won).await
         };
 
@@ -674,6 +755,18 @@ mod tests {
     fn empty_whole_document_layer_items_are_absent() {
         assert_eq!(nonempty_whole_document_items::<i32>(vec![]), None);
         assert_eq!(nonempty_whole_document_items(vec![1]), Some(vec![1]));
+    }
+
+    #[test]
+    fn bridge_activity_requires_every_selected_unit_to_succeed() {
+        let activity = WholeDocumentBridgeActivity::new();
+        assert!(activity.is_authoritative());
+        activity.mark_selected("virt:first");
+        activity.mark_selected("virt:second");
+        activity.mark_succeeded("virt:first");
+        assert!(!activity.is_authoritative());
+        activity.mark_succeeded("virt:second");
+        assert!(activity.is_authoritative());
     }
 
     #[test]

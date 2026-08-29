@@ -397,6 +397,7 @@ impl LanguageServerPool {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -424,6 +425,7 @@ impl LanguageServerPool {
             Some(expected_incarnation),
             None,
             None,
+            None,
         )
         .await
     }
@@ -442,6 +444,7 @@ impl LanguageServerPool {
         expected_incarnation: u64,
         attempted: Arc<std::sync::atomic::AtomicBool>,
         selected: Arc<std::sync::atomic::AtomicBool>,
+        valid_response: Arc<std::sync::atomic::AtomicBool>,
     ) -> io::Result<Option<HostRawResponse>> {
         self.send_host_raw_request_inner(
             server_name,
@@ -454,6 +457,7 @@ impl LanguageServerPool {
             None,
             Some(attempted),
             Some(selected),
+            Some(valid_response),
         )
         .await
     }
@@ -471,6 +475,7 @@ impl LanguageServerPool {
         revision_text_reader: Option<HostTextReader>,
         attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
         selected: Option<Arc<std::sync::atomic::AtomicBool>>,
+        valid_response: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> io::Result<Option<HostRawResponse>> {
         strip_progress_tokens(&mut params);
         let handle = match self
@@ -497,6 +502,7 @@ impl LanguageServerPool {
         // that would repeat the marker filesystem walk on a request-frequency
         // path (execute-command-routing-token).
         let answering = Arc::clone(&handle);
+        let response_observer = valid_response;
         let (value, incarnation, connection_generation) = self
             .execute_host_request(
                 handle,
@@ -507,6 +513,11 @@ impl LanguageServerPool {
                 attempted,
                 |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
                 move |response, incarnation, connection_generation| {
+                    if response.get("result").is_some()
+                        && let Some(valid_response) = response_observer
+                    {
+                        valid_response.store(true, std::sync::atomic::Ordering::Release);
+                    }
                     (
                         parse_host_raw_response(response, method),
                         incarnation,
