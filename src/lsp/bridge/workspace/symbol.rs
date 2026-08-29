@@ -653,16 +653,7 @@ impl LanguageServerPool {
                         let confirmed_revisions = self
                             .confirmed_virtual_document_revisions_for_connection(handle.key())
                             .await;
-                        if projection_context.is_some() {
-                            projection_fences
-                                .lock()
-                                .recover_poison("workspace symbol projection fences")
-                                .push((
-                                    Arc::clone(&handle),
-                                    generation,
-                                    confirmed_revisions.clone(),
-                                ));
-                        }
+                        let projection_revision_fence = confirmed_revisions.clone();
                         let virtual_versions = confirmed_revisions
                             .iter()
                             .map(|(uri, revision)| (uri.clone(), revision.version))
@@ -695,6 +686,7 @@ impl LanguageServerPool {
                         };
                         let symbols = decode_response(response, supports_tags).map_err(|_| ())?;
                         let mut prepared = Vec::with_capacity(symbols.len());
+                        let mut has_projected_symbol = false;
                         for mut symbol in symbols {
                             let projection = if let Some(context) = projection_context {
                                 let Some(projection) = project_workspace_symbol_location(
@@ -722,6 +714,7 @@ impl LanguageServerPool {
                             } else {
                                 None
                             };
+                            has_projected_symbol |= projection.is_some();
                             if let Some(projection) = &projection {
                                 let (Some(host_uri), Some(host_identity)) =
                                     (projection.host_uri.as_deref(), projection.host_identity)
@@ -747,6 +740,12 @@ impl LanguageServerPool {
                                     projection,
                                 }),
                             ));
+                        }
+                        if has_projected_symbol {
+                            projection_fences
+                                .lock()
+                                .recover_poison("workspace symbol projection fences")
+                                .push((Arc::clone(&handle), generation, projection_revision_fence));
                         }
                         Ok(prepared)
                     }
