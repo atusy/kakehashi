@@ -26,7 +26,7 @@ pub(crate) struct DynamicCapabilityRegistry {
     changes: tokio::sync::watch::Sender<u64>,
     diagnostic_registration_settled: tokio::sync::OnceCell<()>,
     static_workspace_diagnostic_provider: AtomicBool,
-    workspace_diagnostic_pull_completed: AtomicBool,
+    workspace_diagnostic_pull_active: AtomicBool,
     workspace_diagnostic_lifecycle: Mutex<WorkspaceDiagnosticLifecycle>,
     workspace_diagnostic_registration_refresh_pending: AtomicBool,
 }
@@ -74,7 +74,7 @@ impl DynamicCapabilityRegistry {
             changes,
             diagnostic_registration_settled: tokio::sync::OnceCell::new(),
             static_workspace_diagnostic_provider: AtomicBool::new(false),
-            workspace_diagnostic_pull_completed: AtomicBool::new(false),
+            workspace_diagnostic_pull_active: AtomicBool::new(false),
             workspace_diagnostic_lifecycle: Mutex::new(WorkspaceDiagnosticLifecycle::default()),
             workspace_diagnostic_registration_refresh_pending: AtomicBool::new(false),
         }
@@ -84,7 +84,7 @@ impl DynamicCapabilityRegistry {
         self.changes.send_replace(revision);
     }
 
-    pub(crate) fn register(&self, registrations: Vec<Registration>) {
+    pub(crate) fn register(&self, registrations: Vec<Registration>) -> bool {
         let mut guard = self
             .registrations
             .write()
@@ -106,6 +106,7 @@ impl DynamicCapabilityRegistry {
         }
         drop(guard);
         self.notify_change(revision);
+        workspace_diagnostic_changed
     }
 
     pub(crate) fn unregister(&self, unregistrations: Vec<Unregistration>) {
@@ -183,9 +184,14 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_completed(&self) -> bool {
-        self.workspace_diagnostic_pull_completed
-            .store(true, Ordering::Release);
+        self.workspace_diagnostic_pull_active
+            .store(false, Ordering::Release);
         self.take_workspace_diagnostic_registration_refresh()
+    }
+
+    pub(crate) fn mark_workspace_diagnostic_pull_active(&self) {
+        self.workspace_diagnostic_pull_active
+            .store(true, Ordering::Release);
     }
 
     pub(crate) fn take_workspace_diagnostic_registration_refresh(&self) -> bool {
@@ -201,15 +207,16 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn request_or_defer_workspace_diagnostic_registration_refresh(&self) -> bool {
-        if self
-            .workspace_diagnostic_pull_completed
+        if !self
+            .workspace_diagnostic_pull_active
             .load(Ordering::Acquire)
         {
             return true;
         }
         self.workspace_diagnostic_registration_refresh_pending
             .store(true, Ordering::Release);
-        self.workspace_diagnostic_pull_completed
+        !self
+            .workspace_diagnostic_pull_active
             .load(Ordering::Acquire)
             && self
                 .workspace_diagnostic_registration_refresh_pending
@@ -520,6 +527,23 @@ mod tests {
     }
 
     #[test]
+    fn replacing_workspace_diagnostics_with_document_only_is_a_workspace_change() {
+        let registry = DynamicCapabilityRegistry::new();
+        assert!(registry.register(vec![Registration {
+            id: "diagnostics".into(),
+            method: "textDocument/diagnostic".into(),
+            register_options: Some(serde_json::json!({ "workspaceDiagnostics": true })),
+        }]));
+
+        assert!(registry.register(vec![Registration {
+            id: "diagnostics".into(),
+            method: "textDocument/diagnostic".into(),
+            register_options: Some(serde_json::json!({ "workspaceDiagnostics": false })),
+        }]));
+        assert!(!registry.has_workspace_diagnostic_provider());
+    }
+
+    #[test]
     fn registration_snapshot_keeps_resolve_state_stable_during_admission() {
         let registry = DynamicCapabilityRegistry::new();
         registry.register(vec![Registration {
@@ -583,6 +607,7 @@ mod tests {
     #[test]
     fn diagnostic_registration_refresh_waits_for_an_accepted_aggregate() {
         let registry = DynamicCapabilityRegistry::new();
+        registry.mark_workspace_diagnostic_pull_active();
 
         assert!(
             !registry.request_or_defer_workspace_diagnostic_registration_refresh(),
@@ -626,6 +651,7 @@ mod tests {
     #[test]
     fn cold_pull_stays_incomplete_until_success_is_recorded() {
         let registry = DynamicCapabilityRegistry::new();
+        registry.mark_workspace_diagnostic_pull_active();
 
         assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
         assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
@@ -637,11 +663,20 @@ mod tests {
     #[test]
     fn empty_pull_releases_registration_refresh_without_arming_exit_refresh() {
         let registry = DynamicCapabilityRegistry::new();
+        registry.mark_workspace_diagnostic_pull_active();
 
         assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
         assert!(registry.mark_workspace_diagnostic_pull_completed());
         assert!(!registry.has_workspace_diagnostic_contributed());
         assert!(registry.request_or_defer_workspace_diagnostic_registration_refresh());
+    }
+
+    #[test]
+    fn warm_registration_refreshes_without_waiting_for_a_pull() {
+        let registry = DynamicCapabilityRegistry::new();
+
+        assert!(registry.request_or_defer_workspace_diagnostic_registration_refresh());
+        assert!(!registry.take_workspace_diagnostic_registration_refresh());
     }
 
     #[test]

@@ -1122,24 +1122,14 @@ async fn handle_server_request(
         deps.dynamic_capabilities.unregister(unregistrations);
     }
 
-    let workspace_diagnostics_registered =
-        pending_registrations.as_ref().is_some_and(|registrations| {
-            registrations.iter().any(|registration| {
-                registration.method == "textDocument/diagnostic"
-                    && registration
-                        .register_options
-                        .as_ref()
-                        .and_then(|options| options.get("workspaceDiagnostics"))
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-            })
-        });
-    if let Some(registrations) = pending_registrations {
+    let workspace_diagnostics_changed = if let Some(registrations) = pending_registrations {
         // Registration takes the registry write lease before its acknowledgement.
         // An old-plan workspace pull already holding a provider read lease enters
         // the writer FIFO first and cannot complete after the server sees the ack.
-        deps.dynamic_capabilities.register(registrations);
-    }
+        deps.dynamic_capabilities.register(registrations)
+    } else {
+        false
+    };
 
     let response = match body {
         Ok(result) => jsonrpc::Response::from_ok(id, result),
@@ -1152,7 +1142,7 @@ async fn handle_server_request(
         // The registry writer fence precedes the acknowledgement; this
         // capability-gated upstream path then schedules a fresh pull against
         // the committed provider set after the acknowledgement is queued.
-        if workspace_diagnostics_registered
+        if workspace_diagnostics_changed
             && deps
                 .dynamic_capabilities
                 .request_or_defer_workspace_diagnostic_registration_refresh()

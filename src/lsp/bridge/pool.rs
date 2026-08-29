@@ -2990,6 +2990,45 @@ impl LanguageServerPool {
         admit: &(dyn Fn() -> bool + Sync),
         on_acquired: &ConnectionAcquiredObserver<'_>,
     ) -> io::Result<(Vec<Arc<ConnectionHandle>>, u64)> {
+        self.get_or_create_workspace_connections_wait_ready_admitted_inner(
+            server_name,
+            server_config,
+            timeout,
+            admit,
+            on_acquired,
+            false,
+        )
+        .await
+    }
+
+    pub(super) async fn get_or_create_complete_workspace_connections_wait_ready_admitted_observed(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        timeout: Duration,
+        admit: &(dyn Fn() -> bool + Sync),
+        on_acquired: &ConnectionAcquiredObserver<'_>,
+    ) -> io::Result<(Vec<Arc<ConnectionHandle>>, u64)> {
+        self.get_or_create_workspace_connections_wait_ready_admitted_inner(
+            server_name,
+            server_config,
+            timeout,
+            admit,
+            on_acquired,
+            true,
+        )
+        .await
+    }
+
+    async fn get_or_create_workspace_connections_wait_ready_admitted_inner(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        timeout: Duration,
+        admit: &(dyn Fn() -> bool + Sync),
+        on_acquired: &ConnectionAcquiredObserver<'_>,
+        require_complete_roots: bool,
+    ) -> io::Result<(Vec<Arc<ConnectionHandle>>, u64)> {
         let initial_workspace_generation = self.workspace_generation.load(Ordering::Acquire);
         if initial_workspace_generation & 1 != 0 || !admit() {
             return Err(io::Error::new(
@@ -3125,11 +3164,12 @@ impl LanguageServerPool {
                 .await?;
             Ok::<_, io::Error>(handle)
         });
-        for handle in futures::future::join_all(acquisitions)
-            .await
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        for acquisition in futures::future::join_all(acquisitions).await {
+            let handle = match acquisition {
+                Ok(handle) => handle,
+                Err(error) if require_complete_roots => return Err(error),
+                Err(_) => continue,
+            };
             if !handles
                 .iter()
                 .any(|existing| Arc::ptr_eq(existing, &handle))
