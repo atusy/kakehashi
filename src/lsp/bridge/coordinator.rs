@@ -1134,6 +1134,27 @@ impl BridgeCoordinator {
             .await;
     }
 
+    pub(crate) fn record_latest_virtual_contents(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        content_version: u64,
+        injections: &[BridgeInjection],
+    ) {
+        self.pool
+            .record_latest_virtual_contents(uri, incarnation, content_version, injections);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn latest_virtual_content_for_test(
+        &self,
+        host_uri: &Url,
+        injection: &BridgeInjection,
+    ) -> Option<(String, (u64, u64))> {
+        self.pool
+            .latest_virtual_content_for_test(host_uri, injection)
+    }
+
     pub(crate) async fn open_host_incarnation(&self, uri: &Url, incarnation: u64) {
         self.pool.open_host_incarnation(uri, incarnation).await;
     }

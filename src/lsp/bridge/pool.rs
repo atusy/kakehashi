@@ -2147,6 +2147,19 @@ impl LanguageServerPool {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn latest_virtual_content_for_test(
+        &self,
+        host_uri: &Url,
+        injection: &crate::lsp::bridge::coordinator::BridgeInjection,
+    ) -> Option<(String, (u64, u64))> {
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri).ok()?;
+        let virtual_uri =
+            VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
+        let (content, identity) = self.latest_virtual_content_snapshot(host_uri, &virtual_uri)?;
+        Some((content?.as_ref().to_owned(), identity))
+    }
+
     /// Send `didOpen` for the virtual document if not already opened, registering
     /// all tracking state on success. Callers handle error cleanup (router entry
     /// and upstream-request registry).
