@@ -365,11 +365,10 @@ impl NormalizedDocumentFilter {
         let Ok(uri) = url::Url::parse(uri) else {
             return false;
         };
-        if self
-            .language
-            .as_deref()
-            .is_some_and(|expected| language != Some(expected))
-        {
+        if self.language.as_deref().is_some_and(|expected| {
+            language != Some(expected)
+                && crate::language::heuristic::detect_from_token(expected).as_deref() != language
+        }) {
             return false;
         }
         if self
@@ -3323,6 +3322,18 @@ mod tests {
 
         assert!(filter.applies_to("file:///workspace/nested/main.rs", Some("rust")));
         assert!(!filter.applies_to("file:///workspace/nested/deeper/main.rs", Some("rust")));
+    }
+
+    #[test]
+    fn document_selector_matches_canonical_language_aliases() {
+        let filter = NormalizedDocumentFilter {
+            language: Some("typescriptreact".into()),
+            scheme: Some("file".into()),
+            pattern: None,
+            pattern_base_uri: None,
+        };
+
+        assert!(filter.applies_to("file:///workspace/component.tsx", Some("tsx")));
     }
 
     #[tokio::test(start_paused = true)]
