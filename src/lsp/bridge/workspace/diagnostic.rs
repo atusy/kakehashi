@@ -170,8 +170,11 @@ fn reconcile_overlapping_root_reports_with_language(
     }
 
     fn containing_root_depth(root: Option<&str>, document_uri: &str) -> Option<usize> {
-        let root = url::Url::parse(root?).ok()?;
-        let document = url::Url::parse(document_uri).ok()?;
+        let root =
+            crate::lsp::bridge::root_markers::normalized_root_url(&url::Url::parse(root?).ok()?);
+        let document = crate::lsp::bridge::root_markers::normalized_root_url(
+            &url::Url::parse(document_uri).ok()?,
+        );
         if root.scheme() != document.scheme()
             || root.username() != document.username()
             || root.password() != document.password()
