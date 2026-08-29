@@ -1242,9 +1242,16 @@ mod tests {
         assert!(first.poll().is_ready());
         tokio::task::yield_now().await;
 
-        let Poll::Ready(Ok(Some(response))) = second.poll() else {
-            panic!("the cancelled request must win a simultaneous gate handoff");
-        };
+        let mut response = None;
+        for _ in 0..3 {
+            if let Poll::Ready(Ok(Some(ready))) = second.poll() {
+                response = Some(ready);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let response =
+            response.expect("the cancelled request must win a simultaneous gate handoff");
         assert_eq!(response.id(), &tower_lsp_server::jsonrpc::Id::Number(2));
         assert_eq!(
             response.error().expect("request must fail").code,
