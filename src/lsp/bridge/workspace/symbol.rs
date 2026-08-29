@@ -266,22 +266,11 @@ fn can_restore_flat_response(symbols: &[NormalizedSymbol], supports_tags: bool) 
         })
 }
 
-fn nested_response_preserving_deprecation(
-    symbols: Vec<NormalizedSymbol>,
-    supports_tags: bool,
-) -> WorkspaceSymbolResponse {
+fn nested_response(symbols: Vec<NormalizedSymbol>) -> WorkspaceSymbolResponse {
     WorkspaceSymbolResponse::Nested(
         symbols
             .into_iter()
-            .map(|mut normalized| {
-                if !supports_tags && normalized.legacy_deprecated {
-                    let tags = normalized.symbol.tags.get_or_insert_with(Vec::new);
-                    if !tags.contains(&SymbolTag::DEPRECATED) {
-                        tags.push(SymbolTag::DEPRECATED);
-                    }
-                }
-                normalized.symbol
-            })
+            .map(|normalized| normalized.symbol)
             .collect(),
     )
 }
@@ -324,12 +313,12 @@ async fn project_workspace_symbol_location(
         crate::lsp::lsp_impl::region_offset::resolve_region_offset(
             documents, language, bridge, &host_url, &region_id,
         )?;
+    if !contiguous {
+        return None;
+    }
     let downstream_location = symbol.location.clone();
     match &mut symbol.location {
         OneOf::Left(location) => {
-            if !contiguous {
-                return None;
-            }
             crate::lsp::bridge::translate_virtual_range_to_host(&mut location.range, &offset);
             if location.range.start > location.range.end || location.range.end > region_end {
                 return None;
@@ -680,10 +669,7 @@ impl LanguageServerPool {
         if can_restore_flat_response(&symbols, supports_tags) {
             return Some(restore_legacy_flat_response(symbols));
         }
-        Some(nested_response_preserving_deprecation(
-            symbols,
-            supports_tags,
-        ))
+        Some(nested_response(symbols))
     }
 
     #[cfg(test)]
@@ -1250,7 +1236,7 @@ mod tests {
 
     #[test]
     #[allow(deprecated)]
-    fn lazy_symbol_fallback_keeps_eager_deprecation() {
+    fn lazy_symbol_fallback_does_not_send_unsupported_deprecation_tags() {
         let mut symbols = normalize_response(
             WorkspaceSymbolResponse::Flat(vec![SymbolInformation {
                 name: "old".into(),
@@ -1274,12 +1260,10 @@ mod tests {
         }));
 
         assert!(!can_restore_flat_response(&symbols, false));
-        let WorkspaceSymbolResponse::Nested(symbols) =
-            nested_response_preserving_deprecation(symbols, false)
-        else {
+        let WorkspaceSymbolResponse::Nested(symbols) = nested_response(symbols) else {
             panic!("lazy fallback must remain nested")
         };
-        assert_eq!(symbols[0].tags, Some(vec![SymbolTag::DEPRECATED]));
+        assert_eq!(symbols[0].tags, None);
     }
 
     #[test]
@@ -2394,6 +2378,48 @@ mod tests {
         };
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "partial");
+    }
+
+    #[tokio::test]
+    async fn workspace_producers_keep_secondary_roots_when_primary_acquisition_fails() {
+        let pool = LanguageServerPool::new();
+        let folder_a = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/a").unwrap(),
+            name: "a".into(),
+        };
+        let folder_b = WorkspaceFolder {
+            uri: Uri::from_str("file:///workspace/b").unwrap(),
+            name: "b".into(),
+        };
+        pool.set_root_uri(Some(folder_a.uri.to_string()));
+        pool.set_workspace_folders(Some(vec![folder_a, folder_b]));
+        let root_b = create_handle_advertising_workspace_symbols(ConnectionKey::new(
+            "symbols",
+            Some("file:///workspace/b".into()),
+        ))
+        .await;
+        record_test_spawn_root(&root_b, "file:///workspace/b");
+        pool.connections()
+            .await
+            .insert(root_b.key().clone(), Arc::clone(&root_b));
+        let config = crate::config::settings::BridgeServerConfig {
+            cmd: Some(vec!["__kakehashi_missing_workspace_symbol_server__".into()]),
+            languages: Some(Vec::new()),
+            ..Default::default()
+        };
+
+        let (handles, _) = pool
+            .get_or_create_workspace_connections_wait_ready_admitted(
+                "symbols",
+                &config,
+                Duration::from_secs(1),
+                &|| true,
+            )
+            .await
+            .expect("a failed primary must not discard a ready secondary root");
+
+        assert_eq!(handles.len(), 1);
+        assert!(Arc::ptr_eq(&handles[0], &root_b));
     }
 
     #[tokio::test]
