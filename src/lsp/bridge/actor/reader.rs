@@ -1130,6 +1130,10 @@ async fn handle_server_request(
     } else {
         false
     };
+    let publish_workspace_diagnostic_registration_refresh = workspace_diagnostics_changed
+        && deps
+            .dynamic_capabilities
+            .request_or_defer_workspace_diagnostic_registration_refresh();
 
     let response = match body {
         Ok(result) => jsonrpc::Response::from_ok(id, result),
@@ -1142,11 +1146,7 @@ async fn handle_server_request(
         // The registry writer fence precedes the acknowledgement; this
         // capability-gated upstream path then schedules a fresh pull against
         // the committed provider set after the acknowledgement is queued.
-        if workspace_diagnostics_changed
-            && deps
-                .dynamic_capabilities
-                .request_or_defer_workspace_diagnostic_registration_refresh()
-        {
+        if publish_workspace_diagnostic_registration_refresh {
             let _ = deps
                 .upstream_tx
                 .send(UpstreamNotification::DiagnosticProviderChanged);
@@ -2185,7 +2185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_capability_fences_old_plans_before_its_ack_is_queued() {
+    async fn register_capability_binds_cold_refresh_before_its_ack_is_queued() {
         let router = ResponseRouter::new();
         let (response_tx, mut response_rx) = mpsc::channel(1);
         response_tx
@@ -2193,7 +2193,7 @@ mod tests {
             .await
             .unwrap();
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
-        let _ = dynamic_capabilities.try_mark_workspace_diagnostic_contributed();
+        dynamic_capabilities.mark_workspace_diagnostic_pull_active();
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
@@ -2234,14 +2234,15 @@ mod tests {
             upstream_rx.try_recv().is_err(),
             "the retry event must not overtake the registration acknowledgement"
         );
+        dynamic_capabilities.mark_workspace_diagnostic_pull_aborted();
         let _blocker = response_rx.recv().await.expect("prefilled blocker");
         assert!(futures::poll!(handling.as_mut()).is_ready());
         let ack = response_rx.recv().await.expect("registration ack");
         assert!(matches!(ack, OutboundMessage::Untracked(value) if value["id"] == 1));
         assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
-        assert_eq!(
-            upstream_rx.try_recv().expect("registration retry event"),
-            UpstreamNotification::DiagnosticProviderChanged
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "an aborted cold pull must clear the refresh bound before acknowledgement"
         );
     }
 
