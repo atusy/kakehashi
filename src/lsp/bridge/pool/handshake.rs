@@ -74,6 +74,9 @@ pub(super) async fn perform_lsp_handshake(
     }
     let bridge_routing = parsed.bridge_routing;
     let type_hierarchy_provider = parsed.type_hierarchy_provider;
+    if let Some(provider) = parsed.raw_diagnostic_provider {
+        handle.set_raw_diagnostic_provider(provider);
+    }
     let capabilities = parsed.capabilities;
 
     // 4. Send initialized notification via the single-writer loop
