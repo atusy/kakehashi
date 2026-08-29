@@ -523,7 +523,16 @@ where
                             }
                             _ = gate.wait_turn() => {}
                         }
-                        forwarder.unsubscribe(&upstream_id);
+                        if forwarder.unsubscribe_and_take_cancelled(&upstream_id) {
+                            drop(inner_fut);
+                            drop(gate);
+                            return Ok(request_id.map(|id| {
+                                Response::from_error(
+                                    id,
+                                    tower_lsp_server::jsonrpc::Error::request_cancelled(),
+                                )
+                            }));
+                        }
                     } else {
                         gate.wait_turn().await;
                     }
