@@ -2769,7 +2769,10 @@ impl LanguageServerPool {
         let start = std::time::Instant::now();
         let handle = if server_config.prefers_shared_instance() {
             let shared_key = ConnectionKey::shared(server_name);
-            let shared_exists = self.connections.lock().await.contains_key(&shared_key);
+            let shared_exists = self
+                .ready_connection_by_key_for_config(&shared_key, Some(server_config))
+                .await
+                .is_some();
             self.acquire_resolved_wait_ready(
                 server_name,
                 server_config,
@@ -2851,16 +2854,16 @@ impl LanguageServerPool {
             return Ok((Vec::new(), initial_workspace_generation));
         }
         let start = std::time::Instant::now();
-        let (primary, workspace_generation) = self
+        let primary = self
             .get_or_create_workspace_connection_wait_ready_admitted(
                 server_name,
                 server_config,
                 timeout,
                 admit,
             )
-            .await?;
+            .await;
         let Some(folders) = self.workspace_folders() else {
-            return Ok((vec![primary], workspace_generation));
+            return primary.map(|(handle, generation)| (vec![handle], generation));
         };
         let mut roots = Vec::with_capacity(folders.len());
         for folder in folders {
@@ -2878,24 +2881,40 @@ impl LanguageServerPool {
             }
             roots.push((root, folder));
         }
-        if roots.is_empty() || self.workspace_handle_covers_roots(&primary, &roots) {
-            return Ok((vec![primary], workspace_generation));
+        if roots.is_empty() {
+            return primary.map(|(handle, generation)| (vec![handle], generation));
         }
+        if let Ok((primary, workspace_generation)) = &primary
+            && self.workspace_handle_covers_roots(primary, &roots)
+        {
+            return Ok((vec![Arc::clone(primary)], *workspace_generation));
+        }
+
+        let workspace_generation = primary
+            .as_ref()
+            .map_or(initial_workspace_generation, |(_, generation)| *generation);
 
         let workspace_admit = || {
             admit()
                 && self.workspace_generation.load(Ordering::Acquire) == workspace_generation
                 && workspace_generation & 1 == 0
         };
-        let primary_root = primary.spawn_root().map(str::to_owned);
-        let primary_covers_spawn_root = !primary.supports_initial_workspace_folders()
-            && primary_root.as_deref().is_some_and(|spawn_root| {
-                roots
-                    .iter()
-                    .any(|(root, _)| super::root_markers::same_root_uri(spawn_root, root.as_str()))
-            });
+        let primary_handle = primary.ok().map(|(handle, _)| handle);
+        let primary_root = primary_handle
+            .as_ref()
+            .and_then(|handle| handle.spawn_root())
+            .map(str::to_owned);
+        let primary_covers_spawn_root = primary_handle.as_ref().is_some_and(|primary| {
+            !primary.supports_initial_workspace_folders()
+                && primary_root.as_deref().is_some_and(|spawn_root| {
+                    roots.iter().any(|(root, _)| {
+                        super::root_markers::same_root_uri(spawn_root, root.as_str())
+                    })
+                })
+        });
         let mut handles = primary_covers_spawn_root
-            .then_some(primary)
+            .then_some(primary_handle)
+            .flatten()
             .into_iter()
             .collect::<Vec<_>>();
         let uncovered: Vec<_> = roots
@@ -2945,7 +2964,11 @@ impl LanguageServerPool {
             )
             .await
         });
-        for handle in futures::future::try_join_all(acquisitions).await? {
+        for handle in futures::future::join_all(acquisitions)
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+        {
             if !handles
                 .iter()
                 .any(|existing| Arc::ptr_eq(existing, &handle))
