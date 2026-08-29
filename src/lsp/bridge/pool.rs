@@ -368,7 +368,7 @@ impl HostLanguageAdmission {
 
 type LatestVirtualContents = DashMap<Url, HostVirtualContents>;
 type LatestVirtualContentSnapshot = (Option<Arc<str>>, (u64, u64));
-type ConnectionAcquiredObserver<'a> = dyn Fn(&Arc<ConnectionHandle>) + Sync + 'a;
+type ConnectionAcquiredObserver<'a> = dyn Fn(&Arc<ConnectionHandle>, bool) + Sync + 'a;
 
 impl OpenClaimGuard {
     fn disarm(&mut self) {
@@ -3034,7 +3034,7 @@ impl LanguageServerPool {
             server_config,
             timeout,
             admit,
-            &|_| {},
+            &|_, _| {},
         )
         .await
     }
@@ -3485,7 +3485,7 @@ impl LanguageServerPool {
                         })?
                 };
                 if let Some(on_acquired) = on_acquired {
-                    on_acquired(&handle);
+                    on_acquired(&handle, false);
                 }
                 handle.wait_for_ready(timeout).await?;
                 if admit.is_some_and(|admit| !admit()) {
@@ -4043,7 +4043,7 @@ impl LanguageServerPool {
                     io::Error::other("bridge: connection disappeared before ReturnExisting")
                 })?;
                 if let Some(on_acquired) = on_acquired {
-                    on_acquired(&handle);
+                    on_acquired(&handle, false);
                 }
                 // Release the pool lock before announcing: `announce_shared_root`
                 // re-locks `connections` itself for its Arc::ptr_eq liveness
@@ -4063,7 +4063,7 @@ impl LanguageServerPool {
                     // acquisition ownership under the original pool lock so a
                     // cancelled waiter cannot disappear before attaching its
                     // cleanup guard.
-                    on_acquired(&handle);
+                    on_acquired(&handle, false);
                 }
                 // Log once when server is disabled due to repeated panics
                 if matches!(err, BridgeError::Disabled) {
@@ -4256,7 +4256,7 @@ impl LanguageServerPool {
         // Insert into pool immediately so concurrent requests see Initializing state
         connections.insert(connection_key.clone(), Arc::clone(&handle));
         if let Some(on_acquired) = on_acquired {
-            on_acquired(&handle);
+            on_acquired(&handle, true);
         }
 
         // Release lock before spawning handshake task
@@ -9885,8 +9885,8 @@ mod tests {
         let config = devnull_config();
         let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed_handles = Arc::clone(&observed);
-        let on_acquired = move |handle: &Arc<ConnectionHandle>| {
-            observed_handles.lock().unwrap().push(Arc::clone(handle));
+        let on_acquired = move |_handle: &Arc<ConnectionHandle>, started_by_pull: bool| {
+            observed_handles.lock().unwrap().push(started_by_pull);
         };
         let admit = || true;
         let acquire = pool.get_or_create_connection_wait_ready_with_admit(
@@ -9901,9 +9901,9 @@ mod tests {
 
         assert!(futures::poll!(acquire.as_mut()).is_pending());
         assert_eq!(
-            observed.lock().unwrap().len(),
-            1,
-            "the handle must be observable before cancellation can drop the handshake wait"
+            *observed.lock().unwrap(),
+            vec![true],
+            "the newly spawned handle must be observable before cancellation can drop the handshake wait"
         );
         drop(acquire);
     }
@@ -9912,7 +9912,7 @@ mod tests {
     async fn acquisition_observer_retains_a_handle_when_later_admission_fails() {
         let pool = LanguageServerPool::new();
         let config = devnull_config();
-        let key = ConnectionKey::for_server("observed-existing");
+        let key = ConnectionKey::workspace("observed-existing");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
         handle.record_launch_config(&config);
         pool.connections
@@ -9921,8 +9921,8 @@ mod tests {
             .insert(key, Arc::clone(&handle));
         let admitted = AtomicBool::new(true);
         let observed = std::sync::Mutex::new(Vec::new());
-        let on_acquired = |handle: &Arc<ConnectionHandle>| {
-            observed.lock().unwrap().push(Arc::clone(handle));
+        let on_acquired = |_handle: &Arc<ConnectionHandle>, started_by_pull: bool| {
+            observed.lock().unwrap().push(started_by_pull);
             admitted.store(false, Ordering::Release);
         };
 
@@ -9937,7 +9937,7 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert_eq!(observed.lock().unwrap().len(), 1);
+        assert_eq!(*observed.lock().unwrap(), vec![false]);
     }
 
     #[tokio::test]
@@ -9952,8 +9952,8 @@ mod tests {
             .await
             .insert(key.clone(), Arc::clone(&handle));
         let observed = std::sync::Mutex::new(Vec::new());
-        let on_acquired = |handle: &Arc<ConnectionHandle>| {
-            observed.lock().unwrap().push(Arc::clone(handle));
+        let on_acquired = |_handle: &Arc<ConnectionHandle>, started_by_pull: bool| {
+            observed.lock().unwrap().push(started_by_pull);
         };
 
         let result = pool
@@ -9970,8 +9970,7 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert_eq!(observed.lock().unwrap().len(), 1);
-        assert!(Arc::ptr_eq(&observed.lock().unwrap()[0], &handle));
+        assert_eq!(*observed.lock().unwrap(), vec![false]);
     }
 
     /// Test that ensure_server_ready is idempotent - calling twice doesn't spawn a second server.

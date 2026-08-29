@@ -93,8 +93,13 @@ struct CompletedDiagnosticProducer {
 }
 
 struct WorkspaceDiagnosticPullGuard {
-    handles: Arc<std::sync::Mutex<Vec<Arc<ConnectionHandle>>>>,
+    handles: Arc<std::sync::Mutex<Vec<WorkspaceDiagnosticPullHandle>>>,
     upstream_tx: tokio::sync::mpsc::UnboundedSender<crate::lsp::bridge::UpstreamNotification>,
+}
+
+struct WorkspaceDiagnosticPullHandle {
+    handle: Arc<ConnectionHandle>,
+    started_by_pull: bool,
 }
 
 impl Drop for WorkspaceDiagnosticPullGuard {
@@ -104,10 +109,11 @@ impl Drop for WorkspaceDiagnosticPullGuard {
             .lock()
             .recover_poison("WorkspaceDiagnosticPullGuard::drop");
         let mut refresh = false;
-        for handle in handles.iter() {
-            refresh |= handle
+        for acquired in handles.iter() {
+            refresh |= acquired
+                .handle
                 .dynamic_capabilities()
-                .mark_workspace_diagnostic_pull_aborted();
+                .mark_workspace_diagnostic_pull_aborted(acquired.started_by_pull);
         }
         if refresh {
             let _ = self
@@ -1321,17 +1327,24 @@ impl LanguageServerPool {
             handles: Arc::clone(&acquired_handles),
             upstream_tx: self.upstream_tx(),
         };
-        let on_acquired = |handle: &Arc<ConnectionHandle>| {
+        let on_acquired = |handle: &Arc<ConnectionHandle>, started_by_pull: bool| {
             let mut handles = acquired_handles
                 .lock()
                 .recover_poison("dispatch_workspace_diagnostic_inner::on_acquired");
-            if handles.iter().any(|existing| Arc::ptr_eq(existing, handle)) {
+            if let Some(existing) = handles
+                .iter_mut()
+                .find(|existing| Arc::ptr_eq(&existing.handle, handle))
+            {
+                existing.started_by_pull |= started_by_pull;
                 return;
             }
             handle
                 .dynamic_capabilities()
                 .mark_workspace_diagnostic_pull_active();
-            handles.push(Arc::clone(handle));
+            handles.push(WorkspaceDiagnosticPullHandle {
+                handle: Arc::clone(handle),
+                started_by_pull,
+            });
         };
 
         let requests = servers.into_iter().map(|(name, config)| {
@@ -2096,7 +2109,10 @@ mod tests {
         );
 
         drop(WorkspaceDiagnosticPullGuard {
-            handles: Arc::new(std::sync::Mutex::new(vec![Arc::clone(&handle)])),
+            handles: Arc::new(std::sync::Mutex::new(vec![WorkspaceDiagnosticPullHandle {
+                handle: Arc::clone(&handle),
+                started_by_pull: true,
+            }])),
             upstream_tx: LanguageServerPool::new().upstream_tx(),
         });
 

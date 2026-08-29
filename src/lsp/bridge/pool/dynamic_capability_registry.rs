@@ -205,14 +205,14 @@ impl DynamicCapabilityRegistry {
             .active = true;
     }
 
-    pub(crate) fn mark_workspace_diagnostic_pull_aborted(&self) -> bool {
+    pub(crate) fn mark_workspace_diagnostic_pull_aborted(&self, started_by_pull: bool) -> bool {
         let mut pull = self
             .workspace_diagnostic_pull
             .lock()
             .recover_poison("DynamicCapabilityRegistry::mark_workspace_diagnostic_pull_aborted");
         if pull.active {
             pull.active = false;
-            if pull.accepted_once {
+            if pull.accepted_once || !started_by_pull {
                 return std::mem::take(&mut pull.registration_refresh_pending);
             }
             pull.registration_refresh_pending = false;
@@ -713,7 +713,7 @@ mod tests {
         registry.mark_workspace_diagnostic_pull_active();
         assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
 
-        assert!(!registry.mark_workspace_diagnostic_pull_aborted());
+        assert!(!registry.mark_workspace_diagnostic_pull_aborted(true));
 
         assert!(!registry.take_workspace_diagnostic_registration_refresh());
         assert!(
@@ -726,12 +726,22 @@ mod tests {
     fn aborted_cold_pull_does_not_suppress_a_later_registration() {
         let registry = DynamicCapabilityRegistry::new();
         registry.mark_workspace_diagnostic_pull_active();
-        registry.mark_workspace_diagnostic_pull_aborted();
+        registry.mark_workspace_diagnostic_pull_aborted(true);
 
         assert!(
             registry.request_or_defer_workspace_diagnostic_registration_refresh(),
             "a registration not observed during the pull must refresh normally"
         );
+    }
+
+    #[test]
+    fn aborted_first_pull_releases_refresh_for_a_preexisting_connection() {
+        let registry = DynamicCapabilityRegistry::new();
+        registry.mark_workspace_diagnostic_pull_active();
+        assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
+
+        assert!(registry.mark_workspace_diagnostic_pull_aborted(false));
+        assert!(!registry.take_workspace_diagnostic_registration_refresh());
     }
 
     #[test]
@@ -744,7 +754,7 @@ mod tests {
         registry.mark_workspace_diagnostic_pull_active();
         assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
 
-        assert!(registry.mark_workspace_diagnostic_pull_aborted());
+        assert!(registry.mark_workspace_diagnostic_pull_aborted(true));
         assert!(!registry.take_workspace_diagnostic_registration_refresh());
     }
 
@@ -761,7 +771,7 @@ mod tests {
         registry.mark_workspace_diagnostic_pull_active();
         assert!(!registry.request_or_defer_workspace_diagnostic_registration_refresh());
 
-        assert!(registry.mark_workspace_diagnostic_pull_aborted());
+        assert!(registry.mark_workspace_diagnostic_pull_aborted(true));
         assert!(!registry.take_workspace_diagnostic_registration_refresh());
     }
 
@@ -771,7 +781,7 @@ mod tests {
         registry.mark_workspace_diagnostic_pull_active();
         assert!(!registry.mark_workspace_diagnostic_pull_completed());
 
-        registry.mark_workspace_diagnostic_pull_aborted();
+        registry.mark_workspace_diagnostic_pull_aborted(true);
 
         assert!(registry.request_or_defer_workspace_diagnostic_registration_refresh());
     }
