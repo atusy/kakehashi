@@ -248,6 +248,26 @@ impl CancelForwarder {
         subscribers.subscribers.remove(upstream_id);
     }
 
+    /// Atomically release one subscriber and report whether cancellation was
+    /// already delivered for the request's active generation. A cancellation
+    /// arriving after this lock is released becomes pending for the next
+    /// subscriber, so middleware can hand cancellation ownership downstream
+    /// without an unsubscribe gap.
+    pub(crate) fn unsubscribe_and_take_cancelled(&self, upstream_id: &UpstreamId) -> bool {
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .recover_poison("CancelForwarder::unsubscribe_and_take_cancelled");
+        subscribers.subscribers.remove(upstream_id);
+        let generation = subscribers.active_requests.get(upstream_id).copied();
+        generation.is_some()
+            && subscribers
+                .delivered_cancellations
+                .get(upstream_id)
+                .copied()
+                == generation
+    }
+
     /// Notify a subscriber that its request was cancelled, or retain the signal
     /// while an accepted request has not subscribed yet. Returns whether the ID
     /// belongs to an active request or subscriber.
@@ -1210,6 +1230,26 @@ mod tests {
         // Second subscription should now succeed
         let result = forwarder.subscribe(upstream_id);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancellation_handoff_observes_delivered_or_retains_later_cancel() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+
+        let delivered_id = UpstreamId::Number(42);
+        let _delivered_guard = ActiveRequestGuard::new(forwarder.clone(), delivered_id.clone());
+        let _delivered_rx = forwarder.subscribe(delivered_id.clone()).unwrap();
+        assert!(forwarder.notify_cancel(&delivered_id));
+        assert!(forwarder.unsubscribe_and_take_cancelled(&delivered_id));
+
+        let later_id = UpstreamId::Number(43);
+        let _later_guard = ActiveRequestGuard::new(forwarder.clone(), later_id.clone());
+        let _outer_rx = forwarder.subscribe(later_id.clone()).unwrap();
+        assert!(!forwarder.unsubscribe_and_take_cancelled(&later_id));
+        assert!(forwarder.notify_cancel(&later_id));
+        let mut inner_rx = forwarder.subscribe(later_id).unwrap();
+        assert!(matches!(inner_rx.try_recv(), Ok(())));
     }
 
     #[tokio::test]
