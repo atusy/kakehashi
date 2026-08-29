@@ -454,9 +454,10 @@ impl Kakehashi {
             self.resolve_layer_config(language, METHOD)
                 .allows(LayerSource::Virt)
         });
-        let actionable_virtual = document_language.as_ref().is_some_and(|language| {
-            self.semantic_tokens_full_has_potential_virtual_producer(language)
-        });
+        let actionable_virtual = virtual_enabled
+            && document_language.as_ref().is_some_and(|language| {
+                self.semantic_tokens_full_has_potential_virtual_producer(language)
+            });
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
         // supersession, and cancellation contract. A current snapshot makes
