@@ -552,7 +552,9 @@ impl Kakehashi {
                     activity.mark_selected("host");
                 }
             }
-            if local_succeeded.load(std::sync::atomic::Ordering::Acquire) {
+            if local_succeeded.load(std::sync::atomic::Ordering::Acquire)
+                && whole_document_unit_succeeded(&fan_in)
+            {
                 if let Some(succeeded) = &host_bridge_succeeded {
                     succeeded.store(true, std::sync::atomic::Ordering::Release);
                 }
