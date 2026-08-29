@@ -579,7 +579,7 @@ impl Kakehashi {
             direct_request,
         );
         let tracking = Some((request_id, cancel_token));
-        let retryable_snapshot = self.documents.latest_snapshot(&uri).and_then(|view| {
+        let mut observed_snapshot = self.documents.latest_snapshot(&uri).and_then(|view| {
             let tree_present = view
                 .slot
                 .snapshot
@@ -592,71 +592,65 @@ impl Kakehashi {
                 tree_present,
             ))
         });
-        let retry_params = params.clone();
-        let retry_tracking = tracking.clone();
-        let outcome = self
-            .semantic_tokens_full_impl_with_tracking_once(params, tracking, direct_request)
-            .await;
-        let retry_after_snapshot_publication = || {
-            retryable_snapshot.is_some_and(
-                |(incarnation, content_version, generation, initial_tree_present)| {
-                    self.cache.semantic_token_generation() == generation
-                        && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                            view.slot.current_incarnation == incarnation
-                                && view.content_version == content_version
-                                && semantic_snapshot_state_advanced(
-                                    initial_tree_present,
-                                    view.slot
-                                        .snapshot
-                                        .as_ref()
-                                        .map(|snapshot| snapshot.tree.is_some()),
-                                )
-                        })
-                        && retry_tracking.as_ref().is_some_and(|(request_id, cancel)| {
+        loop {
+            let outcome = self
+                .semantic_tokens_full_impl_with_tracking_once(
+                    params.clone(),
+                    tracking.clone(),
+                    direct_request,
+                )
+                .await;
+            let retryable_outcome = match outcome {
+                Ok(Some(outcome)) => {
+                    request_guard.finish();
+                    return Ok(Some(outcome));
+                }
+                Ok(None) => Ok(None),
+                Err(error) if error.code == crate::error::content_modified_error().code => {
+                    Err(error)
+                }
+                Err(error) => {
+                    request_guard.finish();
+                    return Err(error);
+                }
+            };
+            let next_snapshot = observed_snapshot.and_then(
+                |(incarnation, content_version, generation, previous_tree_present)| {
+                    if self.cache.semantic_token_generation() != generation
+                        || !tracking.as_ref().is_some_and(|(request_id, cancel)| {
                             !cancel.is_cancelled()
                                 && self.cache.is_request_active(&uri, *request_id)
                         })
+                    {
+                        return None;
+                    }
+                    self.documents.latest_snapshot(&uri).and_then(|view| {
+                        let current_tree_present = view
+                            .slot
+                            .snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.tree.is_some());
+                        (view.slot.current_incarnation == incarnation
+                            && view.content_version == content_version
+                            && semantic_snapshot_state_advanced(
+                                previous_tree_present,
+                                current_tree_present,
+                            ))
+                        .then_some((
+                            incarnation,
+                            content_version,
+                            generation,
+                            current_tree_present,
+                        ))
+                    })
                 },
-            )
-        };
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(error)
-                if error.code == crate::error::content_modified_error().code
-                    && retry_after_snapshot_publication() =>
-            {
-                let outcome = self
-                    .semantic_tokens_full_impl_with_tracking_once(
-                        retry_params,
-                        retry_tracking,
-                        direct_request,
-                    )
-                    .await;
+            );
+            let Some(next_snapshot) = next_snapshot else {
                 request_guard.finish();
-                return outcome;
-            }
-            Err(error) => {
-                request_guard.finish();
-                return Err(error);
-            }
-        };
-        if outcome.is_some() {
-            request_guard.finish();
-            return Ok(outcome);
+                return retryable_outcome;
+            };
+            observed_snapshot = Some(next_snapshot);
         }
-        if !retry_after_snapshot_publication() {
-            request_guard.finish();
-            return Ok(None);
-        }
-        let outcome = self
-            .semantic_tokens_full_impl_with_tracking_once(
-                retry_params,
-                retry_tracking,
-                direct_request,
-            )
-            .await;
-        request_guard.finish();
-        outcome
     }
 
     async fn semantic_tokens_full_impl_with_tracking_once(
@@ -688,7 +682,7 @@ impl Kakehashi {
         let actionable_virtual = if virtual_enabled {
             match document_language.as_deref() {
                 Some(language) => {
-                    self.semantic_tokens_full_has_potential_virtual_producer(language)
+                    self.semantic_tokens_full_has_potential_virtual_producer(&uri, language)
                         .await
                 }
                 None => false,
@@ -1681,15 +1675,27 @@ impl Kakehashi {
                 Some((configs, aggregation))
             })
             .collect::<Vec<_>>();
-        let server_names = plans
-            .iter()
-            .flat_map(|(configs, _)| configs.iter().map(|config| config.server_name.as_str()))
-            .collect::<std::collections::HashSet<_>>();
-        let incapable = self
-            .bridge
-            .pool()
-            .servers_known_incapable(&server_names, METHOD)
-            .await;
+        let pool = self.bridge.pool();
+        let mut incapable = std::collections::HashSet::new();
+        let mut incapable_by_connection = std::collections::HashMap::new();
+        for (configs, _) in &plans {
+            for config in configs {
+                let key = pool
+                    .resolved_connection_key(&config.server_name, &config.config, host_uri)
+                    .await;
+                let known_incapable = match incapable_by_connection.get(&key) {
+                    Some(known_incapable) => *known_incapable,
+                    None => {
+                        let known_incapable = pool.connection_known_incapable(&key, METHOD).await;
+                        incapable_by_connection.insert(key, known_incapable);
+                        known_incapable
+                    }
+                };
+                if known_incapable {
+                    incapable.insert(config.server_name.clone());
+                }
+            }
+        }
         plans.into_iter().any(|(configs, aggregation)| {
             semantic_configs_select_servers(
                 &aggregation.priorities,
