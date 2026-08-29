@@ -112,8 +112,9 @@ impl LanguageServerPool {
         client_progress_token: Option<NumberOrString>,
         expected_incarnation: Option<u64>,
         attempted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        selected: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> io::Result<Option<SemanticTokens>> {
-        let handle = self
+        let handle = match self
             .get_or_create_virtual_connection(
                 server_name,
                 server_config,
@@ -121,7 +122,16 @@ impl LanguageServerPool {
                 injection_language,
                 region_id,
             )
-            .await?;
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(selected) = selected {
+                    selected.store(true, std::sync::atomic::Ordering::Release);
+                }
+                return Err(error);
+            }
+        };
         if !handle.has_capability(FULL_METHOD) {
             return Ok(None);
         }
@@ -132,6 +142,9 @@ impl LanguageServerPool {
             Position::new(offset.line(), offset.column_for_line(0)),
             region_end,
         );
+        if let Some(selected) = selected {
+            selected.store(true, std::sync::atomic::Ordering::Release);
+        }
         self.execute_bridge_request_observed(
             handle,
             host_uri,

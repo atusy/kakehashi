@@ -75,7 +75,7 @@ impl Kakehashi {
         expected_snapshot: Option<WholeDocumentSnapshotIdentity>,
         bridge_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
         bridge_succeeded: Option<Arc<std::sync::atomic::AtomicBool>>,
-        virt_work_selected: Option<Arc<std::sync::atomic::AtomicBool>>,
+        bridge_work_selected: Option<Arc<std::sync::atomic::AtomicBool>>,
         require_all_layers: bool,
         preserve_empty: bool,
         nested_regions_first: bool,
@@ -284,9 +284,6 @@ impl Kakehashi {
                 if !request_selects_servers(&agg.priorities, &configs, agg.max_fan_out) {
                     continue;
                 }
-                if let Some(selected) = &virt_work_selected {
-                    selected.store(true, std::sync::atomic::Ordering::Release);
-                }
                 let region_ctx = DocumentRequestContext {
                     uri: uri.clone(),
                     resolved: resolved.clone(),
@@ -402,8 +399,9 @@ impl Kakehashi {
                     let on_host_winner = on_host_winner.clone();
                     let attempted = host_bridge_attempted.clone();
                     let succeeded = host_bridge_succeeded.clone();
+                    let selected = bridge_work_selected.clone();
                     async move {
-                        let raw = match attempted {
+                        let (raw, succeeded_after_parse) = match attempted {
                             Some(attempted) => {
                                 let local_attempted =
                                     Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -423,21 +421,17 @@ impl Kakehashi {
                                         t.upstream_id,
                                         expected_incarnation,
                                         Arc::clone(&local_attempted),
+                                        selected.expect("activity markers are paired"),
                                     )
                                     .await;
                                 let was_attempted =
                                     local_attempted.load(std::sync::atomic::Ordering::Acquire);
                                 if was_attempted {
                                     attempted.store(true, std::sync::atomic::Ordering::Release);
-                                    if result.is_ok()
-                                        && let Some(succeeded) = succeeded
-                                    {
-                                        succeeded.store(true, std::sync::atomic::Ordering::Release);
-                                    }
                                 }
-                                result?
+                                (result?, was_attempted.then_some(succeeded).flatten())
                             }
-                            None => {
+                            None => (
                                 t.pool
                                     .send_host_raw_request_for_incarnation(
                                         &t.server_name,
@@ -453,10 +447,14 @@ impl Kakehashi {
                                         t.upstream_id,
                                         expected_incarnation,
                                     )
-                                    .await?
-                            }
+                                    .await?,
+                                None,
+                            ),
                         };
                         let Some(raw) = raw else {
+                            if let Some(succeeded) = succeeded_after_parse {
+                                succeeded.store(true, std::sync::atomic::Ordering::Release);
+                            }
                             return Ok(None);
                         };
                         if raw.incarnation != expected_incarnation {
@@ -471,6 +469,9 @@ impl Kakehashi {
                         let Some(items) = parse_host(raw.value) else {
                             return Ok(None);
                         };
+                        if let Some(succeeded) = succeeded_after_parse {
+                            succeeded.store(true, std::sync::atomic::Ordering::Release);
+                        }
                         Ok(on_host_winner(HostWholeDocumentResponse {
                             items,
                             server_name: t.server_name,
