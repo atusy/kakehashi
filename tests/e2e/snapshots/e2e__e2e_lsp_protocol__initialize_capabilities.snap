@@ -127,8 +127,8 @@ expression: capabilities
     "resolveProvider": true
   },
   "diagnosticProvider": {
-    "interFileDependencies": false,
-    "workspaceDiagnostics": false
+    "interFileDependencies": true,
+    "workspaceDiagnostics": true
   },
   "typeHierarchyProvider": true
 }
