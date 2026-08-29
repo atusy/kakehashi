@@ -465,6 +465,7 @@ impl Kakehashi {
                 params,
                 &mut cancel_rx,
                 tracking,
+                native_enabled,
                 native_enabled || virtual_enabled,
             )
             .await?
@@ -641,6 +642,7 @@ impl Kakehashi {
         params: SemanticTokensParams,
         cancel_rx: &mut Option<crate::lsp::request_id::CancelReceiver>,
         tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
+        compute_native: bool,
         require_snapshot: bool,
     ) -> Result<Option<NativeSemanticLayer>> {
         let lsp_uri = params.text_document.uri;
@@ -755,6 +757,17 @@ impl Kakehashi {
                 return Ok(None);
             }
         };
+        if !compute_native {
+            return Ok(Some(NativeSemanticLayer::new(
+                SemanticTokens {
+                    result_id: None,
+                    data: Vec::new(),
+                },
+                Some(snapshot),
+                request_guard,
+                token_generation,
+            )));
+        }
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
             // No detectable language, or resolved-but-tree-less (see
