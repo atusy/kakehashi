@@ -75,9 +75,12 @@ impl VirtualUriProvenance {
             .mutation
             .write()
             .recover_poison("VirtualUriProvenance::mutation");
+        let was_visible = self.contains(&uri);
         self.insert_issued(uri.clone());
         self.reservations.remove(&uri);
-        self.revision.fetch_add(1, Ordering::AcqRel);
+        if !was_visible {
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     fn insert_queued(&self, uri: String) {
@@ -2835,6 +2838,31 @@ mod tests {
             !tracker.try_claim_for_open(&rejected, &key).await,
             "queued publication must not release its claim reservation"
         );
+    }
+
+    #[tokio::test]
+    async fn confirming_queued_provenance_does_not_advance_visibility_revision() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/queued.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "queued-visible");
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        assert!(tracker.try_claim_for_open(&virtual_uri, &key).await);
+        let claim = tracker
+            .open_claim_waiter(&virtual_uri, &key)
+            .expect("claim identity");
+        assert!(tracker.mark_open_queued(&virtual_uri, &key, generation, &claim));
+        let observer = tracker.observe_virtual_uris_for_connection(&key, generation);
+        let queued_revision = observer.provenance_revision();
+
+        assert!(
+            tracker
+                .mark_open_sent(&virtual_uri, &key, generation, &claim)
+                .await
+        );
+
+        assert!(observer.contains(&virtual_uri.to_uri_string()));
+        assert_eq!(observer.provenance_revision(), queued_revision);
     }
 
     #[tokio::test]
