@@ -45,7 +45,7 @@ impl Kakehashi {
                     )
                     .await
             },
-            parse_host_verbatim::<Vec<DocumentLink>>,
+            |value| Ok(parse_host_verbatim::<Vec<DocumentLink>>(value)),
             |mut won| {
                 let server_resolves = won.handle.has_capability("documentLink/resolve");
                 envelope_host_document_links(
@@ -57,7 +57,7 @@ impl Kakehashi {
                     won.handle.key(),
                     server_resolves,
                 );
-                Some(won.items)
+                Ok(Some(won.items))
             },
             |mut acc, next| {
                 acc.extend(next);
