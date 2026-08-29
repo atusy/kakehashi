@@ -98,7 +98,7 @@ fn virtual_workspace_symbol_locations_round_trip_through_the_host() {
         "initialize",
         json!({
             "processId": std::process::id(),
-            "rootUri": null,
+            "rootUri": "file:///workspace",
             "workspaceFolders": null,
             "capabilities": {
                 "workspace": {
