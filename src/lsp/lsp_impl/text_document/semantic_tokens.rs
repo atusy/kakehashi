@@ -471,7 +471,7 @@ impl Kakehashi {
                 &mut cancel_rx,
                 tracking,
                 native_enabled,
-                native_enabled || virtual_enabled,
+                native_enabled || actionable_virtual,
             )
             .await?
         else {
@@ -540,6 +540,7 @@ impl Kakehashi {
                     true,
                     true,
                     true,
+                    actionable_virtual,
                     native,
                     move |task| {
                         let attempted = std::sync::Arc::clone(&virt_bridge_attempted);
@@ -2734,7 +2735,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn host_only_delta_reentry_does_not_wait_for_a_native_snapshot() {
+    async fn delta_reentry_without_actionable_virtual_work_skips_the_first_parse_backstop() {
         use crate::config::WorkspaceSettings;
         use crate::config::settings::{LanguageSettings, LayerAggregationConfig, LayersConfig};
         use std::collections::HashMap;
@@ -2745,7 +2746,7 @@ mod tests {
         aggregation.insert(
             "textDocument/semanticTokens/full".to_string(),
             LayerAggregationConfig {
-                priorities: Some(vec![LayerSource::Host]),
+                priorities: Some(vec![LayerSource::Host, LayerSource::Virt]),
                 strategy: None,
             },
         );
@@ -2786,11 +2787,11 @@ mod tests {
         };
 
         let result = tokio::time::timeout(
-            Duration::from_millis(100),
+            Duration::from_millis(500),
             server.semantic_tokens_full_delta_impl(params),
         )
         .await
-        .expect("host-only delta re-entry must not wait for the first-parse backstop")
+        .expect("inactive virtual work must not trigger the first-parse backstop")
         .expect("semantic tokens delta should return without error");
         assert!(result.is_none(), "no host server is configured: {result:?}");
     }
