@@ -105,16 +105,10 @@ pub(crate) struct VirtualUriObserver {
 
 impl VirtualUriObserver {
     pub(crate) fn insert(&self, uri: String) {
-        let _mutation = self
-            .provenance
-            .mutation
-            .write()
-            .recover_poison("VirtualUriProvenance::mutation");
         self.explicit_uris
             .lock()
             .recover_poison("VirtualUriObserver::explicit_uris")
             .insert(uri);
-        self.provenance.revision.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(crate) fn contains(&self, uri: &str) -> bool {
@@ -2632,6 +2626,23 @@ mod tests {
         tracker.untrack_document(&virtual_uri, &key).await;
 
         assert!(observer.contains(&virtual_uri.to_uri_string()));
+    }
+
+    #[test]
+    fn observer_local_uri_does_not_advance_shared_provenance_revision() {
+        let tracker = DocumentTracker::new();
+        let key = ConnectionKey::for_server("lua");
+        let generation = tracker.connection_generation(&key);
+        let first = tracker.observe_virtual_uris_for_connection(&key, generation);
+        let concurrent = tracker.observe_virtual_uris_for_connection(&key, generation);
+        let revision = concurrent.provenance_revision();
+        let local_uri = "file:///project/local.lua";
+
+        first.insert(local_uri.into());
+
+        assert!(first.contains(local_uri));
+        assert!(!concurrent.contains(local_uri));
+        assert_eq!(concurrent.provenance_revision(), revision);
     }
 
     #[tokio::test]
