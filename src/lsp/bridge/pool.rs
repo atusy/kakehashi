@@ -2395,6 +2395,14 @@ impl LanguageServerPool {
         {
             return false;
         }
+        if uri.scheme() == "file"
+            && let (Ok(uri_path), Ok(root_path)) = (
+                super::root_markers::normalized_root_url(uri).to_file_path(),
+                super::root_markers::normalized_root_url(root).to_file_path(),
+            )
+        {
+            return uri_path.starts_with(root_path);
+        }
         let Some(mut root_segments) = root.path_segments().map(Iterator::collect::<Vec<_>>) else {
             return uri == root;
         };
@@ -2445,9 +2453,9 @@ impl LanguageServerPool {
         &self,
         handle: &Arc<ConnectionHandle>,
         server_config: &crate::config::settings::BridgeServerConfig,
-    ) {
+    ) -> io::Result<()> {
         if handle.key().is_shared() || handle.key().is_client_fallback() {
-            return;
+            return Ok(());
         }
         let languages = server_config.languages.as_deref().unwrap_or_default();
         let accepts_all = languages
@@ -2503,18 +2511,21 @@ impl LanguageServerPool {
             if !connections.get(handle.key()).is_some_and(|current| {
                 Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
             }) {
-                return;
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "workspace producer was replaced before virtual documents opened",
+                ));
             }
-            let _ = self
-                .ensure_document_opened(
-                    &mut ConnectionHandleSender(handle),
-                    &host_uri,
-                    &virtual_uri,
-                    &content,
-                    handle.key(),
-                )
-                .await;
+            self.ensure_document_opened(
+                &mut ConnectionHandleSender(handle),
+                &host_uri,
+                &virtual_uri,
+                &content,
+                handle.key(),
+            )
+            .await?;
         }
+        Ok(())
     }
 
     fn record_latest_virtual_content_batch<'a>(
@@ -6894,9 +6905,11 @@ mod tests {
         };
 
         pool.open_recorded_workspace_virtual_documents(&primary_handle, &config)
-            .await;
+            .await
+            .unwrap();
         pool.open_recorded_workspace_virtual_documents(&secondary_handle, &config)
-            .await;
+            .await
+            .unwrap();
 
         let primary_revisions = pool
             .confirmed_virtual_document_revisions_for_connection(&primary_key)
@@ -6952,13 +6965,59 @@ mod tests {
             .await
             .insert(folder_capable_key.clone(), Arc::clone(&folder_capable));
         pool.open_recorded_workspace_virtual_documents(&folder_capable, &config)
-            .await;
+            .await
+            .unwrap();
         let folder_capable_revisions = pool
             .confirmed_virtual_document_revisions_for_connection(&folder_capable_key)
             .await;
         assert!(folder_capable_revisions.contains_key(&primary_uri));
         assert!(folder_capable_revisions.contains_key(&secondary_uri));
         assert!(!folder_capable_revisions.contains_key(&outside_uri));
+    }
+
+    #[test]
+    fn workspace_producer_scope_normalizes_equivalent_file_uri_paths() {
+        let encoded = Url::parse("file:///workspace/%7Eproject/main.md").unwrap();
+        let literal = Url::parse("file:///workspace/~project").unwrap();
+
+        assert!(LanguageServerPool::uri_is_within_root(&encoded, &literal));
+    }
+
+    #[tokio::test]
+    async fn workspace_producer_aborts_when_a_recorded_virtual_didopen_cannot_enqueue() {
+        let pool = LanguageServerPool::new();
+        let host = Url::parse("file:///workspace/doc.md").unwrap();
+        let injection = crate::lsp::bridge::coordinator::BridgeInjection {
+            language: "lua".to_owned(),
+            region_id: TEST_ULID_LUA_0.to_owned(),
+            content: "print('ready')".to_owned(),
+        };
+        pool.open_host_incarnation(&host, 1).await;
+        pool.record_latest_virtual_contents(&host, 1, 0, std::slice::from_ref(&injection));
+        let key = ConnectionKey::workspace("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        record_test_spawn_root(&handle, "file:///workspace");
+        pool.connections()
+            .await
+            .insert(key.clone(), Arc::clone(&handle));
+        handle.cancel_writer_for_test().await;
+        let config = crate::config::settings::BridgeServerConfig {
+            languages: Some(vec!["lua".to_owned()]),
+            ..Default::default()
+        };
+
+        let error = pool
+            .open_recorded_workspace_virtual_documents(&handle, &config)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(
+            pool.confirmed_virtual_document_revisions_for_connection(&key)
+                .await
+                .is_empty(),
+            "the producer must not proceed with a partially opened document set"
+        );
     }
 
     /// Test that ensure_document_opened sends didOpen when document is not yet opened.

@@ -613,8 +613,13 @@ impl LanguageServerPool {
                 }
                 if projection_context.is_some() {
                     for handle in &handles {
-                        self.open_recorded_workspace_virtual_documents(handle, &config)
-                            .await;
+                        if self
+                            .open_recorded_workspace_virtual_documents(handle, &config)
+                            .await
+                            .is_err()
+                        {
+                            return Vec::new();
+                        }
                     }
                 }
                 let workspace_admit =
