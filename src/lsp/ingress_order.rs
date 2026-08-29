@@ -314,6 +314,8 @@ enum Role {
     Reader { uri: String },
     /// Produces a workspace-wide diagnostic snapshot; serialized globally.
     WorkspaceDiagnostic,
+    /// Mutates the workspace scope observed by workspace-wide requests.
+    WorkspaceMutation,
 }
 
 /// Classify a request and extract its `textDocument.uri`, both synchronously.
@@ -347,6 +349,7 @@ enum Role {
 fn classify(req: &Request) -> Option<Role> {
     let method = req.method();
     match method {
+        "workspace/didChangeWorkspaceFolders" => Some(Role::WorkspaceMutation),
         "workspace/diagnostic" => Some(Role::WorkspaceDiagnostic),
         "textDocument/didSave" => {
             // Cleanup for a missing save is signalled by the typed handler.
@@ -500,6 +503,17 @@ where
         let inner_fut = self.inner.call(req);
         match role {
             None => Box::pin(inner_fut),
+            Some(Role::WorkspaceMutation) => {
+                let mut gate = self
+                    .workspace_diagnostic_sequencer
+                    .issue_writer_ticket("workspace/diagnostic");
+                Box::pin(async move {
+                    gate.wait_turn().await;
+                    let result = inner_fut.await;
+                    drop(gate);
+                    result
+                })
+            }
             Some(Role::WorkspaceDiagnostic) => {
                 let document_barriers = self.sequencer.pending_writer_barriers();
                 let mut gate = self
@@ -1144,6 +1158,7 @@ mod tests {
             "textDocument/didOpen" => "open",
             "textDocument/didChange" => "change",
             "textDocument/didClose" => "close",
+            "workspace/didChangeWorkspaceFolders" => "folders",
             _ => "reader",
         }
     }
@@ -1238,6 +1253,34 @@ mod tests {
         assert_eq!(
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["reader", "reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_runs_workspace_diagnostic_after_preceding_folder_change() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "workspace/didChangeWorkspaceFolders",
+            release: Some(release_rx),
+        });
+
+        let folders_fut = gate.call(notification("workspace/didChangeWorkspaceFolders", URI));
+        let diagnostic_fut = gate.call(notification("workspace/diagnostic", URI));
+        let mut folders = tokio_test::task::spawn(folders_fut);
+        let mut diagnostic = tokio_test::task::spawn(diagnostic_fut);
+
+        assert!(diagnostic.poll().is_pending());
+        assert!(folders.poll().is_pending());
+        assert!(diagnostic.poll().is_pending());
+        release_tx.send(()).expect("folder change is waiting");
+        assert!(folders.poll().is_ready());
+        assert!(diagnostic.is_woken());
+        assert!(diagnostic.poll().is_ready());
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["folders", "reader"]
         );
     }
 
