@@ -183,10 +183,14 @@ struct SemanticDeltaComputation {
 fn should_publish_empty_non_native_result(
     non_native_only: bool,
     virt_only: bool,
-    virt_work_selected: bool,
+    bridge_work_selected: bool,
     bridge_succeeded: bool,
 ) -> bool {
-    non_native_only && (bridge_succeeded || (virt_only && !virt_work_selected))
+    non_native_only && (bridge_succeeded || (virt_only && !bridge_work_selected))
+}
+
+fn bridge_overlay_is_authoritative(work_selected: bool, succeeded: bool) -> bool {
+    !work_selected || succeeded
 }
 
 fn commit_full_baselines(
@@ -615,6 +619,10 @@ impl Kakehashi {
             request_guard.finish();
             return Err(crate::error::content_modified_error());
         }
+        let live_snapshot_present = self
+            .documents
+            .latest_snapshot(&uri)
+            .is_some_and(|view| view.slot.snapshot.is_some());
         let Some((live_identity, live_text, live_language)) =
             self.documents.get(&uri).map(|document| {
                 (
@@ -647,7 +655,8 @@ impl Kakehashi {
         let virt_bridge_attempted = std::sync::Arc::clone(&bridge_attempted);
         let bridge_succeeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let virt_bridge_succeeded = std::sync::Arc::clone(&bridge_succeeded);
-        let virt_work_selected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bridge_work_selected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let virt_bridge_work_selected = std::sync::Arc::clone(&bridge_work_selected);
 
         let fan_out = async {
             let data = self
@@ -659,7 +668,7 @@ impl Kakehashi {
                     expected,
                     Some(std::sync::Arc::clone(&bridge_attempted)),
                     Some(std::sync::Arc::clone(&bridge_succeeded)),
-                    Some(std::sync::Arc::clone(&virt_work_selected)),
+                    Some(std::sync::Arc::clone(&bridge_work_selected)),
                     true,
                     true,
                     true,
@@ -668,6 +677,7 @@ impl Kakehashi {
                     move |task| {
                         let attempted = std::sync::Arc::clone(&virt_bridge_attempted);
                         let succeeded = std::sync::Arc::clone(&virt_bridge_succeeded);
+                        let selected = std::sync::Arc::clone(&virt_bridge_work_selected);
                         async move {
                             let region_end = task.region_end();
                             let local_attempted =
@@ -687,6 +697,7 @@ impl Kakehashi {
                                     task.client_progress_token,
                                     expected_incarnation,
                                     Some(std::sync::Arc::clone(&local_attempted)),
+                                    Some(selected),
                                 )
                                 .await;
                             let was_attempted =
@@ -732,13 +743,20 @@ impl Kakehashi {
                 .await?;
 
             let bridge_succeeded = bridge_succeeded.load(std::sync::atomic::Ordering::Acquire);
-            let virt_work_selected = virt_work_selected.load(std::sync::atomic::Ordering::Acquire);
+            let bridge_work_selected =
+                bridge_work_selected.load(std::sync::atomic::Ordering::Acquire);
+            if !bridge_overlay_is_authoritative(bridge_work_selected, bridge_succeeded) {
+                // Native data is only a partial overlay when a selected bridge
+                // producer failed. Preserve the previous merged wire baseline
+                // instead of publishing that incomplete result.
+                return Ok(None);
+            }
             let data = match data {
                 Some(data) => data,
                 None if should_publish_empty_non_native_result(
                     non_native_only,
                     virt_only,
-                    virt_work_selected,
+                    bridge_work_selected,
                     bridge_succeeded,
                 ) =>
                 {
@@ -801,7 +819,7 @@ impl Kakehashi {
                 pending_wire,
                 identity: live_identity,
                 generation,
-                snapshot_present: snapshot.is_some(),
+                snapshot_present: live_snapshot_present,
             }))
         };
         let mut outcome = match cancel_rx.as_mut() {
@@ -2661,6 +2679,12 @@ mod tests {
         assert!(
             !should_publish_empty_non_native_result(true, true, true, false),
             "virt-only request failures differ from a document with no virtual request"
+        );
+        assert!(bridge_overlay_is_authoritative(false, false));
+        assert!(bridge_overlay_is_authoritative(true, true));
+        assert!(
+            !bridge_overlay_is_authoritative(true, false),
+            "native data must not make a failed bridge overlay authoritative"
         );
     }
 
