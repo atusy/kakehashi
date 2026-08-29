@@ -753,21 +753,19 @@ print("hello")
             configs.clone(),
             None,
         );
-        timeout(
-            Duration::from_secs(1),
-            server.bridge.wait_host_eager_open_finished(&uri),
-        )
-        .await
-        .expect("first eager-sync batch should finish");
-        assert_eq!(
-            server
+        timeout(Duration::from_secs(1), async {
+            while server
                 .bridge
                 .pool()
                 .host_document_version(&uri, "rust_ls")
-                .await,
-            Some(1),
-            "the completed batch must have enqueued didOpen"
-        );
+                .await
+                != Some(1)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first eager-sync should enqueue didOpen");
 
         // A re-sync with changed text must send a didChange, advancing to version 2.
         server.bridge.eager_sync_host_document_on_servers(
@@ -777,21 +775,19 @@ print("hello")
             configs,
             None,
         );
-        timeout(
-            Duration::from_secs(1),
-            server.bridge.wait_host_eager_open_finished(&uri),
-        )
-        .await
-        .expect("changed eager-sync batch should finish");
-        assert_eq!(
-            server
+        timeout(Duration::from_secs(1), async {
+            while server
                 .bridge
                 .pool()
                 .host_document_version(&uri, "rust_ls")
-                .await,
-            Some(2),
-            "the completed batch must have enqueued didChange"
-        );
+                .await
+                != Some(2)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("changed eager-sync should enqueue didChange");
     }
 
     /// Live-reader wiring (#422): the on-edit eager re-sync syncs the reader's

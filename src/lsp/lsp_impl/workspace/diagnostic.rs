@@ -13,30 +13,6 @@ impl Kakehashi {
         })
     }
 
-    async fn sync_host_before_workspace_diagnostic(&self, uri: &url::Url) {
-        let Ok(lsp_uri) = crate::lsp::lsp_impl::url_to_uri(uri) else {
-            return;
-        };
-        let Some(host) = self.resolve_host_bridge_context(&lsp_uri, "textDocument/diagnostic")
-        else {
-            return;
-        };
-        let host_uri = host.uri.clone();
-        let documents = std::sync::Arc::clone(&self.documents);
-        let live_uri = host_uri.clone();
-        let live_text_reader: crate::lsp::bridge::HostTextReader = std::sync::Arc::new(move || {
-            documents.get(&live_uri).map(|document| document.text_arc())
-        });
-        self.bridge.eager_sync_host_document_on_servers(
-            &host_uri,
-            &host.language_id,
-            host.text,
-            host.configs,
-            Some(live_text_reader),
-        );
-        self.bridge.wait_host_eager_open_finished(&host_uri).await;
-    }
-
     pub(crate) async fn workspace_diagnostic_impl(
         &self,
         params: WorkspaceDiagnosticParams,
@@ -60,17 +36,32 @@ impl Kakehashi {
                 .ok()
                 .and_then(|uri| self.workspace_diagnostic_selector_language(&uri))
         };
-        let context = crate::lsp::bridge::WorkspaceDiagnosticDispatchContext::cancellable(
-            self.bridge.cancel_forwarder(),
-            &language_for_uri,
-        );
         let dispatch = async {
             for (uri, ticket) in crate::lsp::ingress_order::current_workspace_reader_tails() {
                 if let Ok(uri) = url::Url::parse(&uri) {
                     self.documents.wait_for_watermark(&uri, ticket).await;
-                    self.sync_host_before_workspace_diagnostic(&uri).await;
                 }
             }
+            let open_documents = self
+                .documents
+                .open_uris()
+                .into_iter()
+                .filter_map(|uri| {
+                    let document = self.documents.get(&uri)?;
+                    let text = document.text_arc();
+                    drop(document);
+                    Some(crate::lsp::bridge::WorkspaceDiagnosticOpenDocument {
+                        language_id: self.workspace_diagnostic_selector_language(&uri)?,
+                        uri,
+                        text,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let context = crate::lsp::bridge::WorkspaceDiagnosticDispatchContext::cancellable(
+                self.bridge.cancel_forwarder(),
+                &language_for_uri,
+                &open_documents,
+            );
             pool.dispatch_workspace_diagnostic_cancellable(
                 params,
                 &settings,

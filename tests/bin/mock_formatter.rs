@@ -1438,7 +1438,10 @@ fn main() {
                     && params.get("partialResultToken").is_none_or(Value::is_null)
                     && params.get("workDoneToken").is_none_or(Value::is_null);
                 let message = if isolated {
-                    mode.as_str()
+                    documents
+                        .get("file:///workspace/open.rs")
+                        .map(String::as_str)
+                        .unwrap_or(mode.as_str())
                 } else {
                     "leaked-state"
                 };

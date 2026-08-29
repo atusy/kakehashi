@@ -139,6 +139,55 @@ fn workspace_diagnostic_starts_and_aggregates_cold_producers() {
 }
 
 #[test]
+fn workspace_diagnostic_syncs_unsaved_open_text_to_its_producer() {
+    let config_dir = tempfile::TempDir::new().expect("config temp dir");
+    let config_path = config_dir.path().join("workspace_diagnostic_sync.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("UTF-8 config path"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": "file:///workspace",
+            "capabilities": {
+                "textDocument": { "diagnostic": {} },
+                "workspace": { "diagnostics": { "refreshSupport": true } }
+            },
+            "initializationOptions": {
+                "languageServers": {
+                    "workspace-diagnostic-alpha": {
+                        "cmd": [env!("CARGO_BIN_EXE_mock-lsp-formatter"), "workspace-diagnostic-alpha"],
+                        "languages": []
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": "file:///workspace/open.rs",
+                "languageId": "rust",
+                "version": 1,
+                "text": "unsaved workspace text"
+            }
+        }),
+    );
+
+    let response = client.send_request("workspace/diagnostic", json!({ "previousResultIds": [] }));
+
+    assert_eq!(
+        response["result"]["items"][0]["items"][0]["message"], "unsaved workspace text",
+        "the workspace producer must receive didOpen before its diagnostic request"
+    );
+}
+
+#[test]
 fn workspace_diagnostic_sends_each_dynamic_provider_its_own_wire_params() {
     let (mut client, _config_dir, events) =
         init_dynamic_workspace_diagnostic_client("workspace-diagnostic-dynamic");
