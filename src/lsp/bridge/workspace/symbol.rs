@@ -266,6 +266,26 @@ fn can_restore_flat_response(symbols: &[NormalizedSymbol], supports_tags: bool) 
         })
 }
 
+fn nested_response_preserving_deprecation(
+    symbols: Vec<NormalizedSymbol>,
+    supports_tags: bool,
+) -> WorkspaceSymbolResponse {
+    WorkspaceSymbolResponse::Nested(
+        symbols
+            .into_iter()
+            .map(|mut normalized| {
+                if !supports_tags && normalized.legacy_deprecated {
+                    let tags = normalized.symbol.tags.get_or_insert_with(Vec::new);
+                    if !tags.contains(&SymbolTag::DEPRECATED) {
+                        tags.push(SymbolTag::DEPRECATED);
+                    }
+                }
+                normalized.symbol
+            })
+            .collect(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn project_workspace_symbol_location(
     pool: &LanguageServerPool,
@@ -662,11 +682,9 @@ impl LanguageServerPool {
         if can_restore_flat_response(&symbols, supports_tags) {
             return Some(restore_legacy_flat_response(symbols));
         }
-        Some(WorkspaceSymbolResponse::Nested(
-            symbols
-                .into_iter()
-                .map(|normalized| normalized.symbol)
-                .collect(),
+        Some(nested_response_preserving_deprecation(
+            symbols,
+            supports_tags,
         ))
     }
 
@@ -1230,6 +1248,40 @@ mod tests {
             panic!("eager mixed responses should preserve the legacy response shape");
         };
         assert_eq!(symbols[0].deprecated, Some(true));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn lazy_symbol_fallback_keeps_eager_deprecation() {
+        let mut symbols = normalize_response(
+            WorkspaceSymbolResponse::Flat(vec![SymbolInformation {
+                name: "old".into(),
+                kind: SymbolKind::FUNCTION,
+                tags: None,
+                deprecated: Some(true),
+                location: location(),
+                container_name: None,
+            }]),
+            false,
+        );
+        symbols.push(NormalizedSymbol::from(WorkspaceSymbol {
+            name: "lazy".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Right(WorkspaceLocation {
+                uri: location().uri,
+            }),
+            data: Some(serde_json::json!({ "resolve": true })),
+        }));
+
+        assert!(!can_restore_flat_response(&symbols, false));
+        let WorkspaceSymbolResponse::Nested(symbols) =
+            nested_response_preserving_deprecation(symbols, false)
+        else {
+            panic!("lazy fallback must remain nested")
+        };
+        assert_eq!(symbols[0].tags, Some(vec![SymbolTag::DEPRECATED]));
     }
 
     #[test]
