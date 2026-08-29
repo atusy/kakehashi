@@ -6,9 +6,6 @@ use tower_lsp_server::ls_types::{Registration, Unregistration};
 
 use crate::error::LockResultExt;
 
-const WORKSPACE_DIAGNOSTIC_PULL_IDLE: u8 = 0;
-const WORKSPACE_DIAGNOSTIC_PULL_ACTIVE: u8 = 1;
-
 /// Thread-safe store for dynamically registered LSP capabilities.
 ///
 /// Downstream language servers (e.g., Pyright) register capabilities dynamically
@@ -29,9 +26,14 @@ pub(crate) struct DynamicCapabilityRegistry {
     changes: tokio::sync::watch::Sender<u64>,
     diagnostic_registration_settled: tokio::sync::OnceCell<()>,
     static_workspace_diagnostic_provider: AtomicBool,
-    workspace_diagnostic_pull_state: AtomicU8,
+    workspace_diagnostic_pull: Mutex<WorkspaceDiagnosticPull>,
     workspace_diagnostic_lifecycle: Mutex<WorkspaceDiagnosticLifecycle>,
-    workspace_diagnostic_registration_refresh_pending: AtomicBool,
+}
+
+#[derive(Default)]
+struct WorkspaceDiagnosticPull {
+    active: bool,
+    registration_refresh_pending: bool,
 }
 
 #[derive(Default)]
@@ -77,9 +79,8 @@ impl DynamicCapabilityRegistry {
             changes,
             diagnostic_registration_settled: tokio::sync::OnceCell::new(),
             static_workspace_diagnostic_provider: AtomicBool::new(false),
-            workspace_diagnostic_pull_state: AtomicU8::new(WORKSPACE_DIAGNOSTIC_PULL_IDLE),
+            workspace_diagnostic_pull: Mutex::new(WorkspaceDiagnosticPull::default()),
             workspace_diagnostic_lifecycle: Mutex::new(WorkspaceDiagnosticLifecycle::default()),
-            workspace_diagnostic_registration_refresh_pending: AtomicBool::new(false),
         }
     }
 
@@ -187,35 +188,42 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_completed(&self) -> bool {
-        self.workspace_diagnostic_pull_state
-            .store(WORKSPACE_DIAGNOSTIC_PULL_IDLE, Ordering::Release);
-        self.take_workspace_diagnostic_registration_refresh()
+        let mut pull = self
+            .workspace_diagnostic_pull
+            .lock()
+            .recover_poison("DynamicCapabilityRegistry::mark_workspace_diagnostic_pull_completed");
+        pull.active = false;
+        std::mem::take(&mut pull.registration_refresh_pending)
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_active(&self) {
-        self.workspace_diagnostic_pull_state
-            .store(WORKSPACE_DIAGNOSTIC_PULL_ACTIVE, Ordering::Release);
+        self.workspace_diagnostic_pull
+            .lock()
+            .recover_poison("DynamicCapabilityRegistry::mark_workspace_diagnostic_pull_active")
+            .active = true;
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_aborted(&self) {
-        if self
-            .workspace_diagnostic_pull_state
-            .compare_exchange(
-                WORKSPACE_DIAGNOSTIC_PULL_ACTIVE,
-                WORKSPACE_DIAGNOSTIC_PULL_IDLE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            self.workspace_diagnostic_registration_refresh_pending
-                .store(false, Ordering::Release);
+        let mut pull = self
+            .workspace_diagnostic_pull
+            .lock()
+            .recover_poison("DynamicCapabilityRegistry::mark_workspace_diagnostic_pull_aborted");
+        if pull.active {
+            pull.active = false;
+            pull.registration_refresh_pending = false;
         }
     }
 
     pub(crate) fn take_workspace_diagnostic_registration_refresh(&self) -> bool {
-        self.workspace_diagnostic_registration_refresh_pending
-            .swap(false, Ordering::AcqRel)
+        std::mem::take(
+            &mut self
+                .workspace_diagnostic_pull
+                .lock()
+                .recover_poison(
+                    "DynamicCapabilityRegistry::take_workspace_diagnostic_registration_refresh",
+                )
+                .registration_refresh_pending,
+        )
     }
 
     pub(crate) fn has_workspace_diagnostic_contributed(&self) -> bool {
@@ -226,19 +234,14 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn request_or_defer_workspace_diagnostic_registration_refresh(&self) -> bool {
-        match self.workspace_diagnostic_pull_state.load(Ordering::Acquire) {
-            WORKSPACE_DIAGNOSTIC_PULL_IDLE => return true,
-            WORKSPACE_DIAGNOSTIC_PULL_ACTIVE => {}
-            _ => unreachable!("workspace diagnostic pull state is valid"),
-        }
-        self.workspace_diagnostic_registration_refresh_pending
-            .store(true, Ordering::Release);
-        match self.workspace_diagnostic_pull_state.load(Ordering::Acquire) {
-            WORKSPACE_DIAGNOSTIC_PULL_ACTIVE => false,
-            WORKSPACE_DIAGNOSTIC_PULL_IDLE => self
-                .workspace_diagnostic_registration_refresh_pending
-                .swap(false, Ordering::AcqRel),
-            _ => unreachable!("workspace diagnostic pull state is valid"),
+        let mut pull = self.workspace_diagnostic_pull.lock().recover_poison(
+            "DynamicCapabilityRegistry::request_or_defer_workspace_diagnostic_registration_refresh",
+        );
+        if pull.active {
+            pull.registration_refresh_pending = true;
+            false
+        } else {
+            true
         }
     }
 
