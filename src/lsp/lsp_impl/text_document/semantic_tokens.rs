@@ -478,11 +478,20 @@ impl Kakehashi {
         let generation = native_layer.generation;
         let native_tokens = native_layer.tokens;
         let snapshot = native_layer.snapshot;
-        if virtual_enabled && snapshot.is_none() {
+        if virtual_enabled
+            && snapshot
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.tree.is_none())
+        {
             // An unparsed virtual layer is pending work, not an authoritative
             // empty overlay. Register interest so parse settlement re-drives
             // the client, and preserve its previous tokens until then.
-            self.cache.record_served_semantic_version(&uri, 0);
+            self.cache.record_served_semantic_version(
+                &uri,
+                snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.parsed_version),
+            );
             request_guard.finish();
             return Err(crate::error::content_modified_error());
         }
@@ -2607,7 +2616,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn mixed_non_native_full_does_not_require_a_native_snapshot() {
+    async fn treeless_non_native_full_registers_pending_virtual_refresh() {
         use crate::config::WorkspaceSettings;
         use crate::config::settings::{LanguageSettings, LayerAggregationConfig, LayersConfig};
         use std::collections::HashMap;
@@ -2649,13 +2658,14 @@ mod tests {
             Some("py".to_string()),
             None,
         );
+        publish_treeless(server, &uri, "unparsed", 0);
 
         let result = tokio::time::timeout(
-            crate::lsp::lsp_impl::snapshot_read::FIRST_PARSE_BACKSTOP + Duration::from_millis(100),
+            Duration::from_millis(100),
             server.semantic_tokens_full_impl(full_params(&uri)),
         )
         .await
-        .expect("virtual discovery must stop at the first-parse backstop")
+        .expect("tree-less virtual discovery must finish without waiting")
         .expect_err("pending virtual discovery must preserve the previous overlay");
         assert_eq!(result.code, crate::error::content_modified_error().code);
         assert_eq!(server.cache.served_semantic_version(&uri), Some(0));
