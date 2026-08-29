@@ -426,6 +426,12 @@ fn transform_semantic_tokens_result_to_host_inner(
         };
         let start = Position::new(absolute_line, absolute_start);
         if token.length == 0 {
+            if reject_invalid_coordinates {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "semantic token length must be positive",
+                ));
+            }
             continue;
         }
         let end = Position::new(
@@ -449,6 +455,15 @@ fn transform_semantic_tokens_result_to_host_inner(
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "semantic token type is outside the advertised legend",
+            ));
+        }
+        if reject_invalid_coordinates
+            && legend.token_modifiers.len() < u32::BITS as usize
+            && token.token_modifiers_bitset >> legend.token_modifiers.len() != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "semantic token modifiers are outside the advertised legend",
             ));
         }
         let Some(token_type) = remap_token_type(token.token_type, legend) else {
@@ -823,6 +838,14 @@ mod tests {
         assert!(
             transform(json!({ "result": { "data": [0, 0, 1, 1, 0] } })).is_err(),
             "a token type outside the advertised legend is malformed"
+        );
+        assert!(
+            transform(json!({ "result": { "data": [0, 0, 0, 0, 0] } })).is_err(),
+            "a zero-length token is malformed"
+        );
+        assert!(
+            transform(json!({ "result": { "data": [0, 0, 1, 0, 1] } })).is_err(),
+            "a modifier outside the advertised legend is malformed"
         );
         assert!(
             transform_semantic_tokens_full_response_to_host(
