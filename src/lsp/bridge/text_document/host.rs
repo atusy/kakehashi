@@ -456,36 +456,6 @@ impl LanguageServerPool {
         .await
     }
 
-    /// Revision-bound host request. The reader is evaluated under the host
-    /// synchronization lock and rejects a superseded document before syncing.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn send_host_raw_request_for_revision(
-        &self,
-        server_name: &str,
-        server_config: &BridgeServerConfig,
-        doc: &HostDocument<'_>,
-        method: &'static str,
-        params: serde_json::Value,
-        upstream_request_id: Option<UpstreamId>,
-        expected_incarnation: u64,
-        revision_text_reader: HostTextReader,
-    ) -> io::Result<Option<HostRawResponse>> {
-        self.send_host_raw_request_inner(
-            server_name,
-            server_config,
-            doc,
-            method,
-            params,
-            upstream_request_id,
-            Some(expected_incarnation),
-            Some(revision_text_reader),
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
     /// Incarnation-fenced host request that marks `attempted` only after the
     /// selected server has initialized and accepted the method capability.
     #[allow(clippy::too_many_arguments)]
