@@ -66,8 +66,16 @@ struct RootedDiagnosticReport {
     report: WorkspaceDiagnosticReport,
 }
 
+#[cfg(test)]
 fn reconcile_overlapping_root_reports(
     reports: impl IntoIterator<Item = RootedDiagnosticReport>,
+) -> Vec<WorkspaceDiagnosticReport> {
+    reconcile_overlapping_root_reports_with_observer(reports, |_, _, _| {})
+}
+
+fn reconcile_overlapping_root_reports_with_observer(
+    reports: impl IntoIterator<Item = RootedDiagnosticReport>,
+    mut on_visible: impl FnMut(&str, Option<&str>, &WorkspaceDocumentDiagnosticReport),
 ) -> Vec<WorkspaceDiagnosticReport> {
     struct RootedDiagnosticItem {
         server: String,
@@ -177,10 +185,25 @@ fn reconcile_overlapping_root_reports(
                 ))
                 .is_none_or(|(_, _, root)| item.spawn_root.as_deref().unwrap_or_default() == root)
         })
-        .map(|item| WorkspaceDiagnosticReport {
-            items: vec![item.item],
+        .map(|item| {
+            on_visible(&item.server, item.spawn_root.as_deref(), &item.item);
+            WorkspaceDiagnosticReport {
+                items: vec![item.item],
+            }
         })
         .collect()
+}
+
+fn diagnostic_item_has_visible_output(item: &WorkspaceDocumentDiagnosticReport) -> bool {
+    match item {
+        WorkspaceDocumentDiagnosticReport::Full(report) => {
+            !report.full_document_diagnostic_report.items.is_empty()
+        }
+        // An unchanged report retains the diagnostics represented by the
+        // client's previous result id, so the producer still owns visible
+        // state that must be invalidated if its reader exits.
+        WorkspaceDocumentDiagnosticReport::Unchanged(_) => true,
+    }
 }
 
 impl DiagnosticProvider {
@@ -670,7 +693,15 @@ impl LanguageServerPool {
                 }
             }
         });
-        let reports = reconcile_overlapping_root_reports(reports);
+        let mut visible_producers = HashSet::<(String, Option<String>)>::new();
+        let reports = reconcile_overlapping_root_reports_with_observer(
+            reports,
+            |server, spawn_root, item| {
+                if diagnostic_item_has_visible_output(item) {
+                    visible_producers.insert((server.to_owned(), spawn_root.map(str::to_owned)));
+                }
+            },
+        );
         let result = aggregate_reports(reports);
         drop(_provenance_guards);
         if !admit() {
@@ -719,14 +750,18 @@ impl LanguageServerPool {
             ));
         }
         let mut contribution_states = Vec::<(Arc<ConnectionHandle>, bool)>::new();
-        for (handle, _, plan) in &provider_plans {
+        for (handle, _, _) in &provider_plans {
+            let is_visible = visible_producers.contains(&(
+                handle.key().server().to_owned(),
+                handle.spawn_root().map(str::to_owned),
+            ));
             if let Some((_, contributed)) = contribution_states
                 .iter_mut()
                 .find(|(existing, _)| Arc::ptr_eq(existing, handle))
             {
-                *contributed |= !plan.is_empty();
+                *contributed |= is_visible;
             } else {
-                contribution_states.push((Arc::clone(handle), !plan.is_empty()));
+                contribution_states.push((Arc::clone(handle), is_visible));
             }
         }
         let mut contribution_guards = contribution_states
@@ -1947,10 +1982,20 @@ mod tests {
                 .dynamic_capabilities()
                 .has_workspace_diagnostic_contributed()
         );
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "still-capable".into(),
+            method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
+        }]);
+        let provider_plan = diagnostic_providers(&handle);
+        assert!(!provider_plan.is_empty());
 
         pool.aggregate_admitted_workspace_diagnostic_reports(
             [std::future::ready(Some(CompletedDiagnosticProducer {
-                provider_plan: Vec::new(),
+                provider_plan,
                 handle: Arc::clone(&handle),
                 generation,
                 report: WorkspaceDiagnosticReport::default(),
@@ -1966,7 +2011,7 @@ mod tests {
             !handle
                 .dynamic_capabilities()
                 .has_workspace_diagnostic_contributed(),
-            "an accepted empty provider plan must disarm the reader-exit refresh"
+            "an accepted empty report must disarm the reader-exit refresh even while capable"
         );
         assert!(
             !handle
