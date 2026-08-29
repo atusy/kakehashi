@@ -514,6 +514,7 @@ impl LanguageServerPool {
             Some(revision_text_reader),
             None,
             None,
+            None,
         )
         .await
     }
