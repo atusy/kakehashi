@@ -18,7 +18,7 @@
 
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
-    NumberOrString, Position, Range, SemanticTokens, SemanticTokensDelta,
+    NumberOrString, Position, Range, SemanticToken, SemanticTokens, SemanticTokensDelta,
     SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
     SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
 };
@@ -215,6 +215,26 @@ fn should_publish_empty_non_native_result(
     bridge_succeeded: bool,
 ) -> bool {
     non_native_only && (bridge_succeeded || !bridge_work_selected)
+}
+
+fn parse_host_semantic_tokens_result(
+    value: serde_json::Value,
+) -> std::io::Result<Option<Vec<SemanticToken>>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value::<SemanticTokensResult>(value)
+        .map(|result| match result {
+            SemanticTokensResult::Tokens(tokens) => tokens.data,
+            SemanticTokensResult::Partial(partial) => partial.data,
+        })
+        .map(Some)
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid host semantic token result: {error}"),
+            )
+        })
 }
 
 fn commit_full_baselines(
@@ -739,31 +759,36 @@ impl Kakehashi {
                             result.map(|tokens| tokens.map(|tokens| tokens.data))
                         }
                     },
-                    |value| {
-                        serde_json::from_value::<SemanticTokensResult>(value)
-                            .ok()
-                            .map(|result| match result {
-                                SemanticTokensResult::Tokens(tokens) => tokens.data,
-                                SemanticTokensResult::Partial(partial) => partial.data,
-                            })
-                    },
+                    parse_host_semantic_tokens_result,
                     |won| {
-                        let legend = won.handle.semantic_tokens_legend()?;
+                        let legend = won.handle.semantic_tokens_legend().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "missing host semantic token legend",
+                            )
+                        })?;
                         let mapper = crate::text::PositionMapper::new(&won.host_text);
-                        let document_end = mapper.byte_to_position(won.host_text.len())?;
-                        crate::lsp::bridge::transform_semantic_tokens_result_to_host(
+                        let document_end = mapper
+                            .byte_to_position(won.host_text.len())
+                            .ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "invalid host document end",
+                                )
+                            })?;
+                        crate::lsp::bridge::transform_semantic_tokens_result_to_host_strict(
                             serde_json::to_value(SemanticTokens {
                                 result_id: None,
                                 data: won.items,
                             })
-                            .ok()?,
+                            .map_err(std::io::Error::other)?,
                             legend,
                             &RegionOffset::new(0, 0),
                             document_end,
                             &won.host_text,
                             Range::new(Position::new(0, 0), document_end),
                         )
-                        .map(|tokens| tokens.data)
+                        .map(|tokens| Some(tokens.data))
                     },
                     crate::lsp::bridge::merge_semantic_token_layers,
                     crate::lsp::bridge::merge_semantic_token_layers,
@@ -2651,6 +2676,21 @@ mod tests {
             !should_publish_empty_non_native_result(false, false, false),
             "native-only results are not authoritative bridge overlays"
         );
+    }
+
+    #[test]
+    fn malformed_host_semantic_result_is_a_fan_in_error() {
+        assert!(
+            parse_host_semantic_tokens_result(serde_json::Value::Null)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_host_semantic_tokens_result(serde_json::json!({ "data": [] }))
+                .unwrap()
+                .is_some()
+        );
+        assert!(parse_host_semantic_tokens_result(serde_json::json!({ "data": "bad" })).is_err());
     }
 
     #[test]

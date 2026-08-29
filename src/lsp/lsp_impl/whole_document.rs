@@ -143,8 +143,8 @@ impl Kakehashi {
         N: Future<Output = Result<Option<Vec<T>>>>,
         F: Fn(FanOutTask) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = io::Result<Option<Vec<T>>>> + Send + 'static,
-        P: Fn(serde_json::Value) -> Option<Vec<T>> + Clone + Send + 'static,
-        H: Fn(HostWholeDocumentResponse<T>) -> Option<Vec<T>> + Clone + Send + 'static,
+        P: Fn(serde_json::Value) -> io::Result<Option<Vec<T>>> + Clone + Send + 'static,
+        H: Fn(HostWholeDocumentResponse<T>) -> io::Result<Option<Vec<T>>> + Clone + Send + 'static,
         R: Fn(Vec<T>, Vec<T>) -> Vec<T> + Copy + Send,
         M: Fn(Vec<T>, Vec<T>) -> Vec<T>,
     {
@@ -522,7 +522,7 @@ impl Kakehashi {
                             }
                             return Ok(None);
                         };
-                        let Some(items) = parse_host(raw.value) else {
+                        let Some(items) = parse_host(raw.value)? else {
                             return Ok(None);
                         };
                         let projected = on_host_winner(HostWholeDocumentResponse {
@@ -533,7 +533,7 @@ impl Kakehashi {
                             incarnation: Some(raw.incarnation),
                             connection_generation: raw.connection_generation,
                             handle: raw.handle,
-                        });
+                        })?;
                         Ok(record_host_projection_success(
                             projected,
                             succeeded_after_parse.as_ref(),

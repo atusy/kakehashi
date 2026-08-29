@@ -416,9 +416,11 @@ fn transform_semantic_tokens_result_to_host_inner(
             io::Error::new(io::ErrorKind::InvalidData, "semantic token line overflow")
         })?;
         absolute_start = if token.delta_line == 0 {
-            absolute_start.checked_add(token.delta_start).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "semantic token column overflow")
-            })?
+            absolute_start
+                .checked_add(token.delta_start)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "semantic token column overflow")
+                })?
         } else {
             token.delta_start
         };

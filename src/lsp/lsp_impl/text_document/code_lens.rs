@@ -46,7 +46,7 @@ impl Kakehashi {
                     )
                     .await
             },
-            parse_host_verbatim::<Vec<CodeLens>>,
+            |value| Ok(parse_host_verbatim::<Vec<CodeLens>>(value)),
             |mut won| {
                 let server_resolves = won.handle.has_capability("codeLens/resolve");
                 envelope_host_code_lenses(
@@ -58,7 +58,7 @@ impl Kakehashi {
                     won.handle.key(),
                     server_resolves,
                 );
-                Some(won.items)
+                Ok(Some(won.items))
             },
             |mut acc, next| {
                 acc.extend(next);
