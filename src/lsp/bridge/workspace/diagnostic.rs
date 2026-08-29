@@ -1502,8 +1502,20 @@ impl LanguageServerPool {
                         provider.identifier.clone(),
                         provider.static_document_selector.clone(),
                     ));
+            let send_request = || {
+                handle
+                    .dynamic_capabilities()
+                    .mark_workspace_diagnostic_request_sent(request_id);
+                let result = handle.send_request(request, request_id);
+                if result.is_err() {
+                    handle
+                        .dynamic_capabilities()
+                        .mark_workspace_diagnostic_response_received(request_id);
+                }
+                result
+            };
             let admitted = if static_admitted {
-                Some(handle.send_request(request, request_id))
+                Some(send_request())
             } else {
                 handle.dynamic_capabilities().with_registrations_by_id(
                     &provider.dynamic_registration_ids,
@@ -1516,7 +1528,7 @@ impl LanguageServerPool {
                                     |(identifier, _)| identifier == provider.identifier,
                                 )
                             })
-                            .then(|| handle.send_request(request, request_id))
+                            .then(send_request)
                     },
                 )
             };
@@ -1534,6 +1546,9 @@ impl LanguageServerPool {
             }
         }
         let response = handle.wait_for_response(request_id, response_rx).await;
+        handle
+            .dynamic_capabilities()
+            .mark_workspace_diagnostic_response_received(request_id);
         if response
             .as_ref()
             .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
