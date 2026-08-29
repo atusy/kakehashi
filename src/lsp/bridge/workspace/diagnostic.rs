@@ -11,9 +11,9 @@ use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
-    DiagnosticRegistrationOptions, DiagnosticServerCapabilities, Registration,
-    WorkspaceDiagnosticParams, WorkspaceDiagnosticReport, WorkspaceDiagnosticReportResult,
-    WorkspaceDocumentDiagnosticReport, WorkspaceFullDocumentDiagnosticReport,
+    DiagnosticServerCapabilities, Registration, WorkspaceDiagnosticParams,
+    WorkspaceDiagnosticReport, WorkspaceDiagnosticReportResult, WorkspaceDocumentDiagnosticReport,
+    WorkspaceFullDocumentDiagnosticReport,
 };
 
 use crate::config::settings::WorkspaceSettings;
@@ -62,6 +62,7 @@ struct NormalizedDocumentFilter {
     language: Option<String>,
     scheme: Option<String>,
     pattern: Option<String>,
+    pattern_base_uri: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -379,10 +380,28 @@ impl NormalizedDocumentFilter {
             return false;
         }
         self.pattern.as_deref().is_none_or(|pattern| {
+            let candidate = if let Some(base_uri) = self.pattern_base_uri.as_deref() {
+                let Ok(base_uri) = url::Url::parse(base_uri) else {
+                    return false;
+                };
+                if uri.scheme() != base_uri.scheme() {
+                    return false;
+                }
+                let base = base_uri.path().trim_end_matches('/');
+                let Some(relative) = uri.path().strip_prefix(base) else {
+                    return false;
+                };
+                let Some(relative) = relative.strip_prefix('/') else {
+                    return relative.is_empty() && pattern.is_empty();
+                };
+                relative
+            } else {
+                uri.path()
+            };
             globset::GlobBuilder::new(pattern)
                 .literal_separator(true)
                 .build()
-                .map(|glob| glob.compile_matcher().is_match(uri.path()))
+                .map(|glob| glob.compile_matcher().is_match(candidate))
                 .unwrap_or(false)
         })
     }
@@ -398,14 +417,22 @@ fn normalize_document_selector(
                 language: filter.language,
                 scheme: filter.scheme,
                 pattern: filter.pattern,
+                pattern_base_uri: None,
             })
             .collect::<Vec<_>>();
         filters.sort_by(|left, right| {
-            (&left.language, &left.scheme, &left.pattern).cmp(&(
-                &right.language,
-                &right.scheme,
-                &right.pattern,
-            ))
+            (
+                &left.language,
+                &left.scheme,
+                &left.pattern,
+                &left.pattern_base_uri,
+            )
+                .cmp(&(
+                    &right.language,
+                    &right.scheme,
+                    &right.pattern,
+                    &right.pattern_base_uri,
+                ))
         });
         filters.dedup();
         filters
@@ -442,13 +469,62 @@ fn static_workspace_diagnostic_options(
 fn dynamic_workspace_diagnostic_options(
     registration: &Registration,
 ) -> Option<(Option<String>, Option<Vec<NormalizedDocumentFilter>>)> {
-    let options: DiagnosticRegistrationOptions =
-        serde_json::from_value(registration.register_options.clone()?).ok()?;
-    options.diagnostic_options.workspace_diagnostics.then(|| {
-        let selector = normalize_document_selector(
-            options.text_document_registration_options.document_selector,
-        );
-        (options.diagnostic_options.identifier, selector)
+    let options = registration.register_options.as_ref()?.as_object()?;
+    if options
+        .get("workspaceDiagnostics")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    let identifier = match options.get("identifier") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(identifier)) => Some(identifier.clone()),
+        Some(_) => return None,
+    };
+    let selector = match options.get("documentSelector") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Array(filters)) => Some(
+            filters
+                .iter()
+                .map(normalize_dynamic_document_filter)
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        Some(_) => return None,
+    };
+    Some((identifier, selector))
+}
+
+fn normalize_dynamic_document_filter(
+    value: &serde_json::Value,
+) -> Option<NormalizedDocumentFilter> {
+    let filter = value.as_object()?;
+    let string_field = |name| match filter.get(name) {
+        None | Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(value)) => Some(Some(value.clone())),
+        Some(_) => None,
+    };
+    let language = string_field("language")?;
+    let scheme = string_field("scheme")?;
+    let (pattern, pattern_base_uri) = match filter.get("pattern") {
+        None | Some(serde_json::Value::Null) => (None, None),
+        Some(serde_json::Value::String(pattern)) => (Some(pattern.clone()), None),
+        Some(serde_json::Value::Object(relative)) => {
+            let pattern = relative.get("pattern")?.as_str()?.to_owned();
+            let base_uri = match relative.get("baseUri")? {
+                serde_json::Value::String(uri) => uri.clone(),
+                serde_json::Value::Object(folder) => folder.get("uri")?.as_str()?.to_owned(),
+                _ => return None,
+            };
+            (Some(pattern), Some(base_uri))
+        }
+        Some(_) => return None,
+    };
+    Some(NormalizedDocumentFilter {
+        language,
+        scheme,
+        pattern,
+        pattern_base_uri,
     })
 }
 
@@ -3150,6 +3226,7 @@ mod tests {
             language: Some(language.to_owned()),
             scheme: Some("file".to_owned()),
             pattern: None,
+            pattern_base_uri: None,
         };
         let provider = |languages: &[&str]| DiagnosticProvider {
             identifier: Some("shared".into()),
@@ -3221,6 +3298,7 @@ mod tests {
             language: Some("rust".into()),
             scheme: Some("file".into()),
             pattern: Some("/workspace/nested/*.rs".into()),
+            pattern_base_uri: None,
         };
 
         assert!(filter.applies_to("file:///workspace/nested/main.rs", Some("rust")));
@@ -3301,6 +3379,32 @@ mod tests {
             futures::poll!(second.as_mut()),
             std::task::Poll::Ready(providers) if providers.0.is_empty()
         ));
+    }
+
+    #[test]
+    fn dynamic_diagnostic_selector_accepts_relative_patterns() {
+        let registration = Registration {
+            id: "relative".into(),
+            method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+            register_options: Some(serde_json::json!({
+                "workspaceDiagnostics": true,
+                "documentSelector": [{
+                    "language": "rust",
+                    "scheme": "file",
+                    "pattern": {
+                        "baseUri": { "uri": "file:///workspace/nested", "name": "nested" },
+                        "pattern": "*.rs"
+                    }
+                }]
+            })),
+        };
+        let (_, selector) = dynamic_workspace_diagnostic_options(&registration)
+            .expect("relative pattern registration must remain a provider");
+        let filter = &selector.expect("selector must be preserved")[0];
+
+        assert!(filter.applies_to("file:///workspace/nested/main.rs", Some("rust")));
+        assert!(!filter.applies_to("file:///workspace/nested/deeper/main.rs", Some("rust")));
+        assert!(!filter.applies_to("file:///workspace/other/main.rs", Some("rust")));
     }
 
     #[tokio::test]
