@@ -13,6 +13,30 @@ impl Kakehashi {
         })
     }
 
+    async fn sync_host_before_workspace_diagnostic(&self, uri: &url::Url) {
+        let Ok(lsp_uri) = crate::lsp::lsp_impl::url_to_uri(uri) else {
+            return;
+        };
+        let Some(host) = self.resolve_host_bridge_context(&lsp_uri, "textDocument/diagnostic")
+        else {
+            return;
+        };
+        let host_uri = host.uri.clone();
+        let documents = std::sync::Arc::clone(&self.documents);
+        let live_uri = host_uri.clone();
+        let live_text_reader: crate::lsp::bridge::HostTextReader = std::sync::Arc::new(move || {
+            documents.get(&live_uri).map(|document| document.text_arc())
+        });
+        self.bridge.eager_sync_host_document_on_servers(
+            &host_uri,
+            &host.language_id,
+            host.text,
+            host.configs,
+            Some(live_text_reader),
+        );
+        self.bridge.wait_host_eager_open_finished(&host_uri).await;
+    }
+
     pub(crate) async fn workspace_diagnostic_impl(
         &self,
         params: WorkspaceDiagnosticParams,
@@ -44,6 +68,7 @@ impl Kakehashi {
             for (uri, ticket) in crate::lsp::ingress_order::current_workspace_reader_tails() {
                 if let Ok(uri) = url::Url::parse(&uri) {
                     self.documents.wait_for_watermark(&uri, ticket).await;
+                    self.sync_host_before_workspace_diagnostic(&uri).await;
                 }
             }
             pool.dispatch_workspace_diagnostic_cancellable(
