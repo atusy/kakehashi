@@ -68,8 +68,7 @@ impl DynamicCapabilityRegistry {
         }
     }
 
-    fn notify_change(&self) {
-        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+    fn notify_change(&self, revision: u64) {
         self.changes.send_replace(revision);
     }
 
@@ -81,8 +80,9 @@ impl DynamicCapabilityRegistry {
         for reg in registrations {
             guard.insert(reg.id.clone(), reg);
         }
+        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
         drop(guard);
-        self.notify_change();
+        self.notify_change(revision);
     }
 
     pub(crate) fn unregister(&self, unregistrations: Vec<Unregistration>) {
@@ -93,8 +93,9 @@ impl DynamicCapabilityRegistry {
         for unreg in unregistrations {
             guard.remove(&unreg.id);
         }
+        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
         drop(guard);
-        self.notify_change();
+        self.notify_change(revision);
     }
 
     pub(crate) fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -214,6 +215,31 @@ impl DynamicCapabilityRegistry {
             .filter(|registration| registration.method == method)
             .cloned()
             .collect()
+    }
+
+    /// Snapshot matching registrations and the mutation revision while the
+    /// registration map is read-locked. Writers advance the revision before
+    /// releasing their write lock, so the pair cannot hide an unregister /
+    /// re-register ABA transition.
+    pub(crate) fn registrations_for_method_with_revision(
+        &self,
+        method: &str,
+    ) -> (Vec<Registration>, u64) {
+        let guard = self
+            .registrations
+            .read()
+            .recover_poison("DynamicCapabilityRegistry::registrations_for_method_with_revision");
+        let registrations = guard
+            .values()
+            .filter(|registration| registration.method == method)
+            .cloned()
+            .collect();
+        let revision = self.revision.load(Ordering::Acquire);
+        (registrations, revision)
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
     }
 
     pub(crate) fn registrations_read(&self) -> RwLockReadGuard<'_, HashMap<String, Registration>> {
