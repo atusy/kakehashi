@@ -1072,16 +1072,16 @@ impl Kakehashi {
         if layers.priorities.contains(&LayerSource::Host)
             && let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD)
         {
-            let candidates = ctx
-                .configs
-                .iter()
-                .map(|config| config.server_name.as_str())
-                .collect::<std::collections::HashSet<_>>();
-            let incapable = self
-                .bridge
-                .pool_arc()
-                .servers_known_incapable(&candidates, METHOD)
-                .await;
+            let pool = self.bridge.pool_arc();
+            let mut incapable = std::collections::HashSet::new();
+            for config in &ctx.configs {
+                let key = pool
+                    .resolved_connection_key(&config.server_name, &config.config, uri)
+                    .await;
+                if pool.connection_known_incapable(&key, METHOD).await {
+                    incapable.insert(config.server_name.clone());
+                }
+            }
             let suppressed = ctx
                 .configs
                 .iter()
