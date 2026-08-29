@@ -236,12 +236,13 @@ impl Kakehashi {
         &self,
         uri: &Url,
         live_identity: (u64, u64),
-        generation: u64,
+        generations: (u64, u64),
         snapshot: Option<&std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
         require_snapshot_identity: bool,
         edit_lock: &std::sync::Arc<tokio::sync::Mutex<()>>,
     ) -> bool {
-        self.cache.semantic_token_generation() == generation
+        self.settings_manager.settings_generation() == generations.1
+            && self.cache.semantic_token_generation() == generations.0
             && (!require_snapshot_identity
                 || snapshot.map_or_else(
                     || {
@@ -256,7 +257,7 @@ impl Kakehashi {
                             uri,
                             snapshot.incarnation,
                             snapshot.parsed_version,
-                            generation,
+                            generations.0,
                             edit_lock,
                         )
                     },
@@ -447,6 +448,7 @@ impl Kakehashi {
         let progress_token = params.work_done_progress_params.work_done_token.clone();
         let upstream_id = current_upstream_id();
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let settings_generation = self.settings_manager.settings_generation();
         let host_only = self.semantic_tokens_full_is_host_only(&uri);
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
@@ -572,7 +574,7 @@ impl Kakehashi {
                 || !self.semantic_full_response_is_current(
                     &uri,
                     live_identity,
-                    generation,
+                    (generation, settings_generation),
                     snapshot.as_ref(),
                     !host_only,
                     &edit_lock,
@@ -2383,16 +2385,40 @@ mod tests {
         assert!(view.slot.snapshot.is_none(), "snapshot must stay absent");
         let identity = (view.slot.current_incarnation, view.content_version);
         let generation = server.cache.semantic_token_generation();
+        let settings_generation = server.settings_manager.settings_generation();
         let edit_lock = server.documents.edit_lock(&uri);
+        assert!(server.semantic_full_response_is_current(
+            &uri,
+            identity,
+            (generation, settings_generation),
+            None,
+            true,
+            &edit_lock,
+        ));
+        server
+            .settings_manager
+            .apply_settings(crate::config::WorkspaceSettings::default());
         assert!(
-            server.semantic_full_response_is_current(
-                &uri, identity, generation, None, true, &edit_lock,
-            )
+            !server.semantic_full_response_is_current(
+                &uri,
+                identity,
+                (generation, settings_generation),
+                None,
+                true,
+                &edit_lock,
+            ),
+            "a settings reload must invalidate the captured host-only plan"
         );
+        let settings_generation = server.settings_manager.settings_generation();
         publish_treeless(server, &uri, "old", 0);
         assert!(
             !server.semantic_full_response_is_current(
-                &uri, identity, generation, None, true, &edit_lock,
+                &uri,
+                identity,
+                (generation, settings_generation),
+                None,
+                true,
+                &edit_lock,
             ),
             "a snapshot published during parserless fan-out invalidates that response"
         );
@@ -2400,11 +2426,14 @@ mod tests {
         server
             .documents
             .update_document(uri.clone(), "new".to_string(), None);
-        assert!(
-            !server.semantic_full_response_is_current(
-                &uri, identity, generation, None, true, &edit_lock,
-            )
-        );
+        assert!(!server.semantic_full_response_is_current(
+            &uri,
+            identity,
+            (generation, settings_generation),
+            None,
+            true,
+            &edit_lock,
+        ));
 
         let updated = server
             .documents
@@ -2415,7 +2444,7 @@ mod tests {
         assert!(!server.semantic_full_response_is_current(
             &uri,
             updated_identity,
-            generation,
+            (generation, settings_generation),
             None,
             true,
             &edit_lock,
