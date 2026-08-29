@@ -6,6 +6,13 @@ use tower_lsp_server::ls_types::{WorkspaceDiagnosticParams, WorkspaceDiagnosticR
 use super::super::{Kakehashi, lock_settings_reload};
 
 impl Kakehashi {
+    fn workspace_diagnostic_selector_language(&self, uri: &url::Url) -> Option<String> {
+        self.document_bridge_language(uri).or_else(|| {
+            self.language
+                .candidate_language_for_document(uri.path(), "")
+        })
+    }
+
     pub(crate) async fn workspace_diagnostic_impl(
         &self,
         params: WorkspaceDiagnosticParams,
@@ -27,7 +34,7 @@ impl Kakehashi {
         let language_for_uri = |uri: &str| {
             url::Url::parse(uri)
                 .ok()
-                .and_then(|uri| self.document_language(&uri))
+                .and_then(|uri| self.workspace_diagnostic_selector_language(&uri))
         };
         let context = crate::lsp::bridge::WorkspaceDiagnosticDispatchContext::cancellable(
             self.bridge.cancel_forwarder(),
@@ -67,6 +74,20 @@ mod tests {
     use crate::lsp::bridge::test_helpers::create_handle_with_key;
     use crate::lsp::bridge::{ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId};
     use crate::lsp::request_id::{CURRENT_REQUEST_ID, CancelForwarder};
+
+    #[test]
+    fn unopened_workspace_diagnostic_uri_keeps_an_uninstalled_selector_language() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = url::Url::parse("file:///workspace/main.kakehashi_uninstalled").unwrap();
+
+        assert_eq!(
+            server
+                .workspace_diagnostic_selector_language(&uri)
+                .as_deref(),
+            Some("kakehashi_uninstalled")
+        );
+    }
 
     #[tokio::test]
     async fn cancelled_workspace_diagnostic_handler_sweeps_every_provider_registration() {
