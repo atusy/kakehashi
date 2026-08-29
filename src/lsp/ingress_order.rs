@@ -509,6 +509,7 @@ where
                 Box::pin(async move {
                     if let Some((forwarder, upstream_id, mut cancel_rx)) = cancellation {
                         tokio::select! {
+                            biased;
                             _ = &mut cancel_rx => {
                                 forwarder.unsubscribe(&upstream_id);
                                 drop(inner_fut);
@@ -1242,16 +1243,20 @@ mod tests {
         assert!(first.poll().is_ready());
         tokio::task::yield_now().await;
 
-        let mut response = None;
+        let mut outcome = None;
         for _ in 0..3 {
-            if let Poll::Ready(Ok(Some(ready))) = second.poll() {
-                response = Some(ready);
-                break;
+            match second.poll() {
+                Poll::Ready(ready) => {
+                    outcome = Some(ready);
+                    break;
+                }
+                Poll::Pending => tokio::task::yield_now().await,
             }
-            tokio::task::yield_now().await;
         }
-        let response =
-            response.expect("the cancelled request must win a simultaneous gate handoff");
+        let response = outcome
+            .expect("the cancelled request must win a simultaneous gate handoff")
+            .expect("the ingress service must not fail")
+            .expect("the cancelled request must produce an error response");
         assert_eq!(response.id(), &tower_lsp_server::jsonrpc::Id::Number(2));
         assert_eq!(
             response.error().expect("request must fail").code,
