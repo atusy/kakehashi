@@ -1134,6 +1134,7 @@ impl Kakehashi {
             &owned_regions
         };
         let pool = self.bridge.pool_arc();
+        let mut incapable_by_connection = std::collections::HashMap::new();
         for region in regions {
             if !region.contiguous {
                 continue;
@@ -1160,7 +1161,15 @@ impl Kakehashi {
                 let key = pool
                     .resolved_connection_key(&config.server_name, &config.config, &routing_uri)
                     .await;
-                if pool.connection_known_incapable(&key, METHOD).await {
+                let known_incapable = match incapable_by_connection.get(&key) {
+                    Some(known_incapable) => *known_incapable,
+                    None => {
+                        let known_incapable = pool.connection_known_incapable(&key, METHOD).await;
+                        incapable_by_connection.insert(key, known_incapable);
+                        known_incapable
+                    }
+                };
+                if known_incapable {
                     incapable.insert(config.server_name.clone());
                 }
             }
