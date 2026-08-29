@@ -44,12 +44,7 @@ pub(crate) struct WorkspaceDiagnosticServerCancelled {
 impl WorkspaceDiagnosticServerCancelled {
     pub(crate) fn from_response(response: &serde_json::Value) -> Option<Self> {
         let error = response.get("error")?;
-        (error.get("code").and_then(serde_json::Value::as_i64) == Some(-32802)
-            && error
-                .pointer("/data/retriggerRequest")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(true))
-        .then(|| Self {
+        (error.get("code").and_then(serde_json::Value::as_i64) == Some(-32802)).then(|| Self {
             message: error
                 .get("message")
                 .and_then(serde_json::Value::as_str)
