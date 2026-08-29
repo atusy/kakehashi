@@ -2417,12 +2417,27 @@ impl LanguageServerPool {
         })
     }
 
+    fn host_is_in_workspace_producer_scope(
+        &self,
+        handle: &ConnectionHandle,
+        host_uri: &Url,
+    ) -> bool {
+        handle
+            .key()
+            .marker_root()
+            .or_else(|| handle.spawn_root())
+            .map_or_else(
+                || self.host_is_in_client_workspace(host_uri),
+                |root| Url::parse(root).is_ok_and(|root| Self::uri_is_within_root(host_uri, &root)),
+            )
+    }
+
     pub(super) async fn open_recorded_workspace_virtual_documents(
         &self,
         handle: &Arc<ConnectionHandle>,
         server_config: &crate::config::settings::BridgeServerConfig,
     ) {
-        if !handle.key().is_workspace() {
+        if handle.key().is_shared() || handle.key().is_client_fallback() {
             return;
         }
         let languages = server_config.languages.as_deref().unwrap_or_default();
@@ -2431,7 +2446,7 @@ impl LanguageServerPool {
             .any(|language| language == crate::config::settings::LANGUAGES_WILDCARD);
         let mut documents = Vec::new();
         for host in &self.latest_virtual_contents {
-            if !self.host_is_in_client_workspace(host.key()) {
+            if !self.host_is_in_workspace_producer_scope(handle, host.key()) {
                 continue;
             }
             let _publication = host
@@ -6813,45 +6828,83 @@ mod tests {
     // - Rollback on send failure
 
     #[tokio::test]
-    async fn workspace_producer_opens_only_recorded_virtual_documents_in_client_scope() {
+    async fn workspace_producers_open_recorded_virtual_documents_in_their_root_scope() {
         let pool = LanguageServerPool::new();
-        pool.set_root_uri(Some("file:///workspace".to_owned()));
-        let inside_host = Url::parse("file:///workspace/inside.md").unwrap();
+        pool.set_root_uri(Some("file:///workspace/a".to_owned()));
+        pool.set_workspace_folders(Some(vec![
+            tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///workspace/a".parse().unwrap(),
+                name: "a".to_owned(),
+            },
+            tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///workspace/b".parse().unwrap(),
+                name: "b".to_owned(),
+            },
+        ]));
+        let primary_host = Url::parse("file:///workspace/a/inside.md").unwrap();
+        let secondary_host = Url::parse("file:///workspace/b/inside.md").unwrap();
         let outside_host = Url::parse("file:///outside/history.md").unwrap();
-        let inside = crate::lsp::bridge::coordinator::BridgeInjection {
+        let primary = crate::lsp::bridge::coordinator::BridgeInjection {
             language: "lua".to_owned(),
             region_id: TEST_ULID_LUA_0.to_owned(),
-            content: "inside".to_owned(),
+            content: "primary".to_owned(),
+        };
+        let secondary = crate::lsp::bridge::coordinator::BridgeInjection {
+            language: "lua".to_owned(),
+            region_id: TEST_ULID_LUA_1.to_owned(),
+            content: "secondary".to_owned(),
         };
         let outside = crate::lsp::bridge::coordinator::BridgeInjection {
             language: "lua".to_owned(),
-            region_id: TEST_ULID_LUA_1.to_owned(),
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5OUT".to_owned(),
             content: "outside".to_owned(),
         };
-        for (host, injection) in [(&inside_host, &inside), (&outside_host, &outside)] {
+        for (host, injection) in [
+            (&primary_host, &primary),
+            (&secondary_host, &secondary),
+            (&outside_host, &outside),
+        ] {
             pool.open_host_incarnation(host, 1).await;
             pool.record_latest_virtual_contents(host, 1, 0, std::slice::from_ref(injection));
         }
-        let key = ConnectionKey::workspace("lua");
-        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
-        pool.connections()
-            .await
-            .insert(key.clone(), Arc::clone(&handle));
+        let primary_key = ConnectionKey::workspace("lua");
+        let primary_handle =
+            create_handle_with_key(ConnectionState::Ready, primary_key.clone()).await;
+        record_test_spawn_root(&primary_handle, "file:///workspace/a");
+        let secondary_key = ConnectionKey::new("lua", Some("file:///workspace/b".to_owned()));
+        let secondary_handle =
+            create_handle_with_key(ConnectionState::Ready, secondary_key.clone()).await;
+        record_test_spawn_root(&secondary_handle, "file:///workspace/b");
+        pool.connections().await.extend([
+            (primary_key.clone(), Arc::clone(&primary_handle)),
+            (secondary_key.clone(), Arc::clone(&secondary_handle)),
+        ]);
         let config = crate::config::settings::BridgeServerConfig {
             languages: Some(vec!["lua".to_owned()]),
             ..Default::default()
         };
 
-        pool.open_recorded_workspace_virtual_documents(&handle, &config)
+        pool.open_recorded_workspace_virtual_documents(&primary_handle, &config)
+            .await;
+        pool.open_recorded_workspace_virtual_documents(&secondary_handle, &config)
             .await;
 
-        let revisions = pool
-            .confirmed_virtual_document_revisions_for_connection(&key)
+        let primary_revisions = pool
+            .confirmed_virtual_document_revisions_for_connection(&primary_key)
             .await;
-        let inside_uri = VirtualDocumentUri::new(
-            &url_to_uri(&inside_host),
-            &inside.language,
-            &inside.region_id,
+        let secondary_revisions = pool
+            .confirmed_virtual_document_revisions_for_connection(&secondary_key)
+            .await;
+        let primary_uri = VirtualDocumentUri::new(
+            &url_to_uri(&primary_host),
+            &primary.language,
+            &primary.region_id,
+        )
+        .to_uri_string();
+        let secondary_uri = VirtualDocumentUri::new(
+            &url_to_uri(&secondary_host),
+            &secondary.language,
+            &secondary.region_id,
         )
         .to_uri_string();
         let outside_uri = VirtualDocumentUri::new(
@@ -6860,8 +6913,15 @@ mod tests {
             &outside.region_id,
         )
         .to_uri_string();
-        assert_eq!(revisions[&inside_uri].host_identity, Some((1, 0)));
-        assert!(!revisions.contains_key(&outside_uri));
+        assert_eq!(primary_revisions[&primary_uri].host_identity, Some((1, 0)));
+        assert!(!primary_revisions.contains_key(&secondary_uri));
+        assert!(!primary_revisions.contains_key(&outside_uri));
+        assert_eq!(
+            secondary_revisions[&secondary_uri].host_identity,
+            Some((1, 0))
+        );
+        assert!(!secondary_revisions.contains_key(&primary_uri));
+        assert!(!secondary_revisions.contains_key(&outside_uri));
     }
 
     /// Test that ensure_document_opened sends didOpen when document is not yet opened.
