@@ -634,15 +634,22 @@ impl ConnectionHandle {
     /// Called once after successful LSP handshake, before transitioning to Ready.
     /// Subsequent calls are ignored (OnceLock semantics).
     pub(super) fn set_server_capabilities(&self, capabilities: ServerCapabilities) {
-        let workspace_diagnostics = match capabilities.diagnostic_provider.as_ref() {
+        let typed_workspace_diagnostics = match capabilities.diagnostic_provider.as_ref() {
             Some(DiagnosticServerCapabilities::Options(options)) => options.workspace_diagnostics,
             Some(DiagnosticServerCapabilities::RegistrationOptions(options)) => {
                 options.diagnostic_options.workspace_diagnostics
             }
             None => false,
         };
+        let raw_workspace_diagnostics = self
+            .raw_diagnostic_provider()
+            .and_then(|provider| provider.get("workspaceDiagnostics"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
         self.dynamic_capabilities
-            .set_static_workspace_diagnostic_provider(workspace_diagnostics);
+            .set_static_workspace_diagnostic_provider(
+                typed_workspace_diagnostics || raw_workspace_diagnostics,
+            );
         // OnceLock::set() returns Err if already set - ignore since handshake
         // happens exactly once per connection.
         let _ = self.server_capabilities.set(capabilities);
@@ -2412,6 +2419,28 @@ mod tests {
                 register_options: Some(serde_json::json!({ "workspaceDiagnostics": true })),
             }]);
         assert!(dynamic_handle.has_capability("workspace/diagnostic"));
+    }
+
+    #[tokio::test]
+    async fn raw_static_workspace_diagnostic_provider_participates_in_lifecycle() {
+        let handle = spawn_sink_handle().await;
+        handle.set_raw_diagnostic_provider(serde_json::json!({
+            "workspaceDiagnostics": true,
+            "interFileDependencies": true,
+            "documentSelector": [{
+                "pattern": {
+                    "baseUri": "file:///workspace",
+                    "pattern": "*.rs"
+                }
+            }]
+        }));
+        handle.set_server_capabilities(ServerCapabilities::default());
+
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .has_workspace_diagnostic_provider()
+        );
     }
 
     /// Test has_capability returns true when both static and dynamic.
