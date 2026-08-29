@@ -183,11 +183,21 @@ fn reconcile_overlapping_root_reports_with_language(
         {
             return None;
         }
-        let mut root_segments = root.path_segments()?.collect::<Vec<_>>();
-        while root_segments.last() == Some(&"") {
+        let decoded_segments = |url: &url::Url| {
+            url.path_segments()?
+                .map(|segment| {
+                    percent_encoding::percent_decode_str(segment)
+                        .decode_utf8()
+                        .ok()
+                        .map(|segment| segment.into_owned())
+                })
+                .collect::<Option<Vec<_>>>()
+        };
+        let mut root_segments = decoded_segments(&root)?;
+        while root_segments.last().is_some_and(String::is_empty) {
             root_segments.pop();
         }
-        let document_segments = document.path_segments()?.collect::<Vec<_>>();
+        let document_segments = decoded_segments(&document)?;
         document_segments
             .starts_with(&root_segments)
             .then_some(root_segments.len())
@@ -1778,6 +1788,39 @@ mod tests {
                 Some("file:///workspace/nested".to_owned())
             )),
             "the suppressing nested producer must remain armed for reader-exit refresh"
+        );
+    }
+
+    #[test]
+    fn remote_root_containment_decodes_percent_escape_spelling() {
+        let provider_identifiers = vec![Some("rust".to_owned())];
+        let reports = reconcile_overlapping_root_reports([
+            RootedDiagnosticReport {
+                server: "diagnostics".into(),
+                spawn_root: Some("vscode-remote://ssh-remote+host/workspace".into()),
+                provider_identifiers: provider_identifiers.clone(),
+                report: WorkspaceDiagnosticReport {
+                    items: vec![full(
+                        "vscode-remote://ssh-remote+host/workspace/%e6%97%a5/main.rs",
+                        None,
+                        "stale-parent",
+                    )],
+                },
+            },
+            RootedDiagnosticReport {
+                server: "diagnostics".into(),
+                spawn_root: Some("vscode-remote://ssh-remote+host/workspace/%E6%97%A5".into()),
+                provider_identifiers,
+                report: WorkspaceDiagnosticReport::default(),
+            },
+        ]);
+
+        let WorkspaceDiagnosticReportResult::Report(report) = aggregate_reports(reports) else {
+            panic!("final report")
+        };
+        assert!(
+            report.items.is_empty(),
+            "equivalent percent escapes must let the nested producer clear the parent"
         );
     }
 
