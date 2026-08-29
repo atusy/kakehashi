@@ -2853,7 +2853,6 @@ impl LanguageServerPool {
         {
             return Ok((Vec::new(), initial_workspace_generation));
         }
-        let start = std::time::Instant::now();
         let primary = self
             .get_or_create_workspace_connection_wait_ready_admitted(
                 server_name,
@@ -2949,7 +2948,11 @@ impl LanguageServerPool {
                 .unwrap_or_else(|| ConnectionKey::new(server_name, Some(root.as_str().to_owned())));
             (key, root, folder)
         });
-        let remaining = timeout.saturating_sub(start.elapsed());
+        // The primary probe may consume its entire initialization timeout.
+        // Root-scoped producers are independent processes, so give their
+        // concurrent acquisition batch a fresh per-process readiness window
+        // instead of inheriting an exhausted primary budget.
+        let secondary_timeout = timeout;
         let acquisitions = targets.map(|(key, root, folder)| async move {
             self.acquire_resolved_wait_ready(
                 server_name,
@@ -2957,7 +2960,7 @@ impl LanguageServerPool {
                 key,
                 Some((root, folder)),
                 WaitReadyOptions {
-                    timeout: remaining,
+                    timeout: secondary_timeout,
                     rootless: false,
                     admit: Some(&workspace_admit),
                 },
