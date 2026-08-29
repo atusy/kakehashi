@@ -409,6 +409,7 @@ fn transform_semantic_tokens_result_to_host_inner(
     let mapper = PositionMapper::new(virtual_content);
     let mut absolute_line = 0u32;
     let mut absolute_start = 0u32;
+    let mut previous_end = None;
     let mut host_tokens = Vec::with_capacity(data.len());
 
     for token in data {
@@ -466,6 +467,15 @@ fn transform_semantic_tokens_result_to_host_inner(
                 "semantic token modifiers are outside the advertised legend",
             ));
         }
+        if reject_invalid_coordinates
+            && previous_end.is_some_and(|(line, end)| line == absolute_line && absolute_start < end)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "semantic tokens overlap",
+            ));
+        }
+        previous_end = Some((absolute_line, end.character));
         let Some(token_type) = remap_token_type(token.token_type, legend) else {
             continue;
         };
@@ -846,6 +856,13 @@ mod tests {
         assert!(
             transform(json!({ "result": { "data": [0, 0, 1, 0, 1] } })).is_err(),
             "a modifier outside the advertised legend is malformed"
+        );
+        assert!(
+            transform(json!({
+                "result": { "data": [0, 0, 3, 0, 0, 0, 2, 1, 0, 0] }
+            }))
+            .is_err(),
+            "overlapping tokens violate the advertised client capability"
         );
         assert!(
             transform_semantic_tokens_full_response_to_host(
