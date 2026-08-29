@@ -953,6 +953,11 @@ async fn dispatch_concatenated_formatting(
     let uri = region_ctx.uri.clone();
     let upstream_id = region_ctx.upstream_request_id.clone();
 
+    // Start the whole-pipeline budget before waiting for a scratch slot. Slot
+    // contention is part of the editor-visible request latency and must not
+    // grant queued pipelines a fresh budget after earlier batches finish.
+    let pipeline_start = std::time::Instant::now();
+
     let server_config_for = |name: &str| {
         region_ctx
             .configs
@@ -1010,10 +1015,6 @@ async fn dispatch_concatenated_formatting(
         scratch_run_slot,
     );
 
-    // Start of the whole-pipeline budget window (ADR Decision point 6): every
-    // step's deadline is measured against this single origin, so serial
-    // round-trips share one bound instead of each getting a fresh timeout.
-    let pipeline_start = std::time::Instant::now();
     // One-way sentinel so budget exhaustion is WARNed once per pipeline run:
     // every remaining server skips the same way, and one WARN per skipped
     // server would spam the log for a single formatting request.
