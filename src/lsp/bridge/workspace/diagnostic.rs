@@ -379,7 +379,9 @@ impl NormalizedDocumentFilter {
             return false;
         }
         self.pattern.as_deref().is_none_or(|pattern| {
-            globset::Glob::new(pattern)
+            globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
                 .map(|glob| glob.compile_matcher().is_match(uri.path()))
                 .unwrap_or(false)
         })
@@ -3211,6 +3213,18 @@ mod tests {
             report.full_document_diagnostic_report.items[0].message,
             "parent-python"
         );
+    }
+
+    #[test]
+    fn document_selector_star_does_not_cross_path_segments() {
+        let filter = NormalizedDocumentFilter {
+            language: Some("rust".into()),
+            scheme: Some("file".into()),
+            pattern: Some("/workspace/nested/*.rs".into()),
+        };
+
+        assert!(filter.applies_to("file:///workspace/nested/main.rs", Some("rust")));
+        assert!(!filter.applies_to("file:///workspace/nested/deeper/main.rs", Some("rust")));
     }
 
     #[tokio::test(start_paused = true)]
