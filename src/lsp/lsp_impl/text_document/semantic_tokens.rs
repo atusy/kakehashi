@@ -168,6 +168,7 @@ struct SemanticFullComputation {
     pending_wire: Option<PendingWireBaseline>,
     identity: (u64, u64),
     generation: u64,
+    snapshot_present: bool,
 }
 
 struct SemanticDeltaComputation {
@@ -266,6 +267,19 @@ impl Drop for SemanticComputeCancelGuard {
 }
 
 impl Kakehashi {
+    fn semantic_full_computation_is_current(
+        &self,
+        uri: &Url,
+        computed: &SemanticFullComputation,
+    ) -> bool {
+        self.cache.semantic_token_generation() == computed.generation
+            && self.documents.latest_snapshot(uri).is_some_and(|view| {
+                view.slot.current_incarnation == computed.identity.0
+                    && view.content_version == computed.identity.1
+                    && view.slot.snapshot.is_some() == computed.snapshot_present
+            })
+    }
+
     fn semantic_snapshot_is_current(
         &self,
         uri: &Url,
@@ -740,6 +754,7 @@ impl Kakehashi {
                 pending_wire,
                 identity: live_identity,
                 generation,
+                snapshot_present: snapshot.is_some(),
             }))
         };
         let mut outcome = match cancel_rx.as_mut() {
@@ -795,11 +810,7 @@ impl Kakehashi {
             if commit_guard.is_some()
                 && let Ok(Some(computed)) = &mut outcome
             {
-                let current = self.cache.semantic_token_generation() == computed.generation
-                    && self.documents.get(&uri).is_some_and(|document| {
-                        document.incarnation() == computed.identity.0
-                            && document.content_version() == computed.identity.1
-                    });
+                let current = self.semantic_full_computation_is_current(&uri, computed);
                 if !current
                     || self
                         .cache
@@ -2491,6 +2502,18 @@ mod tests {
         let identity = (view.slot.current_incarnation, view.content_version);
         let generation = server.cache.semantic_token_generation();
         let settings_generation = server.settings_manager.settings_generation();
+        let computed = SemanticFullComputation {
+            result: SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: Vec::new(),
+            }),
+            pending_native: None,
+            pending_wire: None,
+            identity,
+            generation,
+            snapshot_present: false,
+        };
+        assert!(server.semantic_full_computation_is_current(&uri, &computed));
         let edit_lock = server.documents.edit_lock(&uri);
         assert!(server.semantic_full_response_is_current(
             &uri,
@@ -2516,6 +2539,10 @@ mod tests {
         );
         let settings_generation = server.settings_manager.settings_generation();
         publish_treeless(server, &uri, "old", 0);
+        assert!(
+            !server.semantic_full_computation_is_current(&uri, &computed),
+            "the final publication fence must reject a newly published snapshot"
+        );
         assert!(
             !server.semantic_full_response_is_current(
                 &uri,
@@ -2974,6 +3001,7 @@ mod tests {
             pending_wire: Some(pending),
             identity: (1, 1),
             generation: 1,
+            snapshot_present: true,
         };
         commit_full_baselines(&server.cache, &mut computed);
         assert!(
