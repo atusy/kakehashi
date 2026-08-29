@@ -226,25 +226,19 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn request_or_defer_workspace_diagnostic_registration_refresh(&self) -> bool {
-        loop {
-            match self.workspace_diagnostic_pull_state.load(Ordering::Acquire) {
-                WORKSPACE_DIAGNOSTIC_PULL_IDLE => return true,
-                WORKSPACE_DIAGNOSTIC_PULL_ACTIVE => break,
-                _ => unreachable!("workspace diagnostic pull state is valid"),
-            }
+        match self.workspace_diagnostic_pull_state.load(Ordering::Acquire) {
+            WORKSPACE_DIAGNOSTIC_PULL_IDLE => return true,
+            WORKSPACE_DIAGNOSTIC_PULL_ACTIVE => {}
+            _ => unreachable!("workspace diagnostic pull state is valid"),
         }
         self.workspace_diagnostic_registration_refresh_pending
             .store(true, Ordering::Release);
-        loop {
-            match self.workspace_diagnostic_pull_state.load(Ordering::Acquire) {
-                WORKSPACE_DIAGNOSTIC_PULL_ACTIVE => return false,
-                WORKSPACE_DIAGNOSTIC_PULL_IDLE => {
-                    return self
-                        .workspace_diagnostic_registration_refresh_pending
-                        .swap(false, Ordering::AcqRel);
-                }
-                _ => unreachable!("workspace diagnostic pull state is valid"),
-            }
+        match self.workspace_diagnostic_pull_state.load(Ordering::Acquire) {
+            WORKSPACE_DIAGNOSTIC_PULL_ACTIVE => false,
+            WORKSPACE_DIAGNOSTIC_PULL_IDLE => self
+                .workspace_diagnostic_registration_refresh_pending
+                .swap(false, Ordering::AcqRel),
+            _ => unreachable!("workspace diagnostic pull state is valid"),
         }
     }
 
