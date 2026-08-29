@@ -35,7 +35,9 @@ pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
 use document_tracker::DocumentTracker;
-pub(crate) use document_tracker::{OpenedVirtualDoc, VirtualUriObserver};
+pub(crate) use document_tracker::{
+    ConfirmedDocumentRevision, OpenedVirtualDoc, VirtualUriObserver,
+};
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
 use pending_reopen::PendingReopenRegistry;
