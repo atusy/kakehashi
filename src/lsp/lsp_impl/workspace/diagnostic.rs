@@ -40,14 +40,22 @@ impl Kakehashi {
             self.bridge.cancel_forwarder(),
             &language_for_uri,
         );
-        let dispatch = pool.dispatch_workspace_diagnostic_cancellable(
-            params,
-            &settings,
-            upstream_id,
-            &admit,
-            workspace_generation,
-            context,
-        );
+        let dispatch = async {
+            for (uri, ticket) in crate::lsp::ingress_order::current_workspace_reader_tails() {
+                if let Ok(uri) = url::Url::parse(&uri) {
+                    self.documents.wait_for_watermark(&uri, ticket).await;
+                }
+            }
+            pool.dispatch_workspace_diagnostic_cancellable(
+                params,
+                &settings,
+                upstream_id,
+                &admit,
+                workspace_generation,
+                context,
+            )
+            .await
+        };
         match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
