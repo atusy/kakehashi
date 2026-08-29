@@ -1,9 +1,10 @@
 use crate::document::Document;
+use crate::error::LockResultExt;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use dashmap::mapref::one::Ref;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex, watch};
 use tree_sitter::{InputEdit, Tree};
 use url::Url;
@@ -11,6 +12,9 @@ use url::Url;
 // The central store for all document-related information.
 pub struct DocumentStore {
     documents: DashMap<Url, Document>,
+    /// Serializes a coherent read of document identities against text and
+    /// lifecycle mutations spanning multiple DashMap shards.
+    content_snapshot: RwLock<()>,
     parse_states: DashMap<Url, watch::Sender<ParseState>>,
     /// Per-document serialization lock for `didChange` application.
     ///
@@ -101,6 +105,7 @@ impl Default for DocumentStore {
     fn default() -> Self {
         Self {
             documents: DashMap::new(),
+            content_snapshot: RwLock::new(()),
             parse_states: DashMap::new(),
             edit_locks: DashMap::new(),
             open_counter: std::sync::atomic::AtomicU64::new(1),
@@ -112,6 +117,14 @@ impl Default for DocumentStore {
 impl DocumentStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_content_snapshot<T>(&self, read: impl FnOnce() -> T) -> T {
+        let _snapshot = self
+            .content_snapshot
+            .read()
+            .recover_poison("DocumentStore::with_content_snapshot");
+        read()
     }
 
     /// Snapshot the URIs of all currently open documents without retaining any
@@ -211,6 +224,10 @@ impl DocumentStore {
         language_id: Option<String>,
         tree: Option<Tree>,
     ) -> u64 {
+        let _snapshot = self
+            .content_snapshot
+            .write()
+            .recover_poison("DocumentStore::insert");
         let has_tree = tree.is_some();
         // didOpen registers a fresh lifetime → a fresh incarnation, so an
         // in-flight parse from a prior open of this URI can't publish against it.
@@ -246,6 +263,10 @@ impl DocumentStore {
     /// still use it as an edit fixture.
     #[cfg(test)]
     pub fn update_document(&self, uri: Url, text: String, new_tree: Option<Tree>) {
+        let _snapshot = self
+            .content_snapshot
+            .write()
+            .recover_poison("DocumentStore::update_document");
         // Use entry API for atomic operations to prevent race conditions
         // between checking if document exists and inserting/updating.
         // Hot path (the document already exists): `get_mut` borrows the key, so no
@@ -323,6 +344,10 @@ impl DocumentStore {
     /// `Vacant` branch (a reordered notification for an unopened URI) inserts a
     /// tree-less document to mirror the prior `update_document` behavior.
     pub(crate) fn apply_edit_clearing_tree(&self, uri: &Url, text: String, edits: &[InputEdit]) {
+        let _snapshot = self
+            .content_snapshot
+            .write()
+            .recover_poison("DocumentStore::apply_edit_clearing_tree");
         // Hot path (a live document being edited): `get_mut` borrows the key, so no
         // `Url` clone per keystroke. Only a miss falls back to `entry` (owned key),
         // which also re-checks for a document a concurrent open inserted between the
@@ -819,6 +844,10 @@ impl DocumentStore {
     /// gone. Keeping the map entry makes a fast reopen wait on the same mutex
     /// instead of creating a fresh lock and racing the old lifetime's cleanup.
     pub(crate) fn remove_preserving_edit_lock(&self, uri: &Url) -> Option<Document> {
+        let _snapshot = self
+            .content_snapshot
+            .write()
+            .recover_poison("DocumentStore::remove_preserving_edit_lock");
         self.parse_states.remove(uri);
         // Dropping the watermark sender wakes any reader still blocked on
         // the watermark for this document, so a reader racing the close
@@ -1160,6 +1189,38 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn content_snapshot_serializes_multi_document_identity_checks_against_edits() {
+        let store = DocumentStore::new();
+        let first = Url::parse("file:///first.md").unwrap();
+        let second = Url::parse("file:///second.md").unwrap();
+        store.insert(first.clone(), "old".into(), None, None);
+        store.insert(second.clone(), "stable".into(), None, None);
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+
+        thread::scope(|scope| {
+            store.with_content_snapshot(|| {
+                scope.spawn(|| {
+                    attempted_tx.send(()).unwrap();
+                    store.update_document(first.clone(), "new".into(), None);
+                    finished_tx.send(()).unwrap();
+                });
+                attempted_rx.recv().unwrap();
+                thread::sleep(Duration::from_millis(20));
+                assert!(
+                    finished_rx.try_recv().is_err(),
+                    "an edit must wait until the complete identity snapshot is read"
+                );
+                assert_eq!(store.get(&first).unwrap().text(), "old");
+                assert_eq!(store.get(&second).unwrap().text(), "stable");
+            });
+        });
+
+        finished_rx.recv().unwrap();
+        assert_eq!(store.get(&first).unwrap().text(), "new");
+    }
 
     #[test]
     fn insert_stamps_a_fresh_nonzero_incarnation() {

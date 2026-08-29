@@ -12,6 +12,7 @@ use tower_lsp_server::ls_types::{
     Location, OneOf, SymbolInformation, SymbolTag, WorkspaceLocation, WorkspaceSymbol,
     WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
+use url::Url;
 
 use crate::config::settings::WorkspaceSettings;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
@@ -43,6 +44,8 @@ struct WorkspaceSymbolProjection {
     virtual_uri: String,
     virtual_version: i32,
     #[serde(default)]
+    host_uri: Option<String>,
+    #[serde(default)]
     host_identity: Option<(u64, u64)>,
     downstream_location: OneOf<Location, WorkspaceLocation>,
 }
@@ -54,6 +57,29 @@ fn host_document_identity(
     documents
         .get(host_url)
         .map(|document| (document.incarnation(), document.content_version()))
+}
+
+async fn workspace_symbol_projection_is_current(
+    pool: &LanguageServerPool,
+    projection: &WorkspaceSymbolProjection,
+    connection_key: &ConnectionKey,
+    documents: &crate::document::DocumentStore,
+) -> bool {
+    if pool
+        .virtual_document_version(&projection.virtual_uri, connection_key)
+        .await
+        != Some(projection.virtual_version)
+    {
+        return false;
+    }
+    let (Some(host_uri), Some(host_identity)) =
+        (projection.host_uri.as_deref(), projection.host_identity)
+    else {
+        return false;
+    };
+    Url::parse(host_uri)
+        .ok()
+        .is_some_and(|host_uri| host_document_identity(documents, &host_uri) == Some(host_identity))
 }
 
 fn envelope_symbol(symbol: &mut WorkspaceSymbol, envelope: WorkspaceSymbolEnvelope) {
@@ -341,6 +367,7 @@ async fn project_workspace_symbol_location(
     Some(Some(WorkspaceSymbolProjection {
         virtual_uri,
         virtual_version,
+        host_uri: Some(host_url.to_string()),
         host_identity: Some(host_identity),
         downstream_location,
     }))
@@ -561,12 +588,14 @@ impl LanguageServerPool {
         servers.sort_by(|a, b| a.0.cmp(&b.0));
         let producer_scopes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let projection_fences = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let projection_host_fences = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let requests = servers.into_iter().map(|(name, config)| {
             let params = params.clone();
             let upstream_id = upstream_id.clone();
             let producer_scopes = Arc::clone(&producer_scopes);
             let projection_fences = Arc::clone(&projection_fences);
+            let projection_host_fences = Arc::clone(&projection_host_fences);
             async move {
                 let Ok((handles, workspace_generation)) = self
                     .get_or_create_workspace_connections_wait_ready_admitted(
@@ -596,6 +625,7 @@ impl LanguageServerPool {
                     let name = name.clone();
                     let producer_scopes = Arc::clone(&producer_scopes);
                     let projection_fences = Arc::clone(&projection_fences);
+                    let projection_host_fences = Arc::clone(&projection_host_fences);
                     async move {
                         if !handle.has_capability(SYMBOL_METHOD) {
                             return Err(());
@@ -687,6 +717,20 @@ impl LanguageServerPool {
                             } else {
                                 None
                             };
+                            if let Some(projection) = &projection {
+                                let (Some(host_uri), Some(host_identity)) =
+                                    (projection.host_uri.as_deref(), projection.host_identity)
+                                else {
+                                    continue;
+                                };
+                                let Ok(host_uri) = Url::parse(host_uri) else {
+                                    continue;
+                                };
+                                projection_host_fences
+                                    .lock()
+                                    .recover_poison("workspace symbol projection host fences")
+                                    .push((host_uri, host_identity));
+                            }
                             let needs_envelope = needs_resolve_envelope(&symbol, resolves);
                             prepared.push(prepare_symbol_for_aggregation(
                                 symbol,
@@ -728,11 +772,31 @@ impl LanguageServerPool {
                 .lock()
                 .recover_poison("workspace symbol projection fences"),
         );
-        for (handle, generation, revisions) in projection_fences {
+        for (handle, generation, revisions) in &projection_fences {
             if !self
-                .workspace_symbol_projection_fence_is_live(&handle, generation, &revisions)
+                .workspace_symbol_projection_fence_is_live(handle, *generation, revisions)
                 .await
             {
+                return None;
+            }
+        }
+        let connections = self.connections().await;
+        if projection_fences.iter().any(|(handle, generation, _)| {
+            !connections.get(handle.key()).is_some_and(|live| {
+                Arc::ptr_eq(live, handle) && live.state() == ConnectionState::Ready
+            }) || self.document_connection_generation(handle.key()) != *generation
+        }) {
+            return None;
+        }
+        if let Some(context) = projection_context {
+            let projection_host_fences = projection_host_fences
+                .lock()
+                .recover_poison("workspace symbol projection host fences");
+            if !context.documents.with_content_snapshot(|| {
+                projection_host_fences.iter().all(|(host_uri, expected)| {
+                    host_document_identity(context.documents, host_uri) == Some(*expected)
+                })
+            }) {
                 return None;
             }
         }
@@ -862,6 +926,18 @@ impl LanguageServerPool {
                 }
                 if !self
                     .workspace_symbol_producer_is_live(&handle, envelope.connection_generation)
+                    .await
+                {
+                    return fail_soft(symbol);
+                }
+                if let Some(projection) = &envelope.projection
+                    && let Some(context) = projection_context
+                    && !workspace_symbol_projection_is_current(
+                        self,
+                        projection,
+                        handle.key(),
+                        context.documents,
+                    )
                     .await
                 {
                     return fail_soft(symbol);
@@ -1270,6 +1346,38 @@ mod tests {
             .await
             .is_none(),
             "projection must not combine an old virtual revision with new host geometry"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_workspace_symbol_rechecks_the_host_after_producer_liveness() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("symbols");
+        let host = Url::parse("file:///workspace/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "lua",
+            "01ARZ3NDEKTSV4RRFFQ69G5RES",
+        );
+        pool.register_opened_document(&host, &virtual_uri, &key)
+            .await;
+        let documents = crate::document::DocumentStore::new();
+        documents.insert(host.clone(), "old".into(), Some("markdown".into()), None);
+        let projection = WorkspaceSymbolProjection {
+            virtual_uri: virtual_uri.to_uri_string(),
+            virtual_version: 1,
+            host_uri: Some(host.to_string()),
+            host_identity: host_document_identity(&documents, &host),
+            downstream_location: OneOf::Right(WorkspaceLocation {
+                uri: Uri::from_str(&virtual_uri.to_uri_string()).unwrap(),
+            }),
+        };
+
+        assert!(workspace_symbol_projection_is_current(&pool, &projection, &key, &documents).await);
+        documents.update_document(host, "new".into(), None);
+        assert!(
+            !workspace_symbol_projection_is_current(&pool, &projection, &key, &documents).await,
+            "a host edit during the producer-liveness await must invalidate resolve"
         );
     }
 
