@@ -909,6 +909,10 @@ async fn handle_message(
     match classify_message(&message) {
         MessageKind::Response => {
             let id = message.get("id").cloned();
+            if let Some(request_id) = crate::lsp::bridge::protocol::RequestId::from_json(&message) {
+                deps.dynamic_capabilities
+                    .mark_workspace_diagnostic_response_received(request_id);
+            }
             match router.route(message) {
                 RouteResult::Delivered => {
                     // Response delivered successfully - no logging needed for normal case
@@ -1038,13 +1042,15 @@ async fn handle_server_request(
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
     let method = message.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    // Snapshot this at request arrival. A server that emits refresh while
-    // answering kakehashi's active workspace pull is describing the result the
-    // editor is already waiting for; forwarding it would make that pull trigger
-    // another identical pull. A refresh outside this scope may represent an
-    // unopened-file change and must still reach the editor.
-    let diagnostic_refresh_from_active_pull = method == "workspace/diagnostic/refresh"
-        && deps.dynamic_capabilities.workspace_diagnostic_pull_active();
+    // Snapshot this at request arrival. A refresh emitted before the response
+    // to kakehashi's outstanding workspace pull is covered by that response;
+    // forwarding it would make the pull trigger another identical pull. Once
+    // the response has arrived, even while the composite is still aggregating,
+    // a refresh may describe newer workspace state and must remain visible.
+    let diagnostic_refresh_covered_by_pending_pull = method == "workspace/diagnostic/refresh"
+        && deps
+            .dynamic_capabilities
+            .has_pending_workspace_diagnostic_request();
 
     // Deferred request handlers forward to the editor (or, for a
     // workspace/applyEdit the editor never declared support for, answer
@@ -1171,7 +1177,7 @@ async fn handle_server_request(
     // A downstream server may wait for this response before answering the
     // diagnostic pull triggered by the refresh. Queue the acknowledgement
     // first so prefetch can never deadlock behind its own server request.
-    if method == "workspace/diagnostic/refresh" && !diagnostic_refresh_from_active_pull {
+    if method == "workspace/diagnostic/refresh" && !diagnostic_refresh_covered_by_pending_pull {
         let _ = deps
             .upstream_tx
             .send(UpstreamNotification::DiagnosticRefresh);
@@ -3111,11 +3117,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_message_diagnostic_refresh_from_active_pull_is_suppressed() {
+    async fn handle_message_diagnostic_refresh_before_pull_response_is_suppressed() {
         let router = ResponseRouter::new();
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         dynamic_capabilities.mark_workspace_diagnostic_pull_active();
+        dynamic_capabilities.mark_workspace_diagnostic_request_sent(
+            crate::lsp::bridge::protocol::RequestId::new(7),
+        );
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
@@ -3153,7 +3162,13 @@ mod tests {
             "a refresh induced by the active workspace pull must not trigger another pull"
         );
 
-        dynamic_capabilities.mark_workspace_diagnostic_pull_completed();
+        handle_message(
+            json!({"jsonrpc": "2.0", "id": 7, "result": {"items": []}}),
+            &router,
+            "",
+            &deps,
+        )
+        .await;
         handle_message(refresh(11), &router, "", &deps).await;
 
         assert!(matches!(
