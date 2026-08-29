@@ -449,9 +449,13 @@ impl Kakehashi {
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let settings_generation = self.settings_manager.settings_generation();
         let native_enabled = self.semantic_tokens_full_includes_native(&uri);
-        let virtual_enabled = self.document_language(&uri).is_some_and(|language| {
-            self.resolve_layer_config(&language, METHOD)
+        let document_language = self.document_language(&uri);
+        let virtual_enabled = document_language.as_ref().is_some_and(|language| {
+            self.resolve_layer_config(language, METHOD)
                 .allows(LayerSource::Virt)
+        });
+        let actionable_virtual = document_language.as_ref().is_some_and(|language| {
+            self.semantic_tokens_full_has_potential_virtual_producer(language)
         });
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
@@ -478,7 +482,7 @@ impl Kakehashi {
         let generation = native_layer.generation;
         let native_tokens = native_layer.tokens;
         let snapshot = native_layer.snapshot;
-        if virtual_enabled
+        if actionable_virtual
             && snapshot
                 .as_ref()
                 .is_none_or(|snapshot| snapshot.tree.is_none())
@@ -1238,6 +1242,59 @@ impl Kakehashi {
         self.document_language(uri).is_none_or(|language| {
             let layers = self.resolve_layer_config(&language, METHOD);
             layers.allows(LayerSource::Native)
+        })
+    }
+
+    fn semantic_tokens_full_has_potential_virtual_producer(&self, host_language: &str) -> bool {
+        const METHOD: &str = "textDocument/semanticTokens/full";
+        if self.language.injection_query(host_language).is_none() {
+            return false;
+        }
+        let settings = self.settings_manager.load_settings();
+        let mut candidates = settings.languages.keys().cloned().collect::<Vec<_>>();
+        candidates.extend(
+            settings
+                .language_servers
+                .values()
+                .filter_map(|server| server.languages.as_ref())
+                .flatten()
+                .filter(|language| language.as_str() != "*")
+                .cloned(),
+        );
+        if let Some(bridge) = settings
+            .languages
+            .get(host_language)
+            .and_then(|language| language.bridge.as_ref())
+        {
+            candidates.extend(bridge.keys().filter(|name| *name != "_").cloned());
+        }
+        let wildcard_server = settings.language_servers.values().any(|server| {
+            server
+                .languages
+                .as_ref()
+                .is_some_and(|languages| languages.iter().any(|language| language == "*"))
+        });
+        if wildcard_server {
+            candidates.push("__kakehashi_any_injection__".to_owned());
+        }
+        candidates.sort();
+        candidates.dedup();
+        candidates.into_iter().any(|injection_language| {
+            let configs =
+                self.bridge_configs_for_injection_language(host_language, &injection_language);
+            if configs.is_empty() {
+                return false;
+            }
+            let aggregation =
+                self.resolve_aggregation_config(host_language, &injection_language, METHOD);
+            semantic_region_selects_servers(
+                true,
+                &aggregation.priorities,
+                &configs,
+                aggregation.max_fan_out,
+                &std::collections::HashSet::new(),
+                &std::collections::HashSet::new(),
+            )
         })
     }
 
@@ -2616,7 +2673,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn treeless_non_native_full_registers_pending_virtual_refresh() {
+    async fn treeless_full_without_an_actionable_virtual_layer_serves_native_empty() {
         use crate::config::WorkspaceSettings;
         use crate::config::settings::{LanguageSettings, LayerAggregationConfig, LayersConfig};
         use std::collections::HashMap;
@@ -2627,7 +2684,7 @@ mod tests {
         aggregation.insert(
             "textDocument/semanticTokens/full".to_string(),
             LayerAggregationConfig {
-                priorities: Some(vec![LayerSource::Host, LayerSource::Virt]),
+                priorities: Some(vec![LayerSource::Virt, LayerSource::Native]),
                 strategy: None,
             },
         );
@@ -2666,8 +2723,12 @@ mod tests {
         )
         .await
         .expect("tree-less virtual discovery must finish without waiting")
-        .expect_err("pending virtual discovery must preserve the previous overlay");
-        assert_eq!(result.code, crate::error::content_modified_error().code);
+        .expect("semantic tokens full should return without error")
+        .expect("the authoritative native empty layer must be served");
+        let SemanticTokensResult::Tokens(tokens) = result else {
+            panic!("full tokens")
+        };
+        assert!(tokens.data.is_empty());
         assert_eq!(server.cache.served_semantic_version(&uri), Some(0));
     }
 
