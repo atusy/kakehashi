@@ -217,6 +217,7 @@ impl Kakehashi {
                 )
                 .await
             };
+            let mut exact_capability_by_connection = std::collections::HashMap::new();
 
             for (region_index, resolved) in all_regions.iter().enumerate() {
                 // A combined injection concatenates disjoint host spans into one
@@ -251,7 +252,16 @@ impl Kakehashi {
                                 &routing_uri,
                             )
                             .await;
-                        if pool.connection_known_incapable(&key, method_name).await {
+                        let known_incapable = match exact_capability_by_connection.get(&key) {
+                            Some(known_incapable) => *known_incapable,
+                            None => {
+                                let known_incapable =
+                                    pool.connection_known_incapable(&key, method_name).await;
+                                exact_capability_by_connection.insert(key, known_incapable);
+                                known_incapable
+                            }
+                        };
+                        if known_incapable {
                             exact_incapable.insert(config.server_name.clone());
                         }
                     }
