@@ -220,7 +220,19 @@ impl std::ops::DerefMut for NormalizedSymbol {
     }
 }
 
-type IdentifiedSymbol = (NormalizedSymbol, Option<Vec<u8>>);
+struct WorkspaceSymbolAggregationFence {
+    handle: Arc<ConnectionHandle>,
+    generation: u64,
+    projection_revisions: Option<Arc<HashMap<String, ConfirmedDocumentRevision>>>,
+    scope_generation: Option<u64>,
+    projection_host: Option<(Url, (u64, u64))>,
+}
+
+type IdentifiedSymbol = (
+    NormalizedSymbol,
+    Option<Vec<u8>>,
+    Option<WorkspaceSymbolAggregationFence>,
+);
 
 fn prepare_symbol_for_aggregation(
     symbol: impl Into<NormalizedSymbol>,
@@ -238,19 +250,27 @@ fn prepare_symbol_for_aggregation(
         // tag-incapable clients.
         normalized.symbol.data = None;
     }
-    (normalized, identity)
+    (normalized, identity, None)
 }
 
 fn needs_resolve_envelope(symbol: &NormalizedSymbol, resolves: bool) -> bool {
     resolves && !symbol.legacy_flat && matches!(symbol.location, OneOf::Right(_))
 }
 
+#[cfg(test)]
 fn deduplicate_symbols(
     symbols: impl IntoIterator<Item = IdentifiedSymbol>,
 ) -> Vec<NormalizedSymbol> {
+    deduplicate_symbols_with_fences(symbols).0
+}
+
+fn deduplicate_symbols_with_fences(
+    symbols: impl IntoIterator<Item = IdentifiedSymbol>,
+) -> (Vec<NormalizedSymbol>, Vec<WorkspaceSymbolAggregationFence>) {
     let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut deduplicated: Vec<NormalizedSymbol> = Vec::new();
-    for (symbol, identity) in symbols {
+    let mut fences = Vec::new();
+    for (symbol, identity, fence) in symbols {
         if let Some(identity) = identity {
             if let Some(index) = seen.get(&identity).copied() {
                 deduplicated[index].legacy_deprecated |= symbol.legacy_deprecated;
@@ -259,8 +279,9 @@ fn deduplicate_symbols(
             seen.insert(identity, deduplicated.len());
         }
         deduplicated.push(symbol);
+        fences.extend(fence);
     }
-    deduplicated
+    (deduplicated, fences)
 }
 
 #[allow(deprecated)]
@@ -611,16 +632,19 @@ impl LanguageServerPool {
                 if workspace_generation != request_workspace_generation {
                     return Vec::new();
                 }
+                let mut handles = handles;
                 if projection_context.is_some() {
-                    for handle in &handles {
+                    let mut prepared_handles = Vec::with_capacity(handles.len());
+                    for handle in handles {
                         if self
-                            .open_recorded_workspace_virtual_documents(handle, &config)
+                            .open_recorded_workspace_virtual_documents(&handle, &config)
                             .await
-                            .is_err()
+                            .is_ok()
                         {
-                            return Vec::new();
+                            prepared_handles.push(handle);
                         }
                     }
+                    handles = prepared_handles;
                 }
                 let workspace_admit =
                     || admit() && self.workspace_generation() == workspace_generation;
@@ -628,32 +652,28 @@ impl LanguageServerPool {
                     let params = params.clone();
                     let upstream_id = upstream_id.clone();
                     let name = name.clone();
-                    let producer_scopes = Arc::clone(&producer_scopes);
-                    let projection_fences = Arc::clone(&projection_fences);
-                    let projection_host_fences = Arc::clone(&projection_host_fences);
                     async move {
                         if !handle.has_capability(SYMBOL_METHOD) {
                             return Err(());
                         }
-                        if handle.key().is_shared() {
+                        let scope_generation = if handle.key().is_shared() {
                             let scope_generation = handle.workspace_folders().generation();
                             if !self.shared_serves_client_workspace(&handle)
                                 || handle.workspace_folders().generation() != scope_generation
                             {
                                 return Err(());
                             }
-                            producer_scopes
-                                .lock()
-                                .recover_poison("workspace symbol producer scopes")
-                                .push((Arc::clone(&handle), scope_generation));
-                        }
+                            Some(scope_generation)
+                        } else {
+                            None
+                        };
                         let generation = self.document_connection_generation(handle.key());
                         let virtual_uri_observer =
                             self.observe_virtual_uris_for_connection(handle.key(), generation);
                         let confirmed_revisions = self
                             .confirmed_virtual_document_revisions_for_connection(handle.key())
                             .await;
-                        let projection_revision_fence = confirmed_revisions.clone();
+                        let projection_revision_fence = Arc::new(confirmed_revisions.clone());
                         let virtual_versions = confirmed_revisions
                             .iter()
                             .map(|(uri, revision)| (uri.clone(), revision.version))
@@ -686,7 +706,6 @@ impl LanguageServerPool {
                         };
                         let symbols = decode_response(response, supports_tags).map_err(|_| ())?;
                         let mut prepared = Vec::with_capacity(symbols.len());
-                        let mut has_projected_symbol = false;
                         for mut symbol in symbols {
                             let projection = if let Some(context) = projection_context {
                                 let Some(projection) = project_workspace_symbol_location(
@@ -714,8 +733,7 @@ impl LanguageServerPool {
                             } else {
                                 None
                             };
-                            has_projected_symbol |= projection.is_some();
-                            if let Some(projection) = &projection {
+                            let projection_host = if let Some(projection) = &projection {
                                 let (Some(host_uri), Some(host_identity)) =
                                     (projection.host_uri.as_deref(), projection.host_identity)
                                 else {
@@ -724,13 +742,23 @@ impl LanguageServerPool {
                                 let Ok(host_uri) = Url::parse(host_uri) else {
                                     continue;
                                 };
-                                projection_host_fences
-                                    .lock()
-                                    .recover_poison("workspace symbol projection host fences")
-                                    .push((host_uri, host_identity));
-                            }
+                                Some((host_uri, host_identity))
+                            } else {
+                                None
+                            };
+                            let aggregation_fence = (projection.is_some()
+                                || scope_generation.is_some())
+                            .then(|| WorkspaceSymbolAggregationFence {
+                                handle: Arc::clone(&handle),
+                                generation,
+                                projection_revisions: projection
+                                    .as_ref()
+                                    .map(|_| Arc::clone(&projection_revision_fence)),
+                                scope_generation,
+                                projection_host,
+                            });
                             let needs_envelope = needs_resolve_envelope(&symbol, resolves);
-                            prepared.push(prepare_symbol_for_aggregation(
+                            let mut prepared_symbol = prepare_symbol_for_aggregation(
                                 symbol,
                                 needs_envelope.then(|| WorkspaceSymbolEnvelope {
                                     origin: name.clone(),
@@ -739,13 +767,9 @@ impl LanguageServerPool {
                                     inner: None,
                                     projection,
                                 }),
-                            ));
-                        }
-                        if has_projected_symbol {
-                            projection_fences
-                                .lock()
-                                .recover_poison("workspace symbol projection fences")
-                                .push((Arc::clone(&handle), generation, projection_revision_fence));
+                            );
+                            prepared_symbol.2 = aggregation_fence;
+                            prepared.push(prepared_symbol);
                         }
                         Ok(prepared)
                     }
@@ -755,7 +779,28 @@ impl LanguageServerPool {
                     .into_iter()
                     .filter_map(Result::ok)
                     .flatten();
-                deduplicate_symbols(symbols)
+                let (symbols, fences) = deduplicate_symbols_with_fences(symbols);
+                for fence in fences {
+                    if let Some(scope_generation) = fence.scope_generation {
+                        producer_scopes
+                            .lock()
+                            .recover_poison("workspace symbol producer scopes")
+                            .push((Arc::clone(&fence.handle), scope_generation));
+                    }
+                    if let Some(revisions) = fence.projection_revisions {
+                        projection_fences
+                            .lock()
+                            .recover_poison("workspace symbol projection fences")
+                            .push((fence.handle, fence.generation, revisions));
+                    }
+                    if let Some(host) = fence.projection_host {
+                        projection_host_fences
+                            .lock()
+                            .recover_poison("workspace symbol projection host fences")
+                            .push(host);
+                    }
+                }
+                symbols
             }
         });
 
@@ -1464,7 +1509,7 @@ mod tests {
         let symbol = symbols.pop().unwrap();
         let needs_envelope = needs_resolve_envelope(&symbol, true);
         assert!(!needs_envelope);
-        let (symbol, _) =
+        let (symbol, _, _) =
             prepare_symbol_for_aggregation(symbol, needs_envelope.then(|| unreachable!()));
         assert_eq!(symbol.data, None);
         assert!(symbol.legacy_deprecated);
@@ -1493,7 +1538,7 @@ mod tests {
             data: Some(serde_json::json!({ "resolve": "opaque" })),
         });
         assert!(!needs_resolve_envelope(&modern, true));
-        let (modern, _) = prepare_symbol_for_aggregation(modern, None);
+        let (modern, _, _) = prepare_symbol_for_aggregation(modern, None);
         assert_eq!(modern.data, None);
         symbols.push(modern);
         assert!(can_restore_flat_response(&symbols, false));
@@ -1667,6 +1712,50 @@ mod tests {
 
         assert_eq!(symbols.len(), 2);
         assert_eq!(symbols[0].data, first_data);
+    }
+
+    #[tokio::test]
+    async fn duplicate_symbols_keep_only_the_surviving_producer_fence() {
+        let symbol = WorkspaceSymbol {
+            name: "main".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Left(location()),
+            data: None,
+        };
+        let first_handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::new("symbols", Some("file:///workspace".into())),
+        )
+        .await;
+        let duplicate_handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::new("symbols", Some("file:///workspace/nested".into())),
+        )
+        .await;
+        let mut first = prepare_symbol_for_aggregation(symbol.clone(), None);
+        first.2 = Some(WorkspaceSymbolAggregationFence {
+            handle: Arc::clone(&first_handle),
+            generation: 1,
+            projection_revisions: None,
+            scope_generation: Some(1),
+            projection_host: None,
+        });
+        let mut duplicate = prepare_symbol_for_aggregation(symbol, None);
+        duplicate.2 = Some(WorkspaceSymbolAggregationFence {
+            handle: duplicate_handle,
+            generation: 1,
+            projection_revisions: None,
+            scope_generation: Some(1),
+            projection_host: None,
+        });
+
+        let (symbols, fences) = deduplicate_symbols_with_fences([first, duplicate]);
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(fences.len(), 1);
+        assert!(Arc::ptr_eq(&fences[0].handle, &first_handle));
     }
 
     #[test]
