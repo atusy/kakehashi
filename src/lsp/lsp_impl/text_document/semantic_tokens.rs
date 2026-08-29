@@ -327,6 +327,26 @@ impl Drop for SemanticComputeCancelGuard {
 }
 
 impl Kakehashi {
+    fn semantic_computation_snapshot_state(
+        &self,
+        uri: &Url,
+        resolved_snapshot: Option<&std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
+        require_snapshot: bool,
+    ) -> (bool, Option<bool>) {
+        let live = self.documents.latest_snapshot(uri);
+        let snapshot_present = live
+            .as_ref()
+            .is_some_and(|view| view.slot.snapshot.is_some());
+        let tree_present = if require_snapshot {
+            resolved_snapshot.map(|snapshot| snapshot.tree.is_some())
+        } else {
+            live.as_ref()
+                .and_then(|view| view.slot.snapshot.as_ref())
+                .map(|snapshot| snapshot.tree.is_some())
+        };
+        (snapshot_present, tree_present)
+    }
+
     fn semantic_full_computation_is_current(
         &self,
         uri: &Url,
@@ -635,13 +655,14 @@ impl Kakehashi {
         // backstop expires instead, the no-snapshot path carries the live
         // incarnation/content version through fan-out and revalidates that
         // identity before returning.
+        let require_snapshot = native_enabled || actionable_virtual;
         let Some(native_layer) = self
             .semantic_tokens_full_native_layer(
                 params,
                 &mut cancel_rx,
                 tracking,
                 native_enabled,
-                native_enabled || actionable_virtual,
+                require_snapshot,
             )
             .await?
         else {
@@ -671,11 +692,8 @@ impl Kakehashi {
             request_guard.finish();
             return Err(crate::error::content_modified_error());
         }
-        let live_snapshot_present = self
-            .documents
-            .latest_snapshot(&uri)
-            .is_some_and(|view| view.slot.snapshot.is_some());
-        let snapshot_tree_present = snapshot.as_ref().map(|snapshot| snapshot.tree.is_some());
+        let (live_snapshot_present, snapshot_tree_present) =
+            self.semantic_computation_snapshot_state(&uri, snapshot.as_ref(), require_snapshot);
         let Some((live_identity, live_text, live_language)) =
             self.documents.get(&uri).map(|document| {
                 (
@@ -2751,6 +2769,26 @@ mod tests {
         assert!(selected.load(std::sync::atomic::Ordering::Acquire));
         assert!(activity.has_selected());
         assert!(!activity.is_authoritative());
+    }
+
+    #[test]
+    fn host_only_computation_captures_the_live_snapshot_tree_state() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///semantic_host_only_fence.rs").expect("valid test URI");
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_owned(),
+            Some("rust".to_owned()),
+            None,
+        );
+        publish_treeless(server, &uri, "fn main() {}", 0);
+
+        assert_eq!(
+            server.semantic_computation_snapshot_state(&uri, None, false),
+            (true, Some(false)),
+            "a host-only request that skips native resolution must fence against the live tree state"
+        );
     }
 
     #[tokio::test(start_paused = true)]
