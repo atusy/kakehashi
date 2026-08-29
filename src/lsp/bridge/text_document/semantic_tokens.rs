@@ -146,9 +146,8 @@ impl LanguageServerPool {
                 build_semantic_tokens_full_request(virtual_uri, request_id, client_progress_token)
             },
             |response, ctx| {
-                transform_semantic_tokens_response_to_host(
+                transform_semantic_tokens_full_response_to_host(
                     response,
-                    FULL_METHOD,
                     &legend,
                     ctx.offset,
                     region_end,
@@ -158,7 +157,7 @@ impl LanguageServerPool {
             },
             None,
         )
-        .await
+        .await?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -300,6 +299,40 @@ fn transform_semantic_tokens_response_to_host(
         virtual_content,
         host_range,
     )
+}
+
+fn transform_semantic_tokens_full_response_to_host(
+    mut response: serde_json::Value,
+    legend: &SemanticTokensLegend,
+    offset: &RegionOffset,
+    region_end: Position,
+    virtual_content: &str,
+    host_range: Range,
+) -> io::Result<Option<SemanticTokens>> {
+    if response_has_jsonrpc_error(&response, FULL_METHOD) {
+        return Err(io::Error::other(
+            "downstream semanticTokens/full returned a JSON-RPC error",
+        ));
+    }
+    let result = response
+        .get_mut("result")
+        .map(serde_json::Value::take)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing semantic token result")
+        })?;
+    if result.is_null() {
+        return Ok(None);
+    }
+    transform_semantic_tokens_result_to_host(
+        result,
+        legend,
+        offset,
+        region_end,
+        virtual_content,
+        host_range,
+    )
+    .map(Some)
+    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid semantic token result"))
 }
 
 pub(crate) fn transform_semantic_tokens_result_to_host(
@@ -680,5 +713,37 @@ mod tests {
         assert_eq!(tokens.data[1].delta_start, 2);
         assert_eq!(tokens.data[1].token_type, 17);
         assert_eq!(tokens.data[1].token_modifiers_bitset, 1 << 3);
+    }
+
+    #[test]
+    fn full_response_distinguishes_valid_empty_from_invalid_payloads() {
+        let legend = SemanticTokensLegend {
+            token_types: vec![SemanticTokenType::VARIABLE],
+            token_modifiers: Vec::new(),
+        };
+        let transform = |response| {
+            transform_semantic_tokens_full_response_to_host(
+                response,
+                &legend,
+                &RegionOffset::new(0, 0),
+                Position::new(0, 4),
+                "code",
+                Range::new(Position::new(0, 0), Position::new(0, 4)),
+            )
+        };
+
+        assert!(transform(json!({ "result": null })).unwrap().is_none());
+        assert!(
+            transform(json!({ "result": { "data": [] } }))
+                .unwrap()
+                .is_some()
+        );
+        assert!(transform(json!({ "result": { "data": "bad" } })).is_err());
+        assert!(
+            transform(json!({
+                "error": { "code": -32603, "message": "failed" }
+            }))
+            .is_err()
+        );
     }
 }
