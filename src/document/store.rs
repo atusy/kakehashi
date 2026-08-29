@@ -42,17 +42,19 @@ pub struct DocumentStore {
     /// snapshot's incarnation against the URI's current one. See
     /// `Kakehashi::store_lineage` (captures-protocol §"Delta semantics").
     open_counter: std::sync::atomic::AtomicU64,
-    /// Per-document **downstream-sync watermark**: the highest ingress writer
-    /// ticket whose off-ingress parse and tree-dependent downstream document
-    /// synchronization have completed. It is monotonic per document and published
-    /// by the parse scheduler/open task after `process_injections` returns.
+    /// Per-document **parse/injection-sync watermark**: the highest ingress writer
+    /// ticket whose off-ingress parse and tree-dependent injection synchronization
+    /// have completed. It is monotonic per document and published by the parse
+    /// scheduler/open task after `process_injections` returns. Workspace readers
+    /// additionally synchronize the real `_self` host before dispatch.
     ///
     /// This is deliberately a signal **distinct** from the `IngressOrderGate`
     /// completion channel. The per-document parse scheduler runs parse and
     /// downstream synchronization *off* the ingress ticket, so ticket completion
     /// alone implies neither a fresh tree nor current downstream server state. This
-    /// watermark tells workspace readers that both reflect their tail edit. Keyed
-    /// on the ticket (the intra-lifetime wire order). The channel value carries the
+    /// watermark tells workspace readers that the tree and injection servers reflect
+    /// their tail edit; their handler then closes the host-sync side of the barrier.
+    /// Keyed on the ticket (the intra-lifetime wire order). The channel value carries the
     /// lifetime's [`incarnation`](Watermark) too, so the off-ingress advance
     /// ([`advance_watermark_for_incarnation`](Self::advance_watermark_for_incarnation))
     /// gates on it atomically with the ticket write — a prior lifetime's parse
@@ -67,8 +69,8 @@ struct ParseState {
     has_tree: bool,
 }
 
-/// The value carried by a document's downstream-sync watermark channel: the open
-/// `incarnation` the channel belongs to, and the highest `ticket` whose downstream
+/// The value carried by a document's parse/injection-sync watermark channel: the
+/// open `incarnation` the channel belongs to, and the highest `ticket` whose
 /// synchronization has resolved for that lifetime. Storing the incarnation **in the channel**
 /// lets the off-ingress advance compare it against the parse's captured
 /// incarnation *atomically* with the ticket write (inside `send_if_modified`,

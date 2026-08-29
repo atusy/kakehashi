@@ -753,22 +753,21 @@ print("hello")
             configs.clone(),
             None,
         );
-        timeout(Duration::from_secs(1), async {
-            loop {
-                if server
-                    .bridge
-                    .pool()
-                    .host_document_version(&uri, "rust_ls")
-                    .await
-                    == Some(1)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        timeout(
+            Duration::from_secs(1),
+            server.bridge.wait_host_eager_open_finished(&uri),
+        )
         .await
-        .expect("first eager-sync should didOpen the host document at version 1");
+        .expect("first eager-sync batch should finish");
+        assert_eq!(
+            server
+                .bridge
+                .pool()
+                .host_document_version(&uri, "rust_ls")
+                .await,
+            Some(1),
+            "the completed batch must have enqueued didOpen"
+        );
 
         // A re-sync with changed text must send a didChange, advancing to version 2.
         server.bridge.eager_sync_host_document_on_servers(
@@ -778,22 +777,21 @@ print("hello")
             configs,
             None,
         );
-        timeout(Duration::from_secs(1), async {
-            loop {
-                if server
-                    .bridge
-                    .pool()
-                    .host_document_version(&uri, "rust_ls")
-                    .await
-                    == Some(2)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        timeout(
+            Duration::from_secs(1),
+            server.bridge.wait_host_eager_open_finished(&uri),
+        )
         .await
-        .expect("re-sync with changed text should send a didChange advancing to version 2");
+        .expect("changed eager-sync batch should finish");
+        assert_eq!(
+            server
+                .bridge
+                .pool()
+                .host_document_version(&uri, "rust_ls")
+                .await,
+            Some(2),
+            "the completed batch must have enqueued didChange"
+        );
     }
 
     /// Live-reader wiring (#422): the on-edit eager re-sync syncs the reader's

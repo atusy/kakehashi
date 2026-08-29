@@ -1926,6 +1926,20 @@ impl BridgeCoordinator {
             .is_none_or(|batch| batch.handles.iter().all(|h| h.is_finished()))
     }
 
+    /// Wait until the current `_self` host synchronization batch has enqueued
+    /// every document notification. The batch task awaits its per-server tasks,
+    /// and each finishes only after `sync_host_document` has queued its didOpen or
+    /// didChange on the connection's single writer.
+    pub(crate) async fn wait_host_eager_open_finished(&self, uri: &Url) {
+        while self
+            .host_eager_open_tasks
+            .get(uri)
+            .is_some_and(|batch| batch.handles.iter().any(|handle| !handle.is_finished()))
+        {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Push an abort handle into an existing entry, or abort it if stale/removed.
     ///
     /// Called immediately after each `tokio::spawn`. The handle is aborted (not
