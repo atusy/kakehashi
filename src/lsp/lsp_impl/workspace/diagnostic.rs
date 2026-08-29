@@ -72,7 +72,7 @@ mod tests {
     async fn cancelled_workspace_diagnostic_handler_sweeps_every_provider_registration() {
         let pool = Arc::new(LanguageServerPool::new());
         let upstream_id = UpstreamId::Number(42);
-        let key = ConnectionKey::for_server("diagnostics");
+        let key = ConnectionKey::workspace("diagnostics");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
         handle.dynamic_capabilities().register(vec![
             Registration {
@@ -152,7 +152,7 @@ mod tests {
     async fn incomplete_workspace_diagnostic_handler_returns_internal_error() {
         let pool = Arc::new(LanguageServerPool::new());
         let upstream_id = UpstreamId::Number(43);
-        let key = ConnectionKey::for_server("diagnostics");
+        let key = ConnectionKey::workspace("diagnostics");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
         handle.dynamic_capabilities().register(vec![Registration {
             id: "diagnostics".into(),
