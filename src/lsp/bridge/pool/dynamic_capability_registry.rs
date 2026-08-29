@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
@@ -35,6 +35,7 @@ struct WorkspaceDiagnosticPull {
     active: bool,
     accepted_once: bool,
     registration_refresh_pending: bool,
+    pending_request_ids: HashSet<crate::lsp::bridge::protocol::RequestId>,
 }
 
 #[derive(Default)]
@@ -195,6 +196,7 @@ impl DynamicCapabilityRegistry {
             .recover_poison("DynamicCapabilityRegistry::mark_workspace_diagnostic_pull_completed");
         pull.active = false;
         pull.accepted_once = true;
+        pull.pending_request_ids.clear();
         std::mem::take(&mut pull.registration_refresh_pending)
     }
 
@@ -205,11 +207,37 @@ impl DynamicCapabilityRegistry {
             .active = true;
     }
 
-    pub(crate) fn workspace_diagnostic_pull_active(&self) -> bool {
+    pub(crate) fn mark_workspace_diagnostic_request_sent(
+        &self,
+        request_id: crate::lsp::bridge::protocol::RequestId,
+    ) {
         self.workspace_diagnostic_pull
             .lock()
-            .recover_poison("DynamicCapabilityRegistry::workspace_diagnostic_pull_active")
-            .active
+            .recover_poison("DynamicCapabilityRegistry::mark_workspace_diagnostic_request_sent")
+            .pending_request_ids
+            .insert(request_id);
+    }
+
+    pub(crate) fn mark_workspace_diagnostic_response_received(
+        &self,
+        request_id: crate::lsp::bridge::protocol::RequestId,
+    ) {
+        self.workspace_diagnostic_pull
+            .lock()
+            .recover_poison(
+                "DynamicCapabilityRegistry::mark_workspace_diagnostic_response_received",
+            )
+            .pending_request_ids
+            .remove(&request_id);
+    }
+
+    pub(crate) fn has_pending_workspace_diagnostic_request(&self) -> bool {
+        !self
+            .workspace_diagnostic_pull
+            .lock()
+            .recover_poison("DynamicCapabilityRegistry::has_pending_workspace_diagnostic_request")
+            .pending_request_ids
+            .is_empty()
     }
 
     pub(crate) fn mark_workspace_diagnostic_pull_aborted(&self, started_by_pull: bool) -> bool {
@@ -219,6 +247,7 @@ impl DynamicCapabilityRegistry {
             .recover_poison("DynamicCapabilityRegistry::mark_workspace_diagnostic_pull_aborted");
         if pull.active {
             pull.active = false;
+            pull.pending_request_ids.clear();
             if pull.accepted_once || !started_by_pull {
                 return std::mem::take(&mut pull.registration_refresh_pending);
             }
@@ -693,6 +722,30 @@ mod tests {
         assert!(!registry.has_workspace_diagnostic_contributed());
         assert!(registry.mark_workspace_diagnostic_pull_completed());
         assert!(registry.request_or_defer_workspace_diagnostic_registration_refresh());
+    }
+
+    #[test]
+    fn pending_workspace_diagnostic_ids_bound_refresh_suppression() {
+        let registry = DynamicCapabilityRegistry::new();
+        let first = crate::lsp::bridge::protocol::RequestId::new(1);
+        let second = crate::lsp::bridge::protocol::RequestId::new(2);
+
+        registry.mark_workspace_diagnostic_pull_active();
+        registry.mark_workspace_diagnostic_request_sent(first);
+        registry.mark_workspace_diagnostic_request_sent(second);
+        assert!(registry.has_pending_workspace_diagnostic_request());
+
+        registry.mark_workspace_diagnostic_response_received(first);
+        assert!(registry.has_pending_workspace_diagnostic_request());
+        registry.mark_workspace_diagnostic_response_received(second);
+        assert!(!registry.has_pending_workspace_diagnostic_request());
+
+        registry.mark_workspace_diagnostic_request_sent(first);
+        registry.mark_workspace_diagnostic_pull_aborted(true);
+        assert!(
+            !registry.has_pending_workspace_diagnostic_request(),
+            "cancellation must not suppress later independent refreshes"
+        );
     }
 
     #[test]
