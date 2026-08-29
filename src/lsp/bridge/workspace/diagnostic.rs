@@ -1615,7 +1615,7 @@ mod tests {
     }
 
     #[test]
-    fn server_cancelled_retrigger_is_propagated_without_refresh_support() {
+    fn server_cancelled_is_propagated_with_its_retrigger_policy() {
         let response = |data: Option<Value>| {
             let mut error = serde_json::json!({
                 "code": -32802,
@@ -1627,11 +1627,15 @@ mod tests {
             serde_json::json!({ "jsonrpc": "2.0", "id": 1, "error": error })
         };
 
-        for data in [None, Some(serde_json::json!({ "retriggerRequest": true }))] {
+        for data in [
+            None,
+            Some(serde_json::json!({ "retriggerRequest": true })),
+            Some(serde_json::json!({ "retriggerRequest": false })),
+        ] {
             let downstream = crate::error::WorkspaceDiagnosticServerCancelled::from_response(
                 &response(data.clone()),
             )
-            .expect("retriggering ServerCancelled");
+            .expect("typed ServerCancelled");
             let combined = combine_complete_provider_reports([(
                 None,
                 Err(io::Error::new(io::ErrorKind::Interrupted, downstream)),
@@ -1699,12 +1703,6 @@ mod tests {
                 .code
                 .code(),
             -32802
-        );
-        assert!(
-            crate::error::WorkspaceDiagnosticServerCancelled::from_response(&response(Some(
-                serde_json::json!({ "retriggerRequest": false })
-            )))
-            .is_none()
         );
     }
 
