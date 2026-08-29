@@ -4276,11 +4276,13 @@ mod tests {
     async fn dispatch_fails_when_workspace_changes_during_fanout() {
         let pool = Arc::new(LanguageServerPool::new());
         seed_test_client_root(&pool, "file:///workspace");
-        let first =
-            create_handle_advertising_workspace_diagnostics(ConnectionKey::shared("alpha"), None)
-                .await;
+        let first = create_handle_advertising_workspace_diagnostics(
+            ConnectionKey::new("alpha", None),
+            None,
+        )
+        .await;
         let second =
-            create_handle_advertising_workspace_diagnostics(ConnectionKey::shared("zeta"), None)
+            create_handle_advertising_workspace_diagnostics(ConnectionKey::new("zeta", None), None)
                 .await;
         record_test_spawn_root(&first, "file:///workspace");
         record_test_spawn_root(&second, "file:///workspace");
