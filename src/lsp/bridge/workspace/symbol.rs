@@ -555,6 +555,12 @@ impl LanguageServerPool {
                 if workspace_generation != request_workspace_generation {
                     return Vec::new();
                 }
+                if projection_context.is_some() {
+                    for handle in &handles {
+                        self.open_recorded_workspace_virtual_documents(handle, &config)
+                            .await;
+                    }
+                }
                 let workspace_admit =
                     || admit() && self.workspace_generation() == workspace_generation;
                 let requests = handles.into_iter().map(|handle| {
