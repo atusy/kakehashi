@@ -2724,34 +2724,15 @@ impl LanguageServerPool {
         .await
     }
 
-    pub(super) async fn get_or_create_connection_wait_ready_admitted(
-        &self,
-        server_name: &str,
-        server_config: &crate::config::settings::BridgeServerConfig,
-        document_uri: Option<&Url>,
-        timeout: Duration,
-        admit: &(dyn Fn() -> bool + Sync),
-    ) -> io::Result<Arc<ConnectionHandle>> {
-        self.get_or_create_connection_wait_ready_with_admit(
-            server_name,
-            server_config,
-            document_uri,
-            timeout,
-            Some(admit),
-        )
-        .await
-    }
-
     /// Acquire one producer for a document-free client-workspace request.
     ///
-    /// A `preferSharedInstance` connection may have been initialized from the
-    /// first document's marker root. Reusing it would make workspace-wide
-    /// results depend on document open history unless its existing folder set
-    /// exactly serves the client workspace. Probe it without announcing client
-    /// roots; a rejected producer must not be widened as a side effect of a
-    /// document-free request. A cold shared producer is different: it is
-    /// initialized from the current client workspace so the first process can
-    /// serve this request without spawning a redundant fallback.
+    /// Even for `preferSharedInstance`, use the client-fallback key rather than
+    /// the shared document producer. Marker-less documents deliberately join
+    /// the shared process, including documents outside the client workspace;
+    /// letting a workspace-wide request reuse that process would make its
+    /// results depend on document-open history. The fallback key is otherwise
+    /// unused by shared routing, so it remains an isolated client-workspace
+    /// producer and cannot acquire indexed documents while the request runs.
     pub(super) async fn get_or_create_workspace_connection_wait_ready_admitted(
         &self,
         server_name: &str,
@@ -2766,51 +2747,19 @@ impl LanguageServerPool {
                 "client workspace update is in progress",
             ));
         }
-        let start = std::time::Instant::now();
-        let handle = if server_config.prefers_shared_instance() {
-            let shared_key = ConnectionKey::shared(server_name);
-            let shared_exists = self
-                .ready_connection_by_key_for_config(&shared_key, Some(server_config))
-                .await
-                .is_some();
-            self.acquire_resolved_wait_ready(
-                server_name,
-                server_config,
-                shared_key,
-                None,
-                WaitReadyOptions {
-                    timeout,
-                    rootless: shared_exists,
-                    admit: Some(admit),
-                },
-            )
-            .await?
-        } else {
-            self.get_or_create_connection_wait_ready_admitted(
-                server_name,
-                server_config,
-                None,
-                timeout,
-                admit,
-            )
-            .await?
-        };
-        let handle = if !handle.key().is_shared() || self.shared_serves_client_workspace(&handle) {
-            handle
-        } else {
-            self.acquire_resolved_wait_ready(
+        let handle = self
+            .acquire_resolved_wait_ready(
                 server_name,
                 server_config,
                 ConnectionKey::new(server_name, None),
                 None,
                 WaitReadyOptions {
-                    timeout: timeout.saturating_sub(start.elapsed()),
+                    timeout,
                     rootless: false,
                     admit: Some(admit),
                 },
             )
-            .await?
-        };
+            .await?;
         if !admit()
             || self.workspace_generation.load(Ordering::Acquire) != workspace_generation
             || workspace_generation & 1 != 0

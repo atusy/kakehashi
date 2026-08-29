@@ -2161,90 +2161,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_discards_a_shared_producer_that_expands_its_folder_scope() {
-        let pool = Arc::new(LanguageServerPool::new());
-        let client_folder = WorkspaceFolder {
-            uri: Uri::from_str("file:///workspace/client").unwrap(),
-            name: "client".into(),
-        };
-        pool.set_root_uri(Some(client_folder.uri.to_string()));
-        pool.set_workspace_folders(Some(vec![client_folder.clone()]));
-        let shared = create_handle_advertising_workspace_symbols_with_folder_changes(
-            ConnectionKey::shared("symbols"),
-        )
-        .await;
-        shared
-            .workspace_folders()
-            .replace(Some(vec![client_folder.clone()]));
-        pool.connections()
-            .await
-            .insert(shared.key().clone(), Arc::clone(&shared));
-        let mut settings = WorkspaceSettings::default();
-        settings.language_servers.insert(
-            "symbols".into(),
-            crate::config::settings::BridgeServerConfig {
-                cmd: Some(vec!["mock-symbols".into()]),
-                languages: Some(Vec::new()),
-                prefer_shared_instance: Some(true),
-                ..Default::default()
-            },
-        );
-        let params: WorkspaceSymbolParams = serde_json::from_value(serde_json::json!({
-            "query": "workspace"
-        }))
-        .unwrap();
-        let request_pool = Arc::clone(&pool);
-        let request = tokio::spawn(async move {
-            request_pool
-                .dispatch_workspace_symbol(
-                    params,
-                    &settings,
-                    None,
-                    true,
-                    &|| true,
-                    request_pool.workspace_generation(),
-                )
-                .await
-        });
-        let request_id = RequestId::new(2);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !shared.router().is_sent(request_id) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("shared producer receives the request before its scope expands");
-
-        shared.workspace_folders().replace(Some(vec![
-            client_folder,
-            WorkspaceFolder {
-                uri: Uri::from_str("file:///outside").unwrap(),
-                name: "outside".into(),
-            },
-        ]));
-        let _ = shared.router().route(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "result": [{
-                "name": "stale",
-                "kind": 12,
-                "location": {
-                    "uri": "file:///workspace/client/main.rs",
-                    "range": {
-                        "start": { "line": 0, "character": 0 },
-                        "end": { "line": 0, "character": 5 }
-                    }
-                }
-            }]
-        }));
-
-        assert!(
-            request.await.unwrap().is_none(),
-            "a producer that gained an unrelated marker root must not contribute results"
-        );
-    }
-
-    #[tokio::test]
     async fn explicit_empty_workspace_folders_selects_no_producer() {
         let pool = LanguageServerPool::new();
         pool.set_root_uri(Some("file:///workspace/client".into()));
@@ -2423,20 +2339,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_reuses_an_incapable_shared_producer_seeded_from_client_root() {
+    async fn search_isolates_workspace_results_from_shared_document_history() {
         let pool = Arc::new(LanguageServerPool::new());
         seed_test_client_root(&pool, "file:///workspace");
         let shared =
             create_handle_advertising_workspace_symbols(ConnectionKey::shared("symbols")).await;
         record_test_spawn_root(&shared, "file:///workspace");
-        pool.connections()
-            .await
-            .insert(shared.key().clone(), Arc::clone(&shared));
+        let fallback =
+            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+        record_test_spawn_root(&fallback, "file:///workspace");
+        pool.connections().await.extend([
+            (shared.key().clone(), Arc::clone(&shared)),
+            (fallback.key().clone(), Arc::clone(&fallback)),
+        ]);
+        let outside_host = url::Url::parse("file:///outside/history.md").unwrap();
+        let outside_virtual = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&outside_host).unwrap(),
+            "lua",
+            "01ARZ3NDEKTSV4RRFFQ69G5OUT",
+        );
+        pool.register_opened_document(&outside_host, &outside_virtual, shared.key())
+            .await;
         let mut settings = WorkspaceSettings::default();
         settings.language_servers.insert(
             "symbols".into(),
             crate::config::settings::BridgeServerConfig {
-                cmd: Some(vec!["must-not-spawn-fallback".into()]),
+                cmd: Some(vec!["mock-symbols".into()]),
                 languages: Some(Vec::new()),
                 prefer_shared_instance: Some(true),
                 ..Default::default()
@@ -2462,14 +2390,17 @@ mod tests {
 
         let request_id = RequestId::new(2);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while !shared.router().is_sent(request_id) {
+            while !fallback.router().is_sent(request_id) {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("client-seeded shared producer owns workspace search");
-        assert_eq!(pool.connection_count().await, 1);
-        let _ = shared.router().route(serde_json::json!({
+        .expect("workspace search reaches the isolated client producer");
+        assert!(
+            !shared.router().is_sent(request_id),
+            "a shared producer with outside document history must not receive the search"
+        );
+        let _ = fallback.router().route(serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
             "result": []
@@ -2644,12 +2575,12 @@ mod tests {
     async fn search_sender_rejects_workspace_change_after_producer_selection() {
         let pool = Arc::new(LanguageServerPool::new());
         seed_test_client_root(&pool, "file:///workspace");
-        let shared =
-            create_handle_advertising_workspace_symbols(ConnectionKey::shared("symbols")).await;
-        record_test_spawn_root(&shared, "file:///workspace");
+        let fallback =
+            create_handle_advertising_workspace_symbols(ConnectionKey::new("symbols", None)).await;
+        record_test_spawn_root(&fallback, "file:///workspace");
         pool.connections()
             .await
-            .insert(shared.key().clone(), Arc::clone(&shared));
+            .insert(fallback.key().clone(), Arc::clone(&fallback));
         let config = crate::config::settings::BridgeServerConfig {
             cmd: Some(vec!["mock-symbols".into()]),
             languages: Some(Vec::new()),
@@ -2697,7 +2628,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
         assert!(
             !producer.router().is_sent(RequestId::new(2)),
             "a stale workspace producer must be rejected before wire send"
@@ -2860,9 +2791,9 @@ mod tests {
         let pool = Arc::new(LanguageServerPool::new());
         seed_test_client_root(&pool, "file:///workspace");
         let first =
-            create_handle_advertising_workspace_symbols(ConnectionKey::shared("first")).await;
+            create_handle_advertising_workspace_symbols(ConnectionKey::new("first", None)).await;
         let second =
-            create_handle_advertising_workspace_symbols(ConnectionKey::shared("second")).await;
+            create_handle_advertising_workspace_symbols(ConnectionKey::new("second", None)).await;
         record_test_spawn_root(&first, "file:///workspace");
         record_test_spawn_root(&second, "file:///workspace");
         pool.connections().await.extend([
