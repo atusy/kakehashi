@@ -43,8 +43,9 @@ fn workspace_diagnostic_cancel(request_id: RequestId) -> JsonRpcNotification<Val
 struct DiagnosticProvider {
     identifier: Option<String>,
     has_static_provider: bool,
+    static_document_selector: Option<Vec<String>>,
     dynamic_registration_ids: Vec<String>,
-    dynamic_registration_options: Vec<String>,
+    dynamic_document_selectors: Vec<Option<Vec<String>>>,
 }
 
 struct CompletedDiagnosticProducer {
@@ -255,47 +256,78 @@ impl DiagnosticProvider {
         serde_json::to_string(&(
             &self.identifier,
             self.has_static_provider,
-            &self.dynamic_registration_options,
+            &self.static_document_selector,
+            &self.dynamic_document_selectors,
         ))
         .ok()
     }
 }
 
-fn static_workspace_diagnostic_identifier(handle: &ConnectionHandle) -> Option<Option<String>> {
+fn normalize_document_selector(
+    selector: Option<tower_lsp_server::ls_types::DocumentSelector>,
+) -> Option<Vec<String>> {
+    selector.map(|selector| {
+        let mut filters = selector
+            .into_iter()
+            .filter_map(|filter| serde_json::to_string(&filter).ok())
+            .collect::<Vec<_>>();
+        filters.sort();
+        filters.dedup();
+        filters
+    })
+}
+
+fn static_workspace_diagnostic_options(
+    handle: &ConnectionHandle,
+) -> Option<(Option<String>, Option<Vec<String>>)> {
     match handle
         .server_capabilities()
         .and_then(|capabilities| capabilities.diagnostic_provider.as_ref())
     {
         Some(DiagnosticServerCapabilities::Options(options)) if options.workspace_diagnostics => {
-            Some(options.identifier.clone())
+            Some((options.identifier.clone(), None))
         }
-        Some(DiagnosticServerCapabilities::RegistrationOptions(options)) => options
-            .diagnostic_options
-            .workspace_diagnostics
-            .then(|| options.diagnostic_options.identifier.clone()),
+        Some(DiagnosticServerCapabilities::RegistrationOptions(options)) => {
+            options.diagnostic_options.workspace_diagnostics.then(|| {
+                (
+                    options.diagnostic_options.identifier.clone(),
+                    normalize_document_selector(
+                        options
+                            .text_document_registration_options
+                            .document_selector
+                            .clone(),
+                    ),
+                )
+            })
+        }
         _ => None,
     }
 }
 
-fn dynamic_workspace_diagnostic_identifier(registration: &Registration) -> Option<Option<String>> {
+fn dynamic_workspace_diagnostic_options(
+    registration: &Registration,
+) -> Option<(Option<String>, Option<Vec<String>>)> {
     let options: DiagnosticRegistrationOptions =
         serde_json::from_value(registration.register_options.clone()?).ok()?;
-    options
-        .diagnostic_options
-        .workspace_diagnostics
-        .then_some(options.diagnostic_options.identifier)
+    options.diagnostic_options.workspace_diagnostics.then(|| {
+        let selector = normalize_document_selector(
+            options.text_document_registration_options.document_selector,
+        );
+        (options.diagnostic_options.identifier, selector)
+    })
 }
 
 fn diagnostic_providers_from_registrations<'a>(
     handle: &ConnectionHandle,
     registrations: impl Iterator<Item = &'a Registration>,
 ) -> Vec<DiagnosticProvider> {
-    let mut providers = static_workspace_diagnostic_identifier(handle)
-        .map(|identifier| DiagnosticProvider {
+    let mut providers = static_workspace_diagnostic_options(handle)
+        .map(|(identifier, document_selector)| DiagnosticProvider {
             identifier,
             has_static_provider: true,
+            static_document_selector: document_selector,
             dynamic_registration_ids: Vec::new(),
-            dynamic_registration_options: Vec::new(),
+            dynamic_document_selectors: Vec::new(),
         })
         .into_iter()
         .collect::<Vec<_>>();
@@ -304,11 +336,11 @@ fn diagnostic_providers_from_registrations<'a>(
         .collect::<Vec<_>>();
     registrations.sort_by(|left, right| left.id.cmp(&right.id));
     for registration in registrations {
-        let Some(identifier) = dynamic_workspace_diagnostic_identifier(registration) else {
+        let Some((identifier, document_selector)) =
+            dynamic_workspace_diagnostic_options(registration)
+        else {
             continue;
         };
-        let registration_options = serde_json::to_string(&registration.register_options)
-            .unwrap_or_else(|_| "null".to_owned());
         if let Some(provider) = providers
             .iter_mut()
             .find(|provider| provider.identifier == identifier)
@@ -316,21 +348,24 @@ fn diagnostic_providers_from_registrations<'a>(
             provider
                 .dynamic_registration_ids
                 .push(registration.id.clone());
-            provider
-                .dynamic_registration_options
-                .push(registration_options);
+            provider.dynamic_document_selectors.push(document_selector);
         } else {
             providers.push(DiagnosticProvider {
                 identifier,
                 has_static_provider: false,
+                static_document_selector: None,
                 dynamic_registration_ids: vec![registration.id.clone()],
-                dynamic_registration_options: vec![registration_options],
+                dynamic_document_selectors: vec![document_selector],
             });
         }
     }
     for provider in &mut providers {
-        provider.dynamic_registration_options.sort();
-        provider.dynamic_registration_options.dedup();
+        provider.dynamic_document_selectors.sort();
+        provider.dynamic_document_selectors.dedup();
+        if provider.dynamic_document_selectors.contains(&None) {
+            provider.dynamic_document_selectors.clear();
+            provider.dynamic_document_selectors.push(None);
+        }
     }
     providers
 }
@@ -1180,8 +1215,11 @@ impl LanguageServerPool {
                 ));
             }
             let static_admitted = provider.has_static_provider
-                && static_workspace_diagnostic_identifier(handle).as_ref()
-                    == Some(&provider.identifier);
+                && static_workspace_diagnostic_options(handle)
+                    == Some((
+                        provider.identifier.clone(),
+                        provider.static_document_selector.clone(),
+                    ));
             let admitted = if static_admitted {
                 Some(handle.send_request(request, request_id))
             } else {
@@ -1192,8 +1230,9 @@ impl LanguageServerPool {
                         registrations
                             .iter()
                             .any(|registration| {
-                                dynamic_workspace_diagnostic_identifier(registration).as_ref()
-                                    == Some(&provider.identifier)
+                                dynamic_workspace_diagnostic_options(registration).is_some_and(
+                                    |(identifier, _)| identifier == provider.identifier,
+                                )
                             })
                             .then(|| handle.send_request(request, request_id))
                     },
@@ -2755,29 +2794,33 @@ mod tests {
                 DiagnosticProvider {
                     identifier: Some("static".into()),
                     has_static_provider: true,
+                    static_document_selector: providers[0].static_document_selector.clone(),
                     dynamic_registration_ids: vec!["static-registration".into()],
-                    dynamic_registration_options: providers[0].dynamic_registration_options.clone(),
+                    dynamic_document_selectors: providers[0].dynamic_document_selectors.clone(),
                 },
                 DiagnosticProvider {
                     identifier: Some("alpha".into()),
                     has_static_provider: false,
+                    static_document_selector: providers[1].static_document_selector.clone(),
                     dynamic_registration_ids: vec!["a-registration".into()],
-                    dynamic_registration_options: providers[1].dynamic_registration_options.clone(),
+                    dynamic_document_selectors: providers[1].dynamic_document_selectors.clone(),
                 },
                 DiagnosticProvider {
                     identifier: None,
                     has_static_provider: false,
+                    static_document_selector: providers[2].static_document_selector.clone(),
                     dynamic_registration_ids: vec![
                         "no-identifier-a".into(),
                         "no-identifier-z".into()
                     ],
-                    dynamic_registration_options: providers[2].dynamic_registration_options.clone(),
+                    dynamic_document_selectors: providers[2].dynamic_document_selectors.clone(),
                 },
                 DiagnosticProvider {
                     identifier: Some("zeta".into()),
                     has_static_provider: false,
+                    static_document_selector: providers[3].static_document_selector.clone(),
                     dynamic_registration_ids: vec!["z-registration".into()],
-                    dynamic_registration_options: providers[3].dynamic_registration_options.clone(),
+                    dynamic_document_selectors: providers[3].dynamic_document_selectors.clone(),
                 },
             ]
         );
@@ -2827,8 +2870,9 @@ mod tests {
             vec![DiagnosticProvider {
                 identifier: Some("dynamic".into()),
                 has_static_provider: false,
+                static_document_selector: providers[0].static_document_selector.clone(),
                 dynamic_registration_ids: vec!["dynamic".into()],
-                dynamic_registration_options: providers[0].dynamic_registration_options.clone(),
+                dynamic_document_selectors: providers[0].dynamic_document_selectors.clone(),
             }]
         );
     }
@@ -2840,26 +2884,62 @@ mod tests {
             ConnectionKey::for_server("diagnostics"),
         )
         .await;
+        let equivalent_rust_handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("diagnostics"),
+        )
+        .await;
         let markdown_handle = create_handle_with_key(
             ConnectionState::Ready,
             ConnectionKey::for_server("diagnostics"),
         )
         .await;
-        for (handle, language) in [(&rust_handle, "rust"), (&markdown_handle, "markdown")] {
-            handle.dynamic_capabilities().register(vec![Registration {
-                id: "dynamic".into(),
-                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
-                register_options: Some(serde_json::json!({
-                    "documentSelector": [{ "language": language }],
+        for (handle, options) in [
+            (
+                &rust_handle,
+                serde_json::json!({
+                    "documentSelector": [{ "language": "rust" }, { "scheme": "file" }],
+                    "identifier": "shared",
+                    "workspaceDiagnostics": true,
+                    "interFileDependencies": true,
+                    "extensionField": "alpha"
+                }),
+            ),
+            (
+                &equivalent_rust_handle,
+                serde_json::json!({
+                    "documentSelector": [{ "scheme": "file" }, { "language": "rust" }],
+                    "identifier": "shared",
+                    "workspaceDiagnostics": true,
+                    "interFileDependencies": false,
+                    "extensionField": null
+                }),
+            ),
+            (
+                &markdown_handle,
+                serde_json::json!({
+                    "documentSelector": [{ "language": "markdown" }],
                     "identifier": "shared",
                     "workspaceDiagnostics": true,
                     "interFileDependencies": true
-                })),
+                }),
+            ),
+        ] {
+            handle.dynamic_capabilities().register(vec![Registration {
+                id: "dynamic".into(),
+                method: DIAGNOSTIC_REGISTRATION_METHOD.into(),
+                register_options: Some(options),
             }]);
         }
 
         let rust_provider = diagnostic_providers(&rust_handle).remove(0);
+        let equivalent_rust_provider = diagnostic_providers(&equivalent_rust_handle).remove(0);
         let markdown_provider = diagnostic_providers(&markdown_handle).remove(0);
+        assert_eq!(
+            rust_provider.reconciliation_key(),
+            equivalent_rust_provider.reconciliation_key(),
+            "selector order and non-applicability options must not split equivalent providers"
+        );
         assert_ne!(
             rust_provider.reconciliation_key(),
             markdown_provider.reconciliation_key(),
@@ -2906,14 +2986,16 @@ mod tests {
                 DiagnosticProvider {
                     identifier: Some("alpha".into()),
                     has_static_provider: false,
+                    static_document_selector: providers[0].static_document_selector.clone(),
                     dynamic_registration_ids: vec!["alpha".into()],
-                    dynamic_registration_options: providers[0].dynamic_registration_options.clone(),
+                    dynamic_document_selectors: providers[0].dynamic_document_selectors.clone(),
                 },
                 DiagnosticProvider {
                     identifier: Some("beta".into()),
                     has_static_provider: false,
+                    static_document_selector: providers[1].static_document_selector.clone(),
                     dynamic_registration_ids: vec!["beta".into()],
-                    dynamic_registration_options: providers[1].dynamic_registration_options.clone(),
+                    dynamic_document_selectors: providers[1].dynamic_document_selectors.clone(),
                 },
             ]
         );
@@ -3188,8 +3270,9 @@ mod tests {
                     DiagnosticProvider {
                         identifier: None,
                         has_static_provider: true,
+                        static_document_selector: None,
                         dynamic_registration_ids: vec![],
-                        dynamic_registration_options: vec![],
+                        dynamic_document_selectors: vec![],
                     },
                     None,
                     None,
@@ -3239,8 +3322,9 @@ mod tests {
                     DiagnosticProvider {
                         identifier: None,
                         has_static_provider: true,
+                        static_document_selector: None,
                         dynamic_registration_ids: vec![],
-                        dynamic_registration_options: vec![],
+                        dynamic_document_selectors: vec![],
                     },
                     None,
                     None,
@@ -3361,8 +3445,9 @@ mod tests {
                     DiagnosticProvider {
                         identifier: None,
                         has_static_provider: true,
+                        static_document_selector: None,
                         dynamic_registration_ids: vec![],
-                        dynamic_registration_options: vec![],
+                        dynamic_document_selectors: vec![],
                     },
                     Some(&admit),
                     None,
