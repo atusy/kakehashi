@@ -449,6 +449,10 @@ impl Kakehashi {
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let settings_generation = self.settings_manager.settings_generation();
         let native_enabled = self.semantic_tokens_full_includes_native(&uri);
+        let virtual_enabled = self.document_language(&uri).is_some_and(|language| {
+            self.resolve_layer_config(&language, METHOD)
+                .allows(LayerSource::Virt)
+        });
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
         // supersession, and cancellation contract. A current snapshot makes
@@ -457,7 +461,12 @@ impl Kakehashi {
         // incarnation/content version through fan-out and revalidates that
         // identity before returning.
         let Some(native_layer) = self
-            .semantic_tokens_full_native_layer(params, &mut cancel_rx, tracking, native_enabled)
+            .semantic_tokens_full_native_layer(
+                params,
+                &mut cancel_rx,
+                tracking,
+                native_enabled || virtual_enabled,
+            )
             .await?
         else {
             return Ok(None);
@@ -468,6 +477,14 @@ impl Kakehashi {
         let generation = native_layer.generation;
         let native_tokens = native_layer.tokens;
         let snapshot = native_layer.snapshot;
+        if virtual_enabled && snapshot.is_none() {
+            // An unparsed virtual layer is pending work, not an authoritative
+            // empty overlay. Register interest so parse settlement re-drives
+            // the client, and preserve its previous tokens until then.
+            self.cache.record_served_semantic_version(&uri, 0);
+            request_guard.finish();
+            return Err(crate::error::content_modified_error());
+        }
         let Some(live_identity) = self
             .documents
             .get(&uri)
@@ -2613,8 +2630,9 @@ mod tests {
         )
         .await
         .expect("virtual discovery must stop at the first-parse backstop")
-        .expect("semantic tokens full should return without error");
-        assert!(result.is_none(), "no host server is configured: {result:?}");
+        .expect_err("pending virtual discovery must preserve the previous overlay");
+        assert_eq!(result.code, crate::error::content_modified_error().code);
+        assert_eq!(server.cache.served_semantic_version(&uri), Some(0));
     }
 
     #[tokio::test(start_paused = true)]
