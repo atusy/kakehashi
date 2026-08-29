@@ -2745,10 +2745,11 @@ impl LanguageServerPool {
     /// Acquire one producer for a document-free client-workspace request.
     ///
     /// A `preferSharedInstance` connection may have been initialized from the
-    /// first document's marker root. If it cannot follow workspace-folder
-    /// changes, reusing it would make workspace-wide results depend on document
-    /// open history. Use the client-root fallback in that case; a capable shared
-    /// producer still remains the preferred single process.
+    /// first document's marker root. Reusing it would make workspace-wide
+    /// results depend on document open history unless its existing folder set
+    /// exactly serves the client workspace. Probe it without announcing client
+    /// roots; a rejected producer must not be widened as a side effect of a
+    /// document-free request.
     pub(super) async fn get_or_create_workspace_connection_wait_ready_admitted(
         &self,
         server_name: &str,
@@ -2764,15 +2765,29 @@ impl LanguageServerPool {
             ));
         }
         let start = std::time::Instant::now();
-        let handle = self
-            .get_or_create_connection_wait_ready_admitted(
+        let handle = if server_config.prefers_shared_instance() {
+            self.acquire_resolved_wait_ready(
+                server_name,
+                server_config,
+                ConnectionKey::shared(server_name),
+                None,
+                WaitReadyOptions {
+                    timeout,
+                    rootless: true,
+                    admit: Some(admit),
+                },
+            )
+            .await?
+        } else {
+            self.get_or_create_connection_wait_ready_admitted(
                 server_name,
                 server_config,
                 None,
                 timeout,
                 admit,
             )
-            .await?;
+            .await?
+        };
         let handle = if !handle.key().is_shared() || self.shared_serves_client_workspace(&handle) {
             handle
         } else {
