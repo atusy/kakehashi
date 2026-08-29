@@ -682,8 +682,27 @@ impl Kakehashi {
         let actionable_virtual = if virtual_enabled {
             match document_language.as_deref() {
                 Some(language) => {
-                    self.semantic_tokens_full_has_potential_virtual_producer(&uri, language)
-                        .await
+                    let probe =
+                        self.semantic_tokens_full_has_potential_virtual_producer(&uri, language);
+                    match (cancel_rx.as_mut(), supersession.as_ref()) {
+                        (Some(cancel_rx), Some(supersession)) => tokio::select! {
+                            biased;
+                            _ = cancel_rx => return Err(Error::request_cancelled()),
+                            _ = supersession.cancelled() => return Ok(None),
+                            actionable = probe => actionable,
+                        },
+                        (Some(cancel_rx), None) => tokio::select! {
+                            biased;
+                            _ = cancel_rx => return Err(Error::request_cancelled()),
+                            actionable = probe => actionable,
+                        },
+                        (None, Some(supersession)) => tokio::select! {
+                            biased;
+                            _ = supersession.cancelled() => return Ok(None),
+                            actionable = probe => actionable,
+                        },
+                        (None, None) => probe.await,
+                    }
                 }
                 None => false,
             }
