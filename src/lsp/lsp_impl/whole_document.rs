@@ -75,6 +75,7 @@ impl Kakehashi {
         expected_snapshot: Option<WholeDocumentSnapshotIdentity>,
         bridge_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
         bridge_succeeded: Option<Arc<std::sync::atomic::AtomicBool>>,
+        virt_work_selected: Option<Arc<std::sync::atomic::AtomicBool>>,
         require_all_layers: bool,
         preserve_empty: bool,
         nested_regions_first: bool,
@@ -285,6 +286,9 @@ impl Kakehashi {
                 );
                 if !request_selects_servers(&agg.priorities, &configs, agg.max_fan_out) {
                     continue;
+                }
+                if let Some(selected) = &virt_work_selected {
+                    selected.store(true, std::sync::atomic::Ordering::Release);
                 }
                 let region_ctx = DocumentRequestContext {
                     uri: uri.clone(),

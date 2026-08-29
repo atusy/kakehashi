@@ -183,10 +183,10 @@ struct SemanticDeltaComputation {
 fn should_publish_empty_non_native_result(
     non_native_only: bool,
     virt_only: bool,
-    bridge_attempted: bool,
+    virt_work_selected: bool,
     bridge_succeeded: bool,
 ) -> bool {
-    non_native_only && (bridge_succeeded || (virt_only && !bridge_attempted))
+    non_native_only && (bridge_succeeded || (virt_only && !virt_work_selected))
 }
 
 fn commit_full_baselines(
@@ -647,6 +647,7 @@ impl Kakehashi {
         let virt_bridge_attempted = std::sync::Arc::clone(&bridge_attempted);
         let bridge_succeeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let virt_bridge_succeeded = std::sync::Arc::clone(&bridge_succeeded);
+        let virt_work_selected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let fan_out = async {
             let data = self
@@ -658,6 +659,7 @@ impl Kakehashi {
                     expected,
                     Some(std::sync::Arc::clone(&bridge_attempted)),
                     Some(std::sync::Arc::clone(&bridge_succeeded)),
+                    Some(std::sync::Arc::clone(&virt_work_selected)),
                     true,
                     true,
                     true,
@@ -729,14 +731,14 @@ impl Kakehashi {
                 )
                 .await?;
 
-            let bridge_was_attempted = bridge_attempted.load(std::sync::atomic::Ordering::Acquire);
             let bridge_succeeded = bridge_succeeded.load(std::sync::atomic::Ordering::Acquire);
+            let virt_work_selected = virt_work_selected.load(std::sync::atomic::Ordering::Acquire);
             let data = match data {
                 Some(data) => data,
                 None if should_publish_empty_non_native_result(
                     non_native_only,
                     virt_only,
-                    bridge_was_attempted,
+                    virt_work_selected,
                     bridge_succeeded,
                 ) =>
                 {
