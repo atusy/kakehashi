@@ -1571,9 +1571,20 @@ impl Kakehashi {
                         self.cache.finish_request(&uri, request_id);
                         return Err(Error::request_cancelled());
                     }
+                    _ = cancel_token.cancelled() => {
+                        self.cache.finish_request(&uri, request_id);
+                        return Ok(None);
+                    }
                     applicable = applicability => applicable,
                 },
-                None => applicability.await,
+                None => tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        self.cache.finish_request(&uri, request_id);
+                        return Ok(None);
+                    }
+                    applicable = applicability => applicable,
+                },
             }
         } else {
             false
