@@ -2422,6 +2422,15 @@ impl LanguageServerPool {
         handle: &ConnectionHandle,
         host_uri: &Url,
     ) -> bool {
+        if handle.key().is_workspace()
+            && handle.supports_workspace_folder_changes()
+            && let Some(folders) = handle.workspace_folders().snapshot()
+        {
+            return folders.iter().any(|folder| {
+                Url::parse(folder.uri.as_str())
+                    .is_ok_and(|root| Self::uri_is_within_root(host_uri, &root))
+            });
+        }
         handle
             .key()
             .marker_root()
@@ -6922,6 +6931,34 @@ mod tests {
         );
         assert!(!secondary_revisions.contains_key(&primary_uri));
         assert!(!secondary_revisions.contains_key(&outside_uri));
+
+        let folder_capable_key = ConnectionKey::workspace("folder-lua");
+        let folder_capable = create_handle_advertising_workspace_symbols_with_folder_changes(
+            folder_capable_key.clone(),
+        )
+        .await;
+        record_test_spawn_root(&folder_capable, "file:///workspace/a");
+        folder_capable.workspace_folders().replace(Some(vec![
+            tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///workspace/a".parse().unwrap(),
+                name: "a".to_owned(),
+            },
+            tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///workspace/b".parse().unwrap(),
+                name: "b".to_owned(),
+            },
+        ]));
+        pool.connections()
+            .await
+            .insert(folder_capable_key.clone(), Arc::clone(&folder_capable));
+        pool.open_recorded_workspace_virtual_documents(&folder_capable, &config)
+            .await;
+        let folder_capable_revisions = pool
+            .confirmed_virtual_document_revisions_for_connection(&folder_capable_key)
+            .await;
+        assert!(folder_capable_revisions.contains_key(&primary_uri));
+        assert!(folder_capable_revisions.contains_key(&secondary_uri));
+        assert!(!folder_capable_revisions.contains_key(&outside_uri));
     }
 
     /// Test that ensure_document_opened sends didOpen when document is not yet opened.
