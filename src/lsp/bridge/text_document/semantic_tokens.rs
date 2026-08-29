@@ -336,7 +336,7 @@ fn transform_semantic_tokens_full_response_to_host(
     if result.is_null() {
         return Ok(None);
     }
-    transform_semantic_tokens_result_to_host(
+    transform_semantic_tokens_result_to_host_strict(
         result,
         legend,
         offset,
@@ -345,7 +345,6 @@ fn transform_semantic_tokens_full_response_to_host(
         host_range,
     )
     .map(Some)
-    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid semantic token result"))
 }
 
 pub(crate) fn transform_semantic_tokens_result_to_host(
@@ -356,7 +355,53 @@ pub(crate) fn transform_semantic_tokens_result_to_host(
     virtual_content: &str,
     host_range: Range,
 ) -> Option<SemanticTokens> {
-    let result: SemanticTokensRangeResult = serde_json::from_value(result).ok()?;
+    transform_semantic_tokens_result_to_host_inner(
+        result,
+        legend,
+        offset,
+        region_end,
+        virtual_content,
+        host_range,
+        false,
+    )
+    .ok()
+}
+
+pub(crate) fn transform_semantic_tokens_result_to_host_strict(
+    result: serde_json::Value,
+    legend: &SemanticTokensLegend,
+    offset: &RegionOffset,
+    region_end: Position,
+    virtual_content: &str,
+    host_range: Range,
+) -> io::Result<SemanticTokens> {
+    transform_semantic_tokens_result_to_host_inner(
+        result,
+        legend,
+        offset,
+        region_end,
+        virtual_content,
+        host_range,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transform_semantic_tokens_result_to_host_inner(
+    result: serde_json::Value,
+    legend: &SemanticTokensLegend,
+    offset: &RegionOffset,
+    region_end: Position,
+    virtual_content: &str,
+    host_range: Range,
+    reject_invalid_coordinates: bool,
+) -> io::Result<SemanticTokens> {
+    let result: SemanticTokensRangeResult = serde_json::from_value(result).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid semantic token result: {error}"),
+        )
+    })?;
     let data = match result {
         SemanticTokensRangeResult::Tokens(tokens) => tokens.data,
         SemanticTokensRangeResult::Partial(partial) => partial.data,
@@ -367,9 +412,13 @@ pub(crate) fn transform_semantic_tokens_result_to_host(
     let mut host_tokens = Vec::with_capacity(data.len());
 
     for token in data {
-        absolute_line = absolute_line.checked_add(token.delta_line)?;
+        absolute_line = absolute_line.checked_add(token.delta_line).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "semantic token line overflow")
+        })?;
         absolute_start = if token.delta_line == 0 {
-            absolute_start.checked_add(token.delta_start)?
+            absolute_start.checked_add(token.delta_start).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "semantic token column overflow")
+            })?
         } else {
             token.delta_start
         };
@@ -377,10 +426,21 @@ pub(crate) fn transform_semantic_tokens_result_to_host(
         if token.length == 0 {
             continue;
         }
-        let end = Position::new(absolute_line, absolute_start.checked_add(token.length)?);
+        let end = Position::new(
+            absolute_line,
+            absolute_start.checked_add(token.length).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "semantic token length overflow")
+            })?,
+        );
         if mapper.position_to_byte_strict(start).is_none()
             || mapper.position_to_byte_strict(end).is_none()
         {
+            if reject_invalid_coordinates {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "semantic token position is outside the document",
+                ));
+            }
             continue;
         }
         let Some(token_type) = remap_token_type(token.token_type, legend) else {
@@ -405,7 +465,7 @@ pub(crate) fn transform_semantic_tokens_result_to_host(
         result_id: None,
         data: encode_absolute_tokens(host_tokens),
     };
-    Some(filter_semantic_tokens_by_range(&tokens, &host_range))
+    Ok(filter_semantic_tokens_by_range(&tokens, &host_range))
 }
 
 fn remap_token_type(index: u32, legend: &SemanticTokensLegend) -> Option<u32> {
@@ -752,6 +812,13 @@ mod tests {
                 .is_some()
         );
         assert!(transform(json!({ "result": { "data": "bad" } })).is_err());
+        assert!(
+            transform(json!({
+                "result": { "data": [0, 5, 1, 0, 0] }
+            }))
+            .is_err(),
+            "a non-empty response outside the virtual document is not a valid empty result"
+        );
         assert!(
             transform(json!({
                 "error": { "code": -32603, "message": "failed" }
