@@ -509,7 +509,6 @@ where
                 Box::pin(async move {
                     if let Some((forwarder, upstream_id, mut cancel_rx)) = cancellation {
                         tokio::select! {
-                            _ = gate.wait_turn() => {}
                             _ = &mut cancel_rx => {
                                 forwarder.unsubscribe(&upstream_id);
                                 drop(inner_fut);
@@ -521,6 +520,7 @@ where
                                     )
                                 }));
                             }
+                            _ = gate.wait_turn() => {}
                         }
                         forwarder.unsubscribe(&upstream_id);
                     } else {
@@ -1236,17 +1236,20 @@ mod tests {
         .await
         .unwrap();
 
+        // Make the predecessor and cancellation ready before polling the
+        // queued request again. The biased handoff must retain cancellation.
+        release_tx.send(()).expect("first pull is waiting");
+        assert!(first.poll().is_ready());
+        tokio::task::yield_now().await;
+
         let Poll::Ready(Ok(Some(response))) = second.poll() else {
-            panic!("the cancelled request must retire without waiting for its predecessor");
+            panic!("the cancelled request must win a simultaneous gate handoff");
         };
         assert_eq!(response.id(), &tower_lsp_server::jsonrpc::Id::Number(2));
         assert_eq!(
             response.error().expect("request must fail").code,
             tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled
         );
-
-        release_tx.send(()).expect("first pull is waiting");
-        assert!(first.poll().is_ready());
     }
 
     #[tokio::test]
