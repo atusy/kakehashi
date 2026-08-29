@@ -457,7 +457,7 @@ impl Kakehashi {
         let actionable_virtual = if virtual_enabled {
             match document_language.as_deref() {
                 Some(language) => {
-                    self.semantic_tokens_full_has_potential_virtual_producer(language)
+                    self.semantic_tokens_full_has_potential_virtual_producer(&uri, language)
                         .await
                 }
                 None => false,
@@ -1256,6 +1256,7 @@ impl Kakehashi {
 
     async fn semantic_tokens_full_has_potential_virtual_producer(
         &self,
+        host_uri: &Url,
         host_language: &str,
     ) -> bool {
         const METHOD: &str = "textDocument/semanticTokens/full";
@@ -1304,15 +1305,27 @@ impl Kakehashi {
                 Some((configs, aggregation))
             })
             .collect::<Vec<_>>();
-        let server_names = plans
-            .iter()
-            .flat_map(|(configs, _)| configs.iter().map(|config| config.server_name.as_str()))
-            .collect::<std::collections::HashSet<_>>();
-        let incapable = self
-            .bridge
-            .pool()
-            .servers_known_incapable(&server_names, METHOD)
-            .await;
+        let pool = self.bridge.pool();
+        let mut incapable = std::collections::HashSet::new();
+        let mut incapable_by_connection = std::collections::HashMap::new();
+        for (configs, _) in &plans {
+            for config in configs {
+                let key = pool
+                    .resolved_connection_key(&config.server_name, &config.config, host_uri)
+                    .await;
+                let known_incapable = match incapable_by_connection.get(&key) {
+                    Some(known_incapable) => *known_incapable,
+                    None => {
+                        let known_incapable = pool.connection_known_incapable(&key, METHOD).await;
+                        incapable_by_connection.insert(key, known_incapable);
+                        known_incapable
+                    }
+                };
+                if known_incapable {
+                    incapable.insert(config.server_name.clone());
+                }
+            }
+        }
         plans.into_iter().any(|(configs, aggregation)| {
             semantic_region_selects_servers(
                 true,
@@ -1494,7 +1507,7 @@ impl Kakehashi {
                     .resolve_layer_config(language, "textDocument/semanticTokens/full")
                     .allows(LayerSource::Virt) =>
             {
-                self.semantic_tokens_full_has_potential_virtual_producer(language)
+                self.semantic_tokens_full_has_potential_virtual_producer(&uri, language)
                     .await
             }
             _ => false,
@@ -2896,13 +2909,12 @@ mod tests {
                 .bridge_configs_for_injection_language("rust", "html")
                 .is_empty()
         );
+        let uri = Url::parse("file:///semantic_delta_treeless.rs").expect("valid test URI");
         assert!(
             server
-                .semantic_tokens_full_has_potential_virtual_producer("rust")
+                .semantic_tokens_full_has_potential_virtual_producer(&uri, "rust")
                 .await
         );
-
-        let uri = Url::parse("file:///semantic_delta_treeless.rs").expect("valid test URI");
         server.documents.insert(
             uri.clone(),
             "let html = \"<div>\";".to_string(),
