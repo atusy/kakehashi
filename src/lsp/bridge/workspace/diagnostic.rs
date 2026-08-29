@@ -391,7 +391,7 @@ impl NormalizedDocumentFilter {
         if self
             .scheme
             .as_deref()
-            .is_some_and(|expected| uri.scheme() != expected)
+            .is_some_and(|expected| !uri.scheme().eq_ignore_ascii_case(expected))
         {
             return false;
         }
@@ -3436,6 +3436,18 @@ mod tests {
 
         assert!(filter.applies_to("file:///workspace/nested/main.rs", Some("rust")));
         assert!(!filter.applies_to("file:///workspace/nested/deeper/main.rs", Some("rust")));
+    }
+
+    #[test]
+    fn document_selector_scheme_is_ascii_case_insensitive() {
+        let filter = NormalizedDocumentFilter {
+            language: None,
+            scheme: Some("FILE".into()),
+            pattern: None,
+            pattern_base_uri: None,
+        };
+
+        assert!(filter.applies_to("file:///workspace/main.rs", None));
     }
 
     #[test]
