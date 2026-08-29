@@ -61,15 +61,26 @@ impl Kakehashi {
             return Ok(None);
         }
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        let documents = std::sync::Arc::clone(&self.documents);
         let fan_in = dispatch_host_preferred(
             &ctx,
             self.bridge.pool_arc(),
             move |t: HostFanOutTask| {
                 let params = raw_params.clone();
+                let documents = std::sync::Arc::clone(&documents);
                 async move {
+                    let host_uri = t.uri.clone();
+                    let revision_text_reader: crate::lsp::bridge::HostTextReader =
+                        std::sync::Arc::new(move || {
+                            documents.get(&host_uri).and_then(|document| {
+                                (document.incarnation() == incarnation
+                                    && document.content_version() == content_version)
+                                    .then(|| document.text_arc())
+                            })
+                        });
                     let raw = t
                         .pool
-                        .send_host_raw_request_for_incarnation(
+                        .send_host_raw_request_for_revision(
                             &t.server_name,
                             &t.server_config,
                             &HostDocument {
@@ -81,6 +92,7 @@ impl Kakehashi {
                             params,
                             t.upstream_id,
                             incarnation,
+                            revision_text_reader,
                         )
                         .await?;
                     Ok(raw
