@@ -2420,7 +2420,7 @@ impl LanguageServerPool {
                     .is_ok_and(|root| Self::uri_is_within_root(host_uri, &root))
             });
         }
-        self.root_uri().is_none_or(|root| {
+        self.root_uri().is_some_and(|root| {
             Url::parse(&root).is_ok_and(|root| Self::uri_is_within_root(host_uri, &root))
         })
     }
@@ -6981,6 +6981,14 @@ mod tests {
         let literal = Url::parse("file:///workspace/~project").unwrap();
 
         assert!(LanguageServerPool::uri_is_within_root(&encoded, &literal));
+    }
+
+    #[test]
+    fn rootless_workspace_producer_does_not_claim_cached_hosts() {
+        let pool = LanguageServerPool::new();
+        let host = Url::parse("file:///workspace/doc.md").unwrap();
+
+        assert!(!pool.host_is_in_client_workspace(&host));
     }
 
     #[tokio::test]
