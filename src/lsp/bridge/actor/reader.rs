@@ -2234,7 +2234,7 @@ mod tests {
             upstream_rx.try_recv().is_err(),
             "the retry event must not overtake the registration acknowledgement"
         );
-        dynamic_capabilities.mark_workspace_diagnostic_pull_aborted();
+        dynamic_capabilities.mark_workspace_diagnostic_pull_aborted(true);
         let _blocker = response_rx.recv().await.expect("prefilled blocker");
         assert!(futures::poll!(handling.as_mut()).is_ready());
         let ack = response_rx.recv().await.expect("registration ack");
