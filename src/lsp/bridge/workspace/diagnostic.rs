@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
     DiagnosticRegistrationOptions, DiagnosticServerCapabilities, Registration,
@@ -39,13 +40,28 @@ fn workspace_diagnostic_cancel(request_id: RequestId) -> JsonRpcNotification<Val
     )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct NormalizedDocumentFilter {
+    language: Option<String>,
+    scheme: Option<String>,
+    pattern: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DiagnosticProvider {
     identifier: Option<String>,
     has_static_provider: bool,
-    static_document_selector: Option<Vec<String>>,
+    static_document_selector: Option<Vec<NormalizedDocumentFilter>>,
     dynamic_registration_ids: Vec<String>,
-    dynamic_document_selectors: Vec<Option<Vec<String>>>,
+    dynamic_document_selectors: Vec<Option<Vec<NormalizedDocumentFilter>>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DiagnosticProviderScope {
+    identifier: Option<String>,
+    has_static_provider: bool,
+    static_document_selector: Option<Vec<NormalizedDocumentFilter>>,
+    dynamic_document_selectors: Vec<Option<Vec<NormalizedDocumentFilter>>>,
 }
 
 struct CompletedDiagnosticProducer {
@@ -92,11 +108,20 @@ struct RootedDiagnosticReport {
 fn reconcile_overlapping_root_reports(
     reports: impl IntoIterator<Item = RootedDiagnosticReport>,
 ) -> Vec<WorkspaceDiagnosticReport> {
-    reconcile_overlapping_root_reports_with_observer(reports, |_, _, _| {})
+    reconcile_overlapping_root_reports_with_language(reports, |_| None, |_, _, _| {})
 }
 
+#[cfg(test)]
 fn reconcile_overlapping_root_reports_with_observer(
     reports: impl IntoIterator<Item = RootedDiagnosticReport>,
+    on_contributing: impl FnMut(&str, Option<&str>, Option<&WorkspaceDocumentDiagnosticReport>),
+) -> Vec<WorkspaceDiagnosticReport> {
+    reconcile_overlapping_root_reports_with_language(reports, |_| None, on_contributing)
+}
+
+fn reconcile_overlapping_root_reports_with_language(
+    reports: impl IntoIterator<Item = RootedDiagnosticReport>,
+    language_for_uri: impl Fn(&str) -> Option<String>,
     mut on_contributing: impl FnMut(&str, Option<&str>, Option<&WorkspaceDocumentDiagnosticReport>),
 ) -> Vec<WorkspaceDiagnosticReport> {
     struct RootedDiagnosticItem {
@@ -134,6 +159,37 @@ fn reconcile_overlapping_root_reports_with_observer(
             .then_some(root_segments.len())
     }
 
+    fn provider_identities_for_uri(
+        encoded_providers: &[Option<String>],
+        uri: &str,
+        language: Option<&str>,
+    ) -> Vec<Option<String>> {
+        let mut identities = encoded_providers
+            .iter()
+            .filter_map(|encoded| match encoded {
+                None => Some(None),
+                Some(encoded) => match serde_json::from_str::<DiagnosticProviderScope>(encoded) {
+                    Ok(scope) => scope.applies_to(uri, language).then_some(scope.identifier),
+                    // Unit-level callers and legacy combined reports may carry
+                    // an already-canonical provider identifier.
+                    Err(_) => Some(Some(encoded.clone())),
+                },
+            })
+            .collect::<Vec<_>>();
+        identities.sort();
+        identities.dedup();
+        if identities.is_empty() {
+            // Unknown/non-matching language information must not collapse
+            // unrelated selector scopes into one empty identity. Retain the
+            // exact scope as a conservative fallback; a later URI with a
+            // resolved language can still reconcile partially overlapping
+            // selectors by provider identifier.
+            encoded_providers.to_vec()
+        } else {
+            identities
+        }
+    }
+
     let reports = reports
         .into_iter()
         .map(|report| {
@@ -150,9 +206,12 @@ fn reconcile_overlapping_root_reports_with_observer(
     for (report, _) in &reports {
         for item in &report.report.items {
             let uri = item_uri(item);
+            let language = language_for_uri(uri);
+            let provider_identities =
+                provider_identities_for_uri(&report.provider_identifiers, uri, language.as_deref());
             let key = (
                 report.server.clone(),
-                report.provider_identifiers.clone(),
+                provider_identities.clone(),
                 uri.to_owned(),
             );
             // Coverage belongs to every matching producer, including one that
@@ -160,7 +219,11 @@ fn reconcile_overlapping_root_reports_with_observer(
             // report cannot suppress a stale parent-root diagnostic.
             for (producer, reported_uris) in reports.iter().filter(|(producer, _)| {
                 producer.server == report.server
-                    && producer.provider_identifiers == report.provider_identifiers
+                    && provider_identities_for_uri(
+                        &producer.provider_identifiers,
+                        uri,
+                        language.as_deref(),
+                    ) == provider_identities
             }) {
                 let containing_depth = containing_root_depth(producer.spawn_root.as_deref(), uri);
                 let producer_reported_uri = reported_uris.contains(uri);
@@ -187,11 +250,12 @@ fn reconcile_overlapping_root_reports_with_observer(
     for (report, _) in &reports {
         for item in &report.report.items {
             let uri = item_uri(item);
-            let Some((_, _, preferred_root)) = preferred_roots.get(&(
-                report.server.clone(),
-                report.provider_identifiers.clone(),
-                uri.to_owned(),
-            )) else {
+            let language = language_for_uri(uri);
+            let provider_identities =
+                provider_identities_for_uri(&report.provider_identifiers, uri, language.as_deref());
+            let Some((_, _, preferred_root)) =
+                preferred_roots.get(&(report.server.clone(), provider_identities, uri.to_owned()))
+            else {
                 continue;
             };
             if report.spawn_root.as_deref().unwrap_or_default() != preferred_root
@@ -220,12 +284,11 @@ fn reconcile_overlapping_root_reports_with_observer(
         })
         .filter(|item| {
             let uri = item_uri(&item.item);
+            let language = language_for_uri(uri);
+            let provider_identities =
+                provider_identities_for_uri(&item.provider_identifiers, uri, language.as_deref());
             preferred_roots
-                .get(&(
-                    item.server.clone(),
-                    item.provider_identifiers.clone(),
-                    uri.to_owned(),
-                ))
+                .get(&(item.server.clone(), provider_identities, uri.to_owned()))
                 .is_none_or(|(_, _, root)| item.spawn_root.as_deref().unwrap_or_default() == root)
         })
         .map(|item| {
@@ -255,25 +318,76 @@ impl DiagnosticProvider {
     }
 
     fn reconciliation_key(&self) -> Option<String> {
-        serde_json::to_string(&(
-            &self.identifier,
-            self.has_static_provider,
-            &self.static_document_selector,
-            &self.dynamic_document_selectors,
-        ))
+        serde_json::to_string(&DiagnosticProviderScope {
+            identifier: self.identifier.clone(),
+            has_static_provider: self.has_static_provider,
+            static_document_selector: self.static_document_selector.clone(),
+            dynamic_document_selectors: self.dynamic_document_selectors.clone(),
+        })
         .ok()
+    }
+}
+
+impl DiagnosticProviderScope {
+    fn applies_to(&self, uri: &str, language: Option<&str>) -> bool {
+        let selector_applies = |selector: &Option<Vec<NormalizedDocumentFilter>>| {
+            selector.as_ref().is_none_or(|filters| {
+                filters
+                    .iter()
+                    .any(|filter| filter.applies_to(uri, language))
+            })
+        };
+        (self.has_static_provider && selector_applies(&self.static_document_selector))
+            || self.dynamic_document_selectors.iter().any(selector_applies)
+    }
+}
+
+impl NormalizedDocumentFilter {
+    fn applies_to(&self, uri: &str, language: Option<&str>) -> bool {
+        let Ok(uri) = url::Url::parse(uri) else {
+            return false;
+        };
+        if self
+            .language
+            .as_deref()
+            .is_some_and(|expected| language != Some(expected))
+        {
+            return false;
+        }
+        if self
+            .scheme
+            .as_deref()
+            .is_some_and(|expected| uri.scheme() != expected)
+        {
+            return false;
+        }
+        self.pattern.as_deref().is_none_or(|pattern| {
+            globset::Glob::new(pattern)
+                .map(|glob| glob.compile_matcher().is_match(uri.path()))
+                .unwrap_or(false)
+        })
     }
 }
 
 fn normalize_document_selector(
     selector: Option<tower_lsp_server::ls_types::DocumentSelector>,
-) -> Option<Vec<String>> {
+) -> Option<Vec<NormalizedDocumentFilter>> {
     selector.map(|selector| {
         let mut filters = selector
             .into_iter()
-            .filter_map(|filter| serde_json::to_string(&filter).ok())
+            .map(|filter| NormalizedDocumentFilter {
+                language: filter.language,
+                scheme: filter.scheme,
+                pattern: filter.pattern,
+            })
             .collect::<Vec<_>>();
-        filters.sort();
+        filters.sort_by(|left, right| {
+            (&left.language, &left.scheme, &left.pattern).cmp(&(
+                &right.language,
+                &right.scheme,
+                &right.pattern,
+            ))
+        });
         filters.dedup();
         filters
     })
@@ -281,7 +395,7 @@ fn normalize_document_selector(
 
 fn static_workspace_diagnostic_options(
     handle: &ConnectionHandle,
-) -> Option<(Option<String>, Option<Vec<String>>)> {
+) -> Option<(Option<String>, Option<Vec<NormalizedDocumentFilter>>)> {
     match handle
         .server_capabilities()
         .and_then(|capabilities| capabilities.diagnostic_provider.as_ref())
@@ -308,7 +422,7 @@ fn static_workspace_diagnostic_options(
 
 fn dynamic_workspace_diagnostic_options(
     registration: &Registration,
-) -> Option<(Option<String>, Option<Vec<String>>)> {
+) -> Option<(Option<String>, Option<Vec<NormalizedDocumentFilter>>)> {
     let options: DiagnosticRegistrationOptions =
         serde_json::from_value(registration.register_options.clone()?).ok()?;
     options.diagnostic_options.workspace_diagnostics.then(|| {
@@ -712,7 +826,7 @@ impl LanguageServerPool {
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| io::Error::other("workspace diagnostic producer set was incomplete"))?;
-        self.aggregate_admitted_completed_workspace_diagnostic_reports(reports, admit)
+        self.aggregate_admitted_completed_workspace_diagnostic_reports(reports, admit, &|_| None)
             .await
     }
 
@@ -720,6 +834,7 @@ impl LanguageServerPool {
         &self,
         reports: impl IntoIterator<Item = CompletedDiagnosticProducer>,
         admit: &(dyn Fn() -> bool + Sync),
+        language_for_uri: &(dyn Fn(&str) -> Option<String> + Sync),
     ) -> io::Result<WorkspaceDiagnosticReportResult> {
         let connections = self.connections().await;
         if !admit() {
@@ -834,8 +949,9 @@ impl LanguageServerPool {
             }
         });
         let mut contributing_producers = HashSet::<(String, Option<String>)>::new();
-        let reports = reconcile_overlapping_root_reports_with_observer(
+        let reports = reconcile_overlapping_root_reports_with_language(
             reports,
+            language_for_uri,
             |server, spawn_root, item| {
                 if item.is_none_or(diagnostic_item_has_visible_output) {
                     contributing_producers
@@ -989,6 +1105,7 @@ impl LanguageServerPool {
             admit,
             request_workspace_generation,
             None,
+            &|_| None,
         )
         .await
     }
@@ -1001,6 +1118,7 @@ impl LanguageServerPool {
         admit: &(dyn Fn() -> bool + Sync),
         request_workspace_generation: u64,
         cancel_forwarder: &CancelForwarder,
+        language_for_uri: &(dyn Fn(&str) -> Option<String> + Sync),
     ) -> io::Result<WorkspaceDiagnosticReportResult> {
         self.dispatch_workspace_diagnostic_inner(
             params,
@@ -1009,6 +1127,7 @@ impl LanguageServerPool {
             admit,
             request_workspace_generation,
             Some(cancel_forwarder),
+            language_for_uri,
         )
         .await
     }
@@ -1021,6 +1140,7 @@ impl LanguageServerPool {
         admit: &(dyn Fn() -> bool + Sync),
         request_workspace_generation: u64,
         cancel_forwarder: Option<&CancelForwarder>,
+        language_for_uri: &(dyn Fn(&str) -> Option<String> + Sync),
     ) -> io::Result<WorkspaceDiagnosticReportResult> {
         if request_workspace_generation & 1 != 0 {
             return Err(io::Error::new(
@@ -1169,8 +1289,12 @@ impl LanguageServerPool {
             || admit() && self.workspace_generation() == request_workspace_generation;
         let reports =
             self.collect_completed_workspace_diagnostic_requests(join_all(requests).await)?;
-        self.aggregate_admitted_completed_workspace_diagnostic_reports(reports, &workspace_admit)
-            .await
+        self.aggregate_admitted_completed_workspace_diagnostic_reports(
+            reports,
+            &workspace_admit,
+            language_for_uri,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1938,7 +2062,11 @@ mod tests {
         };
 
         let result = pool
-            .aggregate_admitted_completed_workspace_diagnostic_reports([completed], &|| false)
+            .aggregate_admitted_completed_workspace_diagnostic_reports(
+                [completed],
+                &|| false,
+                &|_| None,
+            )
             .await;
 
         assert!(result.is_err());
@@ -2995,6 +3123,77 @@ mod tests {
             rust_provider.reconciliation_key(),
             markdown_provider.reconciliation_key(),
             "providers with the same identifier but distinct selectors must not suppress each other"
+        );
+    }
+
+    #[test]
+    fn overlapping_provider_selectors_reconcile_per_reported_uri() {
+        let filter = |language: &str| NormalizedDocumentFilter {
+            language: Some(language.to_owned()),
+            scheme: Some("file".to_owned()),
+            pattern: None,
+        };
+        let provider = |languages: &[&str]| DiagnosticProvider {
+            identifier: Some("shared".into()),
+            has_static_provider: false,
+            static_document_selector: None,
+            dynamic_registration_ids: vec!["dynamic".into()],
+            dynamic_document_selectors: vec![Some(
+                languages.iter().map(|language| filter(language)).collect(),
+            )],
+        };
+        let parent = provider(&["rust", "python"])
+            .reconciliation_key()
+            .expect("provider scope should serialize");
+        let child = provider(&["rust"])
+            .reconciliation_key()
+            .expect("provider scope should serialize");
+        let rust_uri = "file:///workspace/nested/main.rs";
+        let python_uri = "file:///workspace/nested/main.py";
+
+        let reports = reconcile_overlapping_root_reports_with_language(
+            [
+                RootedDiagnosticReport {
+                    server: "diagnostics".into(),
+                    spawn_root: Some("file:///workspace".into()),
+                    provider_identifiers: vec![Some(parent)],
+                    report: WorkspaceDiagnosticReport {
+                        items: vec![
+                            full(rust_uri, None, "parent-rust"),
+                            full(python_uri, None, "parent-python"),
+                        ],
+                    },
+                },
+                RootedDiagnosticReport {
+                    server: "diagnostics".into(),
+                    spawn_root: Some("file:///workspace/nested".into()),
+                    provider_identifiers: vec![Some(child)],
+                    report: WorkspaceDiagnosticReport::default(),
+                },
+            ],
+            |uri| {
+                if uri.ends_with(".rs") {
+                    Some("rust".into())
+                } else if uri.ends_with(".py") {
+                    Some("python".into())
+                } else {
+                    None
+                }
+            },
+            |_, _, _| {},
+        );
+
+        let WorkspaceDiagnosticReportResult::Report(report) = aggregate_reports(reports) else {
+            panic!("final report")
+        };
+        assert_eq!(report.items.len(), 1);
+        let WorkspaceDocumentDiagnosticReport::Full(report) = &report.items[0] else {
+            panic!("full report")
+        };
+        assert_eq!(report.uri.as_str(), python_uri);
+        assert_eq!(
+            report.full_document_diagnostic_report.items[0].message,
+            "parent-python"
         );
     }
 
