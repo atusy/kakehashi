@@ -483,6 +483,7 @@ impl LanguageServerPool {
             params,
             upstream_request_id,
             None,
+            None,
         )
         .await
     }
@@ -508,6 +509,32 @@ impl LanguageServerPool {
             params,
             upstream_request_id,
             Some(expected_incarnation),
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_host_raw_request_for_revision(
+        &self,
+        server_name: &str,
+        server_config: &BridgeServerConfig,
+        doc: &HostDocument<'_>,
+        method: &'static str,
+        params: serde_json::Value,
+        upstream_request_id: Option<UpstreamId>,
+        expected_incarnation: u64,
+        revision_text_reader: HostTextReader,
+    ) -> io::Result<Option<HostRawResponse>> {
+        self.send_host_raw_request_inner(
+            server_name,
+            server_config,
+            doc,
+            method,
+            params,
+            upstream_request_id,
+            Some(expected_incarnation),
+            Some(revision_text_reader),
         )
         .await
     }
@@ -522,6 +549,7 @@ impl LanguageServerPool {
         mut params: serde_json::Value,
         upstream_request_id: Option<UpstreamId>,
         expected_incarnation: Option<u64>,
+        revision_text_reader: Option<HostTextReader>,
     ) -> io::Result<Option<HostRawResponse>> {
         strip_progress_tokens(&mut params);
         let handle = self
@@ -542,6 +570,7 @@ impl LanguageServerPool {
                 doc,
                 upstream_request_id,
                 expected_incarnation,
+                revision_text_reader,
                 |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
                 move |response, incarnation, connection_generation| {
                     (
@@ -591,6 +620,7 @@ impl LanguageServerPool {
             handle,
             doc,
             upstream_request_id,
+            None,
             None,
             |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
             // The parser promotes error responses, missing results, and
@@ -674,6 +704,7 @@ impl LanguageServerPool {
                 doc,
                 upstream_request_id,
                 None,
+                None,
                 |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
                 move |response, _incarnation, _connection_generation| {
                     if response_has_jsonrpc_error(&response, method) {
@@ -706,12 +737,14 @@ impl LanguageServerPool {
     /// The skeleton mirrors `execute_bridge_request_with_handle` minus the
     /// virtual URI and the coordinate translation — host responses are the
     /// downstream server's verbatim answer.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_host_request<T, P: serde::Serialize>(
         &self,
         handle: Arc<ConnectionHandle>,
         doc: &HostDocument<'_>,
         upstream_request_id: Option<UpstreamId>,
         expected_incarnation: Option<u64>,
+        revision_text_reader: Option<HostTextReader>,
         build_request: impl FnOnce(RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, u64, u64) -> T,
     ) -> io::Result<T> {
@@ -802,9 +835,36 @@ impl LanguageServerPool {
             }
 
             let mut docs = self.host_documents().await;
+            let revision_text = match revision_text_reader.as_ref() {
+                Some(read) => match read() {
+                    Some(text) => Some(text),
+                    None => {
+                        drop(docs);
+                        drop(connections);
+                        if let Some(ref id) = upstream_request_id {
+                            self.unregister_upstream_request(id, connection_key);
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "host document revision changed before request synchronization",
+                        ));
+                    }
+                },
+                None => None,
+            };
+            let revision_doc = HostDocument {
+                uri: doc.uri,
+                language_id: doc.language_id,
+                text: revision_text
+                    .as_ref()
+                    .map(|(text, _)| &**text)
+                    .unwrap_or(doc.text),
+                revision: doc.revision,
+            };
             let mut sender = ConnectionHandleSender(&handle);
             if let Err(e) =
-                sync_host_document(&mut sender, &mut docs, doc, None, connection_key).await
+                sync_host_document(&mut sender, &mut docs, &revision_doc, None, connection_key)
+                    .await
             {
                 drop(docs);
                 drop(connections);
