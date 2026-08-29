@@ -447,6 +447,7 @@ impl Kakehashi {
         let progress_token = params.work_done_progress_params.work_done_token.clone();
         let upstream_id = current_upstream_id();
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let supersession = tracking.as_ref().map(|(_, cancel)| cancel.clone());
         let settings_generation = self.settings_manager.settings_generation();
         let native_enabled = self.semantic_tokens_full_includes_native(&uri);
         let document_language = self.document_language(&uri);
@@ -457,8 +458,27 @@ impl Kakehashi {
         let actionable_virtual = if virtual_enabled {
             match document_language.as_deref() {
                 Some(language) => {
-                    self.semantic_tokens_full_has_potential_virtual_producer(&uri, language)
-                        .await
+                    let probe =
+                        self.semantic_tokens_full_has_potential_virtual_producer(&uri, language);
+                    match (cancel_rx.as_mut(), supersession.as_ref()) {
+                        (Some(cancel_rx), Some(supersession)) => tokio::select! {
+                            biased;
+                            _ = cancel_rx => return Err(Error::request_cancelled()),
+                            _ = supersession.cancelled() => return Ok(None),
+                            actionable = probe => actionable,
+                        },
+                        (Some(cancel_rx), None) => tokio::select! {
+                            biased;
+                            _ = cancel_rx => return Err(Error::request_cancelled()),
+                            actionable = probe => actionable,
+                        },
+                        (None, Some(supersession)) => tokio::select! {
+                            biased;
+                            _ = supersession.cancelled() => return Ok(None),
+                            actionable = probe => actionable,
+                        },
+                        (None, None) => probe.await,
+                    }
                 }
                 None => false,
             }
@@ -1507,8 +1527,31 @@ impl Kakehashi {
                     .resolve_layer_config(language, "textDocument/semanticTokens/full")
                     .allows(LayerSource::Virt) =>
             {
-                self.semantic_tokens_full_has_potential_virtual_producer(&uri, language)
-                    .await
+                let probe =
+                    self.semantic_tokens_full_has_potential_virtual_producer(&uri, language);
+                match cancel_rx.as_mut() {
+                    Some(cancel_rx) => tokio::select! {
+                        biased;
+                        _ = cancel_rx => {
+                            cancel_token.cancel();
+                            self.cache.finish_request(&uri, request_id);
+                            return Err(Error::request_cancelled());
+                        }
+                        _ = cancel_token.cancelled() => {
+                            self.cache.finish_request(&uri, request_id);
+                            return Ok(None);
+                        }
+                        actionable = probe => actionable,
+                    },
+                    None => tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => {
+                            self.cache.finish_request(&uri, request_id);
+                            return Ok(None);
+                        }
+                        actionable = probe => actionable,
+                    },
+                }
             }
             _ => false,
         };
