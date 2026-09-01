@@ -65,6 +65,8 @@ pub(crate) struct HostDocument<'a> {
 pub(crate) struct HostRawResponse {
     pub(crate) value: serde_json::Value,
     pub(crate) handle: Arc<ConnectionHandle>,
+    pub(crate) incarnation: u64,
+    pub(crate) connection_generation: u64,
 }
 
 fn fingerprint(text: &str) -> u64 {
@@ -318,21 +320,29 @@ impl LanguageServerPool {
         // that would repeat the marker filesystem walk on a request-frequency
         // path (execute-command-routing-token).
         let answering = Arc::clone(&handle);
-        let value = self
+        let (value, incarnation, connection_generation) = self
             .execute_host_request(
                 handle,
                 doc,
                 upstream_request_id,
                 |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
-                move |response| parse_host_raw_response(response, method),
+                move |response, incarnation, connection_generation| {
+                    (
+                        parse_host_raw_response(response, method),
+                        incarnation,
+                        connection_generation,
+                    )
+                },
             )
-            // Outer `?`: transport/protocol failure from `execute_host_request`.
-            // Inner `Result` from the parser: a downstream JSON-RPC error
-            // response. Both are request failures, so flatten them into one `Err`.
-            .await??;
+            .await?;
+        // The outer result is the transport/protocol outcome; `value` is the
+        // downstream JSON-RPC parse result. Both are request failures.
+        let value = value?;
         Ok(value.map(|value| HostRawResponse {
             value,
             handle: answering,
+            incarnation,
+            connection_generation,
         }))
     }
 
@@ -370,7 +380,9 @@ impl LanguageServerPool {
             // `send_formatting_request`: the fan-in counts `Err`s, which CLI
             // mode maps onto its error exit code. Only the no-capability
             // early return above yields `Ok(None)`.
-            move |response| parse_host_formatting_response(response, method).map(Some),
+            move |response, _incarnation, _connection_generation| {
+                parse_host_formatting_response(response, method).map(Some)
+            },
         )
         .await?
     }
@@ -444,7 +456,7 @@ impl LanguageServerPool {
                 doc,
                 upstream_request_id,
                 |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
-                move |response| {
+                move |response, _incarnation, _connection_generation| {
                     if response_has_jsonrpc_error(&response, method) {
                         return Err(io::Error::other(format!(
                             "downstream server answered {method} with an error response: {}",
@@ -481,13 +493,12 @@ impl LanguageServerPool {
         doc: &HostDocument<'_>,
         upstream_request_id: Option<UpstreamId>,
         build_request: impl FnOnce(RequestId) -> JsonRpcRequest<P>,
-        transform_response: impl FnOnce(serde_json::Value) -> T,
+        transform_response: impl FnOnce(serde_json::Value, u64, u64) -> T,
     ) -> io::Result<T> {
         // Route per-connection state by this handle's pool key (#382).
         let connection_key = handle.key();
         self.wait_for_host_routing(doc.uri).await;
-        let lifecycle = self.host_lifecycle_lock(doc.uri);
-        let _lifecycle_guard = lifecycle.lock().await;
+        let host_lifecycle = self.request_host_lifecycle(doc.uri).await?;
         if self.is_host_routing_suppressed(doc.uri, connection_key) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -539,7 +550,7 @@ impl LanguageServerPool {
         // wedging the `(uri, connection)` pair until the next purge. Holding
         // `connections` here also excludes a purge from interleaving with
         // this sync, closing the race entirely.
-        {
+        let connection_generation = {
             let connections = self.connections().await;
             if !connections
                 .get(connection_key)
@@ -576,7 +587,8 @@ impl LanguageServerPool {
                 }
                 return Err(e.into());
             }
-        }
+            self.document_connection_generation(connection_key)
+        };
 
         let response = handle.wait_for_response(request_id, response_rx).await;
         router_guard.disarm();
@@ -585,7 +597,12 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, connection_key);
         }
 
-        Ok(transform_response(response?))
+        let incarnation = host_lifecycle.incarnation();
+        Ok(transform_response(
+            response?,
+            incarnation,
+            connection_generation,
+        ))
     }
 }
 

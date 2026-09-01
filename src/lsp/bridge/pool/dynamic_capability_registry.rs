@@ -65,11 +65,9 @@ impl DynamicCapabilityRegistry {
     /// `registerOptions.<flag>`.
     ///
     /// Sub-capabilities that live INSIDE another method's options have no
-    /// method of their own to register — `completionItem/resolve` is
-    /// `textDocument/completion`'s `resolveProvider`, not a registrable method
-    /// — so [`Self::has_registration`] can never see them. Without this, a
-    /// server that registers completion dynamically with `resolveProvider:
-    /// true` and advertises nothing statically reads as non-resolving.
+    /// method of their own to register — for example, `completionItem/resolve`
+    /// is `textDocument/completion`'s `resolveProvider`, not a registrable
+    /// method — so [`Self::has_registration`] can never see them.
     pub(crate) fn registration_options_flag(&self, method: &str, flag: &str) -> bool {
         self.registrations
             .read()

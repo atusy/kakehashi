@@ -54,7 +54,6 @@ pub(crate) use client_progress::{
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
 pub(crate) use inbound_request_registry::InboundRequestRegistry;
-pub(crate) use pool::ConnectionKey;
 #[cfg(test)]
 pub(crate) use pool::ConnectionState;
 pub use pool::LanguageServerPool;
@@ -66,6 +65,7 @@ pub(crate) use pool::UpstreamId;
 /// seeds a `Ready` downstream to exercise `collect_push_diagnostics`' filter.
 #[cfg(test)]
 pub(crate) use pool::test_helpers;
+pub(crate) use pool::{ConnectionHandle, ConnectionKey};
 pub(crate) use progress_registry::{ProgressConnectionId, ProgressRegistry};
 pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::RequestId;
@@ -83,7 +83,8 @@ pub(crate) use protocol::workspace_edit_within_region;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};
 pub(crate) use text_document::{
     CodeActionEnvelope, CodeLensEnvelope, UpstreamCodeActionCaps, bridge_code_actions,
-    extract_code_action_envelope, extract_code_lens_envelope, parse_code_actions_leniently,
+    envelope_host_code_lenses, extract_code_action_envelope, extract_code_lens_envelope,
+    parse_code_actions_leniently,
 };
 pub(crate) use text_document::{KakehashiEnvelope, bridge_host_completion_items, extract_envelope};
 pub(crate) use text_document::{OpenExpectation, OpenOutcome};

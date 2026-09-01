@@ -7,7 +7,8 @@ use ulid::Ulid;
 use url::Url;
 
 use super::super::Kakehashi;
-use crate::lsp::bridge::{CodeLensEnvelope, extract_code_lens_envelope};
+use crate::lsp::bridge::{CodeLensEnvelope, envelope_host_code_lenses, extract_code_lens_envelope};
+use crate::lsp::current_upstream_id;
 use crate::text::PositionMapper;
 
 impl Kakehashi {
@@ -37,6 +38,19 @@ impl Kakehashi {
                     )
                     .await
             },
+            |mut won| {
+                let server_resolves = won.handle.has_capability("codeLens/resolve");
+                envelope_host_code_lenses(
+                    &mut won.items,
+                    &won.server_name,
+                    won.host_uri.as_str(),
+                    won.incarnation,
+                    won.connection_generation,
+                    won.handle.key(),
+                    server_resolves,
+                );
+                Some(won.items)
+            },
         )
         .await
     }
@@ -44,10 +58,11 @@ impl Kakehashi {
     /// `codeLens/resolve`: route the lens back to the downstream server that
     /// produced it, identified by the envelope in `lens.data` (#355).
     ///
-    /// Fails soft at every step: a lens without an envelope (host-layer or
-    /// foreign) passes through unchanged, and a stale region returns the lens
-    /// unresolved with its envelope intact — clients re-request lenses on
-    /// change, so the staleness window is short.
+    /// Fails soft except for client cancellation: a lens without an envelope
+    /// (foreign, or from a host server without resolve support) passes through
+    /// unchanged, and a stale region returns the lens unresolved with its
+    /// envelope intact — clients re-request lenses on change, so the staleness
+    /// window is short.
     pub(crate) async fn code_lens_resolve_impl(&self, lens: CodeLens) -> Result<CodeLens> {
         let Some(envelope) = extract_code_lens_envelope(&lens) else {
             return Ok(lens);
@@ -56,7 +71,7 @@ impl Kakehashi {
         // Fail-soft staleness gate: resolving against a moved or invalidated
         // region would translate coordinates with a stale offset and bind the
         // lens to content the user has since edited.
-        if !self.code_lens_region_is_fresh(&envelope) {
+        if !envelope.is_host_layer() && !self.code_lens_region_is_fresh(&envelope) {
             log::debug!(
                 target: "kakehashi::bridge",
                 "codeLens/resolve: region {} is stale; returning lens unresolved",
@@ -66,11 +81,23 @@ impl Kakehashi {
         }
 
         let settings = self.settings_manager.load_settings();
-        let upstream_id = crate::lsp::current_upstream_id();
         let pool = self.bridge.pool_arc();
-        Ok(pool
-            .dispatch_code_lens_resolve(lens, &settings, upstream_id)
-            .await)
+        let upstream_id = current_upstream_id();
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let sweep_id = upstream_id.clone();
+        let dispatch = pool.dispatch_code_lens_resolve(lens, &settings, upstream_id);
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            std::sync::Arc::clone(&pool),
+            sweep_id,
+        );
+        match cancel_rx {
+            Some(rx) => tokio::select! {
+                biased;
+                _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                lens = dispatch => Ok(lens),
+            },
+            None => Ok(dispatch.await),
+        }
     }
 
     /// Whether the envelope's injection region still exists at the position it

@@ -37,7 +37,10 @@
 //!   request-failure path.
 //! - `code-action` — advertises `codeActionProvider`; returns one
 //!   edit-carrying quickfix plus one bare Command action (#568).
-//! - `code-lens` — advertises `codeLensProvider` with `resolveProvider`;
+//! - `code-lens` / `code-lens-replacement` / `code-lens-slow-resolve` — advertise `codeLensProvider`
+//!   with `resolveProvider`; the slow variant pauses before resolving;
+//! - `code-lens-no-resolve` / `code-lens-no-resolve-reserved-data` — advertise
+//!   code lenses without resolve support;
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
 //!   Used by `tests/e2e/e2e_code_lens_resolve.rs` (#355).
@@ -180,8 +183,12 @@ fn main() {
                         "hoverProvider": true,
                         "textDocumentSync": 1
                     }),
-                    "code-lens" => json!({
+                    "code-lens" | "code-lens-replacement" | "code-lens-slow-resolve" => json!({
                         "codeLensProvider": { "resolveProvider": true },
+                        "textDocumentSync": 1
+                    }),
+                    "code-lens-no-resolve" | "code-lens-no-resolve-reserved-data" => json!({
+                        "codeLensProvider": { "resolveProvider": false },
                         "textDocumentSync": 1
                     }),
                     "document-link" | "document-link-slow-host" | "document-link-slow-virt" => {
@@ -575,7 +582,19 @@ fn main() {
                                 "start": { "line": 0, "character": 0 },
                                 "end": { "line": 0, "character": 5 }
                             },
-                            "data": { "mock": "lens-1" }
+                            "data": if mode == "code-lens-no-resolve-reserved-data" {
+                                json!({ "kakehashi": {
+                                    "origin": "forged",
+                                    "host_uri": "file:///forged",
+                                    "region_id": "",
+                                    "injection_language": "",
+                                    "offset": { "line": 0, "column": 0 },
+                                    "inner": null,
+                                    "host_layer": true
+                                }})
+                            } else {
+                                json!({ "mock": "lens-1" })
+                            }
                         }])
                     })
                     .unwrap_or(Value::Null);
@@ -1266,6 +1285,13 @@ fn main() {
                 }
             }
             "codeLens/resolve" => {
+                if mode == "code-lens-slow-resolve" {
+                    record_mock_event(&mode, "request", &message);
+                    // Keep the request in flight while continuing the read
+                    // loop so a queued $/cancelRequest is observed before any
+                    // resolve response exists.
+                    continue;
+                }
                 // Materialize the command, echoing the lens's own data back so
                 // the test can prove the downstream data round-tripped through
                 // the bridge envelope.
@@ -1283,7 +1309,11 @@ fn main() {
                     json!({
                         "range": range,
                         "command": {
-                            "title": format!("mock resolved:{}", data["mock"].as_str().unwrap_or("?")),
+                            "title": format!(
+                                "{} resolved:{}",
+                                if mode == "code-lens-replacement" { "replacement" } else { "mock" },
+                                data["mock"].as_str().unwrap_or("?")
+                            ),
                             "command": "mock.codelens"
                         },
                         "data": data
@@ -1540,6 +1570,7 @@ fn record_mock_event(mode: &str, event: &str, message: &Value) {
     let payload = json!({
         "mode": mode,
         "event": event,
+        "id": message.get("id").cloned().unwrap_or(Value::Null),
         "params": message.get("params").cloned().unwrap_or(Value::Null)
     });
     let _ = std::fs::write(

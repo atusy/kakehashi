@@ -692,16 +692,18 @@ impl ConnectionHandle {
         if self.dynamic_capabilities().has_registration(method) {
             return true;
         }
-        // A sub-capability that lives inside ANOTHER method's options has no
-        // method of its own to register, so the name match above can never see
-        // it: `completionItem/resolve` is `textDocument/completion`'s
-        // `resolveProvider`. Without this, a server that registers completion
-        // dynamically and advertises nothing statically reads as non-resolving,
-        // and its items are served with no way to resolve them.
-        if method == "completionItem/resolve"
+        // Resolve sub-capabilities live inside their parent request's options
+        // and have no registration method of their own, so a direct method-name
+        // lookup can never see them.
+        let dynamic_resolve_parent = match method {
+            "completionItem/resolve" => Some("textDocument/completion"),
+            "codeLens/resolve" => Some("textDocument/codeLens"),
+            _ => None,
+        };
+        if let Some(parent) = dynamic_resolve_parent
             && self
                 .dynamic_capabilities()
-                .registration_options_flag("textDocument/completion", "resolveProvider")
+                .registration_options_flag(parent, "resolveProvider")
         {
             return true;
         }
@@ -2880,5 +2882,38 @@ mod tests {
         });
 
         assert!(!handle.has_capability("codeLens/resolve"));
+    }
+
+    #[tokio::test]
+    async fn code_lens_resolve_capability_true_from_dynamic_registration() {
+        use tower_lsp_server::ls_types::Registration;
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        assert!(!handle.has_capability("codeLens/resolve"));
+
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "code-lens-1".to_string(),
+            method: "textDocument/codeLens".to_string(),
+            register_options: Some(serde_json::json!({ "resolveProvider": true })),
+        }]);
+
+        assert!(handle.has_capability("codeLens/resolve"));
+    }
+
+    #[tokio::test]
+    async fn code_lens_resolve_capability_false_when_dynamic_registration_omits_the_flag() {
+        use tower_lsp_server::ls_types::Registration;
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "code-lens-1".to_string(),
+            method: "textDocument/codeLens".to_string(),
+            register_options: Some(serde_json::json!({})),
+        }]);
+
+        assert!(!handle.has_capability("codeLens/resolve"));
+        assert!(handle.has_capability("textDocument/codeLens"));
     }
 }
