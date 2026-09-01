@@ -79,31 +79,16 @@ impl Kakehashi {
         // otherwise an immediate save can overtake its projected didChange and
         // run the downstream save hook against stale fragment text. If the
         // bounded settle fails, omit didSave rather than violate that contract.
-        if let Some((_, saved_incarnation, saved_content_version)) = &saved_document {
-            let saved_snapshot_is_current =
-                saved_parse_is_current(self, &uri, *saved_incarnation, *saved_content_version)
-                    .await;
-
-            if saved_snapshot_is_current {
-                let edit_lock = self.documents.edit_lock(&uri);
-                let edit_guard = edit_lock.lock().await;
-                let still_saved_version = self.documents.get(&uri).is_some_and(|document| {
-                    document.incarnation() == *saved_incarnation
-                        && document.content_version() == *saved_content_version
-                });
-                if still_saved_version
-                    && let Some((_, injections)) =
-                        self.injection_coordinator().bridge_injections(&uri)
-                {
-                    pool.sync_and_forward_did_save_to_virtual_docs(
-                        &uri,
-                        *saved_incarnation,
-                        &injections,
-                    )
-                    .await;
-                }
-                drop(edit_guard);
-            }
+        if let Some((_, saved_incarnation, saved_content_version)) = &saved_document
+            && saved_parse_is_current(self, &uri, *saved_incarnation, *saved_content_version).await
+        {
+            self.forward_virtual_did_save_for_saved_version(
+                &pool,
+                &uri,
+                *saved_incarnation,
+                *saved_content_version,
+            )
+            .await;
         }
 
         // Register diagnostic collection immediately, but keep its parse wait
@@ -120,6 +105,32 @@ impl Kakehashi {
         }
 
         self.notifier().log_info("file saved!").await;
+    }
+
+    /// Forward the save to `uri`'s virtual documents, but only while the
+    /// document still carries the saved lineage. The edit lock is held across
+    /// the check and the downstream enqueue so a concurrent edit cannot slip
+    /// between them and turn the projected content stale.
+    async fn forward_virtual_did_save_for_saved_version(
+        &self,
+        pool: &std::sync::Arc<crate::lsp::LanguageServerPool>,
+        uri: &url::Url,
+        saved_incarnation: u64,
+        saved_content_version: u64,
+    ) {
+        let edit_lock = self.documents.edit_lock(uri);
+        let edit_guard = edit_lock.lock().await;
+        let still_saved_version = self.documents.get(uri).is_some_and(|document| {
+            document.incarnation() == saved_incarnation
+                && document.content_version() == saved_content_version
+        });
+        if still_saved_version
+            && let Some((_, injections)) = self.injection_coordinator().bridge_injections(uri)
+        {
+            pool.sync_and_forward_did_save_to_virtual_docs(uri, saved_incarnation, &injections)
+                .await;
+        }
+        drop(edit_guard);
     }
 }
 
