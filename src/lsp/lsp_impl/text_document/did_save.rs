@@ -120,17 +120,22 @@ impl Kakehashi {
     ) {
         let edit_lock = self.documents.edit_lock(uri);
         let edit_guard = edit_lock.lock().await;
-        let still_saved_version = self.documents.get(uri).is_some_and(|document| {
-            document.incarnation() == saved_incarnation
-                && document.content_version() == saved_content_version
-        });
-        if still_saved_version
+        let current_lineage = self
+            .documents
+            .get(uri)
+            .map(|document| (document.incarnation(), document.content_version()));
+        if current_lineage == Some((saved_incarnation, saved_content_version))
             && let Some((_, injections)) = self.injection_coordinator().bridge_injections(uri)
         {
             pool.sync_and_forward_did_save_to_virtual_docs(uri, saved_incarnation, &injections)
                 .await;
         }
         drop(edit_guard);
+        // `edit_lock` get-or-inserts, so a close during the settle leaves this
+        // path holding an entry the closed document will never reclaim.
+        if current_lineage.is_none() {
+            self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+        }
     }
 }
 
