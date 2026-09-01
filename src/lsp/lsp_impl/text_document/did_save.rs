@@ -190,6 +190,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_document_virtual_save_reclaims_its_edit_lock() {
+        // A close that lands after the settle vouched for the saved parse
+        // leaves this path minting an edit-lock entry for a URI that no
+        // longer has a document, and no other path reclaims it: the
+        // background diagnostic waiter bails out before its own reclaim, and
+        // `remove_preserving_edit_lock` retains the entry on purpose.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = url::Url::parse("file:///test/closed-virtual-save.md").unwrap();
+        let pool = server.bridge.pool_arc();
+
+        server
+            .forward_virtual_did_save_for_saved_version(&pool, &uri, 1, 1)
+            .await;
+
+        assert!(
+            !server.documents.has_edit_lock(&uri),
+            "a save for a closed document must not retain its edit-lock entry"
+        );
+    }
+
+    #[tokio::test]
     async fn missing_document_did_save_reclaims_its_edit_lock() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
