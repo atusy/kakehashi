@@ -1,7 +1,7 @@
 //! The completion routing envelope is minted only for an origin that
-//! advertises `completionItem/resolve`; a non-resolving origin's items reach
-//! the client bare, on the virt layer as on the host layer
-//! (`e2e_host_bridge` covers the host side).
+//! advertises `completionItem/resolve` (reserved-key collision aside); a
+//! non-resolving origin's items reach the client bare, on the virt layer as
+//! on the host layer (`e2e_host_bridge` covers the host side).
 
 use crate::helpers::lsp_client::LspClient;
 use crate::helpers::lua_bridge::shutdown_client;

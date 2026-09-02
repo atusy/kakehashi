@@ -47,22 +47,21 @@ Partially implemented:
   the envelope stamped into `CompletionItem.data`; the host layer stamps one
   too (marked `host_layer`, so the resolve forwards VERBATIM — no coordinate
   translation and no injection-region edit guard). Both layers mint under
-  one rule, shared by completion, codeLens, and documentLink: only for a
-  server that advertises the matching resolve method. Without that
-  capability the items stay bare — an envelope would be pure wire weight on
-  every item, and its resolve would only fail soft — so a client resolve
-  passes the bare item through unchanged. The resolve side re-checks the
-  capability on the live origin regardless and, finding it absent, returns
-  the item unresolved with its envelope restored — warning when the
-  capability was withdrawn under the item (a respawn or dynamic
-  unregister), quietly when the envelope existed only to nest a
-  reserved-key payload from a non-resolving origin. `codeLens/resolve` forwards the
-  original payload and coordinates verbatim on the host layer. A
-  non-resolving server's item normally stays bare; the reserved-key collision
+  one rule, shared by completion, codeLens, and documentLink: for a server
+  that advertises the matching resolve method, plus the reserved-key
+  exception below. Without that capability the items stay bare — an
+  envelope would be pure wire weight on every item, and its resolve would
+  only fail soft — so a client resolve passes the bare item through
+  unchanged. The resolve side re-checks the capability on the live origin
+  regardless and, finding it absent, returns the item unresolved with its
+  envelope restored — warning when the capability was withdrawn under the
+  item (a respawn or dynamic unregister), quietly when the envelope existed
+  only to nest a reserved-key payload from a non-resolving origin. That
   exception wraps `data.kakehashi` as opaque `inner` data so a downstream
   payload cannot impersonate bridge routing metadata. (codeAction needs no
   such exception: an action that leaves without an envelope leaves with no
-  `data` at all.) The codeLens envelope retains
+  `data` at all.) `codeLens/resolve` forwards the original payload and
+  coordinates verbatim on the host layer. The codeLens envelope retains
   the host-document incarnation plus the exact producing `ConnectionKey` and
   its generation, so an old lens is returned unresolved after either a
   document reopen, a rooted/shared routing-key change, or a downstream process

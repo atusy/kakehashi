@@ -22,9 +22,12 @@ pub(crate) fn should_envelope(data: Option<&Value>, server_resolves: bool) -> bo
 /// Whether a payload occupies the envelope key itself. On the producer side
 /// this is the collision exception above; on the resolve side, once the
 /// envelope is stripped and the payload restored into `data`, an item whose
-/// payload does so was enveloped ONLY for that reason, so a capability miss
-/// on it is the expected steady state of a non-resolving origin, not a
-/// capability that vanished under the item.
+/// payload does so cannot be told apart from one enveloped only for that
+/// reason, so a capability miss on it is read as the steady state of a
+/// non-resolving origin rather than a capability that vanished under the
+/// item. A resolving origin whose payload happens to nest the key loses the
+/// warning in that corner; accepted rather than widen every envelope with a
+/// wrap reason.
 pub(crate) fn nests_reserved_key(data: Option<&Value>) -> bool {
     data.is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
 }

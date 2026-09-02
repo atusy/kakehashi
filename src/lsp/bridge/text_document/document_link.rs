@@ -302,11 +302,13 @@ impl LanguageServerPool {
         };
 
         if !handle.has_capability("documentLink/resolve") {
-            // Two ways here. The origin never advertised resolve and its
-            // payload was wrapped only for squatting on the reserved key:
-            // steady state, every client resolve of that link lands here,
-            // so say so quietly. Or it did advertise and a respawn or dynamic
-            // unregister withdrew the capability under the link: anomalous.
+            // Two ways here. The payload nests the reserved key: as far as
+            // this branch can tell, the origin never advertised resolve and
+            // the wrap existed only to nest it — steady state, so every
+            // client resolve of that link that clears the gates above
+            // lands here; say so quietly. Otherwise the origin did advertise
+            // and a respawn or dynamic unregister withdrew the capability
+            // under the link: anomalous.
             if nests_reserved_key(link.data.as_ref()) {
                 debug!(
                     target: "kakehashi::bridge",
@@ -896,8 +898,9 @@ mod tests {
     /// is minted for a resolving origin, so reaching a non-resolving handle
     /// means the origin changed under the link (dynamic unregister, respawn)
     /// or the payload was wrapped for squatting on the reserved key. Either
-    /// way the link comes back unresolved AND the anomaly is logged, as the
-    /// codeAction and host-completion paths already did.
+    /// way the link comes back unresolved; the withdrawn-capability way is
+    /// logged as an anomaly, as the codeAction and host-completion paths
+    /// already did (the reserved-key way is the sibling test below).
     #[test]
     fn dispatch_warns_and_re_envelopes_when_origin_no_longer_resolves() {
         use crate::lsp::bridge::test_logging::captured_warnings_for;

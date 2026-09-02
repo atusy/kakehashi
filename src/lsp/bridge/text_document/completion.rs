@@ -1435,7 +1435,7 @@ mod tests {
         envelope_host_item(&mut item, "tsudoi-ls", "file:///test/doc.txt");
 
         // The two fields a host envelope leaves at their defaults must not
-        // ride the wire — this rides in every item of every response.
+        // ride the wire — this rides in every enveloped item of a response.
         let wire = item.data.clone().expect("enveloped");
         assert!(
             wire["kakehashi"].get("region_id").is_none(),

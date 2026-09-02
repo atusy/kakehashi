@@ -143,11 +143,13 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability("completionItem/resolve") {
-            // Two ways here. The origin never advertised resolve and its
-            // payload was wrapped only for squatting on the reserved key:
-            // steady state, every client resolve of that item lands here,
-            // so say so quietly. Or it did advertise and a respawn or dynamic
-            // unregister withdrew the capability under the item: anomalous.
+            // Two ways here. The payload nests the reserved key: as far as
+            // this branch can tell, the origin never advertised resolve and
+            // the wrap existed only to nest it — steady state, so every
+            // client resolve of that item that clears the gates above
+            // lands here; say so quietly. Otherwise the origin did advertise
+            // and a respawn or dynamic unregister withdrew the capability
+            // under the item: anomalous.
             if nests_reserved_key(item.data.as_ref()) {
                 debug!(
                     target: "kakehashi::bridge",
@@ -239,11 +241,13 @@ impl LanguageServerPool {
         };
 
         if !handle.has_capability("completionItem/resolve") {
-            // Two ways here. The origin never advertised resolve and its
-            // payload was wrapped only for squatting on the reserved key:
-            // steady state, every client resolve of that item lands here,
-            // so say so quietly. Or it did advertise and a respawn or dynamic
-            // unregister withdrew the capability under the item: anomalous.
+            // Two ways here. The payload nests the reserved key: as far as
+            // this branch can tell, the origin never advertised resolve and
+            // the wrap existed only to nest it — steady state, so every
+            // client resolve of that item that clears the gates above
+            // lands here; say so quietly. Otherwise the origin did advertise
+            // and a respawn or dynamic unregister withdrew the capability
+            // under the item: anomalous.
             if nests_reserved_key(item.data.as_ref()) {
                 debug!(
                     target: "kakehashi::bridge",

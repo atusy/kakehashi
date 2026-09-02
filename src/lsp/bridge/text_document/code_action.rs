@@ -733,8 +733,9 @@ impl LanguageServerPool {
             // Anomalous: the envelope was only minted because the origin
             // advertised resolve, so reaching here means a respawn changed
             // capabilities under the action. (Unlike the other resolve kinds,
-            // `codeAction/resolve` has no dynamic-registration path in
-            // `has_capability`, so an unregister cannot flip it.)
+            // `has_capability` reads no `textDocument/codeAction`
+            // registration-options `resolveProvider`, so a standard dynamic
+            // unregister cannot flip it.)
             warn!(
                 target: "kakehashi::bridge",
                 "codeAction/resolve (host): {:?} no longer advertises resolveProvider; \
@@ -834,8 +835,9 @@ impl LanguageServerPool {
             // Anomalous: the envelope was only minted because the origin
             // advertised resolve, so reaching here means a respawn changed
             // capabilities under the action. (Unlike the other resolve kinds,
-            // `codeAction/resolve` has no dynamic-registration path in
-            // `has_capability`, so an unregister cannot flip it.)
+            // `has_capability` reads no `textDocument/codeAction`
+            // registration-options `resolveProvider`, so a standard dynamic
+            // unregister cannot flip it.)
             warn!(
                 target: "kakehashi::bridge",
                 "codeAction/resolve: {:?} no longer advertises resolveProvider; returning unresolved",
