@@ -814,6 +814,70 @@ mod tests {
         );
     }
 
+    /// One way to reach the resolve-side capability miss is an anomaly: the
+    /// origin advertised `inlayHint/resolve` when the hint was minted and no
+    /// longer does (respawn, dynamic unregister). The hint must come back
+    /// unresolved with its payload intact, and the miss must be logged as the
+    /// completion, codeLens and documentLink paths log theirs (the
+    /// reserved-key way is the sibling test below).
+    #[test]
+    fn dispatch_warns_and_re_envelopes_when_origin_no_longer_resolves() {
+        use crate::lsp::bridge::test_logging::captured_warnings_for;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let warnings = captured_warnings_for(|| {
+            runtime.block_on(async {
+                let pool = LanguageServerPool::new();
+                let key = ConnectionKey::for_server("lua-ls");
+                let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
+                    crate::lsp::bridge::ConnectionState::Ready,
+                    key.clone(),
+                )
+                .await;
+                pool.insert_connection(handle).await;
+                let host_uri = Url::parse("file:///test.lua").unwrap();
+                pool.open_host_incarnation(&host_uri, 2).await;
+                let mut settings = crate::config::settings::WorkspaceSettings::default();
+                settings.language_servers.insert(
+                    "lua-ls".to_string(),
+                    BridgeServerConfig {
+                        cmd: Some(vec!["lua-language-server".to_string()]),
+                        ..Default::default()
+                    },
+                );
+                let mut hints: Vec<InlayHint> = serde_json::from_value(json!([{
+                    "position": { "line": 0, "character": 1 },
+                    "label": ": number",
+                    "data": { "token": 1 }
+                }]))
+                .unwrap();
+                envelope_host_inlay_hints(
+                    &mut hints,
+                    "lua-ls",
+                    "file:///test.lua",
+                    InlayHintDocumentRevision {
+                        incarnation: Some(2),
+                        content_version: 3,
+                    },
+                    pool.document_connection_generation(&key),
+                    &key,
+                    true,
+                );
+
+                let result = pool
+                    .dispatch_inlay_hint_resolve(hints.remove(0), &settings, None, None)
+                    .await;
+                let envelope = extract_inlay_hint_envelope(&result).expect("envelope restored");
+                assert_eq!(envelope.inner, Some(json!({ "token": 1 })));
+                assert!(result.tooltip.is_none(), "hint stays unresolved");
+            });
+        });
+        assert!(
+            warnings.iter().any(|w| w.contains("inlayHint/resolve")
+                && w.contains("no longer advertises resolveProvider")),
+            "the capability miss must be logged, not silently swallowed: {warnings:?}"
+        );
+    }
+
     #[test]
     fn inlay_hint_resolve_request_carries_original_data() {
         let hint: InlayHint = serde_json::from_value(json!({
