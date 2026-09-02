@@ -378,6 +378,15 @@ impl LanguageServerPool {
         };
 
         if !handle.has_capability("codeLens/resolve") {
+            // Anomalous: the envelope was only minted because the origin
+            // advertised resolve (or the payload squatted on the reserved
+            // key), so reaching here means a respawn or dynamic unregister
+            // changed capabilities under the lens.
+            warn!(
+                target: "kakehashi::bridge",
+                "codeLens/resolve: {:?} no longer advertises resolveProvider; returning unresolved",
+                envelope.origin
+            );
             re_envelope_lens(&mut lens, &envelope);
             return lens;
         }

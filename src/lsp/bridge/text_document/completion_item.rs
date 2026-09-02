@@ -142,13 +142,13 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability("completionItem/resolve") {
-            // Anomalous, unlike on the virt path (which envelopes
-            // unconditionally): a host envelope is minted ONLY for a server
-            // that advertised resolve, so reaching here means a respawn
-            // changed capabilities (or the handle is still initializing).
+            // Anomalous: the envelope was only minted because the origin
+            // advertised resolve (or the payload squatted on the reserved
+            // key), so reaching here means a respawn or dynamic unregister
+            // changed capabilities under the item.
             warn!(
                 target: "kakehashi::bridge",
-                "completionItem/resolve: host server {server_name:?} no longer advertises \
+                "completionItem/resolve (host): {server_name:?} no longer advertises \
                  resolveProvider; returning unresolved"
             );
             re_envelope_item(&mut item, &envelope);
@@ -230,6 +230,15 @@ impl LanguageServerPool {
         };
 
         if !handle.has_capability("completionItem/resolve") {
+            // Anomalous: the envelope was only minted because the origin
+            // advertised resolve (or the payload squatted on the reserved
+            // key), so reaching here means a respawn or dynamic unregister
+            // changed capabilities under the item.
+            warn!(
+                target: "kakehashi::bridge",
+                "completionItem/resolve: {server_name:?} no longer advertises resolveProvider; \
+                 returning unresolved"
+            );
             re_envelope_item(&mut item, &envelope);
             return item;
         }

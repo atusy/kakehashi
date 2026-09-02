@@ -306,6 +306,15 @@ impl LanguageServerPool {
         };
 
         if !handle.has_capability("documentLink/resolve") {
+            // Anomalous: the envelope was only minted because the origin
+            // advertised resolve (or the payload squatted on the reserved
+            // key), so reaching here means a respawn or dynamic unregister
+            // changed capabilities under the link.
+            warn!(
+                target: "kakehashi::bridge",
+                "documentLink/resolve: {:?} no longer advertises resolveProvider; returning unresolved",
+                envelope.origin
+            );
             re_envelope_link(&mut link, &envelope);
             return link;
         }

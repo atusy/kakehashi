@@ -728,11 +728,12 @@ impl LanguageServerPool {
         };
         if !handle.has_capability("codeAction/resolve") {
             // Anomalous: the envelope was only minted because the origin
-            // advertised resolve, so reaching here means a respawn changed
-            // capabilities (or the handle is still initializing).
+            // advertised resolve, so reaching here means a respawn or dynamic
+            // unregister changed capabilities under the action.
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: {:?} no longer advertises resolveProvider; returning unresolved",
+                "codeAction/resolve (host): {:?} no longer advertises resolveProvider; \
+                 returning unresolved",
                 envelope.origin
             );
             re_envelope_action(&mut action, &envelope);
@@ -826,8 +827,8 @@ impl LanguageServerPool {
         };
         if !handle.has_capability("codeAction/resolve") {
             // Anomalous: the envelope was only minted because the origin
-            // advertised resolve, so reaching here means a respawn changed
-            // capabilities (or the handle is still initializing).
+            // advertised resolve, so reaching here means a respawn or dynamic
+            // unregister changed capabilities under the action.
             warn!(
                 target: "kakehashi::bridge",
                 "codeAction/resolve: {:?} no longer advertises resolveProvider; returning unresolved",
