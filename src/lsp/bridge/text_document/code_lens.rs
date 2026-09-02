@@ -596,14 +596,16 @@ mod tests {
     use serde_json::json;
 
     /// Run the virt transform for a resolving origin: every lens is enveloped.
-    fn transform_for_test(
+    /// (The completion twin defaults the other way — its helper is named for
+    /// a non-resolving origin.)
+    fn transform_for_resolving_server(
         response: serde_json::Value,
         offset: &RegionOffset,
     ) -> Option<Vec<CodeLens>> {
-        transform_for_resolving_server(response, offset, true)
+        transform_with_resolve_support(response, offset, true)
     }
 
-    fn transform_for_resolving_server(
+    fn transform_with_resolve_support(
         response: serde_json::Value,
         offset: &RegionOffset,
         server_resolves: bool,
@@ -629,14 +631,14 @@ mod tests {
         let offset = RegionOffset::new(3, 0);
 
         let resolvable =
-            transform_for_resolving_server(response(json!({"token": 1})), &offset, true).unwrap();
+            transform_with_resolve_support(response(json!({"token": 1})), &offset, true).unwrap();
         let envelope =
             extract_code_lens_envelope(&resolvable[0]).expect("resolving origin envelopes");
         assert_eq!(envelope.origin, "lua-ls");
         assert_eq!(envelope.inner, Some(json!({"token": 1})));
 
         let bare =
-            transform_for_resolving_server(response(json!({"token": 1})), &offset, false).unwrap();
+            transform_with_resolve_support(response(json!({"token": 1})), &offset, false).unwrap();
         assert_eq!(
             bare[0].data,
             Some(json!({"token": 1})),
@@ -645,7 +647,7 @@ mod tests {
         );
         assert_eq!(bare[0].range.start.line, 3, "ranges are still translated");
 
-        let forged = transform_for_resolving_server(
+        let forged = transform_with_resolve_support(
             response(json!({ ENVELOPE_KEY: { "origin": "spoofed" } })),
             &offset,
             false,
@@ -764,7 +766,7 @@ mod tests {
         });
 
         let offset = RegionOffset::new(5, 0);
-        let transformed = transform_for_test(response, &offset);
+        let transformed = transform_for_resolving_server(response, &offset);
 
         let lenses = transformed.expect("Should parse code lenses");
         assert_eq!(lenses.len(), 1);
@@ -800,7 +802,7 @@ mod tests {
         });
 
         let offset = RegionOffset::new(3, 0);
-        let transformed = transform_for_test(response, &offset);
+        let transformed = transform_for_resolving_server(response, &offset);
 
         let lenses = transformed.expect("Should parse code lenses");
         assert_eq!(
@@ -831,7 +833,7 @@ mod tests {
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"}))]
     fn code_lens_response_returns_none_for_invalid(#[case] response: serde_json::Value) {
         let offset = RegionOffset::new(5, 0);
-        let transformed = transform_for_test(response, &offset);
+        let transformed = transform_for_resolving_server(response, &offset);
         assert!(transformed.is_none());
     }
 
@@ -840,7 +842,7 @@ mod tests {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
         let offset = RegionOffset::new(5, 0);
-        let transformed = transform_for_test(response, &offset);
+        let transformed = transform_for_resolving_server(response, &offset);
         assert!(transformed.expect("Should parse empty array").is_empty());
     }
 
@@ -859,7 +861,7 @@ mod tests {
         });
 
         let offset = RegionOffset::new(10, 0);
-        let transformed = transform_for_test(response, &offset);
+        let transformed = transform_for_resolving_server(response, &offset);
 
         let lenses = transformed.expect("Should parse code lenses");
         assert_eq!(

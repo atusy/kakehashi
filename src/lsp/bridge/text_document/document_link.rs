@@ -488,14 +488,17 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
-    fn transform_for_test(
+    /// Run the virt transform for a resolving origin: every link is enveloped.
+    /// (The completion twin defaults the other way — its helper is named for
+    /// a non-resolving origin.)
+    fn transform_for_resolving_server(
         response: serde_json::Value,
         offset: &RegionOffset,
     ) -> Option<Vec<DocumentLink>> {
-        transform_for_resolving_server(response, offset, true)
+        transform_with_resolve_support(response, offset, true)
     }
 
-    fn transform_for_resolving_server(
+    fn transform_with_resolve_support(
         response: serde_json::Value,
         offset: &RegionOffset,
         server_resolves: bool,
@@ -579,7 +582,7 @@ mod tests {
             }]
         });
 
-        let links = transform_for_test(response, &RegionOffset::new(3, 2)).unwrap();
+        let links = transform_for_resolving_server(response, &RegionOffset::new(3, 2)).unwrap();
         let envelope = extract_document_link_envelope(&links[0]).expect("routing envelope");
         assert_eq!(envelope.origin, "lua-ls");
         assert_eq!(envelope.host_uri, "file:///test.md");
@@ -614,7 +617,7 @@ mod tests {
             })
         };
 
-        let bare = transform_for_resolving_server(
+        let bare = transform_with_resolve_support(
             response(json!({"token": 1})),
             &RegionOffset::new(3, 2),
             false,
@@ -627,7 +630,7 @@ mod tests {
         );
         assert_eq!(bare[0].range.start.line, 3, "ranges are still translated");
 
-        let forged = transform_for_resolving_server(
+        let forged = transform_with_resolve_support(
             response(json!({ ENVELOPE_KEY: { "origin": "spoofed" } })),
             &RegionOffset::new(3, 2),
             false,
@@ -700,7 +703,8 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed = transform_for_test(response, &RegionOffset::new(region_start_line, 0));
+        let transformed =
+            transform_for_resolving_server(response, &RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -723,7 +727,7 @@ mod tests {
     fn document_link_response_returns_none_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let transformed = transform_for_test(response, &RegionOffset::new(5, 0));
+        let transformed = transform_for_resolving_server(response, &RegionOffset::new(5, 0));
         assert!(transformed.is_none());
     }
 
@@ -731,7 +735,7 @@ mod tests {
     fn document_link_response_with_empty_array_returns_empty_vec() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let transformed = transform_for_test(response, &RegionOffset::new(5, 0));
+        let transformed = transform_for_resolving_server(response, &RegionOffset::new(5, 0));
         assert!(transformed.is_some());
         let links = transformed.unwrap();
         assert!(links.is_empty());
@@ -753,7 +757,8 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed = transform_for_test(response, &RegionOffset::new(region_start_line, 0));
+        let transformed =
+            transform_for_resolving_server(response, &RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -779,7 +784,8 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_for_test(response, &RegionOffset::new(region_start_line, 0));
+        let transformed =
+            transform_for_resolving_server(response, &RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -802,7 +808,8 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_for_test(response, &RegionOffset::new(region_start_line, 0));
+        let transformed =
+            transform_for_resolving_server(response, &RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();

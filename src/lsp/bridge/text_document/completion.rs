@@ -656,16 +656,18 @@ mod tests {
 
     /// Run the virt transform for a NON-resolving origin, the shape most
     /// coordinate tests want: ranges translate, `data` passes through bare.
-    fn transform_for_test(
+    /// (The codeLens and documentLink twins default the other way — their
+    /// helper is named for a resolving origin.)
+    fn transform_for_non_resolving_server(
         response: serde_json::Value,
         offset: &RegionOffset,
         region_end: Position,
         request_host_line: Option<u32>,
     ) -> Option<CompletionList> {
-        transform_for_resolving_server(response, offset, region_end, request_host_line, false)
+        transform_with_resolve_support(response, offset, region_end, request_host_line, false)
     }
 
-    fn transform_for_resolving_server(
+    fn transform_with_resolve_support(
         response: serde_json::Value,
         offset: &RegionOffset,
         region_end: Position,
@@ -702,7 +704,7 @@ mod tests {
         };
         let offset = RegionOffset::new(3, 2);
 
-        let resolvable = transform_for_resolving_server(
+        let resolvable = transform_with_resolve_support(
             response(json!({"token": 1})),
             &offset,
             TEST_REGION_END,
@@ -714,7 +716,7 @@ mod tests {
         assert_eq!(envelope.origin, "lua-ls");
         assert_eq!(envelope.inner, Some(json!({"token": 1})));
 
-        let bare = transform_for_test(
+        let bare = transform_for_non_resolving_server(
             response(json!({"token": 1})),
             &offset,
             TEST_REGION_END,
@@ -728,7 +730,7 @@ mod tests {
              would only fail soft back to it, so the envelope is pure wire weight"
         );
 
-        let forged = transform_for_test(
+        let forged = transform_for_non_resolving_server(
             response(json!({ ENVELOPE_KEY: { "origin": "spoofed" } })),
             &offset,
             TEST_REGION_END,
@@ -804,7 +806,7 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed = transform_for_test(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
@@ -837,8 +839,12 @@ mod tests {
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_a_completion_response"}))]
     #[case::error_response(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     fn completion_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
-        let transformed =
-            transform_for_test(response, &RegionOffset::new(3, 0), TEST_REGION_END, None);
+        let transformed = transform_for_non_resolving_server(
+            response,
+            &RegionOffset::new(3, 0),
+            TEST_REGION_END,
+            None,
+        );
         assert!(transformed.is_none());
     }
 
@@ -860,7 +866,7 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed = transform_for_test(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
@@ -909,7 +915,7 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_for_test(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
@@ -955,7 +961,7 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed = transform_for_test(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
@@ -997,8 +1003,12 @@ mod tests {
             }
         });
 
-        let transformed =
-            transform_for_test(response, &RegionOffset::new(10, 4), TEST_REGION_END, None);
+        let transformed = transform_for_non_resolving_server(
+            response,
+            &RegionOffset::new(10, 4),
+            TEST_REGION_END,
+            None,
+        );
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
@@ -1034,8 +1044,12 @@ mod tests {
             }
         });
 
-        let transformed =
-            transform_for_test(response, &RegionOffset::new(10, 4), TEST_REGION_END, None);
+        let transformed = transform_for_non_resolving_server(
+            response,
+            &RegionOffset::new(10, 4),
+            TEST_REGION_END,
+            None,
+        );
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
@@ -1075,8 +1089,12 @@ mod tests {
             }
         });
 
-        let transformed =
-            transform_for_test(response, &RegionOffset::new(5, 7), TEST_REGION_END, None);
+        let transformed = transform_for_non_resolving_server(
+            response,
+            &RegionOffset::new(5, 7),
+            TEST_REGION_END,
+            None,
+        );
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(ref edit)) =
@@ -1118,8 +1136,12 @@ mod tests {
             }
         });
 
-        let transformed =
-            transform_for_test(response, &RegionOffset::new(5, 3), TEST_REGION_END, None);
+        let transformed = transform_for_non_resolving_server(
+            response,
+            &RegionOffset::new(5, 3),
+            TEST_REGION_END,
+            None,
+        );
 
         let list = transformed.unwrap();
         let edits = list.items[0].additional_text_edits.as_ref().unwrap();
@@ -1188,7 +1210,7 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_for_test(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
@@ -1634,7 +1656,7 @@ mod tests {
             ]
         });
 
-        let list = transform_for_test(response, &offset, region_end, None).unwrap();
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
 
         assert_eq!(list.items.len(), 1, "prefix-breaking item must be dropped");
         assert_eq!(list.items[0].label, "safe");
@@ -1670,7 +1692,7 @@ mod tests {
             ]
         });
 
-        let list = transform_for_test(response, &offset, region_end, None).unwrap();
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
 
         assert_eq!(list.items.len(), 1, "item with safe primary edit is kept");
         assert!(
@@ -1700,7 +1722,7 @@ mod tests {
             ]
         });
 
-        let list = transform_for_test(response, &offset, region_end, None).unwrap();
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
 
         assert!(
             list.items.is_empty(),
@@ -1732,7 +1754,7 @@ mod tests {
             ]
         });
 
-        let list = transform_for_test(response, &offset, region_end, None).unwrap();
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
 
         assert_eq!(list.items.len(), 1, "region-escaping item must drop");
         assert_eq!(list.items[0].label, "contained");
@@ -1757,13 +1779,14 @@ mod tests {
             ]
         });
 
-        let list = transform_for_test(response.clone(), &offset, region_end, None).unwrap();
+        let list = transform_for_non_resolving_server(response.clone(), &offset, region_end, None)
+            .unwrap();
         assert_eq!(list.items.len(), 1, "multiline fallback must drop");
         assert_eq!(list.items[0].label, "single");
 
         // Same response in a plain fenced region: both survive.
         let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
-        let list = transform_for_test(response, &plain, region_end, None).unwrap();
+        let list = transform_for_non_resolving_server(response, &plain, region_end, None).unwrap();
         assert_eq!(list.items.len(), 2, "plain regions take multiline inserts");
     }
 
@@ -1794,7 +1817,8 @@ mod tests {
             ]
         });
 
-        let list = transform_for_test(response.clone(), &offset, region_end, None).unwrap();
+        let list = transform_for_non_resolving_server(response.clone(), &offset, region_end, None)
+            .unwrap();
         let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(
             labels,
@@ -1804,7 +1828,7 @@ mod tests {
 
         // Plain (all-zero) region: everything survives.
         let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
-        let list = transform_for_test(response, &plain, region_end, None).unwrap();
+        let list = transform_for_non_resolving_server(response, &plain, region_end, None).unwrap();
         assert_eq!(list.items.len(), 3, "plain regions are exempt");
     }
 
@@ -1842,13 +1866,17 @@ mod tests {
         });
 
         // Requested on host line 5 (virtual line 2, unprefixed): kept.
-        let list = transform_for_test(response.clone(), &offset, region_end, Some(5)).unwrap();
+        let list =
+            transform_for_non_resolving_server(response.clone(), &offset, region_end, Some(5))
+                .unwrap();
         assert_eq!(list.items.len(), 1, "later-line insertion is safe");
 
         // Requested on host line 3 (virtual line 0): in a MULTI-LINE region
         // line 0's captured content runs to end-of-line, so the inserted
         // newline splits only injected content — kept.
-        let list = transform_for_test(response.clone(), &offset, region_end, Some(3)).unwrap();
+        let list =
+            transform_for_non_resolving_server(response.clone(), &offset, region_end, Some(3))
+                .unwrap();
         assert_eq!(list.items.len(), 1, "multi-line region line 0 is safe");
 
         // Same shape but a SAME-LINE inline region (region end on the start
@@ -1858,7 +1886,8 @@ mod tests {
             line: 3,
             character: 20,
         };
-        let list = transform_for_test(response, &offset, inline_end, Some(3)).unwrap();
+        let list =
+            transform_for_non_resolving_server(response, &offset, inline_end, Some(3)).unwrap();
         assert!(
             list.items.is_empty(),
             "inline-region line-0 insertion would split the host line"
@@ -1890,7 +1919,7 @@ mod tests {
             ]
         });
 
-        let list = transform_for_test(response, &offset, region_end, None).unwrap();
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
         assert!(
             list.items.is_empty(),
             "either prefixed start line must reject the snippet variable"
@@ -1916,14 +1945,17 @@ mod tests {
         });
 
         let mixed = RegionOffset::with_per_line_offsets(3, vec![2, 0, 0]);
-        let list = transform_for_test(response.clone(), &mixed, region_end, Some(4)).unwrap();
+        let list =
+            transform_for_non_resolving_server(response.clone(), &mixed, region_end, Some(4))
+                .unwrap();
         assert!(
             list.items.is_empty(),
             "boundary-adjacent insertion in a prefixed region must drop"
         );
 
         let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
-        let list = transform_for_test(response, &plain, region_end, Some(4)).unwrap();
+        let list =
+            transform_for_non_resolving_server(response, &plain, region_end, Some(4)).unwrap();
         assert_eq!(list.items.len(), 1, "all-zero regions keep no boundary");
     }
 }
