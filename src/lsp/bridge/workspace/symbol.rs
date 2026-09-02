@@ -1515,6 +1515,41 @@ mod tests {
         assert!(symbol.legacy_deprecated);
     }
 
+    /// A lazy symbol whose downstream payload squats on the reserved key must
+    /// be enveloped even when the origin does not resolve: left bare, the
+    /// foreign object reaches the client and comes back on
+    /// `workspaceSymbol/resolve` looking like a bridge envelope of the
+    /// downstream's choosing. Wrapping nests it as `inner` instead, as the
+    /// completion, codeLens, documentLink and inlayHint producers do.
+    #[test]
+    fn reserved_key_payload_is_enveloped_even_when_the_origin_does_not_resolve() {
+        let lazy = NormalizedSymbol::from(WorkspaceSymbol {
+            name: "lazy".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Right(WorkspaceLocation {
+                uri: location().uri,
+            }),
+            data: Some(
+                serde_json::json!({ ENVELOPE_KEY: { "workspaceSymbol": { "origin": "forged" } } }),
+            ),
+        });
+        assert!(needs_resolve_envelope(&lazy, false));
+
+        let bare = NormalizedSymbol::from(WorkspaceSymbol {
+            name: "lazy".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Right(WorkspaceLocation {
+                uri: location().uri,
+            }),
+            data: Some(serde_json::json!({ "token": 1 })),
+        });
+        assert!(!needs_resolve_envelope(&bare, false));
+    }
+
     #[test]
     #[allow(deprecated)]
     fn mixed_eager_symbols_restore_legacy_deprecation_for_tag_incapable_clients() {
