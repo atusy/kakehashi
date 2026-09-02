@@ -37,8 +37,8 @@ pub(crate) struct BridgeResponseContext<'a> {
 pub(crate) struct RequestHostLifecycle<'a> {
     pool: &'a LanguageServerPool,
     host_uri: &'a Url,
-    lifecycle: Arc<tokio::sync::Mutex<()>>,
-    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    lifecycle: Arc<tokio::sync::RwLock<()>>,
+    guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     incarnation: u64,
 }
 
@@ -67,7 +67,9 @@ impl LanguageServerPool {
                 format!("bridge: host document is closed: {host_uri}"),
             )
         })?;
-        let guard = Arc::clone(&lifecycle).lock_owned().await;
+        // SHARED: concurrent requests on one document must overlap. Only
+        // lifecycle transitions take this exclusively.
+        let guard = Arc::clone(&lifecycle).read_owned().await;
         let Some(incarnation) = self.current_host_incarnation(host_uri) else {
             drop(guard);
             self.remove_host_lifecycle_lock_if_unshared(host_uri, &lifecycle);
@@ -558,6 +560,51 @@ mod tests {
             panic!("closed host must reject a late request");
         };
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    /// The host and virt layers of one document race under `try_join!`, and
+    /// each takes this lock for its whole downstream round trip. If it were
+    /// exclusive, the second layer could not even send its request until the
+    /// first answered — a client `$/cancelRequest` would then have nothing to
+    /// forward to the layer that had not started, which is exactly what
+    /// `e2e_whole_document_link_cancel_forwards_to_concatenated_layers` saw.
+    #[tokio::test]
+    async fn concurrent_requests_on_one_document_hold_the_lifecycle_together() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/concurrent-layers.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        let first = pool.request_host_lifecycle(&host_uri).await.unwrap();
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pool.request_host_lifecycle(&host_uri),
+        )
+        .await
+        .expect("a second in-flight request must not wait out the first")
+        .expect("the document is still open");
+
+        assert_eq!(first.incarnation(), 1);
+        assert_eq!(second.incarnation(), 1);
+
+        // A close still waits for BOTH to finish.
+        let close = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            tokio::spawn(async move { pool.close_host_incarnation(&host_uri, 1).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !close.is_finished(),
+            "close must not pass an in-flight request"
+        );
+        drop(first);
+        tokio::task::yield_now().await;
+        assert!(
+            !close.is_finished(),
+            "close must wait for the last in-flight request, not just the first"
+        );
+        drop(second);
+        close.await.unwrap();
     }
 
     #[tokio::test]

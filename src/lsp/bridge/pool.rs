@@ -292,7 +292,14 @@ struct OpenClaimGuard {
 }
 
 type OpenTransitionLocks = DashMap<(ConnectionKey, String), Arc<tokio::sync::Mutex<()>>>;
-type HostLifecycleLocks = DashMap<Url, Arc<tokio::sync::Mutex<()>>>;
+/// Per-host-document lifecycle lock, as a reader/writer lock: in-flight
+/// requests take it **shared**, lifecycle transitions (open / close / eager
+/// open / routing resolution) take it **exclusive**. Shared is what makes the
+/// host and virt layers of one document run concurrently — with a plain mutex
+/// each layer waited out the other's full downstream round trip, so
+/// `race_layers_concatenated`'s `try_join!` was serialized by a lock and a
+/// client cancel could not reach a layer that had not started yet.
+type HostLifecycleLocks = DashMap<Url, Arc<tokio::sync::RwLock<()>>>;
 pub(crate) struct HostVirtualContents {
     // The open lifetime that owns this container. Reopen replaces the whole
     // container, so a stale publisher holding the old DashMap guard can only
@@ -2077,11 +2084,14 @@ impl LanguageServerPool {
             .insert(region_id.to_string(), Arc::<str>::from(content));
     }
 
-    pub(crate) fn host_lifecycle_lock(&self, host_uri: &Url) -> Arc<tokio::sync::Mutex<()>> {
+    /// The document's lifecycle lock, created on first use. Transitions lock it
+    /// exclusively (`write`); requests take [`Self::request_host_lifecycle`],
+    /// which locks it shared.
+    pub(crate) fn host_lifecycle_lock(&self, host_uri: &Url) -> Arc<tokio::sync::RwLock<()>> {
         Arc::clone(
             self.host_lifecycle_locks
                 .entry(host_uri.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
                 .value(),
         )
     }
@@ -2095,7 +2105,7 @@ impl LanguageServerPool {
     pub(crate) fn existing_host_lifecycle_lock(
         &self,
         host_uri: &Url,
-    ) -> Option<Arc<tokio::sync::Mutex<()>>> {
+    ) -> Option<Arc<tokio::sync::RwLock<()>>> {
         self.host_lifecycle_locks
             .get(host_uri)
             .map(|entry| Arc::clone(entry.value()))
@@ -2104,7 +2114,7 @@ impl LanguageServerPool {
     pub(crate) fn remove_host_lifecycle_lock_if_unshared(
         &self,
         host_uri: &Url,
-        lifecycle: &Arc<tokio::sync::Mutex<()>>,
+        lifecycle: &Arc<tokio::sync::RwLock<()>>,
     ) {
         self.host_lifecycle_locks.remove_if(host_uri, |_, current| {
             Arc::ptr_eq(current, lifecycle)
@@ -2115,7 +2125,7 @@ impl LanguageServerPool {
 
     pub(crate) async fn open_host_incarnation(&self, host_uri: &Url, incarnation: u64) {
         let lifecycle = self.host_lifecycle_lock(host_uri);
-        let _guard = lifecycle.lock().await;
+        let _guard = lifecycle.write().await;
         self.latest_virtual_contents.insert(
             host_uri.clone(),
             HostVirtualContents {
@@ -2127,7 +2137,7 @@ impl LanguageServerPool {
 
     pub(crate) async fn close_host_incarnation(&self, host_uri: &Url, incarnation: u64) {
         let lifecycle = self.host_lifecycle_lock(host_uri);
-        let guard = lifecycle.lock().await;
+        let guard = lifecycle.write().await;
         // A delayed close from an older lifetime must not clear a fast reopen's
         // cache container.
         self.latest_virtual_contents

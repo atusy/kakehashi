@@ -211,7 +211,7 @@ impl LanguageServerPool {
     pub(crate) async fn close_host_bridge_document(&self, uri: &Url) {
         self.finish_all_host_routing(uri);
         let lifecycle = self.host_lifecycle_lock(uri);
-        let _lifecycle_guard = lifecycle.lock().await;
+        let _lifecycle_guard = lifecycle.write().await;
         self.invalidate_diagnostic_host(uri);
         let Ok(uri_lsp) = host_url_to_lsp_uri(uri) else {
             return;

@@ -70,7 +70,7 @@ pub(crate) struct OpenExpectation<'a> {
 struct LifecycleCleanup<'a> {
     pool: &'a LanguageServerPool,
     host_uri: &'a url::Url,
-    lifecycle: &'a Arc<tokio::sync::Mutex<()>>,
+    lifecycle: &'a Arc<tokio::sync::RwLock<()>>,
 }
 
 impl Drop for LifecycleCleanup<'_> {
@@ -238,7 +238,9 @@ impl LanguageServerPool {
             // this entry, so it either linearizes after this open (and closes the
             // tracked virtual document) or wins first and makes this stale batch
             // stop without opening old content.
-            let lifecycle_guard = lifecycle.lock().await;
+            // EXCLUSIVE: this opens virtual documents, so it must linearize
+            // against close/reopen the same way the transitions do.
+            let lifecycle_guard = lifecycle.write().await;
             let current_incarnation = self.current_host_incarnation(host_uri);
             if current_incarnation != Some(expected_incarnation) {
                 drop(lifecycle_guard);
@@ -353,7 +355,7 @@ impl LanguageServerPool {
         live_text_reader: Option<&(dyn Fn() -> Option<Arc<str>> + Send + Sync)>,
     ) {
         let lifecycle = self.host_lifecycle_lock(host_uri);
-        let _lifecycle_guard = lifecycle.lock().await;
+        let _lifecycle_guard = lifecycle.write().await;
         let handle = match self
             .get_or_create_connection_wait_ready(
                 server_name,
