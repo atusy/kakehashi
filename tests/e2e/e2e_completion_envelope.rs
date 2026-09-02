@@ -103,6 +103,11 @@ fn e2e_virtual_completion_from_non_resolving_server_keeps_its_data() {
     );
 
     let response = client.send_request("completionItem/resolve", item.clone());
+    assert!(
+        response.get("error").is_none(),
+        "unexpected resolve error: {:?}",
+        response.get("error")
+    );
     assert_eq!(
         response["result"], item,
         "a bare item has no origin to route to and comes back unchanged"

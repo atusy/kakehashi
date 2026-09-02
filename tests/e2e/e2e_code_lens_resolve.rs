@@ -295,6 +295,11 @@ fn e2e_virtual_code_lens_from_non_resolving_server_keeps_its_data() {
     assert_eq!(lens["data"], json!({ "mock": "lens-1" }));
 
     let response = client.send_request("codeLens/resolve", lens.clone());
+    assert!(
+        response.get("error").is_none(),
+        "unexpected resolve error: {:?}",
+        response.get("error")
+    );
     assert_eq!(
         response["result"], lens,
         "a bare lens has no origin to route to and comes back unchanged"
