@@ -26,17 +26,17 @@ use tower_lsp_server::ls_types::{
 use ulid::Ulid;
 use url::Url;
 
+use super::super::Kakehashi;
 use super::super::bridge_context::RangeRequestContext;
-use super::super::{Kakehashi, detect_document_language};
+use super::super::region_offset::resolve_region_offset;
 use crate::config::settings::AggregationStrategy;
-use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
     FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
     dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{
     CodeActionEnvelope, HostDocument, RegionOffset, UpstreamCodeActionCaps, bridge_code_actions,
-    extract_code_action_envelope, parse_code_actions_leniently, region_host_end,
+    extract_code_action_envelope, parse_code_actions_leniently,
 };
 
 const METHOD: &str = "textDocument/codeAction";
@@ -300,34 +300,23 @@ impl Kakehashi {
         envelope: &CodeActionEnvelope,
         host_url: &Url,
     ) -> Option<Position> {
-        // Re-resolve the region from the LIVE parse (same construction as the
-        // goto/showDocument offset path), yielding the current per-line offset
-        // and virtual content used to derive the exact mapped host end.
-        let snapshot = self.documents.get(host_url)?.snapshot()?;
-        let language_name = detect_document_language(&self.language, &self.documents, host_url)?;
-        let injection_query = self.language.injection_query(&language_name)?;
-        let resolved = InjectionResolver::resolve_by_region_id(
+        // Re-resolve the region from the LIVE parse (the same construction the
+        // goto/showDocument/applyEdit offset paths use), yielding the current
+        // per-line offset and the exact mapped host end.
+        let (live_offset, region_end, contiguous) = resolve_region_offset(
+            &self.documents,
             &self.language,
-            self.bridge.node_tracker(),
+            &self.bridge,
             host_url,
-            snapshot.tree(),
-            snapshot.text(),
-            injection_query.as_ref(),
             &envelope.region_id,
-            snapshot.incarnation(),
         )?;
         // The action may have been created while a single combined capture was
         // contiguous, then resolved after another capture introduced a masked
         // host gap. The stable first-region ID/offset alone cannot detect that
         // geometry change, so re-check live edit safety here.
-        if !resolved.contiguous {
+        if !contiguous {
             return None;
         }
-        let live_offset = RegionOffset::with_per_line_offsets(
-            resolved.region.line_range.start,
-            resolved.line_column_offsets,
-        );
-        let region_end = region_host_end(&resolved.virtual_content, &live_offset);
         // Compare the WHOLE offset, not just the start: a diverged interior
         // per-line column offset (e.g. a blockquote-prefix edit that left the
         // start line intact) would translate the resolved edit to wrong host
