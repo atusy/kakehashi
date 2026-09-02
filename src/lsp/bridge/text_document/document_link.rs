@@ -11,6 +11,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::config::settings::BridgeServerConfig;
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope};
 use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,8 +27,6 @@ use super::super::protocol::{translate_host_range_to_virtual, translate_virtual_
 use super::completion::EnvelopeOffset;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-
-const ENVELOPE_KEY: &str = "kakehashi";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct DocumentLinkEnvelope {
@@ -115,19 +114,6 @@ fn re_envelope_link(link: &mut DocumentLink, envelope: &DocumentLinkEnvelope) {
     );
 }
 
-/// A downstream that cannot resolve gains nothing from the routing envelope,
-/// so its opaque `data` passes through untouched — except when that data
-/// carries the reserved key itself, which would otherwise let a downstream
-/// present a payload of its own choosing as kakehashi routing metadata. Those
-/// are wrapped anyway, with the foreign object nested as `inner`.
-fn should_envelope_link(link: &DocumentLink, server_resolves: bool) -> bool {
-    server_resolves
-        || link
-            .data
-            .as_ref()
-            .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
-}
-
 pub(crate) fn envelope_host_document_links(
     links: &mut [DocumentLink],
     server_name: &str,
@@ -150,7 +136,7 @@ pub(crate) fn envelope_host_document_links(
         host_layer: true,
     };
     for link in links {
-        if should_envelope_link(link, server_resolves) {
+        if should_envelope(link.data.as_ref(), server_resolves) {
             envelope_link_data(link, &ctx);
         }
     }
@@ -487,7 +473,7 @@ fn transform_document_link_response_to_host(
     // Transform ranges to host coordinates
     for link in &mut links {
         translate_virtual_range_to_host(&mut link.range, offset);
-        if should_envelope_link(link, server_resolves) {
+        if should_envelope(link.data.as_ref(), server_resolves) {
             envelope_link_data(link, envelope_ctx);
         }
     }

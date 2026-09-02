@@ -23,6 +23,7 @@ use serde_json::Value;
 use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
+use crate::lsp::bridge::envelope::ENVELOPE_KEY;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionDisabled, CodeActionOrCommand, CodeActionParams,
     CodeActionResponse, DocumentChangeOperation, DocumentChanges, NumberOrString,
@@ -40,9 +41,6 @@ use super::super::protocol::{
     workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 use super::completion::EnvelopeOffset;
-
-/// Wrapper key inside `CodeAction.data` that identifies the origin server.
-const ENVELOPE_KEY: &str = "kakehashi";
 
 /// Envelope stored in `CodeAction.data` for routing `codeAction/resolve`
 /// (#568 PR 4), mirroring [`CodeLensEnvelope`](super::code_lens::CodeLensEnvelope).

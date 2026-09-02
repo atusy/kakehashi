@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::settings::BridgeServerConfig;
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope};
 use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position};
 use url::Url;
 
@@ -122,7 +123,7 @@ fn build_completion_request(
 /// Normalizes all responses to `CompletionList` (an array result is wrapped as
 /// `CompletionList { isIncomplete: false, items }`). Returns `None` for null
 /// results, missing results, and deserialization failures. Each item that
-/// [`should_envelope_item`] selects — the origin advertises
+/// [`should_envelope`] selects — the origin advertises
 /// `completionItem/resolve`, or the payload squats on the reserved key — has
 /// its `data` wrapped in a routing envelope; the rest pass through bare.
 fn transform_completion_response_to_host(
@@ -167,7 +168,7 @@ fn transform_completion_response_to_host(
         if !transform_completion_item(item, offset, region_end, request_host_line) {
             return false;
         }
-        if should_envelope_item(item, server_resolves) {
+        if should_envelope(item.data.as_ref(), server_resolves) {
             envelope_item_data(item, envelope_ctx);
         }
         true
@@ -386,9 +387,6 @@ fn snippet_contains_variable(text: &str) -> bool {
 // Envelope types for completionItem/resolve routing
 // =============================================================================
 
-/// Wrapper key inside `CompletionItem.data` that identifies the origin server.
-const ENVELOPE_KEY: &str = "kakehashi";
-
 /// Envelope stored in `CompletionItem.data` for routing `completionItem/resolve`.
 ///
 /// When Kakehashi fans out completion to multiple downstream servers, each item's
@@ -598,23 +596,10 @@ pub(crate) fn bridge_host_completion_items(
         CompletionResponse::List(list) => &mut list.items,
     };
     for item in items.iter_mut() {
-        if should_envelope_item(item, server_resolves) {
+        if should_envelope(item.data.as_ref(), server_resolves) {
             envelope_host_item(item, server_name, host_uri);
         }
     }
-}
-
-/// Whether an item must carry a routing envelope: the origin advertises
-/// `completionItem/resolve`, or the item's own `data` already occupies the
-/// envelope key — the one case a non-resolving server's item must still be
-/// wrapped, so its payload is nested rather than read back as routing
-/// metadata it never earned.
-fn should_envelope_item(item: &CompletionItem, server_resolves: bool) -> bool {
-    server_resolves
-        || item
-            .data
-            .as_ref()
-            .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
 }
 
 /// Wrap a HOST-layer item's `data` in a routing envelope so a later

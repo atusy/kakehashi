@@ -40,9 +40,7 @@ use super::completion::EnvelopeOffset;
 use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-
-/// Wrapper key inside `CodeLens.data` that identifies the origin server.
-const ENVELOPE_KEY: &str = "kakehashi";
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope};
 
 /// Envelope stored in `CodeLens.data` for routing `codeLens/resolve` (#355).
 ///
@@ -182,22 +180,10 @@ pub(crate) fn envelope_host_code_lenses(
         host_layer: true,
     };
     for lens in lenses {
-        if should_envelope_lens(lens, server_resolves) {
+        if should_envelope(lens.data.as_ref(), server_resolves) {
             envelope_lens_data(lens, &ctx);
         }
     }
-}
-
-/// Whether a lens must carry a routing envelope: the origin advertises
-/// `codeLens/resolve`, or the lens's own `data` already occupies the envelope
-/// key — the one case a non-resolving server's lens must still be wrapped, so
-/// its payload is nested rather than read back as routing metadata.
-fn should_envelope_lens(lens: &CodeLens, server_resolves: bool) -> bool {
-    server_resolves
-        || lens
-            .data
-            .as_ref()
-            .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
 }
 
 impl LanguageServerPool {
@@ -569,7 +555,7 @@ fn parse_code_lens_resolve_response(mut response: serde_json::Value) -> Option<C
 /// Transform a code lens response from virtual to host document coordinates.
 ///
 /// Each lens's `range` is translated by `offset`, and the `data` of each lens
-/// that [`should_envelope_lens`] selects — the origin advertises
+/// that [`should_envelope`] selects — the origin advertises
 /// `codeLens/resolve`, or the payload squats on the reserved key — is wrapped
 /// in a routing envelope so `codeLens/resolve` can find the origin server
 /// later; the rest pass through bare. Unresolved lenses (no `command`) are
@@ -594,7 +580,7 @@ fn transform_code_lens_response_to_host(
 
     for lens in &mut lenses {
         translate_virtual_range_to_host(&mut lens.range, offset);
-        if should_envelope_lens(lens, server_resolves) {
+        if should_envelope(lens.data.as_ref(), server_resolves) {
             envelope_lens_data(lens, envelope_ctx);
         }
     }
