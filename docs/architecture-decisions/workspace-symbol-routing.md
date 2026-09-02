@@ -44,11 +44,17 @@ root and cannot follow workspace-folder changes, search uses the client-root
 fallback connection instead. Reusing that marker-rooted process would make the
 search scope depend on which document happened to start it first.
 
-Symbols from a resolve-capable server carry an opaque envelope containing the
-producer's server name, connection identity, connection generation, and
-original `data`. Resolve is sent only to that exact live producer. A missing,
-replaced, or reconfigured producer returns the unresolved enveloped symbol
-instead of sending opaque process-owned data to another process.
+Lazy symbols from a resolve-capable server carry an opaque envelope containing
+the producer's server name, connection identity, connection generation, and
+original `data`. The envelope decision is the shared rule in
+`bridge::envelope`: a lazy symbol whose `data` nests the reserved key is
+enveloped even when its producer does not resolve, so the foreign object is
+nested as `inner` rather than parsed as a routing envelope on
+`workspaceSymbol/resolve`. Resolve is sent only to that exact live producer. A
+missing, replaced, or reconfigured producer returns the unresolved enveloped
+symbol instead of sending opaque process-owned data to another process; a
+producer that no longer advertises resolve is logged at warn, or at debug when
+the payload nests the reserved key (its steady state).
 
 An exact virtual URI previously issued to the producing connection is projected
 back to its host URI and current injection offset. The request snapshots the
