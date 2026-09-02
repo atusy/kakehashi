@@ -120,34 +120,12 @@ impl CancelForwarder {
     /// downstream `$/cancelRequest` (capture-before-notify; see
     /// `forward_cancel_by_upstream_id_with_notify`).
     #[cfg(test)]
-    pub(crate) async fn forward_cancel(&self, upstream_id: UpstreamId) -> std::io::Result<()> {
+    pub(crate) fn forward_cancel(&self, upstream_id: UpstreamId) -> std::io::Result<()> {
         let generation = self.request_generation(&upstream_id);
         self.forward_cancel_for_generation(upstream_id, generation)
-            .await
     }
 
-    #[cfg(test)]
-    async fn forward_cancel_for_generation(
-        &self,
-        upstream_id: UpstreamId,
-        generation: Option<u64>,
-    ) -> std::io::Result<()> {
-        let validate_forwarder = self.clone();
-        let notify_forwarder = self.clone();
-        let validate_id = upstream_id.clone();
-        let notify_id = upstream_id.clone();
-        self.pool
-            .forward_cancel_by_upstream_id_if_current(
-                upstream_id,
-                move || validate_forwarder.request_generation(&validate_id) == generation,
-                move || {
-                    notify_forwarder.notify_cancel_for_generation(&notify_id, generation);
-                },
-            )
-            .await
-    }
-
-    fn forward_cancel_for_generation_sync(
+    fn forward_cancel_for_generation(
         &self,
         upstream_id: UpstreamId,
         generation: Option<u64>,
@@ -512,7 +490,7 @@ where
         // exact handles needed to do this without awaiting the connections map.
         if let Some((forwarder, upstream_id, generation)) = cancel_request
             && let Err(error) =
-                forwarder.forward_cancel_for_generation_sync(upstream_id.clone(), Some(generation))
+                forwarder.forward_cancel_for_generation(upstream_id.clone(), Some(generation))
         {
             log::debug!(
                 target: "kakehashi::cancel",
@@ -947,7 +925,6 @@ mod tests {
         let mut new_request_cancel = forwarder.subscribe(upstream_id.clone()).unwrap();
         forwarder
             .forward_cancel_for_generation(upstream_id, old_generation)
-            .await
             .unwrap();
 
         assert!(matches!(
