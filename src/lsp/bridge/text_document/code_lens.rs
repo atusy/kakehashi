@@ -1065,4 +1065,62 @@ mod tests {
             .await;
         assert_eq!(result.data, Some(json!({"custom": true})));
     }
+
+    /// The resolve-side capability gate is the authoritative one: an envelope
+    /// is minted for a resolving origin, so reaching a non-resolving handle
+    /// means the origin changed under the lens (dynamic unregister, respawn)
+    /// or the payload was wrapped for squatting on the reserved key. Either
+    /// way the lens comes back unresolved AND the anomaly is logged, as the
+    /// completion and codeAction paths already do.
+    #[test]
+    fn dispatch_warns_and_re_envelopes_when_origin_no_longer_resolves() {
+        use crate::lsp::bridge::test_logging::captured_warnings_for;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let warnings = captured_warnings_for(|| {
+            runtime.block_on(async {
+                let pool = LanguageServerPool::new();
+                let key = ConnectionKey::for_server("lua-ls");
+                let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
+                    crate::lsp::bridge::ConnectionState::Ready,
+                    key.clone(),
+                )
+                .await;
+                pool.insert_connection(handle).await;
+                let mut settings = WorkspaceSettings::default();
+                settings.language_servers.insert(
+                    "lua-ls".to_string(),
+                    BridgeServerConfig {
+                        cmd: Some(vec!["lua-language-server".to_string()]),
+                        ..Default::default()
+                    },
+                );
+                let mut lenses = vec![CodeLens {
+                    range: tower_lsp_server::ls_types::Range::default(),
+                    command: None,
+                    data: Some(json!({"kind": "references"})),
+                }];
+                envelope_host_code_lenses(
+                    &mut lenses,
+                    "lua-ls",
+                    "file:///test.md",
+                    None,
+                    pool.document_connection_generation(&key),
+                    &key,
+                    true,
+                );
+
+                let result = pool
+                    .dispatch_code_lens_resolve(lenses.remove(0), &settings, None)
+                    .await;
+                let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
+                assert_eq!(envelope.inner, Some(json!({"kind": "references"})));
+                assert!(result.command.is_none(), "lens stays unresolved");
+            });
+        });
+        assert!(
+            warnings.iter().any(|w| w.contains("codeLens/resolve")
+                && w.contains("no longer advertises resolveProvider")),
+            "the capability miss must be logged, not silently swallowed: {warnings:?}"
+        );
+    }
 }

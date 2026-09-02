@@ -869,4 +869,58 @@ mod tests {
         assert_eq!(envelope.inner, Some(json!({"token": "link-1"})));
         assert!(result.target.is_none());
     }
+
+    /// The resolve-side capability gate is the authoritative one: an envelope
+    /// is minted for a resolving origin, so reaching a non-resolving handle
+    /// means the origin changed under the link (dynamic unregister, respawn)
+    /// or the payload was wrapped for squatting on the reserved key. Either
+    /// way the link comes back unresolved AND the anomaly is logged, as the
+    /// completion and codeAction paths already do.
+    #[test]
+    fn dispatch_warns_and_re_envelopes_when_origin_no_longer_resolves() {
+        use crate::lsp::bridge::test_logging::captured_warnings_for;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let warnings = captured_warnings_for(|| {
+            runtime.block_on(async {
+                let pool = LanguageServerPool::new();
+                let key = ConnectionKey::for_server("lua-ls");
+                let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
+                    crate::lsp::bridge::ConnectionState::Ready,
+                    key.clone(),
+                )
+                .await;
+                pool.insert_connection(handle).await;
+                let mut settings = crate::config::settings::WorkspaceSettings::default();
+                settings.language_servers.insert(
+                    "lua-ls".to_string(),
+                    crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec!["lua-language-server".to_string()]),
+                        ..Default::default()
+                    },
+                );
+                let mut links = vec![unresolved_link(Some(json!({"token": "link-1"})))];
+                envelope_host_document_links(
+                    &mut links,
+                    "lua-ls",
+                    "file:///test.md",
+                    None,
+                    pool.document_connection_generation(&key),
+                    &key,
+                    true,
+                );
+
+                let result = pool
+                    .dispatch_document_link_resolve(links.remove(0), &settings, None)
+                    .await;
+                let envelope = extract_document_link_envelope(&result).expect("envelope restored");
+                assert_eq!(envelope.inner, Some(json!({"token": "link-1"})));
+                assert!(result.target.is_none(), "link stays unresolved");
+            });
+        });
+        assert!(
+            warnings.iter().any(|w| w.contains("documentLink/resolve")
+                && w.contains("no longer advertises resolveProvider")),
+            "the capability miss must be logged, not silently swallowed: {warnings:?}"
+        );
+    }
 }
