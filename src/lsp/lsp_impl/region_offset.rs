@@ -40,8 +40,10 @@ impl Kakehashi {
     /// envelope was minted from, so regions under those directives (markdown
     /// frontmatter, blockquote prose) compare equal while unchanged.
     ///
-    /// One implementation serves every `*/resolve` staleness gate that keys
-    /// on `(host_uri, region_id, offset)`, so the gates cannot drift.
+    /// The code-lens and document-link gates ask exactly this question and
+    /// share this one answer, so they cannot drift. Completion and code
+    /// action need the region end and contiguity as well, so they call
+    /// [`resolve_region_offset`] directly and compare the same offset.
     pub(super) fn region_offset_is_fresh(
         &self,
         host_uri: &str,
