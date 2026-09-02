@@ -121,7 +121,11 @@ fn drain_stderr_loop(mut stderr: std::process::ChildStderr, sink: Arc<Mutex<Vec<
     let mut buf = [0u8; 8192];
     loop {
         match stderr.read(&mut buf) {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
+            // A signal can interrupt the read; giving up here would leave the
+            // pipe unread and reinstate the wedge this thread exists to prevent.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
             Ok(read) => {
                 let mut sink = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 sink.extend_from_slice(&buf[..read]);
