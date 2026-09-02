@@ -445,6 +445,101 @@ fn e2e_host_code_lens_from_closed_incarnation_stays_unresolved() {
     shutdown(&mut client);
 }
 
+/// A virt-layer lens is bound to the pooled process that produced it, as
+/// a host-layer lens is: after the origin server is relaunched (same pool
+/// key, new generation) or rerouted (different pool key), data minted by the
+/// old process must not be handed to the replacement. The old lens itself
+/// is already rejected by the incarnation gate (the reopen below), so the
+/// stale probe is the replacement's lens carrying the OLD producer identity.
+fn assert_replaced_virtual_connection_lens_stays_unresolved(change_pool_key: bool) {
+    let bin = mock_formatter_bin();
+    let (mut client, _config_dir) = init_client();
+    open_markdown(&mut client);
+    let old_lens = code_lens_with_retry(&mut client).remove(0);
+
+    let mut server = json!({
+        "cmd": [bin, "code-lens-replacement"],
+        "languages": ["lua"]
+    });
+    if change_pool_key {
+        server["preferSharedInstance"] = json!(true);
+    }
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "languageServers": { "mock-codelens": server } } }),
+    );
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": MARKDOWN_URI } }),
+    );
+    open_markdown(&mut client);
+
+    let replacement_lens = code_lens_with_retry(&mut client).remove(0);
+    let old_envelope = &old_lens["data"]["kakehashi"];
+    let replacement_envelope = &replacement_lens["data"]["kakehashi"];
+    assert!(
+        !old_envelope["connection_key"].is_null(),
+        "virt lenses must be bound to their producing connection: {old_envelope}"
+    );
+    if change_pool_key {
+        assert_ne!(
+            old_envelope["connection_key"], replacement_envelope["connection_key"],
+            "precondition: replacement must move from client-fallback to shared"
+        );
+        assert_eq!(
+            old_envelope["connection_generation"], replacement_envelope["connection_generation"],
+            "different keys should demonstrate the equal-generation collision"
+        );
+    } else {
+        assert_eq!(
+            old_envelope["connection_key"], replacement_envelope["connection_key"],
+            "precondition: replacement must reuse the same pool key"
+        );
+        assert_ne!(
+            old_envelope["connection_generation"], replacement_envelope["connection_generation"],
+            "same-key replacement must advance its generation"
+        );
+    }
+    let replacement = client.send_request("codeLens/resolve", replacement_lens.clone());
+    assert_eq!(
+        replacement["result"]["command"]["title"], "replacement resolved:lens-1",
+        "precondition: the replacement process must be active"
+    );
+
+    let mut stale_lens = replacement_lens;
+    stale_lens["data"]["kakehashi"]["connection_key"] = old_envelope["connection_key"].clone();
+    stale_lens["data"]["kakehashi"]["connection_generation"] =
+        old_envelope["connection_generation"].clone();
+    stale_lens["data"]["kakehashi"]["inner"] = old_envelope["inner"].clone();
+    let stale_data = stale_lens["data"].clone();
+    let response = client.send_request("codeLens/resolve", stale_lens);
+    assert!(
+        response.get("error").is_none(),
+        "stale producer data must fail soft, not as JSON-RPC error: {response}"
+    );
+    assert_eq!(
+        response["result"].get("command"),
+        None,
+        "opaque lens data must not be sent to a replacement process"
+    );
+    assert_eq!(
+        response["result"]["data"], stale_data,
+        "fail-soft resolve must preserve the original routing envelope"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_virtual_code_lens_from_same_key_replacement_stays_unresolved() {
+    assert_replaced_virtual_connection_lens_stays_unresolved(false);
+}
+
+#[test]
+fn e2e_virtual_code_lens_from_different_key_replacement_stays_unresolved() {
+    assert_replaced_virtual_connection_lens_stays_unresolved(true);
+}
+
 #[test]
 fn e2e_host_code_lens_resolve_cancel_returns_request_cancelled() {
     let cancel_dir = tempfile::TempDir::new().expect("cancel dir");

@@ -1199,4 +1199,73 @@ mod tests {
             "a reserved-key wrap is not a lost capability: {warnings:?}"
         );
     }
+
+    /// A virt-layer lens is bound to the exact pooled process that produced
+    /// it, as a host-layer lens already is: resolve requires the producing
+    /// key and generation, refuses a key that names a different server, and
+    /// fails soft BEFORE touching any connection when they do not match. The
+    /// fixture's live handle advertises nothing, so reaching it would log the
+    /// capability miss; a silent unresolved return therefore proves the gate
+    /// fired before the handle was consulted (and that nothing was spawned).
+    #[rstest]
+    #[case::unbound(None, None)]
+    #[case::stale_generation(Some("lua-ls"), Some(1))]
+    #[case::key_names_another_server(Some("other-ls"), Some(0))]
+    fn virt_dispatch_fails_soft_without_reaching_a_process_it_did_not_bind_to(
+        #[case] key_server: Option<&str>,
+        #[case] generation_delta: Option<u64>,
+    ) {
+        use crate::lsp::bridge::test_logging::captured_warnings_for;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let warnings = captured_warnings_for(|| {
+            runtime.block_on(async {
+                let pool = LanguageServerPool::new();
+                let host_uri = Url::parse("file:///test.md").expect("valid url");
+                pool.open_host_incarnation(&host_uri, 1).await;
+                let live_key = ConnectionKey::for_server("lua-ls");
+                let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
+                    crate::lsp::bridge::ConnectionState::Ready,
+                    live_key.clone(),
+                )
+                .await;
+                pool.insert_connection(handle).await;
+                let mut settings = WorkspaceSettings::default();
+                settings.language_servers.insert(
+                    "lua-ls".to_string(),
+                    BridgeServerConfig {
+                        cmd: Some(vec!["lua-language-server".to_string()]),
+                        ..Default::default()
+                    },
+                );
+                let stamped_key = key_server.map(ConnectionKey::for_server);
+                let stamped_generation = generation_delta
+                    .map(|delta| pool.document_connection_generation(&live_key) + delta);
+                let offset = RegionOffset::new(3, 0);
+                let mut lens = CodeLens {
+                    range: tower_lsp_server::ls_types::Range::default(),
+                    command: None,
+                    data: Some(json!({"kind": "references"})),
+                };
+                envelope_lens_data(
+                    &mut lens,
+                    &CodeLensEnvelopeContext {
+                        connection_generation: stamped_generation,
+                        connection_key: stamped_key.as_ref(),
+                        ..ctx_with(&offset)
+                    },
+                );
+
+                let result = pool.dispatch_code_lens_resolve(lens, &settings, None).await;
+                let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
+                assert_eq!(envelope.inner, Some(json!({"kind": "references"})));
+                assert_eq!(envelope.connection_key, stamped_key);
+                assert_eq!(envelope.connection_generation, stamped_generation);
+                assert!(result.command.is_none(), "lens stays unresolved");
+            });
+        });
+        assert!(
+            warnings.is_empty(),
+            "an unbound or mismatched envelope must fail soft before any connection is consulted: {warnings:?}"
+        );
+    }
 }
