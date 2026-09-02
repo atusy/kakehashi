@@ -45,13 +45,17 @@ Partially implemented:
   documentColor/colorPresentation pair. `completionItem/resolve` routes by
   the envelope stamped into `CompletionItem.data`; the host layer stamps one
   too (marked `host_layer`, so the resolve forwards VERBATIM — no coordinate
-  translation and no injection-region edit guard), but only for a server that
-  advertises `completionItem/resolve`. Without that capability the items stay
-  bare and a resolve falls back gracefully (item returned unresolved).
-  `codeLens/resolve` follows the same host-layer rule: a winning host server
-  that advertises resolve has its lenses stamped with an origin envelope, and
-  resolving one forwards the original payload and coordinates verbatim. A
-  non-resolving server's lens normally stays bare; the reserved-key collision
+  translation and no injection-region edit guard). Both layers mint under
+  one rule, shared by completion, codeLens, and documentLink: only for a
+  server that advertises the matching resolve method. Without that
+  capability the items stay bare — an envelope would be pure wire weight on
+  every item, and its resolve would only fail soft — so a client resolve
+  passes the bare item through unchanged. The resolve side re-checks the
+  capability on the live origin regardless and, finding it gone (a respawn
+  or dynamic unregister under the item), warns and returns the item
+  unresolved with its envelope restored. `codeLens/resolve` forwards the
+  original payload and coordinates verbatim on the host layer. A
+  non-resolving server's item normally stays bare; the reserved-key collision
   exception wraps `data.kakehashi` as opaque `inner` data so a downstream
   payload cannot impersonate bridge routing metadata. The envelope retains
   the host-document incarnation plus the exact producing `ConnectionKey` and
