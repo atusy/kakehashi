@@ -18,10 +18,46 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::Position;
 use url::Url;
 
+use super::Kakehashi;
 use crate::document::DocumentStore;
 use crate::language::injection::ResolvedInjection;
 use crate::language::{InjectionResolver, LanguageCoordinator};
-use crate::lsp::bridge::{BridgeCoordinator, RegionOffset, region_host_end};
+use crate::lsp::bridge::{BridgeCoordinator, EnvelopeOffset, RegionOffset, region_host_end};
+
+impl Kakehashi {
+    /// Whether the injection region a resolve envelope names still resolves
+    /// to the offset snapshot the envelope carries.
+    ///
+    /// Re-resolves the region from the live parse and compares the WHOLE
+    /// effective offset (start line plus every per-line column offset), so a
+    /// region that moved, was invalidated, or had an interior blockquote
+    /// prefix edited is reported stale — translating the resolved payload with
+    /// the snapshot offset would bind it to wrong host coordinates then. The
+    /// live offset is the same `#offset!`/`#trim!`-adjusted geometry the
+    /// envelope was minted from, so regions under those directives (markdown
+    /// frontmatter, blockquote prose) compare equal while unchanged.
+    ///
+    /// One implementation serves every `*/resolve` staleness gate that keys
+    /// on `(host_uri, region_id, offset)`, so the gates cannot drift.
+    pub(super) fn region_offset_is_fresh(
+        &self,
+        host_uri: &str,
+        region_id: &str,
+        offset: &EnvelopeOffset,
+    ) -> bool {
+        let Ok(host_url) = Url::parse(host_uri) else {
+            return false;
+        };
+        resolve_region_offset(
+            &self.documents,
+            &self.language,
+            &self.bridge,
+            &host_url,
+            region_id,
+        )
+        .is_some_and(|(live_offset, _, _)| live_offset == RegionOffset::from(offset))
+    }
+}
 
 /// Rebuild the region's current host offset from the live parse, keyed by its
 /// `region_id` (a ULID in production). Returns `None` when the offset can't be

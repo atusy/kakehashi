@@ -1,15 +1,10 @@
 //! Document link method for Kakehashi.
 
+use super::super::Kakehashi;
+use crate::lsp::bridge::{envelope_host_document_links, extract_document_link_envelope};
+use crate::lsp::current_upstream_id;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams};
-use url::Url;
-
-use super::super::Kakehashi;
-use super::super::region_offset::resolve_region_offset;
-use crate::lsp::bridge::{
-    DocumentLinkEnvelope, envelope_host_document_links, extract_document_link_envelope,
-};
-use crate::lsp::current_upstream_id;
 
 impl Kakehashi {
     pub(crate) async fn document_link_impl(
@@ -62,7 +57,13 @@ impl Kakehashi {
         let Some(envelope) = extract_document_link_envelope(&link) else {
             return Ok(link);
         };
-        if !envelope.is_host_layer() && !self.document_link_region_is_fresh(&envelope) {
+        if !envelope.is_host_layer()
+            && !self.region_offset_is_fresh(
+                &envelope.host_uri,
+                &envelope.region_id,
+                &envelope.offset,
+            )
+        {
             return Ok(link);
         }
 
@@ -84,21 +85,5 @@ impl Kakehashi {
             },
             None => Ok(dispatch.await),
         }
-    }
-
-    fn document_link_region_is_fresh(&self, envelope: &DocumentLinkEnvelope) -> bool {
-        let Ok(uri) = Url::parse(&envelope.host_uri) else {
-            return false;
-        };
-        resolve_region_offset(
-            &self.documents,
-            &self.language,
-            &self.bridge,
-            &uri,
-            &envelope.region_id,
-        )
-        .is_some_and(|(offset, _, _)| {
-            offset == crate::lsp::bridge::RegionOffset::from(&envelope.offset)
-        })
     }
 }
