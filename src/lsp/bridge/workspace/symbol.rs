@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
-use log::warn;
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
@@ -19,7 +19,7 @@ use crate::config::settings::WorkspaceSettings;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::error::LockResultExt;
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope};
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, nests_reserved_key, should_envelope};
 use crate::lsp::bridge::pool::{
     ConfirmedDocumentRevision, ConnectionHandle, ConnectionState, INIT_TIMEOUT_SECS,
     LanguageServerPool, UpstreamId, VirtualUriObserver,
@@ -940,11 +940,24 @@ impl LanguageServerPool {
             return fail_soft(symbol);
         };
         if !handle.has_capability(RESOLVE_METHOD) {
-            warn!(
-                target: "kakehashi::bridge",
-                "{RESOLVE_METHOD}: {:?} no longer advertises resolveProvider; returning unresolved",
-                envelope.origin
-            );
+            // Two ways here. A payload that nests the reserved key was wrapped
+            // only to keep it out of the routing metadata, regardless of
+            // resolve support, so landing here is its steady state. Anything
+            // else was enveloped because the origin resolved at mint time and
+            // the capability has since gone (respawn, dynamic unregister).
+            if nests_reserved_key(symbol.data.as_ref()) {
+                debug!(
+                    target: "kakehashi::bridge",
+                    "{RESOLVE_METHOD}: {:?} does not resolve; returning the reserved-key payload unresolved",
+                    envelope.origin
+                );
+            } else {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "{RESOLVE_METHOD}: {:?} no longer advertises resolveProvider; returning unresolved",
+                    envelope.origin
+                );
+            }
             return fail_soft(symbol);
         }
         let mut downstream_symbol = symbol.clone();
