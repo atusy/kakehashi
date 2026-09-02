@@ -3818,21 +3818,55 @@ impl LanguageServerPool {
         let mut targets = Vec::new();
         if let Some(connection_counts) = registry.get(&upstream_id) {
             for connection_key in connection_counts.keys() {
-                let Some(producers) = handles
+                // Every drop below is best-effort per LSP, but it must still be
+                // countable: this is the only path production takes, so an
+                // invisible drop here is a cancel that vanishes with no trace.
+                let producers: Vec<Arc<ConnectionHandle>> = handles
                     .get(&upstream_id)
                     .and_then(|by_key| by_key.get(connection_key))
-                else {
+                    .map(|producers| producers.iter().filter_map(Weak::upgrade).collect())
+                    .unwrap_or_default();
+                if producers.is_empty() {
+                    // The producing process is gone (replaced connection, or a
+                    // handle dropped between registration and cancel).
+                    self.cancel_metrics.record_no_connection();
+                    log::debug!(
+                        target: "kakehashi::bridge::cancel",
+                        "Cancel dropped: no live producer for '{}' (upstream_id: {}, expected if the connection was replaced)",
+                        connection_key,
+                        upstream_id
+                    );
                     continue;
-                };
-                for handle in producers
-                    .iter()
-                    .filter_map(Weak::upgrade)
+                }
+                let ready: Vec<Arc<ConnectionHandle>> = producers
+                    .into_iter()
                     .filter(|handle| handle.state() == ConnectionState::Ready)
-                {
+                    .collect();
+                if ready.is_empty() {
+                    // Still handshaking or already failed - cancels cannot be
+                    // written to a connection that is not Ready.
+                    self.cancel_metrics.record_not_ready();
+                    log::debug!(
+                        target: "kakehashi::bridge::cancel",
+                        "Cancel dropped: no ready producer for '{}' (upstream_id: {})",
+                        connection_key,
+                        upstream_id
+                    );
+                    continue;
+                }
+                for handle in ready {
                     let (known, downstream_ids) =
                         handle.router().prepare_cancel_by_upstream(&upstream_id);
                     if !known {
+                        // Request already completed, or the id never reached
+                        // this router.
                         self.cancel_metrics.record_unknown_id();
+                        log::debug!(
+                            target: "kakehashi::bridge::cancel",
+                            "Cancel dropped: upstream ID {} not found for '{}' (request may have completed)",
+                            upstream_id,
+                            connection_key
+                        );
                         continue;
                     }
                     targets.push((connection_key.clone(), handle, downstream_ids));
@@ -3840,6 +3874,11 @@ impl LanguageServerPool {
             }
         } else {
             self.cancel_metrics.record_not_in_registry();
+            log::debug!(
+                target: "kakehashi::bridge::cancel",
+                "Cancel dropped: upstream ID {} not in registry (expected during init or after completion)",
+                upstream_id
+            );
         }
         drop(handles);
         drop(registry);
