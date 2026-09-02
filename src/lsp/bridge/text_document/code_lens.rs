@@ -428,8 +428,7 @@ impl LanguageServerPool {
                 Err(e) => {
                     warn!(
                         target: "kakehashi::bridge",
-                        "codeLens/resolve{layer}: failed to register request for {}: {}",
-                        server_name, e
+                        "codeLens/resolve{layer}: failed to register request for {server_name}: {e}"
                     );
                     if let Some(ref id) = upstream_id {
                         self.unregister_upstream_request(id, connection_key);
@@ -472,8 +471,7 @@ impl LanguageServerPool {
         if let Err(e) = send_result {
             warn!(
                 target: "kakehashi::bridge",
-                "codeLens/resolve{layer}: failed to send request for {}: {}",
-                server_name, e
+                "codeLens/resolve{layer}: failed to send request for {server_name}: {e}"
             );
             if let Some(ref id) = upstream_id {
                 self.unregister_upstream_request(id, connection_key);
@@ -494,8 +492,7 @@ impl LanguageServerPool {
             Err(e) => {
                 warn!(
                     target: "kakehashi::bridge",
-                    "codeLens/resolve failed for server {}: {}",
-                    server_name, e
+                    "codeLens/resolve{layer} failed for server {server_name}: {e}"
                 );
                 re_envelope_lens(&mut lens, &envelope);
                 return lens;

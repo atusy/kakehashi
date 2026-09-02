@@ -413,7 +413,7 @@ impl LanguageServerPool {
             Err(error) => {
                 warn!(
                     target: "kakehashi::bridge",
-                    "documentLink/resolve failed for server {server_name}: {error}"
+                    "documentLink/resolve{layer} failed for server {server_name}: {error}"
                 );
                 re_envelope_link(&mut link, &envelope);
                 return link;
