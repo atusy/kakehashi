@@ -219,6 +219,11 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/codeLens") {
             return Ok(None);
         }
+        // Bind the lenses to this exact process: resolve looks the producer
+        // up by key and generation and never hands process-owned data to a
+        // replacement (the host layer stamps the same pair).
+        let connection_key = handle.key().clone();
+        let connection_generation = self.document_connection_generation(&connection_key);
         // Read resolve support when the RESPONSE arrives, as the host layer
         // does: a dynamic `resolveProvider` registration can land between
         // send and reply, and the envelope decision should see it.
@@ -242,8 +247,8 @@ impl LanguageServerPool {
                     region_id,
                     injection_language,
                     incarnation: host_incarnation,
-                    connection_generation: None,
-                    connection_key: None,
+                    connection_generation: Some(connection_generation),
+                    connection_key: Some(&connection_key),
                     offset: ctx.offset,
                     host_layer: false,
                 };
@@ -326,41 +331,36 @@ impl LanguageServerPool {
             re_envelope_lens(&mut lens, &envelope);
             return lens;
         }
-        let handle_result = if envelope.is_host_layer() {
-            let Some(expected_generation) = envelope.connection_generation else {
-                re_envelope_lens(&mut lens, &envelope);
-                return lens;
-            };
-            let Some(connection_key) = envelope
-                .connection_key
-                .as_ref()
-                .filter(|key| key.server() == server_name)
-            else {
-                re_envelope_lens(&mut lens, &envelope);
-                return lens;
-            };
-            if self.document_connection_generation(connection_key) != expected_generation {
-                re_envelope_lens(&mut lens, &envelope);
-                return lens;
-            }
-            self.ready_connection_by_key_for_config(connection_key, Some(server_config))
-                .await
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "producer connection is no longer live",
-                    )
-                })
-        } else {
-            self.get_or_create_virtual_connection(
-                server_name,
-                server_config,
-                &host_uri,
-                &envelope.injection_language,
-                &envelope.region_id,
-            )
-            .await
+        // Both layers bind the lens to the exact process that produced it:
+        // the envelope must name a live connection under the origin's own
+        // key at the generation it was minted for. Anything else fails soft
+        // here, before any connection is consulted — resolve never spawns or
+        // selects a replacement for process-owned lens data.
+        let Some(expected_generation) = envelope.connection_generation else {
+            re_envelope_lens(&mut lens, &envelope);
+            return lens;
         };
+        let Some(connection_key) = envelope
+            .connection_key
+            .as_ref()
+            .filter(|key| key.server() == server_name)
+        else {
+            re_envelope_lens(&mut lens, &envelope);
+            return lens;
+        };
+        if self.document_connection_generation(connection_key) != expected_generation {
+            re_envelope_lens(&mut lens, &envelope);
+            return lens;
+        }
+        let handle_result = self
+            .ready_connection_by_key_for_config(connection_key, Some(server_config))
+            .await
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "producer connection is no longer live",
+                )
+            });
         let handle = match handle_result {
             Ok(h) => h,
             Err(e) => {
@@ -457,10 +457,9 @@ impl LanguageServerPool {
             let producer_is_live = connections
                 .get(connection_key)
                 .is_some_and(|current| Arc::ptr_eq(current, &handle));
-            let generation_matches = !envelope.is_host_layer()
-                || envelope.connection_generation.is_some_and(|expected| {
-                    self.document_connection_generation(connection_key) == expected
-                });
+            let generation_matches = envelope.connection_generation.is_some_and(|expected| {
+                self.document_connection_generation(connection_key) == expected
+            });
             if !producer_is_live || !generation_matches {
                 Err(io::Error::new(
                     io::ErrorKind::NotConnected,
