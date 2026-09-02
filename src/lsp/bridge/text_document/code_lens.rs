@@ -218,7 +218,10 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/codeLens") {
             return Ok(None);
         }
-        let server_resolves = handle.has_capability("codeLens/resolve");
+        // Read resolve support when the RESPONSE arrives, as the host layer
+        // does: a dynamic `resolveProvider` registration can land between
+        // send and reply, and the envelope decision should see it.
+        let origin = Arc::clone(&handle);
         let host_uri_string = host_uri.to_string();
         self.execute_bridge_request_with_handle(
             handle,
@@ -246,7 +249,7 @@ impl LanguageServerPool {
                 transform_code_lens_response_to_host(
                     response,
                     ctx.offset,
-                    server_resolves,
+                    origin.has_capability("codeLens/resolve"),
                     &envelope_ctx,
                 )
             },

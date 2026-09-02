@@ -63,7 +63,10 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/completion") {
             return Ok(None);
         }
-        let server_resolves = handle.has_capability("completionItem/resolve");
+        // Read resolve support when the RESPONSE arrives, as the host layer
+        // does: a dynamic `resolveProvider` registration can land between
+        // send and reply, and the envelope decision should see it.
+        let origin = std::sync::Arc::clone(&handle);
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -84,7 +87,7 @@ impl LanguageServerPool {
                     ctx.offset,
                     region_end,
                     Some(host_position.line),
-                    server_resolves,
+                    origin.has_capability("completionItem/resolve"),
                     &EnvelopeContext {
                         server_name,
                         injection_language,

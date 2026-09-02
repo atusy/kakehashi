@@ -175,7 +175,10 @@ impl LanguageServerPool {
         }
         let connection_key = handle.key().clone();
         let connection_generation = self.document_connection_generation(&connection_key);
-        let server_resolves = handle.has_capability("documentLink/resolve");
+        // Read resolve support when the RESPONSE arrives, as the host layer
+        // does: a dynamic `resolveProvider` registration can land between
+        // send and reply, and the envelope decision should see it.
+        let origin = Arc::clone(&handle);
         self.execute_bridge_request_with_handle(
             handle,
             host_uri,
@@ -189,7 +192,7 @@ impl LanguageServerPool {
                 transform_document_link_response_to_host(
                     response,
                     ctx.offset,
-                    server_resolves,
+                    origin.has_capability("documentLink/resolve"),
                     &DocumentLinkEnvelopeContext {
                         server_name,
                         host_uri: host_uri.as_str(),
