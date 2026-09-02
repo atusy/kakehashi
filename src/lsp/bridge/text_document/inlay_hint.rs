@@ -269,6 +269,13 @@ impl LanguageServerPool {
         region_end: Option<Position>,
     ) -> InlayHint {
         let server_name = &envelope.origin;
+        // One function serves both layers; tag the host one like the
+        // completion, codeLens and documentLink paths do.
+        let layer = if envelope.is_host_layer() {
+            " (host)"
+        } else {
+            ""
+        };
         let Ok(host_uri) = Url::parse(&envelope.host_uri) else {
             re_envelope_hint(&mut hint, &envelope);
             return hint;
@@ -307,6 +314,10 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability("inlayHint/resolve") {
+            warn!(
+                target: "kakehashi::bridge",
+                "inlayHint/resolve{layer}: {server_name:?} no longer advertises resolveProvider; returning unresolved"
+            );
             re_envelope_hint(&mut hint, &envelope);
             return hint;
         }
