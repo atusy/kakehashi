@@ -260,13 +260,10 @@ impl Kakehashi {
     /// bound the edit (the exact virtual-content end mapped through the live
     /// per-line offset, matching applyEdit).
     ///
-    /// Known limitation (shared with `code_lens_region_is_fresh`): for
-    /// injections whose queries apply `#offset!` (today only YAML/TOML
-    /// frontmatter in the bundled markdown queries), the envelope offset is
-    /// `#offset!`-adjusted while the live resolution isn't, so the comparison
-    /// never matches and resolve always fails soft for those regions. That errs
-    /// in the safe direction (the action stays unresolved) and frontmatter code
-    /// actions have no known real-world producer; revisit if one appears.
+    /// The live resolution applies the injection query's `#offset!` / `#trim!`
+    /// directives exactly as minting did, so a region under one of them
+    /// (markdown frontmatter, blockquote prose) compares equal while unchanged
+    /// and its actions resolve.
     fn code_action_region_end_if_fresh(
         &self,
         envelope: &CodeActionEnvelope,
