@@ -7410,7 +7410,7 @@ mod tests {
         // Forward cancel request
         let result = pool.forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {});
 
-        // Shouldsucceed (the notification was sent)
+        // Should succeed (the notification was sent)
         assert!(
             result.is_ok(),
             "forward_cancel should succeed: {:?}",
@@ -7506,7 +7506,7 @@ mod tests {
 
         let result = pool.forward_cancel_by_upstream_id_with_notify(upstream_id, || {});
 
-        // Per bet-effort semantics, this should succeed (silent drop)
+        // Per best-effort semantics, this should succeed (silent drop)
         assert!(
             result.is_ok(),
             "forward_cancel should silently drop for nonexistent connection"
@@ -7533,7 +7533,7 @@ mod tests {
 
         let result = pool.forward_cancel_by_upstream_id_with_notify(upstream_id, || {});
 
-        // Per bet-effort semantics, this should succeed (silent drop)
+        // Per best-effort semantics, this should succeed (silent drop)
         assert!(
             result.is_ok(),
             "forward_cancel should silently drop for unknown upstream ID"
@@ -7695,7 +7695,7 @@ mod tests {
         // Forward cancel by upstream ID only (no language parameter)
         let result = pool.forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {});
 
-        // Shouldsucceed because the registry has the mapping
+        // Should succeed because the registry has the mapping
         assert!(
             result.is_ok(),
             "forward_cancel_by_upstream_id should succeed: {:?}",
@@ -7711,7 +7711,7 @@ mod tests {
         // Don't register anything in the registry
         let result = pool.forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(999), || {});
 
-        // Per bet-effort semantics, this should succeed (silent drop)
+        // Per best-effort semantics, this should succeed (silent drop)
         assert!(
             result.is_ok(),
             "forward_cancel_by_upstream_id should silently drop for unknown ID"
@@ -7879,7 +7879,7 @@ mod tests {
         // Forward cancel
         let _ = pool.forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {});
 
-        // Check etrics
+        // Check metrics
         let (successful, no_conn, not_ready, unknown_id, not_in_reg) =
             pool.cancel_metrics().snapshot();
         assert_eq!(successful, 1, "Should record 1 successful cancel");
