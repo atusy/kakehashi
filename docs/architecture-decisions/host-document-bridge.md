@@ -29,11 +29,12 @@ Partially implemented:
   no per-method request builders or response transformers. Handlers run the
   layer walk (`Kakehashi::walk_layers`, cross-layer-aggregation,
   `preferred` semantics): layers are tried lazily in `priorities` — by default
-  virt first, host as fallback. Three methods consume per-server identity in
+  virt first, host as fallback. Four methods consume per-server identity in
   the host arm: codeAction for the `"{title} — {server}"` suffix, completion
-  for its resolve-routing envelope, and codeLens for the winning server's
-  resolve capability and envelope. CodeAction and completion build their own
-  host arms; codeLens uses the shared whole-document winner hook. Covered: definition, hover, declaration,
+  for its resolve-routing envelope, and codeLens and documentLink for the
+  winning server's resolve capability and envelope. CodeAction and completion
+  build their own host arms; codeLens and documentLink use the shared
+  whole-document winner hook. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
   inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
@@ -59,7 +60,9 @@ Partially implemented:
   original payload and coordinates verbatim on the host layer. A
   non-resolving server's item normally stays bare; the reserved-key collision
   exception wraps `data.kakehashi` as opaque `inner` data so a downstream
-  payload cannot impersonate bridge routing metadata. The envelope retains
+  payload cannot impersonate bridge routing metadata. (codeAction needs no
+  such exception: an action that leaves without an envelope leaves with no
+  `data` at all.) The codeLens envelope retains
   the host-document incarnation plus the exact producing `ConnectionKey` and
   its generation, so an old lens is returned unresolved after either a
   document reopen, a rooted/shared routing-key change, or a downstream process

@@ -468,8 +468,10 @@ fn parse_document_link_resolve_response(mut response: serde_json::Value) -> Opti
 
 /// Transform a document link response from virtual to host document coordinates.
 ///
-/// Only each link's `range` is translated by `offset`; target, tooltip, and
-/// data are preserved unchanged.
+/// Each link's `range` is translated by `offset`; `target` and `tooltip` are
+/// preserved. `data` is wrapped in a routing envelope for each link that
+/// `should_envelope` selects (the origin advertises `documentLink/resolve`,
+/// or the payload squats on the reserved key); the rest pass through bare.
 fn transform_document_link_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,

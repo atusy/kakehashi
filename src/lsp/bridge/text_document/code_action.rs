@@ -112,6 +112,11 @@ pub(crate) struct CodeActionEnvelopeContext<'a> {
 
 /// Wrap `action.data` in a Kakehashi envelope for origin tracking, capturing
 /// the CURRENT (unsuffixed) title as `original_title`. Call before suffixing.
+///
+/// Unlike the other resolve kinds, codeAction needs no reserved-key collision
+/// rule (`bridge::envelope::should_envelope`): every action that leaves
+/// without an envelope leaves with `data = None`, so a downstream payload can
+/// never reach the client bare and be read back as routing metadata.
 fn envelope_action_data(action: &mut CodeAction, ctx: &CodeActionEnvelopeContext) {
     let inner = action.data.take();
     let envelope = CodeActionEnvelope {

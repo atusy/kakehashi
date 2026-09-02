@@ -5,12 +5,13 @@
 //! position parameter, like document link); `codeLens/resolve` takes a single
 //! lens as its complete params — see `dispatch_code_lens_resolve`.
 //!
-//! Every injection lens gets a routing envelope in `lens.data` (the
-//! `completionItem/resolve` pattern), as does a winning host lens when its
-//! server advertises resolve, so a later `codeLens/resolve` can be sent to the
-//! origin downstream server. Unresolved lenses (no `command`, only `data`) are
-//! therefore forwarded instead of dropped — servers like rust-analyzer return
-//! mostly-unresolved lenses by design.
+//! A lens gets a routing envelope in `lens.data` on either layer under one
+//! rule (`bridge::envelope::should_envelope`): its origin advertises
+//! `codeLens/resolve`, or its payload squats on the reserved key. That lets a
+//! later `codeLens/resolve` be sent to the origin downstream server; lenses
+//! from a non-resolving origin stay bare. Unresolved lenses (no `command`,
+//! only `data`) are forwarded instead of dropped — servers like rust-analyzer
+//! return mostly-unresolved lenses by design.
 //!
 //! Resolution fails soft for stale regions, missing servers, connection
 //! errors, and parse failures: the lens returns unresolved with its envelope
@@ -1063,7 +1064,8 @@ mod tests {
         assert!(result.command.is_none(), "lens stays unresolved");
     }
 
-    /// dispatch returns a non-envelope lens unchanged (host-layer or foreign).
+    /// dispatch returns a non-envelope lens unchanged (foreign, or from a
+    /// non-resolving origin on either layer).
     #[tokio::test]
     async fn dispatch_returns_non_envelope_lens_unchanged() {
         let pool = std::sync::Arc::new(LanguageServerPool::new());

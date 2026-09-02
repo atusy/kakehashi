@@ -392,9 +392,11 @@ fn snippet_contains_variable(text: &str) -> bool {
 
 /// Envelope stored in `CompletionItem.data` for routing `completionItem/resolve`.
 ///
-/// When Kakehashi fans out completion to multiple downstream servers, each item's
-/// `data` field is wrapped in this envelope so that a later `completionItem/resolve`
-/// can be routed back to the correct server.
+/// When Kakehashi fans out completion to multiple downstream servers, the
+/// `data` of each item whose origin advertises `completionItem/resolve` (or
+/// whose payload squats on the reserved key) is wrapped in this envelope so
+/// that a later `completionItem/resolve` can be routed back to the correct
+/// server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct KakehashiEnvelope {
     /// Server name identifying which downstream produced the item.
@@ -421,7 +423,8 @@ pub(crate) struct KakehashiEnvelope {
     /// Stable injection region identity for live resolve-time geometry checks.
     /// Empty for envelopes minted before this field existed, and for every
     /// host-layer envelope (which has no region) — skipped on the wire in
-    /// that case, since this rides in EVERY item of every completion response.
+    /// that case, since this rides in every enveloped item of a completion
+    /// response.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub region_id: String,
     /// The downstream server's original `data` value (preserved verbatim).
@@ -1463,8 +1466,8 @@ mod tests {
             "a region-carrying envelope stays on the virt resolve path"
         );
 
-        // The virt envelope — minted for every item of every completion —
-        // must not carry the host marker on the wire at all.
+        // The virt envelope — minted for every item of a resolving origin's
+        // completion — must not carry the host marker on the wire at all.
         let mut virt = CompletionItem::default();
         envelope_item_data(
             &mut virt,
