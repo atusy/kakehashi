@@ -698,6 +698,7 @@ impl ConnectionHandle {
         let dynamic_resolve_parent = match method {
             "completionItem/resolve" => Some("textDocument/completion"),
             "codeLens/resolve" => Some("textDocument/codeLens"),
+            "documentLink/resolve" => Some("textDocument/documentLink"),
             _ => None,
         };
         if let Some(parent) = dynamic_resolve_parent
@@ -820,6 +821,11 @@ impl ConnectionHandle {
                 .and_then(|opts| opts.resolve_provider)
                 .unwrap_or(false),
             "textDocument/documentLink" => caps.document_link_provider.is_some(),
+            "documentLink/resolve" => caps
+                .document_link_provider
+                .as_ref()
+                .and_then(|opts| opts.resolve_provider)
+                .unwrap_or(false),
             "textDocument/foldingRange" => matches!(
                 caps.folding_range_provider,
                 Some(
@@ -2921,5 +2927,51 @@ mod tests {
 
         assert!(!handle.has_capability("codeLens/resolve"));
         assert!(handle.has_capability("textDocument/codeLens"));
+    }
+
+    // ============================================
+    // documentLink/resolve capability tests
+    // ============================================
+
+    #[tokio::test]
+    async fn document_link_resolve_capability_follows_static_resolve_provider() {
+        use tower_lsp_server::ls_types::DocumentLinkOptions;
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities {
+            document_link_provider: Some(DocumentLinkOptions {
+                resolve_provider: Some(true),
+                work_done_progress_options: Default::default(),
+            }),
+            ..Default::default()
+        });
+
+        assert!(handle.has_capability("documentLink/resolve"));
+
+        let no_resolve_handle = spawn_sink_handle().await;
+        no_resolve_handle.set_server_capabilities(ServerCapabilities {
+            document_link_provider: Some(DocumentLinkOptions {
+                resolve_provider: Some(false),
+                work_done_progress_options: Default::default(),
+            }),
+            ..Default::default()
+        });
+        assert!(!no_resolve_handle.has_capability("documentLink/resolve"));
+        assert!(no_resolve_handle.has_capability("textDocument/documentLink"));
+    }
+
+    #[tokio::test]
+    async fn document_link_resolve_capability_follows_dynamic_resolve_provider() {
+        use tower_lsp_server::ls_types::Registration;
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "document-link-1".to_string(),
+            method: "textDocument/documentLink".to_string(),
+            register_options: Some(serde_json::json!({ "resolveProvider": true })),
+        }]);
+
+        assert!(handle.has_capability("documentLink/resolve"));
     }
 }

@@ -116,13 +116,12 @@ impl CancelForwarder {
     /// downstream `$/cancelRequest` (capture-before-notify; see
     /// `forward_cancel_by_upstream_id_with_notify`).
     #[cfg(test)]
-    pub(crate) async fn forward_cancel(&self, upstream_id: UpstreamId) -> std::io::Result<()> {
+    pub(crate) fn forward_cancel(&self, upstream_id: UpstreamId) -> std::io::Result<()> {
         let generation = self.request_generation(&upstream_id);
         self.forward_cancel_for_generation(upstream_id, generation)
-            .await
     }
 
-    async fn forward_cancel_for_generation(
+    fn forward_cancel_for_generation(
         &self,
         upstream_id: UpstreamId,
         generation: Option<u64>,
@@ -131,15 +130,13 @@ impl CancelForwarder {
         let notify_forwarder = self.clone();
         let validate_id = upstream_id.clone();
         let notify_id = upstream_id.clone();
-        self.pool
-            .forward_cancel_by_upstream_id_if_current(
-                upstream_id,
-                move || validate_forwarder.request_generation(&validate_id) == generation,
-                move || {
-                    notify_forwarder.notify_cancel_for_generation(&notify_id, generation);
-                },
-            )
-            .await
+        self.pool.forward_cancel_by_upstream_id_if_current_sync(
+            upstream_id,
+            move || validate_forwarder.request_generation(&validate_id) == generation,
+            move || {
+                notify_forwarder.notify_cancel_for_generation(&notify_id, generation);
+            },
+        )
     }
 
     /// Forward a client `window/workDoneProgress/cancel` to the downstream that
@@ -410,12 +407,18 @@ where
     }
 
     fn call(&mut self, req: Request) -> Self::Future {
+        // Everything below runs synchronously inside `call`, which tower-lsp's
+        // transport invokes from its single stdin reader task in wire order
+        // (`concurrency_level` bounds the returned futures, not `call`). That
+        // alone orders generation registration, cancel capture, and tower-lsp's
+        // raw-ID cancellation against a reused JSON-RPC ID; no extra lock is
+        // needed here, and one would only sit uncontended on the hot path.
+        let cancel_forwarder = self.cancel_forwarder.clone();
         // Extract the request ID before delegating
         let request_id = req.id().cloned();
 
         // Check if this is a $/cancelRequest notification and forward to downstream
         // Per LSP spec, cancel params.id can be either integer or string
-        let cancel_forwarder = self.cancel_forwarder.clone();
         let is_cancel_notification = matches!(
             req.method(),
             "$/cancelRequest" | "window/workDoneProgress/cancel"
@@ -432,7 +435,7 @@ where
                 Some(ActiveRequestGuard::new(forwarder, upstream_id))
             })
         };
-        if req.method() == "$/cancelRequest"
+        let cancel_request = if req.method() == "$/cancelRequest"
             && let Some(forwarder) = cancel_forwarder.as_ref()
             && let Some(params) = req.params()
         {
@@ -451,36 +454,13 @@ where
             if let Some(upstream_id) = id_to_cancel
                 && let Some(generation) = forwarder.request_generation(&upstream_id)
             {
-                let forwarder = forwarder.clone();
-                // Fire-and-forget: spawn without tracking JoinHandle.
-                //
-                // This is intentional for $/cancelRequest because:
-                // 1. LSP notifications don't expect responses (fire-and-forget by spec)
-                // 2. Cancel is "best effort" - failures are logged but non-fatal
-                // 3. We must not block the main request flow
-                // 4. Graceful shutdown doesn't need to wait for cancels - the downstream
-                //    server will clean up its own state when it shuts down
-                //
-                // Upstream subscribers are notified inside forward_cancel, AFTER
-                // it captures the downstream targets — notifying here first would
-                // let the woken handler tear down the registry/router state the
-                // forwarding pass is about to read (capture-before-notify).
-                tokio::spawn(async move {
-                    if let Err(e) = forwarder
-                        .forward_cancel_for_generation(upstream_id.clone(), Some(generation))
-                        .await
-                    {
-                        // Log the error but don't fail - cancel forwarding is best-effort
-                        log::debug!(
-                            target: "kakehashi::cancel",
-                            "Failed to forward cancel for request {}: {}",
-                            upstream_id,
-                            e
-                        );
-                    }
-                });
+                Some((forwarder.clone(), upstream_id, generation))
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         // Intercept window/workDoneProgress/cancel and route it to the downstream
         // that owns the progress token (window-work-done-progress bridging).
@@ -500,12 +480,25 @@ where
             });
         }
 
-        // Call inner service and get the future
+        // tower-lsp applies raw-ID cancellation synchronously inside `call`.
+        // Capture downstream targets, notify generation-scoped subscribers, and
+        // enqueue downstream cancels first; production registrations retain the
+        // exact handles needed to do this without awaiting the connections map.
+        if let Some((forwarder, upstream_id, generation)) = cancel_request
+            && let Err(error) =
+                forwarder.forward_cancel_for_generation(upstream_id.clone(), Some(generation))
+        {
+            log::debug!(
+                target: "kakehashi::cancel",
+                "Failed to forward cancel for request {}: {}",
+                upstream_id,
+                error
+            );
+        }
         let inner_fut = self.inner.call(req);
 
         Box::pin(async move {
             let _active_request = active_request;
-            // Set the task-local request ID and await the inner future
             CURRENT_REQUEST_ID.scope(request_id, inner_fut).await
         })
     }
@@ -535,6 +528,7 @@ pub(crate) fn current_upstream_id() -> Option<UpstreamId> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
     /// Mock service that records whether it was called and captures the request ID
@@ -573,6 +567,34 @@ mod tests {
                 *captured_id.lock().await = Some(id);
                 Ok(None)
             })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SynchronousCallService {
+        calls: Arc<AtomicUsize>,
+        cancel_rx: Arc<std::sync::Mutex<Option<CancelReceiver>>>,
+        cancel_was_forwarded_before_inner: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Service<Request> for SynchronousCallService {
+        type Response = Option<Response>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if req.method() == "$/cancelRequest"
+                && let Some(mut cancel_rx) = self.cancel_rx.lock().unwrap().take()
+            {
+                self.cancel_was_forwarded_before_inner
+                    .store(matches!(cancel_rx.try_recv(), Ok(())), Ordering::SeqCst);
+            }
+            std::future::ready(Ok(None))
         }
     }
 
@@ -689,7 +711,7 @@ mod tests {
         // The notification should be processed (no error)
         assert!(result.is_ok());
 
-        // The inner service was still called (tower-lsp needs to see it too)
+        // The inner service is still called after synchronous forwarding.
         let captured = mock.get_captured_id().await;
         assert!(captured.is_some(), "Inner service should still be called");
 
@@ -899,8 +921,53 @@ mod tests {
         let mut new_request_cancel = forwarder.subscribe(upstream_id.clone()).unwrap();
         forwarder
             .forward_cancel_for_generation(upstream_id, old_generation)
-            .await
             .unwrap();
+
+        assert!(matches!(
+            new_request_cancel.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        drop(new_request);
+    }
+
+    #[tokio::test]
+    async fn middleware_forwards_before_synchronous_inner_cancel() {
+        let inner = SynchronousCallService::default();
+        let calls = Arc::clone(&inner.calls);
+        let cancel_rx_slot = Arc::clone(&inner.cancel_rx);
+        let forwarded_before_inner = Arc::clone(&inner.cancel_was_forwarded_before_inner);
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+        let mut service = RequestIdCapture::with_cancel_forwarder(inner, forwarder.clone());
+        let upstream_id = UpstreamId::Number(123);
+        let request = || {
+            Request::build("textDocument/hover")
+                .params(serde_json::json!({}))
+                .id(123i64)
+                .finish()
+        };
+
+        let old_request = service.call(request());
+        *cancel_rx_slot.lock().unwrap() = Some(forwarder.subscribe(upstream_id.clone()).unwrap());
+        let delayed_cancel = service.call(
+            Request::build("$/cancelRequest")
+                .params(serde_json::json!({ "id": 123 }))
+                .finish(),
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the inner cancel call must run synchronously after forwarding"
+        );
+        assert!(
+            forwarded_before_inner.load(Ordering::SeqCst),
+            "generation-scoped forwarding must notify before the inner cancel call"
+        );
+        drop(old_request);
+
+        let new_request = service.call(request());
+        let mut new_request_cancel = forwarder.subscribe(upstream_id).unwrap();
+        delayed_cancel.await.unwrap();
 
         assert!(matches!(
             new_request_cancel.try_recv(),

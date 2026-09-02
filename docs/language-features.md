@@ -184,7 +184,10 @@ Returns a hierarchical or flat outline depending on what your editor supports.
 
 [`textDocument/documentLink`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentLink)
 
-Collects clickable links from all embedded blocks.
+Collects clickable links from all embedded blocks. Lazy links are resolved by
+the same host or embedded-language server that produced them; links from an
+edited or invalidated embedded region are returned unresolved instead of being
+translated with stale coordinates.
 
 ### Rename / Prepare rename
 

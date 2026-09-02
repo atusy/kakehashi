@@ -27,7 +27,7 @@ Current bridge-backed requests include:
 - Hover
 - Find References
 - Rename / Prepare Rename
-- Document Highlight / Document Symbol / Document Link
+- Document Highlight / Document Symbol / Document Link (incl. `documentLink/resolve` routed back to the producing host or injection server; stale injection links fail soft)
 - Moniker / Inlay Hint
 - Code Lens (incl. `codeLens/resolve` routed back to the origin server for both injection- and host-layer lenses; host-layer payloads and coordinates pass through verbatim, while injection resolution fails soft when the region was moved or invalidated since the lens was produced, and always in runtime-range-adjusted (`#offset!` / `#trim!`) regions such as frontmatter)
 - Code Action (incl. `codeAction/resolve` routed back to the origin server, host-layer actions via `bridge._self`, and a merged menu across every injection region a multi-fence range overlaps; advertised only to clients with `codeActionLiteralSupport`)

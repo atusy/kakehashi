@@ -292,7 +292,7 @@ impl LanguageServerPool {
 
         // Register in the upstream request registry FIRST for cancel lookup.
         if let Some(ref id) = upstream_id {
-            self.register_upstream_request(id.clone(), connection_key);
+            self.register_upstream_request_for_handle(id.clone(), handle);
         }
 
         let (request_id, response_rx) = match handle

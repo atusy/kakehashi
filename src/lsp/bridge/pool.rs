@@ -135,7 +135,7 @@ fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHan
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -200,6 +200,9 @@ impl From<&str> for UpstreamId {
         UpstreamId::String(s.to_string())
     }
 }
+
+type UpstreamCancelHandles =
+    HashMap<UpstreamId, HashMap<ConnectionKey, Vec<Weak<ConnectionHandle>>>>;
 
 /// Metrics for cancel request forwarding.
 ///
@@ -289,7 +292,14 @@ struct OpenClaimGuard {
 }
 
 type OpenTransitionLocks = DashMap<(ConnectionKey, String), Arc<tokio::sync::Mutex<()>>>;
-type HostLifecycleLocks = DashMap<Url, Arc<tokio::sync::Mutex<()>>>;
+/// Per-host-document lifecycle lock, as a reader/writer lock: in-flight
+/// requests take it **shared**, lifecycle transitions (open / close / eager
+/// open / routing resolution) take it **exclusive**. Shared is what makes the
+/// host and virt layers of one document run concurrently — with a plain mutex
+/// each layer waited out the other's full downstream round trip, so
+/// `race_layers_concatenated`'s `try_join!` was serialized by a lock and a
+/// client cancel could not reach a layer that had not started yet.
+type HostLifecycleLocks = DashMap<Url, Arc<tokio::sync::RwLock<()>>>;
 pub(crate) struct HostVirtualContents {
     // The open lifetime that owns this container. Reopen replaces the whole
     // container, so a stale publisher holding the old DashMap guard can only
@@ -427,6 +437,10 @@ pub struct LanguageServerPool {
     /// entries dangling to avoid a router→pool back-reference — stale lookups
     /// fail gracefully and IDs get reused.
     upstream_request_registry: std::sync::Mutex<HashMap<UpstreamId, HashMap<ConnectionKey, usize>>>,
+    /// Exact producer handles for synchronous cancel capture at middleware
+    /// ingress, keyed alongside `upstream_request_registry` and written by the
+    /// same registration call so the two maps cannot drift.
+    upstream_cancel_handles: std::sync::Mutex<UpstreamCancelHandles>,
     /// Metrics for cancel forwarding observability.
     cancel_metrics: CancelForwardingMetrics,
     /// Consecutive handshake-task panics per connection (reset to 0 on success).
@@ -545,6 +559,7 @@ impl LanguageServerPool {
             diagnostic_host_epoch: AtomicU64::new(1),
             diagnostic_host_generations: DashMap::new(),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
+            upstream_cancel_handles: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
             root_uri: arc_swap::ArcSwap::new(Arc::new(None)),
@@ -2069,11 +2084,14 @@ impl LanguageServerPool {
             .insert(region_id.to_string(), Arc::<str>::from(content));
     }
 
-    pub(crate) fn host_lifecycle_lock(&self, host_uri: &Url) -> Arc<tokio::sync::Mutex<()>> {
+    /// The document's lifecycle lock, created on first use. Transitions lock it
+    /// exclusively (`write`); requests take [`Self::request_host_lifecycle`],
+    /// which locks it shared.
+    pub(crate) fn host_lifecycle_lock(&self, host_uri: &Url) -> Arc<tokio::sync::RwLock<()>> {
         Arc::clone(
             self.host_lifecycle_locks
                 .entry(host_uri.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
                 .value(),
         )
     }
@@ -2087,7 +2105,7 @@ impl LanguageServerPool {
     pub(crate) fn existing_host_lifecycle_lock(
         &self,
         host_uri: &Url,
-    ) -> Option<Arc<tokio::sync::Mutex<()>>> {
+    ) -> Option<Arc<tokio::sync::RwLock<()>>> {
         self.host_lifecycle_locks
             .get(host_uri)
             .map(|entry| Arc::clone(entry.value()))
@@ -2096,7 +2114,7 @@ impl LanguageServerPool {
     pub(crate) fn remove_host_lifecycle_lock_if_unshared(
         &self,
         host_uri: &Url,
-        lifecycle: &Arc<tokio::sync::Mutex<()>>,
+        lifecycle: &Arc<tokio::sync::RwLock<()>>,
     ) {
         self.host_lifecycle_locks.remove_if(host_uri, |_, current| {
             Arc::ptr_eq(current, lifecycle)
@@ -2107,7 +2125,7 @@ impl LanguageServerPool {
 
     pub(crate) async fn open_host_incarnation(&self, host_uri: &Url, incarnation: u64) {
         let lifecycle = self.host_lifecycle_lock(host_uri);
-        let _guard = lifecycle.lock().await;
+        let _guard = lifecycle.write().await;
         self.latest_virtual_contents.insert(
             host_uri.clone(),
             HostVirtualContents {
@@ -2119,7 +2137,7 @@ impl LanguageServerPool {
 
     pub(crate) async fn close_host_incarnation(&self, host_uri: &Url, incarnation: u64) {
         let lifecycle = self.host_lifecycle_lock(host_uri);
-        let guard = lifecycle.lock().await;
+        let guard = lifecycle.write().await;
         // A delayed close from an older lifetime must not clear a fast reopen's
         // cache container.
         self.latest_virtual_contents
@@ -3660,11 +3678,13 @@ impl LanguageServerPool {
         }
     }
 
-    /// Test-only compatibility wrapper that fans out `$/cancelRequest` to
-    /// every server registered for `upstream_id`, invoking `notify` after every
+    /// Test-only convenience wrapper that fans out `$/cancelRequest` to every
+    /// server registered for `upstream_id`, invoking `notify` after every
     /// `(connection, downstream ids)` target has been captured and before any
-    /// cancel is sent. Production `RequestIdCapture` uses the generation-aware
-    /// [`Self::forward_cancel_by_upstream_id_if_current`] path instead.
+    /// cancel is sent. It delegates to the production
+    /// [`Self::forward_cancel_by_upstream_id_if_current_sync`] path with a
+    /// generation check that always passes, so these tests exercise the same
+    /// code the middleware runs.
     ///
     /// LSP cancel is best-effort, so we silently return `Ok(())` (rather than
     /// erroring) when: the ID is unknown, the connection is still initializing,
@@ -3680,53 +3700,100 @@ impl LanguageServerPool {
     /// only already-writing/sent IDs that still need a FIFO cancel notification;
     /// the later cleanup is then harmless.
     #[cfg(test)]
-    pub(crate) async fn forward_cancel_by_upstream_id_with_notify(
+    pub(crate) fn forward_cancel_by_upstream_id_with_notify(
         &self,
         upstream_id: UpstreamId,
         notify: impl FnOnce(),
     ) -> io::Result<()> {
-        self.forward_cancel_by_upstream_id_if_current(upstream_id, || true, notify)
-            .await
+        self.forward_cancel_by_upstream_id_if_current_sync(upstream_id, || true, notify)
     }
 
-    /// Generation-aware cancellation used by the upstream middleware. The
-    /// validity check runs while the upstream registry is locked, so request-ID
-    /// reuse cannot replace the old request's downstream mappings between the
-    /// check and target capture.
-    pub(crate) async fn forward_cancel_by_upstream_id_if_current(
+    /// Generation-aware cancellation used by the upstream middleware, called
+    /// synchronously from `RequestIdCapture::call` before tower-lsp can process
+    /// the raw-ID cancellation. Request registration retains a weak reference to
+    /// each exact producer handle, so target capture does not need the async
+    /// connections mutex.
+    ///
+    /// The validity check runs while the upstream registry is locked, so
+    /// request-ID reuse cannot replace the old request's downstream mappings
+    /// between the check and target capture.
+    ///
+    /// LSP cancel is best-effort, so we silently return `Ok(())` (rather than
+    /// erroring) when: the ID is unknown, the connection is still initializing,
+    /// the downstream ID was already cleaned up, or an individual server send
+    /// fails. This avoids racing cancel against handshake completion. Every such
+    /// drop still records a `CancelForwardingMetrics` counter and a debug log.
+    ///
+    /// Prepare-before-notify ordering is load-bearing: `notify` wakes the
+    /// upstream handler (via `CancelForwarder::notify_cancel`), whose
+    /// cancellation path immediately destroys the very state this lookup reads —
+    /// `unregister_all_for_upstream_id` empties the registry, and dropping the
+    /// in-flight request futures removes their router cancel mappings. Preparing
+    /// first atomically marks queued work for writer-side skipping and captures
+    /// only already-writing/sent IDs that still need a FIFO cancel notification;
+    /// the later cleanup is then harmless.
+    pub(crate) fn forward_cancel_by_upstream_id_if_current_sync(
         &self,
         upstream_id: UpstreamId,
         is_current: impl FnOnce() -> bool,
         notify: impl FnOnce(),
     ) -> io::Result<()> {
-        // Acquire the async connections lock first, then keep the synchronous
-        // upstream registry locked from generation validation through router
-        // target capture. Registration/unregistration uses that registry lock,
-        // so an ID cannot change request lifetime in the middle of this block.
-        let connections = self.connections().await;
-        let mut targets: Vec<(ConnectionKey, Arc<ConnectionHandle>, Vec<RequestId>)> = Vec::new();
-        let registered = {
-            let registry = self
-                .upstream_request_registry
-                .lock()
-                .recover_poison("LanguageServerPool::forward_cancel_by_upstream_id_if_current");
-            if !is_current() {
-                return Ok(());
-            }
-            if let Some(connection_counts) = registry.get(&upstream_id) {
-                for connection_key in connection_counts.keys() {
-                    let Some(handle) = self.ready_handle_for_cancel_in(
-                        &connections,
+        let registry = self
+            .upstream_request_registry
+            .lock()
+            .recover_poison("LanguageServerPool::forward_cancel_by_upstream_id_if_current_sync");
+        if !is_current() {
+            return Ok(());
+        }
+        let handles = self
+            .upstream_cancel_handles
+            .lock()
+            .recover_poison("LanguageServerPool::forward_cancel_by_upstream_id_if_current_sync");
+        let mut targets = Vec::new();
+        if let Some(connection_counts) = registry.get(&upstream_id) {
+            for connection_key in connection_counts.keys() {
+                // Every drop below is best-effort per LSP, but it must still be
+                // countable: this is the only path production takes, so an
+                // invisible drop here is a cancel that vanishes with no trace.
+                let producers: Vec<Arc<ConnectionHandle>> = handles
+                    .get(&upstream_id)
+                    .and_then(|by_key| by_key.get(connection_key))
+                    .map(|producers| producers.iter().filter_map(Weak::upgrade).collect())
+                    .unwrap_or_default();
+                if producers.is_empty() {
+                    // The producing process is gone (replaced connection, or a
+                    // handle dropped between registration and cancel).
+                    self.cancel_metrics.record_no_connection();
+                    log::debug!(
+                        target: "kakehashi::bridge::cancel",
+                        "Cancel dropped: no live producer for '{}' (upstream_id: {}, expected if the connection was replaced)",
                         connection_key,
-                        &format!("upstream_id: {upstream_id}"),
-                    ) else {
-                        continue;
-                    };
+                        upstream_id
+                    );
+                    continue;
+                }
+                let ready: Vec<Arc<ConnectionHandle>> = producers
+                    .into_iter()
+                    .filter(|handle| handle.state() == ConnectionState::Ready)
+                    .collect();
+                if ready.is_empty() {
+                    // Still handshaking or already failed - cancels cannot be
+                    // written to a connection that is not Ready.
+                    self.cancel_metrics.record_not_ready();
+                    log::debug!(
+                        target: "kakehashi::bridge::cancel",
+                        "Cancel dropped: no ready producer for '{}' (upstream_id: {})",
+                        connection_key,
+                        upstream_id
+                    );
+                    continue;
+                }
+                for handle in ready {
                     let (known, downstream_ids) =
                         handle.router().prepare_cancel_by_upstream(&upstream_id);
                     if !known {
-                        // Request already completed or ID never registered.
-                        // Silently drop per best-effort semantics.
+                        // Request already completed, or the id never reached
+                        // this router.
                         self.cancel_metrics.record_unknown_id();
                         log::debug!(
                             target: "kakehashi::bridge::cancel",
@@ -3736,52 +3803,35 @@ impl LanguageServerPool {
                         );
                         continue;
                     }
-                    if !downstream_ids.is_empty() {
-                        targets.push((connection_key.clone(), handle, downstream_ids));
-                    }
+                    targets.push((connection_key.clone(), handle, downstream_ids));
                 }
-                true
-            } else {
-                false
             }
-        };
-        drop(connections);
-
-        if !registered {
-            // Request not registered yet (still initializing) or already completed.
-            // This is expected - silently drop the downstream cancel, but still
-            // notify the active local handler.
+        } else {
             self.cancel_metrics.record_not_in_registry();
             log::debug!(
                 target: "kakehashi::bridge::cancel",
                 "Cancel dropped: upstream ID {} not in registry (expected during init or after completion)",
                 upstream_id
             );
-            notify();
-            return Ok(());
         }
+        drop(handles);
+        drop(registry);
 
-        // Wake the upstream handler only now that targets are captured.
         notify();
-
-        // 4. Send the cancels (best-effort, log I/O errors).
         for (connection_key, handle, downstream_ids) in targets {
             for downstream_id in downstream_ids {
-                if let Err(e) =
+                if let Err(error) =
                     self.send_cancel_notification(&handle, &connection_key, downstream_id)
                 {
-                    // Log I/O errors (queue full, channel closed) for observability.
-                    // These indicate connection issues worth investigating.
                     log::warn!(
                         target: "kakehashi::bridge::cancel",
                         "Error forwarding cancel for upstream_id {}: {}",
                         upstream_id,
-                        e
+                        error
                     );
                 }
             }
         }
-
         Ok(())
     }
 
@@ -3843,20 +3893,42 @@ impl LanguageServerPool {
     /// Callers MUST call `unregister_upstream_request` per request on completion
     /// (success, error, or timeout) — typically after `wait_for_response()` or
     /// in `ensure_document_opened()` error cleanup — to avoid leaking entries.
-    pub(crate) fn register_upstream_request(
+    ///
+    /// The exact producing handle is retained (weakly) alongside the count so
+    /// cancellation targets can be captured synchronously, before tower-lsp's
+    /// raw-ID cancel handler runs.
+    pub(crate) fn register_upstream_request_for_handle(
         &self,
         upstream_id: UpstreamId,
-        connection_key: &ConnectionKey,
+        handle: &Arc<ConnectionHandle>,
     ) {
+        let connection_key = handle.key();
         let mut registry = self
             .upstream_request_registry
             .lock()
-            .recover_poison("LanguageServerPool::register_upstream_request");
+            .recover_poison("LanguageServerPool::register_upstream_request_for_handle");
+        let mut handles = self
+            .upstream_cancel_handles
+            .lock()
+            .recover_poison("LanguageServerPool::register_upstream_request_for_handle");
         *registry
-            .entry(upstream_id)
+            .entry(upstream_id.clone())
             .or_default()
             .entry(connection_key.clone())
             .or_insert(0) += 1;
+        let producers = handles
+            .entry(upstream_id)
+            .or_default()
+            .entry(connection_key.clone())
+            .or_default();
+        producers.retain(|producer| producer.strong_count() > 0);
+        if !producers
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|producer| Arc::ptr_eq(&producer, handle))
+        {
+            producers.push(Arc::downgrade(handle));
+        }
     }
 
     /// Unregister one in-flight request for `(upstream_id, connection_key)`.
@@ -3872,14 +3944,28 @@ impl LanguageServerPool {
             .lock()
             .recover_poison("LanguageServerPool::unregister_upstream_request");
         if let Some(connections) = registry.get_mut(upstream_id) {
+            let mut remove_handle = false;
             if let Some(count) = connections.get_mut(connection_key) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     connections.remove(connection_key);
+                    remove_handle = true;
                 }
             }
             if connections.is_empty() {
                 registry.remove(upstream_id);
+            }
+            if remove_handle {
+                let mut handles = self
+                    .upstream_cancel_handles
+                    .lock()
+                    .recover_poison("LanguageServerPool::unregister_upstream_request");
+                if let Some(by_key) = handles.get_mut(upstream_id) {
+                    by_key.remove(connection_key);
+                    if by_key.is_empty() {
+                        handles.remove(upstream_id);
+                    }
+                }
             }
         }
     }
@@ -3897,6 +3983,10 @@ impl LanguageServerPool {
             .lock()
             .recover_poison("LanguageServerPool::unregister_all_for_upstream_id");
         registry.remove(upstream_id);
+        self.upstream_cancel_handles
+            .lock()
+            .recover_poison("LanguageServerPool::unregister_all_for_upstream_id")
+            .remove(upstream_id);
     }
 }
 
@@ -7325,12 +7415,10 @@ mod tests {
             .lock()
             .await
             .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &handle);
 
         // Forward cancel request
-        let result = pool
-            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {})
-            .await;
+        let result = pool.forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {});
 
         // Should succeed (the notification was sent)
         assert!(
@@ -7419,14 +7507,14 @@ mod tests {
     async fn forward_cancel_silently_drops_when_no_connection() {
         let pool = LanguageServerPool::new();
         let upstream_id = UpstreamId::Number(42);
-        pool.register_upstream_request(
-            upstream_id.clone(),
-            &ConnectionKey::for_server("nonexistent"),
-        );
+        {
+            let gone =
+                create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("gone"))
+                    .await;
+            pool.register_upstream_request_for_handle(upstream_id.clone(), &gone);
+        }
 
-        let result = pool
-            .forward_cancel_by_upstream_id_with_notify(upstream_id, || {})
-            .await;
+        let result = pool.forward_cancel_by_upstream_id_with_notify(upstream_id, || {});
 
         // Per best-effort semantics, this should succeed (silent drop)
         assert!(
@@ -7451,11 +7539,9 @@ mod tests {
             .await
             .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
         let upstream_id = UpstreamId::Number(999);
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &handle);
 
-        let result = pool
-            .forward_cancel_by_upstream_id_with_notify(upstream_id, || {})
-            .await;
+        let result = pool.forward_cancel_by_upstream_id_with_notify(upstream_id, || {});
 
         // Per best-effort semantics, this should succeed (silent drop)
         assert!(
@@ -7468,12 +7554,14 @@ mod tests {
     // Upstream Request Registry Tests
     // ============================================================
 
-    /// Test that register_upstream_request stores the mapping.
-    #[test]
-    fn register_upstream_request_stores_mapping() {
+    /// Test that registering an upstream request stores the mapping.
+    #[tokio::test]
+    async fn register_upstream_request_stores_mapping() {
         let pool = LanguageServerPool::new();
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
 
-        pool.register_upstream_request(UpstreamId::Number(42), &ConnectionKey::for_server("lua"));
+        pool.register_upstream_request_for_handle(UpstreamId::Number(42), &handle);
 
         let registry = pool.upstream_request_registry.lock().unwrap();
         let servers = registry
@@ -7484,11 +7572,13 @@ mod tests {
     }
 
     /// Test that unregister_upstream_request removes the mapping.
-    #[test]
-    fn unregister_upstream_request_removes_mapping() {
+    #[tokio::test]
+    async fn unregister_upstream_request_removes_mapping() {
         let pool = LanguageServerPool::new();
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
 
-        pool.register_upstream_request(UpstreamId::Number(42), &ConnectionKey::for_server("lua"));
+        pool.register_upstream_request_for_handle(UpstreamId::Number(42), &handle);
         pool.unregister_upstream_request(
             &UpstreamId::Number(42),
             &ConnectionKey::for_server("lua"),
@@ -7522,17 +7612,16 @@ mod tests {
             .lock()
             .await
             .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &handle);
 
         // Simulate the handler waking on the cancel notification and running
         // its cleanup before the forwarding pass sends anything.
         let cleanup_pool = Arc::clone(&pool);
         let cleanup_id = upstream_id.clone();
-        let result = pool
-            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), move || {
+        let result =
+            pool.forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), move || {
                 cleanup_pool.unregister_all_for_upstream_id(Some(&cleanup_id));
-            })
-            .await;
+            });
 
         assert!(
             result.is_ok(),
@@ -7558,12 +7647,14 @@ mod tests {
     /// region must not unregister the server while a sibling request is still
     /// in flight, or `forward_cancel_by_upstream_id` would skip that server
     /// and the sibling's cancel would never reach it.
-    #[test]
-    fn unregister_upstream_request_keeps_server_while_sibling_requests_in_flight() {
+    #[tokio::test]
+    async fn unregister_upstream_request_keeps_server_while_sibling_requests_in_flight() {
         let pool = LanguageServerPool::new();
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
 
-        pool.register_upstream_request(UpstreamId::Number(42), &ConnectionKey::for_server("lua"));
-        pool.register_upstream_request(UpstreamId::Number(42), &ConnectionKey::for_server("lua"));
+        pool.register_upstream_request_for_handle(UpstreamId::Number(42), &handle);
+        pool.register_upstream_request_for_handle(UpstreamId::Number(42), &handle);
 
         pool.unregister_upstream_request(
             &UpstreamId::Number(42),
@@ -7609,12 +7700,10 @@ mod tests {
             .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
 
         // Register the upstream request in the registry
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &handle);
 
         // Forward cancel by upstream ID only (no language parameter)
-        let result = pool
-            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {})
-            .await;
+        let result = pool.forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {});
 
         // Should succeed because the registry has the mapping
         assert!(
@@ -7630,9 +7719,7 @@ mod tests {
         let pool = LanguageServerPool::new();
 
         // Don't register anything in the registry
-        let result = pool
-            .forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(999), || {})
-            .await;
+        let result = pool.forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(999), || {});
 
         // Per best-effort semantics, this should succeed (silent drop)
         assert!(
@@ -7665,12 +7752,11 @@ mod tests {
             .lock()
             .await
             .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &handle);
 
         // Forward cancel request (simulating client cancelling the request)
-        let cancel_result = pool
-            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {})
-            .await;
+        let cancel_result =
+            pool.forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {});
         assert!(cancel_result.is_ok(), "cancel should succeed");
 
         // Now simulate the downstream server responding (with a normal result)
@@ -7741,12 +7827,11 @@ mod tests {
             .lock()
             .await
             .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &handle);
 
         // Forward cancel request
-        let cancel_result = pool
-            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {})
-            .await;
+        let cancel_result =
+            pool.forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {});
         assert!(cancel_result.is_ok(), "cancel should succeed");
 
         // Simulate the downstream server responding with RequestCancelled error
@@ -7799,12 +7884,10 @@ mod tests {
             .lock()
             .await
             .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &handle);
 
         // Forward cancel
-        let _ = pool
-            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {})
-            .await;
+        let _ = pool.forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {});
 
         // Check metrics
         let (successful, no_conn, not_ready, unknown_id, not_in_reg) =
@@ -7816,71 +7899,77 @@ mod tests {
         assert_eq!(not_in_reg, 0);
     }
 
-    /// Test that metrics are recorded for cancel failures.
+    /// The synchronous middleware path is the only one production takes, so
+    /// every way it drops a cancel must stay as observable as the async
+    /// path's: a producer whose process is gone, a producer that is not yet
+    /// ready, an id the producer never routed, and an id absent from the
+    /// registry each have their own counter.
     #[tokio::test]
-    async fn cancel_metrics_records_failures() {
-        use std::sync::Arc;
-
+    async fn sync_cancel_records_metrics_for_every_dropped_producer() {
         let pool = LanguageServerPool::new();
 
-        // Test: no connection
-        pool.register_upstream_request(
+        // No live producer: the registration outlives the handle it named.
+        // The scope is load-bearing — the registry keeps only a `Weak`, so
+        // dropping the last `Arc` here is what makes the upgrade fail. If a
+        // future helper retains the handle, this case silently becomes
+        // `not_ready` or `unknown_id` instead.
+        {
+            let gone = create_handle_with_key(
+                ConnectionState::Ready,
+                ConnectionKey::for_server("gone_lang"),
+            )
+            .await;
+            pool.register_upstream_request_for_handle(UpstreamId::Number(1), &gone);
+        }
+        let _ = pool.forward_cancel_by_upstream_id_if_current_sync(
             UpstreamId::Number(1),
-            &ConnectionKey::for_server("nonexistent"),
+            || true,
+            || {},
         );
-        let _ = pool
-            .forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(1), || {})
-            .await;
 
-        // Test: not in registry
-        let _ = pool
-            .forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(999), || {})
-            .await;
+        // Not in registry.
+        let _ = pool.forward_cancel_by_upstream_id_if_current_sync(
+            UpstreamId::Number(999),
+            || true,
+            || {},
+        );
 
-        // Test: connection not ready
+        // Producer still initializing.
         let handle_init = create_handle_with_key(
             ConnectionState::Initializing,
             ConnectionKey::for_server("init_lang"),
         )
         .await;
-        pool.connections.lock().await.insert(
-            ConnectionKey::for_server("init_lang"),
-            Arc::clone(&handle_init),
-        );
-        pool.register_upstream_request(
+        pool.register_upstream_request_for_handle(UpstreamId::Number(2), &handle_init);
+        let _ = pool.forward_cancel_by_upstream_id_if_current_sync(
             UpstreamId::Number(2),
-            &ConnectionKey::for_server("init_lang"),
+            || true,
+            || {},
         );
-        let _ = pool
-            .forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(2), || {})
-            .await;
 
-        // Test: unknown upstream ID
+        // Ready producer that never routed this upstream id.
         let handle_ready = create_handle_with_key(
             ConnectionState::Ready,
             ConnectionKey::for_server("ready_lang"),
         )
         .await;
-        pool.connections.lock().await.insert(
-            ConnectionKey::for_server("ready_lang"),
-            Arc::clone(&handle_ready),
-        );
-        pool.register_upstream_request(
+        pool.register_upstream_request_for_handle(UpstreamId::Number(3), &handle_ready);
+        let _ = pool.forward_cancel_by_upstream_id_if_current_sync(
             UpstreamId::Number(3),
-            &ConnectionKey::for_server("ready_lang"),
+            || true,
+            || {},
         );
-        let _ = pool
-            .forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(3), || {})
-            .await;
 
-        // Check metrics
         let (successful, no_conn, not_ready, unknown_id, not_in_reg) =
             pool.cancel_metrics().snapshot();
-        assert_eq!(successful, 0, "No successful cancels");
-        assert_eq!(no_conn, 1, "1 no_connection failure");
-        assert_eq!(not_ready, 1, "1 not_ready failure");
-        assert_eq!(unknown_id, 1, "1 unknown_id failure");
-        assert_eq!(not_in_reg, 1, "1 not_in_registry failure");
+        assert_eq!(successful, 0, "no cancel reached a downstream");
+        assert_eq!(no_conn, 1, "the dropped producer must be counted");
+        assert_eq!(not_ready, 1, "the initializing producer must be counted");
+        assert_eq!(unknown_id, 1, "the unrouted upstream id must be counted");
+        assert_eq!(
+            not_in_reg, 1,
+            "the unregistered upstream id must be counted"
+        );
     }
 
     // ========================================
@@ -8325,14 +8414,26 @@ mod tests {
     // Multi-Server Cancel Forwarding Tests
     // ============================================================
 
+    /// Two Ready producers on distinct pool keys, for the fan-out registry
+    /// tests that register one upstream id against both.
+    async fn two_ready_handles() -> (Arc<ConnectionHandle>, Arc<ConnectionHandle>) {
+        (
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua-ls"))
+                .await,
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("pyright"))
+                .await,
+        )
+    }
+
     /// Test that registering multiple servers for the same upstream ID creates a set.
-    #[test]
-    fn register_upstream_request_multiple_servers_creates_set() {
+    #[tokio::test]
+    async fn register_upstream_request_multiple_servers_creates_set() {
         let pool = LanguageServerPool::new();
         let upstream_id = UpstreamId::Number(42);
+        let (lua, pyright) = two_ready_handles().await;
 
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua-ls"));
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("pyright"));
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &lua);
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &pyright);
 
         let registry = pool.upstream_request_registry.lock().unwrap();
         let servers = registry.get(&upstream_id).expect("should have entry");
@@ -8343,13 +8444,14 @@ mod tests {
     }
 
     /// Test that unregistering removes only the specified server from the set.
-    #[test]
-    fn unregister_upstream_request_removes_single_server() {
+    #[tokio::test]
+    async fn unregister_upstream_request_removes_single_server() {
         let pool = LanguageServerPool::new();
         let upstream_id = UpstreamId::Number(42);
+        let (lua, pyright) = two_ready_handles().await;
 
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua-ls"));
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("pyright"));
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &lua);
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &pyright);
         pool.unregister_upstream_request(&upstream_id, &ConnectionKey::for_server("lua-ls"));
 
         let registry = pool.upstream_request_registry.lock().unwrap();
@@ -8361,12 +8463,15 @@ mod tests {
     }
 
     /// Test that unregistering the last server cleans up the entire entry.
-    #[test]
-    fn unregister_upstream_request_cleans_up_empty_set() {
+    #[tokio::test]
+    async fn unregister_upstream_request_cleans_up_empty_set() {
         let pool = LanguageServerPool::new();
         let upstream_id = UpstreamId::Number(42);
+        let lua =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua-ls"))
+                .await;
 
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua-ls"));
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &lua);
         pool.unregister_upstream_request(&upstream_id, &ConnectionKey::for_server("lua-ls"));
 
         let registry = pool.upstream_request_registry.lock().unwrap();
@@ -8411,13 +8516,11 @@ mod tests {
         }
 
         // Register both servers for the same upstream ID
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua-ls"));
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("pyright"));
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &handle_lua);
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &handle_py);
 
         // Forward cancel - should succeed for both servers
-        let result = pool
-            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {})
-            .await;
+        let result = pool.forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {});
         assert!(result.is_ok());
 
         // Verify metrics show 2 successful cancels
@@ -8429,13 +8532,14 @@ mod tests {
     }
 
     /// Test that unregister_all_for_upstream_id removes the entire entry at once.
-    #[test]
-    fn unregister_all_for_upstream_id_removes_entire_entry() {
+    #[tokio::test]
+    async fn unregister_all_for_upstream_id_removes_entire_entry() {
         let pool = LanguageServerPool::new();
         let upstream_id = UpstreamId::Number(42);
+        let (lua, pyright) = two_ready_handles().await;
 
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua-ls"));
-        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("pyright"));
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &lua);
+        pool.register_upstream_request_for_handle(upstream_id.clone(), &pyright);
         pool.unregister_all_for_upstream_id(Some(&upstream_id));
 
         let registry = pool.upstream_request_registry.lock().unwrap();

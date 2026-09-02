@@ -211,7 +211,7 @@ impl LanguageServerPool {
     pub(crate) async fn close_host_bridge_document(&self, uri: &Url) {
         self.finish_all_host_routing(uri);
         let lifecycle = self.host_lifecycle_lock(uri);
-        let _lifecycle_guard = lifecycle.lock().await;
+        let _lifecycle_guard = lifecycle.write().await;
         self.invalidate_diagnostic_host(uri);
         let Ok(uri_lsp) = host_url_to_lsp_uri(uri) else {
             return;
@@ -596,7 +596,7 @@ impl LanguageServerPool {
             ));
         }
         if let Some(ref id) = upstream_request_id {
-            self.register_upstream_request(id.clone(), connection_key);
+            self.register_upstream_request_for_handle(id.clone(), &handle);
         }
 
         let (request_id, response_rx) =

@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -91,8 +91,51 @@ pub struct LspClient {
     /// Handle to the background reader thread, joined on drop after the child
     /// is killed (which closes stdout and unblocks the thread).
     reader: Option<JoinHandle<()>>,
-    stderr: Option<std::process::ChildStderr>,
+    /// Everything the child has written to stderr so far, accumulated by
+    /// `stderr_reader`. Kept as raw bytes: a multi-byte character can straddle
+    /// two reads, so decoding happens once in [`LspClient::drain_stderr`].
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
+    /// Handle to the background stderr drain thread, joined on drop after the
+    /// child is killed (which closes stderr and unblocks the thread).
+    stderr_reader: Option<JoinHandle<()>>,
     request_id: i64,
+}
+
+/// Cap on retained stderr. A chatty server under `RUST_LOG=debug` can emit
+/// megabytes over a test; only the tail is ever useful for diagnosis.
+const STDERR_RETAINED_BYTES: usize = 256 * 1024;
+
+/// Background stderr drain: read until EOF, appending to `sink`.
+///
+/// **This thread is load-bearing, not a convenience.** The child's stderr is a
+/// pipe with a fixed kernel buffer (64 KiB on Linux and macOS). With no reader,
+/// a server that logs more than that blocks forever inside its `write`, and
+/// since kakehashi logs from the same runtime that answers requests, the whole
+/// server wedges: the client then times out waiting for a response that will
+/// never come. `test_semantic_tokens_markdown_inline_bold` — the one test that
+/// passes `with_debug(true)` — hit exactly this once debug logging grew past
+/// the buffer, failing with a 30s timeout on every run.
+fn drain_stderr_loop(mut stderr: std::process::ChildStderr, sink: Arc<Mutex<Vec<u8>>>) {
+    use std::io::Read;
+
+    let mut buf = [0u8; 8192];
+    loop {
+        match stderr.read(&mut buf) {
+            Ok(0) => return,
+            // A signal can interrupt the read; giving up here would leave the
+            // pipe unread and reinstate the wedge this thread exists to prevent.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+            Ok(read) => {
+                let mut sink = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                sink.extend_from_slice(&buf[..read]);
+                if sink.len() > STDERR_RETAINED_BYTES {
+                    let excess = sink.len() - STDERR_RETAINED_BYTES;
+                    sink.drain(..excess);
+                }
+            }
+        }
+    }
 }
 
 /// Message pushed from the background reader thread to the client.
@@ -367,7 +410,11 @@ impl LspClient {
     fn from_child(mut child: Child) -> Self {
         let stdin = child.stdin.take().expect("Failed to get stdin");
         let stdout = BufReader::new(child.stdout.take().expect("Failed to get stdout"));
-        let stderr = child.stderr.take();
+        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+        let stderr_reader = child.stderr.take().map(|stderr| {
+            let sink = Arc::clone(&stderr_buf);
+            std::thread::spawn(move || drain_stderr_loop(stderr, sink))
+        });
 
         let (tx, rx) = mpsc::channel();
         let reader = std::thread::spawn(move || reader_loop(stdout, tx));
@@ -377,27 +424,20 @@ impl LspClient {
             stdin: Some(stdin),
             rx,
             reader: Some(reader),
-            stderr,
+            stderr_buf,
+            stderr_reader,
             request_id: 0,
         }
     }
 
-    /// Read stderr output (single read, up to 4KB).
-    ///
-    /// Note: This may block if no data is available. Call after the server
-    /// has had time to produce output. Useful for debugging server behavior.
+    /// Take everything the server has written to stderr so far, clearing the
+    /// buffer. Never blocks — a background thread does the reading.
     pub fn drain_stderr(&mut self) -> String {
-        use std::io::Read;
-        let Some(stderr) = self.stderr.as_mut() else {
-            return String::new();
-        };
-
-        let mut buf = [0u8; 4096];
-        match stderr.read(&mut buf) {
-            Ok(0) => String::new(),
-            Ok(n) => String::from_utf8_lossy(&buf[..n]).to_string(),
-            Err(_) => String::new(),
-        }
+        let mut sink = self
+            .stderr_buf
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        String::from_utf8_lossy(&std::mem::take(&mut *sink)).into_owned()
     }
 
     /// Send an LSP request and return the response.
@@ -918,6 +958,9 @@ impl Drop for LspClient {
         // pending read, so the subsequent join returns promptly.
         self.kill();
         if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.stderr_reader.take() {
             let _ = handle.join();
         }
     }

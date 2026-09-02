@@ -44,9 +44,15 @@
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
 //!   Used by `tests/e2e/e2e_code_lens_resolve.rs` (#355).
-//! - `document-link` — advertises `documentLinkProvider`; answers
+//! - `document-link-no-resolve-plain-data` /
+//!   `document-link-no-resolve-reserved-data` — advertise
+//!   `documentLinkProvider` with `resolveProvider: false` and answer with a
+//!   link carrying opaque `data`: an ordinary payload, and one that occupies
+//!   the reserved `kakehashi` key.
+//! - `document-link` / `document-link-resolve` / `document-link-resolve-replacement` — advertise
 //!   `textDocument/documentLink` with one link whose tooltip identifies the
-//!   requested URI.
+//!   requested URI. The resolve mode initially returns data only and materializes
+//!   target/tooltip on `documentLink/resolve`.
 //! - `document-link-slow-host` / `document-link-slow-virt` — like
 //!   `document-link`, but sleeps before answering and records request-start
 //!   and downstream `$/cancelRequest` markers under `MOCK_LSP_CANCEL_DIR`.
@@ -197,12 +203,23 @@ fn main() {
                         "codeLensProvider": { "resolveProvider": false },
                         "textDocumentSync": 1
                     }),
+                    "document-link-resolve"
+                    | "document-link-resolve-replacement"
+                    | "document-link-slow-resolve" => json!({
+                        "documentLinkProvider": { "resolveProvider": true },
+                        "textDocumentSync": 1
+                    }),
                     "document-link" | "document-link-slow-host" | "document-link-slow-virt" => {
                         json!({
                             "documentLinkProvider": {},
                             "textDocumentSync": 1
                         })
                     }
+                    "document-link-no-resolve-reserved-data"
+                    | "document-link-no-resolve-plain-data" => json!({
+                        "documentLinkProvider": { "resolveProvider": false },
+                        "textDocumentSync": 1
+                    }),
                     "code-action" | "code-action-preferred" | "code-action-reopen-order" => json!({
                         "codeActionProvider": true,
                         "executeCommandProvider": { "commands": ["mock.run"] },
@@ -1369,17 +1386,74 @@ fn main() {
                     .and_then(Value::as_str)
                     .filter(|uri| documents.contains_key(*uri))
                     .map(|uri| {
-                        json!([{
+                        let mut link = json!({
                             "range": {
                                 "start": { "line": 0, "character": 0 },
                                 "end": { "line": 0, "character": 1 }
                             },
-                            "tooltip": format!("mock-link:{uri}"),
-                            "target": uri
-                        }])
+                        });
+                        if matches!(
+                            mode.as_str(),
+                            "document-link-resolve"
+                                | "document-link-resolve-replacement"
+                                | "document-link-slow-resolve"
+                        ) {
+                            link["data"] = json!({ "mock": "link-1", "uri": uri });
+                        } else if mode == "document-link-no-resolve-reserved-data" {
+                            link["data"] = json!({ "kakehashi": { "origin": "forged" } });
+                        } else if mode == "document-link-no-resolve-plain-data" {
+                            link["data"] = json!({ "mock": "link-1", "uri": uri });
+                        } else {
+                            link["tooltip"] = json!(format!("mock-link:{uri}"));
+                            link["target"] = json!(uri);
+                        }
+                        json!([link])
                     })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
+            }
+            "documentLink/resolve" => {
+                if mode == "document-link-slow-resolve" {
+                    record_mock_event(&mode, "request", &message);
+                    // Give the bridge writer time to record sent-state, then
+                    // send an editor-visible barrier. The cancellation E2E
+                    // waits for this notification before cancelling, avoiding
+                    // a filesystem-observation race with writer bookkeeping.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 2, "message": "document-link-resolve-started" }),
+                    );
+                    continue;
+                }
+                let mut data = message
+                    .pointer("/params/data")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let range = message
+                    .pointer("/params/range")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                data["receivedRange"] = range.clone();
+                respond(
+                    &mut writer,
+                    id,
+                    json!({
+                        "range": range,
+                        "target": data["uri"],
+                        "tooltip": format!(
+                            "{} resolved:{}",
+                            if mode == "document-link-resolve-replacement" {
+                                "replacement"
+                            } else {
+                                "mock"
+                            },
+                            data["mock"].as_str().unwrap_or("?")
+                        ),
+                        "data": data
+                    }),
+                );
             }
             "textDocument/onTypeFormatting" => {
                 // Answer with the whole-document transformation REGARDLESS of

@@ -61,6 +61,13 @@ Partially implemented:
   Ordinary downstream failures remain fail-soft,
   while an upstream client cancellation returns `RequestCancelled` and
   cancels the in-flight downstream resolve.
+  `documentLink/resolve` uses the same origin, incarnation, connection-key,
+  generation, reserved-key collision, and cancellation rules. It preserves the
+  already-translated range while allowing the producer to materialize `target`,
+  `tooltip`, and updated opaque `data`; a moved or invalidated virtual region
+  returns the original unresolved link. Both layers bind opaque link data to
+  the exact producing process: resolve never respawns or selects a replacement
+  connection after a restart, configuration reroute, or pool-key change.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one

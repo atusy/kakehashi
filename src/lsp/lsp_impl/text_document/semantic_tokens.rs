@@ -1563,7 +1563,6 @@ mod tests {
             .bridge
             .cancel_forwarder()
             .forward_cancel(crate::lsp::bridge::UpstreamId::Number(42))
-            .await
             .expect("cancel forward must not error");
 
         let result = request.await.expect("handler task must not panic");

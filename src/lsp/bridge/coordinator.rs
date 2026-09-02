@@ -1701,7 +1701,7 @@ impl BridgeCoordinator {
                 }
                 configs = async {
                     let lifecycle = pool.host_lifecycle_lock(&host_uri_owned);
-                    let _guard = lifecycle.lock().await;
+                    let _guard = lifecycle.write().await;
                     Self::resolve_document_routing(
                         &pool,
                         &host_uri_owned,
