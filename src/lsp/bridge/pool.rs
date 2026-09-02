@@ -6495,6 +6495,48 @@ mod tests {
         );
     }
 
+    /// A resolve envelope names its producer by key AND generation. The
+    /// generation advances under the `connections` lock as the old handle is
+    /// retired, so a caller that compared it outside the lock could still
+    /// acquire the replacement in the gap and consult it. The producer lookup
+    /// therefore compares the generation under that same lock: a live handle
+    /// at the expected generation is served, a moved generation misses.
+    #[tokio::test]
+    async fn a_producer_lookup_misses_when_the_generation_moved() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua");
+        let config = test_helpers::devnull_config_for_language("lua");
+        let handle =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.record_launch_config(&config);
+        pool.connections
+            .lock()
+            .await
+            .insert(key.clone(), Arc::clone(&handle));
+        let minted_at = pool.document_connection_generation(&key);
+
+        assert!(
+            pool.ready_producer_by_key(&key, Some(&config), minted_at)
+                .await
+                .is_some_and(|live| Arc::ptr_eq(&live, &handle)),
+            "the live handle at the minted generation is the producer"
+        );
+        assert!(
+            pool.ready_producer_by_key(&key, Some(&config), minted_at + 1)
+                .await
+                .is_none(),
+            "a generation the key never reached names no producer"
+        );
+
+        pool.document_tracker.purge_connection(&key).await;
+        assert!(
+            pool.ready_producer_by_key(&key, Some(&config), minted_at)
+                .await
+                .is_none(),
+            "after a purge the still-inserted handle is not the minted generation's process"
+        );
+    }
+
     /// A connection mid-handshake is LIVE, and for a shared-instance key it is
     /// the only way to reach the instance at all — the revive path cannot
     /// re-root one without a document. Dropping it would fail soft on a
