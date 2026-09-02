@@ -164,6 +164,23 @@ fn code_lens_with_retry(client: &mut LspClient) -> Vec<Value> {
     panic!("timed out waiting for a non-empty codeLens result");
 }
 
+/// Poll `textDocument/codeLens` until the lens names a producer other than
+/// `old_envelope`'s. Configuration changes propagate asynchronously, so the
+/// first non-empty result after one may still come from the retired process.
+fn replacement_code_lens_with_retry(client: &mut LspClient, old_envelope: &Value) -> Value {
+    for _ in 0..300 {
+        let lens = code_lens_with_retry(client).remove(0);
+        let envelope = &lens["data"]["kakehashi"];
+        if envelope["connection_key"] != old_envelope["connection_key"]
+            || envelope["connection_generation"] != old_envelope["connection_generation"]
+        {
+            return lens;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for a lens from the replacement process");
+}
+
 fn shutdown(client: &mut LspClient) {
     let _ = client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
@@ -367,8 +384,8 @@ fn assert_replaced_connection_lens_stays_unresolved(change_pool_key: bool) {
             }
         }}),
     );
-    let replacement_lens = code_lens_with_retry(&mut client).remove(0);
     let old_envelope = &old_lens["data"]["kakehashi"];
+    let replacement_lens = replacement_code_lens_with_retry(&mut client, old_envelope);
     let replacement_envelope = &replacement_lens["data"]["kakehashi"];
     if change_pool_key {
         assert_ne!(
@@ -474,8 +491,8 @@ fn assert_replaced_virtual_connection_lens_stays_unresolved(change_pool_key: boo
     );
     open_markdown(&mut client);
 
-    let replacement_lens = code_lens_with_retry(&mut client).remove(0);
     let old_envelope = &old_lens["data"]["kakehashi"];
+    let replacement_lens = replacement_code_lens_with_retry(&mut client, old_envelope);
     let replacement_envelope = &replacement_lens["data"]["kakehashi"];
     assert!(
         !old_envelope["connection_key"].is_null(),
