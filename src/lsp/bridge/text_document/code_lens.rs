@@ -21,9 +21,9 @@
 //!
 //! Resolution fails soft for stale regions, missing servers, replaced
 //! producers, connection errors, and parse failures: the lens returns
-//! unresolved with its envelope intact. Client cancellation is the exception and surfaces as
-//! `RequestCancelled`; clients re-request lenses on change, so the ordinary
-//! fail-soft window is short (#355 maintainer decision).
+//! unresolved with its envelope intact. Client cancellation is the exception
+//! and surfaces as `RequestCancelled`; clients re-request lenses on change,
+//! so the ordinary fail-soft window is short (#355 maintainer decision).
 //!
 //! Requests are queued via the channel-based writer task (`send_request()`) for
 //! FIFO ordering with other messages (ls-bridge-message-ordering single-writer loop).
