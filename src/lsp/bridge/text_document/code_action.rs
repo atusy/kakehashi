@@ -697,7 +697,7 @@ impl LanguageServerPool {
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve (host): envelope host_uri '{}' is not a valid URL; ignoring",
+                "codeAction/resolve (host): envelope host_uri {:?} is not a valid URL; ignoring",
                 envelope.host_uri
             );
             re_envelope_action(&mut action, &envelope);
@@ -792,7 +792,7 @@ impl LanguageServerPool {
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: envelope host_uri '{}' is not a valid URL; ignoring",
+                "codeAction/resolve: envelope host_uri {:?} is not a valid URL; ignoring",
                 envelope.host_uri
             );
             re_envelope_action(&mut action, &envelope);

@@ -122,7 +122,7 @@ impl LanguageServerPool {
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             warn!(
                 target: "kakehashi::bridge",
-                "completionItem/resolve (host): envelope host_uri '{}' is not a valid URL; ignoring",
+                "completionItem/resolve (host): envelope host_uri {:?} is not a valid URL; ignoring",
                 envelope.host_uri
             );
             re_envelope_item(&mut item, &envelope);
