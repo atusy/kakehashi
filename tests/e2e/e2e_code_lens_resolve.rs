@@ -25,6 +25,13 @@ fn init_client() -> (LspClient, tempfile::TempDir) {
 }
 
 fn init_client_with_mode(mode: &str) -> (LspClient, tempfile::TempDir) {
+    init_client_with_mode_and_language(mode, "lua")
+}
+
+fn init_client_with_mode_and_language(
+    mode: &str,
+    language: &str,
+) -> (LspClient, tempfile::TempDir) {
     let bin = mock_formatter_bin();
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("code_lens_resolve.toml");
@@ -43,7 +50,7 @@ fn init_client_with_mode(mode: &str) -> (LspClient, tempfile::TempDir) {
             "capabilities": {},
             "workspaceFolders": null,
             "initializationOptions": { "languageServers": {
-                "mock-codelens": { "cmd": [bin, mode], "languages": ["lua"] }
+                "mock-codelens": { "cmd": [bin, mode], "languages": [language] }
             }}
         }),
     );
@@ -132,19 +139,21 @@ fn open_markdown(client: &mut LspClient) {
     std::thread::sleep(Duration::from_millis(1000));
 }
 
-/// Issue `textDocument/codeLens` until a non-empty result satisfies `accept`,
-/// retrying while the result is null (cold downstream still handshaking),
-/// empty (region not resolved yet), or rejected by `accept`. One bounded
-/// loop: a caller's condition must not multiply the retry budget.
+/// Issue `textDocument/codeLens` for `uri` until a non-empty result
+/// satisfies `accept`, retrying while the result is null (cold downstream
+/// still handshaking), empty (region not resolved yet), or rejected by
+/// `accept`. One bounded loop: a caller's condition must not multiply the
+/// retry budget.
 fn code_lenses_until(
     client: &mut LspClient,
+    uri: &str,
     accept: impl Fn(&[Value]) -> bool,
     waiting_for: &str,
 ) -> Vec<Value> {
     for _ in 0..300 {
         let response = client.send_request(
             "textDocument/codeLens",
-            json!({ "textDocument": { "uri": MARKDOWN_URI } }),
+            json!({ "textDocument": { "uri": uri } }),
         );
         assert!(
             response.get("error").is_none(),
@@ -166,8 +175,14 @@ fn code_lenses_until(
     panic!("timed out waiting for {waiting_for}");
 }
 
+/// Issue `textDocument/codeLens` for the shared markdown fixture, retrying
+/// while the result is null (cold downstream still handshaking).
 fn code_lens_with_retry(client: &mut LspClient) -> Vec<Value> {
-    code_lenses_until(client, |_| true, "a non-empty codeLens result")
+    code_lens_with_retry_for(client, MARKDOWN_URI)
+}
+
+fn code_lens_with_retry_for(client: &mut LspClient, uri: &str) -> Vec<Value> {
+    code_lenses_until(client, uri, |_| true, "a non-empty codeLens result")
 }
 
 /// Poll `textDocument/codeLens` until the lens names a producer other than
@@ -176,6 +191,7 @@ fn code_lens_with_retry(client: &mut LspClient) -> Vec<Value> {
 fn replacement_code_lens_with_retry(client: &mut LspClient, old_envelope: &Value) -> Value {
     code_lenses_until(
         client,
+        MARKDOWN_URI,
         |lenses| {
             let envelope = &lenses[0]["data"]["kakehashi"];
             envelope["connection_key"] != old_envelope["connection_key"]
@@ -258,6 +274,45 @@ fn e2e_code_lens_resolve_round_trips_to_origin_server() {
         stale["data"]["kakehashi"]["origin"], "mock-codelens",
         "fail-soft must return the lens with its routing envelope intact; got: {stale:?}"
     );
+
+    shutdown(&mut client);
+}
+
+/// A region whose injection query applies `#offset!` (markdown YAML
+/// frontmatter: the content node spans the `---` fences, the effective
+/// region starts one line below) must resolve like any other region. The
+/// freshness gate compares the envelope's effective offset against the
+/// region's LIVE effective offset, not its raw node position, so the
+/// unchanged region is fresh and the lens comes back with its command.
+#[test]
+fn e2e_code_lens_resolve_accepts_offset_frontmatter_region() {
+    let (mut client, _config_dir) = init_client_with_mode_and_language("code-lens", "yaml");
+    let uri = "file:///test_code_lens_resolve_frontmatter.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "---\ntitle: test\n---\n"
+        }}),
+    );
+
+    let lens = code_lens_with_retry_for(&mut client, uri).remove(0);
+    assert_eq!(
+        lens["range"]["start"],
+        json!({ "line": 1, "character": 0 }),
+        "the mock's virtual line 0 is the frontmatter body on host line 1; got: {lens:?}"
+    );
+
+    let response = client.send_request("codeLens/resolve", lens.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    let resolved = &response["result"];
+    assert_eq!(
+        resolved["command"]["title"], "mock resolved:lens-1",
+        "an unchanged #offset! region is fresh, so resolve must reach the origin; got: {resolved:?}"
+    );
+    assert_eq!(resolved["range"], lens["range"]);
 
     shutdown(&mut client);
 }
