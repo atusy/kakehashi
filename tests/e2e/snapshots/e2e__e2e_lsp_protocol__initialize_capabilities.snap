@@ -53,7 +53,9 @@ expression: capabilities
     "prepareProvider": true,
     "workDoneProgress": true
   },
-  "documentLinkProvider": {},
+  "documentLinkProvider": {
+    "resolveProvider": true
+  },
   "foldingRangeProvider": true,
   "declarationProvider": {
     "workDoneProgress": true
