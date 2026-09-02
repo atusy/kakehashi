@@ -1,10 +1,11 @@
 //! Document link method for Kakehashi.
 
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams};
+
 use super::super::Kakehashi;
 use crate::lsp::bridge::{envelope_host_document_links, extract_document_link_envelope};
 use crate::lsp::current_upstream_id;
-use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams};
 
 impl Kakehashi {
     pub(crate) async fn document_link_impl(
