@@ -132,9 +132,15 @@ fn open_markdown(client: &mut LspClient) {
     std::thread::sleep(Duration::from_millis(1000));
 }
 
-/// Issue `textDocument/codeLens`, retrying while the result is null (cold
-/// downstream still handshaking).
-fn code_lens_with_retry(client: &mut LspClient) -> Vec<Value> {
+/// Issue `textDocument/codeLens` until a non-empty result satisfies `accept`,
+/// retrying while the result is null (cold downstream still handshaking),
+/// empty (region not resolved yet), or rejected by `accept`. One bounded
+/// loop: a caller's condition must not multiply the retry budget.
+fn code_lenses_until(
+    client: &mut LspClient,
+    accept: impl Fn(&[Value]) -> bool,
+    waiting_for: &str,
+) -> Vec<Value> {
     for _ in 0..300 {
         let response = client.send_request(
             "textDocument/codeLens",
@@ -146,39 +152,38 @@ fn code_lens_with_retry(client: &mut LspClient) -> Vec<Value> {
             response.get("error")
         );
         let result = &response["result"];
-        if result.is_null() {
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
+        if !result.is_null() {
+            let lenses = result
+                .as_array()
+                .cloned()
+                .expect("non-null codeLens result must be an array");
+            if !lenses.is_empty() && accept(&lenses) {
+                return lenses;
+            }
         }
-        let lenses = result
-            .as_array()
-            .cloned()
-            .expect("non-null codeLens result must be an array");
-        if lenses.is_empty() {
-            // Region may not be resolved yet; keep retrying.
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
-        }
-        return lenses;
+        std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("timed out waiting for a non-empty codeLens result");
+    panic!("timed out waiting for {waiting_for}");
+}
+
+fn code_lens_with_retry(client: &mut LspClient) -> Vec<Value> {
+    code_lenses_until(client, |_| true, "a non-empty codeLens result")
 }
 
 /// Poll `textDocument/codeLens` until the lens names a producer other than
 /// `old_envelope`'s. Configuration changes propagate asynchronously, so the
 /// first non-empty result after one may still come from the retired process.
 fn replacement_code_lens_with_retry(client: &mut LspClient, old_envelope: &Value) -> Value {
-    for _ in 0..300 {
-        let lens = code_lens_with_retry(client).remove(0);
-        let envelope = &lens["data"]["kakehashi"];
-        if envelope["connection_key"] != old_envelope["connection_key"]
-            || envelope["connection_generation"] != old_envelope["connection_generation"]
-        {
-            return lens;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("timed out waiting for a lens from the replacement process");
+    code_lenses_until(
+        client,
+        |lenses| {
+            let envelope = &lenses[0]["data"]["kakehashi"];
+            envelope["connection_key"] != old_envelope["connection_key"]
+                || envelope["connection_generation"] != old_envelope["connection_generation"]
+        },
+        "a lens from the replacement process",
+    )
+    .remove(0)
 }
 
 fn shutdown(client: &mut LspClient) {
