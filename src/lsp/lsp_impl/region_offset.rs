@@ -44,6 +44,14 @@ impl Kakehashi {
     /// share this one answer, so they cannot drift. Completion and code
     /// action need the region end and contiguity as well, so they call
     /// [`resolve_region_offset`] directly and compare the same offset.
+    ///
+    /// Contiguity is deliberately NOT required here. A non-contiguous
+    /// combined region masks its host gaps with whitespace, so its line
+    /// geometry — and therefore range translation — stays valid; only
+    /// edit-carrying methods are refused on such regions
+    /// (`method_requires_contiguous_injection`), and code lenses and document
+    /// links are minted for them on purpose. Refusing to resolve what was
+    /// deliberately produced would leave those items permanently unresolved.
     pub(super) fn region_offset_is_fresh(
         &self,
         host_uri: &str,
