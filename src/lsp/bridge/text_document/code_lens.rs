@@ -230,7 +230,12 @@ impl LanguageServerPool {
         }
         // Bind the lenses to this exact process: resolve looks the producer
         // up by key and generation and never hands process-owned data to a
-        // replacement (the host layer stamps the same pair).
+        // replacement (the host layer stamps the same pair). Reading the
+        // generation before the send is safe: it only advances under the
+        // `connections` lock as the handle is retired, and the send below
+        // re-verifies this handle under that same lock — a bump before the
+        // send fails the send, a bump after it leaves the lenses stamped with
+        // a generation the resolve side rejects.
         let connection_key = handle.key().clone();
         let connection_generation = self.document_connection_generation(&connection_key);
         // Read resolve support when the RESPONSE arrives, as the host layer
