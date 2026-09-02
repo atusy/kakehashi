@@ -182,16 +182,22 @@ pub(crate) fn envelope_host_code_lenses(
         host_layer: true,
     };
     for lens in lenses {
-        if server_resolves || code_lens_data_carries_envelope_key(lens) {
+        if should_envelope_lens(lens, server_resolves) {
             envelope_lens_data(lens, &ctx);
         }
     }
 }
 
-fn code_lens_data_carries_envelope_key(lens: &CodeLens) -> bool {
-    lens.data
-        .as_ref()
-        .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
+/// Whether a lens must carry a routing envelope: the origin advertises
+/// `codeLens/resolve`, or the lens's own `data` already occupies the envelope
+/// key — the one case a non-resolving server's lens must still be wrapped, so
+/// its payload is nested rather than read back as routing metadata.
+fn should_envelope_lens(lens: &CodeLens, server_resolves: bool) -> bool {
+    server_resolves
+        || lens
+            .data
+            .as_ref()
+            .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
 }
 
 impl LanguageServerPool {

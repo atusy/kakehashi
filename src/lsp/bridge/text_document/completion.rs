@@ -593,18 +593,23 @@ pub(crate) fn bridge_host_completion_items(
         CompletionResponse::List(list) => &mut list.items,
     };
     for item in items.iter_mut() {
-        if server_resolves || data_carries_envelope_key(item) {
+        if should_envelope_item(item, server_resolves) {
             envelope_host_item(item, server_name, host_uri);
         }
     }
 }
 
-/// Whether an item's own `data` already occupies the envelope key — the one
-/// case a non-resolving server's item must still be wrapped.
-fn data_carries_envelope_key(item: &CompletionItem) -> bool {
-    item.data
-        .as_ref()
-        .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
+/// Whether an item must carry a routing envelope: the origin advertises
+/// `completionItem/resolve`, or the item's own `data` already occupies the
+/// envelope key — the one case a non-resolving server's item must still be
+/// wrapped, so its payload is nested rather than read back as routing
+/// metadata it never earned.
+fn should_envelope_item(item: &CompletionItem, server_resolves: bool) -> bool {
+    server_resolves
+        || item
+            .data
+            .as_ref()
+            .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
 }
 
 /// Wrap a HOST-layer item's `data` in a routing envelope so a later
