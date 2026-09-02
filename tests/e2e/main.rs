@@ -19,6 +19,7 @@ mod e2e_cli_diagnose;
 mod e2e_cli_format;
 mod e2e_code_action;
 mod e2e_code_lens_resolve;
+mod e2e_completion_envelope;
 mod e2e_concatenated_formatting;
 mod e2e_config_file;
 mod e2e_config_relative_paths;

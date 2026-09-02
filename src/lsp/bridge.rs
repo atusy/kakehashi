@@ -29,6 +29,7 @@ mod client;
 mod client_progress;
 mod connection;
 pub(crate) mod coordinator;
+pub(crate) mod envelope;
 mod inbound_request_registry;
 mod pool;
 mod progress_registry;

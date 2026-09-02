@@ -56,9 +56,10 @@ impl Kakehashi {
     /// untranslated — they are already real.
     ///
     /// The envelope is minted only for a server that advertises
-    /// `completionItem/resolve`: for one that does not, it would be pure wire
-    /// weight on every item of every completion, and the resolve would fail
-    /// soft back to the unresolved item anyway.
+    /// `completionItem/resolve` (reserved-key collision aside): for one that
+    /// does not, it would be pure wire weight on every item of every
+    /// completion, and the resolve would fail soft back to the unresolved
+    /// item anyway.
     ///
     /// Minting also happens only for the server that WINS the fan-in. Each
     /// fanned-out server carries its identity back beside its response

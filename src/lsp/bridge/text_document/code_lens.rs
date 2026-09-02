@@ -5,12 +5,13 @@
 //! position parameter, like document link); `codeLens/resolve` takes a single
 //! lens as its complete params — see `dispatch_code_lens_resolve`.
 //!
-//! Every injection lens gets a routing envelope in `lens.data` (the
-//! `completionItem/resolve` pattern), as does a winning host lens when its
-//! server advertises resolve, so a later `codeLens/resolve` can be sent to the
-//! origin downstream server. Unresolved lenses (no `command`, only `data`) are
-//! therefore forwarded instead of dropped — servers like rust-analyzer return
-//! mostly-unresolved lenses by design.
+//! A lens gets a routing envelope in `lens.data` on either layer under one
+//! rule (`bridge::envelope::should_envelope`): its origin advertises
+//! `codeLens/resolve`, or its payload squats on the reserved key. That lets a
+//! later `codeLens/resolve` be sent to the origin downstream server; lenses
+//! from a non-resolving origin stay bare. Unresolved lenses (no `command`,
+//! only `data`) are forwarded instead of dropped — servers like rust-analyzer
+//! return mostly-unresolved lenses by design.
 //!
 //! Resolution fails soft for stale regions, missing servers, connection
 //! errors, and parse failures: the lens returns unresolved with its envelope
@@ -24,7 +25,7 @@
 use std::io;
 use std::sync::Arc;
 
-use log::warn;
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::{CodeLens, NumberOrString};
@@ -40,9 +41,7 @@ use super::completion::EnvelopeOffset;
 use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-
-/// Wrapper key inside `CodeLens.data` that identifies the origin server.
-const ENVELOPE_KEY: &str = "kakehashi";
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, nests_reserved_key, should_envelope};
 
 /// Envelope stored in `CodeLens.data` for routing `codeLens/resolve` (#355).
 ///
@@ -182,16 +181,10 @@ pub(crate) fn envelope_host_code_lenses(
         host_layer: true,
     };
     for lens in lenses {
-        if server_resolves || code_lens_data_carries_envelope_key(lens) {
+        if should_envelope(lens.data.as_ref(), server_resolves) {
             envelope_lens_data(lens, &ctx);
         }
     }
-}
-
-fn code_lens_data_carries_envelope_key(lens: &CodeLens) -> bool {
-    lens.data
-        .as_ref()
-        .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
 }
 
 impl LanguageServerPool {
@@ -226,6 +219,10 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/codeLens") {
             return Ok(None);
         }
+        // Read resolve support when the RESPONSE arrives, as the host layer
+        // does: a dynamic `resolveProvider` registration can land between
+        // send and reply, and the envelope decision should see it.
+        let origin = Arc::clone(&handle);
         let host_uri_string = host_uri.to_string();
         self.execute_bridge_request_with_handle(
             handle,
@@ -250,7 +247,12 @@ impl LanguageServerPool {
                     offset: ctx.offset,
                     host_layer: false,
                 };
-                transform_code_lens_response_to_host(response, ctx.offset, &envelope_ctx)
+                transform_code_lens_response_to_host(
+                    response,
+                    ctx.offset,
+                    origin.has_capability("codeLens/resolve"),
+                    &envelope_ctx,
+                )
             },
         )
         .await
@@ -306,6 +308,13 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
     ) -> CodeLens {
         let server_name = &envelope.origin;
+        // One function serves both layers; tag the host one like the
+        // completion and codeAction host paths do.
+        let layer = if envelope.is_host_layer() {
+            " (host)"
+        } else {
+            ""
+        };
         let Ok(host_uri) = Url::parse(&envelope.host_uri) else {
             re_envelope_lens(&mut lens, &envelope);
             return lens;
@@ -357,8 +366,7 @@ impl LanguageServerPool {
             Err(e) => {
                 warn!(
                     target: "kakehashi::bridge",
-                    "codeLens/resolve: failed to connect to {}: {}",
-                    server_name, e
+                    "codeLens/resolve{layer}: failed to connect to {server_name}: {e}"
                 );
                 re_envelope_lens(&mut lens, &envelope);
                 return lens;
@@ -366,6 +374,25 @@ impl LanguageServerPool {
         };
 
         if !handle.has_capability("codeLens/resolve") {
+            // Two ways here. The payload nests the reserved key: as far as
+            // this branch can tell, the origin never advertised resolve and
+            // the wrap existed only to nest it — steady state, so every
+            // client resolve of that lens that clears the gates above
+            // lands here; say so quietly. Otherwise the origin did advertise
+            // and a respawn or dynamic unregister withdrew the capability
+            // under the lens: anomalous.
+            if nests_reserved_key(lens.data.as_ref()) {
+                debug!(
+                    target: "kakehashi::bridge",
+                    "codeLens/resolve{layer}: {server_name:?} does not advertise resolveProvider; the lens was \
+                     enveloped only to nest a reserved-key payload; returning unresolved"
+                );
+            } else {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "codeLens/resolve{layer}: {server_name:?} no longer advertises resolveProvider; returning unresolved"
+                );
+            }
             re_envelope_lens(&mut lens, &envelope);
             return lens;
         }
@@ -403,8 +430,7 @@ impl LanguageServerPool {
                 Err(e) => {
                     warn!(
                         target: "kakehashi::bridge",
-                        "codeLens/resolve: failed to register request for {}: {}",
-                        server_name, e
+                        "codeLens/resolve{layer}: failed to register request for {server_name}: {e}"
                     );
                     if let Some(ref id) = upstream_id {
                         self.unregister_upstream_request(id, connection_key);
@@ -447,8 +473,7 @@ impl LanguageServerPool {
         if let Err(e) = send_result {
             warn!(
                 target: "kakehashi::bridge",
-                "codeLens/resolve: failed to send request for {}: {}",
-                server_name, e
+                "codeLens/resolve{layer}: failed to send request for {server_name}: {e}"
             );
             if let Some(ref id) = upstream_id {
                 self.unregister_upstream_request(id, connection_key);
@@ -469,8 +494,7 @@ impl LanguageServerPool {
             Err(e) => {
                 warn!(
                     target: "kakehashi::bridge",
-                    "codeLens/resolve failed for server {}: {}",
-                    server_name, e
+                    "codeLens/resolve{layer} failed for server {server_name}: {e}"
                 );
                 re_envelope_lens(&mut lens, &envelope);
                 return lens;
@@ -547,13 +571,17 @@ fn parse_code_lens_resolve_response(mut response: serde_json::Value) -> Option<C
 
 /// Transform a code lens response from virtual to host document coordinates.
 ///
-/// Each lens's `range` is translated by `offset` and its `data` is wrapped in
-/// a routing envelope so `codeLens/resolve` can find the origin server later.
-/// Unresolved lenses (no `command`) are kept now that resolve is supported
-/// (#355) — dropping them wholesale destroyed most of rust-analyzer's lenses.
+/// Each lens's `range` is translated by `offset`, and the `data` of each lens
+/// that [`should_envelope`] selects — the origin advertises
+/// `codeLens/resolve`, or the payload squats on the reserved key — is wrapped
+/// in a routing envelope so `codeLens/resolve` can find the origin server
+/// later; the rest pass through bare. Unresolved lenses (no `command`) are
+/// kept now that resolve is supported (#355) — dropping them wholesale
+/// destroyed most of rust-analyzer's lenses.
 fn transform_code_lens_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
+    server_resolves: bool,
     envelope_ctx: &CodeLensEnvelopeContext<'_>,
 ) -> Option<Vec<CodeLens>> {
     if response_has_jsonrpc_error(&response, "textDocument/codeLens") {
@@ -569,7 +597,9 @@ fn transform_code_lens_response_to_host(
 
     for lens in &mut lenses {
         translate_virtual_range_to_host(&mut lens.range, offset);
-        envelope_lens_data(lens, envelope_ctx);
+        if should_envelope(lens.data.as_ref(), server_resolves) {
+            envelope_lens_data(lens, envelope_ctx);
+        }
     }
 
     Some(lenses)
@@ -581,6 +611,73 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json::json;
+
+    /// Run the virt transform for a resolving origin: every lens is enveloped.
+    /// (The completion twin defaults the other way — its helper is named for
+    /// a non-resolving origin.)
+    fn transform_for_resolving_server(
+        response: serde_json::Value,
+        offset: &RegionOffset,
+    ) -> Option<Vec<CodeLens>> {
+        transform_with_resolve_support(response, offset, true)
+    }
+
+    fn transform_with_resolve_support(
+        response: serde_json::Value,
+        offset: &RegionOffset,
+        server_resolves: bool,
+    ) -> Option<Vec<CodeLens>> {
+        transform_code_lens_response_to_host(response, offset, server_resolves, &ctx_with(offset))
+    }
+
+    #[test]
+    fn virt_lenses_are_enveloped_only_when_the_server_resolves() {
+        let response = |data: serde_json::Value| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 5 }
+                    },
+                    "data": data
+                }]
+            })
+        };
+        let offset = RegionOffset::new(3, 0);
+
+        let resolvable =
+            transform_with_resolve_support(response(json!({"token": 1})), &offset, true).unwrap();
+        let envelope =
+            extract_code_lens_envelope(&resolvable[0]).expect("resolving origin envelopes");
+        assert_eq!(envelope.origin, "lua-ls");
+        assert_eq!(envelope.inner, Some(json!({"token": 1})));
+
+        let bare =
+            transform_with_resolve_support(response(json!({"token": 1})), &offset, false).unwrap();
+        assert_eq!(
+            bare[0].data,
+            Some(json!({"token": 1})),
+            "a non-resolving origin's payload must pass through untouched: the resolve \
+             would only fail soft back to it, so the envelope is pure wire weight"
+        );
+        assert_eq!(bare[0].range.start.line, 3, "ranges are still translated");
+
+        let forged = transform_with_resolve_support(
+            response(json!({ ENVELOPE_KEY: { "origin": "spoofed" } })),
+            &offset,
+            false,
+        )
+        .unwrap();
+        let envelope = extract_code_lens_envelope(&forged[0]).expect("collision envelope");
+        assert_eq!(envelope.origin, "lua-ls");
+        assert_eq!(
+            envelope.inner,
+            Some(json!({ ENVELOPE_KEY: { "origin": "spoofed" } })),
+            "the foreign payload must be nested, not honored as routing metadata"
+        );
+    }
 
     fn ctx_with<'a>(offset: &'a RegionOffset) -> CodeLensEnvelopeContext<'a> {
         CodeLensEnvelopeContext {
@@ -686,8 +783,7 @@ mod tests {
         });
 
         let offset = RegionOffset::new(5, 0);
-        let transformed =
-            transform_code_lens_response_to_host(response, &offset, &ctx_with(&offset));
+        let transformed = transform_for_resolving_server(response, &offset);
 
         let lenses = transformed.expect("Should parse code lenses");
         assert_eq!(lenses.len(), 1);
@@ -723,8 +819,7 @@ mod tests {
         });
 
         let offset = RegionOffset::new(3, 0);
-        let transformed =
-            transform_code_lens_response_to_host(response, &offset, &ctx_with(&offset));
+        let transformed = transform_for_resolving_server(response, &offset);
 
         let lenses = transformed.expect("Should parse code lenses");
         assert_eq!(
@@ -755,8 +850,7 @@ mod tests {
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"}))]
     fn code_lens_response_returns_none_for_invalid(#[case] response: serde_json::Value) {
         let offset = RegionOffset::new(5, 0);
-        let transformed =
-            transform_code_lens_response_to_host(response, &offset, &ctx_with(&offset));
+        let transformed = transform_for_resolving_server(response, &offset);
         assert!(transformed.is_none());
     }
 
@@ -765,8 +859,7 @@ mod tests {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
         let offset = RegionOffset::new(5, 0);
-        let transformed =
-            transform_code_lens_response_to_host(response, &offset, &ctx_with(&offset));
+        let transformed = transform_for_resolving_server(response, &offset);
         assert!(transformed.expect("Should parse empty array").is_empty());
     }
 
@@ -785,8 +878,7 @@ mod tests {
         });
 
         let offset = RegionOffset::new(10, 0);
-        let transformed =
-            transform_code_lens_response_to_host(response, &offset, &ctx_with(&offset));
+        let transformed = transform_for_resolving_server(response, &offset);
 
         let lenses = transformed.expect("Should parse code lenses");
         assert_eq!(
@@ -971,7 +1063,8 @@ mod tests {
         assert!(result.command.is_none(), "lens stays unresolved");
     }
 
-    /// dispatch returns a non-envelope lens unchanged (host-layer or foreign).
+    /// dispatch returns a non-envelope lens unchanged (foreign, or from a
+    /// non-resolving origin on either layer).
     #[tokio::test]
     async fn dispatch_returns_non_envelope_lens_unchanged() {
         let pool = std::sync::Arc::new(LanguageServerPool::new());
@@ -986,5 +1079,124 @@ mod tests {
             .dispatch_code_lens_resolve(lens.clone(), &settings, None)
             .await;
         assert_eq!(result.data, Some(json!({"custom": true})));
+    }
+
+    /// The resolve-side capability gate is the authoritative one: an envelope
+    /// is minted for a resolving origin, so reaching a non-resolving handle
+    /// means the origin changed under the lens (dynamic unregister, respawn)
+    /// or the payload was wrapped for squatting on the reserved key. Either
+    /// way the lens comes back unresolved; the withdrawn-capability way is
+    /// logged as an anomaly, as the codeAction and host-completion paths
+    /// already did (the reserved-key way is the sibling test below).
+    #[test]
+    fn dispatch_warns_and_re_envelopes_when_origin_no_longer_resolves() {
+        use crate::lsp::bridge::test_logging::captured_warnings_for;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let warnings = captured_warnings_for(|| {
+            runtime.block_on(async {
+                let pool = LanguageServerPool::new();
+                let key = ConnectionKey::for_server("lua-ls");
+                let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
+                    crate::lsp::bridge::ConnectionState::Ready,
+                    key.clone(),
+                )
+                .await;
+                pool.insert_connection(handle).await;
+                let mut settings = WorkspaceSettings::default();
+                settings.language_servers.insert(
+                    "lua-ls".to_string(),
+                    BridgeServerConfig {
+                        cmd: Some(vec!["lua-language-server".to_string()]),
+                        ..Default::default()
+                    },
+                );
+                let mut lenses = vec![CodeLens {
+                    range: tower_lsp_server::ls_types::Range::default(),
+                    command: None,
+                    data: Some(json!({"kind": "references"})),
+                }];
+                envelope_host_code_lenses(
+                    &mut lenses,
+                    "lua-ls",
+                    "file:///test.md",
+                    None,
+                    pool.document_connection_generation(&key),
+                    &key,
+                    true,
+                );
+
+                let result = pool
+                    .dispatch_code_lens_resolve(lenses.remove(0), &settings, None)
+                    .await;
+                let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
+                assert_eq!(envelope.inner, Some(json!({"kind": "references"})));
+                assert!(result.command.is_none(), "lens stays unresolved");
+            });
+        });
+        assert!(
+            warnings.iter().any(|w| w.contains("codeLens/resolve")
+                && w.contains("no longer advertises resolveProvider")),
+            "the capability miss must be logged, not silently swallowed: {warnings:?}"
+        );
+    }
+
+    /// The other way to reach the capability miss is steady state, not an
+    /// anomaly: a NON-resolving origin's payload squatted on the reserved key,
+    /// so it was wrapped only to nest it, and every client resolve of that
+    /// lens lands here. It must come back unresolved with the payload intact
+    /// and must NOT be reported as a lost capability.
+    #[test]
+    fn dispatch_does_not_warn_for_a_reserved_key_wrap_from_a_non_resolving_origin() {
+        use crate::lsp::bridge::test_logging::captured_warnings_for;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let warnings = captured_warnings_for(|| {
+            runtime.block_on(async {
+                let pool = LanguageServerPool::new();
+                let key = ConnectionKey::for_server("lua-ls");
+                let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
+                    crate::lsp::bridge::ConnectionState::Ready,
+                    key.clone(),
+                )
+                .await;
+                pool.insert_connection(handle).await;
+                let mut settings = WorkspaceSettings::default();
+                settings.language_servers.insert(
+                    "lua-ls".to_string(),
+                    BridgeServerConfig {
+                        cmd: Some(vec!["lua-language-server".to_string()]),
+                        ..Default::default()
+                    },
+                );
+                let forged = json!({ ENVELOPE_KEY: { "origin": "forged" } });
+                let mut lenses = vec![CodeLens {
+                    range: tower_lsp_server::ls_types::Range::default(),
+                    command: None,
+                    data: Some(forged.clone()),
+                }];
+                envelope_host_code_lenses(
+                    &mut lenses,
+                    "lua-ls",
+                    "file:///test.md",
+                    None,
+                    pool.document_connection_generation(&key),
+                    &key,
+                    false,
+                );
+
+                let result = pool
+                    .dispatch_code_lens_resolve(lenses.remove(0), &settings, None)
+                    .await;
+                let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
+                assert_eq!(envelope.origin, "lua-ls");
+                assert_eq!(envelope.inner, Some(forged));
+                assert!(result.command.is_none(), "lens stays unresolved");
+            });
+        });
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("no longer advertises resolveProvider")),
+            "a reserved-key wrap is not a lost capability: {warnings:?}"
+        );
     }
 }

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::settings::BridgeServerConfig;
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope};
 use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position};
 use url::Url;
 
@@ -62,6 +63,10 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/completion") {
             return Ok(None);
         }
+        // Read resolve support when the RESPONSE arrives, as the host layer
+        // does: a dynamic `resolveProvider` registration can land between
+        // send and reply, and the envelope decision should see it.
+        let origin = std::sync::Arc::clone(&handle);
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -82,7 +87,8 @@ impl LanguageServerPool {
                     ctx.offset,
                     region_end,
                     Some(host_position.line),
-                    Some(EnvelopeContext {
+                    origin.has_capability("completionItem/resolve"),
+                    &EnvelopeContext {
                         server_name,
                         injection_language,
                         incarnation: host_incarnation,
@@ -91,7 +97,7 @@ impl LanguageServerPool {
                         offset: ctx.offset,
                         region_end: Some(region_end),
                         host_layer: false,
-                    }),
+                    },
                 )
             },
         )
@@ -119,14 +125,17 @@ fn build_completion_request(
 ///
 /// Normalizes all responses to `CompletionList` (an array result is wrapped as
 /// `CompletionList { isIncomplete: false, items }`). Returns `None` for null
-/// results, missing results, and deserialization failures. When `envelope_ctx`
-/// is `Some`, each item's `data` is wrapped in a routing envelope.
+/// results, missing results, and deserialization failures. Each item that
+/// [`should_envelope`] selects — the origin advertises
+/// `completionItem/resolve`, or the payload squats on the reserved key — has
+/// its `data` wrapped in a routing envelope; the rest pass through bare.
 fn transform_completion_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     region_end: Position,
     request_host_line: Option<u32>,
-    envelope_ctx: Option<EnvelopeContext<'_>>,
+    server_resolves: bool,
+    envelope_ctx: &EnvelopeContext<'_>,
 ) -> Option<CompletionList> {
     if response_has_jsonrpc_error(&response, "textDocument/completion") {
         return None;
@@ -155,15 +164,15 @@ fn transform_completion_response_to_host(
     };
 
     // Transform all items in the list (dropping any whose primary edit is
-    // unsafe for the injection region), then optionally envelope for resolve
-    // routing
+    // unsafe for the injection region), then envelope for resolve routing
+    // under the same policy as the host layer.
     let before = list.items.len();
     list.items.retain_mut(|item| {
         if !transform_completion_item(item, offset, region_end, request_host_line) {
             return false;
         }
-        if let Some(ref ctx) = envelope_ctx {
-            envelope_item_data(item, ctx);
+        if should_envelope(item.data.as_ref(), server_resolves) {
+            envelope_item_data(item, envelope_ctx);
         }
         true
     });
@@ -381,14 +390,13 @@ fn snippet_contains_variable(text: &str) -> bool {
 // Envelope types for completionItem/resolve routing
 // =============================================================================
 
-/// Wrapper key inside `CompletionItem.data` that identifies the origin server.
-const ENVELOPE_KEY: &str = "kakehashi";
-
 /// Envelope stored in `CompletionItem.data` for routing `completionItem/resolve`.
 ///
-/// When Kakehashi fans out completion to multiple downstream servers, each item's
-/// `data` field is wrapped in this envelope so that a later `completionItem/resolve`
-/// can be routed back to the correct server.
+/// When Kakehashi fans out completion to multiple downstream servers, the
+/// `data` of each item whose origin advertises `completionItem/resolve` (or
+/// whose payload squats on the reserved key) is wrapped in this envelope so
+/// that a later `completionItem/resolve` can be routed back to the correct
+/// server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct KakehashiEnvelope {
     /// Server name identifying which downstream produced the item.
@@ -415,7 +423,8 @@ pub(crate) struct KakehashiEnvelope {
     /// Stable injection region identity for live resolve-time geometry checks.
     /// Empty for envelopes minted before this field existed, and for every
     /// host-layer envelope (which has no region) — skipped on the wire in
-    /// that case, since this rides in EVERY item of every completion response.
+    /// that case, since this rides in every enveloped item of a completion
+    /// response.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub region_id: String,
     /// The downstream server's original `data` value (preserved verbatim).
@@ -593,18 +602,10 @@ pub(crate) fn bridge_host_completion_items(
         CompletionResponse::List(list) => &mut list.items,
     };
     for item in items.iter_mut() {
-        if server_resolves || data_carries_envelope_key(item) {
+        if should_envelope(item.data.as_ref(), server_resolves) {
             envelope_host_item(item, server_name, host_uri);
         }
     }
-}
-
-/// Whether an item's own `data` already occupies the envelope key — the one
-/// case a non-resolving server's item must still be wrapped.
-fn data_carries_envelope_key(item: &CompletionItem) -> bool {
-    item.data
-        .as_ref()
-        .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
 }
 
 /// Wrap a HOST-layer item's `data` in a routing envelope so a later
@@ -658,6 +659,118 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json::json;
+
+    /// Run the virt transform for a NON-resolving origin, the shape most
+    /// coordinate tests want: ranges translate, `data` passes through bare.
+    /// (The codeLens and documentLink twins default the other way — their
+    /// helper is named for a resolving origin.)
+    fn transform_for_non_resolving_server(
+        response: serde_json::Value,
+        offset: &RegionOffset,
+        region_end: Position,
+        request_host_line: Option<u32>,
+    ) -> Option<CompletionList> {
+        transform_with_resolve_support(response, offset, region_end, request_host_line, false)
+    }
+
+    fn transform_with_resolve_support(
+        response: serde_json::Value,
+        offset: &RegionOffset,
+        region_end: Position,
+        request_host_line: Option<u32>,
+        server_resolves: bool,
+    ) -> Option<CompletionList> {
+        transform_completion_response_to_host(
+            response,
+            offset,
+            region_end,
+            request_host_line,
+            server_resolves,
+            &EnvelopeContext {
+                server_name: "lua-ls",
+                injection_language: "lua",
+                incarnation: Some(1),
+                host_uri: "file:///test.md",
+                region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                offset,
+                region_end: Some(region_end),
+                host_layer: false,
+            },
+        )
+    }
+
+    #[test]
+    fn virt_items_are_enveloped_only_when_the_server_resolves() {
+        let response = |data: serde_json::Value| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": [{
+                    "label": "print",
+                    "textEdit": {
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 2 }
+                        },
+                        "newText": "print"
+                    },
+                    "data": data
+                }]
+            })
+        };
+        let offset = RegionOffset::new(3, 2);
+
+        let resolvable = transform_with_resolve_support(
+            response(json!({"token": 1})),
+            &offset,
+            TEST_REGION_END,
+            None,
+            true,
+        )
+        .unwrap();
+        let envelope = extract_envelope(&resolvable.items[0]).expect("resolving origin envelopes");
+        assert_eq!(envelope.origin, "lua-ls");
+        assert_eq!(envelope.inner, Some(json!({"token": 1})));
+
+        let bare = transform_for_non_resolving_server(
+            response(json!({"token": 1})),
+            &offset,
+            TEST_REGION_END,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            bare.items[0].data,
+            Some(json!({"token": 1})),
+            "a non-resolving origin's payload must pass through untouched: the resolve \
+             would only fail soft back to it, so the envelope is pure wire weight"
+        );
+        let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) =
+            &bare.items[0].text_edit
+        else {
+            panic!("the bare item keeps its edit");
+        };
+        assert_eq!(
+            (edit.range.start.line, edit.range.start.character),
+            (3, 2),
+            "ranges are still translated for a bare item"
+        );
+
+        let forged = transform_for_non_resolving_server(
+            response(json!({ ENVELOPE_KEY: { "origin": "spoofed" } })),
+            &offset,
+            TEST_REGION_END,
+            None,
+        )
+        .unwrap();
+        let envelope = extract_envelope(&forged.items[0]).expect("collision envelope");
+        assert_eq!(envelope.origin, "lua-ls");
+        assert_eq!(
+            envelope.inner,
+            Some(json!({ ENVELOPE_KEY: { "origin": "spoofed" } })),
+            "the foreign payload must be nested, not honored as routing metadata"
+        );
+    }
 
     // ==========================================================================
     // Completion request tests
@@ -719,11 +832,10 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed = transform_completion_response_to_host(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
-            None,
             None,
         );
 
@@ -753,11 +865,10 @@ mod tests {
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_a_completion_response"}))]
     #[case::error_response(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     fn completion_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
-        let transformed = transform_completion_response_to_host(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(3, 0),
             TEST_REGION_END,
-            None,
             None,
         );
         assert!(transformed.is_none());
@@ -781,11 +892,10 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed = transform_completion_response_to_host(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
-            None,
             None,
         );
 
@@ -831,11 +941,10 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_completion_response_to_host(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
-            None,
             None,
         );
 
@@ -878,11 +987,10 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed = transform_completion_response_to_host(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
-            None,
             None,
         );
 
@@ -921,11 +1029,10 @@ mod tests {
             }
         });
 
-        let transformed = transform_completion_response_to_host(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(10, 4),
             TEST_REGION_END,
-            None,
             None,
         );
 
@@ -963,11 +1070,10 @@ mod tests {
             }
         });
 
-        let transformed = transform_completion_response_to_host(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(10, 4),
             TEST_REGION_END,
-            None,
             None,
         );
 
@@ -1009,11 +1115,10 @@ mod tests {
             }
         });
 
-        let transformed = transform_completion_response_to_host(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(5, 7),
             TEST_REGION_END,
-            None,
             None,
         );
 
@@ -1057,11 +1162,10 @@ mod tests {
             }
         });
 
-        let transformed = transform_completion_response_to_host(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(5, 3),
             TEST_REGION_END,
-            None,
             None,
         );
 
@@ -1132,11 +1236,10 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_completion_response_to_host(
+        let transformed = transform_for_non_resolving_server(
             response,
             &RegionOffset::new(region_start_line, 0),
             TEST_REGION_END,
-            None,
             None,
         );
 
@@ -1332,7 +1435,7 @@ mod tests {
         envelope_host_item(&mut item, "tsudoi-ls", "file:///test/doc.txt");
 
         // The two fields a host envelope leaves at their defaults must not
-        // ride the wire — this rides in every item of every response.
+        // ride the wire — this rides in every enveloped item of a response.
         let wire = item.data.clone().expect("enveloped");
         assert!(
             wire["kakehashi"].get("region_id").is_none(),
@@ -1383,8 +1486,8 @@ mod tests {
             "a region-carrying envelope stays on the virt resolve path"
         );
 
-        // The virt envelope — minted for every item of every completion —
-        // must not carry the host marker on the wire at all.
+        // The virt envelope — minted for every item of a resolving origin's
+        // completion — must not carry the host marker on the wire at all.
         let mut virt = CompletionItem::default();
         envelope_item_data(
             &mut virt,
@@ -1579,8 +1682,7 @@ mod tests {
             ]
         });
 
-        let list = transform_completion_response_to_host(response, &offset, region_end, None, None)
-            .unwrap();
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
 
         assert_eq!(list.items.len(), 1, "prefix-breaking item must be dropped");
         assert_eq!(list.items[0].label, "safe");
@@ -1616,8 +1718,7 @@ mod tests {
             ]
         });
 
-        let list = transform_completion_response_to_host(response, &offset, region_end, None, None)
-            .unwrap();
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
 
         assert_eq!(list.items.len(), 1, "item with safe primary edit is kept");
         assert!(
@@ -1647,8 +1748,7 @@ mod tests {
             ]
         });
 
-        let list = transform_completion_response_to_host(response, &offset, region_end, None, None)
-            .unwrap();
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
 
         assert!(
             list.items.is_empty(),
@@ -1680,8 +1780,7 @@ mod tests {
             ]
         });
 
-        let list = transform_completion_response_to_host(response, &offset, region_end, None, None)
-            .unwrap();
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
 
         assert_eq!(list.items.len(), 1, "region-escaping item must drop");
         assert_eq!(list.items[0].label, "contained");
@@ -1706,21 +1805,14 @@ mod tests {
             ]
         });
 
-        let list = transform_completion_response_to_host(
-            response.clone(),
-            &offset,
-            region_end,
-            None,
-            None,
-        )
-        .unwrap();
+        let list = transform_for_non_resolving_server(response.clone(), &offset, region_end, None)
+            .unwrap();
         assert_eq!(list.items.len(), 1, "multiline fallback must drop");
         assert_eq!(list.items[0].label, "single");
 
         // Same response in a plain fenced region: both survive.
         let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
-        let list = transform_completion_response_to_host(response, &plain, region_end, None, None)
-            .unwrap();
+        let list = transform_for_non_resolving_server(response, &plain, region_end, None).unwrap();
         assert_eq!(list.items.len(), 2, "plain regions take multiline inserts");
     }
 
@@ -1751,14 +1843,8 @@ mod tests {
             ]
         });
 
-        let list = transform_completion_response_to_host(
-            response.clone(),
-            &offset,
-            region_end,
-            None,
-            None,
-        )
-        .unwrap();
+        let list = transform_for_non_resolving_server(response.clone(), &offset, region_end, None)
+            .unwrap();
         let labels: Vec<_> = list.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(
             labels,
@@ -1768,8 +1854,7 @@ mod tests {
 
         // Plain (all-zero) region: everything survives.
         let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
-        let list = transform_completion_response_to_host(response, &plain, region_end, None, None)
-            .unwrap();
+        let list = transform_for_non_resolving_server(response, &plain, region_end, None).unwrap();
         assert_eq!(list.items.len(), 3, "plain regions are exempt");
     }
 
@@ -1807,27 +1892,17 @@ mod tests {
         });
 
         // Requested on host line 5 (virtual line 2, unprefixed): kept.
-        let list = transform_completion_response_to_host(
-            response.clone(),
-            &offset,
-            region_end,
-            Some(5),
-            None,
-        )
-        .unwrap();
+        let list =
+            transform_for_non_resolving_server(response.clone(), &offset, region_end, Some(5))
+                .unwrap();
         assert_eq!(list.items.len(), 1, "later-line insertion is safe");
 
         // Requested on host line 3 (virtual line 0): in a MULTI-LINE region
         // line 0's captured content runs to end-of-line, so the inserted
         // newline splits only injected content — kept.
-        let list = transform_completion_response_to_host(
-            response.clone(),
-            &offset,
-            region_end,
-            Some(3),
-            None,
-        )
-        .unwrap();
+        let list =
+            transform_for_non_resolving_server(response.clone(), &offset, region_end, Some(3))
+                .unwrap();
         assert_eq!(list.items.len(), 1, "multi-line region line 0 is safe");
 
         // Same shape but a SAME-LINE inline region (region end on the start
@@ -1838,8 +1913,7 @@ mod tests {
             character: 20,
         };
         let list =
-            transform_completion_response_to_host(response, &offset, inline_end, Some(3), None)
-                .unwrap();
+            transform_for_non_resolving_server(response, &offset, inline_end, Some(3)).unwrap();
         assert!(
             list.items.is_empty(),
             "inline-region line-0 insertion would split the host line"
@@ -1871,8 +1945,7 @@ mod tests {
             ]
         });
 
-        let list = transform_completion_response_to_host(response, &offset, region_end, None, None)
-            .unwrap();
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
         assert!(
             list.items.is_empty(),
             "either prefixed start line must reject the snippet variable"
@@ -1898,14 +1971,9 @@ mod tests {
         });
 
         let mixed = RegionOffset::with_per_line_offsets(3, vec![2, 0, 0]);
-        let list = transform_completion_response_to_host(
-            response.clone(),
-            &mixed,
-            region_end,
-            Some(4),
-            None,
-        )
-        .unwrap();
+        let list =
+            transform_for_non_resolving_server(response.clone(), &mixed, region_end, Some(4))
+                .unwrap();
         assert!(
             list.items.is_empty(),
             "boundary-adjacent insertion in a prefixed region must drop"
@@ -1913,8 +1981,7 @@ mod tests {
 
         let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
         let list =
-            transform_completion_response_to_host(response, &plain, region_end, Some(4), None)
-                .unwrap();
+            transform_for_non_resolving_server(response, &plain, region_end, Some(4)).unwrap();
         assert_eq!(list.items.len(), 1, "all-zero regions keep no boundary");
     }
 }

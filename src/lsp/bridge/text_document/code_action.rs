@@ -23,6 +23,7 @@ use serde_json::Value;
 use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
+use crate::lsp::bridge::envelope::ENVELOPE_KEY;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionDisabled, CodeActionOrCommand, CodeActionParams,
     CodeActionResponse, DocumentChangeOperation, DocumentChanges, NumberOrString,
@@ -40,9 +41,6 @@ use super::super::protocol::{
     workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 use super::completion::EnvelopeOffset;
-
-/// Wrapper key inside `CodeAction.data` that identifies the origin server.
-const ENVELOPE_KEY: &str = "kakehashi";
 
 /// Envelope stored in `CodeAction.data` for routing `codeAction/resolve`
 /// (#568 PR 4), mirroring [`CodeLensEnvelope`](super::code_lens::CodeLensEnvelope).
@@ -114,6 +112,11 @@ pub(crate) struct CodeActionEnvelopeContext<'a> {
 
 /// Wrap `action.data` in a Kakehashi envelope for origin tracking, capturing
 /// the CURRENT (unsuffixed) title as `original_title`. Call before suffixing.
+///
+/// Unlike the other resolve kinds, codeAction needs no reserved-key collision
+/// rule (`bridge::envelope::should_envelope`): every action that leaves
+/// without an envelope leaves with `data = None`, so a downstream payload can
+/// never reach the client bare and be read back as routing metadata.
 fn envelope_action_data(action: &mut CodeAction, ctx: &CodeActionEnvelopeContext) {
     let inner = action.data.take();
     let envelope = CodeActionEnvelope {
@@ -699,7 +702,7 @@ impl LanguageServerPool {
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve (host): envelope host_uri '{}' is not a valid URL; ignoring",
+                "codeAction/resolve (host): envelope host_uri {:?} is not a valid URL; ignoring",
                 envelope.host_uri
             );
             re_envelope_action(&mut action, &envelope);
@@ -729,10 +732,14 @@ impl LanguageServerPool {
         if !handle.has_capability("codeAction/resolve") {
             // Anomalous: the envelope was only minted because the origin
             // advertised resolve, so reaching here means a respawn changed
-            // capabilities (or the handle is still initializing).
+            // capabilities under the action. (Unlike the other resolve kinds,
+            // `has_capability` reads no `textDocument/codeAction`
+            // registration-options `resolveProvider`, so a standard dynamic
+            // unregister cannot flip it.)
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: {:?} no longer advertises resolveProvider; returning unresolved",
+                "codeAction/resolve (host): {:?} no longer advertises resolveProvider; \
+                 returning unresolved",
                 envelope.origin
             );
             re_envelope_action(&mut action, &envelope);
@@ -791,7 +798,7 @@ impl LanguageServerPool {
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             warn!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: envelope host_uri '{}' is not a valid URL; ignoring",
+                "codeAction/resolve: envelope host_uri {:?} is not a valid URL; ignoring",
                 envelope.host_uri
             );
             re_envelope_action(&mut action, &envelope);
@@ -827,7 +834,10 @@ impl LanguageServerPool {
         if !handle.has_capability("codeAction/resolve") {
             // Anomalous: the envelope was only minted because the origin
             // advertised resolve, so reaching here means a respawn changed
-            // capabilities (or the handle is still initializing).
+            // capabilities under the action. (Unlike the other resolve kinds,
+            // `has_capability` reads no `textDocument/codeAction`
+            // registration-options `resolveProvider`, so a standard dynamic
+            // unregister cannot flip it.)
             warn!(
                 target: "kakehashi::bridge",
                 "codeAction/resolve: {:?} no longer advertises resolveProvider; returning unresolved",

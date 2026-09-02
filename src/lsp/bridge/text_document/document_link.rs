@@ -11,7 +11,8 @@ use std::io;
 use std::sync::Arc;
 
 use crate::config::settings::BridgeServerConfig;
-use log::warn;
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, nests_reserved_key, should_envelope};
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::DocumentLink;
@@ -26,8 +27,6 @@ use super::super::protocol::{translate_host_range_to_virtual, translate_virtual_
 use super::completion::EnvelopeOffset;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-
-const ENVELOPE_KEY: &str = "kakehashi";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct DocumentLinkEnvelope {
@@ -115,19 +114,6 @@ fn re_envelope_link(link: &mut DocumentLink, envelope: &DocumentLinkEnvelope) {
     );
 }
 
-/// A downstream that cannot resolve gains nothing from the routing envelope,
-/// so its opaque `data` passes through untouched — except when that data
-/// carries the reserved key itself, which would otherwise let a downstream
-/// present a payload of its own choosing as kakehashi routing metadata. Those
-/// are wrapped anyway, with the foreign object nested as `inner`.
-fn should_envelope_link(link: &DocumentLink, server_resolves: bool) -> bool {
-    server_resolves
-        || link
-            .data
-            .as_ref()
-            .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
-}
-
 pub(crate) fn envelope_host_document_links(
     links: &mut [DocumentLink],
     server_name: &str,
@@ -150,7 +136,7 @@ pub(crate) fn envelope_host_document_links(
         host_layer: true,
     };
     for link in links {
-        if should_envelope_link(link, server_resolves) {
+        if should_envelope(link.data.as_ref(), server_resolves) {
             envelope_link_data(link, &ctx);
         }
     }
@@ -189,7 +175,10 @@ impl LanguageServerPool {
         }
         let connection_key = handle.key().clone();
         let connection_generation = self.document_connection_generation(&connection_key);
-        let server_resolves = handle.has_capability("documentLink/resolve");
+        // Read resolve support when the RESPONSE arrives, as the host layer
+        // does: a dynamic `resolveProvider` registration can land between
+        // send and reply, and the envelope decision should see it.
+        let origin = Arc::clone(&handle);
         self.execute_bridge_request_with_handle(
             handle,
             host_uri,
@@ -203,7 +192,7 @@ impl LanguageServerPool {
                 transform_document_link_response_to_host(
                     response,
                     ctx.offset,
-                    server_resolves,
+                    origin.has_capability("documentLink/resolve"),
                     &DocumentLinkEnvelopeContext {
                         server_name,
                         host_uri: host_uri.as_str(),
@@ -256,6 +245,13 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
     ) -> DocumentLink {
         let server_name = &envelope.origin;
+        // One function serves both layers; tag the host one like the
+        // completion and codeAction host paths do.
+        let layer = if envelope.is_host_layer() {
+            " (host)"
+        } else {
+            ""
+        };
         let Ok(host_uri) = Url::parse(&envelope.host_uri) else {
             re_envelope_link(&mut link, &envelope);
             return link;
@@ -298,7 +294,7 @@ impl LanguageServerPool {
             Err(error) => {
                 warn!(
                     target: "kakehashi::bridge",
-                    "documentLink/resolve: failed to connect to {server_name}: {error}"
+                    "documentLink/resolve{layer}: failed to connect to {server_name}: {error}"
                 );
                 re_envelope_link(&mut link, &envelope);
                 return link;
@@ -306,6 +302,25 @@ impl LanguageServerPool {
         };
 
         if !handle.has_capability("documentLink/resolve") {
+            // Two ways here. The payload nests the reserved key: as far as
+            // this branch can tell, the origin never advertised resolve and
+            // the wrap existed only to nest it — steady state, so every
+            // client resolve of that link that clears the gates above
+            // lands here; say so quietly. Otherwise the origin did advertise
+            // and a respawn or dynamic unregister withdrew the capability
+            // under the link: anomalous.
+            if nests_reserved_key(link.data.as_ref()) {
+                debug!(
+                    target: "kakehashi::bridge",
+                    "documentLink/resolve{layer}: {server_name:?} does not advertise resolveProvider; the link was \
+                     enveloped only to nest a reserved-key payload; returning unresolved"
+                );
+            } else {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "documentLink/resolve{layer}: {server_name:?} no longer advertises resolveProvider; returning unresolved"
+                );
+            }
             re_envelope_link(&mut link, &envelope);
             return link;
         }
@@ -340,7 +355,7 @@ impl LanguageServerPool {
             Err(error) => {
                 warn!(
                     target: "kakehashi::bridge",
-                    "documentLink/resolve: failed to register request for {server_name}: {error}"
+                    "documentLink/resolve{layer}: failed to register request for {server_name}: {error}"
                 );
                 if let Some(ref id) = upstream_id {
                     self.unregister_upstream_request(id, connection_key);
@@ -380,7 +395,7 @@ impl LanguageServerPool {
         if let Err(error) = send_result {
             warn!(
                 target: "kakehashi::bridge",
-                "documentLink/resolve: failed to send request for {server_name}: {error}"
+                "documentLink/resolve{layer}: failed to send request for {server_name}: {error}"
             );
             if let Some(ref id) = upstream_id {
                 self.unregister_upstream_request(id, connection_key);
@@ -400,7 +415,7 @@ impl LanguageServerPool {
             Err(error) => {
                 warn!(
                     target: "kakehashi::bridge",
-                    "documentLink/resolve failed for server {server_name}: {error}"
+                    "documentLink/resolve{layer} failed for server {server_name}: {error}"
                 );
                 re_envelope_link(&mut link, &envelope);
                 return link;
@@ -455,8 +470,10 @@ fn parse_document_link_resolve_response(mut response: serde_json::Value) -> Opti
 
 /// Transform a document link response from virtual to host document coordinates.
 ///
-/// Only each link's `range` is translated by `offset`; target, tooltip, and
-/// data are preserved unchanged.
+/// Each link's `range` is translated by `offset`; `target` and `tooltip` are
+/// preserved. `data` is wrapped in a routing envelope for each link that
+/// `should_envelope` selects (the origin advertises `documentLink/resolve`,
+/// or the payload squats on the reserved key); the rest pass through bare.
 fn transform_document_link_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
@@ -478,7 +495,7 @@ fn transform_document_link_response_to_host(
     // Transform ranges to host coordinates
     for link in &mut links {
         translate_virtual_range_to_host(&mut link.range, offset);
-        if should_envelope_link(link, server_resolves) {
+        if should_envelope(link.data.as_ref(), server_resolves) {
             envelope_link_data(link, envelope_ctx);
         }
     }
@@ -493,14 +510,17 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
-    fn transform_for_test(
+    /// Run the virt transform for a resolving origin: every link is enveloped.
+    /// (The completion twin defaults the other way — its helper is named for
+    /// a non-resolving origin.)
+    fn transform_for_resolving_server(
         response: serde_json::Value,
         offset: &RegionOffset,
     ) -> Option<Vec<DocumentLink>> {
-        transform_for_resolving_server(response, offset, true)
+        transform_with_resolve_support(response, offset, true)
     }
 
-    fn transform_for_resolving_server(
+    fn transform_with_resolve_support(
         response: serde_json::Value,
         offset: &RegionOffset,
         server_resolves: bool,
@@ -584,7 +604,7 @@ mod tests {
             }]
         });
 
-        let links = transform_for_test(response, &RegionOffset::new(3, 2)).unwrap();
+        let links = transform_for_resolving_server(response, &RegionOffset::new(3, 2)).unwrap();
         let envelope = extract_document_link_envelope(&links[0]).expect("routing envelope");
         assert_eq!(envelope.origin, "lua-ls");
         assert_eq!(envelope.host_uri, "file:///test.md");
@@ -619,7 +639,7 @@ mod tests {
             })
         };
 
-        let bare = transform_for_resolving_server(
+        let bare = transform_with_resolve_support(
             response(json!({"token": 1})),
             &RegionOffset::new(3, 2),
             false,
@@ -632,7 +652,7 @@ mod tests {
         );
         assert_eq!(bare[0].range.start.line, 3, "ranges are still translated");
 
-        let forged = transform_for_resolving_server(
+        let forged = transform_with_resolve_support(
             response(json!({ ENVELOPE_KEY: { "origin": "spoofed" } })),
             &RegionOffset::new(3, 2),
             false,
@@ -705,7 +725,8 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed = transform_for_test(response, &RegionOffset::new(region_start_line, 0));
+        let transformed =
+            transform_for_resolving_server(response, &RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -728,7 +749,7 @@ mod tests {
     fn document_link_response_returns_none_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let transformed = transform_for_test(response, &RegionOffset::new(5, 0));
+        let transformed = transform_for_resolving_server(response, &RegionOffset::new(5, 0));
         assert!(transformed.is_none());
     }
 
@@ -736,7 +757,7 @@ mod tests {
     fn document_link_response_with_empty_array_returns_empty_vec() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let transformed = transform_for_test(response, &RegionOffset::new(5, 0));
+        let transformed = transform_for_resolving_server(response, &RegionOffset::new(5, 0));
         assert!(transformed.is_some());
         let links = transformed.unwrap();
         assert!(links.is_empty());
@@ -758,7 +779,8 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed = transform_for_test(response, &RegionOffset::new(region_start_line, 0));
+        let transformed =
+            transform_for_resolving_server(response, &RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -784,7 +806,8 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_for_test(response, &RegionOffset::new(region_start_line, 0));
+        let transformed =
+            transform_for_resolving_server(response, &RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -807,7 +830,8 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_for_test(response, &RegionOffset::new(region_start_line, 0));
+        let transformed =
+            transform_for_resolving_server(response, &RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -868,5 +892,116 @@ mod tests {
         let envelope = extract_document_link_envelope(&result).expect("envelope restored");
         assert_eq!(envelope.inner, Some(json!({"token": "link-1"})));
         assert!(result.target.is_none());
+    }
+
+    /// The resolve-side capability gate is the authoritative one: an envelope
+    /// is minted for a resolving origin, so reaching a non-resolving handle
+    /// means the origin changed under the link (dynamic unregister, respawn)
+    /// or the payload was wrapped for squatting on the reserved key. Either
+    /// way the link comes back unresolved; the withdrawn-capability way is
+    /// logged as an anomaly, as the codeAction and host-completion paths
+    /// already did (the reserved-key way is the sibling test below).
+    #[test]
+    fn dispatch_warns_and_re_envelopes_when_origin_no_longer_resolves() {
+        use crate::lsp::bridge::test_logging::captured_warnings_for;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let warnings = captured_warnings_for(|| {
+            runtime.block_on(async {
+                let pool = LanguageServerPool::new();
+                let key = ConnectionKey::for_server("lua-ls");
+                let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
+                    crate::lsp::bridge::ConnectionState::Ready,
+                    key.clone(),
+                )
+                .await;
+                pool.insert_connection(handle).await;
+                let mut settings = crate::config::settings::WorkspaceSettings::default();
+                settings.language_servers.insert(
+                    "lua-ls".to_string(),
+                    crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec!["lua-language-server".to_string()]),
+                        ..Default::default()
+                    },
+                );
+                let mut links = vec![unresolved_link(Some(json!({"token": "link-1"})))];
+                envelope_host_document_links(
+                    &mut links,
+                    "lua-ls",
+                    "file:///test.md",
+                    None,
+                    pool.document_connection_generation(&key),
+                    &key,
+                    true,
+                );
+
+                let result = pool
+                    .dispatch_document_link_resolve(links.remove(0), &settings, None)
+                    .await;
+                let envelope = extract_document_link_envelope(&result).expect("envelope restored");
+                assert_eq!(envelope.inner, Some(json!({"token": "link-1"})));
+                assert!(result.target.is_none(), "link stays unresolved");
+            });
+        });
+        assert!(
+            warnings.iter().any(|w| w.contains("documentLink/resolve")
+                && w.contains("no longer advertises resolveProvider")),
+            "the capability miss must be logged, not silently swallowed: {warnings:?}"
+        );
+    }
+
+    /// The other way to reach the capability miss is steady state, not an
+    /// anomaly: a NON-resolving origin's payload squatted on the reserved key,
+    /// so it was wrapped only to nest it, and every client resolve of that
+    /// link lands here. It must come back unresolved with the payload intact
+    /// and must NOT be reported as a lost capability.
+    #[test]
+    fn dispatch_does_not_warn_for_a_reserved_key_wrap_from_a_non_resolving_origin() {
+        use crate::lsp::bridge::test_logging::captured_warnings_for;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let warnings = captured_warnings_for(|| {
+            runtime.block_on(async {
+                let pool = LanguageServerPool::new();
+                let key = ConnectionKey::for_server("lua-ls");
+                let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
+                    crate::lsp::bridge::ConnectionState::Ready,
+                    key.clone(),
+                )
+                .await;
+                pool.insert_connection(handle).await;
+                let mut settings = crate::config::settings::WorkspaceSettings::default();
+                settings.language_servers.insert(
+                    "lua-ls".to_string(),
+                    crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec!["lua-language-server".to_string()]),
+                        ..Default::default()
+                    },
+                );
+                let forged = json!({ ENVELOPE_KEY: { "origin": "forged" } });
+                let mut links = vec![unresolved_link(Some(forged.clone()))];
+                envelope_host_document_links(
+                    &mut links,
+                    "lua-ls",
+                    "file:///test.md",
+                    None,
+                    pool.document_connection_generation(&key),
+                    &key,
+                    false,
+                );
+
+                let result = pool
+                    .dispatch_document_link_resolve(links.remove(0), &settings, None)
+                    .await;
+                let envelope = extract_document_link_envelope(&result).expect("envelope restored");
+                assert_eq!(envelope.origin, "lua-ls");
+                assert_eq!(envelope.inner, Some(forged));
+                assert!(result.target.is_none(), "link stays unresolved");
+            });
+        });
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("no longer advertises resolveProvider")),
+            "a reserved-key wrap is not a lost capability: {warnings:?}"
+        );
     }
 }

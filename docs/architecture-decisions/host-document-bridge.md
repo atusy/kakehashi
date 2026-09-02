@@ -29,11 +29,12 @@ Partially implemented:
   no per-method request builders or response transformers. Handlers run the
   layer walk (`Kakehashi::walk_layers`, cross-layer-aggregation,
   `preferred` semantics): layers are tried lazily in `priorities` — by default
-  virt first, host as fallback. Three methods consume per-server identity in
+  virt first, host as fallback. Four methods consume per-server identity in
   the host arm: codeAction for the `"{title} — {server}"` suffix, completion
-  for its resolve-routing envelope, and codeLens for the winning server's
-  resolve capability and envelope. CodeAction and completion build their own
-  host arms; codeLens uses the shared whole-document winner hook. Covered: definition, hover, declaration,
+  for its resolve-routing envelope, and codeLens and documentLink for the
+  winning server's resolve capability and envelope. CodeAction and completion
+  build their own host arms; codeLens and documentLink use the shared
+  whole-document winner hook. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
   inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
@@ -45,15 +46,24 @@ Partially implemented:
   documentColor/colorPresentation pair. `completionItem/resolve` routes by
   the envelope stamped into `CompletionItem.data`; the host layer stamps one
   too (marked `host_layer`, so the resolve forwards VERBATIM — no coordinate
-  translation and no injection-region edit guard), but only for a server that
-  advertises `completionItem/resolve`. Without that capability the items stay
-  bare and a resolve falls back gracefully (item returned unresolved).
-  `codeLens/resolve` follows the same host-layer rule: a winning host server
-  that advertises resolve has its lenses stamped with an origin envelope, and
-  resolving one forwards the original payload and coordinates verbatim. A
-  non-resolving server's lens normally stays bare; the reserved-key collision
+  translation and no injection-region edit guard). Both layers mint under
+  one rule, shared by completion, codeLens, and documentLink: for a server
+  that advertises the matching resolve method, plus the reserved-key
+  exception below. Without that capability the items stay bare — an
+  envelope would be pure wire weight on every item, and its resolve would
+  only fail soft — so a client resolve passes the bare item through
+  unchanged. The resolve side re-checks the capability on the live origin
+  regardless and, finding it absent, returns the item unresolved with its
+  envelope restored — warning that the capability was withdrawn under the
+  item (a respawn or dynamic unregister), unless the payload itself nests
+  the reserved key, which the resolve side reads as the steady state of a
+  non-resolving origin's collision wrap and logs quietly (a resolving origin
+  with such a payload loses the warning; accepted). That collision
   exception wraps `data.kakehashi` as opaque `inner` data so a downstream
-  payload cannot impersonate bridge routing metadata. The envelope retains
+  payload cannot impersonate bridge routing metadata. (codeAction needs no
+  such exception: an action that leaves without an envelope leaves with no
+  `data` at all.) `codeLens/resolve` forwards the original payload and
+  coordinates verbatim on the host layer. The codeLens envelope retains
   the host-document incarnation plus the exact producing `ConnectionKey` and
   its generation, so an old lens is returned unresolved after either a
   document reopen, a rooted/shared routing-key change, or a downstream process

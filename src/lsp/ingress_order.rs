@@ -55,6 +55,7 @@ use tower::Service;
 use tower_lsp_server::jsonrpc::{Request, Response};
 
 use crate::error::LockResultExt;
+use crate::lsp::bridge::envelope::ENVELOPE_KEY;
 
 tokio::task_local! {
     /// The current writer's ingress ticket, scoped around the gated handler
@@ -359,7 +360,7 @@ fn classify(req: &Request) -> Option<Role> {
             Some(Role::Reader { uri })
         }
         "codeLens/resolve" | "codeAction/resolve" | "documentLink/resolve" => {
-            let raw = req.params()?["data"]["kakehashi"]["host_uri"].as_str()?;
+            let raw = req.params()?["data"][ENVELOPE_KEY]["host_uri"].as_str()?;
             Some(Role::Reader {
                 uri: normalize_uri(raw),
             })
