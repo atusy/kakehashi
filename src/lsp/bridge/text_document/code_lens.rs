@@ -588,6 +588,71 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
+    /// Run the virt transform for a resolving origin: every lens is enveloped.
+    fn transform_for_test(
+        response: serde_json::Value,
+        offset: &RegionOffset,
+    ) -> Option<Vec<CodeLens>> {
+        transform_for_resolving_server(response, offset, true)
+    }
+
+    fn transform_for_resolving_server(
+        response: serde_json::Value,
+        offset: &RegionOffset,
+        server_resolves: bool,
+    ) -> Option<Vec<CodeLens>> {
+        transform_code_lens_response_to_host(response, offset, server_resolves, &ctx_with(offset))
+    }
+
+    #[test]
+    fn virt_lenses_are_enveloped_only_when_the_server_resolves() {
+        let response = |data: serde_json::Value| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 5 }
+                    },
+                    "data": data
+                }]
+            })
+        };
+        let offset = RegionOffset::new(3, 0);
+
+        let resolvable =
+            transform_for_resolving_server(response(json!({"token": 1})), &offset, true).unwrap();
+        let envelope =
+            extract_code_lens_envelope(&resolvable[0]).expect("resolving origin envelopes");
+        assert_eq!(envelope.origin, "lua-ls");
+        assert_eq!(envelope.inner, Some(json!({"token": 1})));
+
+        let bare =
+            transform_for_resolving_server(response(json!({"token": 1})), &offset, false).unwrap();
+        assert_eq!(
+            bare[0].data,
+            Some(json!({"token": 1})),
+            "a non-resolving origin's payload must pass through untouched: the resolve \
+             would only fail soft back to it, so the envelope is pure wire weight"
+        );
+        assert_eq!(bare[0].range.start.line, 3, "ranges are still translated");
+
+        let forged = transform_for_resolving_server(
+            response(json!({ ENVELOPE_KEY: { "origin": "spoofed" } })),
+            &offset,
+            false,
+        )
+        .unwrap();
+        let envelope = extract_code_lens_envelope(&forged[0]).expect("collision envelope");
+        assert_eq!(envelope.origin, "lua-ls");
+        assert_eq!(
+            envelope.inner,
+            Some(json!({ ENVELOPE_KEY: { "origin": "spoofed" } })),
+            "the foreign payload must be nested, not honored as routing metadata"
+        );
+    }
+
     fn ctx_with<'a>(offset: &'a RegionOffset) -> CodeLensEnvelopeContext<'a> {
         CodeLensEnvelopeContext {
             server_name: "lua-ls",
@@ -692,8 +757,7 @@ mod tests {
         });
 
         let offset = RegionOffset::new(5, 0);
-        let transformed =
-            transform_code_lens_response_to_host(response, &offset, &ctx_with(&offset));
+        let transformed = transform_for_test(response, &offset);
 
         let lenses = transformed.expect("Should parse code lenses");
         assert_eq!(lenses.len(), 1);
@@ -729,8 +793,7 @@ mod tests {
         });
 
         let offset = RegionOffset::new(3, 0);
-        let transformed =
-            transform_code_lens_response_to_host(response, &offset, &ctx_with(&offset));
+        let transformed = transform_for_test(response, &offset);
 
         let lenses = transformed.expect("Should parse code lenses");
         assert_eq!(
@@ -761,8 +824,7 @@ mod tests {
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"}))]
     fn code_lens_response_returns_none_for_invalid(#[case] response: serde_json::Value) {
         let offset = RegionOffset::new(5, 0);
-        let transformed =
-            transform_code_lens_response_to_host(response, &offset, &ctx_with(&offset));
+        let transformed = transform_for_test(response, &offset);
         assert!(transformed.is_none());
     }
 
@@ -771,8 +833,7 @@ mod tests {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
         let offset = RegionOffset::new(5, 0);
-        let transformed =
-            transform_code_lens_response_to_host(response, &offset, &ctx_with(&offset));
+        let transformed = transform_for_test(response, &offset);
         assert!(transformed.expect("Should parse empty array").is_empty());
     }
 
@@ -791,8 +852,7 @@ mod tests {
         });
 
         let offset = RegionOffset::new(10, 0);
-        let transformed =
-            transform_code_lens_response_to_host(response, &offset, &ctx_with(&offset));
+        let transformed = transform_for_test(response, &offset);
 
         let lenses = transformed.expect("Should parse code lenses");
         assert_eq!(
