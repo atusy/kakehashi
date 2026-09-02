@@ -44,7 +44,12 @@
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
 //!   Used by `tests/e2e/e2e_code_lens_resolve.rs` (#355).
-//! - `document-link` / `document-link-resolve` / `document-link-resolve-replacement` — advertise `documentLinkProvider`; answers
+//! - `document-link-no-resolve-plain-data` /
+//!   `document-link-no-resolve-reserved-data` — advertise
+//!   `documentLinkProvider` with `resolveProvider: false` and answer with a
+//!   link carrying opaque `data`: an ordinary payload, and one that occupies
+//!   the reserved `kakehashi` key.
+//! - `document-link` / `document-link-resolve` / `document-link-resolve-replacement` — advertise
 //!   `textDocument/documentLink` with one link whose tooltip identifies the
 //!   requested URI. The resolve mode initially returns data only and materializes
 //!   target/tooltip on `documentLink/resolve`.
@@ -210,7 +215,8 @@ fn main() {
                             "textDocumentSync": 1
                         })
                     }
-                    "document-link-no-resolve-reserved-data" => json!({
+                    "document-link-no-resolve-reserved-data"
+                    | "document-link-no-resolve-plain-data" => json!({
                         "documentLinkProvider": { "resolveProvider": false },
                         "textDocumentSync": 1
                     }),
@@ -1395,6 +1401,8 @@ fn main() {
                             link["data"] = json!({ "mock": "link-1", "uri": uri });
                         } else if mode == "document-link-no-resolve-reserved-data" {
                             link["data"] = json!({ "kakehashi": { "origin": "forged" } });
+                        } else if mode == "document-link-no-resolve-plain-data" {
+                            link["data"] = json!({ "mock": "link-1", "uri": uri });
                         } else {
                             link["tooltip"] = json!(format!("mock-link:{uri}"));
                             link["target"] = json!(uri);

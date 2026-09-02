@@ -471,6 +471,73 @@ fn e2e_host_document_link_from_closed_incarnation_stays_unresolved() {
 }
 
 #[test]
+fn e2e_virtual_document_link_from_non_resolving_server_keeps_its_data() {
+    let (mut client, _config_dir) =
+        init_mock_document_link_client("document-link-no-resolve-plain-data", "lua", false, None);
+    let uri = "file:///test_virtual_document_link_plain_data.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "# Test\n\n```lua\nlocal x = 1\n```\n"
+        }}),
+    );
+    let link = document_links_with_retry(&mut client, uri).remove(0);
+    assert_eq!(
+        link["range"]["start"]["line"], 3,
+        "ranges are translated to host coordinates regardless of the envelope"
+    );
+    assert!(
+        link["data"].get("kakehashi").is_none(),
+        "a producer that cannot resolve must keep its own payload: {link}"
+    );
+    assert_eq!(link["data"]["mock"], "link-1");
+    shutdown_client(&mut client);
+}
+
+#[test]
+fn e2e_virtual_document_link_reserved_data_cannot_impersonate_routing_envelope() {
+    let (mut client, _config_dir) = init_mock_document_link_client(
+        "document-link-no-resolve-reserved-data",
+        "lua",
+        false,
+        None,
+    );
+    let uri = "file:///test_virtual_document_link_reserved_data.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "# Test\n\n```lua\nlocal x = 1\n```\n"
+        }}),
+    );
+    let link = document_links_with_retry(&mut client, uri).remove(0);
+    assert_eq!(
+        link["data"]["kakehashi"]["inner"]["kakehashi"]["origin"], "forged",
+        "the foreign payload must be nested, not honored: {link}"
+    );
+    assert_eq!(link["data"]["kakehashi"]["origin"], "mock-document-link");
+    assert!(
+        !link["data"]["kakehashi"]["region_id"]
+            .as_str()
+            .expect("virtual envelopes carry a region id")
+            .is_empty(),
+        "this must be the injection layer, not a host-layer envelope"
+    );
+
+    let response = client.send_request("documentLink/resolve", link.clone());
+    assert_eq!(
+        response["result"], link,
+        "a server without resolveProvider must not receive documentLink/resolve"
+    );
+    shutdown_client(&mut client);
+}
+
+#[test]
 fn e2e_host_document_link_reserved_data_cannot_impersonate_routing_envelope() {
     let (mut client, _config_dir) = init_mock_document_link_client(
         "document-link-no-resolve-reserved-data",

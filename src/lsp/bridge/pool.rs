@@ -7899,6 +7899,10 @@ mod tests {
         let pool = LanguageServerPool::new();
 
         // No live producer: the registration outlives the handle it named.
+        // The scope is load-bearing — the registry keeps only a `Weak`, so
+        // dropping the last `Arc` here is what makes the upgrade fail. If a
+        // future helper retains the handle, this case silently becomes
+        // `not_ready` or `unknown_id` instead.
         {
             let gone = create_handle_with_key(
                 ConnectionState::Ready,
