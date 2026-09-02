@@ -235,7 +235,7 @@ impl LanguageServerPool {
     pub(crate) async fn close_invalidated_docs(&self, host_uri: &Url, invalidated_ulids: &[Ulid]) {
         let lifecycle = self.existing_host_lifecycle_lock(host_uri);
         let _lifecycle_guard = match lifecycle {
-            Some(lifecycle) => Some(lifecycle.lock_owned().await),
+            Some(lifecycle) => Some(lifecycle.write_owned().await),
             None => None,
         };
         self.clear_invalidated_virtual_contents(host_uri, invalidated_ulids);
