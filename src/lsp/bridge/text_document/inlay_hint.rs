@@ -19,7 +19,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::config::settings::BridgeServerConfig;
-use log::warn;
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Position, Range, Uri};
@@ -39,7 +39,7 @@ use super::super::protocol::{
 use super::completion::EnvelopeOffset;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope};
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, nests_reserved_key, should_envelope};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InlayHintEnvelope {
@@ -314,10 +314,22 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability("inlayHint/resolve") {
-            warn!(
-                target: "kakehashi::bridge",
-                "inlayHint/resolve{layer}: {server_name:?} no longer advertises resolveProvider; returning unresolved"
-            );
+            // Two ways here. A payload that nests the reserved key was wrapped
+            // only to keep it out of the routing metadata, regardless of
+            // resolve support, so landing here is its steady state. Anything
+            // else was enveloped because the origin resolved at mint time and
+            // the capability has since gone (respawn, dynamic unregister).
+            if nests_reserved_key(hint.data.as_ref()) {
+                debug!(
+                    target: "kakehashi::bridge",
+                    "inlayHint/resolve{layer}: {server_name:?} does not resolve; returning the reserved-key payload unresolved"
+                );
+            } else {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "inlayHint/resolve{layer}: {server_name:?} no longer advertises resolveProvider; returning unresolved"
+                );
+            }
             re_envelope_hint(&mut hint, &envelope);
             return hint;
         }
