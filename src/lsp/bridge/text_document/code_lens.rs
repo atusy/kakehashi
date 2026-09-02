@@ -366,12 +366,16 @@ impl LanguageServerPool {
             re_envelope_lens(&mut lens, &envelope);
             return lens;
         };
+        // Lock-free fail-soft for the steady-state stale lens (a generation
+        // the key has long moved past); the lookup below re-compares under
+        // the `connections` lock, so a purge racing this check cannot hand
+        // back the replacement it installed.
         if self.document_connection_generation(connection_key) != expected_generation {
             re_envelope_lens(&mut lens, &envelope);
             return lens;
         }
         let handle_result = self
-            .ready_connection_by_key_for_config(connection_key, Some(server_config))
+            .ready_producer_by_key(connection_key, Some(server_config), expected_generation)
             .await
             .ok_or_else(|| {
                 io::Error::new(

@@ -659,6 +659,30 @@ impl LanguageServerPool {
             .map(Arc::clone)
     }
 
+    /// The live `Ready` connection under `key` **at** `expected_generation`,
+    /// for the resolve envelopes that name their producer by key and
+    /// generation. The generation is compared under the same `connections`
+    /// lock as the handle read: it only advances under that lock as the old
+    /// handle is retired, so a caller that compared it outside the lock could
+    /// acquire the replacement in the gap. `config` is compared as in
+    /// [`ready_connection_by_key_for_config`](Self::ready_connection_by_key_for_config).
+    pub(crate) async fn ready_producer_by_key(
+        &self,
+        key: &ConnectionKey,
+        config: Option<&crate::config::settings::BridgeServerConfig>,
+        expected_generation: u64,
+    ) -> Option<Arc<ConnectionHandle>> {
+        let connections = self.connections.lock().await;
+        if self.document_connection_generation(key) != expected_generation {
+            return None;
+        }
+        connections
+            .get(key)
+            .filter(|handle| handle.state() == ConnectionState::Ready)
+            .filter(|handle| config.is_none_or(|config| handle.matches_launch_config(config)))
+            .map(Arc::clone)
+    }
+
     /// Shared registry of in-flight forwarded requests, handed to the forwarding
     /// loop so it can await each request's cancel token and drop settled entries
     /// (#404).
