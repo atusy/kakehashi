@@ -18,7 +18,7 @@ use crate::config::settings::WorkspaceSettings;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::error::LockResultExt;
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-use crate::lsp::bridge::envelope::ENVELOPE_KEY;
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope};
 use crate::lsp::bridge::pool::{
     ConfirmedDocumentRevision, ConnectionHandle, ConnectionState, INIT_TIMEOUT_SECS,
     LanguageServerPool, UpstreamId, VirtualUriObserver,
@@ -253,8 +253,18 @@ fn prepare_symbol_for_aggregation(
     (normalized, identity, None)
 }
 
+/// Whether a downstream symbol's `data` is wrapped in the routing envelope.
+///
+/// Only a lazy (`WorkspaceLocation`) modern symbol can be resolved, so only
+/// that shape carries an envelope. Within that shape the shared rule applies:
+/// a resolving origin gets one for routing, and a payload that squats on the
+/// reserved key gets one regardless, so the foreign object is nested as
+/// `inner` instead of being parsed as an envelope on
+/// `workspaceSymbol/resolve` (see `bridge::envelope`).
 fn needs_resolve_envelope(symbol: &NormalizedSymbol, resolves: bool) -> bool {
-    resolves && !symbol.legacy_flat && matches!(symbol.location, OneOf::Right(_))
+    !symbol.legacy_flat
+        && matches!(symbol.location, OneOf::Right(_))
+        && should_envelope(symbol.data.as_ref(), resolves)
 }
 
 #[cfg(test)]
