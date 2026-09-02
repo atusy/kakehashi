@@ -92,8 +92,9 @@ pub struct LspClient {
     /// is killed (which closes stdout and unblocks the thread).
     reader: Option<JoinHandle<()>>,
     /// Everything the child has written to stderr so far, accumulated by
-    /// `stderr_reader`. Read (and cleared) by [`LspClient::drain_stderr`].
-    stderr_buf: Arc<Mutex<String>>,
+    /// `stderr_reader`. Kept as raw bytes: a multi-byte character can straddle
+    /// two reads, so decoding happens once in [`LspClient::drain_stderr`].
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
     /// Handle to the background stderr drain thread, joined on drop after the
     /// child is killed (which closes stderr and unblocks the thread).
     stderr_reader: Option<JoinHandle<()>>,
@@ -114,7 +115,7 @@ const STDERR_RETAINED_BYTES: usize = 256 * 1024;
 /// never come. `test_semantic_tokens_markdown_inline_bold` — the one test that
 /// passes `with_debug(true)` — hit exactly this once debug logging grew past
 /// the buffer, failing with a 30s timeout on every run.
-fn drain_stderr_loop(mut stderr: std::process::ChildStderr, sink: Arc<Mutex<String>>) {
+fn drain_stderr_loop(mut stderr: std::process::ChildStderr, sink: Arc<Mutex<Vec<u8>>>) {
     use std::io::Read;
 
     let mut buf = [0u8; 8192];
@@ -123,13 +124,10 @@ fn drain_stderr_loop(mut stderr: std::process::ChildStderr, sink: Arc<Mutex<Stri
             Ok(0) | Err(_) => return,
             Ok(read) => {
                 let mut sink = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                sink.push_str(&String::from_utf8_lossy(&buf[..read]));
+                sink.extend_from_slice(&buf[..read]);
                 if sink.len() > STDERR_RETAINED_BYTES {
                     let excess = sink.len() - STDERR_RETAINED_BYTES;
-                    let cut = (excess..=sink.len())
-                        .find(|at| sink.is_char_boundary(*at))
-                        .unwrap_or(0);
-                    sink.drain(..cut);
+                    sink.drain(..excess);
                 }
             }
         }
@@ -408,7 +406,7 @@ impl LspClient {
     fn from_child(mut child: Child) -> Self {
         let stdin = child.stdin.take().expect("Failed to get stdin");
         let stdout = BufReader::new(child.stdout.take().expect("Failed to get stdout"));
-        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let stderr_buf = Arc::new(Mutex::new(Vec::new()));
         let stderr_reader = child.stderr.take().map(|stderr| {
             let sink = Arc::clone(&stderr_buf);
             std::thread::spawn(move || drain_stderr_loop(stderr, sink))
@@ -435,7 +433,7 @@ impl LspClient {
             .stderr_buf
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        std::mem::take(&mut *sink)
+        String::from_utf8_lossy(&std::mem::take(&mut *sink)).into_owned()
     }
 
     /// Send an LSP request and return the response.
