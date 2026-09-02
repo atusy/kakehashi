@@ -245,6 +245,13 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
     ) -> DocumentLink {
         let server_name = &envelope.origin;
+        // One function serves both layers; tag the host one like the
+        // completion and codeAction host paths do.
+        let layer = if envelope.is_host_layer() {
+            " (host)"
+        } else {
+            ""
+        };
         let Ok(host_uri) = Url::parse(&envelope.host_uri) else {
             re_envelope_link(&mut link, &envelope);
             return link;
@@ -287,7 +294,7 @@ impl LanguageServerPool {
             Err(error) => {
                 warn!(
                     target: "kakehashi::bridge",
-                    "documentLink/resolve: failed to connect to {server_name}: {error}"
+                    "documentLink/resolve{layer}: failed to connect to {server_name}: {error}"
                 );
                 re_envelope_link(&mut link, &envelope);
                 return link;
@@ -303,13 +310,13 @@ impl LanguageServerPool {
             if nests_reserved_key(link.data.as_ref()) {
                 debug!(
                     target: "kakehashi::bridge",
-                    "documentLink/resolve: {server_name:?} does not advertise resolveProvider; the link was \
+                    "documentLink/resolve{layer}: {server_name:?} does not advertise resolveProvider; the link was \
                      enveloped only to nest a reserved-key payload; returning unresolved"
                 );
             } else {
                 warn!(
                     target: "kakehashi::bridge",
-                    "documentLink/resolve: {server_name:?} no longer advertises resolveProvider; returning unresolved"
+                    "documentLink/resolve{layer}: {server_name:?} no longer advertises resolveProvider; returning unresolved"
                 );
             }
             re_envelope_link(&mut link, &envelope);
@@ -346,7 +353,7 @@ impl LanguageServerPool {
             Err(error) => {
                 warn!(
                     target: "kakehashi::bridge",
-                    "documentLink/resolve: failed to register request for {server_name}: {error}"
+                    "documentLink/resolve{layer}: failed to register request for {server_name}: {error}"
                 );
                 if let Some(ref id) = upstream_id {
                     self.unregister_upstream_request(id, connection_key);
@@ -386,7 +393,7 @@ impl LanguageServerPool {
         if let Err(error) = send_result {
             warn!(
                 target: "kakehashi::bridge",
-                "documentLink/resolve: failed to send request for {server_name}: {error}"
+                "documentLink/resolve{layer}: failed to send request for {server_name}: {error}"
             );
             if let Some(ref id) = upstream_id {
                 self.unregister_upstream_request(id, connection_key);

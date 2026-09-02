@@ -307,6 +307,13 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
     ) -> CodeLens {
         let server_name = &envelope.origin;
+        // One function serves both layers; tag the host one like the
+        // completion and codeAction host paths do.
+        let layer = if envelope.is_host_layer() {
+            " (host)"
+        } else {
+            ""
+        };
         let Ok(host_uri) = Url::parse(&envelope.host_uri) else {
             re_envelope_lens(&mut lens, &envelope);
             return lens;
@@ -358,8 +365,7 @@ impl LanguageServerPool {
             Err(e) => {
                 warn!(
                     target: "kakehashi::bridge",
-                    "codeLens/resolve: failed to connect to {}: {}",
-                    server_name, e
+                    "codeLens/resolve{layer}: failed to connect to {server_name}: {e}"
                 );
                 re_envelope_lens(&mut lens, &envelope);
                 return lens;
@@ -375,13 +381,13 @@ impl LanguageServerPool {
             if nests_reserved_key(lens.data.as_ref()) {
                 debug!(
                     target: "kakehashi::bridge",
-                    "codeLens/resolve: {server_name:?} does not advertise resolveProvider; the lens was \
+                    "codeLens/resolve{layer}: {server_name:?} does not advertise resolveProvider; the lens was \
                      enveloped only to nest a reserved-key payload; returning unresolved"
                 );
             } else {
                 warn!(
                     target: "kakehashi::bridge",
-                    "codeLens/resolve: {server_name:?} no longer advertises resolveProvider; returning unresolved"
+                    "codeLens/resolve{layer}: {server_name:?} no longer advertises resolveProvider; returning unresolved"
                 );
             }
             re_envelope_lens(&mut lens, &envelope);
@@ -421,7 +427,7 @@ impl LanguageServerPool {
                 Err(e) => {
                     warn!(
                         target: "kakehashi::bridge",
-                        "codeLens/resolve: failed to register request for {}: {}",
+                        "codeLens/resolve{layer}: failed to register request for {}: {}",
                         server_name, e
                     );
                     if let Some(ref id) = upstream_id {
@@ -465,7 +471,7 @@ impl LanguageServerPool {
         if let Err(e) = send_result {
             warn!(
                 target: "kakehashi::bridge",
-                "codeLens/resolve: failed to send request for {}: {}",
+                "codeLens/resolve{layer}: failed to send request for {}: {}",
                 server_name, e
             );
             if let Some(ref id) = upstream_id {
