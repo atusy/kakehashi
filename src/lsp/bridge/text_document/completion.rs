@@ -62,6 +62,7 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/completion") {
             return Ok(None);
         }
+        let server_resolves = handle.has_capability("completionItem/resolve");
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -82,7 +83,8 @@ impl LanguageServerPool {
                     ctx.offset,
                     region_end,
                     Some(host_position.line),
-                    Some(EnvelopeContext {
+                    server_resolves,
+                    &EnvelopeContext {
                         server_name,
                         injection_language,
                         incarnation: host_incarnation,
@@ -91,7 +93,7 @@ impl LanguageServerPool {
                         offset: ctx.offset,
                         region_end: Some(region_end),
                         host_layer: false,
-                    }),
+                    },
                 )
             },
         )
@@ -119,14 +121,17 @@ fn build_completion_request(
 ///
 /// Normalizes all responses to `CompletionList` (an array result is wrapped as
 /// `CompletionList { isIncomplete: false, items }`). Returns `None` for null
-/// results, missing results, and deserialization failures. When `envelope_ctx`
-/// is `Some`, each item's `data` is wrapped in a routing envelope.
+/// results, missing results, and deserialization failures. Each item that
+/// [`should_envelope_item`] selects — the origin advertises
+/// `completionItem/resolve`, or the payload squats on the reserved key — has
+/// its `data` wrapped in a routing envelope; the rest pass through bare.
 fn transform_completion_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     region_end: Position,
     request_host_line: Option<u32>,
-    envelope_ctx: Option<EnvelopeContext<'_>>,
+    server_resolves: bool,
+    envelope_ctx: &EnvelopeContext<'_>,
 ) -> Option<CompletionList> {
     if response_has_jsonrpc_error(&response, "textDocument/completion") {
         return None;
@@ -155,15 +160,15 @@ fn transform_completion_response_to_host(
     };
 
     // Transform all items in the list (dropping any whose primary edit is
-    // unsafe for the injection region), then optionally envelope for resolve
-    // routing
+    // unsafe for the injection region), then envelope for resolve routing
+    // under the same policy as the host layer.
     let before = list.items.len();
     list.items.retain_mut(|item| {
         if !transform_completion_item(item, offset, region_end, request_host_line) {
             return false;
         }
-        if let Some(ref ctx) = envelope_ctx {
-            envelope_item_data(item, ctx);
+        if should_envelope_item(item, server_resolves) {
+            envelope_item_data(item, envelope_ctx);
         }
         true
     });
