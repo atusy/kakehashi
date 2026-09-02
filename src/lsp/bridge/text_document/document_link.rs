@@ -115,6 +115,19 @@ fn re_envelope_link(link: &mut DocumentLink, envelope: &DocumentLinkEnvelope) {
     );
 }
 
+/// A downstream that cannot resolve gains nothing from the routing envelope,
+/// so its opaque `data` passes through untouched — except when that data
+/// carries the reserved key itself, which would otherwise let a downstream
+/// present a payload of its own choosing as kakehashi routing metadata. Those
+/// are wrapped anyway, with the foreign object nested as `inner`.
+fn should_envelope_link(link: &DocumentLink, server_resolves: bool) -> bool {
+    server_resolves
+        || link
+            .data
+            .as_ref()
+            .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
+}
+
 pub(crate) fn envelope_host_document_links(
     links: &mut [DocumentLink],
     server_name: &str,
@@ -137,12 +150,7 @@ pub(crate) fn envelope_host_document_links(
         host_layer: true,
     };
     for link in links {
-        if server_resolves
-            || link
-                .data
-                .as_ref()
-                .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
-        {
+        if should_envelope_link(link, server_resolves) {
             envelope_link_data(link, &ctx);
         }
     }
@@ -181,6 +189,7 @@ impl LanguageServerPool {
         }
         let connection_key = handle.key().clone();
         let connection_generation = self.document_connection_generation(&connection_key);
+        let server_resolves = handle.has_capability("documentLink/resolve");
         self.execute_bridge_request_with_handle(
             handle,
             host_uri,
@@ -194,6 +203,7 @@ impl LanguageServerPool {
                 transform_document_link_response_to_host(
                     response,
                     ctx.offset,
+                    server_resolves,
                     &DocumentLinkEnvelopeContext {
                         server_name,
                         host_uri: host_uri.as_str(),
@@ -450,6 +460,7 @@ fn parse_document_link_resolve_response(mut response: serde_json::Value) -> Opti
 fn transform_document_link_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
+    server_resolves: bool,
     envelope_ctx: &DocumentLinkEnvelopeContext<'_>,
 ) -> Option<Vec<DocumentLink>> {
     if response_has_jsonrpc_error(&response, "textDocument/documentLink") {
@@ -467,7 +478,9 @@ fn transform_document_link_response_to_host(
     // Transform ranges to host coordinates
     for link in &mut links {
         translate_virtual_range_to_host(&mut link.range, offset);
-        envelope_link_data(link, envelope_ctx);
+        if should_envelope_link(link, server_resolves) {
+            envelope_link_data(link, envelope_ctx);
+        }
     }
 
     Some(links)
@@ -484,10 +497,19 @@ mod tests {
         response: serde_json::Value,
         offset: &RegionOffset,
     ) -> Option<Vec<DocumentLink>> {
+        transform_for_resolving_server(response, offset, true)
+    }
+
+    fn transform_for_resolving_server(
+        response: serde_json::Value,
+        offset: &RegionOffset,
+        server_resolves: bool,
+    ) -> Option<Vec<DocumentLink>> {
         let connection_key = ConnectionKey::shared("lua-ls");
         transform_document_link_response_to_host(
             response,
             offset,
+            server_resolves,
             &DocumentLinkEnvelopeContext {
                 server_name: "lua-ls",
                 host_uri: "file:///test.md",
@@ -574,6 +596,55 @@ mod tests {
         );
         assert_eq!(links[0].range.start.line, 3);
         assert_eq!(links[0].range.start.character, 3);
+    }
+
+    /// A downstream that cannot resolve gains nothing from the envelope, and
+    /// wrapping its `data` anyway hides the payload it asked to get back. The
+    /// host helper already gates on the capability; the virtual layer must use
+    /// the same rule — including the reserved-key exception, so a downstream
+    /// cannot smuggle its own `kakehashi` object through as routing metadata.
+    #[test]
+    fn virtual_links_are_enveloped_only_when_the_server_resolves() {
+        let response = |data: serde_json::Value| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "result": [{
+                    "range": {
+                        "start": { "line": 0, "character": 1 },
+                        "end": { "line": 0, "character": 4 }
+                    },
+                    "data": data
+                }]
+            })
+        };
+
+        let bare = transform_for_resolving_server(
+            response(json!({"token": 1})),
+            &RegionOffset::new(3, 2),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            bare[0].data,
+            Some(json!({"token": 1})),
+            "a non-resolving server's payload must pass through untouched"
+        );
+        assert_eq!(bare[0].range.start.line, 3, "ranges are still translated");
+
+        let forged = transform_for_resolving_server(
+            response(json!({ ENVELOPE_KEY: { "origin": "spoofed" } })),
+            &RegionOffset::new(3, 2),
+            false,
+        )
+        .unwrap();
+        let envelope = extract_document_link_envelope(&forged[0]).expect("collision envelope");
+        assert_eq!(envelope.origin, "lua-ls");
+        assert_eq!(
+            envelope.inner,
+            Some(json!({ ENVELOPE_KEY: { "origin": "spoofed" } })),
+            "the foreign payload must be nested, not honored as routing metadata"
+        );
     }
 
     #[test]
