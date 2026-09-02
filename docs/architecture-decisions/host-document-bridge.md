@@ -54,9 +54,11 @@ Partially implemented:
   only fail soft — so a client resolve passes the bare item through
   unchanged. The resolve side re-checks the capability on the live origin
   regardless and, finding it absent, returns the item unresolved with its
-  envelope restored — warning when the capability was withdrawn under the
-  item (a respawn or dynamic unregister), quietly when the envelope existed
-  only to nest a reserved-key payload from a non-resolving origin. That
+  envelope restored — warning that the capability was withdrawn under the
+  item (a respawn or dynamic unregister), unless the payload itself nests
+  the reserved key, which the resolve side reads as the steady state of a
+  non-resolving origin's collision wrap and logs quietly (a resolving origin
+  with such a payload loses the warning; accepted). That collision
   exception wraps `data.kakehashi` as opaque `inner` data so a downstream
   payload cannot impersonate bridge routing metadata. (codeAction needs no
   such exception: an action that leaves without an envelope leaves with no
