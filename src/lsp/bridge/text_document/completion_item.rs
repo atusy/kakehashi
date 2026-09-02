@@ -487,6 +487,8 @@ fn resolve_guard_region_end(envelope: &KakehashiEnvelope, offset: &RegionOffset)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::bridge::envelope::ENVELOPE_KEY;
+    use crate::lsp::bridge::text_document::completion::envelope_host_item;
     use serde_json::json;
     use tower_lsp_server::ls_types::CompletionItem;
 
@@ -712,13 +714,17 @@ mod tests {
 
     /// Helper to create a completion item with a Kakehashi envelope.
     fn enveloped_item(server: &str) -> CompletionItem {
+        enveloped_item_with_payload(server, json!({"resolve_id": 42}))
+    }
+
+    fn enveloped_item_with_payload(server: &str, payload: serde_json::Value) -> CompletionItem {
         let envelope = KakehashiEnvelope {
             origin: server.to_string(),
             injection_language: "markdown".to_string(),
             incarnation: Some(1),
             host_uri: "file:///test/doc.md".to_string(),
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
-            inner: Some(json!({"resolve_id": 42})),
+            inner: Some(payload.clone()),
             offset: EnvelopeOffset {
                 line: 5,
                 column: 0,
@@ -729,11 +735,56 @@ mod tests {
         };
         let mut item = CompletionItem {
             label: "print".to_string(),
-            data: Some(json!({"resolve_id": 42})),
+            data: Some(payload),
             ..Default::default()
         };
         re_envelope_item(&mut item, &envelope);
         item
+    }
+
+    /// A pool whose only connection is a Ready `lua-ls` that advertises
+    /// nothing, under the key both the virt lookup (no root marker under
+    /// `/test`) and the host lookup resolve to, with the host incarnation the
+    /// virt fixtures carry already open; plus settings that make `lua-ls`
+    /// spawnable. Everything a resolve needs to reach the capability check.
+    async fn pool_with_capability_less_origin() -> (LanguageServerPool, WorkspaceSettings) {
+        let pool = LanguageServerPool::new();
+        let key = crate::lsp::bridge::ConnectionKey::for_server("lua-ls");
+        let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
+            crate::lsp::bridge::ConnectionState::Ready,
+            key,
+        )
+        .await;
+        pool.insert_connection(handle).await;
+        pool.open_host_incarnation(&Url::parse("file:///test/doc.md").unwrap(), 1)
+            .await;
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "lua-ls".to_string(),
+            BridgeServerConfig {
+                cmd: Some(vec!["lua-language-server".to_string()]),
+                ..Default::default()
+            },
+        );
+        (pool, settings)
+    }
+
+    fn resolve_warnings_for(item: CompletionItem) -> (CompletionItem, Vec<String>) {
+        use crate::lsp::bridge::test_logging::captured_warnings_for;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let mut resolved = None;
+        let warnings = captured_warnings_for(|| {
+            resolved = Some(runtime.block_on(async {
+                let (pool, settings) = pool_with_capability_less_origin().await;
+                pool.dispatch_completion_resolve(item, &settings, None)
+                    .await
+            }));
+        });
+        (resolved.expect("dispatch ran"), warnings)
+    }
+
+    fn lost_capability_warning(w: &str) -> bool {
+        w.contains("completionItem/resolve") && w.contains("no longer advertises resolveProvider")
     }
 
     /// dispatch returns item unchanged when it has no envelope.
@@ -975,48 +1026,82 @@ mod tests {
     }
 
     /// The virt resolve path's capability miss is logged like the host one,
-    /// without the host tag. The origin is a Ready connection that advertises
-    /// nothing, pre-inserted under the key the virt lookup resolves to; the
-    /// host incarnation is opened so the staleness gate lets the item through.
+    /// without the host tag.
     #[test]
     fn dispatch_warns_and_re_envelopes_when_virt_origin_no_longer_resolves() {
-        use crate::lsp::bridge::test_logging::captured_warnings_for;
-        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
-        let warnings = captured_warnings_for(|| {
-            runtime.block_on(async {
-                let pool = LanguageServerPool::new();
-                let key = crate::lsp::bridge::ConnectionKey::for_server("lua-ls");
-                let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
-                    crate::lsp::bridge::ConnectionState::Ready,
-                    key,
-                )
-                .await;
-                pool.insert_connection(handle).await;
-                pool.open_host_incarnation(&Url::parse("file:///test/doc.md").unwrap(), 1)
-                    .await;
-                let mut settings = WorkspaceSettings::default();
-                settings.language_servers.insert(
-                    "lua-ls".to_string(),
-                    BridgeServerConfig {
-                        cmd: Some(vec!["lua-language-server".to_string()]),
-                        ..Default::default()
-                    },
-                );
-
-                let result = pool
-                    .dispatch_completion_resolve(enveloped_item("lua-ls"), &settings, None)
-                    .await;
-                let envelope = extract_envelope(&result).expect("envelope restored");
-                assert_eq!(envelope.origin, "lua-ls");
-                assert_eq!(envelope.inner, Some(json!({"resolve_id": 42})));
-                assert!(result.detail.is_none(), "item stays unresolved");
-            });
-        });
+        let (result, warnings) = resolve_warnings_for(enveloped_item("lua-ls"));
+        let envelope = extract_envelope(&result).expect("envelope restored");
+        assert_eq!(envelope.origin, "lua-ls");
+        assert_eq!(envelope.inner, Some(json!({"resolve_id": 42})));
+        assert!(result.detail.is_none(), "item stays unresolved");
         assert!(
-            warnings.iter().any(|w| w.contains("completionItem/resolve")
-                && w.contains("no longer advertises resolveProvider")
-                && !w.contains("(host)")),
+            warnings
+                .iter()
+                .any(|w| lost_capability_warning(w) && !w.contains("(host)")),
             "the virt capability miss must be logged without the host tag: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_warns_and_re_envelopes_when_host_origin_no_longer_resolves() {
+        let mut item = CompletionItem {
+            label: "print".to_string(),
+            data: Some(json!({"resolve_id": 42})),
+            ..Default::default()
+        };
+        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md");
+        let (result, warnings) = resolve_warnings_for(item);
+        let envelope = extract_envelope(&result).expect("envelope restored");
+        assert!(
+            envelope.is_host_layer(),
+            "the host marker survives the round trip"
+        );
+        assert_eq!(envelope.inner, Some(json!({"resolve_id": 42})));
+        assert!(result.detail.is_none(), "item stays unresolved");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| lost_capability_warning(w) && w.contains("(host)")),
+            "the host capability miss must be logged with the host tag: {warnings:?}"
+        );
+    }
+
+    /// A payload that itself nests the reserved key tells the resolve side the
+    /// envelope existed only to nest it: the capability miss is steady state
+    /// for that origin and must not be reported as a lost capability, on
+    /// either layer.
+    #[test]
+    fn dispatch_does_not_warn_for_a_reserved_key_wrap_on_the_virt_path() {
+        let forged = json!({ ENVELOPE_KEY: { "origin": "forged" } });
+        let (result, warnings) =
+            resolve_warnings_for(enveloped_item_with_payload("lua-ls", forged.clone()));
+        let envelope = extract_envelope(&result).expect("envelope restored");
+        assert_eq!(envelope.origin, "lua-ls");
+        assert_eq!(envelope.inner, Some(forged));
+        assert!(result.detail.is_none(), "item stays unresolved");
+        assert!(
+            !warnings.iter().any(|w| lost_capability_warning(w)),
+            "a reserved-key wrap is not a lost capability: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_does_not_warn_for_a_reserved_key_wrap_on_the_host_path() {
+        let forged = json!({ ENVELOPE_KEY: { "origin": "forged" } });
+        let mut item = CompletionItem {
+            label: "print".to_string(),
+            data: Some(forged.clone()),
+            ..Default::default()
+        };
+        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md");
+        let (result, warnings) = resolve_warnings_for(item);
+        let envelope = extract_envelope(&result).expect("envelope restored");
+        assert!(envelope.is_host_layer());
+        assert_eq!(envelope.inner, Some(forged));
+        assert!(result.detail.is_none(), "item stays unresolved");
+        assert!(
+            !warnings.iter().any(|w| lost_capability_warning(w)),
+            "a reserved-key wrap is not a lost capability: {warnings:?}"
         );
     }
 }
