@@ -1,16 +1,17 @@
 //! End-to-end test for synthetic push diagnostics (pull-first-diagnostic-forwarding Phase 2).
 //!
 //! This test verifies the `textDocument/publishDiagnostics` push path on
-//! `didSave`/`didOpen`. Note the two flavours below: tests gated by a real
-//! downstream (lua-ls) treat the push as OPTIONAL — they only assert structure
-//! IF one arrives within `OPTIONAL_PUSH_WAIT` (valid Lua may produce none), and
-//! otherwise just require the server not to crash. The layers-gate test, whose
-//! empty publish is deterministic (no downstream), DOES require the push.
+//! `didSave`/`didOpen`. The didOpen test treats a real-downstream push as
+//! optional because valid Lua can leave the merged set unchanged. The didSave
+//! test uses a pull-capable mock whose result has a request generation and
+//! requires the didSave generation. The layers-gate test also requires its
+//! deterministic empty push.
 //!
 //! Run with: `cargo test --features e2e --test e2e e2e_synthetic_push_diagnostic::`
 //!
 //! **Requirements**: lua-language-server must be installed and in PATH.
 
+use crate::helpers::lsp_client::LspClient;
 use crate::helpers::lsp_polling::wait_for_server_ready;
 use crate::helpers::lua_bridge::{create_lua_configured_client, shutdown_client};
 use serde_json::json;
@@ -26,6 +27,41 @@ use std::time::Duration;
 /// server is ready. Tests that *require* a deterministic push keep their own
 /// longer, explicit timeout.
 const OPTIONAL_PUSH_WAIT: Duration = Duration::from_secs(3);
+const REQUIRED_PUSH_WAIT: Duration = Duration::from_secs(10);
+
+fn mock_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_mock-lsp-formatter")
+}
+
+fn create_save_diagnostic_client() -> (LspClient, tempfile::TempDir) {
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("save_diagnostic.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "diagnosticsDebounceMs": 10_000,
+                "languageServers": {
+                    "mock-diagnostic": {
+                        "cmd": [mock_bin(), "diagnostics-save"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    (client, config_dir)
+}
 
 /// E2E test: publishDiagnostics is sent on didOpen
 ///
@@ -111,7 +147,7 @@ print(x)
 /// diagnostics from downstream servers and publish them.
 #[test]
 fn e2e_synthetic_push_on_did_save() {
-    let (mut client, _config_dir) = create_lua_configured_client();
+    let (mut client, _config_dir) = create_save_diagnostic_client();
 
     // First open the document
     let markdown_content = r#"# Test Document
@@ -135,13 +171,40 @@ local x = 1
         }),
     );
 
-    // Wait for lua-ls to be ready
-    wait_for_server_ready(&mut client, markdown_uri, 5, 100);
+    // Require the didOpen pull's generation so the later assertion can identify
+    // the didSave pull specifically. Avoid a readiness probe here because that
+    // probe is itself a diagnostic request and would consume a mock generation.
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            REQUIRED_PUSH_WAIT,
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic["message"] == json!("mock-diagnostic-save:1"))
+                })
+            },
+        )
+        .expect("didOpen must establish diagnostic generation 1");
 
-    // Drain any existing notifications from didOpen
-    let _ = client.wait_for_notification("textDocument/publishDiagnostics", Duration::from_secs(3));
+    // didChange's own pull is delayed for 10s, so generation 2 identifies the
+    // immediate didSave path. The unit waiter test separately holds the exact
+    // saved parse snapshot unready for 16 virtual seconds.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {
+                "uri": markdown_uri,
+                "version": 2
+            },
+            "contentChanges": [{
+                "text": "# Test Document\n\n```lua\nlocal =\n```\n"
+            }]
+        }),
+    );
 
-    // Now send didSave - this should trigger another synthetic push
+    // Now send didSave - this should trigger another synthetic push.
     client.send_notification(
         "textDocument/didSave",
         json!({
@@ -152,10 +215,19 @@ local x = 1
     );
 
     // Wait for publishDiagnostics notification from didSave
-    let notification =
-        client.wait_for_notification("textDocument/publishDiagnostics", OPTIONAL_PUSH_WAIT);
+    let notification = client.wait_for_notification_where(
+        &["textDocument/publishDiagnostics"],
+        Duration::from_secs(5),
+        |params| {
+            params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic["message"] == json!("mock-diagnostic-save:2"))
+            })
+        },
+    );
 
-    if let Some(params) = notification {
+    if let Some((_, params)) = notification {
         println!(
             "Received publishDiagnostics on save: {}",
             serde_json::to_string_pretty(&params).unwrap()
@@ -169,19 +241,20 @@ local x = 1
         );
 
         let diagnostics = params.get("diagnostics").and_then(|d| d.as_array());
+        let diagnostics = diagnostics.expect("publishDiagnostics should have diagnostics array");
         assert!(
-            diagnostics.is_some(),
-            "publishDiagnostics should have diagnostics array"
+            !diagnostics.is_empty(),
+            "the save pull must produce its identifiable diagnostic generation"
         );
 
         println!(
             "✓ E2E: Synthetic push on didSave - received {} diagnostics",
-            diagnostics.unwrap().len()
+            diagnostics.len()
         );
     } else {
-        println!(
-            "⚠ E2E: No publishDiagnostics received on save within timeout. \
-             This may happen if lua-ls is slow."
+        let stderr = client.drain_stderr();
+        panic!(
+            "didSave must produce publishDiagnostics within the E2E timeout; server stderr:\n{stderr}"
         );
     }
 

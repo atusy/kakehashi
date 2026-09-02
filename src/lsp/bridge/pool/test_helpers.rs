@@ -139,6 +139,27 @@ pub(in crate::lsp::bridge) async fn create_handle_with_key(
     create_handle_with_state_and_pid_keyed(state, key).await.0
 }
 
+pub(in crate::lsp::bridge) async fn create_handle_accepting_textless_did_save(
+    key: ConnectionKey,
+) -> Arc<ConnectionHandle> {
+    use tower_lsp_server::ls_types::{
+        ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncOptions,
+        TextDocumentSyncSaveOptions,
+    };
+
+    let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+    handle.set_server_capabilities(ServerCapabilities {
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    });
+    handle
+}
+
 /// Like [`create_handle_with_key`], but also advertises `commands` as the
 /// connection's static `executeCommandProvider.commands`, and optionally records
 /// `spawned_from` as the config the connection was launched with.

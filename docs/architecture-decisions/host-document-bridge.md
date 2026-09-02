@@ -82,23 +82,47 @@ Partially implemented:
   - **`willSave`** goes to host servers that already have the host document
     open *and* to every open virtual document (URI rewritten to the virtual
     one, reason verbatim);
-  - **`didSave`** goes to every open virtual document (URI rewritten); it is
-    not forwarded to host servers today (the host `didSave` handler drives the
-    synthetic-diagnostic pull instead).
+  - **`didSave`** goes to host servers that already have the real document open
+    and to every open virtual document (URI rewritten for the latter). Before
+    an eligible host server receives the notification, kakehashi queues any
+    pending full-text `didChange` and `didSave` under the same
+    connection/document lock, so save hooks observe the editor's latest text.
+    Virtual forwarding binds the parse snapshot and projected content to the
+    exact incarnation/content version observed at save time, revalidates that
+    version under the edit lock, and queues a required injection `didChange`
+    before `didSave` under the virtual document's transition lock. If the 200ms
+    settle expires, the document advances, or the `didChange` enqueue fails, it
+    drops the virtual `didSave` instead of running a save hook on stale or later
+    unsaved fragment text. At ingress, `didSave` is a per-document writer fence,
+    so a later wire-order `didChange` cannot overtake save-time version capture.
+    Synthetic diagnostic collection registers an abortable background waiter
+    for that exact saved incarnation/version and snapshots only after its tree
+    is ready; parse or parser-install latency therefore neither blocks the
+    writer nor silently loses the save trigger. Snapshot preparation repeats
+    that lineage check atomically with the snapshot read. A later `didChange`
+    aborts the saved pull before mutating the document, and the completed pull
+    revalidates and publishes under the same edit lock, so neither the
+    wait-to-snapshot window nor an in-flight downstream request can commit
+    diagnostics for an obsolete saved version. Background diagnostic ownership
+    is ordered by `(incarnation, content version, settings generation, trigger)`, with
+    `didSave > didChange > didOpen` at an equal version and settings generation;
+    a late parse/debounce registration therefore cannot cancel the
+    already-registered save trigger, while a newer configuration generation
+    can legitimately supersede it.
+    Tasks remain behind a start gate until that ownership registration wins;
+    shutdown permanently closes registration before aborting current tasks.
 
   Each recipient is **gated per-server** on the relevant capability —
   `willSave` on `textDocumentSync.willSave`, `didSave` on `textDocumentSync.save`
   — which is also the safety valve: a virt server only hears about a fragment
   "save" if it opted into save hooks; one that didn't never sees it. The
-  `didSave` gate additionally **excludes servers that demand
-  `save.includeText = true`**: kakehashi advertises `includeText = false`
-  upstream and so never receives the editor's saved bytes, so rather than send a
-  contract-violating textless didSave it declines (the server still has current
-  content from didChange). That gate reads **static** capabilities only — a
-  *dynamic* didSave registration is not honored for forwarding, since the
-  method-name-only dynamic registry cannot carry `includeText` and could
-  otherwise smuggle an `includeText = true` server past the filter. Both are
-  fire-and-forget (no lazy spawn). `willSave` is advertised whenever a runnable
+  `didSave` reads the server's **static** `save.includeText` preference. When it
+  is true, kakehashi attaches the tracked host text or the exact projected
+  virtual text bound to that save; otherwise it sends a textless notification.
+  A *dynamic-only* didSave registration is not honored for forwarding, since
+  the method-name-only dynamic registry cannot retain `includeText`. Both are
+  fire-and-forget (no lazy spawn). Host recipients receive the real URI
+  verbatim; virtual recipients receive their projected URI. `willSave` is advertised whenever a runnable
   bridge server (host or virt) is configured; `didSave` is always advertised to
   the editor (`save.includeText = false`).
 

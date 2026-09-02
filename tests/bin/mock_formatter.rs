@@ -97,10 +97,11 @@
 //! - `will-save` — advertises `hoverProvider` + a `textDocumentSync` Options
 //!   block with `willSave`, `willSaveWaitUntil`, and `save` true. Records every
 //!   `textDocument/willSave` (count + last reason + last URI) and
-//!   `textDocument/didSave` (count + last URI), and answers
+//!   `textDocument/didSave` (count + last URI + optional payload text), and answers
 //!   `textDocument/willSaveWaitUntil` with a save-time edit echoing the
 //!   requested URI (only for documents synced via `didOpen`). `hover` returns
-//!   the recorded state as a JSON string (`{will,reason,willUri,did,didUri}`),
+//!   the recorded state as JSON, including the save payload and synchronized
+//!   document text,
 //!   so a test can prove the notifications reached this server carrying the URI
 //!   it knows — the host URI for a host server, the *virtual* URI for a virt
 //!   server. Used by `tests/e2e/e2e_host_bridge.rs` to prove host- AND virt-bridge
@@ -112,6 +113,8 @@
 //! - `will-save-incapable` — like `will-save` (records + reports save state via
 //!   hover) but advertises NEITHER `willSave` nor `save`, so the bridge's
 //!   per-server capability gate must skip it and its counts stay zero (#357).
+//! - `will-save-include-text` — records save state and requires didSave text;
+//!   hover exposes the received payload so forwarding can be checked exactly.
 //! - `notify` — right after answering `initialize`, emits a
 //!   `window/showMessage` followed by a `window/logMessage` notification.
 //!   Used by `tests/e2e/e2e_window_notifications.rs` to prove the bridge forwards
@@ -157,6 +160,9 @@ fn main() {
     let mut last_will_save_uri: Option<String> = None;
     let mut did_save_count: usize = 0;
     let mut last_did_save_uri: Option<String> = None;
+    let mut last_did_save_had_text = false;
+    let mut last_did_save_text: Option<String> = None;
+    let mut last_did_save_document_text: Option<String> = None;
     let mut diagnostic_generation: u64 = 0;
     // `diagnostics-refresh-prefetch-unchanged`: once ANY unchanged report was
     // answered, the baseline demonstrably exists — a later baseline-less full
@@ -237,6 +243,7 @@ fn main() {
                     // (below). Used to prove `pullFallback = false` still
                     // publishes a pull-driven server's spontaneous push (#425).
                     "diagnostics"
+                    | "diagnostics-save"
                     | "diagnostics-fail"
                     | "diagnostics-malformed"
                     | "diagnostics-refresh-prefetch"
@@ -295,6 +302,14 @@ fn main() {
                     "will-save-incapable" => json!({
                         "hoverProvider": true,
                         "textDocumentSync": 1
+                    }),
+                    "will-save-include-text" => json!({
+                        "hoverProvider": true,
+                        "textDocumentSync": {
+                            "openClose": true,
+                            "change": 1,
+                            "save": { "includeText": true }
+                        }
                     }),
                     "workspace-folders" => json!({
                         "hoverProvider": true,
@@ -480,14 +495,22 @@ fn main() {
                     .map(str::to_string);
             }
             "textDocument/didSave" => {
-                // Notification (no id): record receipt + URI for the hover probe
-                // (#357). didSave carries no text (includeText:false), so just
-                // accepting it is the property under test.
+                // Notification (no id): record receipt, URI, and the optional
+                // payload text for the hover probe (#357).
                 did_save_count += 1;
+                last_did_save_text = message
+                    .pointer("/params/text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                last_did_save_had_text = last_did_save_text.is_some();
                 last_did_save_uri = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                last_did_save_document_text = last_did_save_uri
+                    .as_deref()
+                    .and_then(|uri| documents.get(uri))
+                    .cloned();
             }
             "$/cancelRequest" => {
                 record_mock_event(&mode, "cancel", &message);
@@ -538,12 +561,20 @@ fn main() {
                     // Report the recorded willSave/didSave state as a JSON string
                     // so the test can prove the notifications reached this server
                     // and carried the document URI it knows (#357).
+                    let document_text = message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .and_then(|uri| documents.get(uri));
                     let state = json!({
                         "will": will_save_count,
                         "reason": last_will_save_reason,
                         "willUri": last_will_save_uri,
                         "did": did_save_count,
                         "didUri": last_did_save_uri,
+                        "didHadText": last_did_save_had_text,
+                        "didText": last_did_save_text,
+                        "didDocumentText": last_did_save_document_text,
+                        "documentText": document_text,
                     });
                     json!({ "contents": state.to_string() })
                 } else if mode.starts_with("workspace-folders") {
@@ -975,6 +1006,9 @@ fn main() {
                 respond(&mut writer, id, json!({ "executed": command }));
             }
             "textDocument/diagnostic" => {
+                if mode == "diagnostics-save" {
+                    diagnostic_generation += 1;
+                }
                 if matches!(
                     mode.as_str(),
                     "diagnostics-refresh-prefetch"
@@ -1218,7 +1252,9 @@ fn main() {
                 // but only for documents this server actually received via
                 // didOpen, so the test also proves the host document was
                 // synced before the pull.
-                let diagnostic_message = if mode == "diagnostics-refresh-burst" {
+                let diagnostic_message = if mode == "diagnostics-save" {
+                    format!("mock-diagnostic-save:{diagnostic_generation}")
+                } else if mode == "diagnostics-refresh-burst" {
                     format!("mock-diagnostic-generation:{diagnostic_generation}")
                 } else if matches!(
                     mode.as_str(),

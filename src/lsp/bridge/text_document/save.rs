@@ -16,8 +16,20 @@
 use tower_lsp_server::ls_types::TextDocumentSaveReason;
 use url::Url;
 
-use super::super::pool::{ConnectionHandle, ConnectionState, LanguageServerPool};
-use super::super::protocol::JsonRpcNotification;
+use super::super::pool::{
+    ConnectionHandle, ConnectionState, LanguageServerPool, NotificationSendResult,
+};
+use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
+
+fn enqueue_did_save_if_content_synced(
+    did_change: Option<NotificationSendResult>,
+    enqueue_did_save: impl FnOnce() -> NotificationSendResult,
+) -> Option<NotificationSendResult> {
+    if did_change.is_some_and(|outcome| !matches!(outcome, NotificationSendResult::Queued)) {
+        return None;
+    }
+    Some(enqueue_did_save())
+}
 
 impl LanguageServerPool {
     /// Forward `textDocument/willSave` to every open virtual document of
@@ -40,26 +52,106 @@ impl LanguageServerPool {
         .await;
     }
 
-    /// Forward `textDocument/didSave` to every open virtual document of
-    /// `host_uri`, on each live server that accepts a textless didSave (#357).
-    ///
-    /// The notification carries no `text`. Servers that demand
-    /// `save.includeText = true` are filtered out by
-    /// [`ConnectionHandle::accepts_textless_did_save`] rather than served a
-    /// textless didSave: kakehashi advertises `includeText = false` upstream and
-    /// so never receives the editor's saved bytes to forward. Servers that accept
-    /// textless didSave already have current content from the didChange stream.
-    /// That gate reads STATIC capabilities only, so a dynamic didSave
-    /// registration (whose options the method-name-only dynamic registry can't
-    /// carry) cannot smuggle an `includeText = true` server past the filter.
-    pub(crate) async fn forward_did_save_to_virtual_docs(&self, host_uri: &Url) {
-        self.forward_save_notification_to_virtual_docs(
-            host_uri,
-            "textDocument/didSave",
-            ConnectionHandle::accepts_textless_did_save,
-            |virtual_uri| serde_json::json!({ "textDocument": { "uri": virtual_uri } }),
-        )
-        .await;
+    /// Bring every eligible open virtual document to `injections`' current
+    /// content and enqueue its didSave under the same per-document transition,
+    /// attaching the projected text when the server requests it. A failed
+    /// didChange enqueue suppresses didSave for that target, so a queue becoming
+    /// writable between the two cannot expose a stale save hook.
+    pub(crate) async fn sync_and_forward_did_save_to_virtual_docs(
+        &self,
+        host_uri: &Url,
+        incarnation: u64,
+        injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
+    ) {
+        let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return;
+        };
+
+        for injection in injections {
+            self.record_latest_virtual_content(
+                host_uri,
+                incarnation,
+                &injection.language,
+                &injection.region_id,
+                &injection.content,
+            );
+            let virtual_uri =
+                VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
+            let connection_keys = self.connections_opening_or_opened(&virtual_uri);
+
+            for connection_key in connection_keys {
+                // Keep the current-generation map guard through transition,
+                // tracker validation, and both enqueues. Replacement purges
+                // tracker state while holding this same guard; releasing it
+                // early would make an unregistered target look unchanged and
+                // could send didSave to the invalidated process.
+                let connections = self.connections().await;
+                let Some(handle) = connections
+                    .get(&connection_key)
+                    .filter(|handle| handle.state() == ConnectionState::Ready)
+                    .cloned()
+                else {
+                    continue;
+                };
+                let Some(include_text) = handle.did_save_include_text() else {
+                    continue;
+                };
+                let transition = self.open_transition_lock(&virtual_uri, &connection_key);
+                let transition_guard = transition.lock().await;
+                if !self.is_document_opened_on_connection(&virtual_uri, &connection_key) {
+                    drop(transition_guard);
+                    self.remove_open_transition_lock_if_unshared(
+                        &virtual_uri,
+                        &connection_key,
+                        &transition,
+                    );
+                    continue;
+                }
+
+                let did_change = if let Some(version) = self
+                    .increment_version_if_content_changed(
+                        &virtual_uri,
+                        &connection_key,
+                        &injection.content,
+                    )
+                    .await
+                {
+                    let outcome = Self::send_didchange_for_virtual_doc(
+                        &handle,
+                        &virtual_uri.to_uri_string(),
+                        &injection.content,
+                        version,
+                    );
+                    if matches!(outcome, NotificationSendResult::Queued) {
+                        self.record_sent_content_fingerprint(
+                            &virtual_uri,
+                            &connection_key,
+                            &injection.content,
+                        )
+                        .await;
+                    }
+                    Some(outcome)
+                } else {
+                    None
+                };
+
+                let virtual_uri = virtual_uri.to_uri_string();
+                let params = if include_text {
+                    serde_json::json!({
+                        "textDocument": { "uri": virtual_uri },
+                        "text": injection.content,
+                    })
+                } else {
+                    serde_json::json!({ "textDocument": { "uri": virtual_uri } })
+                };
+                let notification = JsonRpcNotification::new("textDocument/didSave", params);
+                let _ = enqueue_did_save_if_content_synced(did_change, || {
+                    handle.send_notification(notification)
+                });
+                drop(transition_guard);
+                drop(connections);
+            }
+        }
     }
 
     /// Shared fan-out: snapshot the host's open virtual docs and send `method`
@@ -123,5 +215,88 @@ impl LanguageServerPool {
             let notification = JsonRpcNotification::new(method, build_params(&virtual_uri));
             handle.send_notification(notification);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::lsp::bridge::coordinator::BridgeInjection;
+    use crate::lsp::bridge::pool::{ConnectionKey, test_helpers};
+
+    #[test]
+    fn queue_full_did_change_suppresses_textless_did_save() {
+        let did_save_enqueued = Cell::new(false);
+        let result =
+            enqueue_did_save_if_content_synced(Some(NotificationSendResult::QueueFull), || {
+                did_save_enqueued.set(true);
+                NotificationSendResult::Queued
+            });
+
+        assert!(result.is_none());
+        assert!(
+            !did_save_enqueued.get(),
+            "didSave must not be attempted after its prerequisite didChange was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_save_holds_connection_generation_through_transition() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("save");
+        let handle = test_helpers::create_handle_accepting_textless_did_save(key.clone()).await;
+        pool.insert_connection(handle).await;
+
+        let host_uri = Url::parse("file:///test/save.md").unwrap();
+        let injection = BridgeInjection {
+            language: "lua".to_string(),
+            region_id: ulid::Ulid::generate().to_string(),
+            content: "print(1)".to_string(),
+        };
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap();
+        let virtual_uri =
+            VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        pool.record_sent_content_fingerprint(&virtual_uri, &key, &injection.content)
+            .await;
+
+        let transition = pool.open_transition_lock(&virtual_uri, &key);
+        let transition_guard = transition.lock().await;
+        let task_pool = Arc::clone(&pool);
+        let task_injection = injection.clone();
+        let task_uri = host_uri.clone();
+        let task = tokio::spawn(async move {
+            task_pool
+                .sync_and_forward_did_save_to_virtual_docs(&task_uri, 1, &[task_injection])
+                .await;
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if tokio::time::timeout(std::time::Duration::from_millis(10), pool.connections())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "save task never acquired the connection-generation guard"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        drop(transition_guard);
+        task.await.expect("save task must finish");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), pool.connections())
+                .await
+                .is_ok(),
+            "connection guard must release after the combined save transition"
+        );
     }
 }

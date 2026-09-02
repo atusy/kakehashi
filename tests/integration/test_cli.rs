@@ -3121,8 +3121,60 @@ fn test_language_uninstall_cancel() {
     );
 }
 
+/// Create a pipe whose both ends are `FD_CLOEXEC`.
+///
+/// The flag is what keeps these tests deterministic: plain `pipe()` creates
+/// inheritable fds, and tests run in parallel threads — a child spawned
+/// concurrently by ANOTHER test can inherit our read end and keep the pipe
+/// alive, in which case the child under test writes into a live pipe and exits
+/// 0 instead of dying by SIGPIPE. That is the historical flake in these tests.
+///
+/// Where the platform has `pipe2` the flag is applied **atomically at
+/// creation**, leaving no window at all — this is what CI runs on, and the
+/// residual window is exactly where the flake kept recurring. Platforms
+/// without `pipe2` (macOS) set the flags in a second syscall and keep a few
+/// instructions of exposure.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "solaris",
+))]
+fn cloexec_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("create CLOEXEC pipe")
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris",
+    ))
+))]
+fn cloexec_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+
+    let (read_fd, write_fd) = nix::unistd::pipe().expect("create pipe");
+    fcntl(&read_fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).expect("set CLOEXEC on read end");
+    fcntl(&write_fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).expect("set CLOEXEC on write end");
+    (read_fd, write_fd)
+}
+
 /// Run the kakehashi binary with `args`, giving it a stdout pipe whose read end
 /// is closed *before* the child is spawned, and return the finished output.
+///
+/// `Stdio::from(write_fd)` still reaches the child despite `FD_CLOEXEC`,
+/// because std dup2s stdio fds for the child and the duplicate loses the flag.
 ///
 /// With no reader, the child inherits only the write end, so its first stdout
 /// write fails with EPIPE — and, once the default SIGPIPE disposition is
@@ -3131,22 +3183,9 @@ fn test_language_uninstall_cancel() {
 /// spawn/write race.
 #[cfg(unix)]
 fn run_with_broken_stdout_pipe(args: &[&str]) -> std::process::Output {
-    use std::os::fd::OwnedFd;
     use std::process::Stdio;
 
-    let (read_fd, write_fd): (OwnedFd, OwnedFd) = nix::unistd::pipe().expect("create pipe");
-    // Mark both ends CLOEXEC immediately: `pipe()` creates inheritable fds,
-    // and tests run in parallel threads — a concurrently spawned child of
-    // ANOTHER test could inherit our read end and keep it open, in which
-    // case the child under test writes into a live pipe and exits 0 instead
-    // of dying by SIGPIPE (the historical flake in these tests). CLOEXEC
-    // stops the leak; `Stdio::from(write_fd)` still works because std dup2s
-    // stdio fds for the child, which clears CLOEXEC on the duplicate.
-    // (macOS has no `pipe2`, so the flags are set in a second syscall; the
-    // remaining pipe()-to-fcntl window is a few instructions wide.)
-    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-    fcntl(&read_fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).expect("set CLOEXEC on read end");
-    fcntl(&write_fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).expect("set CLOEXEC on write end");
+    let (read_fd, write_fd) = cloexec_pipe();
     // Close the read end before spawning: the child gets only the write end, so
     // there is no reader and the first write hits EPIPE.
     drop(read_fd);

@@ -922,6 +922,174 @@ fn e2e_host_will_save_notification_reaches_host() {
 }
 
 #[test]
+fn e2e_host_did_save_notification_reaches_host() {
+    let (mut client, _config_dir, _init) =
+        init_will_save_client("[languages.markdown.bridge._self]\nenabled = true\n");
+
+    let mut warmed = false;
+    for _ in 0..300 {
+        if let Some(state) = host_save_hover(&mut client) {
+            assert_eq!(state["did"], 0, "no didSave before notification: {state}");
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(warmed, "host document must be open before didSave");
+
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": SAVE_URI } }),
+    );
+
+    let mut seen = None;
+    for _ in 0..300 {
+        if let Some(state) = host_save_hover(&mut client)
+            && state["did"] != 0
+        {
+            seen = Some(state);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = seen.expect("the forwarded didSave must reach the host server");
+    assert_eq!(state["did"], 1);
+    assert_eq!(state["didUri"], SAVE_URI, "host URI must remain verbatim");
+    assert_eq!(
+        state["didHadText"], false,
+        "host didSave must omit the text field"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_did_save_observes_the_latest_host_text() {
+    const SAVED_TEXT: &str = "# Saved immediately\n";
+    let (mut client, _config_dir, _init) =
+        init_will_save_client("[languages.markdown.bridge._self]\nenabled = true\n");
+
+    for _ in 0..300 {
+        if host_save_hover(&mut client).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": SAVE_URI, "version": 2 },
+            "contentChanges": [{ "text": SAVED_TEXT }],
+        }),
+    );
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": SAVE_URI } }),
+    );
+
+    let mut seen = None;
+    for _ in 0..300 {
+        if let Some(state) = host_save_hover(&mut client)
+            && state["did"] != 0
+        {
+            seen = Some(state);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = seen.expect("the immediate didSave must reach the host server");
+    assert_eq!(
+        state["didDocumentText"], SAVED_TEXT,
+        "host didChange must precede didSave on the downstream wire"
+    );
+
+    shutdown(&mut client);
+}
+
+fn assert_host_did_save_is_skipped(mode: &str) {
+    let (mut client, _config_dir, _init) = init_will_save_client_with_mode(
+        "[languages.markdown.bridge._self]\nenabled = true\n",
+        mode,
+    );
+
+    let mut warmed = false;
+    for _ in 0..300 {
+        if host_save_hover(&mut client).is_some() {
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(warmed, "host document must be open before didSave");
+
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": SAVE_URI } }),
+    );
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let state = host_save_hover(&mut client).expect("hover must answer");
+        assert_eq!(
+            state["did"], 0,
+            "didSave must not reach an incapable server: {state}"
+        );
+    }
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_did_save_includes_saved_text_when_requested() {
+    const INCLUDED_SAVED_TEXT: &str = "# Included saved text\n";
+    let (mut client, _config_dir, _init) = init_will_save_client_with_mode(
+        "[languages.markdown.bridge._self]\nenabled = true\n",
+        "will-save-include-text",
+    );
+
+    for _ in 0..300 {
+        if host_save_hover(&mut client).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": SAVE_URI, "version": 2 },
+            "contentChanges": [{ "text": INCLUDED_SAVED_TEXT }],
+        }),
+    );
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": SAVE_URI } }),
+    );
+
+    let mut seen = None;
+    for _ in 0..300 {
+        if let Some(state) = host_save_hover(&mut client)
+            && state["did"] != 0
+        {
+            seen = Some(state);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = seen.expect("includeText=true server must receive didSave");
+    assert_eq!(state["didHadText"], true);
+    assert_eq!(state["didText"], INCLUDED_SAVED_TEXT);
+    assert_eq!(state["didDocumentText"], INCLUDED_SAVED_TEXT);
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_did_save_skips_server_without_save_capability() {
+    assert_host_did_save_is_skipped("will-save-incapable");
+}
+
+#[test]
 fn e2e_host_will_save_wait_until_times_out_without_hanging_save() {
     // The host server stalls 8s on willSaveWaitUntil; kakehashi's 5s save budget
     // must abandon the request and return null near 5s — NOT wait the 30s
@@ -1094,6 +1262,166 @@ fn e2e_virt_will_save_and_did_save_reach_virtual_doc() {
             "{key} must be the VIRTUAL document URI; got {uri}"
         );
         assert_ne!(uri, VIRT_SAVE_URI, "{key} must NOT be the host URI");
+    }
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_virt_did_save_observes_the_latest_virtual_text() {
+    const SAVED_MARKDOWN: &str = "# Title\n\n```lua\nprint(2)\n```\n";
+    let (mut client, _config_dir) = init_virt_save_client();
+
+    let mut warmed = false;
+    for _ in 0..300 {
+        if virt_save_hover(&mut client).is_some() {
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(warmed, "virtual document must be open before the edit");
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": VIRT_SAVE_URI, "version": 2 },
+            "contentChanges": [{ "text": SAVED_MARKDOWN }],
+        }),
+    );
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": VIRT_SAVE_URI } }),
+    );
+
+    let mut seen = None;
+    for _ in 0..300 {
+        if let Some(state) = virt_save_hover(&mut client)
+            && state["did"] != 0
+        {
+            seen = Some(state);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = seen.expect("the immediate didSave must reach the virtual server");
+    let saved_text = state["didDocumentText"]
+        .as_str()
+        .expect("the server must retain its virtual document text at didSave");
+    assert!(
+        saved_text.contains("print(2)"),
+        "virtual didChange must precede didSave; got {saved_text:?}"
+    );
+    assert!(
+        !saved_text.contains("print(1)"),
+        "stale virtual text remained"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_virt_did_save_includes_projected_text_when_requested() {
+    const INCLUDED_SAVED_MARKDOWN: &str = "# Title\n\n```lua\nprint(2)\n```\n";
+    let (mut client, _config_dir) = init_virt_save_client_with_mode("will-save-include-text");
+
+    for _ in 0..300 {
+        if virt_save_hover(&mut client).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": VIRT_SAVE_URI, "version": 2 },
+            "contentChanges": [{ "text": INCLUDED_SAVED_MARKDOWN }],
+        }),
+    );
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": VIRT_SAVE_URI } }),
+    );
+
+    let mut seen = None;
+    for _ in 0..300 {
+        if let Some(state) = virt_save_hover(&mut client)
+            && state["did"] != 0
+        {
+            seen = Some(state);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = seen.expect("includeText=true virtual server must receive didSave");
+    assert_eq!(state["didHadText"], true);
+    let text = state["didText"]
+        .as_str()
+        .expect("didSave must include projected virtual text");
+    assert_eq!(state["didText"], state["didDocumentText"]);
+    assert!(text.contains("print(2)"));
+    assert!(!text.contains("# Title"));
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_virt_did_save_never_observes_a_later_unsaved_edit() {
+    const SAVED_MARKDOWN: &str = "# Title\n\n```lua\nprint(2)\n```\n";
+    const UNSAVED_MARKDOWN: &str = "# Title\n\n```lua\nprint(3)\n```\n";
+    let (mut client, _config_dir) = init_virt_save_client();
+
+    let mut warmed = false;
+    for _ in 0..300 {
+        if virt_save_hover(&mut client).is_some() {
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(warmed, "virtual document must be open before the edits");
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": VIRT_SAVE_URI, "version": 2 },
+            "contentChanges": [{ "text": SAVED_MARKDOWN }],
+        }),
+    );
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": VIRT_SAVE_URI } }),
+    );
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": VIRT_SAVE_URI, "version": 3 },
+            "contentChanges": [{ "text": UNSAVED_MARKDOWN }],
+        }),
+    );
+
+    let mut settled = None;
+    for _ in 0..300 {
+        if let Some(state) = virt_save_hover(&mut client)
+            && state["documentText"]
+                .as_str()
+                .is_some_and(|text| text.contains("print(3)"))
+        {
+            settled = Some(state);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = settled.expect("the later unsaved didChange must reach the virtual server");
+    if state["did"] != 0 {
+        let saved_text = state["didDocumentText"]
+            .as_str()
+            .expect("a delivered didSave must record its document text");
+        assert!(
+            saved_text.contains("print(2)"),
+            "didSave may observe saved text or be omitted, never later unsaved text: {saved_text:?}"
+        );
     }
 
     shutdown(&mut client);

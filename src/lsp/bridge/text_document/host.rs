@@ -33,8 +33,8 @@ use url::Url;
 
 use super::super::actor::RouterCleanupGuard;
 use super::super::pool::{
-    ConnectionHandle, ConnectionHandleSender, ConnectionKey, HostDocSyncState, LanguageServerPool,
-    MessageSender, UpstreamId,
+    ConnectionHandle, ConnectionHandleSender, ConnectionKey, ConnectionState, HostDocSyncState,
+    LanguageServerPool, MessageSender, UpstreamId,
 };
 use super::super::protocol::{
     JsonRpcNotification, JsonRpcRequest, RequestId, jsonrpc_error_summary,
@@ -69,10 +69,48 @@ pub(crate) struct HostRawResponse {
     pub(crate) connection_generation: u64,
 }
 
+fn can_notify_host_document(
+    handle: &ConnectionHandle,
+    supports: &impl Fn(&ConnectionHandle) -> bool,
+) -> bool {
+    handle.state() == ConnectionState::Ready && supports(handle)
+}
+
 fn fingerprint(text: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
+}
+
+async fn resync_open_host_document<S: MessageSender>(
+    sender: &mut S,
+    state: &mut HostDocSyncState,
+    uri: Uri,
+    text: &str,
+) -> io::Result<()> {
+    let fp = fingerprint(text);
+    if state.fingerprint == fp {
+        return Ok(());
+    }
+
+    let version = state.version + 1;
+    let notification = JsonRpcNotification::new(
+        "textDocument/didChange",
+        DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(uri, version),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: text.to_string(),
+            }],
+        },
+    );
+    sender.send_notification(notification).await?;
+    *state = HostDocSyncState {
+        version,
+        fingerprint: fp,
+    };
+    Ok(())
 }
 
 /// Owned reader of a host document's current text, shared across the eager
@@ -148,25 +186,7 @@ pub(super) async fn sync_host_document<S: MessageSender>(
             });
         }
         Entry::Occupied(mut entry) => {
-            if entry.get().fingerprint != fp {
-                let version = entry.get().version + 1;
-                let notification = JsonRpcNotification::new(
-                    "textDocument/didChange",
-                    DidChangeTextDocumentParams {
-                        text_document: VersionedTextDocumentIdentifier::new(uri_lsp, version),
-                        content_changes: vec![TextDocumentContentChangeEvent {
-                            range: None,
-                            range_length: None,
-                            text: text.to_string(),
-                        }],
-                    },
-                );
-                sender.send_notification(notification).await?;
-                *entry.get_mut() = HostDocSyncState {
-                    version,
-                    fingerprint: fp,
-                };
-            }
+            resync_open_host_document(sender, entry.get_mut(), uri_lsp, text).await?;
         }
     }
     Ok(())
@@ -262,6 +282,66 @@ impl LanguageServerPool {
         uri: &Url,
         params: &tower_lsp_server::ls_types::WillSaveTextDocumentParams,
     ) {
+        self.notify_open_host_documents(
+            uri,
+            "textDocument/willSave",
+            |handle| handle.has_capability("textDocument/willSave"),
+            params,
+        )
+        .await;
+    }
+
+    /// Re-sync the current host text and then forward `textDocument/didSave` to
+    /// every eligible, already-open host server, attaching that saved text when
+    /// the server's static capability requests it.
+    /// Both notifications are queued while the connection and host-document
+    /// maps stay locked, preserving their downstream wire order.
+    pub(crate) async fn sync_and_notify_host_did_save(&self, uri: &Url, text: &str) {
+        let Ok(uri_lsp) = host_url_to_lsp_uri(uri) else {
+            return;
+        };
+        let uri_string = uri.as_str().to_owned();
+
+        let connections = self.connections().await;
+        let mut docs = self.host_documents().await;
+        for (connection_key, handle) in connections.iter() {
+            if !can_notify_host_document(handle, &|handle| handle.did_save_include_text().is_some())
+            {
+                continue;
+            }
+            let Some(include_text) = handle.did_save_include_text() else {
+                continue;
+            };
+            let Some(state) = docs.get_mut(&(uri_string.clone(), connection_key.clone())) else {
+                continue;
+            };
+
+            let mut sender = ConnectionHandleSender(handle);
+            if resync_open_host_document(&mut sender, state, uri_lsp.clone(), text)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let params = if include_text {
+                serde_json::json!({ "textDocument": { "uri": uri.as_str() }, "text": text })
+            } else {
+                serde_json::json!({ "textDocument": { "uri": uri.as_str() } })
+            };
+            let notification = JsonRpcNotification::new("textDocument/didSave", &params);
+            let _ = sender.send_notification(notification).await;
+        }
+    }
+
+    /// Notify every live host connection that already has `uri` open and
+    /// satisfies the method-specific capability predicate.
+    async fn notify_open_host_documents<P: serde::Serialize + ?Sized>(
+        &self,
+        uri: &Url,
+        method: &'static str,
+        supports: impl Fn(&ConnectionHandle) -> bool,
+        params: &P,
+    ) {
         // `as_str()` is the already-serialized form; `.to_owned()` clones it in
         // one allocation, skipping the `Display`/`to_string` formatting path.
         let uri_string = uri.as_str().to_owned();
@@ -269,13 +349,13 @@ impl LanguageServerPool {
         let connections = self.connections().await;
         let docs = self.host_documents().await;
         for (connection_key, handle) in connections.iter() {
+            if !can_notify_host_document(handle, &supports) {
+                continue;
+            }
             if !docs.contains_key(&(uri_string.clone(), connection_key.clone())) {
                 continue;
             }
-            if !handle.has_capability("textDocument/willSave") {
-                continue;
-            }
-            let notification = JsonRpcNotification::new("textDocument/willSave", params);
+            let notification = JsonRpcNotification::new(method, params);
             handle.send_notification(notification);
         }
     }
@@ -767,6 +847,19 @@ pub(crate) fn normalize_host_goto_result(result: serde_json::Value) -> Option<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn host_save_notification_skips_failed_current_handle() {
+        let handle = crate::lsp::bridge::pool::test_helpers::create_handle_with_key(
+            ConnectionState::Failed,
+            ConnectionKey::for_server("save"),
+        )
+        .await;
+        assert!(
+            !can_notify_host_document(&handle, &|_| true),
+            "a mapped but failed handle is not a live notification target"
+        );
+    }
 
     #[test]
     fn raw_response_strips_envelope_and_passes_result_verbatim() {

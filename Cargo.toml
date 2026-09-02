@@ -120,8 +120,8 @@ nix = { version = "0.31", features = ["signal", "process", "fs"] }
 [features]
 e2e = []
 
-# Unix-only dev dependencies: pipe() for deterministic broken-pipe tests,
-# Signal::SIGPIPE for asserting the termination signal.
+# Unix-only dev dependencies: pipe2()/pipe() for deterministic broken-pipe
+# tests, Signal::SIGPIPE for asserting the termination signal.
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.31", features = ["fs", "signal"] }
 

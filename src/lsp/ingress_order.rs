@@ -12,9 +12,11 @@
 //! *before* buffering the returned futures, so this middleware can assign
 //! per-URI sequence tickets at `call` time:
 //!
-//! - **Writers** (`didOpen` / `didChange` / `didClose`) take the next ticket
+//! - **Writers** (`didOpen` / `didChange` / `didSave` / `didClose`) take the next ticket
 //!   and run only after the previous writer for the same document finished,
-//!   so opens, edits, and closes apply in strict wire order. Gating `didOpen`
+//!   so opens, edits, saves, and closes apply in strict wire order. Treating
+//!   `didSave` as an ordering fence keeps a later unsaved edit from overtaking
+//!   the save-time host/virtual synchronization. Gating `didOpen`
 //!   (#374) closes the two residual first-poll-order races: a `didChange`
 //!   first-polled before `didOpen` no longer misses the document and discards
 //!   its edit (open→edit), and a reopen no longer inserts ahead of a gated
@@ -33,8 +35,8 @@
 //!   (#480) is therefore a liveness fix, not just a latency one; until then
 //!   the exposure is one-time, first open of an uninstalled parser.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
-//!   triple, the edit-producing formatting/rename requests, pull
-//!   diagnostics, and `didSave`'s diagnostic snapshot) snapshot the current
+//!   triple, the edit-producing formatting/rename requests, and pull
+//!   diagnostics) snapshot the current
 //!   tail ticket at `call` time and run only once that ticket is done, so a
 //!   request observes every edit that preceded it on the wire — without
 //!   serializing its computation against later edits or other documents.
@@ -44,6 +46,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use dashmap::DashMap;
@@ -69,6 +72,11 @@ tokio::task_local! {
     /// reader handler so it can wait for the parse watermark to reach this ticket.
     /// Read via [`current_reader_tail`].
     static READER_TAIL: u64;
+
+    /// Set by a reclaimable writer handler after it determines that the URI
+    /// has no live document. The outer gate then removes idle sequencing state
+    /// without resetting tickets for a live document.
+    static RECLAIM_WRITER_SEQUENCE: Arc<AtomicBool>;
 }
 
 /// The ingress writer ticket of the currently-running gated writer handler, or
@@ -87,6 +95,12 @@ pub(crate) fn current_writer_ticket() -> Option<u64> {
 #[cfg(test)]
 pub(crate) fn current_reader_tail() -> Option<u64> {
     READER_TAIL.try_with(|ticket| *ticket).ok()
+}
+
+/// Ask the ingress gate to remove this writer's per-URI sequencing entry once
+/// the handler completes, provided no later writer was already ticketed.
+pub(crate) fn reclaim_current_writer_sequence() {
+    let _ = RECLAIM_WRITER_SEQUENCE.try_with(|flag| flag.store(true, Ordering::Release));
 }
 
 /// Per-document sequencing state.
@@ -273,7 +287,11 @@ impl ReaderBarrier {
 /// How a request participates in per-document ordering.
 enum Role {
     /// Mutates document state; applies in strict wire order per URI.
-    Writer { uri: String, close: bool },
+    Writer {
+        uri: String,
+        close: bool,
+        reclaim_if_missing: bool,
+    },
     /// Reads the document tree; waits for writers that preceded it.
     Reader { uri: String },
 }
@@ -285,8 +303,7 @@ enum Role {
 /// the `kakehashi/captures` triple, which mirrors it, the edit-producing
 /// requests (formatting, rename — their edits are applied by the client to
 /// its current text, so edits computed against a stale snapshot corrupt the
-/// document), pull diagnostics, and `didSave` (its synthetic-diagnostic task
-/// snapshots the document, which must reflect every edit before the save).
+/// document), and pull diagnostics.
 /// `textDocument/codeAction` is in the same class: its
 /// `context.diagnostics` and returned edits are computed against the
 /// document snapshot (#568). `codeLens/resolve` and `codeAction/resolve` are
@@ -302,11 +319,28 @@ enum Role {
 fn classify(req: &Request) -> Option<Role> {
     let method = req.method();
     match method {
+        "textDocument/didSave" => {
+            // Cleanup for a missing save is signalled by the typed handler.
+            // Decode the complete params before issuing a ticket so malformed
+            // payloads rejected before handler entry cannot retain sequencing
+            // state indefinitely.
+            serde_json::from_value::<tower_lsp_server::ls_types::DidSaveTextDocumentParams>(
+                req.params()?.clone(),
+            )
+            .ok()?;
+            let uri = text_document_uri(req)?;
+            Some(Role::Writer {
+                uri,
+                close: false,
+                reclaim_if_missing: true,
+            })
+        }
         "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didClose" => {
             let uri = text_document_uri(req)?;
             Some(Role::Writer {
                 uri,
                 close: method == "textDocument/didClose",
+                reclaim_if_missing: false,
             })
         }
         "textDocument/semanticTokens/full"
@@ -318,7 +352,6 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/prepareRename"
         | "textDocument/codeAction"
         | "textDocument/diagnostic"
-        | "textDocument/didSave"
         | "kakehashi/captures/full"
         | "kakehashi/captures/full/delta"
         | "kakehashi/captures/range" => {
@@ -342,14 +375,15 @@ fn classify(req: &Request) -> Option<Role> {
 /// Extract `params.textDocument.uri`, normalized through `Url` so spelling
 /// variants of the same document (percent-encoding, default ports) sequence
 /// together — internal document state is keyed on parsed `Url`s, and the
-/// gate's keys must not be finer-grained than that. Falls back to the raw
-/// wire string when it doesn't parse (such requests fail in handlers anyway;
-/// gating them consistently by spelling is harmless).
+/// gate's keys must not be finer-grained than that. Invalid URIs are left
+/// ungated: typed LSP parameter decoding rejects them before a handler can
+/// request cleanup, so issuing a ticket would retain unreachable state.
 fn text_document_uri(req: &Request) -> Option<String> {
     // Indexing a missing key or non-object yields Value::Null, whose as_str()
     // returns None — same outcome as get() chains, less noise.
     let raw = req.params()?["textDocument"]["uri"].as_str()?;
-    Some(normalize_uri(raw))
+    let lsp_uri = raw.parse::<tower_lsp_server::ls_types::Uri>().ok()?;
+    url::Url::parse(lsp_uri.as_str()).map(String::from).ok()
 }
 
 /// Normalize a URI spelling through `Url` so variants of the same document
@@ -398,7 +432,11 @@ where
         let inner_fut = self.inner.call(req);
         match role {
             None => Box::pin(inner_fut),
-            Some(Role::Writer { uri, close }) => {
+            Some(Role::Writer {
+                uri,
+                close,
+                reclaim_if_missing,
+            }) => {
                 let sequencer = Arc::clone(&self.sequencer);
                 let mut gate = sequencer.issue_writer_ticket(&uri);
                 let ticket = gate.ticket();
@@ -406,10 +444,17 @@ where
                     gate.wait_turn().await;
                     // Scope the ticket around the handler so it can stamp its
                     // scheduled parse with this wire-order ticket.
-                    let result = WRITER_TICKET.scope(ticket, inner_fut).await;
+                    let reclaim = reclaim_if_missing.then(|| Arc::new(AtomicBool::new(false)));
+                    let result = if let Some(flag) = &reclaim {
+                        RECLAIM_WRITER_SEQUENCE
+                            .scope(Arc::clone(flag), WRITER_TICKET.scope(ticket, inner_fut))
+                            .await
+                    } else {
+                        WRITER_TICKET.scope(ticket, inner_fut).await
+                    };
                     // Mark done before any cleanup decision.
                     drop(gate);
-                    if close {
+                    if close || reclaim.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                         sequencer.finish_close(&uri, ticket);
                     }
                     result
@@ -624,6 +669,87 @@ mod tests {
             .finish()
     }
 
+    struct MissingSaveInner;
+
+    impl Service<Request> for MissingSaveInner {
+        type Response = Option<Response>;
+        type Error = std::convert::Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request) -> Self::Future {
+            Box::pin(async move {
+                if req.method() == "textDocument/didSave" {
+                    reclaim_current_writer_sequence();
+                }
+                Ok(None)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_save_reclaims_idle_sequence_state() {
+        let mut gate = IngressOrderGate::new(MissingSaveInner);
+
+        gate.call(notification("textDocument/didSave", URI))
+            .await
+            .unwrap();
+
+        assert!(!gate.sequencer.docs.contains_key(URI));
+    }
+
+    #[tokio::test]
+    async fn late_missing_save_reclaims_state_preserved_by_close() {
+        let mut gate = IngressOrderGate::new(MissingSaveInner);
+
+        let close = gate.call(notification("textDocument/didClose", URI));
+        let late_save = gate.call(notification("textDocument/didSave", URI));
+        close.await.unwrap();
+        assert!(
+            gate.sequencer.docs.contains_key(URI),
+            "close must retain state while the late save ticket is pending"
+        );
+        late_save.await.unwrap();
+
+        assert!(!gate.sequencer.docs.contains_key(URI));
+    }
+
+    #[tokio::test]
+    async fn malformed_save_reclaims_sequence_state_through_the_real_handler() {
+        let (service, _socket) = tower_lsp_server::LspService::new(crate::lsp::Kakehashi::new);
+        let mut gate = IngressOrderGate::new(service);
+        // WHATWG `url::Url` accepts and percent-encodes this space, while the
+        // typed LSP URI parser rejects it before `did_save_impl` is entered.
+        let malformed = "file:///test/a b";
+
+        gate.call(notification("textDocument/didSave", malformed))
+            .await
+            .unwrap();
+
+        assert!(gate.sequencer.docs.is_empty());
+        assert!(classify(&notification("textDocument/didSave", malformed)).is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_save_params_do_not_create_sequence_state() {
+        let (service, _socket) = tower_lsp_server::LspService::new(crate::lsp::Kakehashi::new);
+        let mut gate = IngressOrderGate::new(service);
+        let malformed = Request::build("textDocument/didSave")
+            .params(serde_json::json!({
+                "textDocument": { "uri": URI },
+                "text": 1,
+            }))
+            .finish();
+
+        assert!(classify(&malformed).is_none());
+        gate.call(malformed).await.unwrap();
+
+        assert!(gate.sequencer.docs.is_empty());
+    }
+
     #[test]
     fn classify_routes_methods() {
         let writer = classify(&notification("textDocument/didChange", URI));
@@ -641,6 +767,12 @@ mod tests {
             "didOpen must be a non-close writer"
         );
 
+        let save = classify(&notification("textDocument/didSave", URI));
+        assert!(
+            matches!(save, Some(Role::Writer { close: false, .. })),
+            "didSave must fence later didChange writers"
+        );
+
         for method in [
             "textDocument/semanticTokens/full",
             "textDocument/semanticTokens/full/delta",
@@ -651,7 +783,6 @@ mod tests {
             "textDocument/prepareRename",
             "textDocument/codeAction",
             "textDocument/diagnostic",
-            "textDocument/didSave",
             "kakehashi/captures/full",
             "kakehashi/captures/full/delta",
             "kakehashi/captures/range",

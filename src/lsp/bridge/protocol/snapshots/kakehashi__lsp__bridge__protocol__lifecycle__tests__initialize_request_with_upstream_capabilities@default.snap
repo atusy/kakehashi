@@ -21,6 +21,10 @@ expression: request
         }
       },
       "textDocument": {
+        "synchronization": {
+          "dynamicRegistration": false,
+          "didSave": true
+        },
         "completion": {
           "dynamicRegistration": false,
           "completionItem": {

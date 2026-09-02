@@ -6,7 +6,10 @@
 //! collection publishes, and uses `DashMap` for concurrent access via sharded
 //! locks (no single global lock).
 
-use dashmap::DashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use dashmap::{DashMap, mapref::entry::Entry};
 use tokio::task::AbortHandle;
 use url::Url;
 
@@ -17,9 +20,45 @@ use url::Url;
 /// collection publishes results.
 #[derive(Default)]
 pub(crate) struct SyntheticDiagnosticsManager {
-    /// Map from document URI to the AbortHandle of the active diagnostic task.
-    /// When a new task starts, the previous task (if any) is aborted.
-    active_tasks: DashMap<Url, AbortHandle>,
+    /// Map from document URI to its latest ordering key and optional active
+    /// handle. A completed task leaves a key tombstone until didClose.
+    active_tasks: DashMap<Url, ActiveTask>,
+    registration_lock: std::sync::Mutex<()>,
+    shutdown: AtomicBool,
+}
+
+struct ActiveTask {
+    key: SyntheticDiagnosticTaskKey,
+    abort_handle: Option<AbortHandle>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SyntheticDiagnosticTrigger {
+    Open,
+    Change,
+    Save,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SyntheticDiagnosticTaskKey {
+    incarnation: u64,
+    content_version: u64,
+    settings_generation: u64,
+    trigger: SyntheticDiagnosticTrigger,
+}
+
+impl ActiveTask {
+    fn is_finished(&self) -> bool {
+        self.abort_handle
+            .as_ref()
+            .is_some_and(AbortHandle::is_finished)
+    }
+
+    fn abort(&self) {
+        if let Some(handle) = &self.abort_handle {
+            handle.abort();
+        }
+    }
 }
 
 impl SyntheticDiagnosticsManager {
@@ -27,6 +66,8 @@ impl SyntheticDiagnosticsManager {
     pub(crate) fn new() -> Self {
         Self {
             active_tasks: DashMap::new(),
+            registration_lock: std::sync::Mutex::new(()),
+            shutdown: AtomicBool::new(false),
         }
     }
 
@@ -34,27 +75,105 @@ impl SyntheticDiagnosticsManager {
     /// any existing task and returning its `AbortHandle`.
     ///
     /// Also opportunistically cleans up finished tasks to prevent memory buildup.
-    pub(crate) fn register_task(&self, uri: Url, abort_handle: AbortHandle) -> Option<AbortHandle> {
+    #[cfg(test)]
+    pub(crate) fn register_task(&self, uri: Url, abort_handle: AbortHandle) -> bool {
+        self.register_task_for_lineage(uri, 0, 0, 0, SyntheticDiagnosticTrigger::Open, abort_handle)
+    }
+
+    /// Register work for one document version and trigger. Lexicographic
+    /// lineage ordering prevents late old-lifetime/version work from replacing
+    /// newer work; at the same version and settings generation, save outranks
+    /// change, which outranks open.
+    pub(crate) fn register_task_for_lineage(
+        &self,
+        uri: Url,
+        incarnation: u64,
+        content_version: u64,
+        settings_generation: u64,
+        trigger: SyntheticDiagnosticTrigger,
+        abort_handle: AbortHandle,
+    ) -> bool {
+        let _registration = self.registration_lock.lock().unwrap();
+        if self.shutdown.load(Ordering::Acquire) {
+            abort_handle.abort();
+            return false;
+        }
         // Opportunistic cleanup: remove entries for tasks that have completed.
         // This prevents memory buildup from documents that were saved but not re-saved.
         // We limit to a small number to avoid blocking the registration.
         self.cleanup_finished_tasks(5);
 
-        let previous = self.active_tasks.insert(uri, abort_handle);
-
-        if let Some(ref prev_handle) = previous {
-            // Abort the previous task - it's now superseded
-            prev_handle.abort();
-            log::debug!(
-                target: "kakehashi::synthetic_diag",
-                "Superseded previous diagnostic task"
-            );
+        let key = SyntheticDiagnosticTaskKey {
+            incarnation,
+            content_version,
+            settings_generation,
+            trigger,
+        };
+        match self.active_tasks.entry(uri) {
+            Entry::Vacant(entry) => {
+                entry.insert(ActiveTask {
+                    key,
+                    abort_handle: Some(abort_handle),
+                });
+                true
+            }
+            Entry::Occupied(mut entry) => {
+                if entry.get().key > key {
+                    // Newer document/trigger work already owns the URI. Discard
+                    // the late older task instead of aborting its successor.
+                    abort_handle.abort();
+                    return false;
+                }
+                let previous = entry.insert(ActiveTask {
+                    key,
+                    abort_handle: Some(abort_handle),
+                });
+                previous.abort();
+                log::debug!(
+                    target: "kakehashi::synthetic_diag",
+                    "Superseded previous diagnostic task"
+                );
+                true
+            }
         }
-
-        previous
     }
 
-    /// Remove entries for tasks that have finished.
+    /// Spawn work behind a start gate, then release it only if registration
+    /// wins. Rejected and post-shutdown tasks never execute their future.
+    pub(crate) fn spawn_task_for_lineage<F>(
+        &self,
+        uri: Url,
+        incarnation: u64,
+        content_version: u64,
+        settings_generation: u64,
+        trigger: SyntheticDiagnosticTrigger,
+        future: F,
+    ) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            if start_rx.await.is_ok() {
+                future.await;
+            }
+        });
+        let accepted = self.register_task_for_lineage(
+            uri,
+            incarnation,
+            content_version,
+            settings_generation,
+            trigger,
+            task.abort_handle(),
+        );
+        if accepted {
+            let _ = start_tx.send(());
+        }
+        accepted
+    }
+
+    /// Drop handles for tasks that have finished while preserving each URI's
+    /// latest ordering key as a high-watermark until didClose.
     ///
     /// Called opportunistically during registration to prevent memory buildup.
     /// Limited to avoid O(n) scan on every registration.
@@ -65,14 +184,14 @@ impl SyntheticDiagnosticsManager {
         if cleaned > 0 {
             log::trace!(
                 target: "kakehashi::synthetic_diag",
-                "Cleaned up {} finished diagnostic task entries",
+                "Released {} finished diagnostic task handles",
                 cleaned
             );
         }
     }
 
     fn finished_task_uris(&self, limit: usize) -> Vec<Url> {
-        // Collect keys to remove to avoid holding multiple references during iteration.
+        // Collect keys to clean without holding multiple references during iteration.
         let mut uris = Vec::with_capacity(limit);
         for entry in self.active_tasks.iter() {
             if entry.value().is_finished() {
@@ -86,20 +205,18 @@ impl SyntheticDiagnosticsManager {
     }
 
     fn remove_if_still_finished(&self, uris: Vec<Url>) -> usize {
-        let mut removed = 0;
+        let mut cleaned = 0;
         for uri in uris {
-            // Recheck the current value so a newly registered task for the same
-            // URI cannot be deleted after the scan observed an older finished
-            // handle.
-            if self
-                .active_tasks
-                .remove_if(&uri, |_, handle| handle.is_finished())
-                .is_some()
+            // Recheck under the entry guard so a newly registered task cannot
+            // lose its handle after the scan observed an older finished one.
+            if let Some(mut task) = self.active_tasks.get_mut(&uri)
+                && task.is_finished()
             {
-                removed += 1;
+                task.abort_handle = None;
+                cleaned += 1;
             }
         }
-        removed
+        cleaned
     }
 
     /// Check if there's an active task for a document.
@@ -107,13 +224,17 @@ impl SyntheticDiagnosticsManager {
     /// Useful for debugging and tests.
     #[cfg(test)]
     pub(crate) fn has_active_task(&self, uri: &Url) -> bool {
-        self.active_tasks.contains_key(uri)
+        self.active_tasks
+            .get(uri)
+            .is_some_and(|task| task.abort_handle.is_some())
     }
 
     /// Abort all active tasks and clear the map.
     ///
     /// Called during server shutdown to clean up.
     pub(crate) fn abort_all(&self) {
+        let _registration = self.registration_lock.lock().unwrap();
+        self.shutdown.store(true, Ordering::Release);
         for entry in self.active_tasks.iter() {
             entry.value().abort();
         }
@@ -125,8 +246,8 @@ impl SyntheticDiagnosticsManager {
     /// Called when a document is closed. The task is aborted since publishing
     /// diagnostics for a closed document would be wasteful.
     pub(crate) fn remove_document(&self, uri: &Url) {
-        if let Some((_, handle)) = self.active_tasks.remove(uri) {
-            handle.abort();
+        if let Some((_, task)) = self.active_tasks.remove(uri) {
+            task.abort();
             log::debug!(
                 target: "kakehashi::synthetic_diag",
                 "Aborted diagnostic task for closed document"
@@ -138,6 +259,18 @@ impl SyntheticDiagnosticsManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn active_task(abort_handle: AbortHandle) -> ActiveTask {
+        ActiveTask {
+            key: SyntheticDiagnosticTaskKey {
+                incarnation: 0,
+                content_version: 0,
+                settings_generation: 0,
+                trigger: SyntheticDiagnosticTrigger::Open,
+            },
+            abort_handle: Some(abort_handle),
+        }
+    }
 
     #[tokio::test]
     async fn test_register_supersedes_previous() {
@@ -152,8 +285,7 @@ mod tests {
         let handle1 = task1.abort_handle();
 
         // Register task 1
-        let superseded = manager.register_task(uri.clone(), handle1.clone());
-        assert!(superseded.is_none());
+        assert!(manager.register_task(uri.clone(), handle1.clone()));
         assert!(manager.has_active_task(&uri));
 
         // Spawn and register task 2
@@ -163,8 +295,7 @@ mod tests {
         });
         let handle2 = task2.abort_handle();
 
-        let superseded = manager.register_task(uri.clone(), handle2);
-        assert!(superseded.is_some());
+        assert!(manager.register_task(uri.clone(), handle2));
 
         // Task 1 should be aborted - yield to let the abort propagate
         tokio::task::yield_now().await;
@@ -174,6 +305,235 @@ mod tests {
         let result = task2.await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 43);
+    }
+
+    #[tokio::test]
+    async fn late_old_incarnation_cannot_abort_reopened_document_task() {
+        let manager = SyntheticDiagnosticsManager::new();
+        let uri = Url::parse("file:///reopened.md").unwrap();
+        let reopened_task = tokio::spawn(std::future::pending::<()>());
+        let reopened_handle = reopened_task.abort_handle();
+        manager.register_task_for_lineage(
+            uri.clone(),
+            2,
+            0,
+            0,
+            SyntheticDiagnosticTrigger::Open,
+            reopened_handle.clone(),
+        );
+
+        let late_old_task = tokio::spawn(std::future::pending::<()>());
+        let late_old_handle = late_old_task.abort_handle();
+        manager.register_task_for_lineage(
+            uri,
+            1,
+            0,
+            0,
+            SyntheticDiagnosticTrigger::Save,
+            late_old_handle.clone(),
+        );
+
+        tokio::task::yield_now().await;
+        assert!(
+            late_old_handle.is_finished(),
+            "late work for the closed lifetime must discard itself"
+        );
+        assert!(
+            !reopened_handle.is_finished(),
+            "late old-lifetime work must not supersede the reopened document"
+        );
+        reopened_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn late_older_version_cannot_abort_saved_task_in_the_same_incarnation() {
+        let manager = SyntheticDiagnosticsManager::new();
+        let uri = Url::parse("file:///saved.md").unwrap();
+        let saved_task = tokio::spawn(std::future::pending::<()>());
+        let saved_handle = saved_task.abort_handle();
+        manager.register_task_for_lineage(
+            uri.clone(),
+            1,
+            2,
+            0,
+            SyntheticDiagnosticTrigger::Save,
+            saved_handle.clone(),
+        );
+
+        let late_open_task = tokio::spawn(std::future::pending::<()>());
+        let late_open_handle = late_open_task.abort_handle();
+        manager.register_task_for_lineage(
+            uri,
+            1,
+            1,
+            0,
+            SyntheticDiagnosticTrigger::Open,
+            late_open_handle.clone(),
+        );
+
+        tokio::task::yield_now().await;
+        assert!(late_open_handle.is_finished());
+        assert!(!saved_handle.is_finished());
+        saved_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn late_same_version_change_cannot_abort_saved_task() {
+        let manager = SyntheticDiagnosticsManager::new();
+        let uri = Url::parse("file:///saved-same-version.md").unwrap();
+        let saved_task = tokio::spawn(std::future::pending::<()>());
+        let saved_handle = saved_task.abort_handle();
+        manager.register_task_for_lineage(
+            uri.clone(),
+            1,
+            2,
+            0,
+            SyntheticDiagnosticTrigger::Save,
+            saved_handle.clone(),
+        );
+
+        let late_change_task = tokio::spawn(std::future::pending::<()>());
+        let late_change_handle = late_change_task.abort_handle();
+        manager.register_task_for_lineage(
+            uri,
+            1,
+            2,
+            0,
+            SyntheticDiagnosticTrigger::Change,
+            late_change_handle.clone(),
+        );
+
+        tokio::task::yield_now().await;
+        assert!(
+            late_change_handle.is_finished(),
+            "same-version debounce work must yield to the save trigger"
+        );
+        assert!(
+            !saved_handle.is_finished(),
+            "same-version debounce work must not abort the save trigger"
+        );
+        saved_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn completed_save_key_still_rejects_same_version_change() {
+        let manager = SyntheticDiagnosticsManager::new();
+        let uri = Url::parse("file:///completed-save.md").unwrap();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        assert!(manager.spawn_task_for_lineage(
+            uri.clone(),
+            1,
+            2,
+            0,
+            SyntheticDiagnosticTrigger::Save,
+            async move {
+                let _ = finished_tx.send(());
+            },
+        ));
+        finished_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        manager.cleanup_finished_tasks(5);
+
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let task_ran = std::sync::Arc::clone(&ran);
+        assert!(!manager.spawn_task_for_lineage(
+            uri,
+            1,
+            2,
+            0,
+            SyntheticDiagnosticTrigger::Change,
+            async move {
+                task_ran.store(true, Ordering::Release);
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert!(!ran.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn newer_settings_generation_supersedes_completed_save() {
+        let manager = SyntheticDiagnosticsManager::new();
+        let uri = Url::parse("file:///reconfigured-after-save.md").unwrap();
+        let (saved_tx, saved_rx) = tokio::sync::oneshot::channel();
+        assert!(manager.spawn_task_for_lineage(
+            uri.clone(),
+            1,
+            2,
+            1,
+            SyntheticDiagnosticTrigger::Save,
+            async move {
+                let _ = saved_tx.send(());
+            },
+        ));
+        saved_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        manager.cleanup_finished_tasks(5);
+
+        let (change_tx, change_rx) = tokio::sync::oneshot::channel();
+        assert!(manager.spawn_task_for_lineage(
+            uri,
+            1,
+            2,
+            2,
+            SyntheticDiagnosticTrigger::Change,
+            async move {
+                let _ = change_tx.send(());
+            },
+        ));
+        change_rx.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_lower_priority_task_never_starts() {
+        let manager = SyntheticDiagnosticsManager::new();
+        let uri = Url::parse("file:///start-gated.md").unwrap();
+        let saved_task = tokio::spawn(std::future::pending::<()>());
+        let saved_handle = saved_task.abort_handle();
+        manager.register_task_for_lineage(
+            uri.clone(),
+            1,
+            1,
+            0,
+            SyntheticDiagnosticTrigger::Save,
+            saved_handle.clone(),
+        );
+
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let task_ran = std::sync::Arc::clone(&ran);
+        assert!(!manager.spawn_task_for_lineage(
+            uri,
+            1,
+            1,
+            0,
+            SyntheticDiagnosticTrigger::Open,
+            async move {
+                task_ran.store(true, Ordering::Release);
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert!(!ran.load(Ordering::Acquire));
+        saved_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_tasks_before_they_start() {
+        let manager = SyntheticDiagnosticsManager::new();
+        manager.abort_all();
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let task_ran = std::sync::Arc::clone(&ran);
+        assert!(!manager.spawn_task_for_lineage(
+            Url::parse("file:///after-shutdown.md").unwrap(),
+            1,
+            1,
+            0,
+            SyntheticDiagnosticTrigger::Save,
+            async move {
+                task_ran.store(true, Ordering::Release);
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert!(!ran.load(Ordering::Acquire));
+        assert!(manager.active_tasks.is_empty());
     }
 
     #[tokio::test]
@@ -224,7 +584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_finished_tasks_removes_finished_entries() {
+    async fn cleanup_finished_tasks_releases_handles_but_keeps_keys() {
         let manager = SyntheticDiagnosticsManager::new();
         let uri = Url::parse("file:///finished.md").unwrap();
 
@@ -233,10 +593,13 @@ mod tests {
         task.await.unwrap();
         assert!(handle.is_finished());
 
-        manager.active_tasks.insert(uri.clone(), handle);
+        manager
+            .active_tasks
+            .insert(uri.clone(), active_task(handle));
         manager.cleanup_finished_tasks(5);
 
         assert!(!manager.has_active_task(&uri));
+        assert!(manager.active_tasks.contains_key(&uri));
     }
 
     #[tokio::test]
@@ -249,7 +612,9 @@ mod tests {
         });
         let handle = task.abort_handle();
 
-        manager.active_tasks.insert(uri.clone(), handle.clone());
+        manager
+            .active_tasks
+            .insert(uri.clone(), active_task(handle.clone()));
         manager.cleanup_finished_tasks(5);
 
         assert!(manager.has_active_task(&uri));
@@ -269,7 +634,7 @@ mod tests {
 
         manager
             .active_tasks
-            .insert(uri.clone(), finished_handle.clone());
+            .insert(uri.clone(), active_task(finished_handle.clone()));
         let stale_cleanup_candidates = manager.finished_task_uris(5);
         assert_eq!(stale_cleanup_candidates, vec![uri.clone()]);
 
@@ -279,7 +644,7 @@ mod tests {
         let replacement_handle = replacement_task.abort_handle();
         manager
             .active_tasks
-            .insert(uri.clone(), replacement_handle.clone());
+            .insert(uri.clone(), active_task(replacement_handle.clone()));
 
         let removed = manager.remove_if_still_finished(stale_cleanup_candidates);
 
@@ -301,7 +666,7 @@ mod tests {
         assert!(finished_handle.is_finished());
         manager
             .active_tasks
-            .insert(finished_uri.clone(), finished_handle);
+            .insert(finished_uri.clone(), active_task(finished_handle));
 
         let new_task = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;

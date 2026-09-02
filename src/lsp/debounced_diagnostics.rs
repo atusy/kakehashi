@@ -22,7 +22,7 @@ use super::lsp_impl::DiagnosticPublisher;
 use super::lsp_impl::text_document::publish_diagnostic::{
     DiagnosticSnapshot, PullLayerOutcome, collect_push_diagnostics,
 };
-use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
+use super::synthetic_diagnostics::{SyntheticDiagnosticTrigger, SyntheticDiagnosticsManager};
 
 /// Default debounce duration for `didChange` events.
 ///
@@ -57,6 +57,8 @@ struct DebouncedDiagnosticData {
     /// Open lifetime captured when the timer was scheduled. A close/reopen at
     /// the same URI must not let this prior lifetime register new work.
     incarnation: u64,
+    content_version: u64,
+    settings_generation: u64,
     /// Reference to synthetic diagnostics manager for task registration
     synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
     /// The single proactive publisher: feeds the pull result into the cache and
@@ -167,7 +169,21 @@ impl DebouncedDiagnosticsManager {
                 uri
             );
         }
-        let Some(incarnation) = documents.get(&uri).map(|doc| doc.incarnation()) else {
+        let Some((incarnation, content_version, settings_generation)) = snapshot_data
+            .as_ref()
+            .map(|snapshot| {
+                (
+                    snapshot.lineage.incarnation,
+                    snapshot.lineage.content_version,
+                    snapshot.lineage.settings_generation,
+                )
+            })
+            .or_else(|| {
+                documents
+                    .get(&uri)
+                    .map(|doc| (doc.incarnation(), doc.content_version(), 0))
+            })
+        else {
             return;
         };
 
@@ -180,6 +196,8 @@ impl DebouncedDiagnosticsManager {
             publisher,
             documents,
             incarnation,
+            content_version,
+            settings_generation,
             #[cfg(test)]
             execution_gate: self.execution_gate.lock().unwrap().clone(),
         };
@@ -272,6 +290,8 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         publisher,
         documents,
         incarnation,
+        content_version,
+        settings_generation,
         #[cfg(test)]
         execution_gate,
     } = data;
@@ -288,9 +308,11 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
     // prior timer. The new await is also a cancellation checkpoint after sleep.
     let edit_lock = documents.edit_lock(&uri);
     let edit_guard = edit_lock.lock().await;
-    let current_incarnation = documents.get(&uri).map(|doc| doc.incarnation());
-    if current_incarnation != Some(incarnation) {
-        if current_incarnation.is_none() {
+    let current_lineage = documents
+        .get(&uri)
+        .map(|doc| (doc.incarnation(), doc.content_version()));
+    if current_lineage != Some((incarnation, content_version)) {
+        if current_lineage.is_none() {
             documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
         }
         drop(edit_guard);
@@ -343,7 +365,7 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
     // This task is registered with SyntheticDiagnosticsManager for superseding
     let uri_clone = uri.clone();
     let publish_documents = Arc::clone(&documents);
-    let task = tokio::spawn(async move {
+    let future = async move {
         let diagnostics =
             collect_push_diagnostics(snapshot_data, &bridge_pool, &uri_clone, LOG_TARGET).await;
 
@@ -354,11 +376,11 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         // lifetime and returns. didClose also aborts this registered task.
         let publish_edit_lock = publish_documents.edit_lock(&uri_clone);
         let publish_edit_guard = publish_edit_lock.lock().await;
-        let current_incarnation = publish_documents
+        let current_lineage = publish_documents
             .get(&uri_clone)
-            .map(|doc| doc.incarnation());
-        if current_incarnation != Some(incarnation) {
-            if current_incarnation.is_none() {
+            .map(|doc| (doc.incarnation(), doc.content_version()));
+        if current_lineage != Some((incarnation, content_version)) {
+            if current_lineage.is_none() {
                 publish_documents.remove_edit_lock_if_unshared(&uri_clone, &publish_edit_lock);
             }
             drop(publish_edit_guard);
@@ -387,12 +409,19 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
             }
         }
         drop(publish_edit_guard);
-    });
+    };
 
     // Register with SyntheticDiagnosticsManager for superseding
     // If a didSave or another debounced didChange triggers while this is running,
     // the new task will supersede this one
-    synthetic_diagnostics.register_task(uri, task.abort_handle());
+    synthetic_diagnostics.spawn_task_for_lineage(
+        uri,
+        incarnation,
+        content_version,
+        settings_generation,
+        SyntheticDiagnosticTrigger::Change,
+        future,
+    );
     drop(edit_guard);
 }
 

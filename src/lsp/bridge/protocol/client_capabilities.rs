@@ -24,7 +24,8 @@ fn build_baseline_capabilities(
         DocumentSymbolClientCapabilities, DynamicRegistrationClientCapabilities,
         GeneralClientCapabilities, GotoCapability, HoverClientCapabilities,
         InlayHintClientCapabilities, PositionEncodingKind, SignatureHelpClientCapabilities,
-        TextDocumentClientCapabilities, WorkspaceClientCapabilities,
+        TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities,
+        WorkspaceClientCapabilities,
     };
 
     let goto_link = Some(GotoCapability {
@@ -33,6 +34,11 @@ fn build_baseline_capabilities(
     });
 
     let mut text_document = TextDocumentClientCapabilities {
+        synchronization: Some(TextDocumentSyncClientCapabilities {
+            dynamic_registration: Some(false),
+            did_save: Some(true),
+            ..Default::default()
+        }),
         hover: Some(HoverClientCapabilities {
             dynamic_registration: Some(false),
             ..Default::default()
@@ -470,6 +476,19 @@ mod tests {
                 insta::assert_json_snapshot!(capabilities);
             });
         }
+    }
+
+    #[test]
+    fn bridge_advertises_static_did_save_support() {
+        let capabilities = build_bridge_client_capabilities(None, true, false);
+        let synchronization = capabilities
+            .text_document
+            .as_ref()
+            .and_then(|text_document| text_document.synchronization.as_ref())
+            .expect("the bridge must advertise text-document synchronization");
+
+        assert_eq!(synchronization.dynamic_registration, Some(false));
+        assert_eq!(synchronization.did_save, Some(true));
     }
 
     #[test]
