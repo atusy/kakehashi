@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use log::warn;
+use log::{debug, warn};
 use tower_lsp_server::ls_types::{CompletionItem, Position};
 use url::Url;
 
@@ -37,6 +37,7 @@ use crate::config::{
     merge_bridge_server_configs, resolve_with_wildcard, settings::BridgeServerConfig,
 };
 use crate::lsp::bridge::actor::RouterCleanupGuard;
+use crate::lsp::bridge::envelope::nests_reserved_key;
 
 impl LanguageServerPool {
     /// Route a `completionItem/resolve` request to the origin downstream server.
@@ -142,15 +143,23 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability("completionItem/resolve") {
-            // Anomalous: the envelope was only minted because the origin
-            // advertised resolve (or the payload squatted on the reserved
-            // key), so reaching here means a respawn or dynamic unregister
-            // changed capabilities under the item.
-            warn!(
-                target: "kakehashi::bridge",
-                "completionItem/resolve (host): {server_name:?} no longer advertises \
-                 resolveProvider; returning unresolved"
-            );
+            // Two ways here. The origin never advertised resolve and its
+            // payload was wrapped only for squatting on the reserved key:
+            // steady state, every client resolve of that item lands here,
+            // so say so quietly. Or it did advertise and a respawn or dynamic
+            // unregister withdrew the capability under the item: anomalous.
+            if nests_reserved_key(item.data.as_ref()) {
+                debug!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve (host): {server_name:?} does not advertise resolveProvider; the item was \
+                     enveloped only to nest a reserved-key payload; returning unresolved"
+                );
+            } else {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve (host): {server_name:?} no longer advertises resolveProvider; returning unresolved"
+                );
+            }
             re_envelope_item(&mut item, &envelope);
             return item;
         }
@@ -230,15 +239,23 @@ impl LanguageServerPool {
         };
 
         if !handle.has_capability("completionItem/resolve") {
-            // Anomalous: the envelope was only minted because the origin
-            // advertised resolve (or the payload squatted on the reserved
-            // key), so reaching here means a respawn or dynamic unregister
-            // changed capabilities under the item.
-            warn!(
-                target: "kakehashi::bridge",
-                "completionItem/resolve: {server_name:?} no longer advertises resolveProvider; \
-                 returning unresolved"
-            );
+            // Two ways here. The origin never advertised resolve and its
+            // payload was wrapped only for squatting on the reserved key:
+            // steady state, every client resolve of that item lands here,
+            // so say so quietly. Or it did advertise and a respawn or dynamic
+            // unregister withdrew the capability under the item: anomalous.
+            if nests_reserved_key(item.data.as_ref()) {
+                debug!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve: {server_name:?} does not advertise resolveProvider; the item was \
+                     enveloped only to nest a reserved-key payload; returning unresolved"
+                );
+            } else {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve: {server_name:?} no longer advertises resolveProvider; returning unresolved"
+                );
+            }
             re_envelope_item(&mut item, &envelope);
             return item;
         }

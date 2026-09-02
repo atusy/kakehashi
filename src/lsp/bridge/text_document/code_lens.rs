@@ -24,7 +24,7 @@
 use std::io;
 use std::sync::Arc;
 
-use log::warn;
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::{CodeLens, NumberOrString};
@@ -40,7 +40,7 @@ use super::completion::EnvelopeOffset;
 use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope};
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, nests_reserved_key, should_envelope};
 
 /// Envelope stored in `CodeLens.data` for routing `codeLens/resolve` (#355).
 ///
@@ -367,15 +367,23 @@ impl LanguageServerPool {
         };
 
         if !handle.has_capability("codeLens/resolve") {
-            // Anomalous: the envelope was only minted because the origin
-            // advertised resolve (or the payload squatted on the reserved
-            // key), so reaching here means a respawn or dynamic unregister
-            // changed capabilities under the lens.
-            warn!(
-                target: "kakehashi::bridge",
-                "codeLens/resolve: {:?} no longer advertises resolveProvider; returning unresolved",
-                envelope.origin
-            );
+            // Two ways here. The origin never advertised resolve and its
+            // payload was wrapped only for squatting on the reserved key:
+            // steady state, every client resolve of that lens lands here,
+            // so say so quietly. Or it did advertise and a respawn or dynamic
+            // unregister withdrew the capability under the lens: anomalous.
+            if nests_reserved_key(lens.data.as_ref()) {
+                debug!(
+                    target: "kakehashi::bridge",
+                    "codeLens/resolve: {server_name:?} does not advertise resolveProvider; the lens was \
+                     enveloped only to nest a reserved-key payload; returning unresolved"
+                );
+            } else {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "codeLens/resolve: {server_name:?} no longer advertises resolveProvider; returning unresolved"
+                );
+            }
             re_envelope_lens(&mut lens, &envelope);
             return lens;
         }
@@ -1071,7 +1079,7 @@ mod tests {
     /// means the origin changed under the lens (dynamic unregister, respawn)
     /// or the payload was wrapped for squatting on the reserved key. Either
     /// way the lens comes back unresolved AND the anomaly is logged, as the
-    /// completion and codeAction paths already do.
+    /// codeAction and host-completion paths already did.
     #[test]
     fn dispatch_warns_and_re_envelopes_when_origin_no_longer_resolves() {
         use crate::lsp::bridge::test_logging::captured_warnings_for;

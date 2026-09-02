@@ -51,9 +51,11 @@ Partially implemented:
   capability the items stay bare — an envelope would be pure wire weight on
   every item, and its resolve would only fail soft — so a client resolve
   passes the bare item through unchanged. The resolve side re-checks the
-  capability on the live origin regardless and, finding it gone (a respawn
-  or dynamic unregister under the item), warns and returns the item
-  unresolved with its envelope restored. `codeLens/resolve` forwards the
+  capability on the live origin regardless and, finding it absent, returns
+  the item unresolved with its envelope restored — warning when the
+  capability was withdrawn under the item (a respawn or dynamic
+  unregister), quietly when the envelope existed only to nest a
+  reserved-key payload from a non-resolving origin. `codeLens/resolve` forwards the
   original payload and coordinates verbatim on the host layer. A
   non-resolving server's item normally stays bare; the reserved-key collision
   exception wraps `data.kakehashi` as opaque `inner` data so a downstream

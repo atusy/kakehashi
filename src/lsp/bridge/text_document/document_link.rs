@@ -11,8 +11,8 @@ use std::io;
 use std::sync::Arc;
 
 use crate::config::settings::BridgeServerConfig;
-use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope};
-use log::warn;
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, nests_reserved_key, should_envelope};
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::DocumentLink;
@@ -295,15 +295,23 @@ impl LanguageServerPool {
         };
 
         if !handle.has_capability("documentLink/resolve") {
-            // Anomalous: the envelope was only minted because the origin
-            // advertised resolve (or the payload squatted on the reserved
-            // key), so reaching here means a respawn or dynamic unregister
-            // changed capabilities under the link.
-            warn!(
-                target: "kakehashi::bridge",
-                "documentLink/resolve: {:?} no longer advertises resolveProvider; returning unresolved",
-                envelope.origin
-            );
+            // Two ways here. The origin never advertised resolve and its
+            // payload was wrapped only for squatting on the reserved key:
+            // steady state, every client resolve of that link lands here,
+            // so say so quietly. Or it did advertise and a respawn or dynamic
+            // unregister withdrew the capability under the link: anomalous.
+            if nests_reserved_key(link.data.as_ref()) {
+                debug!(
+                    target: "kakehashi::bridge",
+                    "documentLink/resolve: {server_name:?} does not advertise resolveProvider; the link was \
+                     enveloped only to nest a reserved-key payload; returning unresolved"
+                );
+            } else {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "documentLink/resolve: {server_name:?} no longer advertises resolveProvider; returning unresolved"
+                );
+            }
             re_envelope_link(&mut link, &envelope);
             return link;
         }
@@ -880,7 +888,7 @@ mod tests {
     /// means the origin changed under the link (dynamic unregister, respawn)
     /// or the payload was wrapped for squatting on the reserved key. Either
     /// way the link comes back unresolved AND the anomaly is logged, as the
-    /// completion and codeAction paths already do.
+    /// codeAction and host-completion paths already did.
     #[test]
     fn dispatch_warns_and_re_envelopes_when_origin_no_longer_resolves() {
         use crate::lsp::bridge::test_logging::captured_warnings_for;

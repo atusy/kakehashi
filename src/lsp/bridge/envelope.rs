@@ -16,7 +16,17 @@ pub(crate) const ENVELOPE_KEY: &str = "kakehashi";
 /// envelope would be pure wire weight on every item, and its resolve would
 /// only fail soft back to the unresolved item.
 pub(crate) fn should_envelope(data: Option<&Value>, server_resolves: bool) -> bool {
-    server_resolves || data.is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
+    server_resolves || nests_reserved_key(data)
+}
+
+/// Whether a payload occupies the envelope key itself. On the producer side
+/// this is the collision exception above; on the resolve side, once the
+/// envelope is stripped and the payload restored into `data`, an item whose
+/// payload does so was enveloped ONLY for that reason, so a capability miss
+/// on it is the expected steady state of a non-resolving origin, not a
+/// capability that vanished under the item.
+pub(crate) fn nests_reserved_key(data: Option<&Value>) -> bool {
+    data.is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
 }
 
 #[cfg(test)]
