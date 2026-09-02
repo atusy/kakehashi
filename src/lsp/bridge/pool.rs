@@ -8016,6 +8016,75 @@ mod tests {
         assert_eq!(not_in_reg, 1, "1 not_in_registry failure");
     }
 
+    /// The synchronous middleware path is the only one production takes, so
+    /// every way it drops a cancel must stay as observable as the async
+    /// path's: a producer whose process is gone, a producer that is not yet
+    /// ready, an id the producer never routed, and an id absent from the
+    /// registry each have their own counter.
+    #[tokio::test]
+    async fn sync_cancel_records_metrics_for_every_dropped_producer() {
+        let pool = LanguageServerPool::new();
+
+        // No live producer: the registration outlives the handle it named.
+        {
+            let gone = create_handle_with_key(
+                ConnectionState::Ready,
+                ConnectionKey::for_server("gone_lang"),
+            )
+            .await;
+            pool.register_upstream_request_for_handle(UpstreamId::Number(1), &gone);
+        }
+        let _ = pool.forward_cancel_by_upstream_id_if_current_sync(
+            UpstreamId::Number(1),
+            || true,
+            || {},
+        );
+
+        // Not in registry.
+        let _ = pool.forward_cancel_by_upstream_id_if_current_sync(
+            UpstreamId::Number(999),
+            || true,
+            || {},
+        );
+
+        // Producer still initializing.
+        let handle_init = create_handle_with_key(
+            ConnectionState::Initializing,
+            ConnectionKey::for_server("init_lang"),
+        )
+        .await;
+        pool.register_upstream_request_for_handle(UpstreamId::Number(2), &handle_init);
+        let _ = pool.forward_cancel_by_upstream_id_if_current_sync(
+            UpstreamId::Number(2),
+            || true,
+            || {},
+        );
+
+        // Ready producer that never routed this upstream id.
+        let handle_ready = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("ready_lang"),
+        )
+        .await;
+        pool.register_upstream_request_for_handle(UpstreamId::Number(3), &handle_ready);
+        let _ = pool.forward_cancel_by_upstream_id_if_current_sync(
+            UpstreamId::Number(3),
+            || true,
+            || {},
+        );
+
+        let (successful, no_conn, not_ready, unknown_id, not_in_reg) =
+            pool.cancel_metrics().snapshot();
+        assert_eq!(successful, 0, "no cancel reached a downstream");
+        assert_eq!(no_conn, 1, "the dropped producer must be counted");
+        assert_eq!(not_ready, 1, "the initializing producer must be counted");
+        assert_eq!(unknown_id, 1, "the unrouted upstream id must be counted");
+        assert_eq!(
+            not_in_reg, 1,
+            "the unregistered upstream id must be counted"
+        );
+    }
+
     // ========================================
     // Process-sharing didClose tests
     // ========================================
