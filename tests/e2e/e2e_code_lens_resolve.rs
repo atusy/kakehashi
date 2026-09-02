@@ -21,6 +21,10 @@ fn mock_formatter_bin() -> &'static str {
 }
 
 fn init_client() -> (LspClient, tempfile::TempDir) {
+    init_client_with_mode("code-lens")
+}
+
+fn init_client_with_mode(mode: &str) -> (LspClient, tempfile::TempDir) {
     let bin = mock_formatter_bin();
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("code_lens_resolve.toml");
@@ -39,7 +43,7 @@ fn init_client() -> (LspClient, tempfile::TempDir) {
             "capabilities": {},
             "workspaceFolders": null,
             "initializationOptions": { "languageServers": {
-                "mock-codelens": { "cmd": [bin, "code-lens"], "languages": ["lua"] }
+                "mock-codelens": { "cmd": [bin, mode], "languages": ["lua"] }
             }}
         }),
     );
@@ -270,6 +274,31 @@ fn e2e_host_code_lens_resolve_round_trips_verbatim() {
         "the complete host range must pass through without virtual translation"
     );
     assert_eq!(resolved["data"]["kakehashi"]["host_layer"], true);
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_virtual_code_lens_from_non_resolving_server_keeps_its_data() {
+    let (mut client, _config_dir) = init_client_with_mode("code-lens-no-resolve");
+    open_markdown(&mut client);
+
+    let lens = code_lens_with_retry(&mut client).remove(0);
+    assert_eq!(
+        lens["range"]["start"]["line"], 3,
+        "ranges are translated to host coordinates regardless of the envelope"
+    );
+    assert!(
+        lens["data"].get("kakehashi").is_none(),
+        "a producer that cannot resolve must keep its own payload: {lens}"
+    );
+    assert_eq!(lens["data"], json!({ "mock": "lens-1" }));
+
+    let response = client.send_request("codeLens/resolve", lens.clone());
+    assert_eq!(
+        response["result"], lens,
+        "a bare lens has no origin to route to and comes back unchanged"
+    );
 
     shutdown(&mut client);
 }
