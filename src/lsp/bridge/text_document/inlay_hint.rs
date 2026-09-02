@@ -188,9 +188,12 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/inlayHint") {
             return Ok(None);
         }
-        let server_resolves = handle.has_capability("inlayHint/resolve");
         let connection_key = handle.key().clone();
         let connection_generation = self.document_connection_generation(&connection_key);
+        // Read resolve support when the RESPONSE arrives, as the host layer
+        // does: a dynamic `resolveProvider` registration can land between
+        // send and reply, and the envelope decision should see it.
+        let origin = Arc::clone(&handle);
         self.execute_bridge_request_with_handle(
             handle,
             host_uri,
@@ -227,7 +230,7 @@ impl LanguageServerPool {
                         offset: ctx.offset,
                         host_layer: false,
                     },
-                    server_resolves,
+                    origin.has_capability("inlayHint/resolve"),
                 )
             },
         )
