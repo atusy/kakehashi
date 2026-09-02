@@ -63,11 +63,12 @@ Partially implemented:
   payload cannot impersonate bridge routing metadata. (codeAction needs no
   such exception: an action that leaves without an envelope leaves with no
   `data` at all.) `codeLens/resolve` forwards the original payload and
-  coordinates verbatim on the host layer. The codeLens envelope retains
-  the host-document incarnation plus the exact producing `ConnectionKey` and
-  its generation, so an old lens is returned unresolved after either a
-  document reopen, a rooted/shared routing-key change, or a downstream process
-  replacement. Resolve never spawns a replacement for process-owned lens data.
+  coordinates verbatim on the host layer. On both layers the codeLens
+  envelope retains the host-document incarnation plus the exact producing
+  `ConnectionKey` and its generation, so an old lens is returned unresolved
+  after either a document reopen, a rooted/shared routing-key change, or a
+  downstream process replacement. Resolve looks the producer up by that key
+  and never spawns or selects a replacement for process-owned lens data.
   Ordinary downstream failures remain fail-soft,
   while an upstream client cancellation returns `RequestCancelled` and
   cancels the in-flight downstream resolve.

@@ -13,9 +13,15 @@
 //! only `data`) are forwarded instead of dropped — servers like rust-analyzer
 //! return mostly-unresolved lenses by design.
 //!
-//! Resolution fails soft for stale regions, missing servers, connection
-//! errors, and parse failures: the lens returns unresolved with its envelope
-//! intact. Client cancellation is the exception and surfaces as
+//! Both layers bind a lens to the exact process that produced it: the
+//! envelope carries the producing connection's pool key and generation, and
+//! resolve looks that connection up by key instead of re-deriving one, so a
+//! relaunch or a routing-key change never hands process-owned lens data to a
+//! replacement (the documentLink twin follows the same rule).
+//!
+//! Resolution fails soft for stale regions, missing servers, replaced
+//! producers, connection errors, and parse failures: the lens returns
+//! unresolved with its envelope intact. Client cancellation is the exception and surfaces as
 //! `RequestCancelled`; clients re-request lenses on change, so the ordinary
 //! fail-soft window is short (#355 maintainer decision).
 //!
@@ -65,12 +71,15 @@ pub(crate) struct CodeLensEnvelope {
     /// Host open incarnation that produced this lens. Missing for legacy data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) incarnation: Option<u64>,
-    /// Generation of the producing pooled connection. Host resolve must not
-    /// hand process-owned data to a replacement process under the same key.
+    /// Generation of the producing pooled connection, on either layer.
+    /// Resolve must not hand process-owned data to a replacement process
+    /// under the same key, so a moved generation fails soft.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) connection_generation: Option<u64>,
-    /// Exact pool key of the producing host connection. Generations are local
-    /// to a key, so the key and generation together identify the process.
+    /// Exact pool key of the producing connection, on either layer.
+    /// Generations are local to a key, so the key and generation together
+    /// identify the process; resolve looks the producer up by this key and
+    /// never re-derives one from the host URI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) connection_key: Option<ConnectionKey>,
     /// Region offset snapshot for coordinate translation at resolve time.
@@ -303,8 +312,12 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Send a `codeLens/resolve` request to the downstream server that
+    /// Send a `codeLens/resolve` request to the exact downstream process that
     /// produced the lens, re-enveloping the resolved lens for return.
+    ///
+    /// The envelope's connection key and generation identify that process on
+    /// both layers; a lens whose producer was replaced (or that never carried
+    /// the pair) comes back unresolved without any connection being consulted.
     async fn send_code_lens_resolve_request(
         &self,
         server_config: &BridgeServerConfig,
