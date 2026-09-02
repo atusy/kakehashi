@@ -39,8 +39,7 @@ use super::super::protocol::{
 use super::completion::EnvelopeOffset;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-
-const ENVELOPE_KEY: &str = "kakehashi";
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InlayHintEnvelope {
@@ -148,12 +147,7 @@ pub(crate) fn envelope_host_inlay_hints(
     };
     for hint in hints {
         encode_inlay_hint_commands(hint, connection_key);
-        if server_resolves
-            || hint
-                .data
-                .as_ref()
-                .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
-        {
+        if should_envelope(hint.data.as_ref(), server_resolves) {
             envelope_hint_data(hint, &ctx);
         }
     }
@@ -589,12 +583,7 @@ fn transform_inlay_hint_response_to_host_and_envelope(
             envelope_ctx.connection_key,
         );
 
-        if server_resolves
-            || hint
-                .data
-                .as_ref()
-                .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
-        {
+        if should_envelope(hint.data.as_ref(), server_resolves) {
             envelope_hint_data(hint, envelope_ctx);
         }
     }
