@@ -2503,7 +2503,7 @@ impl LanguageServerPool {
             let Some(lifecycle) = self.existing_host_lifecycle_lock(&host_uri) else {
                 continue;
             };
-            let _lifecycle = lifecycle.lock().await;
+            let _lifecycle = lifecycle.write().await;
             if self.current_host_incarnation(&host_uri) != Some(incarnation) {
                 continue;
             }
