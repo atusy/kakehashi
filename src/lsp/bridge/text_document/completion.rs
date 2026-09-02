@@ -705,7 +705,17 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "result": [{ "label": "print", "data": data }]
+                "result": [{
+                    "label": "print",
+                    "textEdit": {
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 2 }
+                        },
+                        "newText": "print"
+                    },
+                    "data": data
+                }]
             })
         };
         let offset = RegionOffset::new(3, 2);
@@ -734,6 +744,16 @@ mod tests {
             Some(json!({"token": 1})),
             "a non-resolving origin's payload must pass through untouched: the resolve \
              would only fail soft back to it, so the envelope is pure wire weight"
+        );
+        let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) =
+            &bare.items[0].text_edit
+        else {
+            panic!("the bare item keeps its edit");
+        };
+        assert_eq!(
+            (edit.range.start.line, edit.range.start.character),
+            (3, 2),
+            "ranges are still translated for a bare item"
         );
 
         let forged = transform_for_non_resolving_server(
