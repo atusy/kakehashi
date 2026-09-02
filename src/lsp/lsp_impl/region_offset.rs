@@ -3,11 +3,14 @@
 //! Shared by translators of inbound (downstream → editor) payloads that must
 //! map virtual-document coordinates back to the host document —
 //! `window/showDocument` ([`ShowDocumentTranslator`]) and `workspace/applyEdit`
-//! ([`ApplyEditTranslator`]). The offset is rebuilt exactly as the goto request
-//! path does (`region_id → node byte range → resolve injection → RegionOffset`),
-//! so inbound translation can't disagree with goto on the same region. The
-//! region's content-precise host end and contiguity are returned alongside so
-//! an edit translator can reject a range that escapes the region or targets a
+//! ([`ApplyEditTranslator`]) — and by the `*/resolve` staleness gates
+//! (completion, code action, code lens, document link), which compare the
+//! rebuilt offset against the snapshot their envelope carries. The offset is
+//! rebuilt exactly as the goto request path does (`region_id → node byte
+//! range → resolve injection → RegionOffset`), so neither inbound translation
+//! nor a resolve gate can disagree with goto on the same region. The region's
+//! content-precise host end and contiguity are returned alongside so an edit
+//! translator can reject a range that escapes the region or targets a
 //! combined document with masked host gaps.
 //!
 //! [`ShowDocumentTranslator`]: super::show_document_translation::ShowDocumentTranslator
