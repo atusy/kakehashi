@@ -2119,6 +2119,26 @@ mod tests {
         );
     }
 
+    /// The other way to reach the capability miss is steady state, not an
+    /// anomaly: a NON-resolving origin's payload squatted on the reserved key,
+    /// so it was wrapped only to nest it, and every client resolve of that
+    /// symbol lands here. It must come back unresolved with the payload
+    /// intact and must NOT be reported as a lost capability.
+    #[test]
+    fn dispatch_does_not_warn_for_a_reserved_key_wrap_from_a_non_resolving_origin() {
+        let payload = serde_json::json!({ ENVELOPE_KEY: { "ownedBy": "downstream" } });
+        let (result, warnings) = resolve_warnings_for(payload.clone());
+        let mut result = result;
+        strip_envelope(&mut result).expect("envelope restored");
+        assert_eq!(result.data, Some(payload));
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("workspaceSymbol/resolve")),
+            "a reserved-key wrap is steady state, not a lost capability: {warnings:?}"
+        );
+    }
+
     #[tokio::test]
     async fn resolve_sender_rejects_an_old_response_after_replacement() {
         let pool = Arc::new(LanguageServerPool::new());
