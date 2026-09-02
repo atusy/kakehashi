@@ -232,6 +232,7 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/codeLens") {
             return Ok(None);
         }
+        let server_resolves = handle.has_capability("codeLens/resolve");
         let host_uri_string = host_uri.to_string();
         self.execute_bridge_request_with_handle(
             handle,
@@ -256,7 +257,12 @@ impl LanguageServerPool {
                     offset: ctx.offset,
                     host_layer: false,
                 };
-                transform_code_lens_response_to_host(response, ctx.offset, &envelope_ctx)
+                transform_code_lens_response_to_host(
+                    response,
+                    ctx.offset,
+                    server_resolves,
+                    &envelope_ctx,
+                )
             },
         )
         .await
@@ -553,13 +559,17 @@ fn parse_code_lens_resolve_response(mut response: serde_json::Value) -> Option<C
 
 /// Transform a code lens response from virtual to host document coordinates.
 ///
-/// Each lens's `range` is translated by `offset` and its `data` is wrapped in
-/// a routing envelope so `codeLens/resolve` can find the origin server later.
-/// Unresolved lenses (no `command`) are kept now that resolve is supported
-/// (#355) — dropping them wholesale destroyed most of rust-analyzer's lenses.
+/// Each lens's `range` is translated by `offset`, and the `data` of each lens
+/// that [`should_envelope_lens`] selects — the origin advertises
+/// `codeLens/resolve`, or the payload squats on the reserved key — is wrapped
+/// in a routing envelope so `codeLens/resolve` can find the origin server
+/// later; the rest pass through bare. Unresolved lenses (no `command`) are
+/// kept now that resolve is supported (#355) — dropping them wholesale
+/// destroyed most of rust-analyzer's lenses.
 fn transform_code_lens_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
+    server_resolves: bool,
     envelope_ctx: &CodeLensEnvelopeContext<'_>,
 ) -> Option<Vec<CodeLens>> {
     if response_has_jsonrpc_error(&response, "textDocument/codeLens") {
@@ -575,7 +585,9 @@ fn transform_code_lens_response_to_host(
 
     for lens in &mut lenses {
         translate_virtual_range_to_host(&mut lens.range, offset);
-        envelope_lens_data(lens, envelope_ctx);
+        if should_envelope_lens(lens, server_resolves) {
+            envelope_lens_data(lens, envelope_ctx);
+        }
     }
 
     Some(lenses)
