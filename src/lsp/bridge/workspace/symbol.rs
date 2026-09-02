@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
+use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp_server::ls_types::{
@@ -939,6 +940,11 @@ impl LanguageServerPool {
             return fail_soft(symbol);
         };
         if !handle.has_capability(RESOLVE_METHOD) {
+            warn!(
+                target: "kakehashi::bridge",
+                "{RESOLVE_METHOD}: {:?} no longer advertises resolveProvider; returning unresolved",
+                envelope.origin
+            );
             return fail_soft(symbol);
         }
         let mut downstream_symbol = symbol.clone();
