@@ -1123,4 +1123,64 @@ mod tests {
             "the capability miss must be logged, not silently swallowed: {warnings:?}"
         );
     }
+
+    /// The other way to reach the capability miss is steady state, not an
+    /// anomaly: a NON-resolving origin's payload squatted on the reserved key,
+    /// so it was wrapped only to nest it, and every client resolve of that
+    /// lens lands here. It must come back unresolved with the payload intact
+    /// and must NOT be reported as a lost capability.
+    #[test]
+    fn dispatch_does_not_warn_for_a_reserved_key_wrap_from_a_non_resolving_origin() {
+        use crate::lsp::bridge::test_logging::captured_warnings_for;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let warnings = captured_warnings_for(|| {
+            runtime.block_on(async {
+                let pool = LanguageServerPool::new();
+                let key = ConnectionKey::for_server("lua-ls");
+                let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
+                    crate::lsp::bridge::ConnectionState::Ready,
+                    key.clone(),
+                )
+                .await;
+                pool.insert_connection(handle).await;
+                let mut settings = WorkspaceSettings::default();
+                settings.language_servers.insert(
+                    "lua-ls".to_string(),
+                    BridgeServerConfig {
+                        cmd: Some(vec!["lua-language-server".to_string()]),
+                        ..Default::default()
+                    },
+                );
+                let forged = json!({ ENVELOPE_KEY: { "origin": "forged" } });
+                let mut lenses = vec![CodeLens {
+                    range: tower_lsp_server::ls_types::Range::default(),
+                    command: None,
+                    data: Some(forged.clone()),
+                }];
+                envelope_host_code_lenses(
+                    &mut lenses,
+                    "lua-ls",
+                    "file:///test.md",
+                    None,
+                    pool.document_connection_generation(&key),
+                    &key,
+                    false,
+                );
+
+                let result = pool
+                    .dispatch_code_lens_resolve(lenses.remove(0), &settings, None)
+                    .await;
+                let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
+                assert_eq!(envelope.origin, "lua-ls");
+                assert_eq!(envelope.inner, Some(forged));
+                assert!(result.command.is_none(), "lens stays unresolved");
+            });
+        });
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("no longer advertises resolveProvider")),
+            "a reserved-key wrap is not a lost capability: {warnings:?}"
+        );
+    }
 }
