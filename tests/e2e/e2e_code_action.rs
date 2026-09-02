@@ -78,6 +78,14 @@ fn init_client_mode(
     mock_mode: &str,
     client_capabilities: Value,
 ) -> (LspClient, Value, tempfile::TempDir) {
+    init_client_mode_for_language(mock_mode, "lua", client_capabilities)
+}
+
+fn init_client_mode_for_language(
+    mock_mode: &str,
+    language: &str,
+    client_capabilities: Value,
+) -> (LspClient, Value, tempfile::TempDir) {
     let bin = mock_formatter_bin();
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("code_action.toml");
@@ -96,7 +104,7 @@ fn init_client_mode(
             "capabilities": client_capabilities,
             "workspaceFolders": null,
             "initializationOptions": { "languageServers": {
-                "mock-codeaction": { "cmd": [bin, mock_mode], "languages": ["lua"] }
+                "mock-codeaction": { "cmd": [bin, mock_mode], "languages": [language] }
             }}
         }),
     );
@@ -1097,6 +1105,69 @@ fn lazy_action_is_resolved_via_code_action_resolve() {
     // restored the unsuffixed original before forwarding the resolve — if it
     // forwarded the suffixed title, this would be "organized:... — mock-codeaction".
     assert_eq!(edits[0]["newText"], "organized:Lazy organize imports");
+
+    shutdown(&mut client);
+}
+
+/// A lazy action minted inside a region whose injection query applies
+/// `#offset!` (markdown YAML frontmatter: the content node spans the `---`
+/// fences, the effective region starts one line below) resolves like any
+/// other. The freshness gate compares the envelope's effective offset against
+/// the region's LIVE effective offset, so the unchanged region is fresh and
+/// the resolved edit lands on the host frontmatter line.
+#[test]
+fn lazy_action_resolves_inside_offset_frontmatter_region() {
+    let (mut client, init_response, _config_dir) =
+        init_client_mode_for_language("code-action-lazy", "yaml", resolve_support_caps());
+    assert_advertised(&init_response);
+    let uri = "file:///test_code_action_frontmatter.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "---\ntitle: test\n---\n"
+        }}),
+    );
+
+    let mut lazy = None;
+    for _ in 0..300 {
+        let response = client.send_request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": 1, "character": 0 },
+                    "end": { "line": 1, "character": 5 }
+                },
+                "context": { "diagnostics": [] }
+            }),
+        );
+        if let Some(actions) = response["result"].as_array()
+            && let Some(action) = actions.first()
+        {
+            lazy = Some(action.clone());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let lazy = lazy.expect("textDocument/codeAction never returned the lazy action");
+    assert_eq!(
+        lazy["data"]["kakehashi"]["offset"]["line"],
+        json!(1),
+        "the envelope carries the #offset!-adjusted region start; got: {lazy:?}"
+    );
+
+    let resolved = client.send_request("codeAction/resolve", lazy.clone());
+    let resolved = &resolved["result"];
+    let edits = &resolved["edit"]["changes"][uri];
+    assert!(
+        edits.is_array(),
+        "an unchanged #offset! region is fresh, so the edit must materialize on the host; got: {resolved:?}"
+    );
+    // Virtual line 0 = host line 1 (the frontmatter body below the fence).
+    assert_eq!(edits[0]["range"]["start"]["line"], 1);
 
     shutdown(&mut client);
 }
