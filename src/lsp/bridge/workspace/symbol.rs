@@ -18,6 +18,7 @@ use crate::config::settings::WorkspaceSettings;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::error::LockResultExt;
 use crate::lsp::bridge::actor::RouterCleanupGuard;
+use crate::lsp::bridge::envelope::ENVELOPE_KEY;
 use crate::lsp::bridge::pool::{
     ConfirmedDocumentRevision, ConnectionHandle, ConnectionState, INIT_TIMEOUT_SECS,
     LanguageServerPool, UpstreamId, VirtualUriObserver,
@@ -27,7 +28,6 @@ use crate::lsp::bridge::{BridgeCoordinator, ConnectionKey};
 
 const SYMBOL_METHOD: &str = "workspace/symbol";
 const RESOLVE_METHOD: &str = "workspaceSymbol/resolve";
-const ENVELOPE_KEY: &str = "kakehashi";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct WorkspaceSymbolEnvelope {
