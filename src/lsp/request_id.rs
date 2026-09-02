@@ -88,9 +88,6 @@ type CancelSubscriberRegistry = std::sync::Mutex<CancelSubscriberState>;
 #[derive(Clone)]
 pub struct CancelForwarder {
     pool: Arc<LanguageServerPool>,
-    /// Serializes synchronous middleware admission/cancellation so a raw JSON-RPC
-    /// ID cannot be reused between generation validation and tower-lsp's `call`.
-    dispatch_gate: Arc<std::sync::Mutex<()>>,
     /// Registry of subscribers waiting for cancel notifications.
     ///
     /// When a `$/cancelRequest` arrives, we look up the sender and notify it.
@@ -103,7 +100,6 @@ impl CancelForwarder {
     pub fn new(pool: Arc<LanguageServerPool>) -> Self {
         Self {
             pool,
-            dispatch_gate: Arc::new(std::sync::Mutex::new(())),
             subscribers: Arc::new(std::sync::Mutex::new(CancelSubscriberState::default())),
         }
     }
@@ -411,13 +407,13 @@ where
     }
 
     fn call(&mut self, req: Request) -> Self::Future {
+        // Everything below runs synchronously inside `call`, which tower-lsp's
+        // transport invokes from its single stdin reader task in wire order
+        // (`concurrency_level` bounds the returned futures, not `call`). That
+        // alone orders generation registration, cancel capture, and tower-lsp's
+        // raw-ID cancellation against a reused JSON-RPC ID; no extra lock is
+        // needed here, and one would only sit uncontended on the hot path.
         let cancel_forwarder = self.cancel_forwarder.clone();
-        let _dispatch_guard = cancel_forwarder.as_ref().map(|forwarder| {
-            forwarder
-                .dispatch_gate
-                .lock()
-                .recover_poison("RequestIdCapture::call")
-        });
         // Extract the request ID before delegating
         let request_id = req.id().cloned();
 
