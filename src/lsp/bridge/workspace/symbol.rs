@@ -2026,6 +2026,93 @@ mod tests {
         );
     }
 
+    fn lazy_symbol_from(
+        origin: &str,
+        key: &ConnectionKey,
+        generation: u64,
+        data: Value,
+    ) -> WorkspaceSymbol {
+        let mut symbol = WorkspaceSymbol {
+            name: "lazy".into(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Right(WorkspaceLocation {
+                uri: location().uri,
+            }),
+            data: None,
+        };
+        envelope_symbol(
+            &mut symbol,
+            WorkspaceSymbolEnvelope {
+                origin: origin.into(),
+                connection_key: key.clone(),
+                connection_generation: generation,
+                inner: Some(data),
+                projection: None,
+            },
+        );
+        symbol
+    }
+
+    /// Resolve against a Ready producer that advertises nothing, capturing
+    /// the warnings the dispatch emits.
+    fn resolve_warnings_for(data: Value) -> (WorkspaceSymbol, Vec<String>) {
+        use crate::lsp::bridge::test_logging::captured_warnings_for;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let mut resolved = None;
+        let warnings = captured_warnings_for(|| {
+            resolved = Some(runtime.block_on(async {
+                let pool = LanguageServerPool::new();
+                let key = ConnectionKey::for_server("symbols");
+                let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
+                    crate::lsp::bridge::ConnectionState::Ready,
+                    key.clone(),
+                )
+                .await;
+                pool.insert_connection(handle).await;
+                let mut settings = WorkspaceSettings::default();
+                settings.language_servers.insert(
+                    "symbols".into(),
+                    crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec!["mock-symbols".into()]),
+                        languages: Some(Vec::new()),
+                        ..Default::default()
+                    },
+                );
+                let symbol = lazy_symbol_from(
+                    "symbols",
+                    &key,
+                    pool.document_connection_generation(&key),
+                    data,
+                );
+                pool.dispatch_workspace_symbol_resolve(symbol, &settings, None)
+                    .await
+            }));
+        });
+        (resolved.expect("resolve ran"), warnings)
+    }
+
+    /// One way to reach the resolve-side capability miss is an anomaly: the
+    /// origin advertised `workspaceSymbol/resolve` when the symbol was minted
+    /// and no longer does (respawn, dynamic unregister). The symbol must come
+    /// back unresolved with its payload intact, and the miss must be logged
+    /// as every other resolve kind logs theirs.
+    #[test]
+    fn dispatch_warns_and_re_envelopes_when_origin_no_longer_resolves() {
+        let (result, warnings) = resolve_warnings_for(serde_json::json!({ "token": 1 }));
+        let mut result = result;
+        strip_envelope(&mut result).expect("envelope restored");
+        assert_eq!(result.data, Some(serde_json::json!({ "token": 1 })));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("workspaceSymbol/resolve")
+                    && w.contains("no longer advertises resolveProvider")),
+            "the capability miss must be logged, not silently swallowed: {warnings:?}"
+        );
+    }
+
     #[tokio::test]
     async fn resolve_sender_rejects_an_old_response_after_replacement() {
         let pool = Arc::new(LanguageServerPool::new());
