@@ -176,7 +176,6 @@ mod tests {
             .expect("both provider requests must register");
             cancel_forwarder
                 .forward_cancel(upstream_id.clone())
-                .await
                 .unwrap();
         };
         let (result, ()) = tokio::join!(request, cancel);

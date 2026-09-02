@@ -88,6 +88,11 @@ type CancelSubscriberRegistry = std::sync::Mutex<CancelSubscriberState>;
 #[derive(Clone)]
 pub struct CancelForwarder {
     pool: Arc<LanguageServerPool>,
+    /// Makes downstream admission atomic against `$/cancelRequest` capture.
+    /// Only the cancel-forward path and
+    /// `register_downstream_request_if_current` take it; ordinary ingress
+    /// never touches it, so it cannot throttle unrelated messages.
+    admission_gate: Arc<std::sync::Mutex<()>>,
     /// Registry of subscribers waiting for cancel notifications.
     ///
     /// When a `$/cancelRequest` arrives, we look up the sender and notify it.
@@ -100,12 +105,13 @@ impl CancelForwarder {
     pub fn new(pool: Arc<LanguageServerPool>) -> Self {
         Self {
             pool,
+            admission_gate: Arc::new(std::sync::Mutex::new(())),
             subscribers: Arc::new(std::sync::Mutex::new(CancelSubscriberState::default())),
         }
     }
 
     /// Atomically admit one downstream request against this upstream request's
-    /// exact middleware generation. The dispatch gate is shared with raw
+    /// exact middleware generation. The admission gate is shared with raw
     /// `$/cancelRequest` capture: registration wins and is captured, or cancel
     /// wins and leaves a generation-scoped tombstone that rejects this late
     /// registration before it reaches the downstream writer.
@@ -117,8 +123,8 @@ impl CancelForwarder {
         crate::lsp::bridge::RequestId,
         tokio::sync::oneshot::Receiver<serde_json::Value>,
     )> {
-        let _dispatch_guard = self
-            .dispatch_gate
+        let _admission_guard = self
+            .admission_gate
             .lock()
             .recover_poison("CancelForwarder::register_downstream_request_if_current");
         let admissible = {
@@ -167,6 +173,14 @@ impl CancelForwarder {
         upstream_id: UpstreamId,
         generation: Option<u64>,
     ) -> std::io::Result<()> {
+        // Hold the admission gate across capture so a downstream registration
+        // either lands before this pass (and is captured) or observes the
+        // generation tombstone it leaves behind. Everything below is
+        // synchronous, so the guard never spans an await.
+        let _admission_guard = self
+            .admission_gate
+            .lock()
+            .recover_poison("CancelForwarder::forward_cancel_for_generation");
         let validate_forwarder = self.clone();
         let notify_forwarder = self.clone();
         let validate_id = upstream_id.clone();
@@ -1283,7 +1297,7 @@ mod tests {
 
         let generation = forwarder.register_request(upstream_id.clone());
         forwarder
-            .forward_cancel_for_generation_sync(upstream_id.clone(), Some(generation))
+            .forward_cancel_for_generation(upstream_id.clone(), Some(generation))
             .unwrap();
         let error = forwarder
             .register_downstream_request_if_current(upstream_id.clone(), &handle)
