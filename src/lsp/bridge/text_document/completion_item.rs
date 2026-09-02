@@ -973,4 +973,50 @@ mod tests {
         };
         assert_eq!(edit.range.start.line, 5);
     }
+
+    /// The virt resolve path's capability miss is logged like the host one,
+    /// without the host tag. The origin is a Ready connection that advertises
+    /// nothing, pre-inserted under the key the virt lookup resolves to; the
+    /// host incarnation is opened so the staleness gate lets the item through.
+    #[test]
+    fn dispatch_warns_and_re_envelopes_when_virt_origin_no_longer_resolves() {
+        use crate::lsp::bridge::test_logging::captured_warnings_for;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let warnings = captured_warnings_for(|| {
+            runtime.block_on(async {
+                let pool = LanguageServerPool::new();
+                let key = crate::lsp::bridge::ConnectionKey::for_server("lua-ls");
+                let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
+                    crate::lsp::bridge::ConnectionState::Ready,
+                    key,
+                )
+                .await;
+                pool.insert_connection(handle).await;
+                pool.open_host_incarnation(&Url::parse("file:///test/doc.md").unwrap(), 1)
+                    .await;
+                let mut settings = WorkspaceSettings::default();
+                settings.language_servers.insert(
+                    "lua-ls".to_string(),
+                    BridgeServerConfig {
+                        cmd: Some(vec!["lua-language-server".to_string()]),
+                        ..Default::default()
+                    },
+                );
+
+                let result = pool
+                    .dispatch_completion_resolve(enveloped_item("lua-ls"), &settings, None)
+                    .await;
+                let envelope = extract_envelope(&result).expect("envelope restored");
+                assert_eq!(envelope.origin, "lua-ls");
+                assert_eq!(envelope.inner, Some(json!({"resolve_id": 42})));
+                assert!(result.detail.is_none(), "item stays unresolved");
+            });
+        });
+        assert!(
+            warnings.iter().any(|w| w.contains("completionItem/resolve")
+                && w.contains("no longer advertises resolveProvider")
+                && !w.contains("(host)")),
+            "the virt capability miss must be logged without the host tag: {warnings:?}"
+        );
+    }
 }
