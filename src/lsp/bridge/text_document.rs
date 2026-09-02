@@ -13,9 +13,7 @@ pub(crate) use code_action::{
     CodeActionEnvelope, UpstreamCodeActionCaps, bridge_code_actions, extract_code_action_envelope,
     parse_code_actions_leniently,
 };
-pub(crate) use code_lens::{
-    CodeLensEnvelope, envelope_host_code_lenses, extract_code_lens_envelope,
-};
+pub(crate) use code_lens::{envelope_host_code_lenses, extract_code_lens_envelope};
 mod completion;
 pub(crate) use completion::{
     EnvelopeOffset, KakehashiEnvelope, bridge_host_completion_items, extract_envelope,
