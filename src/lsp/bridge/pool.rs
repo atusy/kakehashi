@@ -659,6 +659,30 @@ impl LanguageServerPool {
             .map(Arc::clone)
     }
 
+    /// The live `Ready` connection under `key` **at** `expected_generation`,
+    /// for the resolve envelopes that name their producer by key and
+    /// generation. The generation is compared under the same `connections`
+    /// lock as the handle read: it only advances under that lock as the old
+    /// handle is retired, so a caller that compared it outside the lock could
+    /// acquire the replacement in the gap. `config` is compared as in
+    /// [`ready_connection_by_key_for_config`](Self::ready_connection_by_key_for_config).
+    pub(crate) async fn ready_producer_by_key(
+        &self,
+        key: &ConnectionKey,
+        config: Option<&crate::config::settings::BridgeServerConfig>,
+        expected_generation: u64,
+    ) -> Option<Arc<ConnectionHandle>> {
+        let connections = self.connections.lock().await;
+        if self.document_connection_generation(key) != expected_generation {
+            return None;
+        }
+        connections
+            .get(key)
+            .filter(|handle| handle.state() == ConnectionState::Ready)
+            .filter(|handle| config.is_none_or(|config| handle.matches_launch_config(config)))
+            .map(Arc::clone)
+    }
+
     /// Shared registry of in-flight forwarded requests, handed to the forwarding
     /// loop so it can await each request's cancel token and drop settled entries
     /// (#404).
@@ -6492,6 +6516,48 @@ mod tests {
                 .await
                 .is_some(),
             "the config-less variant still filters on state alone"
+        );
+    }
+
+    /// A resolve envelope names its producer by key AND generation. The
+    /// generation advances under the `connections` lock as the old handle is
+    /// retired, so a caller that compared it outside the lock could still
+    /// acquire the replacement in the gap and consult it. The producer lookup
+    /// therefore compares the generation under that same lock: a live handle
+    /// at the expected generation is served, a moved generation misses.
+    #[tokio::test]
+    async fn a_producer_lookup_misses_when_the_generation_moved() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua");
+        let config = test_helpers::devnull_config_for_language("lua");
+        let handle =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.record_launch_config(&config);
+        pool.connections
+            .lock()
+            .await
+            .insert(key.clone(), Arc::clone(&handle));
+        let minted_at = pool.document_connection_generation(&key);
+
+        assert!(
+            pool.ready_producer_by_key(&key, Some(&config), minted_at)
+                .await
+                .is_some_and(|live| Arc::ptr_eq(&live, &handle)),
+            "the live handle at the minted generation is the producer"
+        );
+        assert!(
+            pool.ready_producer_by_key(&key, Some(&config), minted_at + 1)
+                .await
+                .is_none(),
+            "a generation the key never reached names no producer"
+        );
+
+        pool.document_tracker.purge_connection(&key).await;
+        assert!(
+            pool.ready_producer_by_key(&key, Some(&config), minted_at)
+                .await
+                .is_none(),
+            "after a purge the still-inserted handle is not the minted generation's process"
         );
     }
 

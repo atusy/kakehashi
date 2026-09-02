@@ -13,11 +13,17 @@
 //! only `data`) are forwarded instead of dropped — servers like rust-analyzer
 //! return mostly-unresolved lenses by design.
 //!
-//! Resolution fails soft for stale regions, missing servers, connection
-//! errors, and parse failures: the lens returns unresolved with its envelope
-//! intact. Client cancellation is the exception and surfaces as
-//! `RequestCancelled`; clients re-request lenses on change, so the ordinary
-//! fail-soft window is short (#355 maintainer decision).
+//! Both layers bind a lens to the exact process that produced it: the
+//! envelope carries the producing connection's pool key and generation, and
+//! resolve looks that connection up by key instead of re-deriving one, so a
+//! relaunch or a routing-key change never hands process-owned lens data to a
+//! replacement (the documentLink twin follows the same rule).
+//!
+//! Resolution fails soft for stale regions, missing servers, replaced
+//! producers, connection errors, and parse failures: the lens returns
+//! unresolved with its envelope intact. Client cancellation is the exception
+//! and surfaces as `RequestCancelled`; clients re-request lenses on change,
+//! so the ordinary fail-soft window is short (#355 maintainer decision).
 //!
 //! Requests are queued via the channel-based writer task (`send_request()`) for
 //! FIFO ordering with other messages (ls-bridge-message-ordering single-writer loop).
@@ -65,12 +71,15 @@ pub(crate) struct CodeLensEnvelope {
     /// Host open incarnation that produced this lens. Missing for legacy data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) incarnation: Option<u64>,
-    /// Generation of the producing pooled connection. Host resolve must not
-    /// hand process-owned data to a replacement process under the same key.
+    /// Generation of the producing pooled connection, on either layer.
+    /// Resolve must not hand process-owned data to a replacement process
+    /// under the same key, so a moved generation fails soft.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) connection_generation: Option<u64>,
-    /// Exact pool key of the producing host connection. Generations are local
-    /// to a key, so the key and generation together identify the process.
+    /// Exact pool key of the producing connection, on either layer.
+    /// Generations are local to a key, so the key and generation together
+    /// identify the process; resolve looks the producer up by this key and
+    /// never re-derives one from the host URI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) connection_key: Option<ConnectionKey>,
     /// Region offset snapshot for coordinate translation at resolve time.
@@ -219,6 +228,16 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/codeLens") {
             return Ok(None);
         }
+        // Bind the lenses to this exact process: resolve looks the producer
+        // up by key and generation and never hands process-owned data to a
+        // replacement (the host layer stamps the same pair). Reading the
+        // generation before the send is safe: it only advances under the
+        // `connections` lock as the handle is retired, and the send below
+        // re-verifies this handle under that same lock — a bump before the
+        // send fails the send, a bump after it leaves the lenses stamped with
+        // a generation the resolve side rejects.
+        let connection_key = handle.key().clone();
+        let connection_generation = self.document_connection_generation(&connection_key);
         // Read resolve support when the RESPONSE arrives, as the host layer
         // does: a dynamic `resolveProvider` registration can land between
         // send and reply, and the envelope decision should see it.
@@ -242,8 +261,8 @@ impl LanguageServerPool {
                     region_id,
                     injection_language,
                     incarnation: host_incarnation,
-                    connection_generation: None,
-                    connection_key: None,
+                    connection_generation: Some(connection_generation),
+                    connection_key: Some(&connection_key),
                     offset: ctx.offset,
                     host_layer: false,
                 };
@@ -298,8 +317,12 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Send a `codeLens/resolve` request to the downstream server that
+    /// Send a `codeLens/resolve` request to the exact downstream process that
     /// produced the lens, re-enveloping the resolved lens for return.
+    ///
+    /// The envelope's connection key and generation identify that process on
+    /// both layers; a lens whose producer was replaced (or that never carried
+    /// the pair) comes back unresolved without any connection being consulted.
     async fn send_code_lens_resolve_request(
         &self,
         server_config: &BridgeServerConfig,
@@ -326,41 +349,40 @@ impl LanguageServerPool {
             re_envelope_lens(&mut lens, &envelope);
             return lens;
         }
-        let handle_result = if envelope.is_host_layer() {
-            let Some(expected_generation) = envelope.connection_generation else {
-                re_envelope_lens(&mut lens, &envelope);
-                return lens;
-            };
-            let Some(connection_key) = envelope
-                .connection_key
-                .as_ref()
-                .filter(|key| key.server() == server_name)
-            else {
-                re_envelope_lens(&mut lens, &envelope);
-                return lens;
-            };
-            if self.document_connection_generation(connection_key) != expected_generation {
-                re_envelope_lens(&mut lens, &envelope);
-                return lens;
-            }
-            self.ready_connection_by_key_for_config(connection_key, Some(server_config))
-                .await
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "producer connection is no longer live",
-                    )
-                })
-        } else {
-            self.get_or_create_virtual_connection(
-                server_name,
-                server_config,
-                &host_uri,
-                &envelope.injection_language,
-                &envelope.region_id,
-            )
-            .await
+        // Both layers bind the lens to the exact process that produced it:
+        // the envelope must name a live connection under the origin's own
+        // key at the generation it was minted for. Anything else fails soft
+        // here, before any connection is consulted — resolve never spawns or
+        // selects a replacement for process-owned lens data.
+        let Some(expected_generation) = envelope.connection_generation else {
+            re_envelope_lens(&mut lens, &envelope);
+            return lens;
         };
+        let Some(connection_key) = envelope
+            .connection_key
+            .as_ref()
+            .filter(|key| key.server() == server_name)
+        else {
+            re_envelope_lens(&mut lens, &envelope);
+            return lens;
+        };
+        // Lock-free fail-soft for the steady-state stale lens (a generation
+        // the key has long moved past); the lookup below re-compares under
+        // the `connections` lock, so a purge racing this check cannot hand
+        // back the replacement it installed.
+        if self.document_connection_generation(connection_key) != expected_generation {
+            re_envelope_lens(&mut lens, &envelope);
+            return lens;
+        }
+        let handle_result = self
+            .ready_producer_by_key(connection_key, Some(server_config), expected_generation)
+            .await
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "producer connection is no longer live",
+                )
+            });
         let handle = match handle_result {
             Ok(h) => h,
             Err(e) => {
@@ -457,10 +479,9 @@ impl LanguageServerPool {
             let producer_is_live = connections
                 .get(connection_key)
                 .is_some_and(|current| Arc::ptr_eq(current, &handle));
-            let generation_matches = !envelope.is_host_layer()
-                || envelope.connection_generation.is_some_and(|expected| {
-                    self.document_connection_generation(connection_key) == expected
-                });
+            let generation_matches = envelope.connection_generation.is_some_and(|expected| {
+                self.document_connection_generation(connection_key) == expected
+            });
             if !producer_is_live || !generation_matches {
                 Err(io::Error::new(
                     io::ErrorKind::NotConnected,
@@ -1197,6 +1218,75 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("no longer advertises resolveProvider")),
             "a reserved-key wrap is not a lost capability: {warnings:?}"
+        );
+    }
+
+    /// A virt-layer lens is bound to the exact pooled process that produced
+    /// it, as a host-layer lens already is: resolve requires the producing
+    /// key and generation, refuses a key that names a different server, and
+    /// fails soft BEFORE touching any connection when they do not match. The
+    /// fixture's live handle advertises nothing, so reaching it would log the
+    /// capability miss; a silent unresolved return therefore proves the gate
+    /// fired before the handle was consulted (and that nothing was spawned).
+    #[rstest]
+    #[case::unbound(None, None)]
+    #[case::stale_generation(Some("lua-ls"), Some(1))]
+    #[case::key_names_another_server(Some("other-ls"), Some(0))]
+    fn virt_dispatch_fails_soft_without_reaching_a_process_it_did_not_bind_to(
+        #[case] key_server: Option<&str>,
+        #[case] generation_delta: Option<u64>,
+    ) {
+        use crate::lsp::bridge::test_logging::captured_warnings_for;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let warnings = captured_warnings_for(|| {
+            runtime.block_on(async {
+                let pool = LanguageServerPool::new();
+                let host_uri = Url::parse("file:///test.md").expect("valid url");
+                pool.open_host_incarnation(&host_uri, 1).await;
+                let live_key = ConnectionKey::for_server("lua-ls");
+                let handle = crate::lsp::bridge::test_helpers::create_handle_with_key(
+                    crate::lsp::bridge::ConnectionState::Ready,
+                    live_key.clone(),
+                )
+                .await;
+                pool.insert_connection(handle).await;
+                let mut settings = WorkspaceSettings::default();
+                settings.language_servers.insert(
+                    "lua-ls".to_string(),
+                    BridgeServerConfig {
+                        cmd: Some(vec!["lua-language-server".to_string()]),
+                        ..Default::default()
+                    },
+                );
+                let stamped_key = key_server.map(ConnectionKey::for_server);
+                let stamped_generation = generation_delta
+                    .map(|delta| pool.document_connection_generation(&live_key) + delta);
+                let offset = RegionOffset::new(3, 0);
+                let mut lens = CodeLens {
+                    range: tower_lsp_server::ls_types::Range::default(),
+                    command: None,
+                    data: Some(json!({"kind": "references"})),
+                };
+                envelope_lens_data(
+                    &mut lens,
+                    &CodeLensEnvelopeContext {
+                        connection_generation: stamped_generation,
+                        connection_key: stamped_key.as_ref(),
+                        ..ctx_with(&offset)
+                    },
+                );
+
+                let result = pool.dispatch_code_lens_resolve(lens, &settings, None).await;
+                let envelope = extract_code_lens_envelope(&result).expect("envelope restored");
+                assert_eq!(envelope.inner, Some(json!({"kind": "references"})));
+                assert_eq!(envelope.connection_key, stamped_key);
+                assert_eq!(envelope.connection_generation, stamped_generation);
+                assert!(result.command.is_none(), "lens stays unresolved");
+            });
+        });
+        assert!(
+            warnings.is_empty(),
+            "an unbound or mismatched envelope must fail soft before any connection is consulted: {warnings:?}"
         );
     }
 }
