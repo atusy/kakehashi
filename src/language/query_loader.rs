@@ -133,6 +133,11 @@ impl QueryLoader {
     /// overlays`. Modelines stay in place: tree-sitter reads them as comments,
     /// and keeping them keeps each file's line numbers intact.
     ///
+    /// `is_included` says the language is being resolved as a parent of
+    /// another rather than for itself; Neovim's `get_files(lang, name,
+    /// is_included)` then skips parents written in parentheses, `(cpp)`, and
+    /// so does this.
+    ///
     /// `visited` holds the languages on the current inheritance path so a
     /// cycle is an error; a language leaves it on the way back out so a
     /// diamond (two parents sharing an ancestor) resolves, as in Neovim. No
@@ -142,6 +147,7 @@ impl QueryLoader {
         runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
+        is_included: bool,
         visited: &mut std::collections::HashSet<String>,
     ) -> Result<ResolvedQuery, QueryLoadError> {
         if visited.contains(lang_name) {
@@ -178,10 +184,13 @@ impl QueryLoader {
             // overlay, not a parent of itself.
             let mut extends = modeline.extends;
             for parent in modeline.inherits {
-                if parent == lang_name {
+                if parent.name == lang_name {
                     extends = true;
-                } else if !parents.iter().any(|(name, _)| *name == parent) {
-                    parents.push((parent, path));
+                } else if parent.optional && is_included {
+                    // `(cpp)`: inherited when this file is loaded for its own
+                    // language, not when the file is itself being inherited.
+                } else if !parents.iter().any(|(name, _)| *name == parent.name) {
+                    parents.push((parent.name, path));
                 }
             }
             if extends {
@@ -204,6 +213,7 @@ impl QueryLoader {
                 runtime_bases,
                 parent,
                 file_name,
+                true,
                 visited,
             ) {
                 Ok(resolved) => resolved,
@@ -420,8 +430,13 @@ impl QueryLoader {
         file_name: &str,
     ) -> Result<ParseResult, QueryLoadError> {
         let mut visited = std::collections::HashSet::new();
-        let resolved =
-            Self::resolve_query_recursive(runtime_bases, lang_name, file_name, &mut visited)?;
+        let resolved = Self::resolve_query_recursive(
+            runtime_bases,
+            lang_name,
+            file_name,
+            false,
+            &mut visited,
+        )?;
         Ok(Self::parse_query(
             language,
             &resolved.content,
@@ -514,12 +529,18 @@ mod tests {
         file_name: &str,
     ) -> LspResult<String> {
         let mut visited = std::collections::HashSet::new();
-        QueryLoader::resolve_query_recursive(runtime_bases, lang_name, file_name, &mut visited)
-            .map(|resolved| resolved.content)
-            .map_err(|e| match e {
-                QueryLoadError::Other(e) => e,
-                not_found @ QueryLoadError::NotFound => LspError::query(not_found.to_string()),
-            })
+        QueryLoader::resolve_query_recursive(
+            runtime_bases,
+            lang_name,
+            file_name,
+            false,
+            &mut visited,
+        )
+        .map(|resolved| resolved.content)
+        .map_err(|e| match e {
+            QueryLoadError::Other(e) => e,
+            not_found @ QueryLoadError::NotFound => LspError::query(not_found.to_string()),
+        })
     }
 
     #[test]
@@ -1187,6 +1208,40 @@ mod tests {
             parent_at < child_at && child_at < overlay_at,
             "parents, then base, then overlays:\n{content}"
         );
+    }
+
+    /// Neovim's `get_files` inherits a parenthesized parent, `(cpp)`, only
+    /// when the file is loaded for its own language; a file reached as a
+    /// parent skips its optional parents, so a chain stops there instead of
+    /// pulling in — or failing on — a grandparent the child never asked for.
+    #[test]
+    fn an_optional_parent_is_inherited_only_at_the_top_of_the_chain() {
+        let base = tempdir().unwrap();
+        write_highlights(base.path(), "cpp", "(identifier) @cpp\n");
+        write_highlights(base.path(), "c", "; inherits: (cpp)\n(string_literal) @c\n");
+        write_highlights(
+            base.path(),
+            "cuda",
+            "; inherits: c\n(boolean_literal) @cuda\n",
+        );
+
+        let bases = [base.path().to_path_buf()];
+        let c = resolve_query(&bases, "c", "highlights.scm").unwrap();
+        assert!(
+            position(&c, "@cpp") < position(&c, "@c\n"),
+            "loaded for itself, c inherits (cpp):\n{c}"
+        );
+        let cuda = resolve_query(&bases, "cuda", "highlights.scm").unwrap();
+        assert!(
+            !cuda.contains("@cpp"),
+            "reached as a parent, c skips its optional (cpp):\n{cuda}"
+        );
+        assert!(position(&cuda, "@c\n") < position(&cuda, "@cuda"), "{cuda}");
+
+        // The skipped grandparent need not even exist for the child to load.
+        fs::remove_file(base.path().join("queries/cpp/highlights.scm")).unwrap();
+        assert!(resolve_query(&bases, "cuda", "highlights.scm").is_ok());
+        assert!(resolve_query(&bases, "c", "highlights.scm").is_err());
     }
 
     #[test]

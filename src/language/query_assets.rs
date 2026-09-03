@@ -44,7 +44,7 @@ mod tests {
             let source = asset_source(lang);
             let mut combined = String::new();
             for parent in crate::language::query_modeline::parse_modeline(&source).inherits {
-                combined.push_str(&resolve(&parent, chain));
+                combined.push_str(&resolve(&parent.name, chain));
                 combined.push('\n');
             }
             chain.pop();

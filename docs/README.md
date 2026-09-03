@@ -335,9 +335,9 @@ still count.
 each resolved through this same lookup (so a parent brings its own parents and
 overlays). A cycle between languages is an error; a file naming its own
 language is read as `extends`, as Neovim's `get_files` reads it, and so marks
-the file an overlay. A parenthesized name (`(cpp)`) is read as the bare name;
-Neovim uses the parentheses to stop recursion when the file is itself being
-inherited, which kakehashi does not distinguish.
+the file an overlay. A parenthesized name, `(cpp)`, is inherited only when
+the file is loaded for its own language: a file reached as someone else's
+parent skips its parenthesized parents, as in Neovim, so a chain stops there.
 
 `extends` marks the file as an overlay to merge onto the language's query
 instead of replacing it. Across `searchPaths`, in order, the first file

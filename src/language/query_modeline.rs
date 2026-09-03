@@ -39,15 +39,21 @@
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct QueryModeline {
     /// Parent languages named by `inherits` directives, in declaration order,
-    /// each at most once.
-    ///
-    /// A parenthesized name (`(cpp)`) is read as the bare name: Neovim uses the
-    /// parentheses to stop recursion when the file is itself being inherited,
-    /// which kakehashi does not distinguish.
-    pub inherits: Vec<String>,
+    /// each name at most once.
+    pub inherits: Vec<InheritedLanguage>,
     /// Whether an `extends` directive marks the file as an overlay to merge
     /// onto the language's base query instead of replacing it.
     pub extends: bool,
+}
+
+/// One entry of an `inherits` list.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct InheritedLanguage {
+    pub name: String,
+    /// Written in parentheses, `(cpp)`: Neovim's `get_files` inherits such a
+    /// parent only when the file is loaded for its own language, not when
+    /// the file is itself being inherited, so a chain stops there.
+    pub optional: bool,
 }
 
 /// Read the modeline block at the top of `content`.
@@ -57,10 +63,10 @@ pub(crate) fn parse_modeline(content: &str) -> QueryModeline {
         let directive = line.trim_start_matches(';').trim_matches(is_lua_space);
         if directive == "extends" {
             modeline.extends = true;
-        } else if let Some(names) = inherits_operand(directive) {
-            for name in names {
-                if !modeline.inherits.contains(&name) {
-                    modeline.inherits.push(name);
+        } else if let Some(parents) = inherits_operand(directive) {
+            for parent in parents {
+                if !modeline.inherits.iter().any(|p| p.name == parent.name) {
+                    modeline.inherits.push(parent);
                 }
             }
         }
@@ -80,7 +86,7 @@ pub(crate) fn parse_modeline(content: &str) -> QueryModeline {
 /// parenthesis unmatched) is skipped, and the parents beside it stand.
 /// Neovim would look such an entry up and find nothing; skipping it here
 /// keeps a parent that cannot exist from failing the whole query.
-fn inherits_operand(directive: &str) -> Option<Vec<String>> {
+fn inherits_operand(directive: &str) -> Option<Vec<InheritedLanguage>> {
     let rest = directive
         .strip_prefix("inherits")?
         .trim_start_matches(is_lua_space);
@@ -95,11 +101,20 @@ fn inherits_operand(directive: &str) -> Option<Vec<String>> {
     Some(
         operand
             .split(',')
-            .map(normalize_inherited_language_name)
-            .filter(|name| {
-                let is_name = is_safe_language_name(name);
+            .map(|entry| {
+                let (name, optional) = strip_optional_parentheses(entry);
+                InheritedLanguage {
+                    name: name.to_string(),
+                    optional,
+                }
+            })
+            .filter(|parent| {
+                let is_name = is_safe_language_name(&parent.name);
                 if !is_name {
-                    log::debug!("Ignoring `{name}` in an inherits modeline: not a language name");
+                    log::debug!(
+                        "Ignoring `{}` in an inherits modeline: not a language name",
+                        parent.name
+                    );
                 }
                 is_name
             })
@@ -131,14 +146,17 @@ pub fn is_safe_language_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-/// Strip the parentheses of an optional name, `(cpp)`, leaving the bare name.
-/// Only a *matched* pair is a wrapper: `(cpp` is not a name at all, and the
-/// caller then skips it rather than guessing `cpp`.
-fn normalize_inherited_language_name(name: &str) -> String {
-    name.strip_prefix('(')
+/// Split an entry into its bare name and whether it was parenthesized.
+/// Only a *matched* pair marks an optional name: `(cpp` is not a name at
+/// all, and the caller then skips it rather than guessing `cpp`.
+fn strip_optional_parentheses(entry: &str) -> (&str, bool) {
+    match entry
+        .strip_prefix('(')
         .and_then(|name| name.strip_suffix(')'))
-        .unwrap_or(name)
-        .to_string()
+    {
+        Some(name) => (name, true),
+        None => (entry, false),
+    }
 }
 
 #[cfg(test)]
@@ -146,7 +164,18 @@ mod tests {
     use super::*;
 
     fn inherits(content: &str) -> Vec<String> {
-        parse_modeline(content).inherits
+        parse_modeline(content)
+            .inherits
+            .into_iter()
+            .map(|parent| parent.name)
+            .collect()
+    }
+
+    fn parent(name: &str, optional: bool) -> InheritedLanguage {
+        InheritedLanguage {
+            name: name.to_string(),
+            optional,
+        }
     }
 
     #[test]
@@ -177,13 +206,22 @@ mod tests {
     }
 
     #[test]
-    fn parenthesized_names_read_as_bare_names() {
+    fn parenthesized_names_are_optional_parents() {
         assert_eq!(
-            inherits("; inherits: c,(cpp),(cuda)\n(identifier) @variable\n"),
-            vec!["c", "cpp", "cuda"]
+            parse_modeline("; inherits: c,(cpp),(cuda)\n(identifier) @variable\n").inherits,
+            vec![
+                parent("c", false),
+                parent("cpp", true),
+                parent("cuda", true)
+            ]
         );
         assert_eq!(inherits("; inherits: (cpp)\n"), vec!["cpp"]);
         assert_eq!(inherits("; inherits:(cpp),c\n"), vec!["cpp", "c"]);
+        assert_eq!(
+            parse_modeline("; inherits: c,(c)\n").inherits,
+            vec![parent("c", false)],
+            "a name keeps its first spelling"
+        );
     }
 
     /// Neovim splits a matching list on commas and looks each entry up on its
@@ -206,7 +244,7 @@ mod tests {
         assert_eq!(
             parse_modeline("; inherits: ecma,jsx\r\n;; extends\r\n(identifier) @variable\r\n"),
             QueryModeline {
-                inherits: vec!["ecma".into(), "jsx".into()],
+                inherits: vec![parent("ecma", false), parent("jsx", false)],
                 extends: true,
             }
         );
@@ -269,14 +307,14 @@ mod tests {
         assert_eq!(
             parse_modeline(";; inherits: typescript,jsx\n;; extends\n"),
             QueryModeline {
-                inherits: vec!["typescript".into(), "jsx".into()],
+                inherits: vec![parent("typescript", false), parent("jsx", false)],
                 extends: true,
             }
         );
         assert_eq!(
             parse_modeline(";; extends\n;;\n;; inherits: css\n(identifier) @variable\n"),
             QueryModeline {
-                inherits: vec!["css".into()],
+                inherits: vec![parent("css", false)],
                 extends: true,
             }
         );

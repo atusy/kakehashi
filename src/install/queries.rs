@@ -162,9 +162,12 @@ fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<String>> {
             // saw, so say the chain cannot be determined instead.
             Err(_) => return None,
         };
+        // An optional parent, `(cpp)`, is skipped by the loader only while
+        // the file is itself being inherited; loaded for its own language it
+        // is needed, so the chain counts it.
         for parent in parse_modeline(&content).inherits {
-            if !parents.contains(&parent) {
-                parents.push(parent);
+            if !parents.contains(&parent.name) {
+                parents.push(parent.name);
             }
         }
     }
@@ -944,6 +947,7 @@ fn stage_queries_recursive(
                 // as one named by highlights.scm. A file naming its own
                 // language is read as `extends`, not as a parent.
                 for parent in parse_modeline(&content).inherits {
+                    let parent = parent.name;
                     if parent != language && !parents_to_install.contains(&parent) {
                         parents_to_install.push(parent);
                     }
