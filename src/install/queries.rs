@@ -191,9 +191,10 @@ pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec
         seen: &mut Vec<String>,
         guards: &mut Vec<LanguageLock>,
     ) -> bool {
-        // An inheritance cycle among on-disk files (a self-inherit typo, A↔B)
-        // is the loader's problem to report, not a reason to call the install
-        // incomplete and re-download forever.
+        // A language already on the path — a file naming its own language
+        // (the older `extends` spelling), or an A↔B cycle for the loader to
+        // report — is not a reason to call the install incomplete and
+        // re-download forever.
         if seen.iter().any(|visited| visited == language) {
             return true;
         }
@@ -893,9 +894,9 @@ fn stage_queries_recursive(
     // as incomplete so a later install can repair it without --force.
     if query_install_is_complete(&queries_dir) && !force {
         // Mark as staged BEFORE recursing into parents: an inheritance
-        // cycle among on-disk query files (self-inherit typo, A↔B) would
-        // otherwise recurse forever and overflow the stack. The download
-        // branch below already inserts before its parent loop.
+        // cycle among on-disk query files (a file naming its own language,
+        // A↔B) would otherwise recurse forever and overflow the stack. The
+        // download branch below already inserts before its parent loop.
         staged.insert(language.to_string());
 
         // Even if skipping, we need to check for inherited dependencies
@@ -941,9 +942,10 @@ fn stage_queries_recursive(
             Ok(content) => {
                 // Every query kind resolves its own `; inherits:` chain at load
                 // time, so a parent named by injections.scm is as load-bearing
-                // as one named by highlights.scm.
+                // as one named by highlights.scm. A file naming its own
+                // language is the older `extends` spelling, not a parent.
                 for parent in parse_modeline(&content).inherits {
-                    if !parents_to_install.contains(&parent) {
+                    if parent != language && !parents_to_install.contains(&parent) {
                         parents_to_install.push(parent);
                     }
                 }
@@ -2988,8 +2990,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let data_dir = temp_dir.path().to_path_buf();
 
-        // Self-cycle: a query file inheriting its own language (a one-word
-        // typo in a real highlights.scm). No network: both branches hit the
+        // Self-cycle: a query file inheriting its own language (Neovim's older
+        // spelling of `extends`). No network: both branches hit the
         // already-exists path.
         let a_dir = data_dir.join("queries").join("cyclic_a");
         fs::create_dir_all(&a_dir).unwrap();
