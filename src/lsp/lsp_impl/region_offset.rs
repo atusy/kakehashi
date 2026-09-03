@@ -4,14 +4,14 @@
 //! map virtual-document coordinates back to the host document —
 //! `window/showDocument` ([`ShowDocumentTranslator`]) and `workspace/applyEdit`
 //! ([`ApplyEditTranslator`]) — and by the `*/resolve` staleness gates
-//! (completion, code action, code lens, document link), which compare the
-//! rebuilt offset against the snapshot their envelope carries. The offset is
-//! rebuilt exactly as the goto request path does (`region_id → node byte
-//! range → resolve injection → RegionOffset`), so neither inbound translation
-//! nor a resolve gate can disagree with goto on the same region. The region's
-//! content-precise host end and contiguity are returned alongside so an edit
-//! translator can reject a range that escapes the region or targets a
-//! combined document with masked host gaps.
+//! (completion, code action, code lens, document link, inlay hint), which
+//! compare the rebuilt offset against the snapshot their envelope carries.
+//! The offset is rebuilt exactly as the goto request path does (`region_id →
+//! node byte range → resolve injection → RegionOffset`), so neither inbound
+//! translation nor a resolve gate can disagree with goto on the same region.
+//! The region's content-precise host end and contiguity are returned
+//! alongside so an edit translator can reject a range that escapes the
+//! region or targets a combined document with masked host gaps.
 //!
 //! [`ShowDocumentTranslator`]: super::show_document_translation::ShowDocumentTranslator
 //! [`ApplyEditTranslator`]: super::apply_edit_translation::ApplyEditTranslator
@@ -41,9 +41,9 @@ impl Kakehashi {
     /// frontmatter, blockquote prose) compare equal while unchanged.
     ///
     /// The code-lens and document-link gates ask exactly this question and
-    /// share this one answer, so they cannot drift. Completion and code
-    /// action need the region end and contiguity as well, so they call
-    /// [`resolve_region_offset`] directly and compare the same offset.
+    /// share this one answer, so they cannot drift. Completion, code action
+    /// and inlay hint need the region end and contiguity as well, so they
+    /// call [`resolve_region_offset`] directly and compare the same offset.
     ///
     /// Contiguity is deliberately NOT required here. A non-contiguous
     /// combined region masks its host gaps with whitespace, so its line
