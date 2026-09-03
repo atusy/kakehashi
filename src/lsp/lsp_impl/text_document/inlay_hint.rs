@@ -179,13 +179,19 @@ impl Kakehashi {
             return Ok(hint);
         };
         let unresolved = hint.clone();
-        if !self.inlay_hint_content_is_fresh(&envelope) {
+        // One parse serves every gate below. An unparsable host URI can only
+        // be a mangled echo and fails soft like any other stale envelope.
+        let Ok(host_url) = url::Url::parse(&envelope.host_uri) else {
+            return Ok(hint);
+        };
+        if !self.inlay_hint_content_is_fresh(&host_url, &envelope) {
             return Ok(hint);
         }
         let region_end = if envelope.is_host_layer() {
             None
         } else {
-            let Some((offset, region_end, contiguous)) = self.inlay_hint_region_geometry(&envelope)
+            let Some((offset, region_end, contiguous)) =
+                self.inlay_hint_region_geometry(&host_url, &envelope)
             else {
                 return Ok(hint);
             };
@@ -224,7 +230,7 @@ impl Kakehashi {
         // the region invalidates every parse, which advances the version as
         // well (`Document::invalidate_parse`), so the two stamps cover every
         // way the geometry can move.
-        if !self.inlay_hint_envelope_is_fresh(&envelope, &pool) {
+        if !self.inlay_hint_envelope_is_fresh(&host_url, &envelope, &pool) {
             return Ok(unresolved);
         }
         Ok(resolved)
@@ -232,43 +238,42 @@ impl Kakehashi {
 
     fn inlay_hint_envelope_is_fresh(
         &self,
+        host_url: &url::Url,
         envelope: &InlayHintEnvelope,
         pool: &crate::lsp::bridge::LanguageServerPool,
     ) -> bool {
-        let Ok(uri) = url::Url::parse(&envelope.host_uri) else {
-            return false;
-        };
-        self.inlay_hint_content_is_fresh(envelope)
+        self.inlay_hint_content_is_fresh(host_url, envelope)
             && envelope
                 .incarnation
-                .is_some_and(|expected| pool.current_host_incarnation(&uri) == Some(expected))
+                .is_some_and(|expected| pool.current_host_incarnation(host_url) == Some(expected))
     }
 
-    fn inlay_hint_content_is_fresh(&self, envelope: &InlayHintEnvelope) -> bool {
-        let Ok(uri) = url::Url::parse(&envelope.host_uri) else {
-            return false;
-        };
+    fn inlay_hint_content_is_fresh(
+        &self,
+        host_url: &url::Url,
+        envelope: &InlayHintEnvelope,
+    ) -> bool {
         envelope.content_version.is_some_and(|expected| {
             self.documents
-                .get(&uri)
+                .get(host_url)
                 .is_some_and(|document| document.content_version() == expected)
         })
     }
 
     fn inlay_hint_region_geometry(
         &self,
+        host_url: &url::Url,
         envelope: &InlayHintEnvelope,
     ) -> Option<(
         crate::lsp::bridge::RegionOffset,
         tower_lsp_server::ls_types::Position,
         bool,
     )> {
-        let uri = url::Url::parse(&envelope.host_uri).ok()?;
         resolve_region_offset(
             &self.documents,
             &self.language,
             &self.bridge,
-            &uri,
+            host_url,
             &envelope.region_id,
         )
     }
