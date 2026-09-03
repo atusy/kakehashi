@@ -167,7 +167,8 @@ No position information in response—pass through directly.
 **Applies to**: `textDocument/completion`, `completionItem/resolve`,
 `textDocument/rename`, `textDocument/codeAction`, `textDocument/formatting`,
 `textDocument/rangeFormatting`, `textDocument/onTypeFormatting`,
-`textDocument/inlayHint` (its `textEdits`), `textDocument/colorPresentation`
+`textDocument/inlayHint` and `inlayHint/resolve` (their `textEdits`),
+`textDocument/colorPresentation`
 
 These methods return edits that must be carefully validated.
 
@@ -222,7 +223,9 @@ whether it is what the user wants depends on the injection.
   mechanically applicable, though possibly semantically incomplete without
   its auto-import (availability over fidelity, with a warn log).
 - The same guards apply to inlay-hint `textEdits` (the hint is kept, its
-  accept-edit set drops whole) and color presentations (an unsafe explicit or
+  accept-edit set drops whole; lazily materialized edits from
+  `inlayHint/resolve` pass the same guard, and a rejected set leaves the
+  eager one in place) and color presentations (an unsafe explicit or
   implicit label-replacement edit drops the presentation; unsafe
   additionalTextEdits drop as an array).
 
@@ -402,7 +405,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | formatting | ✅ Implemented | Whole-response atomic drop on unsafe edits |
 | rangeFormatting | ✅ Implemented | Shares the formatting guards |
 | onTypeFormatting | ✅ Implemented | Shares the formatting guards |
-| inlayHint | ✅ Implemented | Unsafe accept-edit sets dropped whole; hint kept |
+| inlayHint | ✅ Implemented | Unsafe accept-edit sets dropped whole; hint kept; `inlayHint/resolve` edits pass the same guard |
 | colorPresentation | ✅ Implemented | Experimental opt-in; unsafe presentations dropped |
 | documentHighlight | ✅ Implemented | Strategy-2 shape (single-document, position-mapped) |
 | diagnostics | ✅ Implemented | Push + pull with host translation |
