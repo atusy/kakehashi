@@ -520,6 +520,7 @@ impl LanguageServerPool {
                 &RegionOffset::from(&envelope.offset),
                 virt.region_end,
                 connection_key,
+                "inlayHint/resolve",
             ),
             None => encode_inlay_hint_commands(&mut resolved, connection_key),
         }
@@ -715,6 +716,7 @@ fn transform_inlay_hint_response_to_host_and_envelope(
             offset,
             region_end,
             envelope_ctx.connection_key,
+            "textDocument/inlayHint",
         );
 
         if should_envelope(hint.data.as_ref(), server_resolves) {
@@ -732,6 +734,7 @@ fn transform_inlay_hint_to_host(
     offset: &RegionOffset,
     region_end: Position,
     connection_key: &ConnectionKey,
+    method: &str,
 ) {
     translate_virtual_position_to_host(&mut hint.position, offset);
 
@@ -745,7 +748,7 @@ fn transform_inlay_hint_to_host(
         {
             log::warn!(
                 target: "kakehashi::bridge",
-                "inlayHint: dropped a hint's textEdits ({}): an edit is unsafe for the injection region (escapes it, breaks line prefixes, or merges content into the closing fence)",
+                "{method}: dropped a hint's textEdits ({}): an edit is unsafe for the injection region (escapes it, breaks line prefixes, or merges content into the closing fence)",
                 text_edits.len()
             );
             hint.text_edits = None;
