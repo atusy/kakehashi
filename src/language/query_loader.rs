@@ -524,10 +524,11 @@ impl QueryLoader {
 /// Append one file's text so the next file starts on a fresh line and no
 /// line is added that the file did not have: a file's line numbers in the
 /// combined text are then its own plus the lines of what precedes it, which
-/// is what a skipped-pattern warning quotes.
+/// is what a skipped-pattern warning quotes. An empty file has no lines and
+/// contributes none.
 fn append_file(combined: &mut String, content: &str) {
     combined.push_str(content);
-    if !content.ends_with('\n') {
+    if !content.is_empty() && !content.ends_with('\n') {
         combined.push('\n');
     }
 }
@@ -1376,6 +1377,14 @@ mod tests {
         assert_eq!(
             content,
             "(identifier) @parent\n; inherits: parent\n(string_literal) @child\n;; extends\n(boolean_literal) @overlay\n"
+        );
+
+        // An empty parent has no lines and must not push the child down one.
+        write_highlights(base.path(), "parent", "");
+        let content = resolve_query(&bases, "child", "highlights.scm").unwrap();
+        assert_eq!(
+            content,
+            "; inherits: parent\n(string_literal) @child\n;; extends\n(boolean_literal) @overlay\n"
         );
     }
 
