@@ -1387,6 +1387,61 @@ mod tests {
         );
     }
 
+    /// A label location may legitimately name the host file itself (a
+    /// server that also holds the host document): only a host location
+    /// inside the region was minted by translating a virtual one, so only
+    /// that is reversed; one outside the region is a real reference and
+    /// must reach the downstream untouched.
+    #[test]
+    fn resolve_request_leaves_a_host_location_outside_the_region_alone() {
+        let envelope = InlayHintEnvelope {
+            origin: "lua-ls".to_string(),
+            host_uri: "file:///doc.md".to_string(),
+            region_id: "region-0".to_string(),
+            injection_language: "lua".to_string(),
+            incarnation: Some(1),
+            content_version: Some(0),
+            connection_generation: Some(0),
+            connection_key: None,
+            offset: EnvelopeOffset {
+                line: 4,
+                column: 0,
+                line_column_offsets: None,
+            },
+            inner: None,
+            host_layer: false,
+        };
+        let mut outgoing: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 4, "character": 1 },
+            "label": [
+                { "value": "inside", "location": {
+                    "uri": "file:///doc.md",
+                    "range": { "start": { "line": 5, "character": 0 }, "end": { "line": 5, "character": 3 } }
+                } },
+                { "value": "outside", "location": {
+                    "uri": "file:///doc.md",
+                    "range": { "start": { "line": 20, "character": 0 }, "end": { "line": 20, "character": 3 } }
+                } }
+            ]
+        }))
+        .unwrap();
+        let host_lsp_uri: Uri = "file:///doc.md".parse().unwrap();
+
+        let virtual_uri = reverse_hint_into_virtual(&mut outgoing, &envelope, &host_lsp_uri);
+
+        let reversed = serde_json::to_value(&outgoing).unwrap();
+        assert_eq!(reversed["label"][0]["location"]["uri"], virtual_uri);
+        assert_eq!(
+            reversed["label"][0]["location"]["range"]["start"],
+            json!({ "line": 1, "character": 0 })
+        );
+        assert_eq!(reversed["label"][1]["location"]["uri"], "file:///doc.md");
+        assert_eq!(
+            reversed["label"][1]["location"]["range"]["start"],
+            json!({ "line": 20, "character": 0 })
+        );
+    }
+
     #[test]
     fn inlay_hint_request_uses_virtual_uri() {
         let host_uri = test_host_uri();
