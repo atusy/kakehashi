@@ -1367,6 +1367,41 @@ mod tests {
         );
     }
 
+    /// An entry skipped as optional is never entered into the parent list,
+    /// so a later file naming the same parent bare still has it followed —
+    /// in either file order, and however the language is reached.
+    #[test]
+    fn an_optional_entry_in_one_file_does_not_suppress_a_bare_one_in_another() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        write_highlights(second.path(), "cpp", "(identifier) @cpp\n");
+        write_highlights(
+            first.path(),
+            "c",
+            ";; extends\n;; inherits: (cpp)\n(string_literal) @overlay\n",
+        );
+        write_highlights(
+            second.path(),
+            "c",
+            "; inherits: cpp\n(boolean_literal) @base\n",
+        );
+        write_highlights(
+            second.path(),
+            "cuda",
+            "; inherits: c\n(integer_literal) @cuda\n",
+        );
+
+        let bases = [first.path().to_path_buf(), second.path().to_path_buf()];
+        for lang in ["c", "cuda"] {
+            let content = resolve_query(&bases, lang, "highlights.scm").unwrap();
+            assert_eq!(
+                content.matches("@cpp").count(),
+                1,
+                "{lang}: the base's bare `cpp` is followed once:\n{content}"
+            );
+        }
+    }
+
     #[test]
     fn a_parent_named_by_both_base_and_overlay_is_concatenated_once() {
         let base = tempdir().unwrap();
