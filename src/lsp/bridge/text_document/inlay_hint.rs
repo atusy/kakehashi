@@ -15,8 +15,9 @@
 //! A hint from an origin that advertises `inlayHint/resolve` (or whose own
 //! `data` occupies the reserved key) leaves with its `data` wrapped in an
 //! [`InlayHintEnvelope`] naming the producing connection (key and
-//! generation), the host incarnation, the content version and the region
-//! offset; every other hint leaves bare, and a client resolve of it passes
+//! generation), the host incarnation, the content version, the region
+//! offset and the label parts whose location was translated; every other
+//! hint leaves bare, and a client resolve of it passes
 //! through unchanged. `inlayHint/resolve` strips the envelope, refuses
 //! anything but the exact producer, reverses the hint into virtual
 //! coordinates for the request, translates the reply back, and merges only
