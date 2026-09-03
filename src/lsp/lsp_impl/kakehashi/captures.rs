@@ -9,8 +9,8 @@
 //!
 //! The query itself is not sent by the client: `kind` names a per-language
 //! asset resolved as `queries/<lang>/<kind>.scm` across the configured
-//! `searchPaths`, through the same loader (`; inherits:`, tolerant
-//! per-pattern compilation) used for highlights. Kinds are therefore
+//! `searchPaths`, through the same loader (`inherits`/`extends` modelines,
+//! tolerant per-pattern compilation) used for highlights. Kinds are therefore
 //! open-ended — defined by what files exist, not by an enum.
 //!
 //! `#set!` directives in the kind file ride along as `metadata` objects —
@@ -48,7 +48,7 @@ use url::Url;
 
 use crate::analysis::next_result_id;
 use crate::language::query_exec::execute_query;
-use crate::language::query_loader::QueryLoader;
+use crate::language::query_loader::{QueryLoadError, QueryLoader};
 use crate::language::registry::LanguageRegistry;
 use crate::lsp::lsp_impl::kakehashi::node::injection_stack::walk_document_layers;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
@@ -424,18 +424,18 @@ fn load_kind_query(
         file_name,
     ) {
         Ok(parsed) => parsed,
+        Err(QueryLoadError::NotFound) => {
+            log::debug!(
+                target: "kakehashi::captures",
+                "no {file_name} for {language_id}"
+            );
+            return KindQueryLoad::Unavailable;
+        }
         Err(err) => {
-            if QueryLoader::find_query_file(search_paths, language_id, file_name).is_none() {
-                log::debug!(
-                    target: "kakehashi::captures",
-                    "no {file_name} for {language_id}: {err}"
-                );
-            } else {
-                log::warn!(
-                    target: "kakehashi::captures",
-                    "failed to load {file_name} for {language_id}: {err}"
-                );
-            }
+            log::warn!(
+                target: "kakehashi::captures",
+                "failed to load {file_name} for {language_id}: {err}"
+            );
             return KindQueryLoad::Unavailable;
         }
     };

@@ -267,7 +267,7 @@ impl QueryLoader {
     /// unreadable directory) is listed too: presence probing must not
     /// downgrade a broken asset to an ordinary absence, so the real read
     /// reports its concrete I/O error.
-    pub(crate) fn find_query_files<P: AsRef<Path>>(
+    fn find_query_files<P: AsRef<Path>>(
         runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
@@ -284,21 +284,6 @@ impl QueryLoader {
                 Err(e) => e.kind() != std::io::ErrorKind::NotFound,
             })
             .collect()
-    }
-
-    /// The first search-path hit for a query file, if any.
-    ///
-    /// `pub(crate)` so the captures handler can distinguish "kind file absent"
-    /// (expected, debug log) from "file exists but failed to load" (asset
-    /// trouble, warn) — captures-protocol §"Null vs. error semantics".
-    pub(crate) fn find_query_file<P: AsRef<Path>>(
-        runtime_bases: &[P],
-        lang_name: &str,
-        file_name: &str,
-    ) -> Option<PathBuf> {
-        Self::find_query_files(runtime_bases, lang_name, file_name)
-            .into_iter()
-            .next()
     }
 
     /// Parse a query string with fault tolerance.
@@ -549,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_query_file() {
+    fn test_find_query_files() {
         let dir = tempdir().unwrap();
         let base_path = dir.path().to_str().unwrap().to_string();
 
@@ -562,18 +547,17 @@ mod tests {
         fs::write(&query_file, "(identifier) @variable").unwrap();
 
         // Test finding the file
-        let result = QueryLoader::find_query_file(&[base_path], "rust", "highlights.scm");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), query_file);
+        let result = QueryLoader::find_query_files(&[base_path], "rust", "highlights.scm");
+        assert_eq!(result, vec![query_file]);
 
         // Test not finding a non-existent file
-        let result = QueryLoader::find_query_file(NO_SEARCH_PATHS, "rust", "highlights.scm");
-        assert!(result.is_none());
+        let result = QueryLoader::find_query_files(NO_SEARCH_PATHS, "rust", "highlights.scm");
+        assert!(result.is_empty());
     }
 
     #[cfg(unix)]
     #[test]
-    fn find_query_file_treats_dangling_symlink_as_present_asset() {
+    fn find_query_files_treats_dangling_symlink_as_present_asset() {
         use std::os::unix::fs::symlink;
 
         let dir = tempdir().unwrap();
@@ -583,8 +567,8 @@ mod tests {
         symlink("missing-target.scm", &query_file).unwrap();
 
         assert_eq!(
-            QueryLoader::find_query_file(&[dir.path()], "rust", "highlights.scm"),
-            Some(query_file),
+            QueryLoader::find_query_files(&[dir.path()], "rust", "highlights.scm"),
+            vec![query_file],
             "a broken configured asset must not be classified as ordinary absence"
         );
 
@@ -596,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn find_query_file_rejects_language_path_traversal() {
+    fn find_query_files_rejects_language_path_traversal() {
         let dir = tempdir().unwrap();
         let runtime = dir.path().join("runtime");
         let outside = dir.path().join("outside");
@@ -605,23 +589,23 @@ mod tests {
 
         // `runtime/queries` sits two components below the tempdir root, so the
         // pre-fix join cleaned to exactly the file planted above.
-        let result = QueryLoader::find_query_file(
+        let result = QueryLoader::find_query_files(
             std::slice::from_ref(&runtime),
             "../../outside",
             "highlights.scm",
         );
 
-        assert_eq!(result, None);
+        assert!(result.is_empty());
 
         // An absolute name is the worse variant: `join` discards the base
         // outright, so no `..` arithmetic is needed to escape.
-        let result = QueryLoader::find_query_file(
+        let result = QueryLoader::find_query_files(
             std::slice::from_ref(&runtime),
             outside.to_str().unwrap(),
             "highlights.scm",
         );
 
-        assert_eq!(result, None);
+        assert!(result.is_empty());
 
         // Positive control on the same base: an ordinary name still resolves,
         // so the assertions above pin the gate rather than a broken fixture.
@@ -629,9 +613,9 @@ mod tests {
         fs::create_dir_all(&inside).unwrap();
         fs::write(inside.join("highlights.scm"), "(identifier) @variable").unwrap();
 
-        let result = QueryLoader::find_query_file(&[runtime], "rust", "highlights.scm");
+        let result = QueryLoader::find_query_files(&[runtime], "rust", "highlights.scm");
 
-        assert_eq!(result, Some(inside.join("highlights.scm")));
+        assert_eq!(result, vec![inside.join("highlights.scm")]);
     }
 
     #[test]
@@ -831,7 +815,7 @@ mod tests {
     #[cfg(unix)]
     #[cfg_attr(target_os = "macos", ignore)]
     #[test]
-    fn test_find_query_file_with_non_utf8_search_path() {
+    fn test_find_query_files_with_non_utf8_search_path() {
         let dir = tempdir().unwrap();
         let non_utf8_base = create_non_utf8_base(&dir);
         let query_dir = non_utf8_base.join("queries").join("rust");
@@ -839,9 +823,9 @@ mod tests {
         fs::write(query_dir.join("highlights.scm"), "(identifier) @variable").unwrap();
 
         let search_paths = vec![non_utf8_base];
-        let result = QueryLoader::find_query_file(&search_paths, "rust", "highlights.scm");
+        let result = QueryLoader::find_query_files(&search_paths, "rust", "highlights.scm");
         assert!(
-            result.is_some(),
+            !result.is_empty(),
             "Should find query file under non-UTF-8 path"
         );
     }
@@ -867,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_query_file_with_path_ref() {
+    fn test_find_query_files_with_path_ref() {
         let dir = tempdir().unwrap();
         let query_dir = dir.path().join("queries").join("rust");
         fs::create_dir_all(&query_dir).unwrap();
@@ -875,8 +859,8 @@ mod tests {
         fs::write(&query_file, "(identifier) @variable").unwrap();
 
         let search_paths: Vec<&Path> = vec![dir.path()];
-        let result = QueryLoader::find_query_file(&search_paths, "rust", "highlights.scm");
-        assert_eq!(result.unwrap(), query_file);
+        let result = QueryLoader::find_query_files(&search_paths, "rust", "highlights.scm");
+        assert_eq!(result, vec![query_file]);
     }
 
     #[test]
