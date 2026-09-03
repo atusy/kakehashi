@@ -133,6 +133,12 @@ impl QueryLoader {
     /// overlays`. Modelines stay in place: tree-sitter reads them as comments,
     /// and keeping them keeps each file's line numbers intact.
     ///
+    /// One departure from `get_files`, on purpose: a parent named more than
+    /// once — twice on a line, or by the base and an overlay both — is
+    /// concatenated once. Neovim appends it each time, and every pattern in
+    /// it then matches twice; nothing relies on that, and no nvim-treesitter
+    /// query repeats a name.
+    ///
     /// `is_included` says the language is being resolved as a parent of
     /// another rather than for itself; Neovim's `get_files(lang, name,
     /// is_included)` then skips parents written in parentheses, `(cpp)`, and
