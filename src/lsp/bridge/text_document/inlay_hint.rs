@@ -619,7 +619,6 @@ fn merge_resolved_inlay_hint(
     translated_locations: &[usize],
     reply_translated_locations: &[usize],
 ) -> (InlayHint, Vec<usize>) {
-    let _ = reply_translated_locations;
     original.tooltip = resolved.tooltip.take().or(original.tooltip);
     original.text_edits = resolved.text_edits.take().or(original.text_edits);
 
@@ -628,12 +627,25 @@ fn merge_resolved_inlay_hint(
             InlayHintLabel::LabelParts(original_parts),
             InlayHintLabel::LabelParts(resolved_parts),
         ) if original_parts.len() == resolved_parts.len() => {
-            for (original_part, mut resolved_part) in original_parts.iter_mut().zip(resolved_parts)
+            // The record follows the location each part ends up with: the
+            // reply's translation where the reply's location is taken, the
+            // mint-time record where the merge keeps the original.
+            let mut refreshed = Vec::new();
+            for (index, (original_part, mut resolved_part)) in
+                original_parts.iter_mut().zip(resolved_parts).enumerate()
             {
                 original_part.tooltip = resolved_part
                     .tooltip
                     .take()
                     .or(original_part.tooltip.take());
+                let translated = if resolved_part.location.is_some() {
+                    reply_translated_locations.contains(&index)
+                } else {
+                    translated_locations.contains(&index)
+                };
+                if translated {
+                    refreshed.push(index);
+                }
                 original_part.location = resolved_part
                     .location
                     .take()
@@ -643,6 +655,7 @@ fn merge_resolved_inlay_hint(
                     .take()
                     .or(original_part.command.take());
             }
+            return (original, refreshed);
         }
         (
             InlayHintLabel::LabelParts(original_parts),
