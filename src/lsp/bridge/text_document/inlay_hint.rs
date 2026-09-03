@@ -504,9 +504,16 @@ impl LanguageServerPool {
         if let Some(ref id) = upstream_id {
             self.unregister_upstream_request(id, connection_key);
         }
-        let Ok(response) = response else {
-            re_envelope_hint(&mut hint, &envelope);
-            return hint;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "inlayHint/resolve{layer} failed for server {server_name}: {error}"
+                );
+                re_envelope_hint(&mut hint, &envelope);
+                return hint;
+            }
         };
         let producer_is_still_live = {
             let connections = self.connections().await;
