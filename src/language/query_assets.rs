@@ -31,7 +31,7 @@ mod tests {
     }
 
     /// The asset source with `; inherits:` parents concatenated from the
-    /// on-disk assets, mirroring the loader's resolution. Fails fast on an
+    /// on-disk assets, read through the loader's own modeline parser. Fails fast on an
     /// inheritance cycle (the runtime loader guards likewise) instead of
     /// recursing until the test suite hangs.
     fn resolved_source(lang: &str) -> String {
@@ -43,13 +43,9 @@ mod tests {
             chain.push(lang.to_string());
             let source = asset_source(lang);
             let mut combined = String::new();
-            if let Some(first_line) = source.lines().next()
-                && let Some(parents) = first_line.strip_prefix("; inherits:")
-            {
-                for parent in parents.split(',') {
-                    combined.push_str(&resolve(parent.trim(), chain));
-                    combined.push('\n');
-                }
+            for parent in crate::language::query_modeline::parse_inherits_directive(&source) {
+                combined.push_str(&resolve(&parent, chain));
+                combined.push('\n');
             }
             chain.pop();
             combined.push_str(&source);

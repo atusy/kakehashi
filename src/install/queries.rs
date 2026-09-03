@@ -230,47 +230,26 @@ pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec
     walk(data_dir, language, &mut Vec::new(), &mut guards).then_some(guards)
 }
 
-/// Strip the parentheses nvim-treesitter puts around some inherited names.
-///
-/// Must match what the query loader does with the same line
-/// (`language::query_loader::normalize_inherited_language_name`): the loader
-/// resolves `(cpp)` as `cpp`, so an installer that dropped it as an unsafe name
-/// would report success and leave the loader looking for a language nothing
-/// fetched.
-fn normalize_inherited_language_name(name: &str) -> String {
-    // Character for character what `query_loader` does, including only
-    // stripping a *matched* pair: on `(cpp` the loader looks for a language
-    // literally called `(cpp`, and an installer that helpfully fetched `cpp`
-    // would report success over a language it still cannot load.
-    name.strip_prefix('(')
-        .and_then(|name| name.strip_suffix(')'))
-        .unwrap_or(name)
-        .trim()
-        .to_string()
-}
-
-/// Parse the `; inherits: lang1,lang2` directive from query content.
-/// Returns the list of parent languages, dropping unsafe names
+/// The parents named by the `; inherits:` directive, dropping unsafe names
 /// (see [`is_safe_language_name`]).
+///
+/// Reads the directive through the same parser as the query loader: the loader
+/// resolves `(cpp)` as `cpp`, so an installer that read the line differently
+/// and dropped it as an unsafe name would report success and leave the loader
+/// looking for a language nothing fetched.
 fn parse_inherits_directive(content: &str) -> Vec<String> {
-    let first_line = content.lines().next().unwrap_or("");
-    if let Some(rest) = first_line.strip_prefix("; inherits:") {
-        rest.split(',')
-            .map(|s| normalize_inherited_language_name(s.trim()))
-            .filter(|s| !s.is_empty())
-            .filter(|s| {
-                let safe = is_safe_language_name(s);
-                if !safe {
-                    // Debug-format: the name is untrusted input and could
-                    // smuggle ANSI escapes into the terminal if printed raw.
-                    eprintln!("Warning: ignoring unsafe inherited language name {:?}", s);
-                }
-                safe
-            })
-            .collect()
-    } else {
-        Vec::new()
-    }
+    crate::language::query_modeline::parse_inherits_directive(content)
+        .into_iter()
+        .filter(|s| {
+            let safe = is_safe_language_name(s);
+            if !safe {
+                // Debug-format: the name is untrusted input and could
+                // smuggle ANSI escapes into the terminal if printed raw.
+                eprintln!("Warning: ignoring unsafe inherited language name {:?}", s);
+            }
+            safe
+        })
+        .collect()
 }
 
 /// Download and install query files for a language, including inherited dependencies.

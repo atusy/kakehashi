@@ -1,4 +1,5 @@
 use crate::error::{LspError, LspResult};
+use crate::language::query_modeline::{parse_inherits_directive, starts_with_inherits_directive};
 use log::warn;
 use path_clean::PathClean;
 use std::fmt::Write;
@@ -8,7 +9,6 @@ use tree_sitter::{Language, Query};
 
 /// Parser library file extensions for different platforms
 const PARSER_EXTENSIONS: &[&str] = &["so", "dylib", "dll"];
-const INHERITS_DIRECTIVE_PREFIX: &str = "; inherits:";
 
 /// Information about a pattern that was skipped during tolerant parsing.
 ///
@@ -144,7 +144,7 @@ impl QueryLoader {
         };
 
         // Parse inheritance directive
-        let parents = Self::parse_inherits_directive(&content);
+        let parents = parse_inherits_directive(&content);
 
         // Build combined query: parents first, then child
         let mut combined = String::new();
@@ -168,28 +168,11 @@ impl QueryLoader {
 
     /// Remove the `; inherits:` line from query content.
     fn strip_inherits_directive(content: &str) -> String {
-        let first_line = content.lines().next().unwrap_or("");
-        if first_line.starts_with(INHERITS_DIRECTIVE_PREFIX) {
+        if starts_with_inherits_directive(content) {
             // Skip the first line
             content.lines().skip(1).collect::<Vec<_>>().join("\n")
         } else {
             content.to_string()
-        }
-    }
-
-    /// Parse the `; inherits: lang1,lang2` directive from query content.
-    ///
-    /// nvim-treesitter queries declare inheritance via this first-line directive;
-    /// returns the parent language names (empty if absent).
-    fn parse_inherits_directive(content: &str) -> Vec<String> {
-        let first_line = content.lines().next().unwrap_or("");
-        if let Some(rest) = first_line.strip_prefix(INHERITS_DIRECTIVE_PREFIX) {
-            rest.split(',')
-                .map(|s| normalize_inherited_language_name(s.trim()))
-                .filter(|s| !s.is_empty())
-                .collect()
-        } else {
-            Vec::new()
         }
     }
 
@@ -404,7 +387,7 @@ impl QueryLoader {
                 e
             ))
         })?;
-        let used_inheritance = !Self::parse_inherits_directive(&original_content).is_empty();
+        let used_inheritance = !parse_inherits_directive(&original_content).is_empty();
 
         let mut visited = std::collections::HashSet::new();
         let query_str = Self::resolve_query_recursive(
@@ -485,14 +468,6 @@ fn is_single_path_component(value: &str) -> bool {
     let mut components = Path::new(value).components();
     matches!(components.next(), Some(Component::Normal(name)) if name == value)
         && components.next().is_none()
-}
-
-fn normalize_inherited_language_name(name: &str) -> String {
-    name.strip_prefix('(')
-        .and_then(|name| name.strip_suffix(')'))
-        .unwrap_or(name)
-        .trim()
-        .to_string()
 }
 
 #[cfg(test)]
@@ -784,13 +759,6 @@ mod tests {
         assert!(result.contains("(string) @string"));
     }
 
-    #[test]
-    fn parse_inherits_directive_strips_parenthesized_language_names() {
-        let parents = QueryLoader::parse_inherits_directive("; inherits: c, (cpp), (cuda)\n");
-
-        assert_eq!(parents, vec!["c", "cpp", "cuda"]);
-    }
-
     /// Create a directory with non-UTF-8 bytes in its name under the given temp dir.
     #[cfg(unix)]
     fn create_non_utf8_base(dir: &tempfile::TempDir) -> PathBuf {
@@ -908,38 +876,6 @@ mod tests {
     }
 
     // Tests for query inheritance
-
-    #[test]
-    fn test_parse_inherits_directive_single() {
-        // TypeScript inherits from ecma
-        let content = "; inherits: ecma\n\n\"require\" @keyword.import\n";
-        let result = QueryLoader::parse_inherits_directive(content);
-        assert_eq!(result, vec!["ecma"]);
-    }
-
-    #[test]
-    fn test_parse_inherits_directive_multiple() {
-        // JavaScript inherits from ecma and jsx
-        let content = "; inherits: ecma,jsx\n\n(identifier) @variable\n";
-        let result = QueryLoader::parse_inherits_directive(content);
-        assert_eq!(result, vec!["ecma", "jsx"]);
-    }
-
-    #[test]
-    fn test_parse_inherits_directive_none() {
-        // ecma has no inheritance
-        let content = "(identifier) @variable\n";
-        let result = QueryLoader::parse_inherits_directive(content);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_parse_inherits_directive_with_spaces() {
-        // Handle spaces around language names
-        let content = "; inherits: ecma , jsx\n";
-        let result = QueryLoader::parse_inherits_directive(content);
-        assert_eq!(result, vec!["ecma", "jsx"]);
-    }
 
     #[test]
     fn test_resolve_query_no_inheritance() {
