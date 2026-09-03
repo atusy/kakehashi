@@ -13,11 +13,11 @@ pub(crate) use code_action::{
     CodeActionEnvelope, UpstreamCodeActionCaps, bridge_code_actions, extract_code_action_envelope,
     parse_code_actions_leniently,
 };
-pub(crate) use code_lens::{
-    CodeLensEnvelope, envelope_host_code_lenses, extract_code_lens_envelope,
-};
+pub(crate) use code_lens::{envelope_host_code_lenses, extract_code_lens_envelope};
 mod completion;
-pub(crate) use completion::{KakehashiEnvelope, bridge_host_completion_items, extract_envelope};
+pub(crate) use completion::{
+    EnvelopeOffset, KakehashiEnvelope, bridge_host_completion_items, extract_envelope,
+};
 mod completion_item;
 mod declaration;
 mod definition;
@@ -29,9 +29,7 @@ pub(crate) use did_open::{OpenExpectation, OpenOutcome};
 mod document_color;
 mod document_highlight;
 mod document_link;
-pub(crate) use document_link::{
-    DocumentLinkEnvelope, envelope_host_document_links, extract_document_link_envelope,
-};
+pub(crate) use document_link::{envelope_host_document_links, extract_document_link_envelope};
 mod document_symbol;
 mod folding_range;
 mod formatting;

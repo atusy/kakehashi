@@ -3,11 +3,14 @@
 //! Shared by translators of inbound (downstream → editor) payloads that must
 //! map virtual-document coordinates back to the host document —
 //! `window/showDocument` ([`ShowDocumentTranslator`]) and `workspace/applyEdit`
-//! ([`ApplyEditTranslator`]). The offset is rebuilt exactly as the goto request
-//! path does (`region_id → node byte range → resolve injection → RegionOffset`),
-//! so inbound translation can't disagree with goto on the same region. The
-//! region's content-precise host end and contiguity are returned alongside so
-//! an edit translator can reject a range that escapes the region or targets a
+//! ([`ApplyEditTranslator`]) — and by the `*/resolve` staleness gates
+//! (completion, code action, code lens, document link), which compare the
+//! rebuilt offset against the snapshot their envelope carries. The offset is
+//! rebuilt exactly as the goto request path does (`region_id → node byte
+//! range → resolve injection → RegionOffset`), so neither inbound translation
+//! nor a resolve gate can disagree with goto on the same region. The region's
+//! content-precise host end and contiguity are returned alongside so an edit
+//! translator can reject a range that escapes the region or targets a
 //! combined document with masked host gaps.
 //!
 //! [`ShowDocumentTranslator`]: super::show_document_translation::ShowDocumentTranslator
@@ -18,10 +21,56 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::Position;
 use url::Url;
 
+use super::Kakehashi;
 use crate::document::DocumentStore;
 use crate::language::injection::ResolvedInjection;
 use crate::language::{InjectionResolver, LanguageCoordinator};
-use crate::lsp::bridge::{BridgeCoordinator, RegionOffset, region_host_end};
+use crate::lsp::bridge::{BridgeCoordinator, EnvelopeOffset, RegionOffset, region_host_end};
+
+impl Kakehashi {
+    /// Whether the injection region a resolve envelope names still resolves
+    /// to the offset snapshot the envelope carries.
+    ///
+    /// Re-resolves the region from the live parse and compares the WHOLE
+    /// effective offset (start line plus every per-line column offset), so a
+    /// region that moved, was invalidated, or had an interior blockquote
+    /// prefix edited is reported stale — translating the resolved payload with
+    /// the snapshot offset would bind it to wrong host coordinates then. The
+    /// live offset is the same `#offset!`/`#trim!`-adjusted geometry the
+    /// envelope was minted from, so regions under those directives (markdown
+    /// frontmatter, blockquote prose) compare equal while unchanged.
+    ///
+    /// The code-lens and document-link gates ask exactly this question and
+    /// share this one answer, so they cannot drift. Completion and code
+    /// action need the region end and contiguity as well, so they call
+    /// [`resolve_region_offset`] directly and compare the same offset.
+    ///
+    /// Contiguity is deliberately NOT required here. A non-contiguous
+    /// combined region masks its host gaps with whitespace, so its line
+    /// geometry — and therefore range translation — stays valid; only
+    /// edit-carrying methods are refused on such regions
+    /// (`method_requires_contiguous_injection`), and code lenses and document
+    /// links are minted for them on purpose. Refusing to resolve what was
+    /// deliberately produced would leave those items permanently unresolved.
+    pub(super) fn region_offset_is_fresh(
+        &self,
+        host_uri: &str,
+        region_id: &str,
+        offset: &EnvelopeOffset,
+    ) -> bool {
+        let Ok(host_url) = Url::parse(host_uri) else {
+            return false;
+        };
+        resolve_region_offset(
+            &self.documents,
+            &self.language,
+            &self.bridge,
+            &host_url,
+            region_id,
+        )
+        .is_some_and(|(live_offset, _, _)| live_offset == RegionOffset::from(offset))
+    }
+}
 
 /// Rebuild the region's current host offset from the live parse, keyed by its
 /// `region_id` (a ULID in production). Returns `None` when the offset can't be
