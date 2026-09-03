@@ -317,6 +317,9 @@ impl LanguageServerPool {
             re_envelope_hint(&mut hint, &envelope);
             return hint;
         }
+        // The producer stamps generation, key and incarnation on every
+        // envelope; a `None` here can only come back from a client-mangled or
+        // legacy echo and fails soft like any other stale one.
         let Some(expected_generation) = envelope.connection_generation else {
             re_envelope_hint(&mut hint, &envelope);
             return hint;
