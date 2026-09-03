@@ -517,9 +517,7 @@ mod tests {
             .map(|resolved| resolved.content)
             .map_err(|e| match e {
                 QueryLoadError::Other(e) => e,
-                QueryLoadError::NotFound => LspError::query(format!(
-                    "Query file {file_name} not found for language {lang_name}"
-                )),
+                not_found @ QueryLoadError::NotFound => LspError::query(not_found.to_string()),
             })
     }
 
