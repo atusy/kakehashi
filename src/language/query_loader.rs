@@ -190,11 +190,13 @@ impl QueryLoader {
             // overlay, not a parent of itself.
             let mut extends = modeline.extends;
             for parent in modeline.inherits {
-                if parent.name == lang_name {
-                    extends = true;
-                } else if parent.optional && is_included {
+                if parent.optional && is_included {
                     // `(cpp)`: inherited when this file is loaded for its own
                     // language, not when the file is itself being inherited.
+                    // Neovim skips the entry before looking at it at all, so
+                    // an optional self-name does not mark an overlay either.
+                } else if parent.name == lang_name {
+                    extends = true;
                 } else if !parents.iter().any(|(name, _)| *name == parent.name) {
                     parents.push((parent.name, path));
                 }
@@ -1248,6 +1250,36 @@ mod tests {
         fs::remove_file(base.path().join("queries/cpp/highlights.scm")).unwrap();
         assert!(resolve_query(&bases, "cuda", "highlights.scm").is_ok());
         assert!(resolve_query(&bases, "c", "highlights.scm").is_err());
+    }
+
+    /// Neovim skips a parenthesized entry of an inherited file before
+    /// looking at it, so `; inherits: (c)` in c's own file marks an overlay
+    /// when c is loaded for itself but not when c is reached as a parent —
+    /// there the file is c's base, shadowing a plain c in a later path.
+    #[test]
+    fn an_optional_self_name_marks_an_overlay_only_at_the_top_of_the_chain() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        write_highlights(first.path(), "c", "; inherits: (c)\n(identifier) @first\n");
+        write_highlights(second.path(), "c", "(string_literal) @second\n");
+        write_highlights(
+            second.path(),
+            "cuda",
+            "; inherits: c\n(boolean_literal) @cuda\n",
+        );
+
+        let bases = [first.path().to_path_buf(), second.path().to_path_buf()];
+        let c = resolve_query(&bases, "c", "highlights.scm").unwrap();
+        assert!(
+            position(&c, "@second") < position(&c, "@first"),
+            "loaded for itself, the self-naming file is an overlay on the plain one:\n{c}"
+        );
+        let cuda = resolve_query(&bases, "cuda", "highlights.scm").unwrap();
+        assert!(cuda.contains("@first"), "{cuda}");
+        assert!(
+            !cuda.contains("@second"),
+            "reached as a parent, the self-naming file is c's base and shadows the other:\n{cuda}"
+        );
     }
 
     #[test]
