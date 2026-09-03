@@ -133,11 +133,13 @@ impl QueryLoader {
     /// overlays`. Modelines stay in place: tree-sitter reads them as comments,
     /// and keeping them keeps each file's line numbers intact.
     ///
-    /// One departure from `get_files`, on purpose: a parent named more than
-    /// once — twice on a line, or by the base and an overlay both — is
-    /// concatenated once. Neovim appends it each time, and every pattern in
-    /// it then matches twice; nothing relies on that, and no nvim-treesitter
-    /// query repeats a name.
+    /// One departure from `get_files`, on purpose: a language reached more
+    /// than once — named twice on a line, by the base and an overlay both, or
+    /// as the shared ancestor of two parents — is concatenated once. Neovim
+    /// appends it each time, and every pattern in it then matches twice;
+    /// nothing relies on that, and no nvim-treesitter query set has such a
+    /// shape. `emitted` is the set of languages already concatenated in this
+    /// resolution.
     ///
     /// `is_included` says the language is being resolved as a parent of
     /// another rather than for itself; Neovim's `get_files(lang, name,
@@ -146,15 +148,16 @@ impl QueryLoader {
     ///
     /// `visited` holds the languages on the current inheritance path so a
     /// cycle is an error; a language leaves it on the way back out so a
-    /// diamond (two parents sharing an ancestor) resolves, as in Neovim. No
-    /// error path removes anything: every error propagates straight to the
-    /// top-level call, which owns the set and drops it.
+    /// diamond (two parents sharing an ancestor) resolves. No error path
+    /// removes anything: every error propagates straight to the top-level
+    /// call, which owns both sets and drops them.
     fn resolve_query_recursive<P: AsRef<Path>>(
         runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
         is_included: bool,
         visited: &mut std::collections::HashSet<String>,
+        emitted: &mut std::collections::HashSet<String>,
     ) -> Result<ResolvedQuery, QueryLoadError> {
         if visited.contains(lang_name) {
             return Err(LspError::query(format!(
@@ -217,12 +220,16 @@ impl QueryLoader {
         let mut file_count = usize::from(base.is_some()) + overlays.len();
         let mut combined = String::new();
         for (parent, declared_in) in &parents {
+            if emitted.contains(parent) {
+                continue;
+            }
             let resolved = match Self::resolve_query_recursive(
                 runtime_bases,
                 parent,
                 file_name,
                 true,
                 visited,
+                emitted,
             ) {
                 Ok(resolved) => resolved,
                 Err(QueryLoadError::NotFound) => {
@@ -241,6 +248,7 @@ impl QueryLoader {
             combined.push_str(&resolved.content);
             combined.push('\n');
             file_count += resolved.file_count;
+            emitted.insert(parent.clone());
         }
         for content in base.into_iter().chain(overlays) {
             combined.push_str(&content);
@@ -438,12 +446,14 @@ impl QueryLoader {
         file_name: &str,
     ) -> Result<ParseResult, QueryLoadError> {
         let mut visited = std::collections::HashSet::new();
+        let mut emitted = std::collections::HashSet::new();
         let resolved = Self::resolve_query_recursive(
             runtime_bases,
             lang_name,
             file_name,
             false,
             &mut visited,
+            &mut emitted,
         )?;
         Ok(Self::parse_query(
             language,
@@ -537,12 +547,14 @@ mod tests {
         file_name: &str,
     ) -> LspResult<String> {
         let mut visited = std::collections::HashSet::new();
+        let mut emitted = std::collections::HashSet::new();
         QueryLoader::resolve_query_recursive(
             runtime_bases,
             lang_name,
             file_name,
             false,
             &mut visited,
+            &mut emitted,
         )
         .map(|resolved| resolved.content)
         .map_err(|e| match e {
@@ -1282,6 +1294,42 @@ mod tests {
         );
     }
 
+    /// A base and an overlay may inherit different parents that share an
+    /// ancestor; that ancestor's patterns must not be compiled twice.
+    #[test]
+    fn a_shared_ancestor_of_base_and_overlay_parents_is_concatenated_once() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "shared", "(identifier) @shared\n");
+        write_highlights(
+            base.path(),
+            "a",
+            "; inherits: shared\n(string_literal) @a\n",
+        );
+        write_highlights(
+            base.path(),
+            "b",
+            "; inherits: shared\n(raw_string_literal) @b\n",
+        );
+        write_highlights(
+            base.path(),
+            "child",
+            "; inherits: a\n(boolean_literal) @child\n",
+        );
+        write_highlights(
+            overlay.path(),
+            "child",
+            ";; extends\n;; inherits: b\n(integer_literal) @overlay\n",
+        );
+
+        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        let content = resolve_query(&bases, "child", "highlights.scm").unwrap();
+        assert_eq!(content.matches("@shared").count(), 1, "{content}");
+        for capture in ["@a", "@b", "@child", "@overlay"] {
+            assert_eq!(content.matches(capture).count(), 1, "{capture}:\n{content}");
+        }
+    }
+
     #[test]
     fn a_parent_named_by_both_base_and_overlay_is_concatenated_once() {
         let base = tempdir().unwrap();
@@ -1501,7 +1549,11 @@ mod tests {
             result.err()
         );
         let content = result.unwrap();
-        assert!(content.contains("(identifier) @shared"));
+        assert_eq!(
+            content.matches("(identifier) @shared").count(),
+            1,
+            "a shared ancestor is concatenated once, not once per path to it:\n{content}"
+        );
         assert!(content.contains("(string_literal) @parent_a"));
         assert!(content.contains("(raw_string_literal) @parent_b"));
         assert!(content.contains("(boolean_literal) @child"));
