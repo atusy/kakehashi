@@ -624,10 +624,11 @@ mod tests {
 
     #[test]
     fn resolve_query_rejects_traversing_inherits_parent() {
-        // The parent language name comes from the first line of an on-disk query
-        // file, so it is the content-driven route into find_query_file -- and
-        // parse_inherits_directive, unlike its install-side twin, applies no
-        // filter of its own.
+        // A parent language name comes from a modeline in an on-disk query
+        // file, so it is the content-driven route into the search paths. The
+        // modeline grammar admits only `[a-z0-9_]+` names, and the lookup
+        // itself rejects anything but a single path component; either alone
+        // must keep the smuggled content out of the combined query.
         let dir = tempdir().unwrap();
         let runtime = dir.path().join("runtime");
 
@@ -643,13 +644,16 @@ mod tests {
         )
         .unwrap();
 
-        let result = resolve_query(&[runtime], "child", "highlights.scm");
-
-        // An unresolvable parent fails the whole child query; what matters is
-        // that the smuggled content never reaches the combined output.
+        let content = resolve_query(&[runtime], "child", "highlights.scm")
+            .expect("a traversal-shaped modeline is a comment, and the child loads");
+        assert!(content.contains("@string"));
         assert!(
-            result.is_err(),
-            "expected traversal to fail, got {result:?}"
+            !content.contains("@smuggled"),
+            "content outside queries/ must never reach the combined query:\n{content}"
+        );
+        assert!(
+            QueryLoader::find_query_files(&[dir.path()], "../outside", "highlights.scm").is_empty(),
+            "and the lookup gate holds on its own, without the grammar"
         );
     }
 

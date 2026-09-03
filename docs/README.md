@@ -317,7 +317,12 @@ kakehashi reads the comment modelines Neovim documents under
 `:h treesitter-query-modeline`, with Neovim's grammar: any run of `;`, any
 spacing, the colon after `inherits` optional, and directives may repeat. The
 modeline block is the run of `;` lines at the top of the file; the first line
-that does not start with `;` — a blank line included — ends it.
+that does not start with `;` — a blank line included — ends it. The list
+after `inherits` is one run of comma-separated names with no whitespace in
+it, each name `[a-z0-9_]+` (Neovim's own class has no digits; kakehashi adds
+them for languages such as `m68k`). A `;` line that says anything else after
+the keyword — `; inherits the ecma queries` — is a comment, as in Neovim, not
+a parent that fails to load.
 
 ```query
 ;; inherits: ecma,jsx

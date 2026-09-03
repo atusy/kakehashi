@@ -1,5 +1,6 @@
 //! Query file downloading from nvim-treesitter repository.
 
+use crate::language::query_modeline::parse_modeline;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -132,18 +133,7 @@ pub struct QueryInstallResult {
     pub files_downloaded: Vec<String>,
 }
 
-/// Whether a language name is safe to use as a path and URL segment.
-///
-/// Language names are used as path segments (`queries/<name>/`) and URL
-/// segments, so anything outside nvim-treesitter's `[a-z0-9_]+` naming is
-/// rejected: a name like `../../x` (from a caller or a `; inherits:` line in
-/// a compromised or custom query source) must not escape the data dir.
-pub fn is_safe_language_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-}
+pub use crate::language::query_modeline::is_safe_language_name;
 
 fn validate_safe_language_name(language: &str) -> Result<(), QueryInstallError> {
     if is_safe_language_name(language) {
@@ -172,7 +162,7 @@ fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<String>> {
             // saw, so say the chain cannot be determined instead.
             Err(_) => return None,
         };
-        for parent in parse_inherits_directive(&content) {
+        for parent in parse_modeline(&content).inherits {
             if !parents.contains(&parent) {
                 parents.push(parent);
             }
@@ -228,29 +218,6 @@ pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec
 
     let mut guards = Vec::new();
     walk(data_dir, language, &mut Vec::new(), &mut guards).then_some(guards)
-}
-
-/// The parents named by the `; inherits:` directive, dropping unsafe names
-/// (see [`is_safe_language_name`]).
-///
-/// Reads the directive through the same parser as the query loader: the loader
-/// resolves `(cpp)` as `cpp`, so an installer that read the line differently
-/// and dropped it as an unsafe name would report success and leave the loader
-/// looking for a language nothing fetched.
-fn parse_inherits_directive(content: &str) -> Vec<String> {
-    crate::language::query_modeline::parse_modeline(content)
-        .inherits
-        .into_iter()
-        .filter(|s| {
-            let safe = is_safe_language_name(s);
-            if !safe {
-                // Debug-format: the name is untrusted input and could
-                // smuggle ANSI escapes into the terminal if printed raw.
-                eprintln!("Warning: ignoring unsafe inherited language name {:?}", s);
-            }
-            safe
-        })
-        .collect()
 }
 
 /// Download and install query files for a language, including inherited dependencies.
@@ -975,7 +942,7 @@ fn stage_queries_recursive(
                 // Every query kind resolves its own `; inherits:` chain at load
                 // time, so a parent named by injections.scm is as load-bearing
                 // as one named by highlights.scm.
-                for parent in parse_inherits_directive(&content) {
+                for parent in parse_modeline(&content).inherits {
                     if !parents_to_install.contains(&parent) {
                         parents_to_install.push(parent);
                     }
@@ -2967,46 +2934,32 @@ mod tests {
     }
 
     /// Inherited language names become path segments (`queries/<name>/`) and
-    /// URL segments, so anything outside nvim-treesitter's `[a-z0-9_]+`
-    /// naming must be dropped — `; inherits: ../../x` from a compromised or
-    /// custom query source must not escape the data dir.
-    /// nvim-treesitter parenthesizes some inherited names, and the query loader
-    /// resolves `(cpp)` as `cpp`. An installer that read it any other way would
-    /// report success and leave the loader looking for a language nothing
-    /// fetched.
+    /// URL segments. The modeline grammar itself admits only `[a-z0-9_]+`
+    /// names — a line naming `../../x` is a comment, not a parent — and that
+    /// grammar is the one the query loader reads, so what the installer walks
+    /// is exactly what the loader will look for, in every form Neovim
+    /// accepts: repeated `;`, no colon, a directive on the second line of
+    /// the block, and parenthesized names read as bare ones.
     #[test]
-    fn parse_inherits_directive_strips_parentheses_like_the_loader() {
-        assert_eq!(
-            parse_inherits_directive("; inherits: c, (cpp), (cuda)\n"),
-            vec!["c".to_string(), "cpp".to_string(), "cuda".to_string()]
-        );
-    }
+    fn on_disk_parents_follow_the_shared_modeline_grammar() {
+        let temp_dir = TempDir::new().unwrap();
+        let queries_dir = temp_dir.path().join("queries").join("child");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(
+            queries_dir.join("highlights.scm"),
+            ";; extends\n;; inherits c,(cpp)\n(comment) @comment\n",
+        )
+        .unwrap();
+        fs::write(
+            queries_dir.join("injections.scm"),
+            "; inherits: ../../evil, html_tags\n; inherits: c3\n(comment) @injection.content\n",
+        )
+        .unwrap();
 
-    /// Only a matched pair is a wrapper. An unmatched one is part of the name
-    /// as far as the loader is concerned, so it must be part of it here too —
-    /// and such a name is then rejected as unsafe rather than turned into a
-    /// different language's.
-    #[test]
-    fn parse_inherits_directive_keeps_unmatched_parentheses() {
-        assert!(
-            parse_inherits_directive("; inherits: (cpp\n").is_empty(),
-            "an unmatched leading parenthesis is part of the name, and unsafe"
-        );
-        assert!(
-            parse_inherits_directive("; inherits: cpp)\n").is_empty(),
-            "and so is an unmatched trailing one"
-        );
-    }
-
-    #[test]
-    fn parse_inherits_directive_drops_unsafe_language_names() {
-        let parents = parse_inherits_directive(
-            "; inherits: ../../evil, html_tags, UPPER, with-dash, c3\n(comment) @comment\n",
-        );
         assert_eq!(
-            parents,
-            vec!["html_tags".to_string(), "c3".to_string()],
-            "only lowercase/digit/underscore names may survive"
+            inherited_languages_on_disk(&queries_dir),
+            Some(vec!["c".to_string(), "cpp".to_string(), "c3".to_string()]),
+            "a line whose operand is not a name list is a comment, the rest are parents"
         );
     }
 
