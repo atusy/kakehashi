@@ -307,7 +307,8 @@ enum Role {
 /// document), and pull diagnostics.
 /// `textDocument/codeAction` is in the same class: its
 /// `context.diagnostics` and returned edits are computed against the
-/// document snapshot (#568). `codeLens/resolve`, `codeAction/resolve`,
+/// document snapshot (#568), and so is `textDocument/inlayHint`, whose
+/// accept-time edits and resolve stamp are computed against it. `codeLens/resolve`, `codeAction/resolve`,
 /// `documentLink/resolve`, and `inlayHint/resolve` are readers too (#355, #568):
 /// their freshness gates read tracker/document
 /// state, so they must observe every `didChange` that preceded them on the
@@ -353,6 +354,7 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/rename"
         | "textDocument/prepareRename"
         | "textDocument/codeAction"
+        | "textDocument/inlayHint"
         | "textDocument/diagnostic"
         | "kakehashi/captures/full"
         | "kakehashi/captures/full/delta"
