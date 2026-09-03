@@ -5,8 +5,9 @@
 //! under the requested range, the host layer (host-document-bridge) bridges
 //! the host document itself with the real URI and its coordinates verbatim.
 //! Either layer re-keys label-part commands for `workspace/executeCommand`
-//! routing and envelopes `data` for `inlayHint/resolve` routing. The first
-//! layer producing a non-empty result wins (`preferred`).
+//! routing and, when the producer advertises `inlayHint/resolve` (or its
+//! payload occupies the reserved key), envelopes `data` for resolve routing.
+//! The first layer producing a non-empty result wins (`preferred`).
 //!
 //! `inlayHint/resolve` gates the echoed envelope on freshness (content
 //! version, and for the virt layer the live region offset and contiguity),
