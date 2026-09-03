@@ -89,7 +89,8 @@ Partially implemented:
   opaque data. Every host-content revision invalidates a produced hint even
   when the edit preserves the region's shape; this revision check runs both
   before downstream dispatch and after its response. Runtime-adjusted region
-  geometry (`#offset!` / `#trim!`) also participates in freshness checks, and
+  geometry (`#offset!` / `#trim!`) also participates in the pre-dispatch
+  freshness check, and
   non-contiguous combined injections fail soft before dispatch because a lazy
   edit could otherwise cross a masked host-only gap. Safe resolves apply the
   same all-or-nothing edit guard as initial hint retrieval.
