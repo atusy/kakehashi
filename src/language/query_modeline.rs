@@ -32,7 +32,7 @@
 //! [`is_safe_language_name`] is the one definition both sides use.
 
 /// What the modeline block at the top of a query file declares.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct QueryModeline {
     /// Parent languages named by `inherits` directives, in declaration order,
     /// each at most once.
