@@ -53,7 +53,9 @@ pub(crate) struct QueryModeline {
 pub(crate) fn parse_modeline(content: &str) -> QueryModeline {
     let mut modeline = QueryModeline::default();
     for line in content.lines().take_while(|line| line.starts_with(';')) {
-        let directive = line.trim_start_matches(';').trim();
+        let directive = line
+            .trim_start_matches(';')
+            .trim_matches(|c: char| c.is_ascii_whitespace());
         if directive == "extends" {
             modeline.extends = true;
         } else if let Some(names) = inherits_operand(directive) {
@@ -80,8 +82,16 @@ pub(crate) fn parse_modeline(content: &str) -> QueryModeline {
 /// Neovim would look such an entry up and find nothing; skipping it here
 /// keeps a parent that cannot exist from failing the whole query.
 fn inherits_operand(directive: &str) -> Option<Vec<String>> {
-    let rest = directive.strip_prefix("inherits")?.trim_start();
-    let operand = rest.strip_prefix(':').unwrap_or(rest).trim_start();
+    // Lua's `%s` is ASCII whitespace; a U+3000 before the keyword keeps the
+    // line a comment in Neovim, so it does here.
+    let ascii_space = |c: char| c.is_ascii_whitespace();
+    let rest = directive
+        .strip_prefix("inherits")?
+        .trim_start_matches(ascii_space);
+    let operand = rest
+        .strip_prefix(':')
+        .unwrap_or(rest)
+        .trim_start_matches(ascii_space);
     let is_list_char = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_,()".contains(&b);
     if operand.is_empty() || !operand.bytes().all(is_list_char) {
         return None;
@@ -229,6 +239,10 @@ mod tests {
         assert!(inherits("; inherits\n").is_empty());
         assert!(!parse_modeline("; extendsfoo\n").extends);
         assert!(!parse_modeline("; extends foo\n").extends);
+        // Lua's `%s` is ASCII: ideographic space and NBSP are not spacing.
+        assert!(inherits(";\u{3000}inherits: ecma\n").is_empty());
+        assert!(inherits("; inherits:\u{a0}ecma\n").is_empty());
+        assert!(!parse_modeline(";\u{3000}extends\n").extends);
     }
 
     #[test]
