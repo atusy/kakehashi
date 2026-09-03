@@ -2,7 +2,8 @@
 //!
 //! The first test drives `textDocument/inlayHint` for a Lua block in Markdown
 //! through a real lua-language-server (skipped when it is not in PATH) and
-//! checks the hints come back in host coordinates. The other tests drive
+//! checks the request succeeds, with any hints inside the block's host
+//! lines. The other tests drive
 //! `inlayHint/resolve` through the mock server's `inlay-hint-*` modes (see
 //! `tests/bin/mock_formatter.rs`) and between them cover both the injection
 //! and host layers: routing back to the exact producer, coordinate reversal,
