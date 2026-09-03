@@ -435,6 +435,65 @@ fn e2e_inlay_hint_resolve_discards_response_after_same_shape_edit() {
     shutdown_client(&mut client);
 }
 
+/// The bridge releases the host lifecycle once the resolve is enqueued, so a
+/// close and reopen can complete while the downstream is still answering.
+/// The reopened document restarts its content version at the value the hint
+/// was minted with, so the host incarnation is the only stamp left to
+/// refuse the reply.
+#[test]
+fn e2e_inlay_hint_resolve_discards_response_after_reopen_during_wait() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-reopen-delayed-resolve", "lua", false, None);
+    let uri = "file:///test_inlay_hint_resolve_reopen_during_wait.md";
+    let open = json!({ "textDocument": {
+        "uri": uri,
+        "languageId": "markdown",
+        "version": 1,
+        "text": "```lua\nlocal x = 1\n```\n"
+    }});
+    client.send_notification("textDocument/didOpen", open.clone());
+    let hint = inlay_hints_with_retry(&mut client, uri, 1, 3).remove(0);
+    assert_eq!(hint["data"]["kakehashi"]["content_version"], json!(0));
+
+    let request_id = client.send_request_async("inlayHint/resolve", hint.clone());
+    wait_for_resolve_started(&mut client);
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    client.send_notification("textDocument/didOpen", open);
+    // The mock answers the parked resolve when the reopened document asks for
+    // hints again, so the reply is evaluated against the reopened
+    // incarnation. This request is only that trigger; its own reply is not
+    // awaited, so it cannot swallow the resolve reply.
+    let _trigger = client.send_request_async(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 1, "character": 0 },
+                "end": { "line": 3, "character": 0 }
+            }
+        }),
+    );
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(response["result"], hint, "{response}");
+
+    // The reopened document mints under a new incarnation but the same
+    // content version, so the incarnation is what refused the reply above.
+    let reopened = inlay_hints_with_retry(&mut client, uri, 1, 3).remove(0);
+    assert_eq!(
+        reopened["data"]["kakehashi"]["content_version"],
+        hint["data"]["kakehashi"]["content_version"]
+    );
+    assert_ne!(
+        reopened["data"]["kakehashi"]["incarnation"],
+        hint["data"]["kakehashi"]["incarnation"]
+    );
+
+    shutdown_client(&mut client);
+}
+
 #[test]
 fn e2e_inlay_hint_resolve_rejects_live_non_contiguous_region_before_dispatch() {
     let marker_dir = tempfile::TempDir::new().expect("marker dir");

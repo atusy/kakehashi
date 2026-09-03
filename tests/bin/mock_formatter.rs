@@ -227,6 +227,7 @@ fn main() {
                     "inlay-hint-resolve"
                     | "inlay-hint-resolve-replacement"
                     | "inlay-hint-delayed-resolve"
+                    | "inlay-hint-reopen-delayed-resolve"
                     | "inlay-hint-slow-resolve" => json!({
                         "inlayHintProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
@@ -1487,6 +1488,15 @@ fn main() {
                 );
             }
             "textDocument/inlayHint" => {
+                // `inlay-hint-reopen-delayed-resolve`: the parked resolve is
+                // answered only once the editor has closed and reopened the
+                // host and asked for hints again, so the reply lands after
+                // the reopen was processed upstream.
+                if mode == "inlay-hint-reopen-delayed-resolve"
+                    && let Some((pending_id, pending_result)) = pending_inlay_resolve.take()
+                {
+                    respond(&mut writer, pending_id, pending_result);
+                }
                 let result = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
@@ -1579,7 +1589,9 @@ fn main() {
                     }],
                     "data": { "resolver": "must-not-replace-original-data" }
                 });
-                if mode == "inlay-hint-delayed-resolve" {
+                if mode == "inlay-hint-delayed-resolve"
+                    || mode == "inlay-hint-reopen-delayed-resolve"
+                {
                     notify(
                         &mut writer,
                         "window/logMessage",
