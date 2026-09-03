@@ -1,5 +1,5 @@
 use crate::error::{LspError, LspResult};
-use crate::language::query_modeline::{parse_inherits_directive, starts_with_inherits_directive};
+use crate::language::query_modeline::parse_modeline;
 use log::warn;
 use path_clean::PathClean;
 use std::fmt::Write;
@@ -117,10 +117,10 @@ impl QueryLoader {
 
     /// Resolve query inheritance and return the combined query content.
     ///
-    /// Recursively resolves parent queries, concatenating parents-first then child,
-    /// and removes the `; inherits:` directive. `preloaded_content` lets the caller
-    /// skip a re-read when it already has the content; `visited` guards against
-    /// circular inheritance.
+    /// Recursively resolves parent queries, concatenating parents-first then
+    /// child. The modeline stays in place: tree-sitter reads it as a comment.
+    /// `preloaded_content` lets the caller skip a re-read when it already has
+    /// the content; `visited` guards against circular inheritance.
     fn resolve_query_recursive<P: AsRef<Path>>(
         runtime_bases: &[P],
         lang_name: &str,
@@ -143,8 +143,7 @@ impl QueryLoader {
             None => Self::load_query_file(runtime_bases, lang_name, file_name)?,
         };
 
-        // Parse inheritance directive
-        let parents = parse_inherits_directive(&content);
+        let parents = parse_modeline(&content).inherits;
 
         // Build combined query: parents first, then child
         let mut combined = String::new();
@@ -157,23 +156,11 @@ impl QueryLoader {
             combined.push('\n');
         }
 
-        // Add child content (without the inherits directive line)
-        let child_content = Self::strip_inherits_directive(&content);
-        combined.push_str(&child_content);
+        combined.push_str(&content);
 
         visited.remove(lang_name);
 
         Ok(combined)
-    }
-
-    /// Remove the `; inherits:` line from query content.
-    fn strip_inherits_directive(content: &str) -> String {
-        if starts_with_inherits_directive(content) {
-            // Skip the first line
-            content.lines().skip(1).collect::<Vec<_>>().join("\n")
-        } else {
-            content.to_string()
-        }
     }
 
     /// Load query content from paths (without parsing).
@@ -387,7 +374,7 @@ impl QueryLoader {
                 e
             ))
         })?;
-        let used_inheritance = !parse_inherits_directive(&original_content).is_empty();
+        let used_inheritance = !parse_modeline(&original_content).inherits.is_empty();
 
         let mut visited = std::collections::HashSet::new();
         let query_str = Self::resolve_query_recursive(
@@ -973,29 +960,31 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_query_removes_directive() {
-        // The "; inherits:" line should be removed from output
+    fn test_resolve_query_keeps_the_modeline_as_an_inert_comment() {
+        // Nothing needs to strip the directive: tree-sitter reads a `;` line
+        // as a comment, and leaving it keeps the child's line numbers intact.
         let dir = tempdir().unwrap();
 
-        // Create ecma query
         let ecma_dir = dir.path().join("queries").join("ecma");
         fs::create_dir_all(&ecma_dir).unwrap();
         fs::write(ecma_dir.join("highlights.scm"), "(identifier) @variable\n").unwrap();
 
-        // Create typescript query with inherits
         let ts_dir = dir.path().join("queries").join("typescript");
         fs::create_dir_all(&ts_dir).unwrap();
         fs::write(
             ts_dir.join("highlights.scm"),
-            "; inherits: ecma\n\"require\" @keyword\n",
+            "; inherits: ecma\n(string_literal) @string\n",
         )
         .unwrap();
 
-        let result = resolve_query(&[dir.path().to_path_buf()], "typescript", "highlights.scm");
-        let content = result.unwrap();
-
-        // The inherits directive should not be in the output
-        assert!(!content.contains("; inherits:"));
+        let content =
+            resolve_query(&[dir.path().to_path_buf()], "typescript", "highlights.scm").unwrap();
+        assert!(content.contains("; inherits: ecma"));
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        assert!(
+            tree_sitter::Query::new(&language, &content).is_ok(),
+            "the directive must compile away as a comment"
+        );
     }
 
     #[test]
@@ -1034,11 +1023,8 @@ mod tests {
             "Should contain typescript patterns"
         );
 
-        // Should NOT have the inherits directive
-        assert!(
-            !content.contains("; inherits:"),
-            "Should strip inherits directive"
-        );
+        // The directive stays as a comment, so both languages' lines hold.
+        assert!(content.contains("; inherits:"));
     }
 
     #[test]
@@ -1106,11 +1092,8 @@ mod tests {
             "Should contain javascript patterns"
         );
 
-        // Should NOT have the inherits directive
-        assert!(
-            !content.contains("; inherits:"),
-            "Should strip inherits directive"
-        );
+        // The directive stays as a comment, so both languages' lines hold.
+        assert!(content.contains("; inherits:"));
     }
 
     // ============================================================

@@ -238,7 +238,8 @@ pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec
 /// and dropped it as an unsafe name would report success and leave the loader
 /// looking for a language nothing fetched.
 fn parse_inherits_directive(content: &str) -> Vec<String> {
-    crate::language::query_modeline::parse_inherits_directive(content)
+    crate::language::query_modeline::parse_modeline(content)
+        .inherits
         .into_iter()
         .filter(|s| {
             let safe = is_safe_language_name(s);

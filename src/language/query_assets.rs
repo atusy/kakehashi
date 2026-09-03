@@ -43,7 +43,7 @@ mod tests {
             chain.push(lang.to_string());
             let source = asset_source(lang);
             let mut combined = String::new();
-            for parent in crate::language::query_modeline::parse_inherits_directive(&source) {
+            for parent in crate::language::query_modeline::parse_modeline(&source).inherits {
                 combined.push_str(&resolve(&parent, chain));
                 combined.push('\n');
             }
