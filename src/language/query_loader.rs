@@ -190,7 +190,8 @@ impl QueryLoader {
             }
         }
 
-        let mut file_count = paths.len();
+        // A shadowed plain file contributed no text, so it does not count.
+        let mut file_count = usize::from(base.is_some()) + overlays.len();
         let mut combined = String::new();
         for parent in &parents {
             let resolved = match Self::resolve_query_recursive(
@@ -990,6 +991,7 @@ mod tests {
 
     #[test]
     fn a_second_plain_query_is_shadowed_by_the_first() {
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
         let first = tempdir().unwrap();
         let second = tempdir().unwrap();
         write_highlights(first.path(), "rust", "(identifier) @first\n");
@@ -1001,6 +1003,14 @@ mod tests {
         assert!(
             !content.contains("@second"),
             "a plain query in a later search path replaces nothing:\n{content}"
+        );
+
+        let parsed =
+            QueryLoader::load_query_with_inheritance(&language, &bases, "rust", "highlights.scm")
+                .unwrap();
+        assert!(
+            !parsed.combined,
+            "a shadowed file contributed nothing, so line numbers are the base file's own"
         );
     }
 
