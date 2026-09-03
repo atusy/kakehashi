@@ -1064,9 +1064,10 @@ impl LanguageCoordinator {
         // Log warnings for skipped patterns
         for skipped in &result.skipped {
             let preview = truncate_preview(&skipped.text, MAX_PREVIEW_LEN);
-            // When inheritance is used, line numbers refer to the combined query,
-            // not the original source file
-            let line_note = if result.used_inheritance {
+            // When several files were combined (inherits parents, extends
+            // overlays), line numbers refer to the combined query, not any
+            // one source file
+            let line_note = if result.combined {
                 " (in combined query)"
             } else {
                 ""
