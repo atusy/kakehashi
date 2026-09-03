@@ -409,7 +409,7 @@ the miss policy keeps the resolver silent.
 * The dead `QueryKind::Locals` pipeline is retired instead of accumulating
   semantics by accident.
 * Query loading reuses the proven captures-protocol machinery wholesale:
-  `searchPaths` resolution, `; inherits:`, tolerant per-pattern compilation,
+  `searchPaths` resolution, `inherits`/`extends` modelines, tolerant per-pattern compilation,
   static `#set!` parsing.
 
 ### Negative
@@ -487,7 +487,7 @@ Implemented: `QueryKind::Bindings` replaces the removed `Locals` end-to-end
 resolution algorithm; the native layer feeds
 definition/references/documentHighlight/rename/prepareRename through the
 cross-layer walk's `native` slot. `bindings.scm` files load from
-`searchPaths` like any other query asset, with per-file `; inherits:`
+`searchPaths` like any other query asset, with per-file `inherits`/`extends`
 resolution; experimental queries for
 bash/go/javascript/lua/python/rust/typescript live in-repo under
 `assets/queries/` (not bundled into the binary), validated by fixture

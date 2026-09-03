@@ -20,7 +20,7 @@ A first iteration shipped `kakehashi/query`: a one-shot method taking a **client
 * **Live-consumer economy**: repeat requests (cursor move, scroll, edit) must not resend the query or the full unchanged result.
 * **Server-owned, dynamically discovered kinds**: the query is named by a free-form `kind` resolved as `queries/<lang>/<kind>.scm` from `searchPaths` — *not* a hard-coded enum — so new kinds appear by dropping files into a search path, and a future method can enumerate available kinds from the directory structure.
 * **Match correlation preserved**: `@context` and `@context.end` within one pattern must stay grouped; a flat capture stream loses which `.end` bounds which `@context`.
-* **Reuse proven mechanics**: the semanticTokens `full`/`delta`/`range` interaction model, the existing tolerant query compilation (`; inherits:`, per-pattern skip), predicate evaluation, ULID minting, and the prefix/suffix single-edit delta algorithm.
+* **Reuse proven mechanics**: the semanticTokens `full`/`delta`/`range` interaction model, the existing tolerant query compilation (`inherits`/`extends` modelines, per-pattern skip), predicate evaluation, ULID minting, and the prefix/suffix single-edit delta algorithm.
 * **Minimal API surface**: one protocol for query execution; `kakehashi/query` is replaced, not kept alongside.
 * **Raw capture identity**: capture names on this protocol are the query's names
   after removing `@`; semantic-token `captureMappings` never renames or filters
