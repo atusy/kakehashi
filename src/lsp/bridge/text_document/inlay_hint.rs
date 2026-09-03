@@ -407,31 +407,9 @@ impl LanguageServerPool {
                 re_envelope_hint(&mut hint, &envelope);
                 return hint;
             };
-            let offset = RegionOffset::from(&envelope.offset);
-            translate_host_position_to_virtual(&mut outgoing.position, &offset);
-            if let Some(edits) = &mut outgoing.text_edits {
-                for edit in edits {
-                    translate_host_range_to_virtual(&mut edit.range, &offset);
-                }
-            }
-            let virtual_uri = VirtualDocumentUri::new(
-                &host_lsp_uri,
-                &envelope.injection_language,
-                &envelope.region_id,
-            );
-            let virtual_lsp_uri = virtual_uri_to_lsp_uri(&virtual_uri);
-            if let InlayHintLabel::LabelParts(parts) = &mut outgoing.label {
-                for part in parts {
-                    if let Some(location) = &mut part.location
-                        && location.uri.as_str() == envelope.host_uri
-                    {
-                        location.uri = virtual_lsp_uri.clone();
-                        translate_host_range_to_virtual(&mut location.range, &offset);
-                    }
-                }
-            }
+            let virtual_uri = reverse_hint_into_virtual(&mut outgoing, &envelope, &host_lsp_uri);
             Some(VirtualResolveTarget {
-                virtual_uri: virtual_uri.to_uri_string(),
+                virtual_uri,
                 host_lsp_uri,
                 region_end,
             })
@@ -555,6 +533,43 @@ impl LanguageServerPool {
         re_envelope_hint(&mut resolved, &envelope);
         resolved
     }
+}
+
+/// Reverse a host-coordinate hint into the virtual document it was produced
+/// for, so the resolve request reaches the downstream in the coordinates it
+/// minted: the position and accept edits go back through the region offset,
+/// and label locations that point into the host document move onto the
+/// virtual URI. Returns that virtual URI; same-region locations in the reply
+/// come back under it.
+fn reverse_hint_into_virtual(
+    outgoing: &mut InlayHint,
+    envelope: &InlayHintEnvelope,
+    host_lsp_uri: &Uri,
+) -> String {
+    let offset = RegionOffset::from(&envelope.offset);
+    translate_host_position_to_virtual(&mut outgoing.position, &offset);
+    if let Some(edits) = &mut outgoing.text_edits {
+        for edit in edits {
+            translate_host_range_to_virtual(&mut edit.range, &offset);
+        }
+    }
+    let virtual_uri = VirtualDocumentUri::new(
+        host_lsp_uri,
+        &envelope.injection_language,
+        &envelope.region_id,
+    );
+    let virtual_lsp_uri = virtual_uri_to_lsp_uri(&virtual_uri);
+    if let InlayHintLabel::LabelParts(parts) = &mut outgoing.label {
+        for part in parts {
+            if let Some(location) = &mut part.location
+                && location.uri.as_str() == envelope.host_uri
+            {
+                location.uri = virtual_lsp_uri.clone();
+                translate_host_range_to_virtual(&mut location.range, &offset);
+            }
+        }
+    }
+    virtual_uri.to_uri_string()
 }
 
 /// Merge only fields that the LSP permits an inlay-hint resolver to fill lazily.
