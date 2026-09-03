@@ -228,6 +228,7 @@ fn main() {
                     | "inlay-hint-resolve-replacement"
                     | "inlay-hint-delayed-resolve"
                     | "inlay-hint-reopen-delayed-resolve"
+                    | "inlay-hint-escaping-resolve"
                     | "inlay-hint-slow-resolve" => json!({
                         "inlayHintProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
@@ -1583,7 +1584,10 @@ fn main() {
                     "textEdits": [{
                         "range": {
                             "start": { "line": 0, "character": 0 },
-                            "end": { "line": 0, "character": 0 }
+                            // `inlay-hint-escaping-resolve`: the lazily
+                            // materialized edit runs past the end of any
+                            // one-line region, so the bridge must drop it.
+                            "end": { "line": if mode == "inlay-hint-escaping-resolve" { 5 } else { 0 }, "character": 0 }
                         },
                         "newText": "resolved "
                     }],

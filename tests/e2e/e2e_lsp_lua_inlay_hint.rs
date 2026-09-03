@@ -494,6 +494,36 @@ fn e2e_inlay_hint_resolve_discards_response_after_reopen_during_wait() {
     shutdown_client(&mut client);
 }
 
+/// A lazily materialized edit passes the same region guard as an eager one;
+/// when it is refused the eager edit set the hint already carried stays.
+#[test]
+fn e2e_inlay_hint_resolve_drops_an_escaping_lazy_edit_and_keeps_the_eager_one() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-escaping-resolve", "lua", false, None);
+    let uri = "file:///test_inlay_hint_resolve_escaping_edit.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "```lua\nlocal x = 1\n```\n"
+        }}),
+    );
+    let hint = inlay_hints_with_retry(&mut client, uri, 1, 3).remove(0);
+    assert_eq!(hint["textEdits"][0]["newText"], "existing ");
+
+    let response = client.send_request("inlayHint/resolve", hint.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["tooltip"], "mock resolved:hint-1");
+    assert_eq!(
+        response["result"]["textEdits"], hint["textEdits"],
+        "the escaping lazy edit must be dropped in favour of the eager set"
+    );
+
+    shutdown_client(&mut client);
+}
+
 #[test]
 fn e2e_inlay_hint_resolve_rejects_live_non_contiguous_region_before_dispatch() {
     let marker_dir = tempfile::TempDir::new().expect("marker dir");
