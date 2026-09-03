@@ -460,7 +460,10 @@ impl LanguageServerPool {
         {
             Ok(pair) => pair,
             Err(error) => {
-                warn!(target: "kakehashi::bridge", "inlayHint/resolve: failed to register request for {server_name}: {error}");
+                warn!(
+                    target: "kakehashi::bridge",
+                    "inlayHint/resolve{layer}: failed to register request for {server_name}: {error}"
+                );
                 if let Some(ref id) = upstream_id {
                     self.unregister_upstream_request(id, connection_key);
                 }
@@ -488,7 +491,10 @@ impl LanguageServerPool {
             }
         };
         if let Err(error) = send_result {
-            warn!(target: "kakehashi::bridge", "inlayHint/resolve: failed to send request for {server_name}: {error}");
+            warn!(
+                target: "kakehashi::bridge",
+                "inlayHint/resolve{layer}: failed to send request for {server_name}: {error}"
+            );
             if let Some(ref id) = upstream_id {
                 self.unregister_upstream_request(id, connection_key);
             }
