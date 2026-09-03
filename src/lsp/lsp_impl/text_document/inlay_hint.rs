@@ -183,7 +183,14 @@ impl Kakehashi {
         let Ok(host_url) = url::Url::parse(&envelope.host_uri) else {
             return Ok(hint);
         };
+        // Every fail-soft exit below is the steady state of a hint the editor
+        // kept past an edit, so it logs at debug like the sibling gates do.
         if !self.inlay_hint_content_is_fresh(&host_url, &envelope) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "inlayHint/resolve: {} was revised since the hint was produced; returning hint unresolved",
+                envelope.host_uri
+            );
             return Ok(hint);
         }
         let region_end = if envelope.is_host_layer() {
@@ -192,9 +199,19 @@ impl Kakehashi {
             let Some((offset, region_end, contiguous)) =
                 self.inlay_hint_region_geometry(&host_url, &envelope)
             else {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "inlayHint/resolve: region {} is stale; returning hint unresolved",
+                    envelope.region_id
+                );
                 return Ok(hint);
             };
             if !inlay_hint_region_is_resolvable(&envelope, &offset, contiguous) {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "inlayHint/resolve: region {} moved or is no longer contiguous; returning hint unresolved",
+                    envelope.region_id
+                );
                 return Ok(hint);
             }
             Some(region_end)
@@ -233,6 +250,11 @@ impl Kakehashi {
         // well (`Document::invalidate_parse`), so the two stamps cover every
         // way the geometry can move.
         if !self.inlay_hint_envelope_is_fresh(&host_url, &envelope, &pool) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "inlayHint/resolve: {} was revised or reopened while resolving; returning hint unresolved",
+                envelope.host_uri
+            );
             return Ok(unresolved);
         }
         Ok(resolved)
