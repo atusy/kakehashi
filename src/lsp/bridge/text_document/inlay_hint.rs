@@ -48,7 +48,9 @@ use super::super::protocol::{
 use super::completion::EnvelopeOffset;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-use crate::lsp::bridge::envelope::{ENVELOPE_KEY, nests_reserved_key, should_envelope};
+use crate::lsp::bridge::envelope::{
+    ENVELOPE_KEY, nests_reserved_key, should_envelope, wrap_envelope,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InlayHintEnvelope {
@@ -110,10 +112,10 @@ fn envelope_hint_data(hint: &mut InlayHint, ctx: &InlayHintEnvelopeContext<'_>) 
         connection_generation: Some(ctx.connection_generation),
         connection_key: Some(ctx.connection_key.clone()),
         offset: EnvelopeOffset::from(ctx.offset),
-        inner,
+        inner: None,
         host_layer: ctx.host_layer,
     };
-    hint.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
+    hint.data = Some(wrap_envelope(&envelope, inner));
 }
 
 pub(crate) fn extract_inlay_hint_envelope(hint: &InlayHint) -> Option<InlayHintEnvelope> {
@@ -126,10 +128,15 @@ fn strip_inlay_hint_envelope(hint: &mut InlayHint) -> Option<InlayHintEnvelope> 
     Some(envelope)
 }
 
+/// Restore the envelope around the hint's current `data` (the downstream's
+/// payload that `strip_inlay_hint_envelope` put back), so a later resolve
+/// still routes.
 fn re_envelope_hint(hint: &mut InlayHint, envelope: &InlayHintEnvelope) {
-    let mut restored = envelope.clone();
-    restored.inner = hint.data.take();
-    hint.data = Some(serde_json::json!({ ENVELOPE_KEY: restored }));
+    debug_assert!(
+        envelope.inner.is_none(),
+        "a stripped envelope carries no inner of its own"
+    );
+    hint.data = Some(wrap_envelope(envelope, hint.data.take()));
 }
 
 pub(crate) fn envelope_host_inlay_hints(
