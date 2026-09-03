@@ -175,7 +175,7 @@ impl Kakehashi {
         if !self.inlay_hint_content_is_fresh(&envelope) {
             return Ok(hint);
         }
-        let region_geometry = if envelope.is_host_layer() {
+        let region_end = if envelope.is_host_layer() {
             None
         } else {
             let Some((offset, region_end, contiguous)) = self.inlay_hint_region_geometry(&envelope)
@@ -185,9 +185,8 @@ impl Kakehashi {
             if !inlay_hint_region_is_resolvable(&envelope, &offset, contiguous) {
                 return Ok(hint);
             }
-            Some((region_end, contiguous))
+            Some(region_end)
         };
-        let region_end = region_geometry.map(|(end, _)| end);
 
         let settings = self.settings_manager.load_settings();
         let pool = self.bridge.pool_arc();
@@ -210,8 +209,13 @@ impl Kakehashi {
 
         // A later didChange/didClose is allowed to proceed once the resolve was
         // enqueued. Revalidate after the response so old lazy edits/locations
-        // are never surfaced into a moved region or reopened document.
-        if !self.inlay_hint_envelope_is_fresh(&envelope, &pool, region_geometry) {
+        // are never surfaced into a revised or reopened document. The region
+        // is deliberately not rebuilt a second time (an injection walk over
+        // the whole tree): its geometry moves only with a content revision,
+        // which the version catches, or a reopen, which the incarnation
+        // catches. A query reload that re-tracks the region leaves the
+        // content, and so the translated edits, exactly as minted.
+        if !self.inlay_hint_envelope_is_fresh(&envelope, &pool) {
             return Ok(unresolved);
         }
         Ok(resolved)
@@ -221,27 +225,14 @@ impl Kakehashi {
         &self,
         envelope: &InlayHintEnvelope,
         pool: &crate::lsp::bridge::LanguageServerPool,
-        expected_region_geometry: Option<(tower_lsp_server::ls_types::Position, bool)>,
     ) -> bool {
         let Ok(uri) = url::Url::parse(&envelope.host_uri) else {
             return false;
         };
-        if !self.inlay_hint_content_is_fresh(envelope) {
-            return false;
-        }
-        if envelope
-            .incarnation
-            .is_none_or(|expected| pool.current_host_incarnation(&uri) != Some(expected))
-        {
-            return false;
-        }
-        envelope.is_host_layer()
-            || self.inlay_hint_region_geometry(envelope).is_some_and(
-                |(offset, region_end, contiguous)| {
-                    offset == crate::lsp::bridge::RegionOffset::from(&envelope.offset)
-                        && expected_region_geometry == Some((region_end, contiguous))
-                },
-            )
+        self.inlay_hint_content_is_fresh(envelope)
+            && envelope
+                .incarnation
+                .is_some_and(|expected| pool.current_host_incarnation(&uri) == Some(expected))
     }
 
     fn inlay_hint_content_is_fresh(&self, envelope: &InlayHintEnvelope) -> bool {
