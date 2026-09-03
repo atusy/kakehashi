@@ -10,7 +10,7 @@ Provides LSP semantic tokens based on Tree-sitter `highlights.scm` queries. Work
 
 - Supports language injection (e.g., SQL in JavaScript template strings, code blocks in Markdown)
 - Uses nvim-treesitter query files for compatibility
-- Supports query inheritance (e.g., TypeScript inherits from `ecma`)
+- Supports Neovim's query modelines: `; inherits:` (e.g., TypeScript inherits from `ecma`) and `;; extends` overlays
 
 ### Selection Range
 
@@ -283,7 +283,8 @@ Array of base directories to search for parsers and queries. If not specified, u
 **Important:** Specify base directories, not subdirectories. The resolver automatically appends `parser/` and `queries/` subdirectories.
 
 Parsers are searched as `{searchPath}/parser/{language}.{so,dylib,dll}`.
-Queries are searched as `{searchPath}/queries/{language}/{query_type}.scm`.
+Queries are searched as `{searchPath}/queries/{language}/{query_type}.scm`;
+see [Query modelines](#query-modelines) for how several hits combine.
 For implicit lookup, `{language}` must be one normal path component: values
 containing a path separator or a `.`/`..` component do not resolve, and on
 Windows neither do drive (`C:\…`) or UNC (`\\server\share\…`) prefixes. This
@@ -302,11 +303,57 @@ Then list each kind you need under `languages[*].queries[*].path`. Supplying
 `queries` at all disables the implicit lookup for the kinds you leave out, and
 only `highlights`, `injections`, and `bindings` can be given an explicit path.
 
-`; inherits:` is resolved only for implicitly located queries. A query file
-given an explicit path is loaded as-is, so an `; inherits:` line in it is inert
-— tree-sitter reads it as a comment and the parent's patterns are silently
-absent. Inherit only from queries that follow the implicit layout, whose parent
-is itself resolved by language name and so must follow it too.
+Modelines are resolved only for implicitly located queries. A query file
+given an explicit path is loaded as-is, so an `; inherits:` or `;; extends`
+line in it is inert — tree-sitter reads it as a comment, and the parent's
+patterns are silently absent. Inherit only from queries that follow the
+implicit layout, whose parent is itself resolved by language name and so must
+follow it too. Explicit paths of one kind are concatenated in the order
+listed, which is the explicit-path way to layer an overlay.
+
+#### Query modelines
+
+kakehashi reads the comment modelines Neovim documents under
+`:h treesitter-query-modeline`, with Neovim's grammar: any run of `;`, any
+spacing, the colon after `inherits` optional, and directives may repeat. The
+modeline block is the run of `;` lines at the top of the file; the first line
+that does not start with `;` — a blank line included — ends it.
+
+```query
+;; inherits: ecma,jsx
+;; extends
+```
+
+`inherits: {lang},...` prepends the named languages' query of the same kind,
+each resolved through this same lookup (so a parent brings its own parents and
+overlays). A cycle is an error. A parenthesized name (`(cpp)`) is read as the
+bare name; Neovim uses the parentheses to stop recursion when the file is
+itself being inherited, which kakehashi does not distinguish.
+
+`extends` marks the file as an overlay to merge onto the language's query
+instead of replacing it. Across `searchPaths`, in order, the first file
+*without* `extends` is the base query and any later plain file is shadowed
+(logged at debug level); every file *with* `extends` is appended after the
+base, in search-path order. The combined query is therefore
+`inherited parents, base, overlays`. A language whose only files are overlays
+loads them alone, as Neovim does.
+
+So to add patterns to a language without copying its query, put an overlay in
+a search path of your own:
+
+```toml
+searchPaths = ["~/.config/kakehashi", "~/.local/share/kakehashi"]
+```
+
+```query
+;; ~/.config/kakehashi/queries/markdown/highlights.scm
+;; extends
+((inline) @markup.raw (#match? @markup.raw "^TODO"))
+```
+
+The overlay's position in `searchPaths` does not matter for the merge order,
+only for which plain file is the base. Diagnostics for a skipped pattern in a
+combined query quote line numbers of the combined text, not of any one file.
 
 #### `languages`
 
