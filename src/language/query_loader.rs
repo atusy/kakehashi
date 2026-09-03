@@ -267,10 +267,7 @@ impl QueryLoader {
         for path in paths {
             let normalized_path = path.as_ref().clean();
             match fs::read_to_string(&normalized_path) {
-                Ok(content) => {
-                    combined_query.push_str(&content);
-                    combined_query.push('\n');
-                }
+                Ok(content) => append_file(&mut combined_query, &content),
                 Err(e) => {
                     return Err(LspError::query(format!(
                         "Failed to read query file {}: {e}",
@@ -841,6 +838,21 @@ mod tests {
         assert!(
             layered.multi_file,
             "a second explicit path shifts line numbers like an overlay does"
+        );
+    }
+
+    #[test]
+    fn explicit_paths_join_on_a_line_boundary_without_blank_lines() {
+        let dir = tempdir().unwrap();
+        let one = dir.path().join("one.scm");
+        let two = dir.path().join("two.scm");
+        fs::write(&one, "(identifier) @variable\n").unwrap();
+        fs::write(&two, "(string_literal) @string").unwrap();
+
+        let content = QueryLoader::load_content_from_paths(&[&one, &two]).unwrap();
+        assert_eq!(
+            content,
+            "(identifier) @variable\n(string_literal) @string\n"
         );
     }
 
