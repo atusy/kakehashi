@@ -44,6 +44,30 @@
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
 //!   Used by `tests/e2e/e2e_code_lens_resolve.rs` (#355).
+//! - `inlay-hint-resolve` / `inlay-hint-resolve-replacement` — advertise
+//!   `inlayHintProvider.resolveProvider = true`; answer `textDocument/inlayHint`
+//!   with one hint (label part with a location and a command, an accept edit,
+//!   opaque `data`) for any document synced via `didOpen`, and
+//!   `inlayHint/resolve` with the lazy fields filled plus a tooltip echoing what
+//!   the request carried (position, edit range, location, command name). The
+//!   replacement variant tags its tooltip so a test can tell which process
+//!   answered.
+//! - `inlay-hint-no-resolve` / `inlay-hint-no-resolve-reserved-data` — advertise
+//!   `resolveProvider = false`; the reserved-data variant puts the bridge's own
+//!   envelope key into the hint's `data`.
+//! - `inlay-hint-delayed-resolve` / `inlay-hint-reopen-delayed-resolve` — like
+//!   `inlay-hint-resolve`, but park the resolve reply (after a
+//!   `window/logMessage` `inlay-hint-resolve-started`) until the next
+//!   `textDocument/didChange`, respectively the next `textDocument/inlayHint`.
+//! - `inlay-hint-slow-resolve` — records the resolve request and any
+//!   `$/cancelRequest` under `MOCK_LSP_CANCEL_DIR`, logs
+//!   `inlay-hint-resolve-started`, and never answers.
+//! - `inlay-hint-marker-resolve` — records the resolve request under
+//!   `MOCK_LSP_CANCEL_DIR` and answers `textDocument/hover` with the requested
+//!   URI and position, so a test can observe the virtual document a region
+//!   maps to.
+//! - `inlay-hint-escaping-resolve` — like `inlay-hint-resolve`, but the resolve
+//!   reply's accept edit ends on line 5, past any one-line region.
 //! - `document-link-no-resolve-plain-data` /
 //!   `document-link-no-resolve-reserved-data` — advertise
 //!   `documentLinkProvider` with `resolveProvider: false` and answer with a
@@ -174,8 +198,9 @@ fn main() {
     // answered, the baseline demonstrably exists — a later baseline-less full
     // request means a pull LOST it and is re-fetching.
     let mut unchanged_answered = false;
-    // The delayed inlay resolver does not answer until it observes the
-    // downstream didChange caused by the upstream edit. This is a deterministic
+    // The delayed inlay resolvers park the reply here: `inlay-hint-delayed-
+    // resolve` answers on the next `didChange`, `inlay-hint-reopen-delayed-
+    // resolve` on the next `textDocument/inlayHint` — a deterministic
     // sent-state barrier for post-response freshness tests.
     let mut pending_inlay_resolve: Option<(Option<Value>, Value)> = None;
 
@@ -1490,9 +1515,9 @@ fn main() {
             }
             "textDocument/inlayHint" => {
                 // `inlay-hint-reopen-delayed-resolve`: the parked resolve is
-                // answered only once the editor has closed and reopened the
-                // host and asked for hints again, so the reply lands after
-                // the reopen was processed upstream.
+                // answered on the next `textDocument/inlayHint`. The test
+                // sends that only after closing and reopening the host, so
+                // the reply lands after the reopen was processed upstream.
                 if mode == "inlay-hint-reopen-delayed-resolve"
                     && let Some((pending_id, pending_result)) = pending_inlay_resolve.take()
                 {
