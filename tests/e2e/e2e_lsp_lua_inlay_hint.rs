@@ -151,6 +151,27 @@ fn inlay_hints_with_retry(
     panic!("timed out waiting for inlay hints");
 }
 
+/// Block until the mock resolver reports `inlay-hint-resolve-started`, the
+/// sent-state barrier the delayed and slow resolver modes raise on receipt.
+/// kakehashi forwards its own `window/logMessage` lines too (query loading,
+/// for one), so the first log message on the wire is not necessarily the
+/// mock's; skip anything else until the deadline.
+fn wait_for_resolve_started(client: &mut LspClient) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let Some(params) = client.wait_for_notification("window/logMessage", remaining) else {
+            panic!("resolve never reached the downstream sent-state barrier");
+        };
+        if params["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("inlay-hint-resolve-started"))
+        {
+            return;
+        }
+    }
+}
+
 fn resolve_request_observation(resolved: &Value) -> Value {
     serde_json::from_str(
         resolved["label"][0]["tooltip"]
@@ -384,14 +405,7 @@ fn e2e_inlay_hint_resolve_discards_response_after_same_shape_edit() {
     let hint = inlay_hints_with_retry(&mut client, uri, 1, 3).remove(0);
 
     let request_id = client.send_request_async("inlayHint/resolve", hint.clone());
-    let started =
-        client.wait_for_notification("window/logMessage", std::time::Duration::from_secs(10));
-    assert!(
-        started.as_ref().is_some_and(|params| params["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("inlay-hint-resolve-started"))),
-        "resolve must reach the downstream sent-state barrier: {started:?}"
-    );
+    wait_for_resolve_started(&mut client);
     client.send_notification(
         "textDocument/didChange",
         json!({
@@ -859,14 +873,7 @@ fn e2e_host_inlay_hint_resolve_cancel_targets_downstream_request() {
     let hint = inlay_hints_with_retry(&mut client, uri, 0, 1).remove(0);
 
     let request_id = client.send_request_async("inlayHint/resolve", hint);
-    let started =
-        client.wait_for_notification("window/logMessage", std::time::Duration::from_secs(10));
-    assert!(
-        started.as_ref().is_some_and(|params| params["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("inlay-hint-resolve-started"))),
-        "resolve must reach the downstream sent-state barrier: {started:?}"
-    );
+    wait_for_resolve_started(&mut client);
     assert!(request_file.exists(), "downstream request must be recorded");
     client.send_notification("$/cancelRequest", json!({ "id": request_id }));
     let response = client.receive_response_for_id_public(request_id);
