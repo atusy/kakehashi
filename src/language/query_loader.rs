@@ -15,7 +15,7 @@ const PARSER_EXTENSIONS: &[&str] = &["so", "dylib", "dll"];
 /// Known limitation: when a query is combined from several files (`inherits`
 /// parents, `extends` overlays), line numbers refer to the **combined** query
 /// string, not the original source file (a pattern on line 5 of a child whose
-/// parent has 100 lines reports 105).
+/// parent has 100 lines reports about 105).
 #[derive(Debug, Clone)]
 pub(crate) struct SkippedPattern {
     /// The pattern text that failed to compile
@@ -1317,7 +1317,7 @@ mod tests {
 
     #[test]
     fn test_resolve_query_no_inheritance() {
-        // ecma has no inheritance - should return content as-is
+        // ecma has no inheritance - the content is the file's own
         let dir = tempdir().unwrap();
 
         // Create ecma query

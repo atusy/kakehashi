@@ -70,7 +70,7 @@ type CapturesRangeResult = { matches: Match[]; skipped: SkippedPattern[] };
 
 type SkippedPattern = { language: string; startLine: number; endLine: number; reason: string };
 // startLine/endLine are 1-indexed lines in the query file — or in the combined
-// query string when `; inherits:` is used (the loader concatenates parents first).
+// query string when several files combine (the loader concatenates `inherits` parents, then the base, then `extends` overlays).
 ```
 
 `language` is present on every match — including host-only requests — so the
@@ -113,7 +113,7 @@ nvim-treesitter.
 
 ### Kind resolution
 
-`kind` names a query file: the server resolves `queries/<language>/<kind>.scm` across its configured `searchPaths` (first hit wins), honoring `; inherits:` directives and tolerant per-pattern compilation — the identical pipeline used for highlights/bindings/injections. `kind` is validated as `[A-Za-z0-9_-]+`; anything else (path separators, dots) is rejected as `InvalidParams` before touching the filesystem. The fixed `QueryKind` enum remains an internal detail of config-time loading; this protocol deliberately does **not** extend it, so available kinds are defined purely by what files exist — enabling a future `kakehashi/captures/kinds` discovery method with no protocol change.
+`kind` names a query file: the server resolves `queries/<language>/<kind>.scm` across its configured `searchPaths` (the first plain file is the base; `;; extends` overlays in any search path merge onto it), honoring `inherits` modelines and tolerant per-pattern compilation — the identical pipeline used for highlights/bindings/injections. `kind` is validated as `[A-Za-z0-9_-]+`; anything else (path separators, dots) is rejected as `InvalidParams` before touching the filesystem. The fixed `QueryKind` enum remains an internal detail of config-time loading; this protocol deliberately does **not** extend it, so available kinds are defined purely by what files exist — enabling a future `kakehashi/captures/kinds` discovery method with no protocol change.
 
 ### The `injection` parameter
 
