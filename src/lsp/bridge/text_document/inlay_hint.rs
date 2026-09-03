@@ -283,6 +283,14 @@ impl LanguageServerPool {
             re_envelope_hint(&mut hint, &envelope);
             return hint;
         };
+        // The virtual path also needs the editor-facing form. `url::Url`
+        // accepts characters RFC 3986 forbids (`|`, `^`, a backslash the file
+        // scheme folds into `/`), so the `Url` parse above does not vouch for
+        // this one, and the envelope is client-echoed data: fail soft.
+        let Ok(host_lsp_uri) = envelope.host_uri.parse::<Uri>() else {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        };
         if envelope
             .incarnation
             .is_some_and(|expected| self.current_host_incarnation(&host_uri) != Some(expected))
@@ -395,7 +403,6 @@ impl LanguageServerPool {
                     translate_host_range_to_virtual(&mut edit.range, &offset);
                 }
             }
-            let host_lsp_uri: Uri = envelope.host_uri.parse().expect("validated host URI");
             let virtual_uri = VirtualDocumentUri::new(
                 &host_lsp_uri,
                 &envelope.injection_language,
@@ -475,7 +482,6 @@ impl LanguageServerPool {
             };
             let offset = RegionOffset::from(&envelope.offset);
             let request_virtual_uri = virtual_uri.as_deref().unwrap_or_default();
-            let host_lsp_uri: Uri = envelope.host_uri.parse().expect("validated host URI");
             transform_inlay_hint_to_host(
                 &mut resolved,
                 request_virtual_uri,
