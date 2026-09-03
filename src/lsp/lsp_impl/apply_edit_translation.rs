@@ -171,7 +171,7 @@ impl ApplyEditTranslator {
                 "kakehashi: the virtual document's host URI is unmappable: {host_url}"
             ));
         };
-        let Some((offset, region_end, contiguous)) = resolve_region_offset(
+        let Some((offset, region_end, contiguous, _)) = resolve_region_offset(
             &self.documents,
             &self.language,
             &self.bridge,

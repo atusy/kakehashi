@@ -68,7 +68,7 @@ impl Kakehashi {
             &host_url,
             region_id,
         )
-        .is_some_and(|(live_offset, _, _)| live_offset == RegionOffset::from(offset))
+        .is_some_and(|(live_offset, _, _, _)| live_offset == RegionOffset::from(offset))
     }
 }
 
@@ -77,14 +77,16 @@ impl Kakehashi {
 /// rebuilt: region invalidated by edits (`lookup_node` misses), a `region_id`
 /// whose tracked geometry/layer no longer exists in the live parse, or a
 /// missing document/snapshot/language/query. The third tuple field reports
-/// whether the virtual content maps to one contiguous host span.
+/// whether the virtual content maps to one contiguous host span; the fourth
+/// is the region's live injection language, so a resolve gate can refuse an
+/// envelope whose echoed language no longer names this region.
 pub(super) fn resolve_region_offset(
     documents: &DocumentStore,
     language: &Arc<LanguageCoordinator>,
     bridge: &BridgeCoordinator,
     host_url: &Url,
     region_id: &str,
-) -> Option<(RegionOffset, Position, bool)> {
+) -> Option<(RegionOffset, Position, bool, String)> {
     // Snapshot is owned, so the document handle (a store lock) is released
     // before `detect_document_language` reaches back into the store.
     let snapshot = documents.get(host_url)?.snapshot()?;
@@ -109,11 +111,16 @@ pub(super) fn resolve_region_offset(
 /// Consume a resolved region into the geometry shared by freshness and edit
 /// validation. The end is derived from the exact virtual content rather than
 /// the raw content-node range, whose trailing named children may be excluded.
-fn resolved_region_geometry(resolved: ResolvedInjection) -> (RegionOffset, Position, bool) {
+fn resolved_region_geometry(resolved: ResolvedInjection) -> (RegionOffset, Position, bool, String) {
     let start_line = resolved.region.line_range.start;
     let offset = RegionOffset::with_per_line_offsets(start_line, resolved.line_column_offsets);
     let region_end = region_host_end(&resolved.virtual_content, &offset);
-    (offset, region_end, resolved.contiguous)
+    (
+        offset,
+        region_end,
+        resolved.contiguous,
+        resolved.injection_language,
+    )
 }
 
 #[cfg(test)]
@@ -138,7 +145,7 @@ mod tests {
             contiguous: true,
         };
 
-        let (_, region_end, _) = resolved_region_geometry(resolved);
+        let (_, region_end, _, _) = resolved_region_geometry(resolved);
 
         assert_eq!(region_end, Position::new(2, 4));
     }

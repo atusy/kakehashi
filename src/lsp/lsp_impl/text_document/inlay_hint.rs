@@ -213,7 +213,7 @@ impl Kakehashi {
             // stale region. Wait for the current parse the way the virt
             // request handlers do before their preamble snapshots it.
             self.ensure_document_parsed(&host_url).await;
-            let Some((offset, region_end, contiguous)) =
+            let Some((offset, region_end, contiguous, _)) =
                 self.inlay_hint_region_geometry(&host_url, &envelope)
             else {
                 log::debug!(
@@ -309,6 +309,7 @@ impl Kakehashi {
         crate::lsp::bridge::RegionOffset,
         tower_lsp_server::ls_types::Position,
         bool,
+        String,
     )> {
         resolve_region_offset(
             &self.documents,
