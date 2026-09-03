@@ -369,10 +369,14 @@ numbers of the combined text, not of any one file.
 Two things stay strict when files combine. Every hit must be readable: a
 dangling symlink or an unreadable file in any search path fails the language's
 query, as it would as the only hit, rather than loading without it. And a
-parent must exist: auto-install fetches the parents named by the queries it
-installs into the data directory, not those named by an overlay elsewhere, so
-a parent that only your overlay names must be installed by hand or the query
-fails to load with a message naming the overlay.
+parent must exist as the same kind of file: `child/context.scm` inheriting
+`foo` needs a `foo/context.scm` on some search path. Auto-install fetches the
+parents named by the `highlights.scm` and `injections.scm` it installs into
+the data directory — those two kinds only, and not parents named by an
+overlay elsewhere — so a parent that only your overlay names, or that a
+`bindings.scm` or a captures kind names, must be put on a search path by
+hand or the query fails to load with a message naming the file that named
+it.
 
 #### `languages`
 

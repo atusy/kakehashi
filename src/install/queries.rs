@@ -145,11 +145,15 @@ fn validate_safe_language_name(language: &str) -> Result<(), QueryInstallError> 
     }
 }
 
-/// Languages an installed query directory inherits, across every query kind.
+/// Languages an installed query directory inherits, across the kinds the
+/// installer manages (`QUERY_FILES`).
 ///
 /// Each kind resolves its own `; inherits:` chain when it loads, and a parent it
 /// names but that is not installed makes that load fail outright — so
-/// injections.scm's parents matter exactly as much as highlights.scm's.
+/// injections.scm's parents matter exactly as much as highlights.scm's. A
+/// kind the installer does not fetch (bindings, captures kinds) resolves its
+/// parents the same way, but only from files the user placed on a search
+/// path; nothing here can install those.
 fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<String>> {
     let mut parents: Vec<String> = Vec::new();
     for query_file in QUERY_FILES {
