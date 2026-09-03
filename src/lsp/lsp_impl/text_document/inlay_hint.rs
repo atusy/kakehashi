@@ -215,13 +215,15 @@ impl Kakehashi {
         }?;
 
         // A later didChange/didClose is allowed to proceed once the resolve was
-        // enqueued. Revalidate after the response so old lazy edits/locations
-        // are never surfaced into a revised or reopened document. The region
-        // is deliberately not rebuilt a second time (an injection walk over
-        // the whole tree): its geometry moves only with a content revision,
-        // which the version catches, or a reopen, which the incarnation
-        // catches. A query reload that re-tracks the region leaves the
-        // content, and so the translated edits, exactly as minted.
+        // enqueued. Revalidate after the response so lazy edits/locations
+        // computed against the content this resolve observed are not
+        // surfaced into a revised or reopened document. The region is
+        // deliberately not rebuilt a second time (an injection walk over the
+        // whole tree): a content edit advances the version, a reopen changes
+        // the incarnation, and a settings/query reload that could re-track
+        // the region invalidates every parse, which advances the version as
+        // well (`Document::invalidate_parse`), so the two stamps cover every
+        // way the geometry can move.
         if !self.inlay_hint_envelope_is_fresh(&envelope, &pool) {
             return Ok(unresolved);
         }

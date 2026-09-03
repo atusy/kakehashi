@@ -236,7 +236,8 @@ document around the embedded block is served without them (the edits drop as
 one atomic set). Lazy hints can be completed through `inlayHint/resolve`; the
 request returns to the exact downstream process that produced the hint. A hint
 remains unresolved after any host-content revision (including same-size edits),
-region movement or invalidation, document reopen, or downstream replacement.
+region movement or invalidation observed before the request is forwarded,
+document reopen, or downstream replacement.
 Resolve is also rejected for non-contiguous injections, where lazy edits could
 cross masked gaps. Runtime query offsets such as frontmatter `#offset!` are
 included in the freshness and coordinate checks. Default combine strategy:
