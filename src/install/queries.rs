@@ -157,10 +157,20 @@ fn validate_safe_language_name(language: &str) -> Result<(), QueryInstallError> 
 fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<InheritedLanguage>> {
     let mut parents: Vec<InheritedLanguage> = Vec::new();
     for query_file in QUERY_FILES {
-        let content = match fs::read_to_string(queries_dir.join(query_file)) {
+        let path = queries_dir.join(query_file);
+        let content = match fs::read_to_string(&path) {
             Ok(content) => content,
-            // A kind this language does not have.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // A kind this language does not have — but only when there is no
+            // entry at all. The loader probes with `symlink_metadata` and
+            // counts a dangling symlink as a present, broken hit that fails
+            // the load; calling the chain complete over it would leave the
+            // user with a language nothing will install and nothing can load.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && fs::symlink_metadata(&path).is_err() =>
+            {
+                continue;
+            }
             // A kind it has but that cannot be read. Answering "no parents"
             // would let a caller call the chain complete on a file it never
             // saw, so say the chain cannot be determined instead.
@@ -185,6 +195,12 @@ fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<InheritedLangua
 /// question the same way, or it would fetch and lock a grandparent the loader
 /// never looks for — and call a chain incomplete over a language the loader
 /// would load.
+///
+/// One coarsening remains: the loader resolves each kind's chain on its own,
+/// while the installer works per language, on the union of its kinds. A
+/// parent one kind names bare and another in parentheses is required here
+/// whenever either kind would need it — a superset of what any one kind
+/// loads, never less.
 fn required_parents(
     parents: Vec<InheritedLanguage>,
     is_included: bool,
@@ -2998,6 +3014,25 @@ mod tests {
     /// is exactly what the loader will look for, in every form Neovim
     /// accepts: repeated `;`, no colon, a directive on the second line of
     /// the block, and parenthesized names read as bare ones.
+    /// The loader counts a dangling symlink as a present, broken file and
+    /// fails the load; the chain must not be called complete over one.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_query_symlink_leaves_the_chain_undetermined() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let queries_dir = temp_dir.path().join("queries").join("child");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        symlink("missing-target.scm", queries_dir.join("injections.scm")).unwrap();
+
+        assert!(
+            inherited_languages_on_disk(&queries_dir).is_none(),
+            "a present-but-broken kind must not read as absent"
+        );
+    }
+
     #[test]
     fn on_disk_parents_follow_the_shared_modeline_grammar() {
         let temp_dir = TempDir::new().unwrap();
