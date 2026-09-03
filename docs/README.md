@@ -346,10 +346,11 @@ base, in search-path order. The combined query is therefore
 loads them alone, as Neovim does.
 
 So to add patterns to a language without copying its query, put an overlay in
-a search path of your own:
+a search path of your own. `searchPaths` replaces the default list, so keep
+the data directory in it:
 
 ```toml
-searchPaths = ["~/.config/kakehashi", "~/.local/share/kakehashi"]
+searchPaths = ["~/.config/kakehashi", "${KAKEHASHI_DATA_DIR}"]
 ```
 
 ```query
@@ -358,9 +359,18 @@ searchPaths = ["~/.config/kakehashi", "~/.local/share/kakehashi"]
 ((inline) @markup.raw (#match? @markup.raw "^TODO"))
 ```
 
-The overlay's position in `searchPaths` does not matter for the merge order,
-only for which plain file is the base. Diagnostics for a skipped pattern in a
-combined query quote line numbers of the combined text, not of any one file.
+An overlay follows the base wherever it sits in `searchPaths`; position
+decides only which plain file is the base (the first) and the order among
+overlays. Diagnostics for a skipped pattern in a combined query quote line
+numbers of the combined text, not of any one file.
+
+Two things stay strict when files combine. Every hit must be readable: a
+dangling symlink or an unreadable file in any search path fails the language's
+query, as it would as the only hit, rather than loading without it. And a
+parent must exist: auto-install fetches the parents named by the queries it
+installs into the data directory, not those named by an overlay elsewhere, so
+a parent that only your overlay names must be installed by hand or the query
+fails to load with a message naming the overlay.
 
 #### `languages`
 
@@ -1280,7 +1290,8 @@ Run `kakehashi language list` for the complete list.
 
 ## Query Inheritance
 
-Some languages inherit queries from base languages:
+Some languages inherit queries from base languages (see
+[Query modelines](#query-modelines) for how the loader reads the directive):
 
 | Language | Inherits From |
 |----------|---------------|
