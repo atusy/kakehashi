@@ -181,6 +181,11 @@ impl Kakehashi {
         // One parse serves every gate below. An unparsable host URI can only
         // be a mangled echo and fails soft like any other stale envelope.
         let Ok(host_url) = url::Url::parse(&envelope.host_uri) else {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "inlayHint/resolve: envelope host URI {:?} does not parse; returning hint unresolved",
+                envelope.host_uri
+            );
             return Ok(hint);
         };
         // Every fail-soft exit below is the steady state of a hint the editor
