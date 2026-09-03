@@ -173,9 +173,9 @@ impl QueryLoader {
             })?;
             let modeline = parse_modeline(&content);
             // Neovim's `get_files` reads a file naming its own language as an
-            // extension (`add_included_lang` reports the self-reference so,
-            // instead of a parent), so the file is an overlay, not a parent
-            // of itself.
+            // extension (`add_included_lang` returns true for the
+            // self-reference instead of adding a parent), so the file is an
+            // overlay, not a parent of itself.
             let mut extends = modeline.extends;
             for parent in modeline.inherits {
                 if parent == lang_name {
