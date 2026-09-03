@@ -47,7 +47,7 @@ Partially implemented:
   the envelope stamped into `CompletionItem.data`; the host layer stamps one
   too (marked `host_layer`, so the resolve forwards VERBATIM — no coordinate
   translation and no injection-region edit guard). Both layers mint under
-  one rule, shared by completion, codeLens, and documentLink: for a server
+  one rule, shared by completion, codeLens, documentLink, and inlayHint: for a server
   that advertises the matching resolve method, plus the reserved-key
   exception below. Without that capability the items stay bare — an
   envelope would be pure wire weight on every item, and its resolve would
