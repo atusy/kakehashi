@@ -558,29 +558,58 @@ impl LanguageServerPool {
 ///
 /// A resolver may return a partial-looking hint in practice. Keep the eager
 /// identity fields from the original response and retain existing lazy values
-/// when the resolver omits them.
+/// when the resolver omits them. Label parts are paired by index, so a reply
+/// whose label has a different shape or part count cannot be paired and
+/// leaves the original parts as they were.
+///
+/// The resolver's `data` is discarded on purpose, unlike the code-lens
+/// resolve, which lets a returned `data` replace the original: the protocol
+/// carries `data` from the request INTO the resolve, and a hint the editor
+/// keeps showing may be resolved again, so the envelope is restored around
+/// the payload it was minted with and routes identically the second time.
 fn merge_resolved_inlay_hint(mut original: InlayHint, mut resolved: InlayHint) -> InlayHint {
     original.tooltip = resolved.tooltip.take().or(original.tooltip);
     original.text_edits = resolved.text_edits.take().or(original.text_edits);
 
-    if let (InlayHintLabel::LabelParts(original_parts), InlayHintLabel::LabelParts(resolved_parts)) =
-        (&mut original.label, resolved.label)
-        && original_parts.len() == resolved_parts.len()
-    {
-        for (original_part, mut resolved_part) in original_parts.iter_mut().zip(resolved_parts) {
-            original_part.tooltip = resolved_part
-                .tooltip
-                .take()
-                .or(original_part.tooltip.take());
-            original_part.location = resolved_part
-                .location
-                .take()
-                .or(original_part.location.take());
-            original_part.command = resolved_part
-                .command
-                .take()
-                .or(original_part.command.take());
+    match (&mut original.label, resolved.label) {
+        (
+            InlayHintLabel::LabelParts(original_parts),
+            InlayHintLabel::LabelParts(resolved_parts),
+        ) if original_parts.len() == resolved_parts.len() => {
+            for (original_part, mut resolved_part) in original_parts.iter_mut().zip(resolved_parts)
+            {
+                original_part.tooltip = resolved_part
+                    .tooltip
+                    .take()
+                    .or(original_part.tooltip.take());
+                original_part.location = resolved_part
+                    .location
+                    .take()
+                    .or(original_part.location.take());
+                original_part.command = resolved_part
+                    .command
+                    .take()
+                    .or(original_part.command.take());
+            }
         }
+        (
+            InlayHintLabel::LabelParts(original_parts),
+            InlayHintLabel::LabelParts(resolved_parts),
+        ) => {
+            debug!(
+                target: "kakehashi::bridge",
+                "inlayHint/resolve: the resolver returned {} label parts for a hint with {}; keeping the original parts",
+                resolved_parts.len(),
+                original_parts.len()
+            );
+        }
+        (InlayHintLabel::LabelParts(_), InlayHintLabel::String(_)) => {
+            debug!(
+                target: "kakehashi::bridge",
+                "inlayHint/resolve: the resolver returned a string label for a hint with label parts; keeping the original parts"
+            );
+        }
+        (InlayHintLabel::String(_), _) => {}
     }
 
     original
