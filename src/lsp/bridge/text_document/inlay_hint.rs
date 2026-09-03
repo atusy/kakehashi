@@ -10,6 +10,15 @@
 //! per-line `> ` prefixes, or merge content into the closing fence) is served
 //! without them (see the safety guard in the response transform).
 //!
+//! # Resolve routing
+//!
+//! Every hint leaves with its `data` wrapped in an [`InlayHintEnvelope`]
+//! naming the producing connection (key and generation), the host
+//! incarnation, the content version and the region offset. `inlayHint/resolve`
+//! strips it, refuses anything but the exact producer, reverses the hint into
+//! virtual coordinates for the request, translates the reply back, and merges
+//! only the protocol's lazy fields into the original hint.
+//!
 //! # Single-Writer Loop (ls-bridge-message-ordering)
 //!
 //! This handler uses `send_request()` to queue requests via the channel-based
