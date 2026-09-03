@@ -621,7 +621,13 @@ fn merge_resolved_inlay_hint(mut original: InlayHint, mut resolved: InlayHint) -
                 "inlayHint/resolve: the resolver returned a string label for a hint with label parts; keeping the original parts"
             );
         }
-        (InlayHintLabel::String(_), _) => {}
+        (InlayHintLabel::String(_), InlayHintLabel::LabelParts(_)) => {
+            debug!(
+                target: "kakehashi::bridge",
+                "inlayHint/resolve: the resolver returned label parts for a hint with a string label; keeping the original label"
+            );
+        }
+        (InlayHintLabel::String(_), InlayHintLabel::String(_)) => {}
     }
 
     original
