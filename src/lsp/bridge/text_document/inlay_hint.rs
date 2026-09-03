@@ -44,9 +44,9 @@ use tower_lsp_server::ls_types::{
 
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, decode_command, encode_command,
-    host_position_within_region_bounds, response_has_jsonrpc_error, text_edit_safe_in_region,
-    translate_host_position_to_virtual, translate_host_range_to_virtual,
-    translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    response_has_jsonrpc_error, text_edit_safe_in_region, translate_host_position_to_virtual,
+    translate_host_range_to_virtual, translate_virtual_position_to_host,
+    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 use super::completion::EnvelopeOffset;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
@@ -426,8 +426,7 @@ impl LanguageServerPool {
                 re_envelope_hint(&mut hint, &envelope);
                 return hint;
             };
-            let virtual_uri =
-                reverse_hint_into_virtual(&mut outgoing, &envelope, &host_lsp_uri, region_end);
+            let virtual_uri = reverse_hint_into_virtual(&mut outgoing, &envelope, &host_lsp_uri);
             Some(VirtualResolveTarget {
                 virtual_uri,
                 host_lsp_uri,
@@ -555,17 +554,15 @@ impl LanguageServerPool {
 /// Reverse a host-coordinate hint into the virtual document it was produced
 /// for, so the resolve request reaches the downstream in the coordinates it
 /// minted: the position and accept edits go back through the region offset,
-/// and label locations that point into the region of the host document move
-/// onto the virtual URI. A host-document location outside the region cannot
-/// have been minted by translation — it is a real reference to the host file
-/// (a server that also holds the host document may return one) — and stays
-/// as it is. Returns the virtual URI; same-region locations in the reply
-/// come back under it.
+/// and the label locations the envelope records as translated move back
+/// onto the virtual URI. Any other host-document location is a real
+/// reference to the host file (a server that also holds the host document
+/// may return one) and stays as it is. Returns the virtual URI; same-region
+/// locations in the reply come back under it.
 fn reverse_hint_into_virtual(
     outgoing: &mut InlayHint,
     envelope: &InlayHintEnvelope,
     host_lsp_uri: &Uri,
-    region_end: Position,
 ) -> String {
     let offset = RegionOffset::from(&envelope.offset);
     translate_host_position_to_virtual(&mut outgoing.position, &offset);
@@ -581,11 +578,10 @@ fn reverse_hint_into_virtual(
     );
     let virtual_lsp_uri = virtual_uri_to_lsp_uri(&virtual_uri);
     if let InlayHintLabel::LabelParts(parts) = &mut outgoing.label {
-        for part in parts {
-            if let Some(location) = &mut part.location
+        for (index, part) in parts.iter_mut().enumerate() {
+            if envelope.translated_locations.contains(&index)
+                && let Some(location) = &mut part.location
                 && location.uri.as_str() == envelope.host_uri
-                && host_position_within_region_bounds(location.range.start, &offset, region_end)
-                && host_position_within_region_bounds(location.range.end, &offset, region_end)
             {
                 location.uri = virtual_lsp_uri.clone();
                 translate_host_range_to_virtual(&mut location.range, &offset);
@@ -1388,8 +1384,7 @@ mod tests {
         .unwrap();
         let host_lsp_uri: Uri = "file:///doc.md".parse().unwrap();
 
-        let virtual_uri =
-            reverse_hint_into_virtual(&mut outgoing, &envelope, &host_lsp_uri, Position::new(8, 0));
+        let virtual_uri = reverse_hint_into_virtual(&mut outgoing, &envelope, &host_lsp_uri);
 
         let reversed = serde_json::to_value(&outgoing).unwrap();
         assert_eq!(reversed["position"], json!({ "line": 1, "character": 7 }));
@@ -1415,10 +1410,10 @@ mod tests {
     }
 
     /// A label location may legitimately name the host file itself (a
-    /// server that also holds the host document): only a host location
-    /// inside the region was minted by translating a virtual one, so only
-    /// that is reversed; one outside the region is a real reference and
-    /// must reach the downstream untouched.
+    /// server that also holds the host document): only the parts the
+    /// envelope records as translated are reversed; a host location the
+    /// downstream returned as such — here one outside the region — is a
+    /// real reference and must reach the downstream untouched.
     #[test]
     fn resolve_request_leaves_a_host_location_outside_the_region_alone() {
         let envelope = InlayHintEnvelope {
@@ -1455,8 +1450,7 @@ mod tests {
         .unwrap();
         let host_lsp_uri: Uri = "file:///doc.md".parse().unwrap();
 
-        let virtual_uri =
-            reverse_hint_into_virtual(&mut outgoing, &envelope, &host_lsp_uri, Position::new(8, 0));
+        let virtual_uri = reverse_hint_into_virtual(&mut outgoing, &envelope, &host_lsp_uri);
 
         let reversed = serde_json::to_value(&outgoing).unwrap();
         assert_eq!(reversed["label"][0]["location"]["uri"], virtual_uri);
@@ -1505,7 +1499,7 @@ mod tests {
         .unwrap();
         let host_lsp_uri: Uri = "file:///doc.md".parse().unwrap();
 
-        reverse_hint_into_virtual(&mut outgoing, &envelope, &host_lsp_uri, Position::new(8, 0));
+        reverse_hint_into_virtual(&mut outgoing, &envelope, &host_lsp_uri);
 
         let reversed = serde_json::to_value(&outgoing).unwrap();
         assert_eq!(reversed["label"][0]["location"]["uri"], "file:///doc.md");
