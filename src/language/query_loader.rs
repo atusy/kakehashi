@@ -1164,6 +1164,31 @@ mod tests {
     }
 
     #[test]
+    fn a_parent_named_by_both_base_and_overlay_is_concatenated_once() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "parent", "(identifier) @parent\n");
+        write_highlights(
+            base.path(),
+            "child",
+            "; inherits: parent\n(string_literal) @child\n",
+        );
+        write_highlights(
+            overlay.path(),
+            "child",
+            ";; extends\n;; inherits: parent\n(boolean_literal) @overlay\n",
+        );
+
+        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        let content = resolve_query(&bases, "child", "highlights.scm").unwrap();
+        assert_eq!(
+            content.matches("@parent").count(),
+            1,
+            "one parent, however many files name it:\n{content}"
+        );
+    }
+
+    #[test]
     fn an_inherited_parent_brings_its_own_extends_overlays() {
         let base = tempdir().unwrap();
         let overlay = tempdir().unwrap();
