@@ -167,12 +167,18 @@ impl QueryLoader {
                 ))
             })?;
             let modeline = parse_modeline(&content);
+            // Naming the language itself is Neovim's older way to say
+            // `extends` (`add_included_lang` returns "extension" for it), so
+            // the file is an overlay, not a parent of itself.
+            let mut extends = modeline.extends;
             for parent in modeline.inherits {
-                if !parents.contains(&parent) {
+                if parent == lang_name {
+                    extends = true;
+                } else if !parents.contains(&parent) {
                     parents.push(parent);
                 }
             }
-            if modeline.extends {
+            if extends {
                 overlays.push(content);
             } else if base.is_none() {
                 base = Some(content);
@@ -1029,6 +1035,31 @@ mod tests {
         let content =
             resolve_query(&[overlay.path().to_path_buf()], "rust", "highlights.scm").unwrap();
         assert!(content.contains("@only"));
+    }
+
+    /// Neovim's `add_included_lang` treats `; inherits: rust` inside rust's
+    /// own query file as the `extends` marker (its `query.set()` docs use that
+    /// idiom), so the file must merge as an overlay rather than trip the
+    /// cycle check and drop the language's query.
+    #[test]
+    fn a_file_that_inherits_its_own_language_is_an_overlay() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "rust", "(identifier) @base\n");
+        write_highlights(
+            overlay.path(),
+            "rust",
+            "; inherits: rust\n(string_literal) @overlay\n",
+        );
+
+        // The self-inheriting file sits first, where a plain file would be the
+        // base: it must still follow the real base as an overlay.
+        let bases = [overlay.path().to_path_buf(), base.path().to_path_buf()];
+        let content = resolve_query(&bases, "rust", "highlights.scm").unwrap();
+        assert!(
+            position(&content, "@base") < position(&content, "@overlay"),
+            "the base query comes first, then the self-inheriting overlay:\n{content}"
+        );
     }
 
     #[test]

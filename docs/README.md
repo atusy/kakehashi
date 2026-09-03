@@ -331,9 +331,11 @@ a parent that fails to load.
 
 `inherits: {lang},...` prepends the named languages' query of the same kind,
 each resolved through this same lookup (so a parent brings its own parents and
-overlays). A cycle is an error. A parenthesized name (`(cpp)`) is read as the
-bare name; Neovim uses the parentheses to stop recursion when the file is
-itself being inherited, which kakehashi does not distinguish.
+overlays). A cycle between languages is an error; naming the file's own
+language is Neovim's older spelling of `extends` and marks the file an
+overlay. A parenthesized name (`(cpp)`) is read as the bare name; Neovim uses
+the parentheses to stop recursion when the file is itself being inherited,
+which kakehashi does not distinguish.
 
 `extends` marks the file as an overlay to merge onto the language's query
 instead of replacing it. Across `searchPaths`, in order, the first file
