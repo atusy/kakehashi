@@ -1194,6 +1194,100 @@ mod tests {
         assert_eq!(merged["data"], json!({ "token": 7 }));
     }
 
+    /// Label parts are paired by index. Give each resolved part a different
+    /// lazy field so a reversed or truncated pairing lands on the wrong part.
+    #[test]
+    fn resolved_label_parts_are_paired_by_index() {
+        let original: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 0, "character": 0 },
+            "label": [{ "value": "first" }, { "value": "second" }]
+        }))
+        .unwrap();
+        let resolved: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 0, "character": 0 },
+            "label": [
+                { "value": "first", "tooltip": "first tooltip" },
+                { "value": "second", "location": {
+                    "uri": "file:///second.lua",
+                    "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 3 } }
+                } }
+            ]
+        }))
+        .unwrap();
+
+        let merged = serde_json::to_value(merge_resolved_inlay_hint(original, resolved)).unwrap();
+        assert_eq!(merged["label"][0]["tooltip"], "first tooltip");
+        assert!(merged["label"][0].get("location").is_none());
+        assert!(merged["label"][1].get("tooltip").is_none());
+        assert_eq!(merged["label"][1]["location"]["uri"], "file:///second.lua");
+    }
+
+    /// A reply whose parts cannot be paired (different count, or a string
+    /// label for a parts hint) leaves the original parts untouched rather
+    /// than pairing a prefix; the top-level lazy fields still merge.
+    #[rstest]
+    #[case::fewer_parts(json!([{ "value": "only", "tooltip": "resolved" }]))]
+    #[case::string_label(json!("resolved as a string"))]
+    fn unpairable_resolved_label_keeps_the_original_parts(#[case] label: serde_json::Value) {
+        let original: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 0, "character": 0 },
+            "label": [
+                { "value": "first", "tooltip": "eager first" },
+                { "value": "second", "tooltip": "eager second" }
+            ]
+        }))
+        .unwrap();
+        let resolved: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 0, "character": 0 },
+            "label": label,
+            "tooltip": "resolved tooltip"
+        }))
+        .unwrap();
+
+        let merged = serde_json::to_value(merge_resolved_inlay_hint(original, resolved)).unwrap();
+        assert_eq!(
+            merged["label"],
+            json!([
+                { "value": "first", "tooltip": "eager first" },
+                { "value": "second", "tooltip": "eager second" }
+            ])
+        );
+        assert_eq!(merged["tooltip"], "resolved tooltip");
+    }
+
+    /// A resolver that omits a lazy field it is allowed to fill must not
+    /// erase the eager value the hint already carried.
+    #[test]
+    fn omitted_lazy_fields_keep_their_eager_values() {
+        let original: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 0, "character": 0 },
+            "label": [{
+                "value": "part",
+                "tooltip": "eager part tooltip",
+                "location": {
+                    "uri": "file:///eager.lua",
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }
+                },
+                "command": { "title": "eager", "command": "eager.command" }
+            }],
+            "tooltip": "eager tooltip",
+            "textEdits": [{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
+                "newText": "eager"
+            }]
+        }))
+        .unwrap();
+        let resolved: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 0, "character": 0 },
+            "label": [{ "value": "part" }]
+        }))
+        .unwrap();
+
+        let merged =
+            serde_json::to_value(merge_resolved_inlay_hint(original.clone(), resolved)).unwrap();
+        assert_eq!(merged, serde_json::to_value(original).unwrap());
+    }
+
     #[test]
     fn inlay_hint_request_uses_virtual_uri() {
         let host_uri = test_host_uri();
