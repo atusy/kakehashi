@@ -204,12 +204,14 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/inlayHint") {
             return Ok(None);
         }
-        let connection_key = handle.key().clone();
-        let connection_generation = self.document_connection_generation(&connection_key);
-        // Read resolve support when the RESPONSE arrives, as the host layer
-        // does: a dynamic `resolveProvider` registration can land between
-        // send and reply, and the envelope decision should see it.
+        // `origin` outlives the request: its key is the envelope's connection
+        // key, and resolve support is read from it when the RESPONSE arrives,
+        // as the host layer does — a dynamic `resolveProvider` registration
+        // can land between send and reply, and the envelope decision should
+        // see it.
         let origin = Arc::clone(&handle);
+        let connection_key = origin.key();
+        let connection_generation = self.document_connection_generation(connection_key);
         self.execute_bridge_request_with_handle(
             handle,
             host_uri,
@@ -242,7 +244,7 @@ impl LanguageServerPool {
                         incarnation: host_incarnation,
                         content_version: Some(content_version),
                         connection_generation,
-                        connection_key: &connection_key,
+                        connection_key,
                         offset: ctx.offset,
                         host_layer: false,
                     },
