@@ -11,7 +11,9 @@ use std::io;
 use std::sync::Arc;
 
 use crate::config::settings::BridgeServerConfig;
-use crate::lsp::bridge::envelope::{ENVELOPE_KEY, nests_reserved_key, should_envelope};
+use crate::lsp::bridge::envelope::{
+    ENVELOPE_KEY, nests_reserved_key, should_envelope, wrap_envelope,
+};
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -79,10 +81,10 @@ fn envelope_link_data(link: &mut DocumentLink, ctx: &DocumentLinkEnvelopeContext
         connection_generation: ctx.connection_generation,
         connection_key: ctx.connection_key.cloned(),
         offset: EnvelopeOffset::from(ctx.offset),
-        inner,
+        inner: None,
         host_layer: ctx.host_layer,
     };
-    link.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
+    link.data = Some(wrap_envelope(&envelope, inner));
 }
 
 pub(crate) fn extract_document_link_envelope(link: &DocumentLink) -> Option<DocumentLinkEnvelope> {

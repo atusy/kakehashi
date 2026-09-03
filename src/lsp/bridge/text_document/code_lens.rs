@@ -47,7 +47,9 @@ use super::completion::EnvelopeOffset;
 use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-use crate::lsp::bridge::envelope::{ENVELOPE_KEY, nests_reserved_key, should_envelope};
+use crate::lsp::bridge::envelope::{
+    ENVELOPE_KEY, nests_reserved_key, should_envelope, wrap_envelope,
+};
 
 /// Envelope stored in `CodeLens.data` for routing `codeLens/resolve` (#355).
 ///
@@ -127,10 +129,10 @@ fn envelope_lens_data(lens: &mut CodeLens, ctx: &CodeLensEnvelopeContext) {
         connection_generation: ctx.connection_generation,
         connection_key: ctx.connection_key.cloned(),
         offset: EnvelopeOffset::from(ctx.offset),
-        inner,
+        inner: None,
         host_layer: ctx.host_layer,
     };
-    lens.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
+    lens.data = Some(wrap_envelope(&envelope, inner));
 }
 
 /// Extract the envelope from a lens's `data` without modifying the lens.

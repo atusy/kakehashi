@@ -23,7 +23,7 @@ use serde_json::Value;
 use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-use crate::lsp::bridge::envelope::ENVELOPE_KEY;
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, wrap_envelope};
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionDisabled, CodeActionOrCommand, CodeActionParams,
     CodeActionResponse, DocumentChangeOperation, DocumentChanges, NumberOrString,
@@ -126,11 +126,11 @@ fn envelope_action_data(action: &mut CodeAction, ctx: &CodeActionEnvelopeContext
         injection_language: ctx.injection_language.to_string(),
         offset: EnvelopeOffset::from(ctx.offset),
         original_title: action.title.clone(),
-        inner,
+        inner: None,
         incarnation: ctx.incarnation,
         host_layer: false,
     };
-    action.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
+    action.data = Some(wrap_envelope(&envelope, inner));
 }
 
 /// Wrap a HOST-layer action's `data` in a routing envelope so a later
@@ -152,11 +152,11 @@ fn envelope_host_action(action: &mut CodeAction, server_name: &str, host_uri: &s
             line_column_offsets: None,
         },
         original_title: action.title.clone(),
-        inner,
+        inner: None,
         incarnation: None,
         host_layer: true,
     };
-    action.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
+    action.data = Some(wrap_envelope(&envelope, inner));
 }
 
 /// Extract the envelope from an action's `data` without modifying the action.
@@ -187,19 +187,20 @@ fn strip_code_action_envelope(action: &mut CodeAction) -> Option<CodeActionEnvel
 /// suffixed one), so it survives repeated strip/re-envelope cycles.
 fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
     let inner = action.data.take();
-    action.data = Some(serde_json::json!({
-        ENVELOPE_KEY: CodeActionEnvelope {
+    action.data = Some(wrap_envelope(
+        &CodeActionEnvelope {
             origin: envelope.origin.clone(),
             host_uri: envelope.host_uri.clone(),
             region_id: envelope.region_id.clone(),
             injection_language: envelope.injection_language.clone(),
             offset: envelope.offset.clone(),
             original_title: envelope.original_title.clone(),
-            inner,
+            inner: None,
             incarnation: envelope.incarnation,
             host_layer: envelope.host_layer,
-        }
-    }));
+        },
+        inner,
+    ));
 }
 
 /// Shape a host server's `codeAction/resolve` RESPONSE for the client (host
