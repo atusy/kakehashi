@@ -41,6 +41,12 @@ impl Kakehashi {
         let work_done_token = params.work_done_progress_params.work_done_token;
         let lsp_uri = params.text_document.uri;
         let range = params.range;
+        // Read before either layer snapshots the document, so the stamp can
+        // only be older than the content the hints were computed on, never
+        // newer: an edit landing in between makes every hint of this
+        // response fail soft on resolve until the editor's next request,
+        // which follows an edit anyway. Threading the snapshot's own version
+        // through the shared bridge preamble would close that window.
         let Some(content_version) = url::Url::parse(lsp_uri.as_str())
             .ok()
             .and_then(|uri| self.documents.get(&uri).map(|doc| doc.content_version()))
