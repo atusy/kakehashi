@@ -155,7 +155,9 @@ impl QueryLoader {
             return Err(QueryLoadError::NotFound);
         }
 
-        let mut parents: Vec<String> = Vec::new();
+        // Each parent with the file that first named it, so a parent that
+        // cannot be found is reported against the modeline to fix.
+        let mut parents: Vec<(String, &PathBuf)> = Vec::new();
         let mut base: Option<String> = None;
         let mut overlays: Vec<String> = Vec::new();
         for path in &paths {
@@ -174,8 +176,8 @@ impl QueryLoader {
             for parent in modeline.inherits {
                 if parent == lang_name {
                     extends = true;
-                } else if !parents.contains(&parent) {
-                    parents.push(parent);
+                } else if !parents.iter().any(|(name, _)| *name == parent) {
+                    parents.push((parent, path));
                 }
             }
             if extends {
@@ -193,7 +195,7 @@ impl QueryLoader {
         // A shadowed plain file contributed no text, so it does not count.
         let mut file_count = usize::from(base.is_some()) + overlays.len();
         let mut combined = String::new();
-        for parent in &parents {
+        for (parent, declared_in) in &parents {
             let resolved = match Self::resolve_query_recursive(
                 runtime_bases,
                 parent,
@@ -204,10 +206,11 @@ impl QueryLoader {
                 Err(QueryLoadError::NotFound) => {
                     visited.remove(lang_name);
                     return Err(LspError::query(format!(
-                        "Query file {} not found for language {} (inherited by {}) in search paths: {}",
+                        "Query file {} not found for language {} (inherited by {} in {}) in search paths: {}",
                         file_name,
                         parent,
                         lang_name,
+                        declared_in.display(),
                         format_search_paths(runtime_bases)
                     ))
                     .into());
@@ -1192,6 +1195,33 @@ mod tests {
             "an overlay shifts line numbers like a parent does"
         );
         assert!(extended.query.is_some());
+    }
+
+    /// With a base and any number of overlays each allowed to name parents,
+    /// the error for a parent that does not exist must say which file named
+    /// it, or a typo in one overlay sends the reader through every file.
+    #[test]
+    fn a_missing_parent_is_reported_against_the_file_that_named_it() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "rust", "(identifier) @base\n");
+        write_highlights(
+            overlay.path(),
+            "rust",
+            ";; extends\n;; inherits: rsut\n(string_literal) @overlay\n",
+        );
+
+        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        let err = resolve_query(&bases, "rust", "highlights.scm").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("not found for language rsut"), "{message}");
+        assert!(
+            message.contains(&format!(
+                "inherited by rust in {}",
+                overlay.path().join("queries/rust/highlights.scm").display()
+            )),
+            "{message}"
+        );
     }
 
     #[test]
