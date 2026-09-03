@@ -208,6 +208,11 @@ impl Kakehashi {
         let region_end = if envelope.is_host_layer() {
             None
         } else {
+            // `didChange` clears the tree and reparses off-ingress; a resolve
+            // issued in that window would find no snapshot and fail soft as a
+            // stale region. Wait for the current parse the way the virt
+            // request handlers do before their preamble snapshots it.
+            self.ensure_document_parsed(&host_url).await;
             let Some((offset, region_end, contiguous)) =
                 self.inlay_hint_region_geometry(&host_url, &envelope)
             else {
