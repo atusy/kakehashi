@@ -199,8 +199,8 @@ mod tests {
         assert_eq!(inherits("; inherits: ()\n"), Vec::<String>::new());
     }
 
-    /// `str::lines` strips `\r\n`; a file checked out with CRLF must not lose
-    /// its parents to a `\r` that fails the name class.
+    /// A CRLF file yields the same modeline as an LF file: `lines` and the
+    /// spacing trim each drop the `\r` before it can fail the name class.
     #[test]
     fn crlf_line_endings_do_not_reach_the_names() {
         assert_eq!(
