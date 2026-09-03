@@ -307,7 +307,7 @@ enum Role {
 /// document), and pull diagnostics.
 /// `textDocument/codeAction` is in the same class: its
 /// `context.diagnostics` and returned edits are computed against the
-/// document snapshot (#568). `codeLens/resolve`, `codeAction/resolve`, and
+/// document snapshot (#568). `codeLens/resolve`, `codeAction/resolve`,
 /// `documentLink/resolve`, and `inlayHint/resolve` are readers too (#355, #568):
 /// their freshness gates read tracker/document
 /// state, so they must observe every `didChange` that preceded them on the
