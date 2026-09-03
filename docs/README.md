@@ -322,7 +322,9 @@ after `inherits` is one run of comma-separated names with no whitespace in
 it, each name `[a-z0-9_]+` (Neovim's own class has no digits; kakehashi adds
 them for languages such as `m68k`). A `;` line that says anything else after
 the keyword — `; inherits the ecma queries` — is a comment, as in Neovim, not
-a parent that fails to load.
+a parent that fails to load; within a list, an entry that is no name (a stray
+trailing comma, an unmatched parenthesis) is skipped and the names beside it
+still count.
 
 ```query
 ;; inherits: ecma,jsx

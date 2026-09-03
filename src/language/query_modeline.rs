@@ -20,15 +20,18 @@
 //! directives may repeat; the first line that does not start with `;` — a
 //! blank line included — ends the block.
 //!
-//! Neovim matches `inherits` against `^;+%s*inherits%s*:?%s*([a-z_,()]+)%s*$`:
-//! the keyword needs no separator before the list, the list is one run of
-//! names with no whitespace inside it, and a line whose operand holds anything
-//! else — `; inherits the ecma queries` — is prose, not a directive. The
-//! parser here reads exactly that, so a comment that mentions inheritance
-//! never becomes a parent that cannot be found. The one widening is digits in
-//! a name: nvim-treesitter ships languages such as `m68k` and `t32` that
-//! Neovim's own character class cannot name. A name in this class is also
-//! what the installer needs of a path and URL segment, so
+//! Neovim matches `inherits` against `^;+%s*inherits%s*:?%s*([a-z_,()]+)%s*$`
+//! and then splits the list on commas: the keyword needs no separator before
+//! the list, the list is one run of list characters with no whitespace inside
+//! it, and a line whose operand holds anything else — `; inherits the ecma
+//! queries` — is prose, not a directive. Within a line that matches, each
+//! name stands alone: `; inherits: ecma,` still inherits `ecma`, the empty
+//! name after the comma finding nothing. The parser here reads exactly that,
+//! so a comment that mentions inheritance never becomes a parent that cannot
+//! be found, and a stray comma never loses the parents beside it. The one
+//! widening is digits in a name: nvim-treesitter ships languages such as
+//! `m68k` and `t32` that Neovim's own character class cannot name. A name in
+//! this class is also what the installer needs of a path and URL segment, so
 //! [`is_safe_language_name`] is the one definition both sides use.
 
 /// What the modeline block at the top of a query file declares.
@@ -67,21 +70,35 @@ pub(crate) fn parse_modeline(content: &str) -> QueryModeline {
 /// The languages named by an `inherits` directive, or `None` when `directive`
 /// is not one.
 ///
-/// Mirrors Neovim's `inherits%s*:?%s*([a-z_,()]+)%s*$`: after the keyword,
-/// optional whitespace, an optional colon, and optional whitespace, the rest
-/// of the line must be a comma-separated run of names with no whitespace in
-/// it. Any other operand makes the line a comment, as it is in Neovim.
+/// Mirrors Neovim's `inherits%s*:?%s*([a-z_,()]+)%s*$` followed by a split on
+/// commas: after the keyword, optional whitespace, an optional colon, and
+/// optional whitespace, the rest of the line must be one run of list
+/// characters — any other operand makes the line a comment, as it is in
+/// Neovim. Within a matching line each comma-separated entry is a name on
+/// its own: one that is not a name after all (empty, or `(cpp` with its
+/// parenthesis unmatched) is skipped, and the parents beside it stand.
+/// Neovim would look such an entry up and find nothing; skipping it here
+/// keeps a parent that cannot exist from failing the whole query.
 fn inherits_operand(directive: &str) -> Option<Vec<String>> {
     let rest = directive.strip_prefix("inherits")?.trim_start();
     let operand = rest.strip_prefix(':').unwrap_or(rest).trim_start();
-    if operand.is_empty() {
+    let is_list_char = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_,()".contains(&b);
+    if operand.is_empty() || !operand.bytes().all(is_list_char) {
         return None;
     }
-    operand
-        .split(',')
-        .map(normalize_inherited_language_name)
-        .map(|name| is_safe_language_name(&name).then_some(name))
-        .collect()
+    Some(
+        operand
+            .split(',')
+            .map(normalize_inherited_language_name)
+            .filter(|name| {
+                let is_name = is_safe_language_name(name);
+                if !is_name {
+                    log::debug!("Ignoring `{name}` in an inherits modeline: not a language name");
+                }
+                is_name
+            })
+            .collect(),
+    )
 }
 
 /// The character class of a language name: `[a-z0-9_]+`.
@@ -101,7 +118,7 @@ pub fn is_safe_language_name(name: &str) -> bool {
 
 /// Strip the parentheses of an optional name, `(cpp)`, leaving the bare name.
 /// Only a *matched* pair is a wrapper: `(cpp` is not a name at all, and the
-/// caller then reads the whole line as a comment rather than guessing `cpp`.
+/// caller then skips it rather than guessing `cpp`.
 fn normalize_inherited_language_name(name: &str) -> String {
     name.strip_prefix('(')
         .and_then(|name| name.strip_suffix(')'))
@@ -150,6 +167,34 @@ mod tests {
             inherits("; inherits: c,(cpp),(cuda)\n(identifier) @variable\n"),
             vec!["c", "cpp", "cuda"]
         );
+        assert_eq!(inherits("; inherits: (cpp)\n"), vec!["cpp"]);
+        assert_eq!(inherits("; inherits:(cpp),c\n"), vec!["cpp", "c"]);
+    }
+
+    /// Neovim splits a matching list on commas and looks each entry up on its
+    /// own, so an entry that is no name finds nothing while its neighbours
+    /// are still inherited. Reading the whole line as a comment instead would
+    /// lose real parents to a stray comma, silently.
+    #[test]
+    fn an_entry_that_is_not_a_name_is_skipped_and_its_neighbours_kept() {
+        assert_eq!(inherits("; inherits: ecma,\n"), vec!["ecma"]);
+        assert_eq!(inherits("; inherits: ecma,,jsx\n"), vec!["ecma", "jsx"]);
+        assert_eq!(inherits("; inherits: c,(cpp\n"), vec!["c"]);
+        assert_eq!(inherits("; inherits: ecma,jsx)\n"), vec!["ecma"]);
+        assert_eq!(inherits("; inherits: ()\n"), Vec::<String>::new());
+    }
+
+    /// `str::lines` strips `\r\n`; a file checked out with CRLF must not lose
+    /// its parents to a `\r` that fails the name class.
+    #[test]
+    fn crlf_line_endings_do_not_reach_the_names() {
+        assert_eq!(
+            parse_modeline("; inherits: ecma,jsx\r\n;; extends\r\n(identifier) @variable\r\n"),
+            QueryModeline {
+                inherits: vec!["ecma".into(), "jsx".into()],
+                extends: true,
+            }
+        );
     }
 
     /// Neovim matches `^;+%s*inherits%s*:?%s*`: any run of semicolons, any
@@ -180,9 +225,6 @@ mod tests {
         assert!(inherits("; inherits: Ecma\n").is_empty());
         assert!(inherits("; inherits: with-dash\n").is_empty());
         assert!(inherits("; inherits: ../../evil\n").is_empty());
-        assert!(inherits("; inherits: (cpp\n").is_empty());
-        assert!(inherits("; inherits: cpp)\n").is_empty());
-        assert!(inherits("; inherits: ecma,\n").is_empty());
         assert!(inherits("; inherits:\n").is_empty());
         assert!(inherits("; inherits\n").is_empty());
         assert!(!parse_modeline("; extendsfoo\n").extends);
