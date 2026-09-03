@@ -172,6 +172,16 @@ fn wait_for_resolve_started(client: &mut LspClient) {
     }
 }
 
+/// A label-part command that left the bridge carries the routing prefix
+/// `workspace/executeCommand` decodes, with the downstream'"'"'s own name last.
+fn assert_routed_command(command: &Value, downstream_name: &str) {
+    let command = command.as_str().expect("a routed command name");
+    assert!(
+        command.starts_with("kakehashi|") && command.ends_with(&format!("|{downstream_name}")),
+        "expected a routed form of {downstream_name}, got {command}"
+    );
+}
+
 fn resolve_request_observation(resolved: &Value) -> Value {
     serde_json::from_str(
         resolved["label"][0]["tooltip"]
@@ -326,7 +336,7 @@ fn e2e_inlay_hint_resolve_round_trips_to_virtual_origin() {
         hint["label"][0]["location"]["range"]["start"],
         json!({ "line": 3, "character": 0 })
     );
-    assert_ne!(hint["label"][0]["command"]["command"], "mock.hint");
+    assert_routed_command(&hint["label"][0]["command"]["command"], "mock.hint");
 
     let response = client.send_request("inlayHint/resolve", hint.clone());
     assert!(response.get("error").is_none(), "{response}");
@@ -365,7 +375,7 @@ fn e2e_inlay_hint_resolve_round_trips_to_virtual_origin() {
         resolved["label"][0]["location"]["range"]["start"],
         json!({ "line": 3, "character": 0 })
     );
-    assert_ne!(resolved["label"][0]["command"]["command"], "mock.resolved");
+    assert_routed_command(&resolved["label"][0]["command"]["command"], "mock.resolved");
 
     client.send_notification(
         "textDocument/didChange",
@@ -597,6 +607,7 @@ fn e2e_inlay_hint_resolve_round_trips_to_host_origin() {
     let hint = inlay_hints_with_retry(&mut client, uri, 0, 1).remove(0);
     assert_eq!(hint["position"], json!({ "line": 0, "character": 1 }));
     assert_eq!(hint["data"]["kakehashi"]["host_layer"], true);
+    assert_routed_command(&hint["label"][0]["command"]["command"], "mock.hint");
     let response = client.send_request("inlayHint/resolve", hint.clone());
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"]["tooltip"], "mock resolved:hint-1");
@@ -606,6 +617,10 @@ fn e2e_inlay_hint_resolve_round_trips_to_host_origin() {
     assert_eq!(observed["receivedTextEdit"], hint["textEdits"][0]["range"]);
     assert_eq!(observed["receivedLocation"], hint["label"][0]["location"]);
     assert_eq!(observed["receivedCommand"], "mock.hint");
+    assert_routed_command(
+        &response["result"]["label"][0]["command"]["command"],
+        "mock.resolved",
+    );
 
     shutdown_client(&mut client);
 }
