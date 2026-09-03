@@ -65,7 +65,7 @@ pub(crate) struct ParseResult {
     /// Whether more than one file contributed (`inherits` parents, `extends`
     /// overlays). When true, line numbers in `skipped` refer to the combined
     /// query, not any one source file.
-    pub combined: bool,
+    pub multi_file: bool,
 }
 
 /// The text of a query assembled from every file that contributes to it.
@@ -306,7 +306,11 @@ impl QueryLoader {
     /// First attempts full compilation (fast path). If that fails, splits the
     /// query into individual patterns, validates each separately, and combines
     /// only the valid ones.
-    pub(crate) fn parse_query(language: &Language, query_str: &str, combined: bool) -> ParseResult {
+    pub(crate) fn parse_query(
+        language: &Language,
+        query_str: &str,
+        multi_file: bool,
+    ) -> ParseResult {
         use crate::language::query_pattern_splitter::split_patterns;
 
         // Fast path: try full compilation first.
@@ -319,7 +323,7 @@ impl QueryLoader {
                 query: Some(query),
                 skipped: Vec::new(),
                 failure_reason: None,
-                combined,
+                multi_file,
             };
         }
 
@@ -334,7 +338,7 @@ impl QueryLoader {
                     query: None,
                     skipped: Vec::new(),
                     failure_reason: Some(ParseFailure::PatternSplitFailed(reason)),
-                    combined,
+                    multi_file,
                 };
             }
         };
@@ -364,7 +368,7 @@ impl QueryLoader {
                 query: None,
                 skipped,
                 failure_reason: Some(ParseFailure::AllPatternsInvalid),
-                combined,
+                multi_file,
             };
         }
 
@@ -374,7 +378,7 @@ impl QueryLoader {
                 query: Some(q),
                 skipped,
                 failure_reason: None,
-                combined,
+                multi_file,
             },
             Err(e) => {
                 // Defensive: handle the rare case where individually-valid patterns
@@ -388,7 +392,7 @@ impl QueryLoader {
                     query: None,
                     skipped,
                     failure_reason: Some(ParseFailure::CombinationFailed(e.message)),
-                    combined,
+                    multi_file,
                 }
             }
         }
@@ -906,7 +910,7 @@ mod tests {
         assert!(result.is_ok(), "Should resolve with PathBuf search paths");
         let parsed = result.unwrap();
         assert!(parsed.query.is_some(), "Should produce a valid query");
-        assert!(parsed.combined, "Should detect inheritance");
+        assert!(parsed.multi_file, "Should detect inheritance");
     }
 
     // Tests for `;; extends` overlays across search paths
@@ -1009,7 +1013,7 @@ mod tests {
             QueryLoader::load_query_with_inheritance(&language, &bases, "rust", "highlights.scm")
                 .unwrap();
         assert!(
-            !parsed.combined,
+            !parsed.multi_file,
             "a shadowed file contributed nothing, so line numbers are the base file's own"
         );
     }
@@ -1123,7 +1127,7 @@ mod tests {
     }
 
     #[test]
-    fn combined_flag_reports_any_multi_file_query() {
+    fn multi_file_flag_reports_any_multi_file_query() {
         let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
         let base = tempdir().unwrap();
         let overlay = tempdir().unwrap();
@@ -1139,7 +1143,7 @@ mod tests {
         let alone =
             QueryLoader::load_query_with_inheritance(&language, &bases, "alone", "highlights.scm")
                 .unwrap();
-        assert!(!alone.combined, "one file, line numbers are the file's");
+        assert!(!alone.multi_file, "one file, line numbers are the file's");
         let extended = QueryLoader::load_query_with_inheritance(
             &language,
             &bases,
@@ -1148,7 +1152,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            extended.combined,
+            extended.multi_file,
             "an overlay shifts line numbers like a parent does"
         );
         assert!(extended.query.is_some());

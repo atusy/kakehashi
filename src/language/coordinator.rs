@@ -1067,7 +1067,7 @@ impl LanguageCoordinator {
             // When several files were combined (inherits parents, extends
             // overlays), line numbers refer to the combined query, not any
             // one source file
-            let line_note = if result.combined {
+            let line_note = if result.multi_file {
                 " (in combined query)"
             } else {
                 ""
