@@ -532,21 +532,29 @@ impl LanguageServerPool {
             re_envelope_hint(&mut hint, &envelope);
             return hint;
         };
-        match &virt {
-            Some(virt) => {
-                transform_inlay_hint_to_host(
-                    &mut resolved,
-                    &virt.virtual_uri,
-                    &virt.host_lsp_uri,
-                    &RegionOffset::from(&envelope.offset),
-                    virt.region_end,
-                    connection_key,
-                    "inlayHint/resolve",
-                );
+        let reply_translated_locations = match &virt {
+            Some(virt) => transform_inlay_hint_to_host(
+                &mut resolved,
+                &virt.virtual_uri,
+                &virt.host_lsp_uri,
+                &RegionOffset::from(&envelope.offset),
+                virt.region_end,
+                connection_key,
+                "inlayHint/resolve",
+            ),
+            None => {
+                encode_inlay_hint_commands(&mut resolved, connection_key);
+                Vec::new()
             }
-            None => encode_inlay_hint_commands(&mut resolved, connection_key),
-        }
-        let mut resolved = merge_resolved_inlay_hint(hint, resolved);
+        };
+        let (mut resolved, translated_locations) = merge_resolved_inlay_hint(
+            hint,
+            resolved,
+            &envelope.translated_locations,
+            &reply_translated_locations,
+        );
+        let mut envelope = envelope;
+        envelope.translated_locations = translated_locations;
         re_envelope_hint(&mut resolved, &envelope);
         resolved
     }
@@ -605,7 +613,13 @@ fn reverse_hint_into_virtual(
 /// carries `data` from the request INTO the resolve, and a hint the editor
 /// keeps showing may be resolved again, so the envelope is restored around
 /// the payload it was minted with and routes identically the second time.
-fn merge_resolved_inlay_hint(mut original: InlayHint, mut resolved: InlayHint) -> InlayHint {
+fn merge_resolved_inlay_hint(
+    mut original: InlayHint,
+    mut resolved: InlayHint,
+    translated_locations: &[usize],
+    reply_translated_locations: &[usize],
+) -> (InlayHint, Vec<usize>) {
+    let _ = reply_translated_locations;
     original.tooltip = resolved.tooltip.take().or(original.tooltip);
     original.text_edits = resolved.text_edits.take().or(original.text_edits);
 
@@ -656,7 +670,7 @@ fn merge_resolved_inlay_hint(mut original: InlayHint, mut resolved: InlayHint) -
         (InlayHintLabel::String(_), InlayHintLabel::String(_)) => {}
     }
 
-    original
+    (original, translated_locations.to_vec())
 }
 
 fn build_inlay_hint_resolve_request(
@@ -1228,7 +1242,9 @@ mod tests {
         }))
         .unwrap();
 
-        let merged = serde_json::to_value(merge_resolved_inlay_hint(original, resolved)).unwrap();
+        let merged =
+            serde_json::to_value(merge_resolved_inlay_hint(original, resolved, &[], &[]).0)
+                .unwrap();
         assert_eq!(merged["position"], json!({ "line": 4, "character": 2 }));
         assert_eq!(merged["label"][0]["value"], ": original");
         assert_eq!(merged["label"][0]["tooltip"], "resolved part tooltip");
@@ -1262,7 +1278,9 @@ mod tests {
         }))
         .unwrap();
 
-        let merged = serde_json::to_value(merge_resolved_inlay_hint(original, resolved)).unwrap();
+        let merged =
+            serde_json::to_value(merge_resolved_inlay_hint(original, resolved, &[], &[]).0)
+                .unwrap();
         assert_eq!(merged["label"][0]["tooltip"], "first tooltip");
         assert!(merged["label"][0].get("location").is_none());
         assert!(merged["label"][1].get("tooltip").is_none());
@@ -1291,7 +1309,9 @@ mod tests {
         }))
         .unwrap();
 
-        let merged = serde_json::to_value(merge_resolved_inlay_hint(original, resolved)).unwrap();
+        let merged =
+            serde_json::to_value(merge_resolved_inlay_hint(original, resolved, &[], &[]).0)
+                .unwrap();
         assert_eq!(
             merged["label"],
             json!([
@@ -1331,7 +1351,8 @@ mod tests {
         .unwrap();
 
         let merged =
-            serde_json::to_value(merge_resolved_inlay_hint(original.clone(), resolved)).unwrap();
+            serde_json::to_value(merge_resolved_inlay_hint(original.clone(), resolved, &[], &[]).0)
+                .unwrap();
         assert_eq!(merged, serde_json::to_value(original).unwrap());
     }
 
