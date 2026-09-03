@@ -443,11 +443,39 @@ fn e2e_inlay_hint_resolve_rejects_live_non_contiguous_region_before_dispatch() {
         }}),
     );
     let mut hint = inlay_hints_with_retry(&mut client, uri, 1, 3).remove(0);
+    // The content version counts text mutations since didOpen, so a hint
+    // minted before any edit carries 0. Inlay hints carry edits and are never
+    // minted for a non-contiguous region, so the stamps below are forged from
+    // that baseline rather than re-minted.
+    assert_eq!(hint["data"]["kakehashi"]["content_version"], json!(0));
 
+    // Positive control for the forged stamp: after one in-fence edit the
+    // region is unchanged and contiguous, so the hint stamped with the live
+    // version must reach the downstream.
     client.send_notification(
         "textDocument/didChange",
         json!({
             "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "```lua\nlocal y = 1\n```\n" }]
+        }),
+    );
+    hint["data"]["kakehashi"]["content_version"] = json!(1);
+    let response = client.send_request("inlayHint/resolve", hint.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(
+        response["result"]["tooltip"], "mock resolved:hint-1",
+        "a live stamp on an unchanged contiguous region must resolve: {response}"
+    );
+    assert!(
+        marker.exists(),
+        "the control resolve must reach the downstream"
+    );
+    std::fs::remove_file(&marker).expect("clear the request marker");
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 3 },
             "contentChanges": [{
                 "text": "```lua\nlocal x = 1\n```\n\nprose\n\n```lua\nlocal y = 2\n```\n"
             }]
@@ -493,14 +521,27 @@ fn e2e_inlay_hint_resolve_rejects_live_non_contiguous_region_before_dispatch() {
             .expect("enveloped column offset")
     );
 
-    // The real edit made the once-single combined capture non-contiguous. Set
-    // only the opaque freshness stamp to the current version so this request
-    // specifically exercises the live geometry/contiguity guard.
+    // The stamp is now one edit behind: that is refused before dispatch,
+    // whatever the region looks like.
+    let response = client.send_request("inlayHint/resolve", hint.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"], hint);
+    assert!(
+        !marker.exists(),
+        "a content-stale resolve must not reach the downstream"
+    );
+
+    // With the live stamp (two edits), the only thing between the request and
+    // the downstream is the geometry guard: the once-single combined capture
+    // is now non-contiguous.
     hint["data"]["kakehashi"]["content_version"] = json!(2);
     let response = client.send_request("inlayHint/resolve", hint.clone());
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"], hint);
-    assert!(!marker.exists(), "resolve must not reach the downstream");
+    assert!(
+        !marker.exists(),
+        "a non-contiguous region must not reach the downstream"
+    );
 
     shutdown_client(&mut client);
 }
