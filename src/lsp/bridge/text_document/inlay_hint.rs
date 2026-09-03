@@ -972,6 +972,74 @@ mod tests {
         );
     }
 
+    /// The envelope's `host_uri` is data the client echoes back, and
+    /// `url::Url` accepts characters RFC 3986 forbids (`|`, `^`, a backslash
+    /// that the file scheme folds into `/`), so a host URI that passes the
+    /// `Url` parse can still fail the `Uri` parse the virtual-document path
+    /// needs. That has to fail soft: a resolve must never take the server
+    /// down.
+    #[test]
+    fn virt_dispatch_fails_soft_when_host_uri_is_not_a_valid_uri() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let pool = LanguageServerPool::new();
+            let key = ConnectionKey::for_server("lua-ls");
+            let handle =
+                crate::lsp::bridge::test_helpers::create_handle_resolving_inlay_hints(key.clone())
+                    .await;
+            pool.insert_connection(handle).await;
+            let host_uri = "file:///test|a.md";
+            assert!(
+                Url::parse(host_uri).is_ok(),
+                "url::Url must accept the raw '|'"
+            );
+            assert!(
+                host_uri.parse::<Uri>().is_err(),
+                "the editor-facing Uri must reject the raw '|'"
+            );
+            pool.open_host_incarnation(&Url::parse(host_uri).unwrap(), 2)
+                .await;
+            let mut settings = crate::config::settings::WorkspaceSettings::default();
+            settings.language_servers.insert(
+                "lua-ls".to_string(),
+                BridgeServerConfig {
+                    cmd: Some(vec!["lua-language-server".to_string()]),
+                    ..Default::default()
+                },
+            );
+            let envelope = InlayHintEnvelope {
+                origin: "lua-ls".to_string(),
+                host_uri: host_uri.to_string(),
+                region_id: "region-0".to_string(),
+                injection_language: "lua".to_string(),
+                incarnation: Some(2),
+                content_version: Some(3),
+                connection_generation: Some(pool.document_connection_generation(&key)),
+                connection_key: Some(key.clone()),
+                offset: EnvelopeOffset::from(&RegionOffset::new(1, 0)),
+                inner: Some(json!({ "token": 1 })),
+                host_layer: false,
+            };
+            let hint: InlayHint = serde_json::from_value(json!({
+                "position": { "line": 1, "character": 1 },
+                "label": ": number",
+                "data": { ENVELOPE_KEY: envelope }
+            }))
+            .unwrap();
+
+            let result = pool
+                .dispatch_inlay_hint_resolve(hint, &settings, None, Some(Position::new(2, 0)))
+                .await;
+            assert!(result.tooltip.is_none(), "hint stays unresolved");
+            assert_eq!(
+                extract_inlay_hint_envelope(&result)
+                    .expect("envelope restored")
+                    .inner,
+                Some(json!({ "token": 1 }))
+            );
+        });
+    }
+
     #[test]
     fn inlay_hint_resolve_request_carries_original_data() {
         let hint: InlayHint = serde_json::from_value(json!({
