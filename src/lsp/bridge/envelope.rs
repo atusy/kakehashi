@@ -17,8 +17,8 @@ pub(crate) const ENVELOPE_KEY: &str = "kakehashi";
 /// item, on responses the client re-requests on every keystroke or scroll.
 /// Serializing the envelope with its `inner` empty and inserting the moved
 /// value afterwards costs one map insert instead. Callers pass an envelope
-/// whose `inner` is `None`; a serialized `inner` would be replaced by the
-/// moved value anyway.
+/// whose `inner` is `None`: a serialized `inner` would be overwritten
+/// whenever a value is moved in, and would otherwise ride along on the wire.
 pub(crate) fn wrap_envelope<E: Serialize>(envelope: &E, inner: Option<Value>) -> Value {
     let mut wrapped = serde_json::to_value(envelope).unwrap_or(Value::Null);
     if let Some(inner) = inner
