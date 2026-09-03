@@ -1307,8 +1307,9 @@ mod tests {
     }
 
     /// The resolve request must reach the downstream in the coordinates it
-    /// minted. A blockquote region (per-line column offsets) is the shape
-    /// where a first-line-only reversal or a dropped column table shows.
+    /// minted. A blockquote region with a different column on every line is
+    /// the shape where a reversal that applies the first line'"'"'s column
+    /// everywhere, or drops the column table, shows.
     #[test]
     fn resolve_request_is_reversed_through_per_line_offsets() {
         let envelope = InlayHintEnvelope {
@@ -1323,7 +1324,7 @@ mod tests {
             offset: EnvelopeOffset {
                 line: 4,
                 column: 2,
-                line_column_offsets: Some(vec![2, 2, 0]),
+                line_column_offsets: Some(vec![2, 3, 0]),
             },
             inner: None,
             host_layer: false,
@@ -1340,10 +1341,16 @@ mod tests {
                     "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }
                 } }
             ],
-            "textEdits": [{
-                "range": { "start": { "line": 5, "character": 2 }, "end": { "line": 5, "character": 10 } },
-                "newText": "x"
-            }]
+            "textEdits": [
+                {
+                    "range": { "start": { "line": 5, "character": 3 }, "end": { "line": 5, "character": 10 } },
+                    "newText": "x"
+                },
+                {
+                    "range": { "start": { "line": 6, "character": 4 }, "end": { "line": 6, "character": 6 } },
+                    "newText": "y"
+                }
+            ]
         }))
         .unwrap();
         let host_lsp_uri: Uri = "file:///doc.md".parse().unwrap();
@@ -1351,10 +1358,14 @@ mod tests {
         let virtual_uri = reverse_hint_into_virtual(&mut outgoing, &envelope, &host_lsp_uri);
 
         let reversed = serde_json::to_value(&outgoing).unwrap();
-        assert_eq!(reversed["position"], json!({ "line": 1, "character": 8 }));
+        assert_eq!(reversed["position"], json!({ "line": 1, "character": 7 }));
         assert_eq!(
             reversed["textEdits"][0]["range"],
-            json!({ "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 8 } })
+            json!({ "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 7 } })
+        );
+        assert_eq!(
+            reversed["textEdits"][1]["range"],
+            json!({ "start": { "line": 2, "character": 4 }, "end": { "line": 2, "character": 6 } })
         );
         assert!(virtual_uri.contains("region-0"), "{virtual_uri}");
         assert_eq!(reversed["label"][0]["location"]["uri"], virtual_uri);
