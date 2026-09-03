@@ -928,6 +928,15 @@ fn e2e_host_inlay_hint_resolve_cancel_targets_downstream_request() {
     );
     let hint = inlay_hints_with_retry(&mut client, uri, 0, 1).remove(0);
 
+    // Diverge the editor-side and downstream id counters first: a bare hint
+    // passes through without reaching any server, so from here on the id the
+    // mock records can only be the translated downstream one.
+    let passthrough = client.send_request(
+        "inlayHint/resolve",
+        json!({ "position": { "line": 0, "character": 0 }, "label": "bare" }),
+    );
+    assert!(passthrough.get("error").is_none(), "{passthrough}");
+
     let request_id = client.send_request_async("inlayHint/resolve", hint);
     wait_for_resolve_started(&mut client);
     assert!(request_file.exists(), "downstream request must be recorded");
@@ -950,6 +959,11 @@ fn e2e_host_inlay_hint_resolve_cancel_targets_downstream_request() {
         serde_json::from_slice(&std::fs::read(&cancel_file).expect("read cancel event"))
             .expect("parse cancel event");
     assert_eq!(cancel_event["params"]["id"], request_event["id"]);
+    assert_ne!(
+        request_event["id"],
+        json!(request_id),
+        "the downstream must see its own request id, not the editor's"
+    );
 
     shutdown_client(&mut client);
 }
