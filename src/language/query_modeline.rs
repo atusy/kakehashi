@@ -117,8 +117,9 @@ fn inherits_operand(directive: &str) -> Option<Vec<String>> {
 /// module doc for why digits are added) and what the installer accepts as a
 /// language to fetch: such a name is one normal path component and a safe
 /// URL segment, so it can never escape `queries/` on disk or the query
-/// source's URL. `pub` because the `kakehashi` binary validates CLI language
-/// arguments through the installer's re-export of it.
+/// source's URL. `pub` because the `kakehashi` binary validates language
+/// names — CLI arguments and on-disk entries alike — through the installer's
+/// re-export of it.
 pub fn is_safe_language_name(name: &str) -> bool {
     !name.is_empty()
         && name
