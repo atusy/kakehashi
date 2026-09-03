@@ -76,6 +76,12 @@ pub(crate) struct InlayHintEnvelope {
     pub(crate) inner: Option<Value>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) host_layer: bool,
+    /// Indices of the label parts whose `location` was translated from the
+    /// virtual document when the hint was minted. Only those are reversed on
+    /// resolve: a host-document location the downstream returned as such is
+    /// a real reference to the host file and must reach it again untouched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) translated_locations: Vec<usize>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -116,7 +122,11 @@ struct InlayHintEnvelopeContext<'a> {
     host_layer: bool,
 }
 
-fn envelope_hint_data(hint: &mut InlayHint, ctx: &InlayHintEnvelopeContext<'_>) {
+fn envelope_hint_data(
+    hint: &mut InlayHint,
+    ctx: &InlayHintEnvelopeContext<'_>,
+    translated_locations: Vec<usize>,
+) {
     let inner = hint.data.take();
     let envelope = InlayHintEnvelope {
         origin: ctx.server_name.to_string(),
@@ -130,6 +140,7 @@ fn envelope_hint_data(hint: &mut InlayHint, ctx: &InlayHintEnvelopeContext<'_>) 
         offset: EnvelopeOffset::from(ctx.offset),
         inner: None,
         host_layer: ctx.host_layer,
+        translated_locations,
     };
     hint.data = Some(wrap_envelope(&envelope, inner));
 }
@@ -180,7 +191,8 @@ pub(crate) fn envelope_host_inlay_hints(
     for hint in hints {
         encode_inlay_hint_commands(hint, connection_key);
         if should_envelope(hint.data.as_ref(), server_resolves) {
-            envelope_hint_data(hint, &ctx);
+            // Host coordinates are forwarded verbatim; nothing is translated.
+            envelope_hint_data(hint, &ctx, Vec::new());
         }
     }
 }
@@ -521,15 +533,17 @@ impl LanguageServerPool {
             return hint;
         };
         match &virt {
-            Some(virt) => transform_inlay_hint_to_host(
-                &mut resolved,
-                &virt.virtual_uri,
-                &virt.host_lsp_uri,
-                &RegionOffset::from(&envelope.offset),
-                virt.region_end,
-                connection_key,
-                "inlayHint/resolve",
-            ),
+            Some(virt) => {
+                transform_inlay_hint_to_host(
+                    &mut resolved,
+                    &virt.virtual_uri,
+                    &virt.host_lsp_uri,
+                    &RegionOffset::from(&envelope.offset),
+                    virt.region_end,
+                    connection_key,
+                    "inlayHint/resolve",
+                );
+            }
             None => encode_inlay_hint_commands(&mut resolved, connection_key),
         }
         let mut resolved = merge_resolved_inlay_hint(hint, resolved);
@@ -723,7 +737,7 @@ fn transform_inlay_hint_response_to_host_and_envelope(
     let mut hints: Vec<InlayHint> = serde_json::from_value(result).ok()?;
 
     for hint in &mut hints {
-        transform_inlay_hint_to_host(
+        let translated_locations = transform_inlay_hint_to_host(
             hint,
             request_virtual_uri,
             host_uri,
@@ -734,7 +748,7 @@ fn transform_inlay_hint_response_to_host_and_envelope(
         );
 
         if should_envelope(hint.data.as_ref(), server_resolves) {
-            envelope_hint_data(hint, envelope_ctx);
+            envelope_hint_data(hint, envelope_ctx, translated_locations);
         }
     }
 
@@ -749,7 +763,7 @@ fn transform_inlay_hint_to_host(
     region_end: Position,
     connection_key: &ConnectionKey,
     method: &str,
-) {
+) -> Vec<usize> {
     translate_virtual_position_to_host(&mut hint.position, offset);
 
     if let Some(text_edits) = &mut hint.text_edits {
@@ -769,8 +783,9 @@ fn transform_inlay_hint_to_host(
         }
     }
 
+    let mut translated_locations = Vec::new();
     if let InlayHintLabel::LabelParts(parts) = &mut hint.label {
-        for part in parts {
+        for (index, part) in parts.iter_mut().enumerate() {
             if let Some(command) = &mut part.command {
                 command.command = encode_command(connection_key, &command.command);
             }
@@ -784,6 +799,7 @@ fn transform_inlay_hint_to_host(
             if uri_str == request_virtual_uri {
                 location.uri = host_uri.clone();
                 translate_virtual_range_to_host(&mut location.range, offset);
+                translated_locations.push(index);
             } else {
                 // The value is display text; only the unrepresentable routing
                 // target is discarded for a different virtual region.
@@ -791,6 +807,7 @@ fn transform_inlay_hint_to_host(
             }
         }
     }
+    translated_locations
 }
 
 fn encode_inlay_hint_commands(hint: &mut InlayHint, connection_key: &ConnectionKey) {
@@ -1144,6 +1161,7 @@ mod tests {
                 offset: EnvelopeOffset::from(&RegionOffset::new(1, 0)),
                 inner: Some(json!({ "token": 1 })),
                 host_layer: false,
+                translated_locations: Vec::new(),
             };
             let hint: InlayHint = serde_json::from_value(json!({
                 "position": { "line": 1, "character": 1 },
@@ -1342,6 +1360,7 @@ mod tests {
             },
             inner: None,
             host_layer: false,
+            translated_locations: vec![0],
         };
         let mut outgoing: InlayHint = serde_json::from_value(json!({
             "position": { "line": 5, "character": 10 },
@@ -1418,6 +1437,7 @@ mod tests {
             },
             inner: None,
             host_layer: false,
+            translated_locations: vec![0],
         };
         let mut outgoing: InlayHint = serde_json::from_value(json!({
             "position": { "line": 4, "character": 1 },
