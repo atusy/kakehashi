@@ -343,6 +343,10 @@ impl LanguageServerPool {
         {
             Some(handle) => handle,
             None => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "inlayHint/resolve{layer}: failed to connect to {server_name}: producer connection is no longer live"
+                );
                 re_envelope_hint(&mut hint, &envelope);
                 return hint;
             }
