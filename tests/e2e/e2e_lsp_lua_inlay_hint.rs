@@ -1,15 +1,14 @@
-//! End-to-end test for Lua inlay hints in Markdown code blocks via kakehashi binary.
+//! End-to-end tests for inlay hints through the kakehashi binary.
 //!
-//! This test verifies the full bridge infrastructure wiring for inlay hints:
-//! - kakehashi binary spawned via LspClient (not direct BridgeConnection)
-//! - Markdown document with Lua code block opened via didOpen
-//! - Inlay hint request with range in Lua block
-//! - kakehashi detects injection, translates range, spawns lua-ls
-//! - Inlay hints received from lua-language-server with transformed coordinates
+//! The first test drives `textDocument/inlayHint` for a Lua block in Markdown
+//! through a real lua-language-server (skipped when it is not in PATH) and
+//! checks the hints come back in host coordinates. Every other test drives
+//! `inlayHint/resolve` on both the injection and host layers through the
+//! mock server's `inlay-hint-*` modes (see `tests/bin/mock_formatter.rs`):
+//! routing back to the exact producer, coordinate reversal, freshness gates,
+//! cancellation, and the edit guard.
 //!
 //! Run with: `cargo test --features e2e --test e2e e2e_lsp_lua_inlay_hint::`
-//!
-//! **Requirements**: lua-language-server must be installed and in PATH.
 
 use crate::helpers::lsp_client::LspClient;
 use crate::helpers::lua_bridge::{
