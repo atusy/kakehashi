@@ -1306,7 +1306,11 @@ Some languages inherit queries from base languages (see
 | JavaScript | ecma, jsx |
 | TSX | typescript, jsx |
 
-When you install a language with inheritance, the base queries are automatically downloaded.
+When you install a language with inheritance, the base queries its
+`highlights.scm` and `injections.scm` name are downloaded with it. Those are
+the only kinds the installer fetches: a parent named by `bindings.scm`, by a
+captures kind, or by an overlay on another search path must be put on a search
+path by hand (see [Query modelines](#query-modelines)).
 
 ## Logging
 
