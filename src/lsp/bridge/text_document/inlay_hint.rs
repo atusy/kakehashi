@@ -85,9 +85,10 @@ impl InlayHintEnvelope {
     }
 }
 
-/// What reversing a virtual-layer resolve reply needs: the virtual URI the
-/// request went out under (same-region label locations come back under it),
-/// the editor-facing host URI, and the live region end for the edit guard.
+/// What translating a virtual-layer resolve reply back into host coordinates
+/// needs: the virtual URI the request went out under (same-region label
+/// locations come back under it), the editor-facing host URI, and the live
+/// region end for the edit guard.
 struct VirtualResolveTarget {
     virtual_uri: String,
     host_lsp_uri: Uri,
