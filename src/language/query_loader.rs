@@ -1054,6 +1054,30 @@ mod tests {
         );
     }
 
+    /// Neovim reads the modeline of every hit, shadowed ones included, so a
+    /// parent named only by the shadowed file is still prepended. This is
+    /// the one way a shadowed file still matters.
+    #[test]
+    fn a_shadowed_plain_query_still_contributes_its_parents() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        write_highlights(first.path(), "rust", "(identifier) @first\n");
+        write_highlights(first.path(), "parent", "(boolean_literal) @parent\n");
+        write_highlights(
+            second.path(),
+            "rust",
+            "; inherits: parent\n(string_literal) @second\n",
+        );
+
+        let bases = [first.path().to_path_buf(), second.path().to_path_buf()];
+        let content = resolve_query(&bases, "rust", "highlights.scm").unwrap();
+        assert!(
+            position(&content, "@parent") < position(&content, "@first"),
+            "the shadowed file's parent still comes first:\n{content}"
+        );
+        assert!(!content.contains("@second"), "{content}");
+    }
+
     #[test]
     fn every_extends_overlay_is_appended_in_search_path_order() {
         let base = tempdir().unwrap();
