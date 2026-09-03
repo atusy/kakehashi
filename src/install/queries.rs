@@ -1,6 +1,6 @@
 //! Query file downloading from nvim-treesitter repository.
 
-use crate::language::query_modeline::parse_modeline;
+use crate::language::query_modeline::{InheritedLanguage, parse_modeline};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -154,8 +154,8 @@ fn validate_safe_language_name(language: &str) -> Result<(), QueryInstallError> 
 /// kind the installer does not fetch (bindings, captures kinds) resolves its
 /// parents the same way, but only from files the user placed on a search
 /// path; nothing here can install those.
-fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<String>> {
-    let mut parents: Vec<String> = Vec::new();
+fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<InheritedLanguage>> {
+    let mut parents: Vec<InheritedLanguage> = Vec::new();
     for query_file in QUERY_FILES {
         let content = match fs::read_to_string(queries_dir.join(query_file)) {
             Ok(content) => content,
@@ -166,16 +166,33 @@ fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<String>> {
             // saw, so say the chain cannot be determined instead.
             Err(_) => return None,
         };
-        // An optional parent, `(cpp)`, is skipped by the loader only while
-        // the file is itself being inherited; loaded for its own language it
-        // is needed, so the chain counts it.
         for parent in parse_modeline(&content).inherits {
-            if !parents.contains(&parent.name) {
-                parents.push(parent.name);
+            match parents.iter_mut().find(|p| p.name == parent.name) {
+                // Required by one kind, required for the language.
+                Some(known) => known.optional &= parent.optional,
+                None => parents.push(parent),
             }
         }
     }
     Some(parents)
+}
+
+/// The parents a language actually needs on disk, given how it is reached.
+///
+/// The loader inherits an optional parent, `(cpp)`, only when the file is
+/// loaded for its own language; a language reached as another's parent skips
+/// its optional parents, so a chain stops there. The installer asks the same
+/// question the same way, or it would fetch and lock a grandparent the loader
+/// never looks for — and call a chain incomplete over a language the loader
+/// would load.
+fn required_parents(
+    parents: Vec<InheritedLanguage>,
+    is_included: bool,
+) -> impl Iterator<Item = String> {
+    parents
+        .into_iter()
+        .filter(move |parent| !(parent.optional && is_included))
+        .map(|parent| parent.name)
 }
 
 /// Hold every language in an inheritance chain still, and report whether all of
@@ -195,6 +212,7 @@ pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec
     fn walk(
         data_dir: &Path,
         language: &str,
+        is_included: bool,
         seen: &mut Vec<String>,
         guards: &mut Vec<LanguageLock>,
     ) -> bool {
@@ -217,14 +235,13 @@ pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec
         let queries_dir = data_dir.join("queries").join(language);
         query_install_is_complete(&queries_dir)
             && inherited_languages_on_disk(&queries_dir).is_some_and(|parents| {
-                parents
-                    .into_iter()
-                    .all(|parent| walk(data_dir, &parent, seen, guards))
+                required_parents(parents, is_included)
+                    .all(|parent| walk(data_dir, &parent, true, seen, guards))
             })
     }
 
     let mut guards = Vec::new();
-    walk(data_dir, language, &mut Vec::new(), &mut guards).then_some(guards)
+    walk(data_dir, language, false, &mut Vec::new(), &mut guards).then_some(guards)
 }
 
 /// Download and install query files for a language, including inherited dependencies.
@@ -490,9 +507,12 @@ impl StagedQueryInstall {
             let Some(parents) = inherited_languages_on_disk(&queries_dir) else {
                 return Some(language);
             };
-            if parents
-                .iter()
-                .any(|parent| !self.dependencies.contains(parent))
+            // Only the requested language is loaded for itself; every other
+            // dependency is reached as a parent, where its optional parents
+            // are not needed.
+            let is_included = language != &self.language;
+            if required_parents(parents, is_included)
+                .any(|parent| !self.dependencies.contains(&parent))
             {
                 return Some(language);
             }
@@ -552,7 +572,8 @@ impl StagedQueryInstall {
                 Ok(PublishQueryDirOutcome::AlreadyComplete) => {
                     let chain_matches = inherited_languages_on_disk(&entry.queries_dir)
                         .is_some_and(|parents| {
-                            parents.iter().all(|parent| dependencies.contains(parent))
+                            required_parents(parents, !requested)
+                                .all(|parent| dependencies.contains(&parent))
                         });
                     if !chain_matches {
                         let residue = publish.rollback();
@@ -834,8 +855,8 @@ fn stage_queries_with_dependencies(
     let outcome = stage_queries_recursive(
         base_url,
         language,
+        StageRole::Requested { force },
         data_dir,
-        force,
         &mut staged,
         &mut entries,
         http_policy,
@@ -863,15 +884,38 @@ fn stage_queries_with_dependencies(
 /// the languages it inherits, so `entries` comes out in dependency order and
 /// publishing it forward puts every base language in place before the language
 /// that needs it.
+/// How a language is reached while staging an install.
+///
+/// Only the requested language is loaded for itself, and only it may be
+/// forced; every other language in the chain is reached as a parent, where
+/// its optional parents are not needed and an existing copy is kept.
+#[derive(Clone, Copy)]
+enum StageRole {
+    Requested { force: bool },
+    Parent,
+}
+
+impl StageRole {
+    fn is_included(self) -> bool {
+        matches!(self, Self::Parent)
+    }
+
+    fn force(self) -> bool {
+        matches!(self, Self::Requested { force: true })
+    }
+}
+
 fn stage_queries_recursive(
     base_url: &str,
     language: &str,
+    role: StageRole,
     data_dir: &Path,
-    force: bool,
     staged: &mut std::collections::HashSet<String>,
     entries: &mut Vec<StagedQueryDir>,
     http_policy: QueryHttpPolicy,
 ) -> Result<StageOutcome, QueryInstallError> {
+    let is_included = role.is_included();
+    let force = role.force();
     // The name becomes a path and URL segment below; reject anything that
     // could escape the data dir (e.g. a caller-provided `../../x`).
     // Escape the untrusted name: the error's Display is printed raw by
@@ -911,13 +955,13 @@ fn stage_queries_recursive(
                 "cannot read the query files installed for '{language}' to find what it inherits"
             )))
         })?;
-        for parent in parents {
+        for parent in required_parents(parents, is_included) {
             // Stage parent dependencies (don't force, just ensure they exist)
             stage_queries_recursive(
                 base_url,
                 &parent,
+                StageRole::Parent,
                 data_dir,
-                false,
                 staged,
                 entries,
                 http_policy,
@@ -949,8 +993,13 @@ fn stage_queries_recursive(
                 // Every query kind resolves its own `; inherits:` chain at load
                 // time, so a parent named by injections.scm is as load-bearing
                 // as one named by highlights.scm. A file naming its own
-                // language is read as `extends`, not as a parent.
+                // language is read as `extends`, not as a parent, and an
+                // optional parent is needed only when the language is loaded
+                // for itself (see `required_parents`).
                 for parent in parse_modeline(&content).inherits {
+                    if parent.optional && is_included {
+                        continue;
+                    }
                     let parent = parent.name;
                     if parent != language && !parents_to_install.contains(&parent) {
                         parents_to_install.push(parent);
@@ -1003,8 +1052,8 @@ fn stage_queries_recursive(
         stage_queries_recursive(
             base_url,
             &parent,
+            StageRole::Parent,
             data_dir,
-            false,
             staged,
             entries,
             http_policy,
@@ -2965,10 +3014,53 @@ mod tests {
         )
         .unwrap();
 
+        let parents = inherited_languages_on_disk(&queries_dir).unwrap();
         assert_eq!(
-            inherited_languages_on_disk(&queries_dir),
-            Some(vec!["c".to_string(), "cpp".to_string(), "c3".to_string()]),
+            parents
+                .iter()
+                .map(|parent| (parent.name.as_str(), parent.optional))
+                .collect::<Vec<_>>(),
+            vec![("c", false), ("cpp", true), ("c3", false)],
             "a line whose operand is not a name list is a comment, the rest are parents"
+        );
+        assert_eq!(
+            required_parents(parents, true).collect::<Vec<_>>(),
+            vec!["c".to_string(), "c3".to_string()],
+            "reached as a parent, the language does not need its optional parent"
+        );
+    }
+
+    /// The loader inherits `(cpp)` only when `c` is loaded for itself, so a
+    /// `cuda` that inherits `c` never looks for `cpp`. The installer must ask
+    /// the same question: installing or checking `cuda` must not require —
+    /// or try to fetch — a `cpp` that only a direct load of `c` needs.
+    #[test]
+    fn an_optional_grandparent_is_not_required_through_an_inherited_parent() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+        let c_dir = data_dir.join("queries").join("c");
+        let cuda_dir = data_dir.join("queries").join("cuda");
+        fs::create_dir_all(&c_dir).unwrap();
+        fs::create_dir_all(&cuda_dir).unwrap();
+        fs::write(c_dir.join("highlights.scm"), "; inherits: (cpp)\n").unwrap();
+        fs::write(cuda_dir.join("highlights.scm"), "; inherits: c\n").unwrap();
+        write_install_marker_for_tests(&c_dir).unwrap();
+        write_install_marker_for_tests(&cuda_dir).unwrap();
+        // No `cpp` on disk, and no network: reaching for it would fail.
+
+        assert!(
+            lock_complete_chain(&data_dir, "cuda").is_some(),
+            "cuda's chain stops at c, whose optional parent it never loads"
+        );
+        assert!(
+            lock_complete_chain(&data_dir, "c").is_none(),
+            "c loaded for itself does need cpp"
+        );
+        let result = install_queries_with_dependencies("cuda", &data_dir, false);
+        assert!(
+            matches!(result, Err(QueryInstallError::AlreadyExists(_))),
+            "installing cuda must not reach for cpp: {:?}",
+            result.err()
         );
     }
 
