@@ -53,9 +53,7 @@ pub(crate) struct QueryModeline {
 pub(crate) fn parse_modeline(content: &str) -> QueryModeline {
     let mut modeline = QueryModeline::default();
     for line in content.lines().take_while(|line| line.starts_with(';')) {
-        let directive = line
-            .trim_start_matches(';')
-            .trim_matches(|c: char| c.is_ascii_whitespace());
+        let directive = line.trim_start_matches(';').trim_matches(is_lua_space);
         if directive == "extends" {
             modeline.extends = true;
         } else if let Some(names) = inherits_operand(directive) {
@@ -82,16 +80,13 @@ pub(crate) fn parse_modeline(content: &str) -> QueryModeline {
 /// Neovim would look such an entry up and find nothing; skipping it here
 /// keeps a parent that cannot exist from failing the whole query.
 fn inherits_operand(directive: &str) -> Option<Vec<String>> {
-    // Lua's `%s` is ASCII whitespace; a U+3000 before the keyword keeps the
-    // line a comment in Neovim, so it does here.
-    let ascii_space = |c: char| c.is_ascii_whitespace();
     let rest = directive
         .strip_prefix("inherits")?
-        .trim_start_matches(ascii_space);
+        .trim_start_matches(is_lua_space);
     let operand = rest
         .strip_prefix(':')
         .unwrap_or(rest)
-        .trim_start_matches(ascii_space);
+        .trim_start_matches(is_lua_space);
     let is_list_char = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_,()".contains(&b);
     if operand.is_empty() || !operand.bytes().all(is_list_char) {
         return None;
@@ -109,6 +104,14 @@ fn inherits_operand(directive: &str) -> Option<Vec<String>> {
             })
             .collect(),
     )
+}
+
+/// What Lua's `%s` matches in Neovim's modeline patterns: C `isspace`, that
+/// is ASCII whitespace plus the vertical tab `char::is_ascii_whitespace`
+/// leaves out. A U+3000 or a no-break space before the keyword keeps the
+/// line a comment in Neovim, so it does here.
+fn is_lua_space(c: char) -> bool {
+    c.is_ascii_whitespace() || c == '\x0B'
 }
 
 /// The character class of a language name: `[a-z0-9_]+`.
@@ -240,7 +243,10 @@ mod tests {
         assert!(inherits("; inherits\n").is_empty());
         assert!(!parse_modeline("; extendsfoo\n").extends);
         assert!(!parse_modeline("; extends foo\n").extends);
-        // Lua's `%s` is ASCII: ideographic space and NBSP are not spacing.
+        // Lua's `%s` is C `isspace`: a vertical tab is spacing, an
+        // ideographic space or an NBSP is not.
+        assert_eq!(inherits("; inherits:\x0Becma\n"), vec!["ecma"]);
+        assert!(parse_modeline(";\x0Bextends\x0B\n").extends);
         assert!(inherits(";\u{3000}inherits: ecma\n").is_empty());
         assert!(inherits("; inherits:\u{a0}ecma\n").is_empty());
         assert!(!parse_modeline(";\u{3000}extends\n").extends);
