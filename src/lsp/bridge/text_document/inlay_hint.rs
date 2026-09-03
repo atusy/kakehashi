@@ -1303,6 +1303,69 @@ mod tests {
         assert_eq!(merged, serde_json::to_value(original).unwrap());
     }
 
+    /// The resolve request must reach the downstream in the coordinates it
+    /// minted. A blockquote region (per-line column offsets) is the shape
+    /// where a first-line-only reversal or a dropped column table shows.
+    #[test]
+    fn resolve_request_is_reversed_through_per_line_offsets() {
+        let envelope = InlayHintEnvelope {
+            origin: "lua-ls".to_string(),
+            host_uri: "file:///doc.md".to_string(),
+            region_id: "region-0".to_string(),
+            injection_language: "lua".to_string(),
+            incarnation: Some(1),
+            content_version: Some(0),
+            connection_generation: Some(0),
+            connection_key: None,
+            offset: EnvelopeOffset {
+                line: 4,
+                column: 2,
+                line_column_offsets: Some(vec![2, 2, 0]),
+            },
+            inner: None,
+            host_layer: false,
+        };
+        let mut outgoing: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 5, "character": 10 },
+            "label": [
+                { "value": "same", "location": {
+                    "uri": "file:///doc.md",
+                    "range": { "start": { "line": 4, "character": 2 }, "end": { "line": 4, "character": 5 } }
+                } },
+                { "value": "elsewhere", "location": {
+                    "uri": "file:///other.lua",
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }
+                } }
+            ],
+            "textEdits": [{
+                "range": { "start": { "line": 5, "character": 2 }, "end": { "line": 5, "character": 10 } },
+                "newText": "x"
+            }]
+        }))
+        .unwrap();
+        let host_lsp_uri: Uri = "file:///doc.md".parse().unwrap();
+
+        let virtual_uri = reverse_hint_into_virtual(&mut outgoing, &envelope, &host_lsp_uri);
+
+        let reversed = serde_json::to_value(&outgoing).unwrap();
+        assert_eq!(reversed["position"], json!({ "line": 1, "character": 8 }));
+        assert_eq!(
+            reversed["textEdits"][0]["range"],
+            json!({ "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 8 } })
+        );
+        assert!(virtual_uri.contains("region-0"), "{virtual_uri}");
+        assert_eq!(reversed["label"][0]["location"]["uri"], virtual_uri);
+        assert_eq!(
+            reversed["label"][0]["location"]["range"],
+            json!({ "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 3 } })
+        );
+        assert_eq!(reversed["label"][1]["location"]["uri"], "file:///other.lua");
+        assert_eq!(
+            reversed["label"][1]["location"]["range"]["start"],
+            json!({ "line": 0, "character": 0 })
+        );
+    }
+
     #[test]
     fn inlay_hint_request_uses_virtual_uri() {
         let host_uri = test_host_uri();
