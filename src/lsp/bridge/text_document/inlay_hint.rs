@@ -70,6 +70,9 @@ pub(crate) struct InlayHintEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) connection_key: Option<ConnectionKey>,
     pub(crate) offset: EnvelopeOffset,
+    /// The downstream's own `data`, nested here. Absent — not null — when the
+    /// hint carried none, so a bare hint costs nothing extra on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) inner: Option<Value>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) host_layer: bool,
