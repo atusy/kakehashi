@@ -31,7 +31,7 @@ mod tests {
     }
 
     /// The asset source with `; inherits:` parents concatenated from the
-    /// on-disk assets, read through the loader's own modeline parser. Fails fast on an
+    /// on-disk assets, read through the shared modeline parser. Fails fast on an
     /// inheritance cycle (the runtime loader guards likewise) instead of
     /// recursing until the test suite hangs.
     fn resolved_source(lang: &str) -> String {
