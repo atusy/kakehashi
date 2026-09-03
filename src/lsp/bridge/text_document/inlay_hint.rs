@@ -503,17 +503,11 @@ impl LanguageServerPool {
                 return hint;
             }
         };
-        let producer_is_still_live = {
-            let connections = self.connections().await;
-            connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle))
-                && self.document_connection_generation(connection_key) == expected_generation
-        };
-        if !producer_is_still_live {
-            re_envelope_hint(&mut hint, &envelope);
-            return hint;
-        }
+        // The reply came from the exact producer the send-time check bound
+        // this request to; a replacement landing after it answered does not
+        // make the answer wrong (positions are the hint's own, edits are
+        // guarded against the live region below), so, like the sibling
+        // resolves, the reply is kept rather than re-checked.
         let Some(mut resolved) = parse_inlay_hint_resolve_response(response) else {
             re_envelope_hint(&mut hint, &envelope);
             return hint;
