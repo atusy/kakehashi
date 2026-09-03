@@ -133,7 +133,11 @@ impl QueryLoader {
     /// overlays`. Modelines stay in place: tree-sitter reads them as comments,
     /// and keeping them keeps each file's line numbers intact.
     ///
-    /// `visited` guards against circular inheritance.
+    /// `visited` holds the languages on the current inheritance path so a
+    /// cycle is an error; a language leaves it on the way back out so a
+    /// diamond (two parents sharing an ancestor) resolves, as in Neovim. No
+    /// error path removes anything: every error propagates straight to the
+    /// top-level call, which owns the set and drops it.
     fn resolve_query_recursive<P: AsRef<Path>>(
         runtime_bases: &[P],
         lang_name: &str,
@@ -151,7 +155,6 @@ impl QueryLoader {
 
         let paths = Self::find_query_files(runtime_bases, lang_name, file_name);
         if paths.is_empty() {
-            visited.remove(lang_name);
             return Err(QueryLoadError::NotFound);
         }
 
@@ -204,7 +207,6 @@ impl QueryLoader {
             ) {
                 Ok(resolved) => resolved,
                 Err(QueryLoadError::NotFound) => {
-                    visited.remove(lang_name);
                     return Err(LspError::query(format!(
                         "Query file {} not found for language {} (inherited by {} in {}) in search paths: {}",
                         file_name,
@@ -215,10 +217,7 @@ impl QueryLoader {
                     ))
                     .into());
                 }
-                Err(other) => {
-                    visited.remove(lang_name);
-                    return Err(other);
-                }
+                Err(other) => return Err(other),
             };
             combined.push_str(&resolved.content);
             combined.push('\n');
