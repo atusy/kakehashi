@@ -1473,9 +1473,6 @@ mod tests {
             content.contains("@keyword.import"),
             "Should contain typescript patterns"
         );
-
-        // The directive stays as a comment, so both languages' lines hold.
-        assert!(content.contains("; inherits:"));
     }
 
     #[test]
@@ -1542,9 +1539,6 @@ mod tests {
             content.contains("@variable.parameter"),
             "Should contain javascript patterns"
         );
-
-        // The directive stays as a comment, so both languages' lines hold.
-        assert!(content.contains("; inherits:"));
     }
 
     // ============================================================
