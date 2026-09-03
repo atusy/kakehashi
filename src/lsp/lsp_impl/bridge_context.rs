@@ -1310,8 +1310,9 @@ impl Kakehashi {
     /// and the virt arm already emits the client-visible "no response" LOG —
     /// only real host failures get surfaced here. That deviation is exactly
     /// why this is shared rather than written per handler: every host arm
-    /// (the verbatim raw walk above, codeAction, completion) must quiet the
-    /// same way, and three hand-copies would drift the moment the policy moves.
+    /// (the verbatim raw walk above, codeAction, completion, inlayHint) must
+    /// quiet the same way, and four hand-copies would drift the moment the
+    /// policy moves.
     ///
     /// `on_done` maps the winning fan-in payload to the handler's response —
     /// identity for the arms whose payload already IS the response, and the
