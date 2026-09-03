@@ -2,11 +2,11 @@
 //!
 //! The first test drives `textDocument/inlayHint` for a Lua block in Markdown
 //! through a real lua-language-server (skipped when it is not in PATH) and
-//! checks the hints come back in host coordinates. Every other test drives
-//! `inlayHint/resolve` on both the injection and host layers through the
-//! mock server's `inlay-hint-*` modes (see `tests/bin/mock_formatter.rs`):
-//! routing back to the exact producer, coordinate reversal, freshness gates,
-//! cancellation, and the edit guard.
+//! checks the hints come back in host coordinates. The other tests drive
+//! `inlayHint/resolve` through the mock server's `inlay-hint-*` modes (see
+//! `tests/bin/mock_formatter.rs`) and between them cover both the injection
+//! and host layers: routing back to the exact producer, coordinate reversal,
+//! freshness gates, cancellation, and the edit guard.
 //!
 //! Run with: `cargo test --features e2e --test e2e e2e_lsp_lua_inlay_hint::`
 
