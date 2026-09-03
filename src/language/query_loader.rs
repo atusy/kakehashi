@@ -401,13 +401,14 @@ impl QueryLoader {
     /// Load and parse a query from explicit paths with fault tolerance.
     ///
     /// Tolerant parsing skips invalid patterns instead of failing the whole query;
-    /// errors only on a missing/unreadable file.
+    /// errors only on a missing/unreadable file. Several paths concatenate in
+    /// the order given, and the result then says so through `multi_file`.
     pub(crate) fn load_query_from_paths<P: AsRef<Path>>(
         language: &Language,
         paths: &[P],
     ) -> LspResult<ParseResult> {
         let query_str = Self::load_content_from_paths(paths)?;
-        Ok(Self::parse_query(language, &query_str, false))
+        Ok(Self::parse_query(language, &query_str, paths.len() > 1))
     }
 
     /// Load and parse a query with inheritance resolution and fault tolerance.
@@ -780,6 +781,24 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .ends_with("parser/rust.so")
+        );
+    }
+
+    #[test]
+    fn explicit_paths_report_multi_file_only_when_several_are_given() {
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let dir = tempdir().unwrap();
+        let one = dir.path().join("one.scm");
+        let two = dir.path().join("two.scm");
+        fs::write(&one, "(identifier) @variable\n").unwrap();
+        fs::write(&two, "(string_literal) @string\n").unwrap();
+
+        let single = QueryLoader::load_query_from_paths(&language, &[&one]).unwrap();
+        assert!(!single.multi_file, "one file, line numbers are its own");
+        let layered = QueryLoader::load_query_from_paths(&language, &[&one, &two]).unwrap();
+        assert!(
+            layered.multi_file,
+            "a second explicit path shifts line numbers like an overlay does"
         );
     }
 
