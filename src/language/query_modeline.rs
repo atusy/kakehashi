@@ -25,11 +25,12 @@
 //! the list, the list is one run of list characters with no whitespace inside
 //! it, and a line whose operand holds anything else — `; inherits the ecma
 //! queries` — is prose, not a directive. Within a line that matches, each
-//! name stands alone: `; inherits: ecma,` still inherits `ecma`, the empty
-//! name after the comma finding nothing. The parser here reads exactly that,
-//! so a comment that mentions inheritance never becomes a parent that cannot
-//! be found, and a stray comma never loses the parents beside it. The one
-//! widening is digits in a name: nvim-treesitter ships languages such as
+//! entry stands alone: `; inherits: ecma,` still inherits `ecma`, and the
+//! empty entry after the comma is skipped (see [`inherits_operand`] for why
+//! it is skipped rather than looked up). So a comment that mentions
+//! inheritance never becomes a parent that cannot be found, and a stray
+//! comma never loses the parents beside it. The one widening of Neovim's
+//! grammar is digits in a name: nvim-treesitter ships languages such as
 //! `m68k` and `t32` that Neovim's own character class cannot name. A name in
 //! this class is also what the installer needs of a path and URL segment, so
 //! [`is_safe_language_name`] is the one definition both sides use.
