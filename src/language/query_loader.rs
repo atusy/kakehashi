@@ -1176,7 +1176,9 @@ mod tests {
             ";; extends\n;; inherits: parent\n(boolean_literal) @overlay\n",
         );
 
-        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        // Overlay first in the search paths, so the asserted order is not
+        // the search-path order.
+        let bases = [overlay.path().to_path_buf(), base.path().to_path_buf()];
         let content = resolve_query(&bases, "child", "highlights.scm").unwrap();
         let parent_at = position(&content, "@parent");
         let child_at = position(&content, "@child");
@@ -1228,7 +1230,9 @@ mod tests {
             ";; extends\n(boolean_literal) @parent_overlay\n",
         );
 
-        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        // Overlay first in the search paths, so the asserted order is not
+        // the search-path order.
+        let bases = [overlay.path().to_path_buf(), base.path().to_path_buf()];
         let content = resolve_query(&bases, "child", "highlights.scm").unwrap();
         let parent_at = position(&content, "@parent\n");
         let parent_overlay_at = position(&content, "@parent_overlay");
