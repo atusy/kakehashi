@@ -360,7 +360,8 @@ impl LanguageServerPool {
             if nests_reserved_key(hint.data.as_ref()) {
                 debug!(
                     target: "kakehashi::bridge",
-                    "inlayHint/resolve{layer}: {server_name:?} does not resolve; returning the reserved-key payload unresolved"
+                    "inlayHint/resolve{layer}: {server_name:?} does not advertise resolveProvider; the hint was \
+                     enveloped only to nest a reserved-key payload; returning unresolved"
                 );
             } else {
                 warn!(
