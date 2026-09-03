@@ -15,7 +15,7 @@ const PARSER_EXTENSIONS: &[&str] = &["so", "dylib", "dll"];
 /// Known limitation: when a query is combined from several files (`inherits`
 /// parents, `extends` overlays), line numbers refer to the **combined** query
 /// string, not the original source file (a pattern on line 5 of a child whose
-/// parent has 100 lines reports about 105).
+/// parent has 100 lines reports 105).
 #[derive(Debug, Clone)]
 pub(crate) struct SkippedPattern {
     /// The pattern text that failed to compile
@@ -245,14 +245,12 @@ impl QueryLoader {
                 }
                 Err(other) => return Err(other),
             };
-            combined.push_str(&resolved.content);
-            combined.push('\n');
+            append_file(&mut combined, &resolved.content);
             file_count += resolved.file_count;
             emitted.insert(parent.clone());
         }
         for content in base.into_iter().chain(overlays) {
-            combined.push_str(&content);
-            combined.push('\n');
+            append_file(&mut combined, &content);
         }
 
         visited.remove(lang_name);
@@ -526,6 +524,17 @@ impl QueryLoader {
 /// stay readable, whereas the write side may be stricter because the name also
 /// becomes a URL segment. Rejection here is a path-shape decision only; it is
 /// not a charset filter and must not be relied on as one.
+/// Append one file's text so the next file starts on a fresh line and no
+/// line is added that the file did not have: a file's line numbers in the
+/// combined text are then its own plus the lines of what precedes it, which
+/// is what a skipped-pattern warning quotes.
+fn append_file(combined: &mut String, content: &str) {
+    combined.push_str(content);
+    if !content.ends_with('\n') {
+        combined.push('\n');
+    }
+}
+
 fn is_single_path_component(value: &str) -> bool {
     let mut components = Path::new(value).components();
     matches!(components.next(), Some(Component::Normal(name)) if name == value)
@@ -1328,6 +1337,34 @@ mod tests {
         for capture in ["@a", "@b", "@child", "@overlay"] {
             assert_eq!(content.matches(capture).count(), 1, "{capture}:\n{content}");
         }
+    }
+
+    /// Files join on a line boundary and nothing else: a file that ends in
+    /// a newline gets no blank line after it, one that does not gets exactly
+    /// the newline it lacks, so every line number in the combined text is the
+    /// file's own offset by the lines before it.
+    #[test]
+    fn files_join_on_a_line_boundary_without_blank_lines() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "parent", "(identifier) @parent\n");
+        write_highlights(
+            base.path(),
+            "child",
+            "; inherits: parent\n(string_literal) @child",
+        );
+        write_highlights(
+            overlay.path(),
+            "child",
+            ";; extends\n(boolean_literal) @overlay\n",
+        );
+
+        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        let content = resolve_query(&bases, "child", "highlights.scm").unwrap();
+        assert_eq!(
+            content,
+            "(identifier) @parent\n; inherits: parent\n(string_literal) @child\n;; extends\n(boolean_literal) @overlay\n"
+        );
     }
 
     #[test]
