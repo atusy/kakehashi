@@ -367,4 +367,23 @@ mod tests {
         assert!(inlay_hint_region_is_resolvable(&envelope, &offset, true));
         assert!(!inlay_hint_region_is_resolvable(&envelope, &offset, false));
     }
+
+    /// A region that moved (a different start line or first-line column) or
+    /// whose per-line column table changed is a different geometry from the
+    /// one the envelope was minted under; contiguity alone must not admit it.
+    #[test]
+    fn inlay_hint_resolve_rejects_a_region_whose_offset_moved() {
+        let envelope = envelope();
+
+        let moved = crate::lsp::bridge::RegionOffset::new(4, 2);
+        assert!(!inlay_hint_region_is_resolvable(&envelope, &moved, true));
+        let shifted_column = crate::lsp::bridge::RegionOffset::new(3, 3);
+        assert!(!inlay_hint_region_is_resolvable(
+            &envelope,
+            &shifted_column,
+            true
+        ));
+        let per_line = crate::lsp::bridge::RegionOffset::with_per_line_offsets(3, vec![2, 1]);
+        assert!(!inlay_hint_region_is_resolvable(&envelope, &per_line, true));
+    }
 }
