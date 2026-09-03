@@ -82,6 +82,15 @@ impl InlayHintEnvelope {
     }
 }
 
+/// What reversing a virtual-layer resolve reply needs: the virtual URI the
+/// request went out under (same-region label locations come back under it),
+/// the editor-facing host URI, and the live region end for the edit guard.
+struct VirtualResolveTarget {
+    virtual_uri: String,
+    host_lsp_uri: Uri,
+    region_end: Position,
+}
+
 pub(crate) struct InlayHintDocumentRevision {
     pub(crate) incarnation: Option<u64>,
     pub(crate) content_version: u64,
@@ -301,14 +310,6 @@ impl LanguageServerPool {
             re_envelope_hint(&mut hint, &envelope);
             return hint;
         };
-        // The virtual path also needs the editor-facing form. `url::Url`
-        // accepts characters RFC 3986 forbids (`|`, `^`, a backslash the file
-        // scheme folds into `/`), so the `Url` parse above does not vouch for
-        // this one, and the envelope is client-echoed data: fail soft.
-        let Ok(host_lsp_uri) = envelope.host_uri.parse::<Uri>() else {
-            re_envelope_hint(&mut hint, &envelope);
-            return hint;
-        };
         if envelope
             .incarnation
             .is_some_and(|expected| self.current_host_incarnation(&host_uri) != Some(expected))
@@ -367,43 +368,10 @@ impl LanguageServerPool {
             return hint;
         }
 
-        // Hold the host lifecycle through enqueue for BOTH layers. A virtual
-        // connection can remain live across a host close/reopen, so pointer +
-        // connection generation alone do not prevent a stale resolve from
-        // being queued after the virtual document's didClose.
-        let Some(expected_incarnation) = envelope.incarnation else {
-            re_envelope_hint(&mut hint, &envelope);
-            return hint;
-        };
-        let _host_lifecycle = match self
-            .request_host_lifecycle_for_incarnation(&host_uri, expected_incarnation)
-            .await
-        {
-            Ok(lifecycle) => lifecycle,
-            Err(_) => {
-                re_envelope_hint(&mut hint, &envelope);
-                return hint;
-            }
-        };
-
+        // Build the outgoing hint before anything is registered, so a
+        // virtual-layer request that cannot be reversed fails soft with
+        // nothing to clean up.
         let connection_key = handle.key();
-        if let Some(ref id) = upstream_id {
-            self.register_upstream_request_for_handle(id.clone(), &handle);
-        }
-        let (request_id, response_rx) = match handle
-            .register_request_with_upstream(upstream_id.clone())
-        {
-            Ok(pair) => pair,
-            Err(error) => {
-                warn!(target: "kakehashi::bridge", "inlayHint/resolve: failed to register request for {server_name}: {error}");
-                if let Some(ref id) = upstream_id {
-                    self.unregister_upstream_request(id, connection_key);
-                }
-                re_envelope_hint(&mut hint, &envelope);
-                return hint;
-            }
-        };
-
         let mut outgoing = hint.clone();
         if let InlayHintLabel::LabelParts(parts) = &mut outgoing.label {
             for part in parts {
@@ -415,9 +383,22 @@ impl LanguageServerPool {
                 }
             }
         }
-        let virtual_uri = if envelope.is_host_layer() {
+        let virt = if envelope.is_host_layer() {
             None
         } else {
+            let Some(region_end) = region_end else {
+                re_envelope_hint(&mut hint, &envelope);
+                return hint;
+            };
+            // The virtual path needs the editor-facing form of the host URI.
+            // `url::Url` accepts characters RFC 3986 forbids (`|`, `^`, a
+            // backslash the file scheme folds into `/`), so the `Url` parse
+            // above does not vouch for this one, and the envelope is
+            // client-echoed data: fail soft.
+            let Ok(host_lsp_uri) = envelope.host_uri.parse::<Uri>() else {
+                re_envelope_hint(&mut hint, &envelope);
+                return hint;
+            };
             let offset = RegionOffset::from(&envelope.offset);
             translate_host_position_to_virtual(&mut outgoing.position, &offset);
             if let Some(edits) = &mut outgoing.text_edits {
@@ -441,8 +422,49 @@ impl LanguageServerPool {
                     }
                 }
             }
-            Some(virtual_uri.to_uri_string())
+            Some(VirtualResolveTarget {
+                virtual_uri: virtual_uri.to_uri_string(),
+                host_lsp_uri,
+                region_end,
+            })
         };
+
+        // Hold the host lifecycle through enqueue for BOTH layers. A virtual
+        // connection can remain live across a host close/reopen, so pointer +
+        // connection generation alone do not prevent a stale resolve from
+        // being queued after the virtual document's didClose.
+        let Some(expected_incarnation) = envelope.incarnation else {
+            re_envelope_hint(&mut hint, &envelope);
+            return hint;
+        };
+        let _host_lifecycle = match self
+            .request_host_lifecycle_for_incarnation(&host_uri, expected_incarnation)
+            .await
+        {
+            Ok(lifecycle) => lifecycle,
+            Err(_) => {
+                re_envelope_hint(&mut hint, &envelope);
+                return hint;
+            }
+        };
+
+        if let Some(ref id) = upstream_id {
+            self.register_upstream_request_for_handle(id.clone(), &handle);
+        }
+        let (request_id, response_rx) = match handle
+            .register_request_with_upstream(upstream_id.clone())
+        {
+            Ok(pair) => pair,
+            Err(error) => {
+                warn!(target: "kakehashi::bridge", "inlayHint/resolve: failed to register request for {server_name}: {error}");
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                re_envelope_hint(&mut hint, &envelope);
+                return hint;
+            }
+        };
+
         let request = build_inlay_hint_resolve_request(&outgoing, request_id);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
         let send_result = {
@@ -497,23 +519,16 @@ impl LanguageServerPool {
             re_envelope_hint(&mut hint, &envelope);
             return hint;
         };
-        if !envelope.is_host_layer() {
-            let Some(region_end) = region_end else {
-                re_envelope_hint(&mut hint, &envelope);
-                return hint;
-            };
-            let offset = RegionOffset::from(&envelope.offset);
-            let request_virtual_uri = virtual_uri.as_deref().unwrap_or_default();
-            transform_inlay_hint_to_host(
+        match &virt {
+            Some(virt) => transform_inlay_hint_to_host(
                 &mut resolved,
-                request_virtual_uri,
-                &host_lsp_uri,
-                &offset,
-                region_end,
+                &virt.virtual_uri,
+                &virt.host_lsp_uri,
+                &RegionOffset::from(&envelope.offset),
+                virt.region_end,
                 connection_key,
-            );
-        } else {
-            encode_inlay_hint_commands(&mut resolved, connection_key);
+            ),
+            None => encode_inlay_hint_commands(&mut resolved, connection_key),
         }
         let mut resolved = merge_resolved_inlay_hint(hint, resolved);
         re_envelope_hint(&mut resolved, &envelope);
