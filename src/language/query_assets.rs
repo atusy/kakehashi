@@ -31,11 +31,14 @@ mod tests {
     }
 
     /// The asset source with `; inherits:` parents concatenated from the
-    /// on-disk assets, read through the shared modeline parser. Fails fast on an
+    /// on-disk assets, read through the shared modeline parser and following
+    /// the loader's rules for which parents count: a parent equal to the
+    /// language marks an overlay rather than a chain, and a parenthesized
+    /// parent is inherited only at the top of the chain. Fails fast on an
     /// inheritance cycle (the runtime loader guards likewise) instead of
     /// recursing until the test suite hangs.
     fn resolved_source(lang: &str) -> String {
-        fn resolve(lang: &str, chain: &mut Vec<String>) -> String {
+        fn resolve(lang: &str, is_included: bool, chain: &mut Vec<String>) -> String {
             assert!(
                 !chain.iter().any(|l| l == lang),
                 "inheritance cycle in assets: {chain:?} -> {lang}"
@@ -44,14 +47,17 @@ mod tests {
             let source = asset_source(lang);
             let mut combined = String::new();
             for parent in crate::language::query_modeline::parse_modeline(&source).inherits {
-                combined.push_str(&resolve(&parent.name, chain));
+                if parent.name == lang || (parent.optional && is_included) {
+                    continue;
+                }
+                combined.push_str(&resolve(&parent.name, true, chain));
                 combined.push('\n');
             }
             chain.pop();
             combined.push_str(&source);
             combined
         }
-        resolve(lang, &mut Vec::new())
+        resolve(lang, false, &mut Vec::new())
     }
 
     /// Every asset must compile in full against the grammar it
