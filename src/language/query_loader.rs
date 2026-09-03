@@ -172,9 +172,10 @@ impl QueryLoader {
                 ))
             })?;
             let modeline = parse_modeline(&content);
-            // Naming the language itself is Neovim's older way to say
-            // `extends` (`add_included_lang` returns "extension" for it), so
-            // the file is an overlay, not a parent of itself.
+            // Neovim's `get_files` reads a file naming its own language as an
+            // extension (`add_included_lang` reports the self-reference so,
+            // instead of a parent), so the file is an overlay, not a parent
+            // of itself.
             let mut extends = modeline.extends;
             for parent in modeline.inherits {
                 if parent == lang_name {
@@ -1112,9 +1113,8 @@ mod tests {
     }
 
     /// Neovim's `add_included_lang` treats `; inherits: rust` inside rust's
-    /// own query file as the `extends` marker (its `query.set()` docs use that
-    /// idiom), so the file must merge as an overlay rather than trip the
-    /// cycle check and drop the language's query.
+    /// own query file as the `extends` marker, so the file must merge as an
+    /// overlay rather than trip the cycle check and drop the language's query.
     #[test]
     fn a_file_that_inherits_its_own_language_is_an_overlay() {
         let base = tempdir().unwrap();

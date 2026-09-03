@@ -192,9 +192,8 @@ pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec
         guards: &mut Vec<LanguageLock>,
     ) -> bool {
         // A language already on the path — a file naming its own language
-        // (the older `extends` spelling), or an A↔B cycle for the loader to
-        // report — is not a reason to call the install incomplete and
-        // re-download forever.
+        // (read as `extends`), or an A↔B cycle for the loader to report — is
+        // not a reason to call the install incomplete and re-download forever.
         if seen.iter().any(|visited| visited == language) {
             return true;
         }
@@ -943,7 +942,7 @@ fn stage_queries_recursive(
                 // Every query kind resolves its own `; inherits:` chain at load
                 // time, so a parent named by injections.scm is as load-bearing
                 // as one named by highlights.scm. A file naming its own
-                // language is the older `extends` spelling, not a parent.
+                // language is read as `extends`, not as a parent.
                 for parent in parse_modeline(&content).inherits {
                     if parent != language && !parents_to_install.contains(&parent) {
                         parents_to_install.push(parent);
@@ -2990,9 +2989,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let data_dir = temp_dir.path().to_path_buf();
 
-        // Self-cycle: a query file inheriting its own language (Neovim's older
-        // spelling of `extends`). No network: both branches hit the
-        // already-exists path.
+        // Self-cycle: a query file inheriting its own language (read as
+        // `extends`). No network: both branches hit the already-exists path.
         let a_dir = data_dir.join("queries").join("cyclic_a");
         fs::create_dir_all(&a_dir).unwrap();
         std::fs::write(a_dir.join("highlights.scm"), "; inherits: cyclic_a\n").unwrap();
