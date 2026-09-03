@@ -114,7 +114,8 @@ expression: capabilities
   "monikerProvider": true,
   "linkedEditingRangeProvider": true,
   "inlayHintProvider": {
-    "workDoneProgress": true
+    "workDoneProgress": true,
+    "resolveProvider": true
   },
   "diagnosticProvider": {
     "interFileDependencies": false,
