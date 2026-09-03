@@ -3,10 +3,35 @@
 //! documentLink, inlayHint; codeAction needs no collision rule because a bare
 //! action never leaves with `data`).
 
+use serde::Serialize;
 use serde_json::Value;
 
 /// Wrapper key inside an item's `data` that marks kakehashi routing metadata.
 pub(crate) const ENVELOPE_KEY: &str = "kakehashi";
+
+/// Serialize an envelope into `{"kakehashi": {…}}`, MOVING the item's own
+/// `data` into `inner`.
+///
+/// The obvious `json!({ ENVELOPE_KEY: envelope })` would serialize `inner`
+/// through `Serialize`, i.e. deep-copy the downstream's `data` — once per
+/// item, on responses the client re-requests on every keystroke or scroll.
+/// Serializing the envelope with its `inner` empty and inserting the moved
+/// value afterwards costs one map insert instead. Callers pass an envelope
+/// whose `inner` is `None`; a serialized `inner` would be replaced by the
+/// moved value anyway.
+pub(crate) fn wrap_envelope<E: Serialize>(envelope: &E, inner: Option<Value>) -> Value {
+    let mut wrapped = serde_json::to_value(envelope).unwrap_or(Value::Null);
+    if let Some(inner) = inner
+        && let Some(fields) = wrapped.as_object_mut()
+    {
+        fields.insert("inner".to_string(), inner);
+    }
+    // Built by hand rather than `json!`, which would deep-copy `wrapped`
+    // (including the `inner` we just moved in) back out through `Serialize`.
+    let mut outer = serde_json::Map::with_capacity(1);
+    outer.insert(ENVELOPE_KEY.to_string(), wrapped);
+    Value::Object(outer)
+}
 
 /// Whether an item must carry a routing envelope: the origin advertises the
 /// matching `*/resolve` method, or the item's own `data` already occupies the
