@@ -7,6 +7,7 @@
 mod tests {
     use crate::analysis::bindings::collect::collect;
     use crate::analysis::bindings::model::BindingsModel;
+    use crate::language::query_loader::append_file;
 
     /// The on-disk `bindings.scm` asset for a language.
     fn asset_source(lang_name: &str) -> String {
@@ -50,11 +51,10 @@ mod tests {
                 if parent.name == lang || (parent.optional && is_included) {
                     continue;
                 }
-                combined.push_str(&resolve(&parent.name, true, chain));
-                combined.push('\n');
+                append_file(&mut combined, &resolve(&parent.name, true, chain));
             }
             chain.pop();
-            combined.push_str(&source);
+            append_file(&mut combined, &source);
             combined
         }
         resolve(lang, false, &mut Vec::new())

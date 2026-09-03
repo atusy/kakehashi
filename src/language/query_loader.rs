@@ -525,8 +525,9 @@ impl QueryLoader {
 /// line is added that the file did not have: a file's line numbers in the
 /// combined text are then its own plus the lines of what precedes it, which
 /// is what a skipped-pattern warning quotes. An empty file has no lines and
-/// contributes none.
-fn append_file(combined: &mut String, content: &str) {
+/// contributes none. `pub(crate)` so the asset tests join sources the same
+/// way and count lines the loader would.
+pub(crate) fn append_file(combined: &mut String, content: &str) {
     combined.push_str(content);
     if !content.is_empty() && !content.ends_with('\n') {
         combined.push('\n');
