@@ -178,7 +178,6 @@ impl Kakehashi {
         let Some(envelope) = extract_inlay_hint_envelope(&hint) else {
             return Ok(hint);
         };
-        let unresolved = hint.clone();
         // One parse serves every gate below. An unparsable host URI can only
         // be a mangled echo and fails soft like any other stale envelope.
         let Ok(host_url) = url::Url::parse(&envelope.host_uri) else {
@@ -201,6 +200,9 @@ impl Kakehashi {
             Some(region_end)
         };
 
+        // Kept for the post-response check; the gates above return `hint`
+        // itself, so only a resolve that is actually dispatched pays for it.
+        let unresolved = hint.clone();
         let settings = self.settings_manager.load_settings();
         let pool = self.bridge.pool_arc();
         let upstream_id = current_upstream_id();
