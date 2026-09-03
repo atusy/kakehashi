@@ -911,6 +911,8 @@ print("hello")
             host_pull_enabled: true,
             narrower_than_editor_pull: false,
             host: Some(HostRequestContext {
+                incarnation: 1,
+                content_version: 0,
                 uri: uri.clone(),
                 language_id: "rust".to_string(),
                 text: std::sync::Arc::from("fn debounce_snapshot() {}"),
@@ -1037,6 +1039,8 @@ print("hello")
             host_pull_enabled: true,
             narrower_than_editor_pull: false,
             host: Some(HostRequestContext {
+                incarnation: 1,
+                content_version: 0,
                 uri: uri.clone(),
                 language_id: "rust".to_string(),
                 text: Arc::from("fn stale() {}"),

@@ -41,21 +41,8 @@ impl Kakehashi {
         let work_done_token = params.work_done_progress_params.work_done_token;
         let lsp_uri = params.text_document.uri;
         let range = params.range;
-        // Read before either layer snapshots the document, so the stamp can
-        // only be older than the content the hints were computed on, never
-        // newer: an edit landing in between makes every hint of this
-        // response fail soft on resolve until the editor's next request,
-        // which follows an edit anyway. Threading the snapshot's own version
-        // through the shared bridge preamble would close that window.
-        let Some(content_version) = url::Url::parse(lsp_uri.as_str())
-            .ok()
-            .and_then(|uri| self.documents.get(&uri).map(|doc| doc.content_version()))
-        else {
-            return Ok(None);
-        };
-
-        let virt = self.inlay_hint_virt_layer(&lsp_uri, range, work_done_token, content_version);
-        let host = self.inlay_hint_host_layer(&lsp_uri, raw_params, content_version);
+        let virt = self.inlay_hint_virt_layer(&lsp_uri, range, work_done_token);
+        let host = self.inlay_hint_host_layer(&lsp_uri, raw_params);
         self.walk_layer_futures(
             &lsp_uri,
             METHOD,
@@ -72,11 +59,16 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         raw_params: serde_json::Value,
-        content_version: u64,
     ) -> Result<Option<Vec<InlayHint>>> {
         let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
             return Ok(None);
         };
+        // The stamps travel with the text they were read with, and a reply
+        // synchronized under another lifetime is refused below: a close and
+        // reopen racing the request would otherwise answer for the old text
+        // under the reopened document's incarnation, and a reopened document
+        // restarts its content version, so both stamps could pass.
+        let (expected_incarnation, content_version) = (ctx.incarnation, ctx.content_version);
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
         let fan_in = dispatch_host_preferred(
@@ -103,6 +95,15 @@ impl Kakehashi {
                     let Some(raw) = raw else {
                         return Ok(None);
                     };
+                    if raw.incarnation != expected_incarnation {
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "textDocument/inlayHint (host): {} was reopened while {} answered; discarding hints computed on the closed text",
+                            t.uri,
+                            t.server_name
+                        );
+                        return Ok(None);
+                    }
                     let Some(hints) = parse_host_verbatim::<Vec<InlayHint>>(raw.value) else {
                         return Ok(None);
                     };
@@ -110,7 +111,7 @@ impl Kakehashi {
                         hints,
                         server_name: t.server_name,
                         host_uri: t.uri.to_string(),
-                        incarnation: Some(raw.incarnation),
+                        incarnation: Some(expected_incarnation),
                         content_version,
                         connection_generation: raw.connection_generation,
                         server_resolves: raw.handle.has_capability("inlayHint/resolve"),
@@ -134,8 +135,19 @@ impl Kakehashi {
         lsp_uri: &Uri,
         range: Range,
         client_progress_token: Option<NumberOrString>,
-        content_version: u64,
     ) -> Result<Option<Vec<InlayHint>>> {
+        // Read before the preamble snapshots the document, so the stamp can
+        // only be older than the content the hints were computed on, never
+        // newer: an edit landing in between makes every hint of this
+        // response fail soft on resolve until the editor's next request,
+        // which follows an edit anyway. A reopen in that window is caught by
+        // the region id, which the reopened document re-tracks.
+        let Some(content_version) = url::Url::parse(lsp_uri.as_str())
+            .ok()
+            .and_then(|uri| self.documents.get(&uri).map(|doc| doc.content_version()))
+        else {
+            return Ok(None);
+        };
         let Some(mut ctx) = self
             .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
             .await
