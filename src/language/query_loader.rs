@@ -1112,6 +1112,34 @@ mod tests {
         );
     }
 
+    /// Every hit must be readable: a broken overlay in a later search path
+    /// fails the language rather than silently loading without it, the same
+    /// "present but broken is not absence" rule the single-hit case follows
+    /// (and what Neovim's `get_files` does — `io.open` failure is an error).
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_overlay_in_a_later_search_path_fails_the_load() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "rust", "(identifier) @base\n");
+        let overlay_dir = overlay.path().join("queries/rust");
+        fs::create_dir_all(&overlay_dir).unwrap();
+        let dangling = overlay_dir.join("highlights.scm");
+        symlink("missing-target.scm", &dangling).unwrap();
+
+        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        let err = resolve_query(&bases, "rust", "highlights.scm")
+            .expect_err("a present-but-broken overlay must surface its read failure");
+        let message = err.to_string();
+        assert!(message.contains("Failed to read query file"), "{message}");
+        assert!(
+            message.contains(&dangling.display().to_string()),
+            "{message}"
+        );
+    }
+
     #[test]
     fn extends_overlay_may_pull_in_inherits_parents() {
         let base = tempdir().unwrap();
