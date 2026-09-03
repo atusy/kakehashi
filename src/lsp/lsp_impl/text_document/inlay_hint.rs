@@ -213,7 +213,7 @@ impl Kakehashi {
             // stale region. Wait for the current parse the way the virt
             // request handlers do before their preamble snapshots it.
             self.ensure_document_parsed(&host_url).await;
-            let Some((offset, region_end, contiguous, _)) =
+            let Some((offset, region_end, contiguous, live_language)) =
                 self.inlay_hint_region_geometry(&host_url, &envelope)
             else {
                 log::debug!(
@@ -223,7 +223,7 @@ impl Kakehashi {
                 );
                 return Ok(hint);
             };
-            if !inlay_hint_region_is_resolvable(&envelope, &offset, contiguous) {
+            if !inlay_hint_region_is_resolvable(&envelope, &offset, contiguous, &live_language) {
                 log::debug!(
                     target: "kakehashi::bridge",
                     "inlayHint/resolve: region {} moved or is no longer contiguous; returning hint unresolved",
@@ -321,12 +321,21 @@ impl Kakehashi {
     }
 }
 
+/// Whether the live region still matches what the envelope was minted from:
+/// contiguous, at the same offset, and of the same injection language. The
+/// language is client-echoed data that names the virtual document the
+/// request goes to; an empty or different one would address a document the
+/// producer never opened (and trips the virtual-URI invariant in debug
+/// builds), so it fails soft here with the rest.
 fn inlay_hint_region_is_resolvable(
     envelope: &InlayHintEnvelope,
     offset: &crate::lsp::bridge::RegionOffset,
     contiguous: bool,
+    live_language: &str,
 ) -> bool {
-    contiguous && *offset == crate::lsp::bridge::RegionOffset::from(&envelope.offset)
+    contiguous
+        && *offset == crate::lsp::bridge::RegionOffset::from(&envelope.offset)
+        && envelope.injection_language == live_language
 }
 
 struct HostInlayHints {
@@ -382,8 +391,29 @@ mod tests {
         let envelope = envelope();
         let offset = crate::lsp::bridge::RegionOffset::new(3, 2);
 
-        assert!(inlay_hint_region_is_resolvable(&envelope, &offset, true));
-        assert!(!inlay_hint_region_is_resolvable(&envelope, &offset, false));
+        assert!(inlay_hint_region_is_resolvable(
+            &envelope, &offset, true, "lua"
+        ));
+        assert!(!inlay_hint_region_is_resolvable(
+            &envelope, &offset, false, "lua"
+        ));
+    }
+
+    /// The envelope's language is client-echoed and names the virtual
+    /// document the request is sent to; one that no longer matches the live
+    /// region, or was emptied, must fail soft before a URI is built from it.
+    #[test]
+    fn inlay_hint_resolve_rejects_a_region_whose_language_differs() {
+        let mut envelope = envelope();
+        let offset = crate::lsp::bridge::RegionOffset::new(3, 2);
+
+        assert!(!inlay_hint_region_is_resolvable(
+            &envelope, &offset, true, "python"
+        ));
+        envelope.injection_language.clear();
+        assert!(!inlay_hint_region_is_resolvable(
+            &envelope, &offset, true, "lua"
+        ));
     }
 
     /// A region that moved (a different start line or first-line column) or
@@ -394,14 +424,19 @@ mod tests {
         let envelope = envelope();
 
         let moved = crate::lsp::bridge::RegionOffset::new(4, 2);
-        assert!(!inlay_hint_region_is_resolvable(&envelope, &moved, true));
+        assert!(!inlay_hint_region_is_resolvable(
+            &envelope, &moved, true, "lua"
+        ));
         let shifted_column = crate::lsp::bridge::RegionOffset::new(3, 3);
         assert!(!inlay_hint_region_is_resolvable(
             &envelope,
             &shifted_column,
-            true
+            true,
+            "lua"
         ));
         let per_line = crate::lsp::bridge::RegionOffset::with_per_line_offsets(3, vec![2, 1]);
-        assert!(!inlay_hint_region_is_resolvable(&envelope, &per_line, true));
+        assert!(!inlay_hint_region_is_resolvable(
+            &envelope, &per_line, true, "lua"
+        ));
     }
 }
