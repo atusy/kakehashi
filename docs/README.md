@@ -333,11 +333,12 @@ still count.
 
 `inherits: {lang},...` prepends the named languages' query of the same kind,
 each resolved through this same lookup (so a parent brings its own parents and
-overlays). A cycle between languages is an error; a file naming its own
-language is read as `extends`, as Neovim's `get_files` reads it, and so marks
-the file an overlay. A parenthesized name, `(cpp)`, is inherited only when
-the file is loaded for its own language: a file reached as someone else's
-parent skips its parenthesized parents, as in Neovim, so a chain stops there.
+overlays). A parenthesized name, `(cpp)`, is inherited only when the file is
+loaded for its own language: a file reached as someone else's parent skips
+its parenthesized parents, as in Neovim, so a chain stops there. Along the
+edges actually followed, a cycle between languages is an error; a file naming
+its own language is read as `extends`, as Neovim's `get_files` reads it, and
+so marks the file an overlay.
 
 `extends` marks the file as an overlay to merge onto the language's query
 instead of replacing it. Across `searchPaths`, in order, the first file
@@ -368,15 +369,15 @@ numbers of the combined text, not of any one file.
 
 Two things stay strict when files combine. Every hit must be readable: a
 dangling symlink or an unreadable file in any search path fails the language's
-query, as it would as the only hit, rather than loading without it. And a
-parent must exist as the same kind of file: `child/context.scm` inheriting
-`foo` needs a `foo/context.scm` on some search path. Auto-install fetches the
-parents named by the `highlights.scm` and `injections.scm` it installs into
-the data directory — those two kinds only, and not parents named by an
-overlay elsewhere — so a parent that only your overlay names, or that a
-`bindings.scm` or a captures kind names, must be put on a search path by
-hand or the query fails to load with a message naming the file that named
-it.
+query, as it would as the only hit, rather than loading without it. And every
+parent actually followed must exist as the same kind of file:
+`child/context.scm` inheriting `foo` needs a `foo/context.scm` on some search
+path. Auto-install fetches the parents named by the `highlights.scm` and
+`injections.scm` it installs into the data directory — those two kinds only,
+and not parents named by an overlay elsewhere — so a parent that only your
+overlay names, or that a `bindings.scm` or a captures kind names, must be put
+on a search path by hand or the query fails to load with a message naming the
+file that named it.
 
 #### `languages`
 
