@@ -39,7 +39,8 @@
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct QueryModeline {
     /// Parent languages named by `inherits` directives, in declaration order,
-    /// each name at most once.
+    /// each name at most once; a name written both with and without
+    /// parentheses is required.
     pub inherits: Vec<InheritedLanguage>,
     /// Whether an `extends` directive marks the file as an overlay to merge
     /// onto the language's base query instead of replacing it.
@@ -65,8 +66,12 @@ pub(crate) fn parse_modeline(content: &str) -> QueryModeline {
             modeline.extends = true;
         } else if let Some(parents) = inherits_operand(directive) {
             for parent in parents {
-                if !modeline.inherits.iter().any(|p| p.name == parent.name) {
-                    modeline.inherits.push(parent);
+                match modeline.inherits.iter_mut().find(|p| p.name == parent.name) {
+                    // Named again without parentheses, a parent is required:
+                    // Neovim would follow that occurrence wherever the file
+                    // is reached, so one entry must say the same.
+                    Some(known) => known.optional &= parent.optional,
+                    None => modeline.inherits.push(parent),
                 }
             }
         }
@@ -217,10 +222,24 @@ mod tests {
         );
         assert_eq!(inherits("; inherits: (cpp)\n"), vec!["cpp"]);
         assert_eq!(inherits("; inherits:(cpp),c\n"), vec!["cpp", "c"]);
+        // Named again without parentheses, a parent is required, in either
+        // order: Neovim would follow the bare occurrence wherever the file is
+        // reached, and one entry must say the same.
         assert_eq!(
             parse_modeline("; inherits: c,(c)\n").inherits,
-            vec![parent("c", false)],
-            "a name keeps its first spelling"
+            vec![parent("c", false)]
+        );
+        assert_eq!(
+            parse_modeline("; inherits: (c),c\n").inherits,
+            vec![parent("c", false)]
+        );
+        assert_eq!(
+            parse_modeline("; inherits: (c)\n; inherits: c\n").inherits,
+            vec![parent("c", false)]
+        );
+        assert_eq!(
+            parse_modeline("; inherits: (c),(c)\n").inherits,
+            vec![parent("c", true)]
         );
     }
 
