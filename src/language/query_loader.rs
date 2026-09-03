@@ -257,7 +257,9 @@ impl QueryLoader {
     }
 
     /// Every `<base>/queries/<lang_name>/<file_name>` across the search paths,
-    /// in search-path order.
+    /// in search-path order, each path once: Neovim dedupes its runtime hits
+    /// the same way, so a directory listed twice in `searchPaths` does not
+    /// append its overlays twice.
     ///
     /// Returns nothing without touching the filesystem when `lang_name` is not
     /// a single normal path component, so a document-controlled injection
@@ -276,14 +278,19 @@ impl QueryLoader {
         if !is_single_path_component(lang_name) {
             return Vec::new();
         }
-        runtime_bases
-            .iter()
-            .map(|base| Self::query_file_path(base.as_ref(), lang_name, file_name))
-            .filter(|candidate| match fs::symlink_metadata(candidate) {
-                Ok(_) => true,
-                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-            })
-            .collect()
+        let mut found: Vec<PathBuf> = Vec::new();
+        for base in runtime_bases {
+            let candidate = Self::query_file_path(base.as_ref(), lang_name, file_name);
+            if found.contains(&candidate) {
+                continue;
+            }
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) => found.push(candidate),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => found.push(candidate),
+            }
+        }
+        found
     }
 
     /// Parse a query string with fault tolerance.
@@ -953,6 +960,32 @@ mod tests {
             ]
         );
         assert!(QueryLoader::find_query_files(&bases, "../rust", "highlights.scm").is_empty());
+    }
+
+    /// Neovim runs its runtime hits through `dedupe_files`; without the same,
+    /// a search path listed twice would append every overlay in it twice.
+    #[test]
+    fn a_search_path_listed_twice_contributes_its_overlay_once() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "rust", "(identifier) @base\n");
+        write_highlights(
+            overlay.path(),
+            "rust",
+            ";; extends\n(string_literal) @overlay\n",
+        );
+
+        let bases = [
+            base.path().to_path_buf(),
+            overlay.path().to_path_buf(),
+            overlay.path().join("."),
+        ];
+        let content = resolve_query(&bases, "rust", "highlights.scm").unwrap();
+        assert_eq!(
+            content.matches("@overlay").count(),
+            1,
+            "the same file must not be concatenated twice:\n{content}"
+        );
     }
 
     #[test]
