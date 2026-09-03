@@ -1,10 +1,17 @@
-//! Inlay hint method for Kakehashi.
+//! Inlay hint methods for Kakehashi.
 //!
-//! Walks the resolved layer order (cross-layer-aggregation): the virt layer
-//! bridges the injection region under the requested range, the host layer
-//! (host-document-bridge) bridges the host document itself with the real URI
-//! and the response verbatim. The first layer producing a non-empty result
-//! wins (`preferred`).
+//! `textDocument/inlayHint` walks the resolved layer order
+//! (cross-layer-aggregation): the virt layer bridges the injection region
+//! under the requested range, the host layer (host-document-bridge) bridges
+//! the host document itself with the real URI and its coordinates verbatim.
+//! Either layer re-keys label-part commands for `workspace/executeCommand`
+//! routing and envelopes `data` for `inlayHint/resolve` routing. The first
+//! layer producing a non-empty result wins (`preferred`).
+//!
+//! `inlayHint/resolve` gates the echoed envelope on freshness (content
+//! version, and for the virt layer the live region offset and contiguity),
+//! forwards to the exact producing connection, and re-checks the content
+//! version and host incarnation after the response.
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintParams, NumberOrString, Range, Uri};
