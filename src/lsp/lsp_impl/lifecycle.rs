@@ -687,6 +687,9 @@ impl Kakehashi {
                         work_done_progress_options: WorkDoneProgressOptions {
                             work_done_progress: Some(true),
                         },
+                        // inlayHint/resolve is routed to the origin downstream
+                        // server via the envelope in hint.data (see
+                        // bridge/text_document/inlay_hint.rs).
                         resolve_provider: Some(true),
                     },
                 ))),
