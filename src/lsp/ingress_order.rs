@@ -787,6 +787,7 @@ mod tests {
             "textDocument/rename",
             "textDocument/prepareRename",
             "textDocument/codeAction",
+            "textDocument/inlayHint",
             "textDocument/diagnostic",
             "kakehashi/captures/full",
             "kakehashi/captures/full/delta",
