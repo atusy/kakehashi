@@ -1,7 +1,7 @@
 //! The one rule for minting a `*/resolve` routing envelope into an item's
 //! `data`, shared by every producer on both layers (completion, codeLens,
-//! documentLink; codeAction needs no collision rule because a bare action
-//! never leaves with `data`).
+//! documentLink, inlayHint; codeAction needs no collision rule because a bare
+//! action never leaves with `data`).
 
 use serde_json::Value;
 
