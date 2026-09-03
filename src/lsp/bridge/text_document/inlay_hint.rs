@@ -1531,6 +1531,50 @@ mod tests {
         );
     }
 
+    /// A resolve reply can add, replace or omit label locations, and the
+    /// re-enveloped hint may be resolved again: the translated-location
+    /// record must follow the locations the merged hint actually carries —
+    /// the reply's translation where the reply's location was taken, the
+    /// original record where the merge fell back to the original location.
+    #[test]
+    fn merge_refreshes_the_translated_location_record() {
+        let original: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 0, "character": 0 },
+            "label": [
+                { "value": "kept", "location": {
+                    "uri": "file:///doc.md",
+                    "range": { "start": { "line": 5, "character": 0 }, "end": { "line": 5, "character": 1 } }
+                } },
+                { "value": "replaced", "location": {
+                    "uri": "file:///doc.md",
+                    "range": { "start": { "line": 6, "character": 0 }, "end": { "line": 6, "character": 1 } }
+                } },
+                { "value": "added" }
+            ]
+        }))
+        .unwrap();
+        let resolved: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 0, "character": 0 },
+            "label": [
+                { "value": "kept" },
+                { "value": "replaced", "location": {
+                    "uri": "file:///elsewhere.lua",
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } }
+                } },
+                { "value": "added", "location": {
+                    "uri": "file:///doc.md",
+                    "range": { "start": { "line": 7, "character": 0 }, "end": { "line": 7, "character": 1 } }
+                } }
+            ]
+        }))
+        .unwrap();
+
+        // Minted: parts 0 and 1 were translated. The reply: part 1 now names
+        // a real file (untranslated), part 2 gained a translated location.
+        let (_, translated) = merge_resolved_inlay_hint(original, resolved, &[0, 1], &[2]);
+        assert_eq!(translated, vec![0, 2]);
+    }
+
     #[test]
     fn inlay_hint_request_uses_virtual_uri() {
         let host_uri = test_host_uri();
