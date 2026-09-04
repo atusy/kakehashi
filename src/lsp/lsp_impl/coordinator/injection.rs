@@ -690,6 +690,19 @@ impl InjectionCoordinator {
         }
     }
 
+    /// Whether `uri`'s current snapshot carries a tree — i.e. is a parse
+    /// result rather than a reload placeholder or a pre-parse slot. The
+    /// stored language of a document without one may predate the reload
+    /// that invalidated it (`invalidate_parse` keeps it until the replacement
+    /// parse lands), so a screen must not trust a rejection based on it.
+    pub(crate) fn snapshot_has_tree(&self, uri: &Url) -> bool {
+        self.documents.latest_snapshot(uri).is_some_and(|view| {
+            view.slot.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.parsed_version == view.content_version && snapshot.tree.is_some()
+            })
+        })
+    }
+
     /// Whether `uri`'s published snapshot still matches its content — a cheap
     /// re-check for a caller that resolved something against it and needs to
     /// know the ground did not move underneath.
