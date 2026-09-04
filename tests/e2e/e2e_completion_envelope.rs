@@ -40,7 +40,17 @@ fn init_virtual_completion_client_on(
         json!({
             "processId": std::process::id(),
             "rootUri": null,
-            "capabilities": {},
+            // LSP 3.18 lets a resolve fill `additionalTextEdits` lazily only
+            // when the client lists it here.
+            "capabilities": {
+                "textDocument": {
+                    "completion": {
+                        "completionItem": {
+                            "resolveSupport": { "properties": ["additionalTextEdits"] }
+                        }
+                    }
+                }
+            },
             "workspaceFolders": null,
             "initializationOptions": {
                 "languageServers": {
