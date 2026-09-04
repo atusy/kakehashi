@@ -22,7 +22,7 @@ async fn spawn_synthetic_diagnostic_for_incarnation<F>(
         documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
         return;
     };
-    let eligible = document.incarnation() == incarnation && document.tree().is_some();
+    let eligible = document.incarnation() == incarnation && document.has_current_tree();
     drop(document);
     if eligible {
         diagnostic_scheduler.spawn_synthetic_diagnostic_task(uri);
@@ -167,7 +167,7 @@ impl Kakehashi {
                         // process_injections would otherwise cancel the eager-open
                         // for a still-tree-less document.
                         let has_tree = documents.get(&install_uri).is_some_and(|doc| {
-                            doc.incarnation() == incarnation && doc.tree().is_some()
+                            doc.incarnation() == incarnation && doc.has_current_tree()
                         });
                         if has_tree {
                             let same_lifetime = injection
@@ -623,7 +623,7 @@ print("hello")
             server
                 .documents
                 .get(&uri)
-                .is_some_and(|doc| doc.tree().is_some()),
+                .is_some_and(|doc| doc.has_current_tree()),
             "the eager open must not run before the parse is installed"
         );
     }

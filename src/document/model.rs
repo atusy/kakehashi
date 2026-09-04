@@ -185,26 +185,37 @@ impl Document {
     }
 
     /// The current parse's tree: the published snapshot's, iff that snapshot
-    /// is this lifetime's and parsed this content version. An edit or a
-    /// reload makes the published snapshot stale, so this is `None` until the
-    /// reparse lands — a reader never sees a tree that predates the text.
-    /// (`Tree` clone is a refcount bump.)
+    /// is this lifetime's and parsed this content version. An edit makes the
+    /// published snapshot stale and a reload replaces it with a tree-less
+    /// placeholder, so this is `None` until the reparse lands — a reader
+    /// never sees a tree that predates the text. (`Tree` clone is a retain
+    /// plus a small allocation; a presence probe should use
+    /// [`has_current_tree`](Self::has_current_tree).)
     pub(crate) fn tree(&self) -> Option<Tree> {
         self.current_snapshot()
             .and_then(|snapshot| snapshot.tree.clone())
     }
 
-    /// The published snapshot iff it is this lifetime's and parsed the
-    /// current content version (parse-snapshot ADR §2 currency).
-    pub(crate) fn current_snapshot(&self) -> Option<Arc<ParseSnapshot>> {
+    /// Whether [`tree`](Self::tree) would be `Some`, without cloning it.
+    pub(crate) fn has_current_tree(&self) -> bool {
         let slot = self.snapshot_tx.borrow();
         slot.snapshot
             .as_ref()
-            .filter(|snapshot| {
-                snapshot.incarnation == self.incarnation
-                    && snapshot.parsed_version == self.content_version
-            })
+            .is_some_and(|snapshot| self.is_current(snapshot) && snapshot.tree.is_some())
+    }
+
+    /// The published snapshot iff it is this lifetime's and parsed the
+    /// current content version (parse-snapshot ADR §2 currency).
+    fn current_snapshot(&self) -> Option<Arc<ParseSnapshot>> {
+        let slot = self.snapshot_tx.borrow();
+        slot.snapshot
+            .as_ref()
+            .filter(|snapshot| self.is_current(snapshot))
             .cloned()
+    }
+
+    fn is_current(&self, snapshot: &ParseSnapshot) -> bool {
+        snapshot.incarnation == self.incarnation && snapshot.parsed_version == self.content_version
     }
 
     /// A snapshot of the current inputs carrying `tree` and nothing derived —
@@ -299,12 +310,14 @@ impl Document {
     /// Create an immutable snapshot of current document state
     ///
     /// Returns None while the document has no current tree (see
-    /// [`tree`](Self::tree)). The snapshot clones text and tree to enable
-    /// lock-free processing.
+    /// [`tree`](Self::tree)). Text and tree both come from the published
+    /// snapshot — the text the tree was parsed from, by construction — so
+    /// their consistency is structural, not an invariant of the text writers.
     pub(crate) fn snapshot(&self) -> Option<DocumentSnapshot> {
+        let snapshot = self.current_snapshot()?;
         Some(DocumentSnapshot {
-            text: self.text.clone(),
-            tree: self.tree()?,
+            tree: snapshot.tree.clone()?,
+            text: Arc::clone(&snapshot.text),
             incarnation: self.incarnation,
         })
     }

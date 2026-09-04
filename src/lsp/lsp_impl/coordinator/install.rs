@@ -400,7 +400,7 @@ impl InstallCoordinator {
                 || self
                     .documents
                     .get(uri)
-                    .is_some_and(|document| document.tree().is_some()))
+                    .is_some_and(|document| document.has_current_tree()))
     }
 
     fn parse_coordinator(&self) -> ParseCoordinator {
