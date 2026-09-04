@@ -156,10 +156,15 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
   still checks `incarnation == current_incarnation` (it is not an unconditional
   early-return), so a straggler publish from lifetime N is rejected against N+1 and
   the version compare is only ever within one lifetime.
-- **Language axis** is subsumed by incarnation: every reopen draws a fresh
-  incarnation (so a relabel across lifetimes is already rejected), and within one
-  lifetime the language does not change. The three-axis edit-path CAS
-  (`incarnation && text && language`) therefore reduces to `incarnation && version`.
+- **Language axis** is subsumed by incarnation for the *stored label*: every
+  reopen draws a fresh incarnation (so a relabel across lifetimes is already
+  rejected), and within one lifetime `Document::language_id` does not change —
+  the reparses' `LanguageCheck::Expect` guards exactly that. The *detected*
+  language a snapshot carries may still move within a lifetime (detection re-runs
+  on the edited text: a rewritten shebang), which is why the seed is bound to
+  the snapshot's grammar independently. The three-axis edit-path CAS
+  (`incarnation && text && language`) therefore reduces to `incarnation && version`
+  for admission, plus the language check on install.
 - **Isolation is per-request re-resolution + incarnation validation, not cell identity.** A `latest_snapshot(uri)` call resolves the *current* cell from the
   store each time and never caches a `Receiver` across requests, and it validates
   `snapshot.incarnation == <live document incarnation>` before serving. To keep that

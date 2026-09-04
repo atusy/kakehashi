@@ -1158,7 +1158,7 @@ print("hello")
             "sanity: host context resolves with a tree present"
         );
 
-        // did_change clears the tree synchronously.
+        // did_change stales the tree synchronously (the version bump).
         server
             .documents
             .update_document(uri.clone(), "fn changed() {}".to_string(), None);
@@ -1262,7 +1262,7 @@ print("hello")
             "a parsed self-host doc yields a diagnostic snapshot"
         );
 
-        // What did_change does synchronously: apply the edit and CLEAR the tree.
+        // What did_change does synchronously: apply the edit, which stales the tree.
         server
             .documents
             .update_document(uri.clone(), "fn changed() {}".to_string(), None);
@@ -1374,8 +1374,8 @@ print("hello")
         configure_rust_self_host(server);
 
         let uri = Url::parse("file:///test/edited.rs").unwrap();
-        // The edit applied new text and cleared the tree (tree = None), exactly as
-        // did_change does before scheduling the reparse.
+        // The edit applied new text with no tree published for it (tree = None),
+        // exactly what did_change leaves behind before scheduling the reparse.
         server.documents.insert(
             uri.clone(),
             "fn edited() {}".to_string(),
