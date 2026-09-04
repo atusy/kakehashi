@@ -1673,10 +1673,12 @@ fn spawn_upstream_request(
                         // which is pure configuration, answered from a memo
                         // with no parse, no tree and no I/O. Paying the parse
                         // wait and the injection resolution before asking it
-                        // would spend this connection's fixed budget in
-                        // proportion to WORKSPACE SIZE rather than to the work
-                        // that belongs to it, and the budget is what `done`
-                        // must signal inside.
+                        // would spend the shared parse-wait deadline — and the
+                        // time every command waits on `done` — in proportion
+                        // to WORKSPACE SIZE rather than to the work that
+                        // belongs to this connection. (The sweep itself is
+                        // not bounded: past the deadline it stops waiting,
+                        // not walking.)
                         //
                         // Reading the language before the parse wait keeps the
                         // incarnation/injections ordering intact, because the
