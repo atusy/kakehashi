@@ -131,13 +131,14 @@ fn e2e_virtual_completion_from_resolving_server_is_enveloped() {
 
 /// A completion list is designed to outlive edits: the editor filters it
 /// locally while the user keeps typing and resolves an item on accept, which
-/// itself edits. A same-shape edit inside the fence must therefore NOT refuse
-/// the resolve — the downstream computes the lazy fields against its own
-/// copy of the text, which the bridge keeps in step. (Inlay hints and lazy
-/// code actions, which the editor re-requests on every edit, are refused
-/// instead.)
+/// itself edits. An edit inside the fence — same shape, or typing that grows
+/// the region — must therefore NOT refuse the resolve: the region is
+/// the same region, and the downstream computes the lazy fields against its
+/// own copy of the text, which the bridge keeps in step. (Inlay hints and
+/// lazy code actions, which the editor re-requests on every edit, are
+/// refused instead.)
 #[test]
-fn e2e_virtual_completion_resolve_survives_a_same_shape_edit() {
+fn e2e_virtual_completion_resolve_survives_an_edit_inside_the_region() {
     let (mut client, _config_dir, item) =
         init_virtual_completion_client("completion-resolve-plain");
     assert_eq!(item["data"]["kakehashi"]["origin"], "mock-completion");
@@ -166,6 +167,24 @@ fn e2e_virtual_completion_resolve_survives_a_same_shape_edit() {
             .as_str()
             .is_some_and(|detail| detail.starts_with("mock-resolved:")),
         "a resolve after an edit that kept the region must still reach the downstream: {response}"
+    );
+
+    // Typing that grows the fence moves the region's end; the region is
+    // still the same one at the same offset.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 3 },
+            "contentChanges": [{ "text": "# Test\n\n```lua\nlocal y = 12\nlocal z = 3\n```\n" }]
+        }),
+    );
+    let response = client.send_request("completionItem/resolve", item.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(
+        response["result"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("mock-resolved:")),
+        "a resolve after typing that grew the region must still reach the downstream: {response}"
     );
 
     shutdown_client(&mut client);
