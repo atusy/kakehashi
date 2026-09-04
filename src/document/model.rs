@@ -469,7 +469,7 @@ mod tests {
     }
 
     fn seed_tree(doc: &Document) -> Option<Tree> {
-        Document::incremental_seed(doc).map(IncrementalSeed::replay)
+        Document::incremental_seed(doc, "rust").map(IncrementalSeed::replay)
     }
 
     /// The seed's own geometry against `text`: tree-sitter's contract is
@@ -514,6 +514,29 @@ mod tests {
             resolved_regions: None,
             layer_trees: std::sync::OnceLock::new(),
         })
+    }
+
+    /// A seed is only good for the grammar that produced its tree: detection
+    /// on the edited text may select another language (a changed shebang),
+    /// and tree-sitter does not check that an old tree belongs to the parser
+    /// it is handed, so a seed for another grammar must parse from scratch.
+    #[test]
+    fn a_seed_is_refused_for_a_grammar_other_than_its_trees() {
+        let mut doc = Document::with_tree(
+            "fn main() {}".to_string(),
+            "rust".to_string(),
+            rust_tree("fn main() {}"),
+            3,
+        );
+        doc.apply_edit("fn main() { }".to_string(), &[edit(11, 11, 12)]);
+        assert!(
+            doc.incremental_seed("rust").is_some(),
+            "the grammar that parsed the published tree seeds"
+        );
+        assert!(
+            doc.incremental_seed("python").is_none(),
+            "another grammar must not reuse the tree"
+        );
     }
 
     /// A tree published for an older version than the log's newest entries
