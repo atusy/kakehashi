@@ -387,6 +387,86 @@ enabled = true
     shutdown(&mut client);
 }
 
+/// The `clientCapabilities` override must survive the whole path: JSON config
+/// → server-config resolution → pool spawn → handshake → the downstream
+/// server's `initialize` on the wire. The unit tests pin each hop separately;
+/// only this test pins the pool wiring (replacing the spawn-site clone with
+/// `None` keeps every unit test green).
+#[test]
+fn e2e_client_capabilities_override_reaches_downstream_initialize() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("caps_override.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+"#,
+    )
+    .expect("write config");
+
+    let record_dir = tempfile::TempDir::new().expect("record dir");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .env("MOCK_LSP_CANCEL_DIR", record_dir.path().to_string_lossy())
+        .build();
+
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host": {
+                        "cmd": [mock_bin(), "definition"],
+                        "languages": ["markdown"],
+                        "clientCapabilities": {
+                            "window": { "workDoneProgress": false }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": MARKDOWN_URI,
+                "languageId": "markdown",
+                "version": 1,
+                "text": MARKDOWN
+            }
+        }),
+    );
+
+    // The definition round-trip guarantees the downstream handshake finished,
+    // so the mock has recorded the initialize params by the time it answers.
+    let _ = send_definition(&mut client);
+
+    let recorded = record_dir.path().join("definition.initialize.json");
+    let payload = std::fs::read_to_string(&recorded)
+        .expect("the mock must have recorded kakehashi's initialize request");
+    let payload: Value = serde_json::from_str(&payload).expect("recorded initialize is JSON");
+    assert_eq!(
+        payload.pointer("/params/capabilities/window/workDoneProgress"),
+        Some(&json!(false)),
+        "the config override must reach the downstream initialize: {payload}"
+    );
+    assert_eq!(
+        payload.pointer("/params/capabilities/general/positionEncodings"),
+        Some(&json!(["utf-16"])),
+        "the bridge-load-bearing encoding must survive the override merge: {payload}"
+    );
+
+    shutdown(&mut client);
+}
+
 #[test]
 fn e2e_host_bridge_is_opt_in() {
     // Without bridge._self.enabled = true, a host-capable server alone does

@@ -259,10 +259,16 @@ impl ConnectionHandle {
         &self,
         config: &crate::config::settings::BridgeServerConfig,
     ) {
+        // Retain every field `same_launch_config` COMPARES; null only the
+        // fields it ignores (`settings` is runtime-propagated, not
+        // launch-defining). A compared field nulled here reads back as a
+        // permanent config mismatch and tears the connection down on every
+        // acquisition.
         let snapshot = crate::config::settings::BridgeServerConfig {
             cmd: config.cmd.clone(),
             languages: config.languages.clone(),
             initialization_options: config.initialization_options.clone(),
+            client_capabilities: config.client_capabilities.clone(),
             settings: None,
             workspace_markers: config.workspace_markers.clone(),
             on_type_formatting_triggers: config.on_type_formatting_triggers.clone(),

@@ -460,6 +460,193 @@ fn merge_upstream_capabilities(
     base
 }
 
+/// Fold a user's `clientCapabilities` config override into the serialized
+/// capabilities (issue #976).
+///
+/// Runs at the JSON layer, after [`merge_upstream_capabilities`], so the user
+/// is the last merge layer (their `false` reliably masks an
+/// upstream-propagated `true`) and fields the typed `ClientCapabilities`
+/// doesn't model pass through instead of being dropped by a typed round-trip.
+/// Merge semantics are [`crate::config::merge::deep_merge_json`] — the same
+/// deep merge that combines the override across config layers.
+///
+/// Two fields are protected as post-merge invariants (enforced on the merged
+/// result, so no override shape can bypass them the way an input filter
+/// could): `general.positionEncodings` — kakehashi's coordinate translation
+/// requires UTF-16, and an override there would silently corrupt every
+/// position in every bridged response — and
+/// `workspace.workspaceEdit.changeAnnotationSupport` — see
+/// [`strip_change_annotation_support`]. A non-object override at the root is
+/// ignored with a warning — deep-merging it would replace the whole
+/// capabilities object.
+pub(super) fn apply_capability_override(
+    capabilities: &mut serde_json::Value,
+    override_json: &serde_json::Value,
+) {
+    if !override_json.is_object() {
+        // Name the type, not the value: the payload is user-supplied and
+        // unbounded, and the pool's editor-facing warning already identifies
+        // the offending server without dumping it.
+        let type_name = match override_json {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "a boolean",
+            serde_json::Value::Number(_) => "a number",
+            serde_json::Value::String(_) => "a string",
+            serde_json::Value::Array(_) => "an array",
+            // Unreachable behind the is_object guard; a string beats a panic.
+            serde_json::Value::Object(_) => "a table",
+        };
+        log::warn!(
+            target: "kakehashi::bridge",
+            "clientCapabilities override must be a table, got {type_name}; ignoring it"
+        );
+        return;
+    }
+    let baseline_encodings = capabilities.pointer("/general/positionEncodings").cloned();
+    let merged = crate::config::merge::deep_merge_json(capabilities, override_json);
+    *capabilities = merged;
+
+    strip_change_annotation_support(capabilities);
+
+    let Some(baseline) = baseline_encodings else {
+        return;
+    };
+    if capabilities.pointer("/general/positionEncodings") == Some(&baseline) {
+        return;
+    }
+    log::warn!(
+        target: "kakehashi::bridge",
+        "clientCapabilities override cannot change general.positionEncodings: \
+         kakehashi's coordinate translation requires UTF-16; keeping {baseline}"
+    );
+    match capabilities.get_mut("general") {
+        Some(serde_json::Value::Object(general)) => {
+            general.insert("positionEncodings".to_string(), baseline);
+        }
+        // A non-object `general` from the override replaced the subtree; a
+        // scalar there is spec-invalid anyway, so rebuild the object around
+        // the load-bearing field. (Any baseline `general` siblings are lost
+        // here — today positionEncodings is the only one.)
+        Some(other) => {
+            *other = serde_json::json!({ "positionEncodings": baseline });
+        }
+        // Unreachable today — deep_merge_json never removes keys, so a
+        // baseline `general` survives every merge — kept so the invariant
+        // holds even if the merge semantics change.
+        None => {
+            if let Some(capabilities) = capabilities.as_object_mut() {
+                capabilities.insert(
+                    "general".to_string(),
+                    serde_json::json!({ "positionEncodings": baseline }),
+                );
+            }
+        }
+    }
+}
+
+/// Config-shape problems in a `clientCapabilities` override worth telling the
+/// USER about, detectable from the override alone (no baseline needed).
+///
+/// Mirrors the conditions [`apply_capability_override`] enforces at merge
+/// time. Enforcement keeps its `log::warn!` backstops, but `log::warn!` is
+/// invisible at the default log level, so the pool surfaces these through
+/// `warn_to_editor` at spawn — where the server name is in scope — as the
+/// user-facing channel. `advertise_configuration` is the settings-presence
+/// gate the override may contradict (downstream-settings-propagation).
+pub(crate) fn capability_override_user_warnings(
+    override_json: &serde_json::Value,
+    advertise_configuration: bool,
+) -> Vec<String> {
+    if !override_json.is_object() {
+        return vec!["clientCapabilities must be a table; ignoring the override".to_string()];
+    }
+    let mut warnings = Vec::new();
+    match override_json.get("general") {
+        Some(general) if !general.is_object() => warnings.push(
+            "clientCapabilities.general must be a table; general.positionEncodings stays utf-16"
+                .to_string(),
+        ),
+        // An override restating the enforced utf-16 baseline is a no-op, not
+        // a conflict — warn only when the value would actually change.
+        Some(general)
+            if general
+                .get("positionEncodings")
+                .is_some_and(|encodings| encodings != &serde_json::json!(["utf-16"])) =>
+        {
+            warnings.push(
+                "clientCapabilities cannot change general.positionEncodings \
+                 (kakehashi's coordinate translation requires utf-16); keeping utf-16"
+                    .to_string(),
+            )
+        }
+        _ => {}
+    }
+    if override_json
+        .pointer("/workspace/workspaceEdit/changeAnnotationSupport")
+        .is_some()
+    {
+        warnings.push(
+            "clientCapabilities cannot advertise workspace.workspaceEdit.changeAnnotationSupport \
+             (annotated edits would lose needsConfirmation in the bridge); removing it"
+                .to_string(),
+        );
+    }
+    // The conflict check reasons about the EFFECTIVE post-merge value, not
+    // just a boolean leaf: a non-object `workspace` replaces the whole
+    // subtree, and `configuration: null`/scalar displaces the advertised
+    // `true` — both turn the capability off as surely as `false` does.
+    match override_json.get("workspace") {
+        Some(workspace) if !workspace.is_object() => warnings.push(
+            "clientCapabilities.workspace must be a table; replacing it wholesale drops every \
+             workspace capability kakehashi advertised"
+                .to_string(),
+        ),
+        Some(workspace) => {
+            let effective_on = workspace
+                .get("configuration")
+                .map(|value| value.as_bool() == Some(true));
+            if let Some(effective_on) = effective_on
+                && effective_on != advertise_configuration
+            {
+                warnings.push(if effective_on {
+                    "clientCapabilities forces workspace.configuration=true but this server has \
+                     no settings to serve: every configuration pull will be answered null"
+                        .to_string()
+                } else {
+                    "clientCapabilities overrides workspace.configuration away from true while \
+                     this server has settings: a pull-model server may never read them"
+                        .to_string()
+                });
+            }
+        }
+        None => {}
+    }
+    warnings
+}
+
+/// Post-merge invariant #2: `workspace.workspaceEdit.changeAnnotationSupport`
+/// must never be advertised. The upstream mirror deliberately withholds it —
+/// ls-types' untagged `OneOf` drops `annotationId` when deserializing
+/// downstream edits, so inviting annotated edits would silently strip
+/// `needsConfirmation` and let a downstream's guarded edit apply without the
+/// confirmation it demanded (the same silent-corruption class as
+/// `positionEncodings`). A user override cannot be allowed to re-open it.
+fn strip_change_annotation_support(capabilities: &mut serde_json::Value) {
+    let Some(workspace_edit) = capabilities
+        .pointer_mut("/workspace/workspaceEdit")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    if workspace_edit.remove("changeAnnotationSupport").is_some() {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "clientCapabilities override cannot advertise workspace.workspaceEdit.changeAnnotationSupport: \
+             annotated edits would lose needsConfirmation in the bridge; removing it"
+        );
+    }
+}
+
 /// Build the client capabilities the bridge declares to downstream servers.
 ///
 /// Combines bridge baseline capabilities with upstream client capabilities.
@@ -1155,6 +1342,274 @@ mod tests {
                 insta::assert_json_snapshot!(merged);
             });
         }
+    }
+
+    #[test]
+    fn capability_override_wins_over_upstream_merge() {
+        use serde_json::json;
+        use tower_lsp_server::ls_types::WindowClientCapabilities;
+
+        // The editor supports progress, so the merge advertises it — the
+        // user's override must still win (user is the last merge layer).
+        let upstream = ClientCapabilities {
+            window: Some(WindowClientCapabilities {
+                work_done_progress: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = build_bridge_client_capabilities(Some(&upstream), true, false);
+        let mut capabilities = serde_json::to_value(&merged).unwrap();
+
+        apply_capability_override(
+            &mut capabilities,
+            &json!({"window": {"workDoneProgress": false}}),
+        );
+
+        assert_eq!(
+            capabilities.pointer("/window/workDoneProgress"),
+            Some(&json!(false)),
+            "the user override must mask the upstream-propagated capability"
+        );
+        assert!(
+            capabilities.pointer("/textDocument/completion").is_some(),
+            "sibling baseline capabilities must survive the deep merge"
+        );
+    }
+
+    #[test]
+    fn capability_override_cannot_touch_position_encodings() {
+        use serde_json::json;
+
+        let merged = build_bridge_client_capabilities(None, true, false);
+        let mut capabilities = serde_json::to_value(&merged).unwrap();
+
+        apply_capability_override(
+            &mut capabilities,
+            &json!({
+                "general": {"positionEncodings": ["utf-8"]},
+                "window": {"workDoneProgress": false}
+            }),
+        );
+
+        assert_eq!(
+            capabilities.pointer("/general/positionEncodings"),
+            Some(&json!(["utf-16"])),
+            "positionEncodings is bridge-load-bearing: an override would \
+             silently corrupt every coordinate translation"
+        );
+        assert_eq!(
+            capabilities.pointer("/window/workDoneProgress"),
+            Some(&json!(false)),
+            "the rest of the override must still apply"
+        );
+    }
+
+    /// The positionEncodings invariant must hold for every override shape,
+    /// not just an object-shaped `general`: a non-object `general` (or a JSON
+    /// null arriving via didChangeConfiguration) replaces the whole subtree in
+    /// a deep merge, which used to bypass an input-filter-style guard.
+    #[test]
+    fn position_encodings_survive_non_object_general_overrides() {
+        use serde_json::json;
+
+        for hostile_general in [json!("utf-8"), json!(null), json!(["utf-8"]), json!(5)] {
+            let merged = build_bridge_client_capabilities(None, true, false);
+            let mut capabilities = serde_json::to_value(&merged).unwrap();
+
+            apply_capability_override(
+                &mut capabilities,
+                &json!({"general": hostile_general, "window": {"workDoneProgress": false}}),
+            );
+
+            assert_eq!(
+                capabilities.pointer("/general/positionEncodings"),
+                Some(&json!(["utf-16"])),
+                "a non-object general ({hostile_general}) must not delete positionEncodings"
+            );
+            assert_eq!(
+                capabilities.pointer("/window/workDoneProgress"),
+                Some(&json!(false)),
+                "the rest of the override must still apply"
+            );
+        }
+    }
+
+    /// `changeAnnotationSupport` is deliberately withheld from the upstream
+    /// mirror (ls-types drops `annotationId`, so `needsConfirmation` would be
+    /// silently lost); an override must not be able to re-open that hole —
+    /// neither on a mirrored `workspaceEdit` nor by creating one from scratch.
+    #[test]
+    fn change_annotation_support_cannot_be_reopened_by_override() {
+        use serde_json::json;
+        use tower_lsp_server::ls_types::{
+            ChangeAnnotationWorkspaceEditClientCapabilities, WorkspaceClientCapabilities,
+            WorkspaceEditClientCapabilities,
+        };
+
+        let annotation_override = json!({
+            "workspace": {"workspaceEdit": {"changeAnnotationSupport": {"groupsOnLabel": true}}}
+        });
+
+        // Upstream mirrors workspaceEdit (annotations withheld by the merge).
+        let upstream = ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                workspace_edit: Some(WorkspaceEditClientCapabilities {
+                    document_changes: Some(true),
+                    change_annotation_support: Some(
+                        ChangeAnnotationWorkspaceEditClientCapabilities {
+                            groups_on_label: Some(true),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = build_bridge_client_capabilities(Some(&upstream), true, false);
+        let mut capabilities = serde_json::to_value(&merged).unwrap();
+        apply_capability_override(&mut capabilities, &annotation_override);
+        assert_eq!(
+            capabilities.pointer("/workspace/workspaceEdit/changeAnnotationSupport"),
+            None,
+            "the override must not re-advertise annotation support the mirror withheld"
+        );
+        assert_eq!(
+            capabilities.pointer("/workspace/workspaceEdit/documentChanges"),
+            Some(&json!(true)),
+            "sibling workspaceEdit fields must survive the strip"
+        );
+
+        // No upstream workspaceEdit: the override creating one from scratch is
+        // stripped of the annotation key all the same.
+        let merged = build_bridge_client_capabilities(None, true, false);
+        let mut capabilities = serde_json::to_value(&merged).unwrap();
+        apply_capability_override(&mut capabilities, &annotation_override);
+        assert_eq!(
+            capabilities.pointer("/workspace/workspaceEdit/changeAnnotationSupport"),
+            None,
+        );
+    }
+
+    /// The spawn-time user warnings must mirror what enforcement does: one
+    /// message per problem, none for a benign override.
+    #[test]
+    fn override_user_warnings_cover_each_enforced_condition() {
+        use serde_json::json;
+
+        assert_eq!(
+            capability_override_user_warnings(&json!("nope"), false).len(),
+            1,
+            "a non-object override warns exactly once (it is ignored wholesale)"
+        );
+        assert!(
+            capability_override_user_warnings(
+                &json!({"window": {"workDoneProgress": false}}),
+                false
+            )
+            .is_empty(),
+            "a benign override must not warn"
+        );
+
+        let noisy = json!({
+            "general": {"positionEncodings": ["utf-8"]},
+            "workspace": {
+                "workspaceEdit": {"changeAnnotationSupport": {"groupsOnLabel": true}},
+                "configuration": true
+            }
+        });
+        let warnings = capability_override_user_warnings(&noisy, false);
+        assert_eq!(
+            warnings.len(),
+            3,
+            "positionEncodings + changeAnnotationSupport + configuration conflict: {warnings:?}"
+        );
+
+        assert_eq!(
+            capability_override_user_warnings(&json!({"general": "utf-8"}), false).len(),
+            1,
+            "a non-object general warns about the protected encoding"
+        );
+        assert!(
+            capability_override_user_warnings(&json!({"workspace": {"configuration": true}}), true)
+                .is_empty(),
+            "configuration matching the gate is not a conflict"
+        );
+        assert!(
+            capability_override_user_warnings(
+                &json!({"general": {"positionEncodings": ["utf-16"]}}),
+                false
+            )
+            .is_empty(),
+            "restating the enforced utf-16 baseline is a no-op, not a conflict"
+        );
+
+        // The conflict check must see through non-boolean displacement, not
+        // just boolean leaves: null/scalar shapes turn the capability off too.
+        assert_eq!(
+            capability_override_user_warnings(&json!({"workspace": null}), true).len(),
+            1,
+            "a non-object workspace wholesale-drops advertised capabilities"
+        );
+        assert_eq!(
+            capability_override_user_warnings(&json!({"workspace": {"configuration": null}}), true)
+                .len(),
+            1,
+            "configuration:null displaces the advertised true as surely as false"
+        );
+        assert!(
+            capability_override_user_warnings(
+                &json!({"workspace": {"configuration": null}}),
+                false
+            )
+            .is_empty(),
+            "configuration:null where nothing was advertised changes nothing"
+        );
+    }
+
+    /// A non-object override at the root would replace the entire capabilities
+    /// object in a deep merge; it must be ignored wholesale.
+    #[test]
+    fn non_object_override_is_ignored() {
+        use serde_json::json;
+
+        let merged = build_bridge_client_capabilities(None, true, false);
+        let mut capabilities = serde_json::to_value(&merged).unwrap();
+        let untouched = capabilities.clone();
+
+        apply_capability_override(&mut capabilities, &json!("nope"));
+
+        assert_eq!(
+            capabilities, untouched,
+            "a scalar override must leave the advertised capabilities unchanged"
+        );
+    }
+
+    #[test]
+    fn capability_override_passes_through_unknown_fields() {
+        use serde_json::json;
+
+        // The override is merged at the JSON layer so fields the typed
+        // ClientCapabilities doesn't model are advertised verbatim instead of
+        // being silently dropped by a typed round-trip.
+        let merged = build_bridge_client_capabilities(None, true, false);
+        let mut capabilities = serde_json::to_value(&merged).unwrap();
+
+        apply_capability_override(
+            &mut capabilities,
+            &json!({"workspace": {"futureCapability": {"nested": true}}}),
+        );
+
+        assert_eq!(
+            capabilities.pointer("/workspace/futureCapability/nested"),
+            Some(&json!(true)),
+        );
+        assert_eq!(
+            capabilities.pointer("/workspace/workspaceFolders"),
+            Some(&json!(true)),
+            "existing workspace keys must survive alongside the addition"
+        );
     }
 
     #[test]

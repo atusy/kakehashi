@@ -158,6 +158,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             }),
         }
