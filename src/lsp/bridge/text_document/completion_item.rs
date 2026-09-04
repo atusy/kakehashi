@@ -686,6 +686,7 @@ mod tests {
             &mut item,
             "tsudoi-ls",
             "file:///test/doc.txt",
+            None,
         );
 
         for round in 1..=2 {
@@ -883,6 +884,7 @@ mod tests {
             &mut item,
             "tsudoi-ls",
             "file:///test/doc.txt",
+            None,
         );
 
         let result = pool
@@ -1053,7 +1055,7 @@ mod tests {
             data: Some(json!({"resolve_id": 42})),
             ..Default::default()
         };
-        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md");
+        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md", None);
         let (result, warnings) = resolve_warnings_for(item);
         let envelope = extract_envelope(&result).expect("envelope restored");
         assert!(
@@ -1097,7 +1099,7 @@ mod tests {
             data: Some(forged.clone()),
             ..Default::default()
         };
-        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md");
+        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md", None);
         let (result, warnings) = resolve_warnings_for(item);
         let envelope = extract_envelope(&result).expect("envelope restored");
         assert!(envelope.is_host_layer());

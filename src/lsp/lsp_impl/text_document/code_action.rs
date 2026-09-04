@@ -473,6 +473,11 @@ impl Kakehashi {
             return Ok(None);
         };
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        // The lifetime the text was read under travels with the actions and a
+        // reply synchronized under another one is refused: a close and reopen
+        // racing the request would otherwise answer for the closed text under
+        // the reopened document's incarnation.
+        let expected_incarnation = ctx.incarnation;
         let pool = self.bridge.pool_arc();
         // One fan-out closure, dispatched by the within-host-layer strategy
         // (`bridge._self.aggregation.<method>.strategy`); moves into one arm.
@@ -497,6 +502,15 @@ impl Kakehashi {
                 let Some(raw) = raw else {
                     return Ok(None);
                 };
+                if raw.incarnation != expected_incarnation {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "textDocument/codeAction (host): {} was reopened while {} answered; discarding actions computed on the closed text",
+                        t.uri,
+                        t.server_name
+                    );
+                    return Ok(None);
+                }
                 let answering = raw.handle;
                 let connection_key = answering.key().clone();
                 let Some(actions) = parse_code_actions_leniently(raw.value) else {
@@ -541,6 +555,7 @@ impl Kakehashi {
                     upstream_caps,
                     server_resolves,
                     None,
+                    Some(expected_incarnation),
                 )))
             }
         };
