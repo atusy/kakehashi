@@ -258,11 +258,14 @@ impl InjectionCoordinator {
             self.bridge.cancel_eager_open(uri);
             return false;
         };
-        // `None` (query not loaded yet) opens nothing now; the parse that
-        // follows the query's arrival re-runs this eager open.
-        let injections = self
-            .resolve_injection_data(uri, &host_language)
-            .unwrap_or_default();
+        // `None`: the document could not be looked at (its language is still
+        // publishing, or it has no tree yet). Leave whatever is open alone —
+        // there is no evidence anything changed — and let the parse that
+        // lands once the language is in place run this pass for real.
+        let Some(injections) = self.resolve_injection_data(uri, &host_language) else {
+            self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+            return true;
+        };
         if injections.is_empty() {
             self.bridge.cancel_eager_open(uri);
             return true;
