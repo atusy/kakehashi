@@ -38,12 +38,29 @@ impl Kakehashi {
         // toggling `host_layer` on a virt envelope. It is not a security
         // boundary (the envelope round-trips through unprotected client `data`)
         // — it guards against accidental bypass, and the host path fails soft.
-        if let Some(envelope) = extract_envelope(&params)
-            && !envelope.is_host_layer()
-            && !self.completion_envelope_is_fresh(&envelope).await
-        {
-            return Ok(params);
+        let envelope = extract_envelope(&params);
+        if let Some(envelope) = &envelope {
+            let Ok(host_url) = Url::parse(&envelope.host_uri) else {
+                return Ok(params);
+            };
+            // Both layers: the item was computed against one text revision,
+            // and a lazily materialized edit or documentation for another
+            // must not be surfaced as if it were for this one.
+            if !self.document_revision_is_current(&host_url, envelope.content_version) {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve: {} was revised since the item was produced; returning item unresolved",
+                    envelope.host_uri
+                );
+                return Ok(params);
+            }
+            if !envelope.is_host_layer() && !self.completion_envelope_is_fresh(envelope).await {
+                return Ok(params);
+            }
         }
+        // Kept for the post-response check; the gates above return `params`
+        // itself, so only a resolve that is actually dispatched pays for it.
+        let unresolved = envelope.as_ref().map(|_| params.clone());
         let settings = self.settings_manager.load_settings();
         let pool = self.bridge.pool_arc();
         let upstream_id = current_upstream_id();
@@ -64,14 +81,34 @@ impl Kakehashi {
             std::sync::Arc::clone(&pool),
             sweep_id,
         );
-        match cancel_rx {
+        let resolved = match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
                 _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
                 item = dispatch => Ok(item),
             },
             None => Ok(dispatch.await),
+        }?;
+        // A later didChange/didClose is allowed to proceed once the resolve
+        // was enqueued. Revalidate after the response so fields computed
+        // against the content this resolve observed are not surfaced into a
+        // revised or reopened document.
+        if let (Some(envelope), Some(unresolved)) = (envelope, unresolved) {
+            let Ok(host_url) = Url::parse(&envelope.host_uri) else {
+                return Ok(unresolved);
+            };
+            if !self.document_revision_is_current(&host_url, envelope.content_version)
+                || !self.host_incarnation_is_current(&host_url, envelope.incarnation)
+            {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve: {} was revised or reopened while resolving; returning item unresolved",
+                    envelope.host_uri
+                );
+                return Ok(unresolved);
+            }
         }
+        Ok(resolved)
     }
 
     async fn completion_envelope_is_fresh(&self, envelope: &KakehashiEnvelope) -> bool {

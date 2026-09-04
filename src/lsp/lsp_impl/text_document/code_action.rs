@@ -167,6 +167,25 @@ impl Kakehashi {
         let Some(envelope) = extract_code_action_envelope(&action) else {
             return Ok(action);
         };
+        let Ok(host_url) = Url::parse(&envelope.host_uri) else {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: envelope host_uri {:?} is not a valid URL",
+                envelope.host_uri
+            );
+            return Ok(action);
+        };
+        // Both layers: the action was computed against one text revision, and
+        // a lazily materialized edit for another must not be applied to this
+        // one even when the region's geometry still matches.
+        if !self.document_revision_is_current(&host_url, envelope.content_version) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: {} was revised since the action was produced; returning action unresolved",
+                envelope.host_uri
+            );
+            return Ok(action);
+        }
 
         // Fail-soft staleness gate: resolving against a moved or invalidated
         // region would translate a resolved edit with a stale offset and bind
@@ -207,6 +226,9 @@ impl Kakehashi {
             }
         };
 
+        // Kept for the post-response check; the gates above return `action`
+        // itself, so only a resolve that is actually dispatched pays for it.
+        let unresolved = action.clone();
         let settings = self.settings_manager.load_settings();
         let upstream_caps = self.upstream_code_action_caps();
         let upstream_id = crate::lsp::current_upstream_id();
@@ -235,14 +257,29 @@ impl Kakehashi {
             std::sync::Arc::clone(&pool),
             sweep_id,
         );
-        match cancel_rx {
+        let resolved = match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
                 _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
                 resolved = dispatch => Ok(resolved),
             },
             None => Ok(dispatch.await),
+        }?;
+        // A later didChange/didClose is allowed to proceed once the resolve
+        // was enqueued. Revalidate after the response so an edit computed
+        // against the content this resolve observed is not surfaced into a
+        // revised or reopened document.
+        if !self.document_revision_is_current(&host_url, envelope.content_version)
+            || !self.host_incarnation_is_current(&host_url, envelope.incarnation)
+        {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: {} was revised or reopened while resolving; returning action unresolved",
+                envelope.host_uri
+            );
+            return Ok(unresolved);
         }
+        Ok(resolved)
     }
 
     /// The region's current content-precise host-document END position if the
