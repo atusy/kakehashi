@@ -204,11 +204,13 @@ fn e2e_virtual_completion_resolve_survives_an_edit_inside_the_region() {
 /// A fence inside a blockquote carries a per-line column offset (the `> `
 /// prefix); adding a line to it grows that vector without moving the region.
 /// The item is still resolvable: the region is identified by its id and
-/// start, and the resolved edits are translated with the region as it is now.
+/// start, and the resolved edits are translated with the region as it is
+/// now — a lazy edit on the added line lands after that line's prefix,
+/// which only the grown offset vector knows.
 #[test]
 fn e2e_virtual_completion_resolve_survives_growth_of_a_blockquoted_fence() {
     let (mut client, _config_dir, item) = init_virtual_completion_client_on(
-        "completion-resolve-plain",
+        "completion-resolve-additional-edit",
         "> ```lua\n> local x = 1\n> ```\n",
         1,
         13,
@@ -229,6 +231,12 @@ fn e2e_virtual_completion_resolve_survives_growth_of_a_blockquoted_fence() {
             .as_str()
             .is_some_and(|detail| detail.starts_with("mock-resolved:")),
         "a resolve after typing that grew the blockquoted fence must still reach the downstream: {response}"
+    );
+    // Virtual line 1 is host line 2 (`> local z = 3`), after its `> ` prefix.
+    assert_eq!(
+        response["result"]["additionalTextEdits"][0]["range"]["start"],
+        json!({ "line": 2, "character": 2 }),
+        "the lazy edit must be translated with the grown per-line offsets: {response}"
     );
 
     shutdown_client(&mut client);

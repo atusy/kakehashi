@@ -52,6 +52,8 @@
 //!   survives the virt edit guard inside a one-line region.
 //! - `code-action-lazy-delayed-resolve` / `code-lens-delayed-resolve` /
 //!   `document-link-delayed-resolve` / `completion-resolve-delayed` /
+//!   `completion-resolve-additional-edit` (lazy `additionalTextEdits` on the
+//!   second virtual line) /
 //!   `completion-resolve-reopen-delayed` /
 //!   `code-lens-reopen-delayed-resolve` / `document-link-reopen-delayed-resolve`
 //!   — like their base modes, but park the resolve reply (after a
@@ -368,7 +370,8 @@ fn main() {
                     "completion-resolve"
                     | "completion-resolve-plain"
                     | "completion-resolve-reopen-delayed"
-                    | "completion-resolve-delayed" => json!({
+                    | "completion-resolve-delayed"
+                    | "completion-resolve-additional-edit" => json!({
                         "completionProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -807,9 +810,25 @@ fn main() {
                 // `completion-resolve-plain`: fill only `detail`, so the reply
                 // survives the bridge's edit guard inside a one-line region and
                 // a test can tell a resolved item from an unresolved one.
+                // `completion-resolve-additional-edit`: a lazy
+                // `additionalTextEdits` on the SECOND virtual line, so a test
+                // can assert the host range it is translated to depends on
+                // the region's live per-line offsets.
+                if mode == "completion-resolve-additional-edit" {
+                    item["additionalTextEdits"] = json!([{
+                        "range": {
+                            "start": { "line": 1, "character": 0 },
+                            "end": { "line": 1, "character": 0 }
+                        },
+                        // No newline: a prefixed (blockquote) region rejects
+                        // inserted lines, which would carry no prefix.
+                        "newText": "--[[resolved]] "
+                    }]);
+                }
                 if mode != "completion-resolve-plain"
                     && mode != "completion-resolve-reopen-delayed"
                     && mode != "completion-resolve-delayed"
+                    && mode != "completion-resolve-additional-edit"
                 {
                     item["textEdit"] = json!({
                         "range": {
