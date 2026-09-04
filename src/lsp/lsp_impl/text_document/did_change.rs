@@ -74,8 +74,9 @@ impl Kakehashi {
         // fall back to diff-based approach for full document sync.
         //
         // This must be called AFTER content changes are applied (so we have new
-        // text) but BEFORE the tree is cleared and the off-ingress reparse is
-        // scheduled (so node-position sync happens against the pre-edit state).
+        // text) but BEFORE the version bump stales the tree and the off-ingress
+        // reparse is scheduled (so node-position sync happens against the
+        // pre-edit state).
         let invalidated_ulids = if edits.is_empty() {
             // Full document sync: no InputEdits available, reconstruct from diff
             self.bridge.apply_text_diff(&uri, &old_text, &text)
@@ -89,15 +90,15 @@ impl Kakehashi {
         // content-addressed, so an edited region simply misses under its new
         // content hash and the old entry is swept by the reparse's populate.
 
-        // Apply the edit to the store and CLEAR the reader-visible tree
-        // synchronously, here under the edit lock (per-document-parse-scheduler ADR).
-        // Clearing the visible tree (rather than leaving the pre-edit one) is what
-        // keeps readers safe once the parse is off-ingress: a virt/native reader now
-        // sees *no* tree until the reparse lands (empty / on-demand fallback) instead
-        // of a stale tree that predates this edit — turning the #342/#374 stale-tree
-        // race into benign emptiness. The document exists (checked above) and the
-        // edit lock serializes didClose, so this update is in-place, not a
-        // resurrection.
+        // Apply the edit to the store synchronously, here under the edit lock
+        // (per-document-parse-scheduler ADR). The content-version bump makes the
+        // published snapshot non-current, so `Document::tree` / `snapshot()` read
+        // as absent until the reparse lands: a virt/native reader sees *no* tree
+        // (empty fallback) rather than a stale one that predates this edit —
+        // turning the #342/#374 stale-tree race into benign emptiness — while
+        // `latest_snapshot` readers keep serving the stale-but-consistent
+        // snapshot. The document exists (checked above) and the edit lock
+        // serializes didClose, so this update is in-place, not a resurrection.
         //
         // The pre-edit tree is NOT discarded: `edits` are logged so the off-ingress
         // reparse's incremental seed (`Document::incremental_seed`, read only by

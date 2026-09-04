@@ -32,7 +32,7 @@ pub struct DocumentStore {
     /// [`next_incarnation`](Self::next_incarnation)). Starts at 1, so a document
     /// built outside the store (incarnation `0`) is always distinguishable from
     /// one this store owns. The incarnation lives *on the document* rather than
-    /// in a side map, so a tree-write CAS or a watermark advance can check it
+    /// in a side map, so `install_parse` or a watermark advance can check it
     /// atomically with the document state under the same shard lock; a consumer
     /// that captured a snapshot detects a close-then-reopen by comparing the
     /// snapshot's incarnation against the URI's current one. See
@@ -1384,7 +1384,7 @@ mod tests {
         );
         assert!(
             !stale.current && !stale.published,
-            "a pre-reload parse must neither restore the legacy tree nor land its snapshot"
+            "a pre-reload parse must not land its snapshot"
         );
 
         let document = store.get(&uri).unwrap();
