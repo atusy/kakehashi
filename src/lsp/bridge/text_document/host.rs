@@ -364,23 +364,24 @@ impl LanguageServerPool {
             let Some(state) = docs.get_mut(&(uri_string.clone(), connection_key.clone())) else {
                 continue;
             };
-            if state
-                .content_version
-                .is_some_and(|recorded| revision.content_version < recorded)
-            {
-                // A newer text already reached this connection; the save's
-                // own notification still goes out below for the text it has.
-                continue;
-            }
-
             let mut sender = ConnectionHandleSender(handle);
-            if resync_open_host_document(&mut sender, state, uri_lsp.clone(), text)
-                .await
-                .is_err()
-            {
-                continue;
+            let newer_text_already_synced = state
+                .content_version
+                .is_some_and(|recorded| revision.content_version < recorded);
+            if newer_text_already_synced {
+                // Do not roll the connection back to the saved text; the
+                // save itself still happened and is announced below (with
+                // the saved text when the server asked for it — that is what
+                // reached the disk).
+            } else {
+                if resync_open_host_document(&mut sender, state, uri_lsp.clone(), text)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                state.content_version = Some(revision.content_version);
             }
-            state.content_version = Some(revision.content_version);
             let params = if include_text {
                 serde_json::json!({ "textDocument": { "uri": uri.as_str() }, "text": text })
             } else {
