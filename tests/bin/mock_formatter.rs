@@ -330,6 +330,26 @@ fn main() {
                         "inlineValueProvider": true,
                         "textDocumentSync": 1
                     }),
+                    "semantic-tokens-range-host" => json!({
+                        "semanticTokensProvider": {
+                            "legend": {
+                                "tokenTypes": ["variable", "keyword"],
+                                "tokenModifiers": ["static"]
+                            },
+                            "range": true
+                        },
+                        "textDocumentSync": 1
+                    }),
+                    "semantic-tokens-range-virt" | "semantic-tokens-range-delayed" => json!({
+                        "semanticTokensProvider": {
+                            "legend": {
+                                "tokenTypes": ["custom", "variable"],
+                                "tokenModifiers": ["static"]
+                            },
+                            "range": true
+                        },
+                        "textDocumentSync": 1
+                    }),
                     "inlay-hint-resolve"
                     | "inlay-hint-resolve-replacement"
                     | "inlay-hint-delayed-resolve"
@@ -1646,6 +1666,26 @@ fn main() {
                 if mode == "inline-value-slow" {
                     record_mock_event(&mode, "request", &message);
                     continue;
+                }
+                respond(&mut writer, id, result);
+            }
+            "textDocument/semanticTokens/range" => {
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|_| {
+                        let (length, token_type) = if mode == "semantic-tokens-range-host" {
+                            (8, 0)
+                        } else {
+                            (4, 1)
+                        };
+                        json!({ "data": [0, 0, length, token_type, 1] })
+                    })
+                    .unwrap_or(Value::Null);
+                if mode == "semantic-tokens-range-delayed" {
+                    record_mock_event(&mode, "request", &message);
+                    wait_for_mock_release(&mode);
                 }
                 respond(&mut writer, id, result);
             }

@@ -9,9 +9,10 @@
 
 10 of the 11 per-method strategies described below are implemented
 (definition, hover, signatureHelp, completion, references, rename,
-codeAction, formatting, documentHighlight, diagnostics). Bridged semantic
-tokens remain unimplemented (native tree-sitter tokens are served, but
-downstream-server tokens are not fetched or merged).
+codeAction, formatting, documentHighlight, diagnostics). Semantic-token range
+requests now support the ordinary preferred host/virt/native layer walk when
+the requested range is wholly owned by one injection; full/delta bridging and
+the progressive native/downstream merge described below remain unimplemented.
 
 ## Context
 
@@ -348,7 +349,7 @@ When multiple servers are configured for a language:
 
 | Method | Merging Strategy (as implemented; rows marked *aspirational* never shipped) |
 |--------|------------------|
-| Semantic Tokens | *Aspirational* — bridged semantic tokens are unimplemented |
+| Semantic Tokens | Range: `preferred` for injection-contained requests, with legend remapping and native fallback. Full/delta progressive merge remains aspirational |
 | Go-to-Definition | `preferred`: first non-empty result (query in `priorities` order) |
 | Find References | `preferred` by default (first non-empty); *concatenate + dedupe is aspirational* |
 | Completion | `preferred` by default (first non-empty); *list merging is aspirational* |
@@ -412,7 +413,8 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | colorPresentation | ✅ Implemented | Experimental opt-in; host edits pass through verbatim, unsafe virtual presentations are dropped |
 | documentHighlight | ✅ Implemented | Strategy-2 shape (single-document, position-mapped) |
 | diagnostics | ✅ Implemented | Push + pull with host translation |
-| semanticTokens | ❌ Not bridged | Native tree-sitter tokens ARE served (semantic-token-overlap-resolution); downstream-server tokens are not fetched or merged — doing so would enable the parallel fetch strategy |
+| semanticTokens/range | ✅ Implemented | Injection-contained requests use preferred virt/host/native layers; downstream legends and coordinates are translated, invalid tokens drop |
+| semanticTokens/full, full/delta | ❌ Not bridged | Native tree-sitter tokens ARE served; downstream-server tokens are not yet fetched or progressively merged |
 
 ### Original Implementation Priority
 

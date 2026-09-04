@@ -89,7 +89,13 @@ servers are queried.
 Highlights the whole document from Tree-sitter queries,
 **including embedded code blocks** — you get highlighting inside fenced code blocks
 even without a language server configured for that language. Delta updates and range
-requests are supported. Highlight colors are driven by the token types/modifiers
+requests are supported. A range wholly contained in one embedded region is first
+offered to that language's bridge server; outside such a region, an enabled
+`bridge._self` server can answer before the built-in Tree-sitter fallback. Downstream
+legends are remapped into kakehashi's advertised legend, and invalid or unknown
+tokens are dropped. Full and delta requests remain built-in only.
+
+Highlight colors are driven by the token types/modifiers
 kakehashi exposes; capture names can be remapped via
 `features.textDocument/semanticTokens.captureMappings`
 (see [the configuration guide](README.md#featurestextdocumentsemantictokenscapturemappings)).

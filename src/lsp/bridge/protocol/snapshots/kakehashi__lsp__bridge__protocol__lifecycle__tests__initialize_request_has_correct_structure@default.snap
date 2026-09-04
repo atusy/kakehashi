@@ -95,6 +95,54 @@ expression: request
         "callHierarchy": {
           "dynamicRegistration": false
         },
+        "semanticTokens": {
+          "dynamicRegistration": false,
+          "requests": {
+            "range": true
+          },
+          "tokenTypes": [
+            "comment",
+            "keyword",
+            "string",
+            "number",
+            "regexp",
+            "operator",
+            "namespace",
+            "type",
+            "struct",
+            "class",
+            "interface",
+            "enum",
+            "enumMember",
+            "typeParameter",
+            "function",
+            "method",
+            "macro",
+            "variable",
+            "parameter",
+            "property",
+            "event",
+            "modifier",
+            "decorator"
+          ],
+          "tokenModifiers": [
+            "declaration",
+            "definition",
+            "readonly",
+            "static",
+            "deprecated",
+            "abstract",
+            "async",
+            "modification",
+            "documentation",
+            "defaultLibrary"
+          ],
+          "formats": [
+            "relative"
+          ],
+          "overlappingTokenSupport": false,
+          "multilineTokenSupport": false
+        },
         "moniker": {
           "dynamicRegistration": false
         },

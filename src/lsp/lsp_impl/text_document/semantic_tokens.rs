@@ -18,20 +18,25 @@
 
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
-    SemanticTokens, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
-    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
+    NumberOrString, Range, SemanticTokens, SemanticTokensDeltaParams,
+    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
+    SemanticTokensRangeResult, SemanticTokensResult,
 };
 use url::Url;
 
 #[cfg(test)]
 use tower_lsp_server::ls_types::{
-    PartialResultParams, Position, Range, TextDocumentIdentifier, WorkDoneProgressParams,
+    PartialResultParams, Position, TextDocumentIdentifier, WorkDoneProgressParams,
 };
 
 use crate::analysis::{
     SemanticSnapshotIdentity, calculate_delta_or_full, filter_semantic_tokens_by_range,
     handle_semantic_tokens_full, next_result_id,
 };
+use crate::lsp::aggregation::server::{
+    HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
+};
+use crate::lsp::bridge::{HostDocument, RegionOffset, host_position_within_region_bounds};
 use crate::lsp::current_upstream_id;
 
 use super::super::{Kakehashi, uri_to_url};
@@ -70,6 +75,35 @@ pub(crate) enum TokenSnapshot {
 enum CurrentTokens {
     Cached(std::sync::Arc<SemanticTokens>),
     Owned(SemanticTokens),
+}
+
+/// Cancels blocking semantic-token work when its async owner is abandoned.
+///
+/// Dropping a `ComputePool` future cannot stop a work unit that already entered
+/// Rayon. Layer races intentionally drop losing futures, so the native range
+/// arm must turn that drop into the cooperative signal polled by the token
+/// collector.
+struct SemanticComputeCancelGuard {
+    token: crate::cancel::CancelToken,
+    armed: bool,
+}
+
+impl SemanticComputeCancelGuard {
+    fn new(token: crate::cancel::CancelToken) -> Self {
+        Self { token, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SemanticComputeCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.token.cancel();
+        }
+    }
 }
 
 impl CurrentTokens {
@@ -1053,6 +1087,249 @@ impl Kakehashi {
         &self,
         params: SemanticTokensRangeParams,
     ) -> Result<Option<SemanticTokensRangeResult>> {
+        const METHOD: &str = "textDocument/semanticTokens/range";
+        let lsp_uri = params.text_document.uri.clone();
+        let range = params.range;
+        if (range.start.line, range.start.character) >= (range.end.line, range.end.character) {
+            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: Vec::new(),
+            })));
+        }
+        let progress_token = params.work_done_progress_params.work_done_token.clone();
+        let mut raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+        if let Some(params) = raw_params.as_object_mut() {
+            // Downstream progress for the client's token is not aggregated or
+            // translated by the bridge reader. Force one complete final result
+            // instead of silently dropping streamed semantic-token chunks.
+            params.remove("partialResultToken");
+        }
+        let request_identity = std::sync::Arc::new(std::sync::OnceLock::new());
+        let virt = self.observe_semantic_range_identity(
+            &lsp_uri,
+            std::sync::Arc::clone(&request_identity),
+            self.semantic_tokens_range_virt_layer(&lsp_uri, range, progress_token),
+        );
+        let host = self.observe_semantic_range_identity(
+            &lsp_uri,
+            std::sync::Arc::clone(&request_identity),
+            self.semantic_tokens_range_host_layer(&lsp_uri, range, raw_params),
+        );
+        let native = self.observe_semantic_range_identity(
+            &lsp_uri,
+            std::sync::Arc::clone(&request_identity),
+            self.semantic_tokens_range_native_layer(params),
+        );
+
+        let result = self
+            .walk_layer_futures(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                virt,
+                host,
+                native,
+                |tokens: &SemanticTokensRangeResult| match tokens {
+                    SemanticTokensRangeResult::Tokens(tokens) => !tokens.data.is_empty(),
+                    SemanticTokensRangeResult::Partial(partial) => !partial.data.is_empty(),
+                },
+            )
+            .await?;
+        let Some(&(incarnation, content_version)) = request_identity.get() else {
+            return Ok(None);
+        };
+        if !self.semantic_range_snapshot_is_current(&lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
+        Ok(result)
+    }
+
+    async fn observe_semantic_range_identity<F>(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        request_identity: std::sync::Arc<std::sync::OnceLock<(u64, u64)>>,
+        layer: F,
+    ) -> Result<Option<SemanticTokensRangeResult>>
+    where
+        F: std::future::Future<Output = Result<Option<SemanticTokensRangeResult>>>,
+    {
+        let identity = uri_to_url(lsp_uri)
+            .ok()
+            .and_then(|uri| self.documents.get(&uri))
+            .map(|document| (document.incarnation(), document.content_version()));
+        let result = layer.await;
+        let identity = identity.or_else(|| {
+            uri_to_url(lsp_uri)
+                .ok()
+                .and_then(|uri| self.documents.get(&uri))
+                .map(|document| (document.incarnation(), document.content_version()))
+        });
+        if let Some(identity) = identity {
+            let _ = request_identity.set(identity);
+        }
+        result
+    }
+
+    async fn semantic_tokens_range_host_layer(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        range: Range,
+        raw_params: serde_json::Value,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        const METHOD: &str = "textDocument/semanticTokens/range";
+        let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
+            return Ok(None);
+        };
+        let incarnation = ctx.incarnation;
+        let content_version = ctx.content_version;
+        if !self.semantic_range_snapshot_is_current(lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        let documents = std::sync::Arc::clone(&self.documents);
+        let result = dispatch_host_preferred(
+            &ctx,
+            self.bridge.pool_arc(),
+            move |task: HostFanOutTask| {
+                let params = raw_params.clone();
+                let documents = std::sync::Arc::clone(&documents);
+                async move {
+                    let host_uri = task.uri.clone();
+                    let revision_text_reader: crate::lsp::bridge::HostTextReader =
+                        std::sync::Arc::new(move || {
+                            documents.get(&host_uri).and_then(|document| {
+                                (document.incarnation() == incarnation
+                                    && document.content_version() == content_version)
+                                    .then(|| document.text_arc())
+                            })
+                        });
+                    task.pool
+                        .send_host_semantic_tokens_range_request(
+                            &task.server_name,
+                            &task.server_config,
+                            &HostDocument {
+                                uri: &task.uri,
+                                language_id: &task.language_id,
+                                text: &task.text,
+                            },
+                            params,
+                            range,
+                            task.upstream_id,
+                            incarnation,
+                            revision_text_reader,
+                        )
+                        .await
+                }
+            },
+            |tokens| {
+                tokens
+                    .as_ref()
+                    .is_some_and(|tokens| !tokens.data.is_empty())
+            },
+            cancel_rx,
+        )
+        .await;
+        let tokens = self.host_layer_result(result, METHOD, |won| won).await?;
+        if !self.semantic_range_snapshot_is_current(lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
+        Ok(tokens.map(SemanticTokensRangeResult::Tokens))
+    }
+
+    async fn semantic_tokens_range_virt_layer(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        range: Range,
+        progress_token: Option<NumberOrString>,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        const METHOD: &str = "textDocument/semanticTokens/range";
+        let Some(mut ctx) = self
+            .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
+            .await
+        else {
+            return Ok(None);
+        };
+        let offset = RegionOffset::with_per_line_offsets(
+            ctx.document.resolved.region.line_range.start,
+            ctx.document.resolved.line_column_offsets.clone(),
+        );
+        let Some(region_end) = ctx.document.region_end else {
+            return Ok(None);
+        };
+        if ctx.range.start > ctx.range.end
+            || !host_position_within_region_bounds(ctx.range.start, &offset, region_end)
+            || !host_position_within_region_bounds(ctx.range.end, &offset, region_end)
+        {
+            return Ok(None);
+        }
+        let host_range = ctx.range;
+        ctx.document.client_progress_token = progress_token;
+        let incarnation = ctx.incarnation;
+        let content_version = ctx.content_version;
+        if !self.semantic_range_snapshot_is_current(lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
+        let (cancel_rx, _cancel_guard) =
+            self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
+        let result = dispatch_preferred(
+            &ctx.document,
+            self.bridge.pool_arc(),
+            |task| async move {
+                task.pool
+                    .send_semantic_tokens_range_request(
+                        &task.server_name,
+                        &task.server_config,
+                        &task.uri,
+                        host_range,
+                        region_end,
+                        &task.injection_language,
+                        &task.region_id,
+                        task.offset,
+                        &task.virtual_content,
+                        task.upstream_id,
+                        task.client_progress_token,
+                        incarnation,
+                    )
+                    .await
+            },
+            |tokens| {
+                tokens
+                    .as_ref()
+                    .is_some_and(|tokens| !tokens.data.is_empty())
+            },
+            cancel_rx,
+        )
+        .await;
+        let tokens = result
+            .handle(&self.notifier(), "semantic token range", None, Ok)
+            .await?;
+        if !self.semantic_range_snapshot_is_current(lsp_uri, incarnation, content_version) {
+            return Ok(None);
+        }
+        Ok(tokens.map(SemanticTokensRangeResult::Tokens))
+    }
+
+    fn semantic_range_snapshot_is_current(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        incarnation: u64,
+        content_version: u64,
+    ) -> bool {
+        uri_to_url(lsp_uri)
+            .ok()
+            .and_then(|uri| {
+                self.documents.get(&uri).map(|document| {
+                    document.incarnation() == incarnation
+                        && document.content_version() == content_version
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    async fn semantic_tokens_range_native_layer(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
         let lsp_uri = params.text_document.uri;
         let range = params.range;
 
@@ -1223,7 +1500,23 @@ impl Kakehashi {
         let supports_multiline = self.settings_manager.supports_multiline_tokens();
         let coordinator = std::sync::Arc::clone(&self.language);
 
-        let result = handle_semantic_tokens_full(
+        // Bind the work to both ownership of this layer future and the input
+        // version it was built from. A higher-priority bridge answer or an
+        // upstream cancellation drops this future and trips the guard; an edit
+        // or close trips the document's version token. In either case, forward
+        // cancellation into the token polled by the blocking collector so a
+        // losing/stale work unit cannot occupy the shared compute pool.
+        let Some(version_cancel) = self.documents.get(&uri).and_then(|document| {
+            (document.incarnation() == snapshot.incarnation
+                && document.content_version() == snapshot.parsed_version)
+                .then(|| document.version_cancel_token())
+        }) else {
+            return Err(crate::error::content_modified_error());
+        };
+        let compute_cancel = crate::cancel::CancelToken::default();
+        let mut compute_guard = SemanticComputeCancelGuard::new(compute_cancel.clone());
+
+        let compute = handle_semantic_tokens_full(
             &self.compute_pool,
             text,
             tree,
@@ -1233,9 +1526,16 @@ impl Kakehashi {
             coordinator,
             supports_multiline,
             None,
-            None,
-        )
-        .await;
+            Some(compute_cancel.clone()),
+        );
+        let result = tokio::select! {
+            result = compute => result,
+            _ = version_cancel.cancelled() => {
+                compute_cancel.cancel();
+                return Err(crate::error::content_modified_error());
+            }
+        };
+        compute_guard.disarm();
 
         // Shape immutable payloads before taking the edit lock. Only the final
         // live-snapshot validation and cache commits need to exclude edits.
@@ -1308,6 +1608,16 @@ mod tests {
     use tokio::time::{Duration, sleep, timeout};
     use tower_lsp_server::LspService;
     use url::Url;
+
+    #[test]
+    fn dropping_semantic_compute_owner_cancels_blocking_work() {
+        let token = crate::cancel::CancelToken::default();
+        {
+            let _guard = SemanticComputeCancelGuard::new(token.clone());
+            assert!(!token.is_cancelled());
+        }
+        assert!(token.is_cancelled());
+    }
 
     /// Publish a snapshot for `uri` built from `text` at `parsed_version`,
     /// tree-less (no parser needed): the handlers' snapshot-resolution and

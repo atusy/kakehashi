@@ -229,8 +229,19 @@ fn recover_server_capabilities(
     let mut recovered = serde_json::Map::new();
     let mut dropped = Vec::new();
     for (field, value) in capabilities {
+        // LSP 3.17 defines semanticTokensProvider.range as `boolean | {}`.
+        // ls-types currently models only the boolean arm, so normalize the
+        // marker object before the per-field typed recovery. Without this, one
+        // valid range advertisement drops the entire provider, including the
+        // legend required to decode every response.
+        let mut value = value.clone();
+        if field == "semanticTokensProvider"
+            && value.get("range").is_some_and(serde_json::Value::is_object)
+        {
+            value["range"] = serde_json::Value::Bool(true);
+        }
         let mut probe = serde_json::Map::new();
-        probe.insert(field.clone(), value.clone());
+        probe.insert(field.clone(), value);
         let probe = serde_json::Value::Object(probe);
         match serde_path_to_error::deserialize::<_, ServerCapabilities>(&probe) {
             Ok(_) => {
@@ -628,6 +639,33 @@ mod tests {
             parsed.capabilities.experimental,
             Some(serde_json::json!(["preserve", "me"]))
         );
+    }
+
+    #[test]
+    fn semantic_tokens_range_marker_object_is_normalized() {
+        let response = serde_json::json!({
+            "result": { "capabilities": {
+                "semanticTokensProvider": {
+                    "legend": {
+                        "tokenTypes": ["variable"],
+                        "tokenModifiers": ["static"]
+                    },
+                    "range": {},
+                    "full": false
+                }
+            } }
+        });
+
+        let parsed = parse_initialize_response_capabilities(&response)
+            .expect("the LSP marker-object range capability must be accepted");
+        let normalized = serde_json::to_value(&parsed.capabilities)
+            .expect("parsed capabilities should serialize");
+
+        assert_eq!(
+            normalized.pointer("/semanticTokensProvider/range"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(parsed.dropped.is_empty());
     }
 
     #[test]
