@@ -1575,7 +1575,12 @@ fn spawn_upstream_request(
                 // closed, misses ones opened since, and is simply EMPTY when the
                 // dead connection never got far enough to hold anything, which is
                 // exactly when a replacement most needs the repair.
-                let hosts = context.injection.open_host_uris();
+                // Documents whose parse is already current go first: they
+                // need no wait, and a pending document ahead of them would
+                // spend the sweep's one budget on a wait they never needed.
+                let hosts = order_reopen_candidates(context.injection.open_host_uris(), |host| {
+                    context.injection.snapshot_is_current(host)
+                });
                 log::debug!(
                     target: "kakehashi::bridge",
                     "Bringing {key} up to date after {server:?} respawned: \
@@ -1599,7 +1604,11 @@ fn spawn_upstream_request(
                 // outstanding for tens of seconds, making each command pay the
                 // full wait repeatedly. On expiry the opens keep running detached
                 // and waiters are released, degrading to the pre-existing lazy
-                // heal rather than stalling.
+                // heal rather than stalling. The sweep itself never stops early:
+                // once the budget is spent it stops WAITING for pending parses,
+                // but still opens every document whose parse is current — a
+                // document nothing else will touch (no pending parse, no
+                // request on it) is otherwise never re-opened at all.
                 let injection = context.injection.clone();
                 let reopen_server = server.clone();
                 // `done` moves INTO the work task, so ONLY real completion
@@ -1635,6 +1644,7 @@ fn spawn_upstream_request(
                     // sweep is now sized by the workspace rather than by what
                     // one dead connection held.
                     let sweep_deadline = std::time::Instant::now() + REOPEN_WAIT;
+                    let mut budget_spent = false;
                     for host in hosts {
                         // Stop if nobody can hear the answer. `rearm` and a
                         // later `claim` both drop the registry's receiver, so a
@@ -1701,19 +1711,22 @@ fn spawn_upstream_request(
                         let remaining = sweep_deadline
                             .checked_duration_since(std::time::Instant::now())
                             .unwrap_or_default();
-                        if remaining.is_zero() {
+                        if remaining.is_zero() && !budget_spent {
                             // Out of budget with candidates still unexamined.
-                            // Report the connection as NOT caught up: the
-                            // waiters are about to time out anyway, and telling
-                            // them the sweep finished would release commands
-                            // onto documents this pass never reached.
+                            // Keep going without waiting: a document whose
+                            // parse is current still gets its open, and only a
+                            // document whose parse is pending is left to that
+                            // parse's own eager open. Report the connection as
+                            // NOT caught up: the waiters are about to time out
+                            // anyway, and telling them the sweep finished would
+                            // release commands onto documents this pass never
+                            // reached.
                             log::debug!(
                                 target: "kakehashi::bridge",
                                 "Re-open of {key} ran out of budget with candidates \
-                                 left; reporting it incomplete"
+                                 left; finishing the current ones without waiting"
                             );
-                            repaired = false;
-                            break;
+                            budget_spent = true;
                         }
                         use crate::lsp::lsp_impl::coordinator::ParseWait;
                         match injection.ensure_document_parsed(&host, remaining).await {
