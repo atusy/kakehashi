@@ -57,7 +57,9 @@ pub struct Document {
     ///
     /// **Read by `reparse_latest` only** — never by `tree()` / `snapshot()`, which
     /// must stay `None` until the reparse lands. Cleared the moment a fresh tree is
-    /// attached (`set_tree`) — a present tree means the seed is consumed — and on a
+    /// attached (`set_parse_result`, reached only through
+    /// `DocumentStore::install_parse`) — a present tree means the seed is
+    /// consumed — and on a
     /// full-text sync (`apply_edit_and_seed` with no `InputEdit`s), where seeding an
     /// unedited tree against wholly-replaced text would violate tree-sitter's
     /// incremental contract and corrupt external scanners (#348).
@@ -264,15 +266,8 @@ impl Document {
         self.pending_seed = None;
     }
 
-    /// Attach a parsed tree **without** touching the text.
-    ///
-    /// For an on-demand reader parse whose parsed text already equals the stored
-    /// text: there is no content-version transition to record, so the text is
-    /// neither re-cloned nor replaced.
-    ///
-    /// Clears `pending_seed`: a present reader-visible tree means the off-ingress
-    /// reparse's seed has been consumed (the tree it would have produced is now
-    /// here), so the next `didChange` seeds from this fresh tree, not a stale seed.
+    /// Drop the tree and the seed on a settings/grammar reload and publish a
+    /// tree-less placeholder at the bumped version (see `ParseSnapshot`).
     pub(crate) fn invalidate_parse(&mut self) {
         self.tree = None;
         self.pending_seed = None;
@@ -296,14 +291,17 @@ impl Document {
         });
     }
 
-    /// Store the open-time parse result — the detected `language` and the parsed
-    /// `tree` (`None` for a parsed-to-nothing / no-language open) —
-    /// **preserving the existing text**.
+    /// Store a parse result — the `language` and the parsed `tree` (`None` for
+    /// a parsed-to-nothing / no-language parse) — **preserving the existing
+    /// text**. Reached only through `DocumentStore::install_parse`, for every
+    /// parse path (open, installed-grammar reparse, edit reparse); the text
+    /// was stored when the document was registered, so the result is recorded
+    /// in place rather than re-inserting a copy of the (potentially large)
+    /// text.
     ///
-    /// For the didOpen parse, whose text was already stored when the document was
-    /// registered: it reparses that same text and records the result *in place*,
-    /// rather than re-inserting a fresh copy of the (potentially large) text. Clears
-    /// any `pending_seed` (the open path never has one — it is set only by an edit).
+    /// Clears `pending_seed`: a present reader-visible tree means the
+    /// off-ingress reparse's seed has been consumed, so the next `didChange`
+    /// seeds from this fresh tree, not a stale seed.
     pub(crate) fn set_parse_result(&mut self, language: Option<String>, tree: Option<Tree>) {
         self.language_id = language;
         self.tree = tree;
@@ -540,7 +538,7 @@ mod tests {
 
     /// Attaching a fresh tree consumes (clears) the pending seed.
     #[test]
-    fn set_tree_clears_pending_seed() {
+    fn set_parse_result_clears_pending_seed() {
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())

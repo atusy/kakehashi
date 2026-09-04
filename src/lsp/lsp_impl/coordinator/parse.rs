@@ -10,9 +10,9 @@ use crate::lsp::lsp_impl::{Kakehashi, build_notifier};
 use crate::lsp::settings_manager::SettingsManager;
 
 /// Everything one populate pass derives for the snapshot it rides on
-/// (parse-snapshot ADR §3): all `None` when populate was skipped (raced CAS)
-/// or the pool work-unit panicked — readers then fall back to inline
-/// resolution for that snapshot.
+/// (parse-snapshot ADR §3): all `None` when the pool work-unit panicked or
+/// populate's own epoch/lifetime guard committed nothing — readers then fall
+/// back to inline resolution for that snapshot.
 #[derive(Default)]
 struct PopulatedSnapshotRegions {
     discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
@@ -794,22 +794,15 @@ impl ParseCoordinator {
 
             let Some(tree) = parsed else { break };
 
-            // Persist FIRST through the non-inserting, tree-absent CAS —
-            // before the snapshot publish, so a legacy-store reader the
-            // publish wakes finds the tree already attached (see the
-            // parse_document ordering note). A closed (Vacant) document, one
-            // whose text moved (a concurrent `didChange`), or one a
-            // concurrent parse already gave a tree all drop this tree — the
-            // tree-absent check makes the "don't clobber a concurrent parse"
-            // guard atomic with the write. Only populate the injection caches
-            // when the tree actually landed, so a `didClose` racing this
-            // reparse can't leave stale injection entries for a gone
-            // document. (`Tree` clone is a cheap refcount bump.)
             // Populate BEFORE the install so the discovery rides the snapshot
             // (ADR §3); populate guards itself against a pass whose text or
             // lifetime moved on, and the install then lands the tree and the
-            // snapshot together — the cell still rejects a stale lifetime or
-            // an out-of-order version on its own.
+            // snapshot together — or neither: a closed (Vacant) document, one
+            // whose text moved (a concurrent `didChange`), and one a
+            // concurrent parse already gave a tree at this version (the cell
+            // refuses the equal-version swap, so the tree is not re-attached
+            // either) all drop this tree. (`Tree` clone is a cheap refcount
+            // bump.)
             let regions = self
                 .populate_injections_on_pool(
                     uri.clone(),
@@ -854,8 +847,9 @@ impl ParseCoordinator {
             if installed.attached {
                 break;
             }
-            // CAS rejected: the text moved under us (a concurrent `didChange`).
-            // Loop to re-read the latest text and try again.
+            // Install rejected: the text moved under us (a concurrent
+            // `didChange`), or a sibling parse already installed this
+            // version. Loop to re-read the latest text and try again.
         }
 
         // Covers the give-up exits of the retry loop (parser still
@@ -996,11 +990,11 @@ impl ParseCoordinator {
 
         let mut events = load_result.events;
         if let Some(tree) = parsed {
-            // Legacy tree CAS BEFORE the snapshot publish (see the
-            // parse_document ordering note): a legacy-store reader woken by
-            // the publish must find the tree already attached. Text +
-            // language + incarnation checked atomically under the tree-write
-            // shard lock: text rejects a within-lifetime stale parse (a
+            // Attach and publish happen in one `install_parse` under the
+            // entry guard, so a legacy-store reader woken by the publish
+            // always finds the tree already attached. Text + language +
+            // incarnation are checked atomically under that guard: text
+            // rejects a within-lifetime stale parse (a
             // `didChange` landed mid-parse); language rejects a reopen that
             // relabelled the URI; incarnation rejects a same-language,
             // identical-text reopen — the tree belongs to the prior lifetime

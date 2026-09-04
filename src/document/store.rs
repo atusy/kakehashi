@@ -150,8 +150,8 @@ impl DocumentStore {
     /// Unlike [`update_tree_availability`] this does **not** create the entry
     /// (`get`, not `parse_sender`'s get-or-insert). For a live document the entry
     /// always exists (created on insert), so this is equivalent; but for the
-    /// non-inserting reader CAS it avoids resurrecting a parse-state for a URI that
-    /// a concurrent `didClose` removed — `remove` drops `parse_states` first, so a
+    /// non-inserting `install_parse` (which may run after a `didClose`) it avoids
+    /// resurrecting a parse-state for a URI that a concurrent `didClose` removed — `remove` drops `parse_states` first, so a
     /// get-or-insert here would recreate a ghost `has_tree = true` for a closed
     /// document. Holding the `Ref` serializes against that `remove`.
     fn mark_tree_available_if_tracked(&self, uri: &Url) {
@@ -712,7 +712,10 @@ impl DocumentStore {
     /// Install a parse result: attach its tree (and language) to the legacy
     /// document iff `expected` still describes the document, and publish
     /// `snapshot` iff the cell admits it — both under the document's entry
-    /// lock, as the one way a parse reaches readers.
+    /// lock, as the one way a parse reaches readers. The `parse_states`
+    /// `has_tree` flip runs after that guard is released (a different map);
+    /// it is non-inserting, so a `didClose` between the two leaves no ghost
+    /// entry.
     ///
     /// The two writes share one `get_mut` guard, and the tree is attached
     /// only when the snapshot was admitted, so no reader can observe a tree
