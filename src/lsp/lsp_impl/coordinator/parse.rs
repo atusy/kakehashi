@@ -417,9 +417,10 @@ impl ParseCoordinator {
     /// calling this, so the parse re-reads that stored text (a cheap `Arc<str>`
     /// refcount bump, [`text_arc`](crate::document::Document::text_arc)) rather than
     /// carrying a second owned `String`, and records the detected language + tree
-    /// **in place** via the non-inserting, text + incarnation CAS
-    /// [`set_parse_result_if_text_and_incarnation_unchanged`] instead of re-inserting a
-    /// fresh copy of the text. Net: zero full-document text copies in the open parse.
+    /// **in place** through the non-inserting, text + incarnation guarded
+    /// [`install_parse`](crate::document::DocumentStore::install_parse) instead of
+    /// re-inserting a fresh copy of the text. Net: zero full-document text copies
+    /// in the open parse.
     /// That store write is **non-inserting** and lifetime-guarded, so it is
     /// resurrection-safe and stale-safe once the open parse moves off the ingress
     /// ticket: a `didClose` racing it stays closed, and a `didChange` / reopen landing
@@ -533,23 +534,6 @@ impl ParseCoordinator {
             };
 
             if let Some(tree) = parsed_tree {
-                // Legacy tree CAS BEFORE the snapshot publish: a legacy-store
-                // reader woken by the publish (the explicit-action waiters
-                // read `doc.snapshot()` after `wait_for_current_snapshot`)
-                // must find the tree already attached — publish-first opened
-                // a window where the cell said Current while the legacy store
-                // was still tree-less, silently no-opping a user-triggered
-                // formatting. The CAS is non-inserting (text + incarnation
-                // checked), so a tree parsed from open-time text/lifetime is
-                // dropped when a `didChange` moved the text on or a
-                // `didClose`/reopen changed the incarnation — the publish
-                // below still lands in that case (stale-but-consistent is
-                // exactly what serve-stale readers consume; the cell guard
-                // independently rejects out-of-order versions). Only populate
-                // the injection caches when the tree actually landed, so a
-                // `didClose` racing this off-ingress parse can't leave stale
-                // injection entries for a gone document. (`Tree` clone is a
-                // cheap refcount bump.)
                 // Populate BEFORE the install so the derived discovery rides
                 // the snapshot (ADR §3 don't-discover-twice); populate guards
                 // itself against a pass whose text or lifetime moved on (the
@@ -676,11 +660,10 @@ impl ParseCoordinator {
     ///
     /// - re-reads the **latest** store text rather than the open-time text (a
     ///   `didChange` may have landed while the install ran), and
-    /// - persists through the **non-inserting**, tree-absent `attach_tree_if_absent`
-    ///   CAS, so a `didClose` during the install leaves the document gone instead
-    ///   of resurrecting it (the install/parse resurrection vector the actor ADR
-    ///   calls out), and a `didChange` between the read and the write drops the
-    ///   now-stale tree.
+    /// - persists through the **non-inserting** `install_parse`, so a `didClose`
+    ///   during the install leaves the document gone instead of resurrecting it
+    ///   (the install/parse resurrection vector the actor ADR calls out), and a
+    ///   `didChange` between the read and the write drops the now-stale tree.
     ///
     /// No watermark advance: the originating `didOpen`'s skip-parse branch already
     /// resolved that ticket's watermark, and this reparse carries no ticket.
@@ -891,9 +874,9 @@ impl ParseCoordinator {
     /// it runs in a spawned loop, *not* on the writer ticket. When the edit stashed a
     /// `pending_seed` (the pre-edit tree with this edit's `InputEdit`s applied) the
     /// parse is **incremental**, seeded from it; a full-text sync stashes no seed and
-    /// parses from scratch (which keeps #348 closed). The tree write
-    /// is the non-inserting text **and language** CAS
-    /// [`update_tree_if_text_and_language_unchanged`]: a closed (Vacant) document is
+    /// parses from scratch (which keeps #348 closed). The tree write is the
+    /// non-inserting, text **and language** guarded
+    /// [`install_parse`](crate::document::DocumentStore::install_parse): a closed (Vacant) document is
     /// left gone (resurrection-safe), a text that moved on (a `didChange` landed
     /// while parsing) is dropped — the scheduler's `dirty` loop then reparses the
     /// newer text — and a reopen that changed the language is rejected (no

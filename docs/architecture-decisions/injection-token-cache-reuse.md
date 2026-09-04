@@ -238,10 +238,11 @@ preference order:
   from one atomic snapshot — physically one unit, so there is **no reader-side gate
   to get wrong**: a snapshot carries discovery (reuse) or does not (the
   on-demand-parse fallback tree → discover inline). The only gate is on the
-  *writer* side — the second CAS below that attaches discovery only to the tree it
-  was built for. Realizability, given `populate_injections` runs *after* the
-  tree CAS (`set_parse_result_if_text_and_incarnation_unchanged`, defined in
-  `src/document/store.rs` and invoked from `src/lsp/lsp_impl/coordinator/parse.rs`):
+  *writer* side — the install below attaches discovery only to the tree it
+  was built for. Realizability, given `populate_injections` runs *before* the
+  install (`DocumentStore::install_parse`, invoked from
+  `src/lsp/lsp_impl/coordinator/parse.rs`) on the tree value, guarding its own
+  cache commits by the tracker's epoch and the lifetime:
   - **No *new* `NodeTracker` mutation.** `populate_injections` *already* calls
     `tracker.get_or_create` today, to mint the `region_id` on each
     `CacheableInjectionRegion` it inserts into the `InjectionMap` (which
