@@ -40,7 +40,7 @@ mod telemetry;
 pub(crate) mod test_logging;
 mod text_document;
 pub(crate) use text_document::{
-    merge_semantic_token_layers, transform_semantic_tokens_result_to_host,
+    merge_semantic_token_layers, transform_semantic_tokens_result_to_host_strict,
 };
 mod window;
 mod workspace;

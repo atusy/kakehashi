@@ -25,6 +25,9 @@ impl Kakehashi {
             None,
             None,
             None,
+            None,
+            None,
+            None,
             false,
             false,
             false,
@@ -46,8 +49,8 @@ impl Kakehashi {
                     .await?;
                 Ok((!colors.is_empty()).then_some(colors))
             },
-            parse_host_verbatim::<Vec<ColorInformation>>,
-            |won| Some(won.items),
+            |value| Ok(parse_host_verbatim::<Vec<ColorInformation>>(value)),
+            |won| Ok(Some(won.items)),
             |mut acc, next| {
                 acc.extend(next);
                 acc

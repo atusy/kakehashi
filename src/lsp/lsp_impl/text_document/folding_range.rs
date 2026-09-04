@@ -21,6 +21,9 @@ impl Kakehashi {
             None,
             None,
             None,
+            None,
+            None,
+            None,
             false,
             false,
             false,
@@ -40,8 +43,8 @@ impl Kakehashi {
                     )
                     .await
             },
-            parse_host_verbatim::<Vec<FoldingRange>>,
-            |won| Some(won.items),
+            |value| Ok(parse_host_verbatim::<Vec<FoldingRange>>(value)),
+            |won| Ok(Some(won.items)),
             |mut acc, next| {
                 acc.extend(next);
                 acc

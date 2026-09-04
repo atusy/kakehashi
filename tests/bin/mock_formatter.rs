@@ -372,7 +372,8 @@ fn main() {
                     }),
                     "semantic-tokens-full-virt"
                     | "semantic-tokens-full-delayed"
-                    | "semantic-tokens-full-marker" => json!({
+                    | "semantic-tokens-full-marker"
+                    | "semantic-tokens-full-changing" => json!({
                         "semanticTokensProvider": {
                             "legend": {
                                 "tokenTypes": ["custom", "variable"],
@@ -1755,6 +1756,10 @@ fn main() {
                             (8, 1)
                         } else if mode == "semantic-tokens-full-host-invalid" {
                             (8, 0)
+                        } else if mode == "semantic-tokens-full-changing"
+                            && text.contains("changed")
+                        {
+                            (7, 1)
                         } else {
                             (4, 1)
                         };

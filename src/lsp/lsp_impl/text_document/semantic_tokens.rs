@@ -18,9 +18,9 @@
 
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
-    NumberOrString, Position, Range, SemanticTokens, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult,
+    NumberOrString, Position, Range, SemanticToken, SemanticTokens, SemanticTokensDelta,
+    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
 };
 use url::Url;
 
@@ -42,6 +42,26 @@ use crate::lsp::bridge::{HostDocument, RegionOffset, host_position_within_region
 use crate::lsp::current_upstream_id;
 
 use super::super::{Kakehashi, uri_to_url};
+
+#[cfg(feature = "e2e")]
+async fn wait_for_semantic_delta_commit_release() {
+    let Ok(dir) = std::env::var("KAKEHASHI_E2E_SEMANTIC_DELTA_COMMIT_BARRIER_DIR") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir);
+    if std::fs::create_dir_all(dir).is_err()
+        || std::fs::write(dir.join("captured"), b"captured").is_err()
+    {
+        return;
+    }
+    let release = dir.join("release");
+    for _ in 0..300 {
+        if release.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
 
 /// Outcome of the serve-current snapshot resolution for the whole-document
 /// token handlers (see [`Kakehashi::current_snapshot_for_tokens`]).
@@ -70,29 +90,19 @@ pub(crate) enum TokenSnapshot {
     Superseded,
 }
 
-/// The delta handler's "current" tokens, either reused from the cache (an
-/// `Arc`, no deep copy yet) or freshly computed (already owned). Comparison
-/// against the previous baseline only needs a reference — [`as_ref`](Self::as_ref)
-/// — so the cache-hit case never clones unless a match arm downstream
-/// actually needs to store the value ([`into_owned`](Self::into_owned)),
-/// which a no-op/empty-edits delta never does.
-enum CurrentTokens {
-    Cached(std::sync::Arc<SemanticTokens>),
-    Owned(SemanticTokens),
-}
-
 struct NativeSemanticLayer {
     tokens: SemanticTokens,
     snapshot: Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
-    request_guard: SemanticFullRequestGuard,
+    request_guard: SemanticRequestGuard,
     generation: u64,
+    pending_native: Option<PendingNativeBaseline>,
 }
 
 impl NativeSemanticLayer {
     fn new(
         tokens: SemanticTokens,
         snapshot: Option<std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
-        request_guard: SemanticFullRequestGuard,
+        request_guard: SemanticRequestGuard,
         generation: u64,
     ) -> Self {
         Self {
@@ -100,14 +110,159 @@ impl NativeSemanticLayer {
             snapshot,
             request_guard,
             generation,
+            pending_native: None,
+        }
+    }
+
+    fn with_pending_native(mut self, pending_native: Option<PendingNativeBaseline>) -> Self {
+        self.pending_native = pending_native;
+        self
+    }
+}
+
+struct PendingNativeBaseline {
+    uri: Url,
+    tokens: SemanticTokens,
+    language: String,
+    cache_key: u64,
+    snapshot: SemanticSnapshotIdentity,
+    served_version: u64,
+}
+
+impl PendingNativeBaseline {
+    fn commit(self, cache: &crate::lsp::cache::CacheCoordinator) {
+        cache.store_tokens(
+            self.uri.clone(),
+            self.tokens,
+            self.language,
+            self.cache_key,
+            self.snapshot,
+        );
+        cache.record_served_semantic_version(&self.uri, self.served_version);
+    }
+}
+
+struct PendingWireBaseline {
+    uri: Url,
+    tokens: SemanticTokens,
+    language: String,
+    cache_key: u64,
+    snapshot: SemanticSnapshotIdentity,
+}
+
+impl PendingWireBaseline {
+    fn commit(self, cache: &crate::lsp::cache::CacheCoordinator) {
+        cache.store_wire_tokens(
+            self.uri,
+            self.tokens,
+            self.language,
+            self.cache_key,
+            self.snapshot,
+        );
+    }
+}
+
+struct SemanticFullComputation {
+    result: SemanticTokensResult,
+    pending_native: Option<PendingNativeBaseline>,
+    pending_wire: Option<PendingWireBaseline>,
+    identity: (u64, u64),
+    generation: u64,
+    settings_generation: u64,
+    snapshot_present: bool,
+    snapshot_tree_present: Option<bool>,
+}
+
+struct SemanticDeltaComputation {
+    result: SemanticTokensFullDeltaResult,
+    pending_native: Option<PendingNativeBaseline>,
+    pending_wire: Option<PendingWireBaseline>,
+    identity: (u64, u64),
+    generation: u64,
+    settings_generation: u64,
+    snapshot_present: bool,
+    snapshot_tree_present: Option<bool>,
+}
+
+fn semantic_snapshot_state_advanced(initial: Option<bool>, current: Option<bool>) -> bool {
+    matches!(
+        (initial, current),
+        (None, Some(_)) | (Some(false), Some(true))
+    )
+}
+
+struct VirtualBridgeSelectionGuard {
+    local_selected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    selected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    activity: std::sync::Arc<super::super::whole_document::WholeDocumentBridgeActivity>,
+    unit: Option<String>,
+}
+
+impl VirtualBridgeSelectionGuard {
+    fn propagate(&mut self) {
+        if self
+            .local_selected
+            .load(std::sync::atomic::Ordering::Acquire)
+            && let Some(unit) = self.unit.take()
+        {
+            self.selected
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.activity.mark_selected(unit);
         }
     }
 }
 
-/// Owns a full request's tracker entry until the complete native + bridge
-/// pipeline finishes. Async cancellation drops the handler future, so explicit
-/// cleanup branches alone cannot reclaim an already-started blocking compute.
-struct SemanticFullRequestGuard {
+impl Drop for VirtualBridgeSelectionGuard {
+    fn drop(&mut self) {
+        self.propagate();
+    }
+}
+
+fn should_publish_empty_non_native_result(
+    non_native_only: bool,
+    bridge_work_selected: bool,
+    bridge_succeeded: bool,
+) -> bool {
+    non_native_only && (bridge_succeeded || !bridge_work_selected)
+}
+
+fn parse_host_semantic_tokens_result(
+    value: serde_json::Value,
+) -> std::io::Result<Option<Vec<SemanticToken>>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value::<SemanticTokensResult>(value)
+        .map(|result| match result {
+            SemanticTokensResult::Tokens(tokens) => tokens.data,
+            SemanticTokensResult::Partial(partial) => partial.data,
+        })
+        .map(Some)
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid host semantic token result: {error}"),
+            )
+        })
+}
+
+fn commit_full_baselines(
+    cache: &crate::lsp::cache::CacheCoordinator,
+    computed: &mut SemanticFullComputation,
+) {
+    if let Some(pending) = computed.pending_native.take() {
+        pending.commit(cache);
+    }
+    if let Some(pending) = computed.pending_wire.take() {
+        pending.commit(cache);
+    }
+}
+
+/// Owns a semantic request's tracker entry through its complete native + bridge
+/// pipeline. Async cancellation drops the handler future, so explicit cleanup
+/// branches alone cannot reclaim an already-started blocking compute. A nested
+/// full computation can borrow the delta request's entry with an unarmed guard.
+struct SemanticRequestGuard {
     cache: std::sync::Arc<crate::lsp::cache::CacheCoordinator>,
     uri: Url,
     request_id: u64,
@@ -115,7 +270,7 @@ struct SemanticFullRequestGuard {
     armed: bool,
 }
 
-impl SemanticFullRequestGuard {
+impl SemanticRequestGuard {
     fn new(
         cache: std::sync::Arc<crate::lsp::cache::CacheCoordinator>,
         uri: Url,
@@ -140,7 +295,7 @@ impl SemanticFullRequestGuard {
     }
 }
 
-impl Drop for SemanticFullRequestGuard {
+impl Drop for SemanticRequestGuard {
     fn drop(&mut self) {
         if self.armed {
             self.cancel_token.cancel();
@@ -178,39 +333,67 @@ impl Drop for SemanticComputeCancelGuard {
     }
 }
 
-impl CurrentTokens {
-    fn from_result(result: SemanticTokensResult) -> Self {
-        match result {
-            SemanticTokensResult::Tokens(tokens) => Self::Owned(tokens),
-            SemanticTokensResult::Partial(_) => Self::Owned(SemanticTokens {
-                result_id: None,
-                data: Vec::new(),
-            }),
-        }
-    }
-
-    fn as_ref(&self) -> &SemanticTokens {
-        match self {
-            Self::Cached(arc) => arc,
-            Self::Owned(tokens) => tokens,
-        }
-    }
-
-    fn into_owned(self) -> SemanticTokens {
-        match self {
-            // The cache entry may have been overwritten or evicted between
-            // this handle being taken and here, leaving this the sole
-            // strong ref — in that case the data is already effectively
-            // ours, and `try_unwrap` reclaims it instead of cloning.
-            Self::Cached(arc) => {
-                std::sync::Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone())
-            }
-            Self::Owned(tokens) => tokens,
-        }
-    }
-}
-
 impl Kakehashi {
+    fn semantic_computation_snapshot_state(
+        &self,
+        uri: &Url,
+        resolved_snapshot: Option<&std::sync::Arc<crate::document::snapshot::ParseSnapshot>>,
+        require_snapshot: bool,
+    ) -> (bool, Option<bool>) {
+        let live = self.documents.latest_snapshot(uri);
+        let snapshot_present = live
+            .as_ref()
+            .is_some_and(|view| view.slot.snapshot.is_some());
+        let tree_present = if require_snapshot {
+            resolved_snapshot.map(|snapshot| snapshot.tree.is_some())
+        } else {
+            live.as_ref()
+                .and_then(|view| view.slot.snapshot.as_ref())
+                .map(|snapshot| snapshot.tree.is_some())
+        };
+        (snapshot_present, tree_present)
+    }
+
+    fn semantic_full_computation_is_current(
+        &self,
+        uri: &Url,
+        computed: &SemanticFullComputation,
+    ) -> bool {
+        self.settings_manager.settings_generation() == computed.settings_generation
+            && self.cache.semantic_token_generation() == computed.generation
+            && self.documents.latest_snapshot(uri).is_some_and(|view| {
+                view.slot.current_incarnation == computed.identity.0
+                    && view.content_version == computed.identity.1
+                    && view.slot.snapshot.is_some() == computed.snapshot_present
+                    && view
+                        .slot
+                        .snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.tree.is_some())
+                        == computed.snapshot_tree_present
+            })
+    }
+
+    fn semantic_delta_computation_is_current(
+        &self,
+        uri: &Url,
+        computed: &SemanticDeltaComputation,
+    ) -> bool {
+        self.settings_manager.settings_generation() == computed.settings_generation
+            && self.cache.semantic_token_generation() == computed.generation
+            && self.documents.latest_snapshot(uri).is_some_and(|view| {
+                view.slot.current_incarnation == computed.identity.0
+                    && view.content_version == computed.identity.1
+                    && view.slot.snapshot.is_some() == computed.snapshot_present
+                    && view
+                        .slot
+                        .snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.tree.is_some())
+                        == computed.snapshot_tree_present
+            })
+    }
+
     fn semantic_snapshot_is_current(
         &self,
         uri: &Url,
@@ -372,72 +555,110 @@ impl Kakehashi {
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
-        self.semantic_tokens_full_impl_with_tracking(params, None)
-            .await
+        Ok(self
+            .semantic_tokens_full_impl_with_tracking(params, None)
+            .await?
+            .map(|computed| computed.result))
     }
 
     async fn semantic_tokens_full_impl_with_tracking(
         &self,
         params: SemanticTokensParams,
         tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
-    ) -> Result<Option<SemanticTokensResult>> {
+    ) -> Result<Option<SemanticFullComputation>> {
         let Ok(uri) = uri_to_url(&params.text_document.uri) else {
             return Ok(None);
         };
-        let owns_tracking = tracking.is_none();
+        let direct_request = tracking.is_none();
         let (request_id, cancel_token) = tracking.unwrap_or_else(|| self.cache.start_request(&uri));
-        let mut request_guard = SemanticFullRequestGuard::new(
+        let mut request_guard = SemanticRequestGuard::new(
             std::sync::Arc::clone(&self.cache),
             uri.clone(),
             request_id,
             cancel_token.clone(),
-            owns_tracking,
+            direct_request,
         );
         let tracking = Some((request_id, cancel_token));
-        let absent_identity = self.documents.latest_snapshot(&uri).and_then(|view| {
-            view.slot.snapshot.is_none().then_some((
+        let mut observed_snapshot = self.documents.latest_snapshot(&uri).and_then(|view| {
+            let tree_present = view
+                .slot
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.tree.is_some());
+            (tree_present != Some(true)).then_some((
                 view.slot.current_incarnation,
                 view.content_version,
                 self.cache.semantic_token_generation(),
+                tree_present,
             ))
         });
-        let retry_params = params.clone();
-        let retry_tracking = tracking.clone();
-        let outcome = self
-            .semantic_tokens_full_impl_with_tracking_once(params, tracking)
-            .await?;
-        if outcome.is_some() {
-            request_guard.finish();
-            return Ok(outcome);
-        }
-        let retry_after_snapshot_publication =
-            absent_identity.is_some_and(|(incarnation, content_version, generation)| {
-                self.cache.semantic_token_generation() == generation
-                    && self.documents.latest_snapshot(&uri).is_some_and(|view| {
-                        view.slot.current_incarnation == incarnation
+        loop {
+            let outcome = self
+                .semantic_tokens_full_impl_with_tracking_once(
+                    params.clone(),
+                    tracking.clone(),
+                    direct_request,
+                )
+                .await;
+            let retryable_outcome = match outcome {
+                Ok(Some(outcome)) => {
+                    request_guard.finish();
+                    return Ok(Some(outcome));
+                }
+                Ok(None) => Ok(None),
+                Err(error) if error.code == crate::error::content_modified_error().code => {
+                    Err(error)
+                }
+                Err(error) => {
+                    request_guard.finish();
+                    return Err(error);
+                }
+            };
+            let next_snapshot = observed_snapshot.and_then(
+                |(incarnation, content_version, generation, previous_tree_present)| {
+                    if self.cache.semantic_token_generation() != generation
+                        || !tracking.as_ref().is_some_and(|(request_id, cancel)| {
+                            !cancel.is_cancelled()
+                                && self.cache.is_request_active(&uri, *request_id)
+                        })
+                    {
+                        return None;
+                    }
+                    self.documents.latest_snapshot(&uri).and_then(|view| {
+                        let current_tree_present = view
+                            .slot
+                            .snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.tree.is_some());
+                        (view.slot.current_incarnation == incarnation
                             && view.content_version == content_version
-                            && view.slot.snapshot.is_some()
+                            && semantic_snapshot_state_advanced(
+                                previous_tree_present,
+                                current_tree_present,
+                            ))
+                        .then_some((
+                            incarnation,
+                            content_version,
+                            generation,
+                            current_tree_present,
+                        ))
                     })
-                    && retry_tracking.as_ref().is_some_and(|(request_id, cancel)| {
-                        !cancel.is_cancelled() && self.cache.is_request_active(&uri, *request_id)
-                    })
-            });
-        if !retry_after_snapshot_publication {
-            request_guard.finish();
-            return Ok(None);
+                },
+            );
+            let Some(next_snapshot) = next_snapshot else {
+                request_guard.finish();
+                return retryable_outcome;
+            };
+            observed_snapshot = Some(next_snapshot);
         }
-        let outcome = self
-            .semantic_tokens_full_impl_with_tracking_once(retry_params, retry_tracking)
-            .await;
-        request_guard.finish();
-        outcome
     }
 
     async fn semantic_tokens_full_impl_with_tracking_once(
         &self,
         params: SemanticTokensParams,
         tracking: Option<(crate::lsp::cache::RequestId, crate::cancel::CancelToken)>,
-    ) -> Result<Option<SemanticTokensResult>> {
+        direct_request: bool,
+    ) -> Result<Option<SemanticFullComputation>> {
         const METHOD: &str = "textDocument/semanticTokens/full";
         let lsp_uri = params.text_document.uri.clone();
         let Ok(uri) = uri_to_url(&lsp_uri) else {
@@ -449,6 +670,9 @@ impl Kakehashi {
         let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let supersession = tracking.as_ref().map(|(_, cancel)| cancel.clone());
         let settings_generation = self.settings_manager.settings_generation();
+        let layer_config = self
+            .document_language(&uri)
+            .map(|language| self.resolve_layer_config(&language, METHOD));
         let native_enabled = self.semantic_tokens_full_includes_native(&uri);
         let document_language = self.document_language(&uri);
         let virtual_enabled = document_language.as_ref().is_some_and(|language| {
@@ -485,6 +709,9 @@ impl Kakehashi {
         } else {
             false
         };
+        let non_native_only = layer_config.as_ref().is_some_and(|layers| {
+            !layers.priorities.is_empty() && !layers.allows(LayerSource::Native)
+        });
         // Establish the serve-current native baseline first. Besides providing
         // immediate syntax coverage, this preserves the existing park,
         // supersession, and cancellation contract. A current snapshot makes
@@ -492,13 +719,14 @@ impl Kakehashi {
         // backstop expires instead, the no-snapshot path carries the live
         // incarnation/content version through fan-out and revalidates that
         // identity before returning.
+        let require_snapshot = native_enabled || actionable_virtual;
         let Some(native_layer) = self
             .semantic_tokens_full_native_layer(
                 params,
                 &mut cancel_rx,
                 tracking,
                 native_enabled,
-                native_enabled || actionable_virtual,
+                require_snapshot,
             )
             .await?
         else {
@@ -510,6 +738,7 @@ impl Kakehashi {
         let generation = native_layer.generation;
         let native_tokens = native_layer.tokens;
         let snapshot = native_layer.snapshot;
+        let pending_native = native_layer.pending_native;
         if actionable_virtual
             && snapshot
                 .as_ref()
@@ -527,17 +756,22 @@ impl Kakehashi {
             request_guard.finish();
             return Err(crate::error::content_modified_error());
         }
-        let Some(live_identity) = self
-            .documents
-            .get(&uri)
-            .map(|document| (document.incarnation(), document.content_version()))
+        let (live_snapshot_present, snapshot_tree_present) =
+            self.semantic_computation_snapshot_state(&uri, snapshot.as_ref(), require_snapshot);
+        let Some((live_identity, live_text, live_language)) =
+            self.documents.get(&uri).map(|document| {
+                (
+                    (document.incarnation(), document.content_version()),
+                    document.text_arc(),
+                    document.language_id().unwrap_or_default().to_string(),
+                )
+            })
         else {
             request_guard.finish();
             return Ok(None);
         };
         let native_result_id = native_tokens.result_id.clone();
         let native_data = native_tokens.data;
-        let native_data_for_comparison = native_data.clone();
         let expected = Some(snapshot.as_ref().map_or_else(
             || super::super::whole_document::WholeDocumentSnapshotIdentity {
                 incarnation: live_identity.0,
@@ -554,6 +788,12 @@ impl Kakehashi {
         let native = std::future::ready(Ok(Some(native_data)));
         let bridge_attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let virt_bridge_attempted = std::sync::Arc::clone(&bridge_attempted);
+        let bridge_succeeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bridge_work_selected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let virt_bridge_work_selected = std::sync::Arc::clone(&bridge_work_selected);
+        let bridge_activity =
+            std::sync::Arc::new(super::super::whole_document::WholeDocumentBridgeActivity::new());
+        let virt_bridge_activity = std::sync::Arc::clone(&bridge_activity);
 
         let fan_out = async {
             let data = self
@@ -564,6 +804,9 @@ impl Kakehashi {
                     progress_token,
                     expected,
                     Some(std::sync::Arc::clone(&bridge_attempted)),
+                    Some(std::sync::Arc::clone(&bridge_succeeded)),
+                    Some(std::sync::Arc::clone(&bridge_work_selected)),
+                    Some(std::sync::Arc::clone(&bridge_activity)),
                     true,
                     true,
                     true,
@@ -571,9 +814,23 @@ impl Kakehashi {
                     native,
                     move |task| {
                         let attempted = std::sync::Arc::clone(&virt_bridge_attempted);
+                        let selected = std::sync::Arc::clone(&virt_bridge_work_selected);
+                        let activity = std::sync::Arc::clone(&virt_bridge_activity);
                         async move {
+                            let unit = format!("virt:{}", task.region_id);
                             let region_end = task.region_end();
-                            task.pool
+                            let local_attempted =
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let local_selected =
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let mut selection_guard = VirtualBridgeSelectionGuard {
+                                local_selected: std::sync::Arc::clone(&local_selected),
+                                selected,
+                                activity: std::sync::Arc::clone(&activity),
+                                unit: Some(unit.clone()),
+                            };
+                            let result = task
+                                .pool
                                 .send_semantic_tokens_full_request(
                                     &task.server_name,
                                     &task.server_config,
@@ -586,45 +843,80 @@ impl Kakehashi {
                                     task.upstream_id,
                                     task.client_progress_token,
                                     expected_incarnation,
-                                    Some(attempted),
+                                    Some(std::sync::Arc::clone(&local_attempted)),
+                                    Some(std::sync::Arc::clone(&local_selected)),
                                 )
-                                .await
-                                .map(|tokens| tokens.map(|tokens| tokens.data))
+                                .await;
+                            selection_guard.propagate();
+                            let was_attempted =
+                                local_attempted.load(std::sync::atomic::Ordering::Acquire);
+                            if was_attempted {
+                                attempted.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                            result.map(|tokens| tokens.map(|tokens| tokens.data))
                         }
                     },
-                    |value| {
-                        serde_json::from_value::<SemanticTokensResult>(value)
-                            .ok()
-                            .map(|result| match result {
-                                SemanticTokensResult::Tokens(tokens) => tokens.data,
-                                SemanticTokensResult::Partial(partial) => partial.data,
-                            })
-                    },
+                    parse_host_semantic_tokens_result,
                     |won| {
-                        let legend = won.handle.semantic_tokens_legend()?;
+                        let legend = won.handle.semantic_tokens_legend().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "missing host semantic token legend",
+                            )
+                        })?;
                         let mapper = crate::text::PositionMapper::new(&won.host_text);
-                        let document_end = mapper.byte_to_position(won.host_text.len())?;
-                        crate::lsp::bridge::transform_semantic_tokens_result_to_host(
+                        let document_end = mapper
+                            .byte_to_position(won.host_text.len())
+                            .ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "invalid host document end",
+                                )
+                            })?;
+                        crate::lsp::bridge::transform_semantic_tokens_result_to_host_strict(
                             serde_json::to_value(SemanticTokens {
                                 result_id: None,
                                 data: won.items,
                             })
-                            .ok()?,
+                            .map_err(std::io::Error::other)?,
                             legend,
                             &RegionOffset::new(0, 0),
                             document_end,
                             &won.host_text,
                             Range::new(Position::new(0, 0), document_end),
                         )
-                        .map(|tokens| tokens.data)
+                        .map(|tokens| Some(tokens.data))
                     },
                     crate::lsp::bridge::merge_semantic_token_layers,
                     crate::lsp::bridge::merge_semantic_token_layers,
                 )
                 .await?;
 
-            let Some(data) = data else {
+            let bridge_work_selected = bridge_activity.has_selected();
+            let bridge_is_authoritative = bridge_activity.is_authoritative();
+            let bridge_succeeded = bridge_work_selected && bridge_is_authoritative;
+            if !bridge_is_authoritative {
+                // Native data is only a partial overlay when a selected bridge
+                // producer failed. Preserve the previous merged wire baseline
+                // instead of publishing that incomplete result.
                 return Ok(None);
+            }
+            let data = match data {
+                Some(data) => data,
+                None if should_publish_empty_non_native_result(
+                    non_native_only,
+                    bridge_work_selected,
+                    bridge_succeeded,
+                ) =>
+                {
+                    // A selected non-native overlay recomputed to no tokens:
+                    // either its server returned null/empty, or the document has
+                    // no eligible non-native work left. Keep an empty wire lineage
+                    // so delta deletes the previous downstream classifications.
+                    bridge_attempted.store(true, std::sync::atomic::Ordering::Release);
+                    Vec::new()
+                }
+                None => return Ok(None),
             };
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;
@@ -642,20 +934,46 @@ impl Kakehashi {
                 return Ok(None);
             }
 
-            // The native cache remains a pure parser baseline. A bridged full
-            // result deliberately has no resultId until the delta handler owns
-            // a distinct merged-wire baseline; otherwise a later native cache
-            // hit would resurrect downstream tokens that a server removed.
-            let result_id = (!bridge_attempted.load(std::sync::atomic::Ordering::Acquire)
-                && data == native_data_for_comparison)
-                .then_some(native_result_id)
-                .flatten();
-            Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-                result_id,
-                data,
-            })))
+            let bridge_attempted = bridge_attempted.load(std::sync::atomic::Ordering::Acquire);
+            let result_id = if bridge_attempted {
+                Some(next_result_id())
+            } else {
+                native_result_id
+            };
+            let tokens = SemanticTokens { result_id, data };
+            let pending_wire = bridge_attempted.then(|| PendingWireBaseline {
+                uri: uri.clone(),
+                tokens: tokens.clone(),
+                language: snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.language.clone())
+                    .unwrap_or(live_language),
+                cache_key: self.cache.cache_key_for(&live_text, generation),
+                snapshot: snapshot.as_ref().map_or(
+                    SemanticSnapshotIdentity {
+                        parsed_version: live_identity.1,
+                        incarnation: live_identity.0,
+                        generation,
+                    },
+                    |snapshot| SemanticSnapshotIdentity {
+                        parsed_version: snapshot.parsed_version,
+                        incarnation: snapshot.incarnation,
+                        generation,
+                    },
+                ),
+            });
+            Ok(Some(SemanticFullComputation {
+                result: SemanticTokensResult::Tokens(tokens),
+                pending_native,
+                pending_wire,
+                identity: live_identity,
+                generation,
+                settings_generation,
+                snapshot_present: live_snapshot_present,
+                snapshot_tree_present,
+            }))
         };
-        let outcome = match cancel_rx.as_mut() {
+        let mut outcome = match cancel_rx.as_mut() {
             Some(cancel_rx) => {
                 tokio::select! {
                     biased;
@@ -675,6 +993,52 @@ impl Kakehashi {
                 }
             }
         };
+        // The biased select above accepts the response before publication. A
+        // direct request then reacquires the document edit lock and holds it
+        // through the tracker-gated cache writes, so neither cancellation nor
+        // didChange can publish a baseline the client never receives.
+        if direct_request && matches!(outcome, Ok(Some(_))) {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let lock = edit_lock.lock();
+            let commit_guard = match cancel_rx.as_mut() {
+                Some(cancel_rx) => tokio::select! {
+                    biased;
+                    _ = cancel_rx => {
+                        cancel_token.cancel();
+                        outcome = Err(Error::request_cancelled());
+                        None
+                    }
+                    _ = cancel_token.cancelled() => {
+                        outcome = Ok(None);
+                        None
+                    }
+                    guard = lock => Some(guard),
+                },
+                None => tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        outcome = Ok(None);
+                        None
+                    }
+                    guard = lock => Some(guard),
+                },
+            };
+            if commit_guard.is_some()
+                && let Ok(Some(computed)) = &mut outcome
+            {
+                let current = self.semantic_full_computation_is_current(&uri, computed);
+                if !current
+                    || self
+                        .cache
+                        .with_active_request(&uri, request_id, || {
+                            commit_full_baselines(&self.cache, computed);
+                        })
+                        .is_none()
+                {
+                    outcome = Ok(None);
+                }
+            }
+        }
         request_guard.finish();
         outcome
     }
@@ -701,13 +1065,18 @@ impl Kakehashi {
         // superseded request stops mid-flight instead of running to completion.
         let owns_tracking = tracking.is_none();
         let (request_id, cancel_token) = tracking.unwrap_or_else(|| self.cache.start_request(&uri));
-        let request_guard = SemanticFullRequestGuard::new(
+        let request_guard = SemanticRequestGuard::new(
             std::sync::Arc::clone(&self.cache),
             uri.clone(),
             request_id,
             cancel_token.clone(),
             owns_tracking,
         );
+        let finish_if_owned = || {
+            if owns_tracking {
+                self.cache.finish_request(&uri, request_id);
+            }
+        };
 
         // Snapshot the settings generation NOW, before reading any
         // settings-dependent tokenization input (language resolution, queries,
@@ -774,12 +1143,12 @@ impl Kakehashi {
                 // document" and the client would stay dark until its next
                 // didChange-driven request.
                 self.cache.record_served_semantic_version(&uri, 0);
-                self.cache.finish_request(&uri, request_id);
+                finish_if_owned();
                 return Err(crate::error::content_modified_error());
             }
             TokenSnapshot::Cancelled => {
                 cancel_token.cancel();
-                self.cache.finish_request(&uri, request_id);
+                finish_if_owned();
                 log::debug!(
                     target: "kakehashi::semantic",
                     "[SEMANTIC_TOKENS] CANCELLED via $/cancelRequest uri={} req={} (while parked)",
@@ -790,7 +1159,7 @@ impl Kakehashi {
             TokenSnapshot::Superseded => {
                 // Same contract as a compute superseded mid-flight (below):
                 // the newer request answers; this one drops out quietly.
-                self.cache.finish_request(&uri, request_id);
+                finish_if_owned();
                 log::debug!(
                     target: "kakehashi::semantic",
                     "[SEMANTIC_TOKENS] CANCELLED uri={} req={} (superseded while parked)",
@@ -909,7 +1278,7 @@ impl Kakehashi {
                 &edit_lock,
             );
             if !still_current || !self.cache.is_request_active(&uri, request_id) {
-                self.cache.finish_request(&uri, request_id);
+                finish_if_owned();
                 return Ok(None);
             }
             self.cache
@@ -953,7 +1322,7 @@ impl Kakehashi {
                     &edit_lock,
                 );
                 if !still_current || !self.cache.is_request_active(&uri, request_id) {
-                    self.cache.finish_request(&uri, request_id);
+                    finish_if_owned();
                     return Ok(None);
                 }
                 self.cache
@@ -1019,7 +1388,7 @@ impl Kakehashi {
                     // instead of running to completion for a discarded result.
                     _ = &mut cancel_rx => {
                         cancel_token.cancel();
-                        self.cache.finish_request(&uri, request_id);
+                        finish_if_owned();
                         log::debug!(
                             target: "kakehashi::semantic",
                             "[SEMANTIC_TOKENS] CANCELLED via $/cancelRequest uri={} req={}",
@@ -1045,7 +1414,7 @@ impl Kakehashi {
         // the client's didChange-driven follow-up request supersedes and heals
         // (§4's narrowed CancelToken role).
         if cancel_token.is_cancelled() {
-            self.cache.finish_request(&uri, request_id);
+            finish_if_owned();
             log::debug!(
                 target: "kakehashi::semantic",
                 "[SEMANTIC_TOKENS] CANCELLED uri={} req={} (compute superseded)",
@@ -1093,23 +1462,34 @@ impl Kakehashi {
             &edit_lock,
         );
         if !still_current || !self.cache.is_request_active(&uri, request_id) {
-            self.cache.finish_request(&uri, request_id);
+            finish_if_owned();
             return Ok(None);
         }
-        // Store keyed by result_id (delta baseline) AND cache_key (so an
-        // unchanged-document repeat request short-circuits the re-tokenization
-        // above). `language_name` is unused after this, so move it in.
-        self.cache.store_tokens(
-            uri.clone(),
-            stored_tokens,
-            language_name,
-            cache_key,
-            snapshot_identity,
-        );
-
-        // Finish tracking this request
-        self.cache
-            .record_served_semantic_version(&uri, snapshot.parsed_version);
+        // A nested full borrows the outer delta's tracker. Keep its freshly
+        // minted native baseline private until that outer request passes its
+        // own lifecycle fence; otherwise a discarded delta can evict the last
+        // baseline actually held by the editor.
+        let pending_native = if owns_tracking {
+            self.cache.store_tokens(
+                uri.clone(),
+                stored_tokens,
+                language_name,
+                cache_key,
+                snapshot_identity,
+            );
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            None
+        } else {
+            Some(PendingNativeBaseline {
+                uri: uri.clone(),
+                tokens: stored_tokens,
+                language: language_name,
+                cache_key,
+                snapshot: snapshot_identity,
+                served_version: snapshot.parsed_version,
+            })
+        };
 
         log::debug!(
             target: "kakehashi::semantic",
@@ -1117,12 +1497,10 @@ impl Kakehashi {
             uri, request_id, lsp_tokens.data.len()
         );
 
-        Ok(Some(NativeSemanticLayer::new(
-            lsp_tokens,
-            Some(snapshot),
-            request_guard,
-            token_generation,
-        )))
+        Ok(Some(
+            NativeSemanticLayer::new(lsp_tokens, Some(snapshot), request_guard, token_generation)
+                .with_pending_native(pending_native),
+        ))
     }
 
     async fn semantic_delta_has_applicable_bridge(
@@ -1130,14 +1508,13 @@ impl Kakehashi {
         lsp_uri: &tower_lsp_server::ls_types::Uri,
         uri: &Url,
         snapshot: &crate::document::snapshot::ParseSnapshot,
-        bridge_language: &str,
-        parser_language: Option<&str>,
+        language_name: &str,
     ) -> bool {
         const METHOD: &str = "textDocument/semanticTokens/full";
         let settings = self.settings_manager.load_settings();
         let layers = super::super::bridge_context::resolve_layer_config_from_settings(
             &settings,
-            bridge_language,
+            language_name,
             METHOD,
         );
         if layers.priorities.contains(&LayerSource::Host)
@@ -1177,10 +1554,6 @@ impl Kakehashi {
         if !layers.priorities.contains(&LayerSource::Virt) {
             return false;
         }
-        let Some(parser_language) = parser_language else {
-            return false;
-        };
-
         let generation = self.cache.semantic_token_generation();
         let owned_regions;
         let regions = if let Some((stamped, regions)) = snapshot.resolved_regions.as_ref()
@@ -1190,7 +1563,7 @@ impl Kakehashi {
         } else {
             let (Some(tree), Some(query)) = (
                 snapshot.tree.as_ref(),
-                self.language.injection_query(parser_language),
+                self.language.injection_query(language_name),
             ) else {
                 return false;
             };
@@ -1212,12 +1585,9 @@ impl Kakehashi {
                 continue;
             }
             let configs = self
-                .bridge_configs_for_injection_language(bridge_language, &region.injection_language);
-            let agg = self.resolve_aggregation_config(
-                bridge_language,
-                &region.injection_language,
-                METHOD,
-            );
+                .bridge_configs_for_injection_language(language_name, &region.injection_language);
+            let agg =
+                self.resolve_aggregation_config(language_name, &region.injection_language, METHOD);
             let Ok(routing_uri) = url::Url::parse(
                 &crate::lsp::bridge::VirtualDocumentUri::new(
                     lsp_uri,
@@ -1252,8 +1622,7 @@ impl Kakehashi {
                 })
                 .map(|config| config.server_name.clone())
                 .collect::<std::collections::HashSet<_>>();
-            if semantic_region_selects_servers(
-                true,
+            if semantic_configs_select_servers(
                 &agg.priorities,
                 &configs,
                 agg.max_fan_out,
@@ -1347,8 +1716,7 @@ impl Kakehashi {
             }
         }
         plans.into_iter().any(|(configs, aggregation)| {
-            semantic_region_selects_servers(
-                true,
+            semantic_configs_select_servers(
                 &aggregation.priorities,
                 &configs,
                 aggregation.max_fan_out,
@@ -1358,63 +1726,107 @@ impl Kakehashi {
         })
     }
 
-    async fn semantic_tokens_delta_reenter_full(
+    pub(crate) async fn semantic_tokens_full_delta_impl(
         &self,
-        uri: &Url,
-        full_params: SemanticTokensParams,
-        request_id: crate::lsp::cache::RequestId,
-        cancel_token: crate::cancel::CancelToken,
-        cancel_rx: &mut Option<crate::lsp::request_id::CancelReceiver>,
+        params: SemanticTokensDeltaParams,
     ) -> Result<Option<SemanticTokensFullDeltaResult>> {
-        let full = self.semantic_tokens_full_impl_with_tracking(
-            full_params,
-            Some((request_id, cancel_token.clone())),
+        let Ok(uri) = uri_to_url(&params.text_document.uri) else {
+            log::warn!(
+                "Invalid URI in semanticTokens/full/delta: {}",
+                params.text_document.uri.as_str()
+            );
+            return Ok(None);
+        };
+        let upstream_id = current_upstream_id();
+        let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let (request_id, cancel_token) = self.cache.start_request(&uri);
+        let mut request_guard = SemanticRequestGuard::new(
+            std::sync::Arc::clone(&self.cache),
+            uri.clone(),
+            request_id,
+            cancel_token.clone(),
+            true,
         );
-        let result = match cancel_rx.as_mut() {
+        let request =
+            self.semantic_tokens_full_delta_tracked_impl(params, request_id, cancel_token.clone());
+        let mut outcome = match cancel_rx.as_mut() {
             Some(cancel_rx) => {
                 tokio::select! {
                     biased;
                     _ = cancel_rx => {
                         cancel_token.cancel();
-                        self.cache.finish_request(uri, request_id);
-                        return Err(Error::request_cancelled());
-                    },
-                    result = full => result,
+                        Err(Error::request_cancelled())
+                    }
+                    _ = cancel_token.cancelled() => Ok(None),
+                    result = request => result,
                 }
             }
-            None => full.await,
+            None => {
+                tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => Ok(None),
+                    result = request => result,
+                }
+            }
         };
-        self.cache.finish_request(uri, request_id);
-        result.map(|result| {
-            result.map(|result| match result {
-                SemanticTokensResult::Tokens(tokens) => {
-                    SemanticTokensFullDeltaResult::Tokens(tokens)
+        if matches!(outcome, Ok(Some(_))) {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let lock = edit_lock.lock();
+            let commit_guard = match cancel_rx.as_mut() {
+                Some(cancel_rx) => tokio::select! {
+                    biased;
+                    _ = cancel_rx => {
+                        cancel_token.cancel();
+                        outcome = Err(Error::request_cancelled());
+                        None
+                    }
+                    _ = cancel_token.cancelled() => {
+                        outcome = Ok(None);
+                        None
+                    }
+                    guard = lock => Some(guard),
+                },
+                None => tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        outcome = Ok(None);
+                        None
+                    }
+                    guard = lock => Some(guard),
+                },
+            };
+            if commit_guard.is_some()
+                && let Ok(Some(computed)) = &mut outcome
+            {
+                let current = self.semantic_delta_computation_is_current(&uri, computed);
+                if !current
+                    || self
+                        .cache
+                        .with_active_request(&uri, request_id, || {
+                            if let Some(pending) = computed.pending_native.take() {
+                                pending.commit(&self.cache);
+                            }
+                            if let Some(pending) = computed.pending_wire.take() {
+                                pending.commit(&self.cache);
+                            }
+                        })
+                        .is_none()
+                {
+                    outcome = Ok(None);
                 }
-                SemanticTokensResult::Partial(partial) => {
-                    SemanticTokensFullDeltaResult::Tokens(SemanticTokens {
-                        result_id: None,
-                        data: partial.data,
-                    })
-                }
-            })
-        })
+            }
+        }
+        request_guard.finish();
+        outcome.map(|outcome| outcome.map(|computed| computed.result))
     }
 
-    pub(crate) async fn semantic_tokens_full_delta_impl(
+    async fn semantic_tokens_full_delta_tracked_impl(
         &self,
         params: SemanticTokensDeltaParams,
-    ) -> Result<Option<SemanticTokensFullDeltaResult>> {
-        let full_params = SemanticTokensParams {
-            work_done_progress_params: params.work_done_progress_params.clone(),
-            partial_result_params: params.partial_result_params.clone(),
-            text_document: params.text_document.clone(),
-        };
-        let upstream_id = current_upstream_id();
-        let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
-        let lsp_uri = params.text_document.uri;
-        let previous_result_id = params.previous_result_id;
-
-        // Convert ls_types::Uri to url::Url for internal use
+        request_id: crate::lsp::cache::RequestId,
+        cancel_token: crate::cancel::CancelToken,
+    ) -> Result<Option<SemanticDeltaComputation>> {
+        let lsp_uri = params.text_document.uri.clone();
         let Ok(uri) = uri_to_url(&lsp_uri) else {
             log::warn!(
                 "Invalid URI in semanticTokens/full/delta: {}",
@@ -1422,524 +1834,172 @@ impl Kakehashi {
             );
             return Ok(None);
         };
-
-        // Start tracking this request - supersedes any previous request for this
-        // URI. `cancel_token` (flipped on supersede/close) is threaded into the
-        // blocking compute so a superseded delta stops mid-flight — this is the
-        // steady-state typing path where the pile-up is worst.
-        let (request_id, cancel_token) = self.cache.start_request(&uri);
-
-        // Snapshot the settings generation NOW, before any settings-dependent
-        // tokenization input is read below (same reload-race safety as
-        // semanticTokens/full; folded into the cache key once the text is known).
-        let token_generation = self.cache.semantic_token_generation();
-
-        log::debug!(
-            target: "kakehashi::semantic",
-            "[SEMANTIC_TOKENS_DELTA] START uri={} req={}",
-            uri, request_id
-        );
-
-        // Early exit if request was superseded
-        if !self.cache.is_request_active(&uri, request_id) {
-            log::debug!(
-                target: "kakehashi::semantic",
-                "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={}",
-                uri, request_id
-            );
+        let previous_result_id = params.previous_result_id.clone();
+        let Some(request_identity) = self
+            .documents
+            .get(&uri)
+            .map(|document| (document.incarnation(), document.content_version()))
+        else {
             return Ok(None);
-        }
-
-        // A full request without a native layer is parser-independent. Re-enter it before
-        // waiting for a native snapshot so a configuration reload cannot make
-        // a client carrying a native resultId take a different path from a
-        // direct full request.
-        if !self.semantic_tokens_full_includes_native(&uri) {
-            return self
-                .semantic_tokens_delta_reenter_full(
+        };
+        let request_generation = self.cache.semantic_token_generation();
+        let request_settings_generation = self.settings_manager.settings_generation();
+        // Hold the requested baseline across the nested full request. The wire
+        // cache is byte-bounded, so looking it up afterwards can lose the exact
+        // lineage when the newly computed full result evicts older entries.
+        let previous_wire = self
+            .cache
+            .get_wire_tokens_if_valid(&uri, &previous_result_id);
+        let previous_native = previous_wire
+            .is_none()
+            .then(|| self.cache.get_tokens_if_valid(&uri, &previous_result_id))
+            .flatten();
+        // Preserve the native-only idle fast path. A wire baseline or any
+        // eligible bridge layer must still execute the full fan-out because a
+        // downstream server may change its answer without a document edit.
+        let idle_candidate = previous_native.as_ref().and_then(|_| {
+            let view = self.documents.latest_snapshot(&uri)?;
+            let snapshot = view.slot.snapshot?;
+            (snapshot.incarnation == view.slot.current_incarnation
+                && snapshot.parsed_version == view.content_version)
+                .then_some(snapshot)
+                .and_then(|snapshot| {
+                    let language = snapshot.language.clone()?;
+                    crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+                        &self.settings_manager.load_settings(),
+                        &language,
+                        "textDocument/semanticTokens/full",
+                    )
+                    .allows(LayerSource::Native)
+                    .then_some((snapshot, language))
+                })
+        });
+        let idle_bridge_applicable = if let Some((snapshot, language)) = idle_candidate.as_ref() {
+            tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => return Ok(None),
+                applicable = self.semantic_delta_has_applicable_bridge(
+                    &lsp_uri,
                     &uri,
-                    full_params,
-                    request_id,
-                    cancel_token,
-                    &mut cancel_rx,
-                )
-                .await;
-        }
-
-        // Serve-current (ADR §3, revised): park until the snapshot matches the
-        // live text (same rationale as semanticTokens/full — this is the
-        // steady-state typing path where a stale answer corrupts the editor's
-        // existing highlights AND poisons the client's delta baseline).
-        let snapshot = match self
-            .current_snapshot_for_tokens(&uri, cancel_rx.as_mut(), &cancel_token)
-            .await
-        {
-            TokenSnapshot::Current(snapshot) => snapshot,
-            TokenSnapshot::Absent => {
-                self.cache.finish_request(&uri, request_id);
-                return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
-                    SemanticTokens {
-                        result_id: None,
-                        data: vec![],
-                    },
-                )));
-            }
-            TokenSnapshot::Stale => {
-                // Register token interest (version 0, monotonic max — a real
-                // serve overwrites) so the settle-refresh gate re-drives this
-                // client even when EVERY request so far rejected: without a
-                // served mark the gate reads "nobody highlights this
-                // document" and the client would stay dark until its next
-                // didChange-driven request.
-                self.cache.record_served_semantic_version(&uri, 0);
-                self.cache.finish_request(&uri, request_id);
-                return Err(crate::error::content_modified_error());
-            }
-            TokenSnapshot::Cancelled => {
-                cancel_token.cancel();
-                self.cache.finish_request(&uri, request_id);
-                log::debug!(
-                    target: "kakehashi::semantic",
-                    "[SEMANTIC_TOKENS_DELTA] CANCELLED via $/cancelRequest uri={} req={} (while parked)",
-                    uri, request_id
-                );
-                return Err(Error::request_cancelled());
-            }
-            TokenSnapshot::Superseded => {
-                // Same contract as a compute superseded mid-flight: the newer
-                // request answers; this one drops out quietly.
-                self.cache.finish_request(&uri, request_id);
-                log::debug!(
-                    target: "kakehashi::semantic",
-                    "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (superseded while parked)",
-                    uri, request_id
-                );
-                return Ok(None);
-            }
-        };
-        // Host full aggregation does not require a parser tree. Check bridge
-        // applicability before the native-only tree gate so a tree-less
-        // current snapshot can still re-enter its configured host layer.
-        let parser_language = snapshot.language.as_deref();
-        let actionable_virtual = match snapshot.language.as_deref() {
-            Some(language)
-                if self
-                    .resolve_layer_config(language, "textDocument/semanticTokens/full")
-                    .allows(LayerSource::Virt) =>
-            {
-                let probe =
-                    self.semantic_tokens_full_has_potential_virtual_producer(&uri, language);
-                match cancel_rx.as_mut() {
-                    Some(cancel_rx) => tokio::select! {
-                        biased;
-                        _ = cancel_rx => {
-                            cancel_token.cancel();
-                            self.cache.finish_request(&uri, request_id);
-                            return Err(Error::request_cancelled());
-                        }
-                        _ = cancel_token.cancelled() => {
-                            self.cache.finish_request(&uri, request_id);
-                            return Ok(None);
-                        }
-                        actionable = probe => actionable,
-                    },
-                    None => tokio::select! {
-                        biased;
-                        _ = cancel_token.cancelled() => {
-                            self.cache.finish_request(&uri, request_id);
-                            return Ok(None);
-                        }
-                        actionable = probe => actionable,
-                    },
-                }
-            }
-            _ => false,
-        };
-        let bridge_applicable = if let Some(bridge_language) = snapshot.language.as_deref() {
-            let applicability = self.semantic_delta_has_applicable_bridge(
-                &lsp_uri,
-                &uri,
-                &snapshot,
-                bridge_language,
-                parser_language,
-            );
-            match cancel_rx.as_mut() {
-                Some(cancel_rx) => tokio::select! {
-                    biased;
-                    _ = cancel_rx => {
-                        cancel_token.cancel();
-                        self.cache.finish_request(&uri, request_id);
-                        return Err(Error::request_cancelled());
-                    }
-                    _ = cancel_token.cancelled() => {
-                        self.cache.finish_request(&uri, request_id);
-                        return Ok(None);
-                    }
-                    applicable = applicability => applicable,
-                },
-                None => tokio::select! {
-                    biased;
-                    _ = cancel_token.cancelled() => {
-                        self.cache.finish_request(&uri, request_id);
-                        return Ok(None);
-                    }
-                    applicable = applicability => applicable,
-                },
+                    snapshot,
+                    language,
+                ) => applicable,
             }
         } else {
-            false
+            true
         };
-        if bridge_applicable || (snapshot.tree.is_none() && actionable_virtual) {
-            return self
-                .semantic_tokens_delta_reenter_full(
-                    &uri,
-                    full_params,
-                    request_id,
-                    cancel_token,
-                    &mut cancel_rx,
-                )
-                .await;
-        }
-
-        let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
-        else {
-            self.cache
-                .record_served_semantic_version(&uri, snapshot.parsed_version);
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
-                SemanticTokens {
-                    result_id: None,
-                    data: vec![],
+        if let (Some(previous), Some((snapshot, language))) =
+            (previous_native.as_ref(), idle_candidate.as_ref())
+            && !idle_bridge_applicable
+            && self.cache.semantic_token_generation() == request_generation
+            && let Some(current) = self.cache.get_current_tokens_for_snapshot(
+                &uri,
+                language,
+                SemanticSnapshotIdentity {
+                    parsed_version: snapshot.parsed_version,
+                    incarnation: snapshot.incarnation,
+                    generation: request_generation,
                 },
-            )));
-        };
-        let text = std::sync::Arc::clone(&snapshot.text);
-
-        // Ensure language is loaded before trying to get queries.
-        // This handles the race condition where semanticTokens/full/delta arrives
-        // before didOpen finishes loading the language.
-        let load_result = self
-            .language
-            .ensure_language_loaded_async(&language_name)
-            .await;
-        if !load_result.success {
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
-                SemanticTokens {
-                    result_id: None,
-                    data: vec![],
-                },
-            )));
-        }
-
-        // Early exit check after loading language
-        if !self.cache.is_request_active(&uri, request_id) {
-            log::debug!(
-                target: "kakehashi::semantic",
-                "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (after language load)",
-                uri, request_id
-            );
-            return Ok(None);
-        }
-
-        let Some(query) = self.language.highlight_query(&language_name) else {
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
-                SemanticTokens {
-                    result_id: None,
-                    data: vec![],
-                },
-            )));
-        };
-
-        // Read the remaining settings-dependent tokenization inputs HERE — with
-        // the query above, no `.await` in between — so a settings reload can't
-        // split them into an inconsistent mix (same as semanticTokens/full).
-        let capture_mappings = self.language.capture_mappings();
-        let supports_multiline = self.settings_manager.supports_multiline_tokens();
-
-        // Early exit check before expensive computation
-        if !self.cache.is_request_active(&uri, request_id) {
-            log::debug!(
-                target: "kakehashi::semantic",
-                "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (before compute)",
-                uri, request_id
-            );
-            return Ok(None);
-        }
-
-        let snapshot_identity = SemanticSnapshotIdentity {
-            parsed_version: snapshot.parsed_version,
-            incarnation: snapshot.incarnation,
-            generation: token_generation,
-        };
-        if let Some(cached) =
-            self.cache
-                .get_current_tokens_for_snapshot(&uri, &language_name, snapshot_identity)
-            && cached.result_id.as_deref() == Some(previous_result_id.as_str())
+            )
+            && std::sync::Arc::ptr_eq(previous, &current)
         {
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;
-            let still_current = self.semantic_snapshot_is_current(
-                &uri,
-                snapshot.incarnation,
-                snapshot.parsed_version,
-                token_generation,
-                &edit_lock,
-            );
-            if !still_current || !self.cache.is_request_active(&uri, request_id) {
-                self.cache.finish_request(&uri, request_id);
-                return Ok(None);
-            }
-            self.cache
-                .record_served_semantic_version(&uri, snapshot.parsed_version);
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
-                tower_lsp_server::ls_types::SemanticTokensDelta {
-                    result_id: Some(previous_result_id),
-                    edits: vec![],
-                },
-            )));
-        }
-
-        // Validity key for the snapshot's text under the generation captured at
-        // the top (see semanticTokens/full for why snapshot-text keying makes
-        // a compute racing a fresh edit cache-safe).
-        let cache_key = self.cache.cache_key_for(&text, token_generation);
-
-        // Compute tokens against the (current-at-resolution) snapshot; same as
-        // semanticTokens/full.
-        let result = {
-            // Snapshot-identical repeat request: reuse the cached full tokens
-            // instead of re-tokenizing.
-            if let Some(cached) = self
-                .cache
-                .get_current_tokens(&uri, &language_name, cache_key)
+            if !cancel_token.is_cancelled()
+                && self.cache.is_request_active(&uri, request_id)
+                && self.semantic_full_response_is_current(
+                    &uri,
+                    request_identity,
+                    (request_generation, request_settings_generation),
+                    Some(snapshot),
+                    true,
+                    &edit_lock,
+                )
             {
-                // Fast path: the client's baseline already IS these cached tokens,
-                // so the delta is necessarily empty — return it directly and skip
-                // the `previous_tokens` clone + O(N) `calculate_delta` below.
-                if cached.result_id.as_deref() == Some(previous_result_id.as_str()) {
-                    let edit_lock = self.documents.edit_lock(&uri);
-                    let _edit_guard = edit_lock.lock().await;
-                    let still_current = self.semantic_snapshot_is_current(
-                        &uri,
-                        snapshot.incarnation,
-                        snapshot.parsed_version,
-                        token_generation,
-                        &edit_lock,
-                    );
-                    if !still_current || !self.cache.is_request_active(&uri, request_id) {
-                        self.cache.finish_request(&uri, request_id);
-                        return Ok(None);
-                    }
-                    self.cache
-                        .record_served_semantic_version(&uri, snapshot.parsed_version);
-                    self.cache.finish_request(&uri, request_id);
-                    return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
-                        tower_lsp_server::ls_types::SemanticTokensDelta {
-                            result_id: Some(previous_result_id),
-                            edits: vec![],
-                        },
-                    )));
-                }
-                // Baseline differs: fall through to diff the cached tokens
-                // against the client's `previous_result_id` (still skips
-                // re-tokenization). Kept as the Arc — cloned into an owned
-                // `SemanticTokens` only in the match arms below that actually
-                // store, not unconditionally here (a stale-but-content-
-                // unchanged baseline lands in the empty-edits arm, which
-                // never needs ownership at all).
-                Some(CurrentTokens::Cached(cached))
-            } else {
-                // capture_mappings and supports_multiline were read before the await
-                // above (consistent with the query and token_generation). Rayon-based
-                // parallel injection processing (SAME as semanticTokens/full).
-                let coordinator = std::sync::Arc::clone(&self.language);
-
-                // Enable per-region injection-token reuse (#529) on the delta
-                // path too — this is the steady-state typing path the cache
-                // targets. Generation pinned to the top-of-handler snapshot.
-                let injection_cache = Some(crate::analysis::semantic::InjectionCacheParams {
-                    uri: uri.clone(),
-                    tracker: self.bridge.node_tracker_arc(),
-                    cache: self.cache.injection_token_cache_arc(),
-                    generation: token_generation,
-                    documents: std::sync::Arc::clone(&self.documents),
-                    parsed_version: snapshot.parsed_version,
-                    incarnation: snapshot.incarnation,
-                    // The snapshot's own discovery (ADR §3, don't-discover-twice).
-                    discovery: snapshot.injection_regions.clone(),
-                });
-
-                // Compute tokens, racing against cancel notification if provided
-                let compute_future = handle_semantic_tokens_full(
-                    &self.compute_pool,
-                    text.clone(),
-                    tree.clone(),
-                    query,
-                    Some(language_name.clone()),
-                    Some(capture_mappings),
-                    coordinator,
-                    supports_multiline,
-                    injection_cache,
-                    Some(cancel_token.clone()),
-                );
-
-                let computed = if let Some(cancel_rx) = cancel_rx {
-                    // Race between computation and cancel notification
-                    tokio::pin!(cancel_rx);
-                    tokio::select! {
-                        biased;
-
-                        // Cancel notification received - abort immediately. Flip
-                        // the token so the now-detached blocking compute stops
-                        // early instead of running to completion for a discarded
-                        // result.
-                        _ = &mut cancel_rx => {
-                            cancel_token.cancel();
-                            self.cache.finish_request(&uri, request_id);
-                            log::debug!(
-                                target: "kakehashi::semantic",
-                                "[SEMANTIC_TOKENS_DELTA] CANCELLED via $/cancelRequest uri={} req={}",
-                                uri, request_id
-                            );
-                            return Err(Error::request_cancelled());
-                        }
-
-                        // Computation completed
-                        result = compute_future => result,
-                    }
-                } else {
-                    // No cancel support - just await the computation
-                    compute_future.await
-                };
-                computed.map(CurrentTokens::from_result)
+                self.cache
+                    .record_served_semantic_version(&uri, snapshot.parsed_version);
+                return Ok(Some(SemanticDeltaComputation {
+                    result: SemanticTokensFullDeltaResult::TokensDelta(SemanticTokensDelta {
+                        result_id: Some(previous_result_id),
+                        edits: Vec::new(),
+                    }),
+                    pending_native: None,
+                    pending_wire: None,
+                    identity: request_identity,
+                    generation: request_generation,
+                    settings_generation: request_settings_generation,
+                    snapshot_present: true,
+                    snapshot_tree_present: Some(snapshot.tree.is_some()),
+                }));
             }
-        };
-
-        // A supersede/close between compute start and here flips the token; the
-        // compute then bailed at a checkpoint and returned `None` (partial), so
-        // drop the request rather than diffing/storing it over the cache. This
-        // is CPU-reclamation, not staleness-rejection (§4's narrowed CancelToken
-        // role).
-        if cancel_token.is_cancelled() {
-            self.cache.finish_request(&uri, request_id);
-            log::debug!(
-                target: "kakehashi::semantic",
-                "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (compute superseded)",
-                uri, request_id
-            );
             return Ok(None);
         }
-
-        // Current tokens from the result — kept lazy (`CurrentTokens::Cached`
-        // stays an `Arc`) until a downstream match arm actually needs an
-        // owned value to mutate and store.
-        let current_tokens = result.unwrap_or_else(|| {
-            CurrentTokens::Owned(SemanticTokens {
+        let previous = previous_wire.or(previous_native);
+        let full_params = SemanticTokensParams {
+            text_document: params.text_document,
+            work_done_progress_params: params.work_done_progress_params,
+            partial_result_params: params.partial_result_params,
+        };
+        let Some(current) = self
+            .semantic_tokens_full_impl_with_tracking(
+                full_params,
+                Some((request_id, cancel_token.clone())),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        if current.settings_generation != request_settings_generation {
+            return Ok(None);
+        }
+        let pending_native = current.pending_native;
+        let pending_wire = current.pending_wire;
+        let snapshot_present = current.snapshot_present;
+        let snapshot_tree_present = current.snapshot_tree_present;
+        let current = match current.result {
+            SemanticTokensResult::Tokens(tokens) => tokens,
+            SemanticTokensResult::Partial(partial) => SemanticTokens {
                 result_id: None,
-                data: Vec::new(),
-            })
-        });
-
-        // Early exit check before storing - prevents superseded request from overwriting cache
-        if !self.cache.is_request_active(&uri, request_id) {
-            log::debug!(
-                target: "kakehashi::semantic",
-                "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (before store)",
-                uri, request_id
-            );
-            return Ok(None);
-        }
-        // Get previous tokens from cache for delta calculation
-        let previous_tokens = self.cache.get_tokens_if_valid(&uri, &previous_result_id);
-
-        // No valid previous baseline: a full result is unavoidable either
-        // way, so this consumes `current_tokens` directly (a cheap
-        // `try_unwrap` when the Arc is uniquely owned) instead of routing
-        // through `delta_result`'s `Tokens` arm, which would clone it once
-        // to build the intermediate value and again for the cache store.
-        let (final_result, tokens_to_store) = if let Some(prev) = previous_tokens {
-            // Calculate delta or return full tokens outside the document edit
-            // lock. Only the final currency check and cache commit need to be
-            // serialized with didChange/didClose.
-            let delta_result =
-                calculate_delta_or_full(&prev, current_tokens.as_ref(), &previous_result_id);
-
-            match delta_result {
-                SemanticTokensFullDeltaResult::Tokens(mut tokens) => {
-                    tokens.result_id = Some(next_result_id());
-                    let stored = tokens.clone();
-                    (SemanticTokensFullDeltaResult::Tokens(tokens), Some(stored))
-                }
-                SemanticTokensFullDeltaResult::TokensDelta(mut delta) if delta.edits.is_empty() => {
-                    delta.result_id = Some(previous_result_id.clone());
-                    (SemanticTokensFullDeltaResult::TokensDelta(delta), None)
-                }
-                SemanticTokensFullDeltaResult::TokensDelta(mut delta) => {
-                    let mut stored = current_tokens.into_owned();
-                    stored.result_id = Some(next_result_id());
-                    delta.result_id = stored.result_id.clone();
-                    (
-                        SemanticTokensFullDeltaResult::TokensDelta(delta),
-                        Some(stored),
-                    )
-                }
-                SemanticTokensFullDeltaResult::PartialTokensDelta { .. } => {
-                    log::warn!(
-                        target: "kakehashi::semantic",
-                        "[SEMANTIC_TOKENS_DELTA] Unexpected PartialTokensDelta variant for uri={}",
-                        uri
-                    );
-                    let mut tokens = current_tokens.into_owned();
-                    tokens.result_id = Some(next_result_id());
-                    let stored = tokens.clone();
-                    (SemanticTokensFullDeltaResult::Tokens(tokens), Some(stored))
-                }
-            }
-        } else {
-            let mut tokens = current_tokens.into_owned();
-            tokens.result_id = Some(next_result_id());
-            let stored = tokens.clone();
-            (SemanticTokensFullDeltaResult::Tokens(tokens), Some(stored))
+                data: partial.data,
+            },
         };
-
+        let result = match previous {
+            Some(previous) => calculate_delta_or_full(&previous, &current, &previous_result_id),
+            None => SemanticTokensFullDeltaResult::Tokens(current),
+        };
+        #[cfg(feature = "e2e")]
+        wait_for_semantic_delta_commit_release().await;
         let edit_lock = self.documents.edit_lock(&uri);
         let _edit_guard = edit_lock.lock().await;
-        let still_current = self.semantic_snapshot_is_current(
-            &uri,
-            snapshot.incarnation,
-            snapshot.parsed_version,
-            token_generation,
-            &edit_lock,
-        );
-        if !still_current || !self.cache.is_request_active(&uri, request_id) {
-            self.cache.finish_request(&uri, request_id);
+        if cancel_token.is_cancelled()
+            || !self.cache.is_request_active(&uri, request_id)
+            || self.cache.semantic_token_generation() != request_generation
+            || self.settings_manager.settings_generation() != request_settings_generation
+            || !self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                view.slot.current_incarnation == request_identity.0
+                    && view.content_version == request_identity.1
+                    && view.slot.snapshot.is_some() == snapshot_present
+                    && view
+                        .slot
+                        .snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.tree.is_some())
+                        == snapshot_tree_present
+            })
+        {
             return Ok(None);
         }
-        if let Some(tokens) = tokens_to_store {
-            self.cache.store_tokens(
-                uri.clone(),
-                tokens,
-                language_name,
-                cache_key,
-                snapshot_identity,
-            );
-        }
 
-        // Finish tracking this request
-        self.cache
-            .record_served_semantic_version(&uri, snapshot.parsed_version);
-        self.cache.finish_request(&uri, request_id);
-
-        log::debug!(
-            target: "kakehashi::semantic",
-            "[SEMANTIC_TOKENS_DELTA] DONE uri={} req={}",
-            uri, request_id
-        );
-
-        Ok(Some(final_result))
+        Ok(Some(SemanticDeltaComputation {
+            result,
+            pending_native,
+            pending_wire,
+            identity: request_identity,
+            generation: request_generation,
+            settings_generation: request_settings_generation,
+            snapshot_present,
+            snapshot_tree_present,
+        }))
     }
 
     pub(crate) async fn semantic_tokens_range_impl(
@@ -2461,21 +2521,7 @@ impl Kakehashi {
     }
 }
 
-fn semantic_region_selects_servers(
-    contiguous: bool,
-    priorities: &[String],
-    configs: &[crate::lsp::bridge::ResolvedServerConfig],
-    max_fan_out: Option<usize>,
-    incapable: &std::collections::HashSet<String>,
-    suppressed: &std::collections::HashSet<String>,
-) -> bool {
-    if !contiguous {
-        return false;
-    }
-    semantic_virt_configs_select_servers(priorities, configs, max_fan_out, incapable, suppressed)
-}
-
-fn semantic_virt_configs_select_servers(
+fn semantic_configs_select_servers(
     priorities: &[String],
     configs: &[crate::lsp::bridge::ResolvedServerConfig],
     max_fan_out: Option<usize>,
@@ -2534,6 +2580,16 @@ mod tests {
     use url::Url;
 
     #[test]
+    fn semantic_retry_accepts_publication_and_same_version_tree_upgrade_only() {
+        assert!(semantic_snapshot_state_advanced(None, Some(false)));
+        assert!(semantic_snapshot_state_advanced(None, Some(true)));
+        assert!(semantic_snapshot_state_advanced(Some(false), Some(true)));
+        assert!(!semantic_snapshot_state_advanced(None, None));
+        assert!(!semantic_snapshot_state_advanced(Some(false), Some(false)));
+        assert!(!semantic_snapshot_state_advanced(Some(true), Some(true)));
+    }
+
+    #[test]
     fn dropping_semantic_compute_owner_cancels_blocking_work() {
         let token = crate::cancel::CancelToken::default();
         {
@@ -2541,47 +2597,6 @@ mod tests {
             assert!(!token.is_cancelled());
         }
         assert!(token.is_cancelled());
-    }
-
-    #[test]
-    fn delta_reentry_excludes_non_contiguous_virtual_regions() {
-        let configs = vec![crate::lsp::bridge::ResolvedServerConfig {
-            server_name: "tokens".into(),
-            config: std::sync::Arc::new(crate::config::settings::BridgeServerConfig::default()),
-        }];
-        let priorities = [crate::config::settings::PRIORITIES_WILDCARD.into()];
-        assert!(!semantic_region_selects_servers(
-            false,
-            &priorities,
-            &configs,
-            None,
-            &std::collections::HashSet::new(),
-            &std::collections::HashSet::new(),
-        ));
-        assert!(semantic_region_selects_servers(
-            true,
-            &priorities,
-            &configs,
-            None,
-            &std::collections::HashSet::new(),
-            &std::collections::HashSet::new(),
-        ));
-        assert!(!semantic_region_selects_servers(
-            true,
-            &priorities,
-            &configs,
-            None,
-            &std::collections::HashSet::from(["tokens".into()]),
-            &std::collections::HashSet::new(),
-        ));
-        assert!(!semantic_region_selects_servers(
-            true,
-            &priorities,
-            &configs,
-            None,
-            &std::collections::HashSet::new(),
-            &std::collections::HashSet::from(["tokens".into()]),
-        ));
     }
 
     #[test]
@@ -2596,14 +2611,14 @@ mod tests {
         let priorities = [crate::config::settings::PRIORITIES_WILDCARD.into()];
         let suppressed = std::collections::HashSet::from(["suppressed".into()]);
 
-        assert!(!semantic_virt_configs_select_servers(
+        assert!(!semantic_configs_select_servers(
             &priorities,
             &configs,
             Some(1),
             &std::collections::HashSet::new(),
             &suppressed,
         ));
-        assert!(semantic_virt_configs_select_servers(
+        assert!(semantic_configs_select_servers(
             &priorities,
             &configs,
             None,
@@ -2613,7 +2628,7 @@ mod tests {
 
         let incapable = std::collections::HashSet::from(["suppressed".into()]);
         assert!(
-            semantic_virt_configs_select_servers(
+            semantic_configs_select_servers(
                 &priorities,
                 &configs,
                 Some(1),
@@ -2653,6 +2668,34 @@ mod tests {
         let identity = (view.slot.current_incarnation, view.content_version);
         let generation = server.cache.semantic_token_generation();
         let settings_generation = server.settings_manager.settings_generation();
+        let computed = SemanticFullComputation {
+            result: SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: Vec::new(),
+            }),
+            pending_native: None,
+            pending_wire: None,
+            identity,
+            generation,
+            settings_generation,
+            snapshot_present: false,
+            snapshot_tree_present: None,
+        };
+        let delta_computed = SemanticDeltaComputation {
+            result: SemanticTokensFullDeltaResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: Vec::new(),
+            }),
+            pending_native: None,
+            pending_wire: None,
+            identity,
+            generation,
+            settings_generation,
+            snapshot_present: false,
+            snapshot_tree_present: None,
+        };
+        assert!(server.semantic_full_computation_is_current(&uri, &computed));
+        assert!(server.semantic_delta_computation_is_current(&uri, &delta_computed));
         let edit_lock = server.documents.edit_lock(&uri);
         assert!(server.semantic_full_response_is_current(
             &uri,
@@ -2676,8 +2719,18 @@ mod tests {
             ),
             "a settings reload must invalidate the captured host-only plan"
         );
+        assert!(!server.semantic_full_computation_is_current(&uri, &computed));
+        assert!(!server.semantic_delta_computation_is_current(&uri, &delta_computed));
         let settings_generation = server.settings_manager.settings_generation();
         publish_treeless(server, &uri, "old", 0);
+        assert!(
+            !server.semantic_full_computation_is_current(&uri, &computed),
+            "the final publication fence must reject a newly published snapshot"
+        );
+        assert!(
+            !server.semantic_delta_computation_is_current(&uri, &delta_computed),
+            "the delta publication fence must reject a newly published snapshot"
+        );
         assert!(
             !server.semantic_full_response_is_current(
                 &uri,
@@ -2716,6 +2769,76 @@ mod tests {
             true,
             &edit_lock,
         ));
+    }
+
+    #[test]
+    fn non_native_empty_result_requires_success_or_no_virtual_request() {
+        assert!(should_publish_empty_non_native_result(true, true, true));
+        assert!(should_publish_empty_non_native_result(true, false, false));
+        assert!(
+            !should_publish_empty_non_native_result(true, true, false),
+            "a failed host or virtual request must not clear highlighting"
+        );
+        assert!(
+            !should_publish_empty_non_native_result(false, false, false),
+            "native-only results are not authoritative bridge overlays"
+        );
+    }
+
+    #[test]
+    fn malformed_host_semantic_result_is_a_fan_in_error() {
+        assert!(
+            parse_host_semantic_tokens_result(serde_json::Value::Null)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_host_semantic_tokens_result(serde_json::json!({ "data": [] }))
+                .unwrap()
+                .is_some()
+        );
+        assert!(parse_host_semantic_tokens_result(serde_json::json!({ "data": "bad" })).is_err());
+    }
+
+    #[test]
+    fn virtual_selection_guard_propagates_selection_on_unwind() {
+        let local_selected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let selected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let activity = std::sync::Arc::new(
+            super::super::super::whole_document::WholeDocumentBridgeActivity::new(),
+        );
+        let guard = VirtualBridgeSelectionGuard {
+            local_selected,
+            selected: std::sync::Arc::clone(&selected),
+            activity: std::sync::Arc::clone(&activity),
+            unit: Some("virt:panicked".into()),
+        };
+
+        drop(guard);
+
+        assert!(selected.load(std::sync::atomic::Ordering::Acquire));
+        assert!(activity.has_selected());
+        assert!(!activity.is_authoritative());
+    }
+
+    #[test]
+    fn host_only_computation_captures_the_live_snapshot_tree_state() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///semantic_host_only_fence.rs").expect("valid test URI");
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_owned(),
+            Some("rust".to_owned()),
+            None,
+        );
+        publish_treeless(server, &uri, "fn main() {}", 0);
+
+        assert_eq!(
+            server.semantic_computation_snapshot_state(&uri, None, false),
+            (true, Some(false)),
+            "a host-only request that skips native resolution must fence against the live tree state"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2808,6 +2931,7 @@ mod tests {
             auto_install: false,
             ..Default::default()
         });
+
         server
             .language
             .language_registry_for_parallel()
@@ -2896,7 +3020,10 @@ mod tests {
         .await
         .expect("inactive virtual work must not trigger the first-parse backstop")
         .expect("semantic tokens delta should return without error");
-        assert!(result.is_none(), "no host server is configured: {result:?}");
+        assert!(
+            matches!(result, Some(SemanticTokensFullDeltaResult::Tokens(ref tokens)) if tokens.data.is_empty()),
+            "no eligible host producer must clear the previous overlay: {result:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -3041,6 +3168,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_full_keeps_borrowed_delta_tracking_active() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///semantic_delta_tracking.rs").expect("valid test URI");
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        publish_treeless(server, &uri, "fn main() {}", 0);
+        let (request_id, cancel_token) = server.cache.start_request(&uri);
+
+        server
+            .semantic_tokens_full_impl_with_tracking(
+                full_params(&uri),
+                Some((request_id, cancel_token.clone())),
+            )
+            .await
+            .expect("nested full should complete");
+        assert!(
+            server.cache.is_request_active(&uri, request_id),
+            "nested full must leave the outer delta's request ownership active"
+        );
+
+        let (newer_id, _newer_token) = server.cache.start_request(&uri);
+        assert!(cancel_token.is_cancelled());
+        assert!(!server.cache.is_request_active(&uri, request_id));
+        server.cache.finish_request(&uri, newer_id);
+    }
+
+    #[tokio::test]
     async fn nested_full_with_superseded_delta_tracking_preserves_the_newer_request() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let uri = Url::parse("file:///delta-reentry-superseded.rs").unwrap();
@@ -3058,6 +3217,102 @@ mod tests {
 
         assert!(result.is_none());
         assert!(service.inner().cache.is_request_active(&uri, newer_id));
+    }
+
+    #[tokio::test]
+    async fn pending_wire_baseline_is_invisible_until_outer_commit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///pending-wire-baseline.rs").expect("valid test URI");
+        let result_id = "pending-wire".to_string();
+        let pending = PendingWireBaseline {
+            uri: uri.clone(),
+            tokens: SemanticTokens {
+                result_id: Some(result_id.clone()),
+                data: vec![tower_lsp_server::ls_types::SemanticToken {
+                    delta_line: 0,
+                    delta_start: 0,
+                    length: 1,
+                    token_type: 0,
+                    token_modifiers_bitset: 0,
+                }],
+            },
+            language: "rust".into(),
+            cache_key: 1,
+            snapshot: SemanticSnapshotIdentity {
+                parsed_version: 1,
+                incarnation: 1,
+                generation: 1,
+            },
+        };
+
+        assert!(
+            server
+                .cache
+                .get_wire_tokens_if_valid(&uri, &result_id)
+                .is_none(),
+            "a nested full baseline must remain private before the delta fence"
+        );
+        let mut computed = SemanticFullComputation {
+            result: SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: Some(result_id.clone()),
+                data: Vec::new(),
+            }),
+            pending_native: None,
+            pending_wire: Some(pending),
+            identity: (1, 1),
+            generation: 1,
+            settings_generation: 1,
+            snapshot_present: true,
+            snapshot_tree_present: Some(true),
+        };
+        commit_full_baselines(&server.cache, &mut computed);
+        assert!(
+            server
+                .cache
+                .get_wire_tokens_if_valid(&uri, &result_id)
+                .is_some(),
+            "a direct full must publish only after its outer select accepts the response"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_native_baseline_is_invisible_until_outer_commit() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///pending-native-baseline.rs").expect("valid test URI");
+        let result_id = "pending-native".to_string();
+        let pending = PendingNativeBaseline {
+            uri: uri.clone(),
+            tokens: SemanticTokens {
+                result_id: Some(result_id.clone()),
+                data: vec![tower_lsp_server::ls_types::SemanticToken {
+                    delta_line: 0,
+                    delta_start: 0,
+                    length: 1,
+                    token_type: 0,
+                    token_modifiers_bitset: 0,
+                }],
+            },
+            language: "rust".into(),
+            cache_key: 1,
+            snapshot: SemanticSnapshotIdentity {
+                parsed_version: 1,
+                incarnation: 1,
+                generation: 1,
+            },
+            served_version: 1,
+        };
+
+        assert!(
+            server.cache.get_tokens_if_valid(&uri, &result_id).is_none(),
+            "a nested native baseline must remain private before the delta fence"
+        );
+        pending.commit(&server.cache);
+        assert!(
+            server.cache.get_tokens_if_valid(&uri, &result_id).is_some(),
+            "a successful outer delta fence must publish its native baseline"
+        );
     }
 
     fn range_params(uri: &Url, range: Range) -> SemanticTokensRangeParams {
@@ -3210,6 +3465,60 @@ mod tests {
         assert!(
             !service.inner().cache.is_request_active(&uri, request_id),
             "dropping the handler must remove its exact tracker entry"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_semantic_tokens_delta_cancels_and_forgets_the_request() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///dropped_delta_request.rs").expect("valid test uri");
+
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let params = SemanticTokensDeltaParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+            },
+            previous_result_id: "missing-baseline".to_string(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        // The nested full computation parks on the absent snapshot while the
+        // outer delta guard remains the sole owner of the tracker entry.
+        let request = {
+            let service = std::sync::Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .inner()
+                    .semantic_tokens_full_delta_impl(params)
+                    .await
+            })
+        };
+        sleep(Duration::from_millis(50)).await;
+        assert!(!request.is_finished(), "the delta request must be parked");
+        let (request_id, cancel_token) = service
+            .inner()
+            .cache
+            .active_request(&uri)
+            .expect("the parked delta request must be tracked");
+
+        request.abort();
+        let error = request
+            .await
+            .expect_err("aborting must drop the delta handler future");
+        assert!(error.is_cancelled());
+        assert!(
+            cancel_token.is_cancelled(),
+            "dropping delta must stop its nested full computation"
+        );
+        assert!(
+            !service.inner().cache.is_request_active(&uri, request_id),
+            "dropping delta must remove its exact tracker entry"
         );
     }
 
@@ -3669,18 +3978,24 @@ mod tests {
             text_document: TextDocumentIdentifier {
                 uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
             },
-            previous_result_id: delta_result_id,
+            previous_result_id: delta_result_id.clone(),
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
 
         let follow_up_result = server
             .semantic_tokens_full_delta_impl(follow_up_params)
-            .await;
-        assert!(
-            follow_up_result.is_ok(),
-            "follow-up delta request should succeed"
+            .await
+            .expect("follow-up delta request should succeed")
+            .expect("unchanged native baseline should produce a delta");
+        let SemanticTokensFullDeltaResult::TokensDelta(follow_up_delta) = follow_up_result else {
+            panic!("unchanged native baseline should keep the delta fast path");
+        };
+        assert_eq!(
+            follow_up_delta.result_id.as_deref(),
+            Some(delta_result_id.as_str())
         );
+        assert!(follow_up_delta.edits.is_empty());
     }
 
     /// End-to-end for the don't-discover-twice lever (parse-snapshot ADR §3):
@@ -4081,6 +4396,19 @@ mod tests {
         let server = service.inner();
         let uri = Url::parse("file:///delta_noop.lua").expect("should construct test uri");
 
+        let mut settings = crate::config::WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "unrelated".into(),
+            crate::config::settings::BridgeServerConfig {
+                cmd: Some(vec!["unrelated-server".into()]),
+                languages: Some(vec!["python".into()]),
+                ..Default::default()
+            },
+        );
+        server
+            .apply_raw_settings(crate::config::RawWorkspaceSettings::default(), settings)
+            .await;
+
         server.documents.insert(
             uri.clone(),
             "local x = 1".to_string(),
@@ -4110,6 +4438,13 @@ mod tests {
             SemanticTokensResult::Tokens(t) => t.result_id.expect("should have result_id"),
             _ => panic!("expected Tokens variant"),
         };
+        assert!(
+            server
+                .cache
+                .get_wire_tokens_if_valid(&uri, &baseline_id)
+                .is_none(),
+            "a native-only full result should not duplicate its baseline in the wire cache"
+        );
 
         // Delta on the UNCHANGED document with the matching baseline: empty delta,
         // same result_id (the fast path).
@@ -4134,7 +4469,7 @@ mod tests {
                 );
                 assert!(
                     d.edits.is_empty(),
-                    "an unchanged document should yield an empty delta"
+                    "an unchanged document should yield an empty delta even when an unrelated server is configured"
                 );
             }
             other => panic!("expected an empty TokensDelta, got {:?}", other),

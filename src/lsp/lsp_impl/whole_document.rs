@@ -12,6 +12,7 @@
 //! `preferred` returns the highest-priority non-empty layer, while
 //! `concatenated` merges every selected layer's list in priority order.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,7 @@ use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{NumberOrString, Uri};
 
+use crate::error::LockResultExt;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, dispatch_host_preferred, dispatch_preferred,
@@ -41,6 +43,54 @@ pub(super) struct HostWholeDocumentResponse<T> {
     pub(super) incarnation: Option<u64>,
     pub(super) connection_generation: u64,
     pub(super) handle: Arc<crate::lsp::bridge::ConnectionHandle>,
+}
+
+pub(super) struct WholeDocumentBridgeActivity {
+    selected: Mutex<HashSet<String>>,
+    succeeded: Mutex<HashSet<String>>,
+}
+
+impl WholeDocumentBridgeActivity {
+    pub(super) fn new() -> Self {
+        Self {
+            selected: Mutex::new(HashSet::new()),
+            succeeded: Mutex::new(HashSet::new()),
+        }
+    }
+
+    pub(super) fn mark_selected(&self, unit: impl Into<String>) {
+        self.selected
+            .lock()
+            .recover_poison("WholeDocumentBridgeActivity::mark_selected")
+            .insert(unit.into());
+    }
+
+    pub(super) fn mark_succeeded(&self, unit: impl Into<String>) {
+        self.succeeded
+            .lock()
+            .recover_poison("WholeDocumentBridgeActivity::mark_succeeded")
+            .insert(unit.into());
+    }
+
+    pub(super) fn has_selected(&self) -> bool {
+        !self
+            .selected
+            .lock()
+            .recover_poison("WholeDocumentBridgeActivity::has_selected")
+            .is_empty()
+    }
+
+    pub(super) fn is_authoritative(&self) -> bool {
+        let selected = self
+            .selected
+            .lock()
+            .recover_poison("WholeDocumentBridgeActivity::is_authoritative");
+        let succeeded = self
+            .succeeded
+            .lock()
+            .recover_poison("WholeDocumentBridgeActivity::is_authoritative");
+        selected.is_subset(&succeeded)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -74,6 +124,9 @@ impl Kakehashi {
         client_progress_token: Option<NumberOrString>,
         expected_snapshot: Option<WholeDocumentSnapshotIdentity>,
         bridge_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
+        bridge_succeeded: Option<Arc<std::sync::atomic::AtomicBool>>,
+        bridge_work_selected: Option<Arc<std::sync::atomic::AtomicBool>>,
+        bridge_activity: Option<Arc<WholeDocumentBridgeActivity>>,
         require_all_layers: bool,
         preserve_empty: bool,
         nested_regions_first: bool,
@@ -90,12 +143,13 @@ impl Kakehashi {
         N: Future<Output = Result<Option<Vec<T>>>>,
         F: Fn(FanOutTask) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = io::Result<Option<Vec<T>>>> + Send + 'static,
-        P: Fn(serde_json::Value) -> Option<Vec<T>> + Clone + Send + 'static,
-        H: Fn(HostWholeDocumentResponse<T>) -> Option<Vec<T>> + Clone + Send + 'static,
+        P: Fn(serde_json::Value) -> io::Result<Option<Vec<T>>> + Clone + Send + 'static,
+        H: Fn(HostWholeDocumentResponse<T>) -> io::Result<Option<Vec<T>>> + Clone + Send + 'static,
         R: Fn(Vec<T>, Vec<T>) -> Vec<T> + Copy + Send,
         M: Fn(Vec<T>, Vec<T>) -> Vec<T>,
     {
         let host_bridge_attempted = bridge_attempted;
+        let host_bridge_succeeded = bridge_succeeded;
         let virt = async {
             if !run_virtual_layer {
                 return Ok(None);
@@ -307,6 +361,8 @@ impl Kakehashi {
                 let pool = Arc::clone(&pool);
                 let send = send.clone();
                 let merge_order = region_merge_order[region_index];
+                let region_activity = bridge_activity.clone();
+                let activity_unit = format!("virt:{}", resolved.region.region_id);
 
                 outer_join_set.spawn(async move {
                     let is_nonempty =
@@ -328,6 +384,11 @@ impl Kakehashi {
                                 .await
                         }
                     };
+                    if whole_document_unit_succeeded(&result)
+                        && let Some(activity) = region_activity
+                    {
+                        activity.mark_succeeded(activity_unit);
+                    }
                     let items = match result {
                         FanInResult::Done(items) => items,
                         FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
@@ -382,6 +443,10 @@ impl Kakehashi {
             #[cfg(feature = "e2e")]
             wait_for_host_admission_release().await;
             let pool = self.bridge.pool_arc();
+            let local_selected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let local_succeeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let request_selected = Arc::clone(&local_selected);
+            let request_succeeded = Arc::clone(&local_succeeded);
             let fan_in = dispatch_host_preferred(
                 &ctx,
                 pool.clone(),
@@ -390,10 +455,17 @@ impl Kakehashi {
                     let parse_host = parse_host.clone();
                     let on_host_winner = on_host_winner.clone();
                     let attempted = host_bridge_attempted.clone();
+                    let succeeded = Some(Arc::clone(&request_succeeded));
+                    let selected = Arc::clone(&request_selected);
                     async move {
-                        let raw = match attempted {
+                        let (raw, succeeded_after_parse) = match attempted {
                             Some(attempted) => {
-                                t.pool
+                                let local_attempted =
+                                    Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let valid_response =
+                                    Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let result = t
+                                    .pool
                                     .send_host_raw_request_for_incarnation_with_attempt_marker(
                                         &t.server_name,
                                         &t.server_config,
@@ -406,11 +478,26 @@ impl Kakehashi {
                                         params,
                                         t.upstream_id,
                                         incarnation,
-                                        attempted,
+                                        Arc::clone(&local_attempted),
+                                        selected,
+                                        Arc::clone(&valid_response),
                                     )
-                                    .await?
+                                    .await;
+                                let was_attempted =
+                                    local_attempted.load(std::sync::atomic::Ordering::Acquire);
+                                if was_attempted {
+                                    attempted.store(true, std::sync::atomic::Ordering::Release);
+                                }
+                                let valid_response =
+                                    valid_response.load(std::sync::atomic::Ordering::Acquire);
+                                (
+                                    result?,
+                                    (was_attempted && valid_response)
+                                        .then_some(succeeded)
+                                        .flatten(),
+                                )
                             }
-                            None => {
+                            None => (
                                 t.pool
                                     .send_host_raw_request_for_incarnation(
                                         &t.server_name,
@@ -425,16 +512,20 @@ impl Kakehashi {
                                         t.upstream_id,
                                         incarnation,
                                     )
-                                    .await?
-                            }
+                                    .await?,
+                                None,
+                            ),
                         };
                         let Some(raw) = raw else {
+                            if let Some(succeeded) = succeeded_after_parse {
+                                succeeded.store(true, std::sync::atomic::Ordering::Release);
+                            }
                             return Ok(None);
                         };
-                        let Some(items) = parse_host(raw.value) else {
+                        let Some(items) = parse_host(raw.value)? else {
                             return Ok(None);
                         };
-                        Ok(on_host_winner(HostWholeDocumentResponse {
+                        let projected = on_host_winner(HostWholeDocumentResponse {
                             items,
                             server_name: t.server_name,
                             host_uri: t.uri,
@@ -442,13 +533,35 @@ impl Kakehashi {
                             incarnation: Some(raw.incarnation),
                             connection_generation: raw.connection_generation,
                             handle: raw.handle,
-                        }))
+                        })?;
+                        Ok(record_host_projection_success(
+                            projected,
+                            succeeded_after_parse.as_ref(),
+                        ))
                     }
                 },
                 |opt| matches!(opt, Some(items) if !items.is_empty()),
                 cancel_rx,
             )
             .await;
+            if local_selected.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(selected) = &bridge_work_selected {
+                    selected.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if let Some(activity) = &bridge_activity {
+                    activity.mark_selected("host");
+                }
+            }
+            if local_succeeded.load(std::sync::atomic::Ordering::Acquire)
+                && whole_document_unit_succeeded(&fan_in)
+            {
+                if let Some(succeeded) = &host_bridge_succeeded {
+                    succeeded.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if let Some(activity) = &bridge_activity {
+                    activity.mark_succeeded("host");
+                }
+            }
             self.host_layer_result(fan_in, method_name, |won| won).await
         };
 
@@ -483,6 +596,25 @@ impl Kakehashi {
             result.and_then(nonempty_whole_document_items)
         })
     }
+}
+
+fn whole_document_unit_succeeded<T>(result: &FanInResult<T>) -> bool {
+    matches!(
+        result,
+        FanInResult::Done(_) | FanInResult::NoResult { errors: 0 }
+    )
+}
+
+fn record_host_projection_success<T>(
+    projected: Option<Vec<T>>,
+    succeeded: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> Option<Vec<T>> {
+    if projected.is_some()
+        && let Some(succeeded) = succeeded
+    {
+        succeeded.store(true, std::sync::atomic::Ordering::Release);
+    }
+    projected
 }
 
 pub(super) fn request_selects_servers(
@@ -652,6 +784,58 @@ mod tests {
     fn empty_whole_document_layer_items_are_absent() {
         assert_eq!(nonempty_whole_document_items::<i32>(vec![]), None);
         assert_eq!(nonempty_whole_document_items(vec![1]), Some(vec![1]));
+    }
+
+    #[test]
+    fn bridge_activity_requires_every_selected_unit_to_succeed() {
+        let activity = WholeDocumentBridgeActivity::new();
+        assert!(activity.is_authoritative());
+        activity.mark_selected("virt:first");
+        activity.mark_selected("virt:second");
+        activity.mark_succeeded("virt:first");
+        assert!(!activity.is_authoritative());
+        activity.mark_succeeded("virt:second");
+        assert!(activity.is_authoritative());
+    }
+
+    #[test]
+    fn host_success_requires_a_projectable_winner() {
+        let succeeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert_eq!(
+            record_host_projection_success::<i32>(None, Some(&succeeded)),
+            None
+        );
+        assert!(
+            !succeeded.load(std::sync::atomic::Ordering::Acquire),
+            "a parsed but unprojectable host response must remain non-authoritative"
+        );
+
+        assert_eq!(
+            record_host_projection_success(Some(vec![1]), Some(&succeeded)),
+            Some(vec![1])
+        );
+        assert!(succeeded.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn region_success_rejects_a_no_winner_outcome_with_failures() {
+        assert!(whole_document_unit_succeeded(&FanInResult::Done(Some(
+            vec![1]
+        ))));
+        assert!(whole_document_unit_succeeded(&FanInResult::<
+            Option<Vec<i32>>,
+        >::NoResult {
+            errors: 0
+        }));
+        assert!(
+            !whole_document_unit_succeeded(&FanInResult::<Option<Vec<i32>>>::NoResult {
+                errors: 1
+            }),
+            "a valid empty response plus a failed fallback must remain non-authoritative"
+        );
+        assert!(!whole_document_unit_succeeded(
+            &FanInResult::<Option<Vec<i32>>>::Cancelled
+        ));
     }
 
     #[test]
