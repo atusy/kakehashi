@@ -699,6 +699,7 @@ impl ConnectionHandle {
             "completionItem/resolve" => Some("textDocument/completion"),
             "codeLens/resolve" => Some("textDocument/codeLens"),
             "documentLink/resolve" => Some("textDocument/documentLink"),
+            "inlayHint/resolve" => Some("textDocument/inlayHint"),
             _ => None,
         };
         if let Some(parent) = dynamic_resolve_parent
@@ -790,6 +791,17 @@ impl ConnectionHandle {
                     Some(OneOf::Left(true) | OneOf::Right(_))
                 )
             }
+            "inlayHint/resolve" => match caps.inlay_hint_provider.as_ref() {
+                Some(OneOf::Right(
+                    tower_lsp_server::ls_types::InlayHintServerCapabilities::Options(options),
+                )) => options.resolve_provider == Some(true),
+                Some(OneOf::Right(
+                    tower_lsp_server::ls_types::InlayHintServerCapabilities::RegistrationOptions(
+                        options,
+                    ),
+                )) => options.inlay_hint_options.resolve_provider == Some(true),
+                _ => false,
+            },
             "textDocument/linkedEditingRange" => matches!(
                 caps.linked_editing_range_provider,
                 Some(
@@ -2973,5 +2985,67 @@ mod tests {
         }]);
 
         assert!(handle.has_capability("documentLink/resolve"));
+    }
+
+    #[tokio::test]
+    async fn inlay_hint_resolve_capability_follows_static_resolve_provider() {
+        use tower_lsp_server::ls_types::{
+            InlayHintOptions, InlayHintRegistrationOptions, InlayHintServerCapabilities,
+        };
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities {
+            inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+                InlayHintOptions {
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                },
+            ))),
+            ..Default::default()
+        });
+        assert!(handle.has_capability("inlayHint/resolve"));
+
+        let no_resolve_handle = spawn_sink_handle().await;
+        no_resolve_handle.set_server_capabilities(ServerCapabilities {
+            inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+                InlayHintOptions {
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                },
+            ))),
+            ..Default::default()
+        });
+        assert!(!no_resolve_handle.has_capability("inlayHint/resolve"));
+        assert!(no_resolve_handle.has_capability("textDocument/inlayHint"));
+
+        let registration_handle = spawn_sink_handle().await;
+        registration_handle.set_server_capabilities(ServerCapabilities {
+            inlay_hint_provider: Some(OneOf::Right(
+                InlayHintServerCapabilities::RegistrationOptions(InlayHintRegistrationOptions {
+                    inlay_hint_options: InlayHintOptions {
+                        resolve_provider: Some(true),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )),
+            ..Default::default()
+        });
+        assert!(registration_handle.has_capability("inlayHint/resolve"));
+    }
+
+    #[tokio::test]
+    async fn inlay_hint_resolve_capability_follows_dynamic_resolve_provider() {
+        use tower_lsp_server::ls_types::Registration;
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "inlay-hint-1".to_string(),
+            method: "textDocument/inlayHint".to_string(),
+            register_options: Some(serde_json::json!({ "resolveProvider": true })),
+        }]);
+
+        assert!(handle.has_capability("inlayHint/resolve"));
     }
 }

@@ -44,6 +44,30 @@
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
 //!   Used by `tests/e2e/e2e_code_lens_resolve.rs` (#355).
+//! - `inlay-hint-resolve` / `inlay-hint-resolve-replacement` — advertise
+//!   `inlayHintProvider.resolveProvider = true`; answer `textDocument/inlayHint`
+//!   with one hint (label part with a location and a command, an accept edit,
+//!   opaque `data`) for any document synced via `didOpen`, and
+//!   `inlayHint/resolve` with the lazy fields filled plus a tooltip echoing what
+//!   the request carried (position, edit range, location, command name). The
+//!   replacement variant tags its tooltip so a test can tell which process
+//!   answered.
+//! - `inlay-hint-no-resolve` / `inlay-hint-no-resolve-reserved-data` — advertise
+//!   `resolveProvider = false`; the reserved-data variant puts the bridge's own
+//!   envelope key into the hint's `data`.
+//! - `inlay-hint-delayed-resolve` / `inlay-hint-reopen-delayed-resolve` — like
+//!   `inlay-hint-resolve`, but park the resolve reply (after a
+//!   `window/logMessage` `inlay-hint-resolve-started`) until the next
+//!   `textDocument/didChange`, respectively the next `textDocument/inlayHint`.
+//! - `inlay-hint-slow-resolve` — records the resolve request and any
+//!   `$/cancelRequest` under `MOCK_LSP_CANCEL_DIR`, logs
+//!   `inlay-hint-resolve-started`, and never answers.
+//! - `inlay-hint-marker-resolve` — records the resolve request under
+//!   `MOCK_LSP_CANCEL_DIR` and answers `textDocument/hover` with the requested
+//!   URI and position, so a test can observe the virtual document a region
+//!   maps to.
+//! - `inlay-hint-escaping-resolve` — like `inlay-hint-resolve`, but the resolve
+//!   reply's accept edit ends on line 5, past any one-line region.
 //! - `document-link-no-resolve-plain-data` /
 //!   `document-link-no-resolve-reserved-data` — advertise
 //!   `documentLinkProvider` with `resolveProvider: false` and answer with a
@@ -174,6 +198,11 @@ fn main() {
     // answered, the baseline demonstrably exists — a later baseline-less full
     // request means a pull LOST it and is re-fetching.
     let mut unchanged_answered = false;
+    // The delayed inlay resolvers park the reply here: `inlay-hint-delayed-
+    // resolve` answers on the next `didChange`, `inlay-hint-reopen-delayed-
+    // resolve` on the next `textDocument/inlayHint` — a deterministic
+    // sent-state barrier for post-response freshness tests.
+    let mut pending_inlay_resolve: Option<(Option<Value>, Value)> = None;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -218,6 +247,24 @@ fn main() {
                     "document-link-no-resolve-reserved-data"
                     | "document-link-no-resolve-plain-data" => json!({
                         "documentLinkProvider": { "resolveProvider": false },
+                        "textDocumentSync": 1
+                    }),
+                    "inlay-hint-resolve"
+                    | "inlay-hint-resolve-replacement"
+                    | "inlay-hint-delayed-resolve"
+                    | "inlay-hint-reopen-delayed-resolve"
+                    | "inlay-hint-escaping-resolve"
+                    | "inlay-hint-slow-resolve" => json!({
+                        "inlayHintProvider": { "resolveProvider": true },
+                        "textDocumentSync": 1
+                    }),
+                    "inlay-hint-marker-resolve" => json!({
+                        "inlayHintProvider": { "resolveProvider": true },
+                        "hoverProvider": true,
+                        "textDocumentSync": 1
+                    }),
+                    "inlay-hint-no-resolve" | "inlay-hint-no-resolve-reserved-data" => json!({
+                        "inlayHintProvider": { "resolveProvider": false },
                         "textDocumentSync": 1
                     }),
                     "code-action" | "code-action-preferred" | "code-action-reopen-order" => json!({
@@ -468,6 +515,11 @@ fn main() {
                     if mode == "diagnostics-push-crash" {
                         std::process::exit(0);
                     }
+                    if mode == "inlay-hint-delayed-resolve"
+                        && let Some((pending_id, pending_result)) = pending_inlay_resolve.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
                 }
             }
             "textDocument/didClose" => {
@@ -574,7 +626,13 @@ fn main() {
                 }
             }
             "textDocument/hover" => {
-                let result = if mode.starts_with("will-save") {
+                let result = if mode == "inlay-hint-marker-resolve" {
+                    let observation = json!({
+                        "uri": message.pointer("/params/textDocument/uri"),
+                        "position": message.pointer("/params/position"),
+                    });
+                    json!({ "contents": observation.to_string() })
+                } else if mode.starts_with("will-save") {
                     // Report the recorded willSave/didSave state as a JSON string
                     // so the test can prove the notifications reached this server
                     // and carried the document URI it knows (#357).
@@ -1454,6 +1512,124 @@ fn main() {
                         "data": data
                     }),
                 );
+            }
+            "textDocument/inlayHint" => {
+                // `inlay-hint-reopen-delayed-resolve`: the parked resolve is
+                // answered on the next `textDocument/inlayHint`. The test
+                // sends that only after closing and reopening the host, so
+                // the reply lands after the reopen was processed upstream.
+                if mode == "inlay-hint-reopen-delayed-resolve"
+                    && let Some((pending_id, pending_result)) = pending_inlay_resolve.take()
+                {
+                    respond(&mut writer, pending_id, pending_result);
+                }
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        let data = if mode == "inlay-hint-no-resolve-reserved-data" {
+                            json!({ "kakehashi": { "origin": "downstream" } })
+                        } else {
+                            json!({ "mock": "hint-1", "uri": uri })
+                        };
+                        json!([{
+                            "position": { "line": 0, "character": 1 },
+                            "label": [{
+                                "value": ": number",
+                                "location": {
+                                    "uri": uri,
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 1 }
+                                    }
+                                },
+                                "command": { "title": "Hint", "command": "mock.hint" }
+                            }],
+                            "textEdits": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 0 }
+                                },
+                                "newText": "existing "
+                            }],
+                            "data": data
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "inlayHint/resolve" => {
+                if mode == "inlay-hint-marker-resolve" {
+                    record_mock_event(&mode, "request", &message);
+                }
+                if mode == "inlay-hint-slow-resolve" {
+                    record_mock_event(&mode, "request", &message);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 2, "message": "inlay-hint-resolve-started" }),
+                    );
+                    continue;
+                }
+                let data = message
+                    .pointer("/params/data")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let observation = json!({
+                    "receivedPosition": message.pointer("/params/position"),
+                    "receivedTextEdit": message.pointer("/params/textEdits/0/range"),
+                    "receivedLocation": message.pointer("/params/label/0/location"),
+                    "receivedCommand": message.pointer("/params/label/0/command/command"),
+                });
+                let result = json!({
+                    "position": { "line": 9, "character": 9 },
+                    "label": [{
+                        "value": ": number",
+                        "tooltip": observation.to_string(),
+                        "location": {
+                            "uri": data["uri"],
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 1 }
+                            }
+                        },
+                        "command": { "title": "Resolved hint", "command": "mock.resolved" }
+                    }],
+                    "tooltip": format!(
+                        "{} resolved:{}",
+                        if mode == "inlay-hint-resolve-replacement" {
+                            "replacement"
+                        } else {
+                            "mock"
+                        },
+                        data["mock"].as_str().unwrap_or("?")
+                    ),
+                    "textEdits": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            // `inlay-hint-escaping-resolve`: the lazily
+                            // materialized edit runs past the end of any
+                            // one-line region, so the bridge must drop it.
+                            "end": { "line": if mode == "inlay-hint-escaping-resolve" { 5 } else { 0 }, "character": 0 }
+                        },
+                        "newText": "resolved "
+                    }],
+                    "data": { "resolver": "must-not-replace-original-data" }
+                });
+                if mode == "inlay-hint-delayed-resolve"
+                    || mode == "inlay-hint-reopen-delayed-resolve"
+                {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "inlay-hint-resolve-started" }),
+                    );
+                    pending_inlay_resolve = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
             }
             "textDocument/onTypeFormatting" => {
                 // Answer with the whole-document transformation REGARDLESS of

@@ -779,7 +779,7 @@ structures with different lifetimes carry the outcome:
   through to kakehashi's ordinary resolution. The binding governs
   **every** site that derives a connection from the host URI — the
   resolve envelopes (`completionItem/resolve`, `codeAction/resolve`,
-  `codeLens/resolve`, `documentLink/resolve` — every envelope that re-derives a connection from
+  `codeLens/resolve`, `documentLink/resolve`, `inlayHint/resolve` — every envelope that re-derives a connection from
   a host URI) included, whose re-resolution would otherwise reach the
   config-root process instead of the one that produced the item
   (ls-bridge-server-pool-coordination is amended accordingly). The

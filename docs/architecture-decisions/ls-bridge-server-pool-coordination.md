@@ -47,16 +47,16 @@ The `ConnectionKey` is stored on each connection handle, so the request,
 `didChange`, host, and cancel paths route per-connection state via
 `handle.key()` without re-resolving the root.
 
-`completionItem/resolve`, `codeAction/resolve`, `codeLens/resolve`, and
-`documentLink/resolve` carry
+`completionItem/resolve`, `codeAction/resolve`, `codeLens/resolve`,
+`documentLink/resolve`, and `inlayHint/resolve` carry
 no `textDocument`, so the originating host URI is stashed in their routing
 envelopes (`KakehashiEnvelope` / `CodeActionEnvelope` / `CodeLensEnvelope` /
-`DocumentLinkEnvelope`)
+`DocumentLinkEnvelope` / `InlayHintEnvelope`)
 and used to re-resolve the same `(server, root)` connection that produced the
 item. (A legacy **completion** envelope without that field falls back to
 the client-root connection — the pre-#382 rule, and still the shipped
-behavior today, via the field's serde default; the code-action, code-lens, and
-document-link envelopes *require* the field, so a stamp-less one fails to
+behavior today, via the field's serde default; the code-action, code-lens,
+document-link, and inlay-hint envelopes *require* the field, so a stamp-less one fails to
 deserialize and the item is returned unresolved. The fail-soft rule
 below is target state that lands with bridge-routing-protocol's
 implementation.) Amended with

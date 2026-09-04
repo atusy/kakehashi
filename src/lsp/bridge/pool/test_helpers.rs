@@ -160,6 +160,29 @@ pub(in crate::lsp::bridge) async fn create_handle_accepting_textless_did_save(
     handle
 }
 
+/// Like [`create_handle_with_key`], but advertising static
+/// `inlayHintProvider.resolveProvider`, so a resolve dispatch reaches the
+/// steps after its capability check.
+pub(in crate::lsp::bridge) async fn create_handle_resolving_inlay_hints(
+    key: ConnectionKey,
+) -> Arc<ConnectionHandle> {
+    use tower_lsp_server::ls_types::{
+        InlayHintOptions, InlayHintServerCapabilities, OneOf, ServerCapabilities,
+    };
+
+    let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+    handle.set_server_capabilities(ServerCapabilities {
+        inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+            InlayHintOptions {
+                resolve_provider: Some(true),
+                ..Default::default()
+            },
+        ))),
+        ..Default::default()
+    });
+    handle
+}
+
 /// Like [`create_handle_with_key`], but also advertises `commands` as the
 /// connection's static `executeCommandProvider.commands`, and optionally records
 /// `spawned_from` as the config the connection was launched with.

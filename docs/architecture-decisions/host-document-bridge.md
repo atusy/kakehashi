@@ -29,12 +29,12 @@ Partially implemented:
   no per-method request builders or response transformers. Handlers run the
   layer walk (`Kakehashi::walk_layers`, cross-layer-aggregation,
   `preferred` semantics): layers are tried lazily in `priorities` — by default
-  virt first, host as fallback. Four methods consume per-server identity in
+  virt first, host as fallback. Five methods consume per-server identity in
   the host arm: codeAction for the `"{title} — {server}"` suffix, completion
-  for its resolve-routing envelope, and codeLens and documentLink for the
-  winning server's resolve capability and envelope. CodeAction and completion
-  build their own host arms; codeLens and documentLink use the shared
-  whole-document winner hook. Covered: definition, hover, declaration,
+  and inlayHint for their resolve-routing envelopes, and codeLens and
+  documentLink for the winning server's resolve capability and envelope.
+  CodeAction, completion, and inlayHint build their own host arms; codeLens
+  and documentLink use the shared whole-document winner hook. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
   inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
@@ -47,7 +47,7 @@ Partially implemented:
   the envelope stamped into `CompletionItem.data`; the host layer stamps one
   too (marked `host_layer`, so the resolve forwards VERBATIM — no coordinate
   translation and no injection-region edit guard). Both layers mint under
-  one rule, shared by completion, codeLens, and documentLink: for a server
+  one rule, shared by completion, codeLens, documentLink, and inlayHint: for a server
   that advertises the matching resolve method, plus the reserved-key
   exception below. Without that capability the items stay bare — an
   envelope would be pure wire weight on every item, and its resolve would
@@ -79,6 +79,21 @@ Partially implemented:
   returns the original unresolved link. Both layers bind opaque link data to
   the exact producing process: resolve never respawns or selects a replacement
   connection after a restart, configuration reroute, or pool-key change.
+  `inlayHint/resolve` follows the same exact-producer and cancellation contract.
+  The host layer forwards coordinates verbatim; the virtual layer reverses the
+  hint position, existing accept edits, and same-document label locations for
+  the request, then translates lazily materialized edits and locations back to
+  the host. Resolve merges only the protocol's lazy fields (`tooltip`,
+  `textEdits`, and label-part `tooltip` / `location` / `command`) into the
+  original hint, preserving its position, label values, kind, padding, and
+  opaque data. Every host-content revision invalidates a produced hint even
+  when the edit preserves the region's shape; this revision check runs both
+  before downstream dispatch and after its response. Runtime-adjusted region
+  geometry (`#offset!` / `#trim!`) also participates in the pre-dispatch
+  freshness check, and
+  non-contiguous combined injections fail soft before dispatch because a lazy
+  edit could otherwise cross a masked host-only gap. Safe resolves apply the
+  same all-or-nothing edit guard as initial hint retrieval.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one

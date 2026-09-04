@@ -215,6 +215,13 @@ pub(crate) struct HostRequestContext {
     pub(crate) language_id: String,
     /// The current host text, shared across per-server tasks.
     pub(crate) text: std::sync::Arc<str>,
+    /// The document lifetime `text` was read from. A downstream reply
+    /// synchronized under a later lifetime (close and reopen raced the
+    /// request) answers for text the reopened document may not hold.
+    pub(crate) incarnation: u64,
+    /// The text mutation count `text` was read at, for producers that stamp
+    /// items with the revision they were computed against.
+    pub(crate) content_version: u64,
     /// Host-capable server configs (`languages` matches the host language —
     /// `handles_language`, so a `"*"` server qualifies too), gated on the
     /// explicit `bridge._self.enabled = true` opt-in.
@@ -1213,7 +1220,17 @@ impl Kakehashi {
         // request (hover / definition / formatting / will-save / diagnostics) would
         // bail to `None` for the whole reparse window after each edit, even though
         // it forwards the real URI + text verbatim and depends on no tree.
-        let text = self.documents.get(&uri)?.text_arc();
+        // Text, lifetime and revision come from ONE store read: separate
+        // reads let a close and reopen in between pair the old text with the
+        // reopened document's stamps.
+        let (text, incarnation, content_version) = {
+            let document = self.documents.get(&uri)?;
+            (
+                document.text_arc(),
+                document.incarnation(),
+                document.content_version(),
+            )
+        };
         let language_name = self.document_language(&uri)?;
 
         let settings = self.settings_manager.load_settings();
@@ -1244,6 +1261,8 @@ impl Kakehashi {
         Some(HostRequestContext {
             uri,
             text,
+            incarnation,
+            content_version,
             language_id: language_name,
             configs,
             priorities: agg.priorities,
@@ -1310,8 +1329,9 @@ impl Kakehashi {
     /// and the virt arm already emits the client-visible "no response" LOG —
     /// only real host failures get surfaced here. That deviation is exactly
     /// why this is shared rather than written per handler: every host arm
-    /// (the verbatim raw walk above, codeAction, completion) must quiet the
-    /// same way, and three hand-copies would drift the moment the policy moves.
+    /// (the verbatim raw walk above, codeAction, completion, inlayHint) must
+    /// quiet the same way, and four hand-copies would drift the moment the
+    /// policy moves.
     ///
     /// `on_done` maps the winning fan-in payload to the handler's response —
     /// identity for the arms whose payload already IS the response, and the

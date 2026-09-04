@@ -191,7 +191,8 @@ fn build_baseline_capabilities(
 /// `completionItem.{documentationFormat, snippetSupport, deprecatedSupport,
 /// tagSupport, commitCharactersSupport, resolveSupport, insertTextModeSupport,
 /// labelDetailsSupport, preselectSupport}`, `hover.contentFormat`,
-/// `signatureHelp.signatureInformation`, `window.workDoneProgress`,
+/// `signatureHelp.signatureInformation`, `inlayHint.resolveSupport`,
+/// `window.workDoneProgress`,
 /// `window.showDocument`, `window.showMessage`,
 /// `workspace.workspaceEdit` (mirrored minus `changeAnnotationSupport` — see
 /// the merge site for why annotations are withheld), and `workspace.applyEdit`
@@ -343,6 +344,21 @@ fn merge_upstream_capabilities(
                 &mut base_sig_info.active_parameter_support,
                 upstream_sig_info.active_parameter_support,
             );
+        }
+
+        // The bridge can translate every standard lazy inlay-hint property,
+        // but the editor ultimately consumes it. Forward only the editor's
+        // declared property set so downstream servers choose eager vs lazy
+        // materialization honestly.
+        if let Some(resolve_support) = upstream_td
+            .inlay_hint
+            .as_ref()
+            .and_then(|capability| capability.resolve_support.clone())
+        {
+            base_td
+                .inlay_hint
+                .get_or_insert_with(Default::default)
+                .resolve_support = Some(resolve_support);
         }
     }
 
@@ -711,6 +727,44 @@ mod tests {
         assert_eq!(item.preselect_support, Some(true));
         // Bridge-controlled field must remain unchanged
         assert_eq!(item.insert_replace_support, Some(true));
+    }
+
+    #[test]
+    fn merge_propagates_inlay_hint_resolve_properties() {
+        use tower_lsp_server::ls_types::{
+            InlayHintClientCapabilities, InlayHintResolveClientCapabilities,
+            TextDocumentClientCapabilities,
+        };
+
+        let properties = vec![
+            "tooltip".to_string(),
+            "textEdits".to_string(),
+            "label.location".to_string(),
+            "label.command".to_string(),
+        ];
+        let upstream = ClientCapabilities {
+            text_document: Some(TextDocumentClientCapabilities {
+                inlay_hint: Some(InlayHintClientCapabilities {
+                    resolve_support: Some(InlayHintResolveClientCapabilities {
+                        properties: properties.clone(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = build_bridge_client_capabilities(Some(&upstream), true, false);
+        assert_eq!(
+            merged
+                .text_document
+                .as_ref()
+                .and_then(|td| td.inlay_hint.as_ref())
+                .and_then(|hint| hint.resolve_support.as_ref())
+                .map(|support| support.properties.as_slice()),
+            Some(properties.as_slice())
+        );
     }
 
     #[test]

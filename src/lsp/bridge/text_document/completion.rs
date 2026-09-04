@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::settings::BridgeServerConfig;
-use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope};
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope, wrap_envelope};
 use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position};
 use url::Url;
 
@@ -544,33 +544,7 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
         region_end: ctx.region_end.map(|end| (end.line, end.character)),
         host_layer: ctx.host_layer,
     };
-    item.data = Some(wrap_envelope(envelope, inner));
-}
-
-/// Serialize an envelope into `{"kakehashi": {…}}`, MOVING the downstream's
-/// own `data` into `inner`.
-///
-/// The obvious `json!({ ENVELOPE_KEY: envelope })` would serialize `inner`
-/// through `Serialize`, i.e. deep-copy the downstream's `data` — once per
-/// item, on a response the client re-requests on every keystroke. Serializing
-/// the envelope with `inner: None` (skipped on the wire) and inserting the
-/// moved value afterwards costs one map insert instead.
-fn wrap_envelope(envelope: KakehashiEnvelope, inner: Option<Value>) -> Value {
-    debug_assert!(
-        envelope.inner.is_none(),
-        "inner must be moved in, not serialized"
-    );
-    let mut wrapped = serde_json::to_value(envelope).unwrap_or(Value::Null);
-    if let Some(inner) = inner
-        && let Some(fields) = wrapped.as_object_mut()
-    {
-        fields.insert("inner".to_string(), inner);
-    }
-    // Built by hand rather than `json!`, which would deep-copy `wrapped`
-    // (including the `inner` we just moved in) back out through `Serialize`.
-    let mut outer = serde_json::Map::with_capacity(1);
-    outer.insert(ENVELOPE_KEY.to_string(), wrapped);
-    Value::Object(outer)
+    item.data = Some(wrap_envelope(&envelope, inner));
 }
 
 /// Apply the HOST-layer completion policy to a host response (#958): envelope
@@ -631,7 +605,7 @@ pub(super) fn envelope_host_item(item: &mut CompletionItem, server_name: &str, h
         region_end: None,
         host_layer: true,
     };
-    item.data = Some(wrap_envelope(envelope, inner));
+    item.data = Some(wrap_envelope(&envelope, inner));
 }
 
 /// Extract the envelope from a completion item's `data` without modifying the item.

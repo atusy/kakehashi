@@ -233,7 +233,21 @@ selection, and always combined with `preferred` — the sequential
 Shows inline hints (types, parameter names) for the embedded block overlapping the
 requested range. A hint whose accept-time text edits would corrupt the host
 document around the embedded block is served without them (the edits drop as
-one atomic set). Default combine strategy: `preferred`.
+one atomic set). Label-part commands are re-keyed so `workspace/executeCommand`
+routes them back to the producing server (the re-keyed names are not
+registered, so a client that only dispatches registered command ids shows the
+part without running its command, as for bridged code actions), and a label
+part whose location points into another embedded block keeps its text but
+loses the location.
+Lazy hints can be completed through `inlayHint/resolve`; the
+request returns to the exact downstream process that produced the hint. A hint
+remains unresolved after any host-content revision (including same-size edits),
+region movement or invalidation observed before the request is forwarded,
+document reopen, or downstream replacement.
+Resolve is also rejected for non-contiguous injections, where lazy edits could
+cross masked gaps. Runtime query offsets such as frontmatter `#offset!` are
+included in the freshness and coordinate checks. Default combine strategy:
+`preferred`.
 
 ### Moniker
 

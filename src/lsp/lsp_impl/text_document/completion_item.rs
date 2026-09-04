@@ -78,7 +78,7 @@ impl Kakehashi {
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             return false;
         };
-        let Some((offset, region_end, contiguous)) = resolve_region_offset(
+        let Some((offset, region_end, contiguous, _)) = resolve_region_offset(
             &self.documents,
             &self.language,
             &self.bridge,
