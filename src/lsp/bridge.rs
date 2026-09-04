@@ -85,12 +85,12 @@ pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_hos
 pub(crate) use text_document::{
     CallHierarchyDocumentRevision, CallHierarchyEnvelope, CodeActionEnvelope, EnvelopeOffset,
     InlayHintDocumentRevision, InlayHintEnvelope, KakehashiEnvelope, TypeHierarchyDocumentRevision,
-    UpstreamCodeActionCaps, bridge_code_actions, bridge_host_completion_items,
-    envelope_host_call_hierarchy_items, envelope_host_code_lenses, envelope_host_document_links,
-    envelope_host_inlay_hints, envelope_host_type_hierarchy_items, extract_call_hierarchy_envelope,
-    extract_code_action_envelope, extract_code_lens_envelope, extract_document_link_envelope,
-    extract_envelope, extract_inlay_hint_envelope, parse_code_actions_leniently,
-    parse_type_hierarchy_items,
+    TypeHierarchyEnvelope, UpstreamCodeActionCaps, bridge_code_actions,
+    bridge_host_completion_items, envelope_host_call_hierarchy_items, envelope_host_code_lenses,
+    envelope_host_document_links, envelope_host_inlay_hints, envelope_host_type_hierarchy_items,
+    extract_call_hierarchy_envelope, extract_code_action_envelope, extract_code_lens_envelope,
+    extract_document_link_envelope, extract_envelope, extract_inlay_hint_envelope,
+    extract_type_hierarchy_envelope, parse_code_actions_leniently, parse_type_hierarchy_items,
 };
 pub(crate) use text_document::{OpenExpectation, OpenOutcome};
 pub(crate) use workspace::WorkspaceFolderSet;

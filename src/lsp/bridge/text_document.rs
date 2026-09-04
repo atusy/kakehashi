@@ -61,5 +61,6 @@ pub(in crate::lsp::bridge) mod test_helpers;
 mod type_definition;
 mod type_hierarchy;
 pub(crate) use type_hierarchy::{
-    TypeHierarchyDocumentRevision, envelope_host_type_hierarchy_items, parse_type_hierarchy_items,
+    TypeHierarchyDocumentRevision, TypeHierarchyEnvelope, envelope_host_type_hierarchy_items,
+    extract_type_hierarchy_envelope, parse_type_hierarchy_items,
 };
