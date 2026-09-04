@@ -200,18 +200,21 @@ pub(super) async fn apply_shared_settings_locked(
     } else {
         Vec::new()
     };
+    // Second bump IMMEDIATELY after the query swap, before any await and
+    // BEFORE the reload guard is released: a request that started after the
+    // transitional bump above but before the swap computed against the OLD
+    // queries yet stamped the new generation — without this bump those
+    // products would be accepted as current for the whole awaited propagate
+    // below, and a publish landing between the guard's release and the bump
+    // would be accepted by readers that treat "no reload in progress" plus a
+    // current stamp as settled. (The final bump after apply_settings covers
+    // the settings-side inputs the apply swaps.)
+    cache.bump_semantic_token_generation();
     // Invalidate again after the synchronous swap: the first bump rejects
     // pre-reload checkouts, while this one rejects parsers acquired while the
     // registry and query stores were being replaced.
     drop(parser_reload);
     crate::analysis::semantic::invalidate_thread_local_parser_caches();
-    // Second bump IMMEDIATELY after the query swap, before any await: a
-    // request that started after the transitional bump above but before the
-    // swap computed against the OLD queries yet stamped the new generation —
-    // without this bump those products would be accepted as current for the
-    // whole awaited propagate below. (The final bump after apply_settings
-    // covers the settings-side inputs the apply swaps.)
-    cache.bump_semantic_token_generation();
     // Publish the settings snapshot before invalidating downstream connections:
     // once propagation exposes a pool miss, a concurrent request must resolve
     // the NEW launch config rather than respawn from the old snapshot (#587).
