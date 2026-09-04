@@ -14,7 +14,9 @@ pub(in crate::lsp::bridge) use crate::config::settings::BridgeServerConfig;
 
 use crate::lsp::bridge::actor::{ResponseRouter, spawn_reader_task};
 use crate::lsp::bridge::connection::AsyncBridgeConnection;
-use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionKey, ConnectionState, UpstreamId};
+use crate::lsp::bridge::pool::{
+    ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId,
+};
 use crate::lsp::bridge::protocol::RequestId;
 
 // Test ULID constants - valid 26-char alphanumeric strings matching ULID format.
@@ -138,6 +140,93 @@ pub(crate) async fn create_handle_with_key(
     key: ConnectionKey,
 ) -> Arc<ConnectionHandle> {
     create_handle_with_state_and_pid_keyed(state, key).await.0
+}
+
+pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_symbols(
+    key: ConnectionKey,
+) -> Arc<ConnectionHandle> {
+    create_handle_advertising_workspace_symbols_with_state(ConnectionState::Ready, key).await
+}
+
+pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_symbols_with_initial_folders(
+    key: ConnectionKey,
+) -> Arc<ConnectionHandle> {
+    use tower_lsp_server::ls_types::{
+        OneOf, ServerCapabilities, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+        WorkspaceSymbolOptions,
+    };
+
+    let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+    handle.set_server_capabilities(ServerCapabilities {
+        workspace_symbol_provider: Some(OneOf::Right(WorkspaceSymbolOptions {
+            resolve_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
+        workspace: Some(WorkspaceServerCapabilities {
+            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                change_notifications: None,
+            }),
+            file_operations: None,
+        }),
+        ..Default::default()
+    });
+    handle
+}
+
+pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_symbols_with_folder_changes(
+    key: ConnectionKey,
+) -> Arc<ConnectionHandle> {
+    use tower_lsp_server::ls_types::{
+        OneOf, ServerCapabilities, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+        WorkspaceSymbolOptions,
+    };
+
+    let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+    handle.set_server_capabilities(ServerCapabilities {
+        workspace_symbol_provider: Some(OneOf::Right(WorkspaceSymbolOptions {
+            resolve_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
+        workspace: Some(WorkspaceServerCapabilities {
+            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                change_notifications: Some(OneOf::Left(true)),
+            }),
+            file_operations: None,
+        }),
+        ..Default::default()
+    });
+    handle
+}
+
+pub(in crate::lsp::bridge) async fn create_handle_advertising_workspace_symbols_with_state(
+    state: ConnectionState,
+    key: ConnectionKey,
+) -> Arc<ConnectionHandle> {
+    use tower_lsp_server::ls_types::{OneOf, ServerCapabilities, WorkspaceSymbolOptions};
+
+    let handle = create_handle_with_key(state, key).await;
+    handle.set_server_capabilities(ServerCapabilities {
+        workspace_symbol_provider: Some(OneOf::Right(WorkspaceSymbolOptions {
+            resolve_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
+        ..Default::default()
+    });
+    handle
+}
+
+pub(in crate::lsp::bridge) fn seed_test_client_root(pool: &LanguageServerPool, root: &str) {
+    pool.set_root_uri(Some(root.to_owned()));
+}
+
+pub(in crate::lsp::bridge) fn record_test_spawn_root(handle: &ConnectionHandle, root: &str) {
+    handle.record_spawn_root(Some(root.to_owned()));
+}
+
+pub(in crate::lsp::bridge) fn transition_handle_to_ready(handle: &ConnectionHandle) -> bool {
+    handle.transition_initializing_to_ready()
 }
 
 pub(in crate::lsp::bridge) async fn create_handle_accepting_textless_did_save(

@@ -227,7 +227,11 @@ impl InjectionCoordinator {
         let edit_lock = self.documents.edit_lock(uri);
         let _lifecycle_guard = edit_lock.lock().await;
         after_lifecycle_lock.await;
-        let Some(incarnation) = self.documents.get(uri).map(|doc| doc.incarnation()) else {
+        let Some((incarnation, content_version)) = self
+            .documents
+            .get(uri)
+            .map(|doc| (doc.incarnation(), doc.content_version()))
+        else {
             self.bridge.cancel_eager_open(uri);
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
             return false;
@@ -256,11 +260,14 @@ impl InjectionCoordinator {
                 .evict_source(uri, &DiagnosticSource::Region(region_id));
         }
 
-        if forward_did_change {
-            self.bridge
-                .forward_didchange_to_opened_docs(uri, incarnation, &injections)
-                .await;
-        }
+        self.publish_virtual_contents(
+            uri,
+            incarnation,
+            content_version,
+            &injections,
+            forward_did_change,
+        )
+        .await;
 
         let languages: HashSet<String> =
             injections.iter().map(|inj| inj.language.clone()).collect();
@@ -315,6 +322,31 @@ impl InjectionCoordinator {
                 .await;
         });
         true
+    }
+
+    async fn publish_virtual_contents(
+        &self,
+        uri: &Url,
+        incarnation: u64,
+        content_version: u64,
+        injections: &[BridgeInjection],
+        forward_did_change: bool,
+    ) {
+        if forward_did_change {
+            self.bridge
+                .forward_didchange_to_opened_docs(uri, incarnation, content_version, injections)
+                .await;
+        } else {
+            // Initial didOpen has no downstream didChange to forward, but eager
+            // didOpen still needs the host revision that workspace-wide results
+            // use to project virtual locations safely.
+            self.bridge.record_latest_virtual_contents(
+                uri,
+                incarnation,
+                content_version,
+                injections,
+            );
+        }
     }
 
     /// Check injected languages and handle missing parsers: auto-install when enabled,
@@ -613,7 +645,7 @@ fn parser_enabled_injection_language(language: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parser_enabled_injection_language;
+    use super::{BridgeInjection, parser_enabled_injection_language};
 
     #[test]
     fn explicit_plaintext_does_not_request_a_parser() {
@@ -742,6 +774,44 @@ mod tests {
         assert!(
             !token.is_cancelled(),
             "a stale pass must not cancel the reopened lifetime's eager batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_injection_pass_publishes_virtual_host_identity() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///initial-injection.md").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "host".to_owned(),
+            Some("markdown".to_owned()),
+            None,
+        );
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        server.bridge.open_host_incarnation(&uri, incarnation).await;
+        let injection = BridgeInjection {
+            language: "lua".to_owned(),
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            content: "print('ready')".to_owned(),
+        };
+
+        server
+            .injection_coordinator()
+            .publish_virtual_contents(
+                &uri,
+                incarnation,
+                content_version,
+                std::slice::from_ref(&injection),
+                false,
+            )
+            .await;
+
+        assert_eq!(
+            server
+                .bridge
+                .latest_virtual_content_for_test(&uri, &injection),
+            Some((injection.content, (incarnation, content_version)))
         );
     }
 

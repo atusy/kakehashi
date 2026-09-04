@@ -38,15 +38,15 @@ impl Kakehashi {
         // the project config layer for a session whose folder list is empty,
         // and reparsing every open document plus a semantic-tokens refresh is
         // a high price for a notification that said nothing.
-        if !self
+        let Some(workspace_change) = self
             .bridge
             .pool()
             .apply_workspace_folder_change(added, &removed)
             .await
-        {
+        else {
             drop(reload);
             return;
-        }
+        };
 
         // The change above recycles client-fallback connections, which is
         // exactly where a `forceStart` warm-up lives — it has no document, so
@@ -121,10 +121,12 @@ impl Kakehashi {
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 self.settings_manager.set_root_path(root_path);
                 self.apply_raw_settings_locked(&reload, raw, settings).await;
+                workspace_change.finish();
                 drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
             }
             Err(error) => {
+                workspace_change.finish();
                 drop(reload);
                 self.notifier()
                     .log_warning(format!(

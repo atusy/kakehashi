@@ -27,6 +27,7 @@ fn build_baseline_capabilities(
         SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
         SemanticTokensFullOptions, SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
         TextDocumentSyncClientCapabilities, TokenFormat, WorkspaceClientCapabilities,
+        WorkspaceSymbolClientCapabilities,
     };
 
     let goto_link = Some(GotoCapability {
@@ -179,6 +180,10 @@ fn build_baseline_capabilities(
             }),
             diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
                 refresh_support: Some(true),
+            }),
+            symbol: Some(WorkspaceSymbolClientCapabilities {
+                dynamic_registration: Some(false),
+                ..Default::default()
             }),
             // The bridge sends InitializeParams.workspaceFolders (upstream
             // passthrough or the workspaceMarkers-derived folder), which LSP makes
@@ -424,6 +429,41 @@ fn merge_upstream_capabilities(
             .workspace_edit = Some(mirrored);
     }
 
+    // The bridge can route workspaceSymbol/resolve, but it only merges the lazy
+    // `location.range` property. Advertise that property only when the editor
+    // will actually issue the resolve; withhold every property the bridge
+    // cannot preserve across its origin envelope.
+    if let Some(upstream_symbol) = upstream
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.symbol.as_ref())
+    {
+        let base_symbol = base
+            .workspace
+            .get_or_insert_with(Default::default)
+            .symbol
+            .get_or_insert_with(Default::default);
+        merge_option(
+            &mut base_symbol.symbol_kind,
+            upstream_symbol.symbol_kind.clone(),
+        );
+        merge_option(
+            &mut base_symbol.tag_support,
+            upstream_symbol.tag_support.clone(),
+        );
+        if upstream_symbol
+            .resolve_support
+            .as_ref()
+            .is_some_and(|support| support.properties.iter().any(|p| p == "location.range"))
+        {
+            base_symbol.resolve_support = Some(
+                tower_lsp_server::ls_types::WorkspaceSymbolResolveSupportCapability {
+                    properties: vec!["location.range".into()],
+                },
+            );
+        }
+    }
+
     // --- workspace.applyEdit (gated on real upstream support) ---
     // The bridge can only relay a downstream `workspace/applyEdit` to an
     // editor that declared the capability itself; advertising it regardless
@@ -560,6 +600,66 @@ mod tests {
             .expect("the bridge must advertise type-hierarchy support downstream");
 
         assert_eq!(type_hierarchy.dynamic_registration, Some(false));
+    }
+
+    #[test]
+    fn workspace_symbol_resolve_support_is_gated_and_narrowed_by_the_editor() {
+        use tower_lsp_server::ls_types::{
+            SymbolKind, SymbolKindCapability, SymbolTag, TagSupport, WorkspaceClientCapabilities,
+            WorkspaceSymbolClientCapabilities, WorkspaceSymbolResolveSupportCapability,
+        };
+
+        let baseline = build_bridge_client_capabilities(None, true, false);
+        let baseline_symbol = baseline
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.symbol.as_ref())
+            .expect("workspace symbol search must be advertised downstream");
+        assert_eq!(baseline_symbol.dynamic_registration, Some(false));
+        assert_eq!(baseline_symbol.resolve_support, None);
+
+        let resolve_support = WorkspaceSymbolResolveSupportCapability {
+            properties: vec!["containerName".into(), "location.range".into()],
+        };
+        let upstream = ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                symbol: Some(WorkspaceSymbolClientCapabilities {
+                    symbol_kind: Some(SymbolKindCapability {
+                        value_set: Some(vec![SymbolKind::TYPE_PARAMETER]),
+                    }),
+                    tag_support: Some(TagSupport {
+                        value_set: vec![SymbolTag::DEPRECATED],
+                    }),
+                    resolve_support: Some(resolve_support.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = build_bridge_client_capabilities(Some(&upstream), true, false);
+        assert_eq!(
+            merged
+                .workspace
+                .as_ref()
+                .unwrap()
+                .symbol
+                .as_ref()
+                .unwrap()
+                .resolve_support,
+            Some(WorkspaceSymbolResolveSupportCapability {
+                properties: vec!["location.range".into()],
+            })
+        );
+        let symbol = merged.workspace.unwrap().symbol.unwrap();
+        assert_eq!(
+            symbol.symbol_kind.unwrap().value_set,
+            Some(vec![SymbolKind::TYPE_PARAMETER])
+        );
+        assert_eq!(
+            symbol.tag_support.unwrap().value_set,
+            vec![SymbolTag::DEPRECATED]
+        );
     }
 
     #[test]

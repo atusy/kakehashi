@@ -158,6 +158,10 @@ pub(crate) struct DocumentTracker {
     /// Keyed by connection (not language) to enable process sharing while
     /// keeping per-root connections distinct.
     document_versions: Mutex<HashMap<ConnectionKey, HashMap<String, i32>>>,
+    /// Revisions whose didOpen/didChange was confirmed enqueued. Unlike
+    /// `document_versions`, this never advances for a dropped notification.
+    confirmed_document_versions:
+        Mutex<HashMap<ConnectionKey, HashMap<String, ConfirmedDocumentRevision>>>,
     /// Map of connection key → (virtual document URI → fingerprint of the content
     /// last sent to that connection). Lets the virt sync skip re-sending `didChange`
     /// when a host edit didn't change a region's extracted content (mirrors the
@@ -204,6 +208,12 @@ pub(crate) struct DocumentTracker {
     connection_generations: DashMap<ConnectionKey, u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConfirmedDocumentRevision {
+    pub(crate) version: i32,
+    pub(crate) host_identity: Option<(u64, u64)>,
+}
+
 impl DocumentTracker {
     /// Create a new DocumentTracker with empty state.
     ///
@@ -212,6 +222,7 @@ impl DocumentTracker {
     pub(crate) fn new() -> Self {
         Self {
             document_versions: Mutex::new(HashMap::new()),
+            confirmed_document_versions: Mutex::new(HashMap::new()),
             document_fingerprints: std::sync::Mutex::new(HashMap::new()),
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
@@ -482,6 +493,8 @@ impl DocumentTracker {
             self.mark_open_sent(virtual_uri, connection_key, generation, &claim)
                 .await
         );
+        self.record_sent_content_fingerprint(virtual_uri, connection_key, "", 1, None)
+            .await;
     }
 
     /// Register close-cleanup ownership without exposing the document to
@@ -606,6 +619,36 @@ impl DocumentTracker {
         Some(version)
     }
 
+    #[cfg(test)]
+    pub(super) async fn confirmed_document_versions_for_connection(
+        &self,
+        connection_key: &ConnectionKey,
+    ) -> HashMap<String, i32> {
+        self.confirmed_document_versions
+            .lock()
+            .await
+            .get(connection_key)
+            .map(|documents| {
+                documents
+                    .iter()
+                    .map(|(uri, revision)| (uri.clone(), revision.version))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(super) async fn confirmed_document_revisions_for_connection(
+        &self,
+        connection_key: &ConnectionKey,
+    ) -> HashMap<String, ConfirmedDocumentRevision> {
+        self.confirmed_document_versions
+            .lock()
+            .await
+            .get(connection_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Like [`Self::increment_document_version`], but a no-op (`None`) when
     /// `content` is unchanged since the last `didChange` sent to this connection
     /// for this virtual document — so a host edit that doesn't alter a region's
@@ -662,23 +705,86 @@ impl DocumentTracker {
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
         content: &str,
+        confirmed_version: i32,
+        host_identity: Option<(u64, u64)>,
     ) {
         let uri_string = virtual_uri.to_uri_string();
         let fp = content_fingerprint(content);
-        let mut fingerprints = self
+        {
+            let mut fingerprints = self
+                .document_fingerprints
+                .lock()
+                .recover_poison("DocumentTracker::document_fingerprints");
+            // Clone the connection key only when first inserting it (common path: the
+            // connection is already present, so look up by borrow).
+            if let Some(docs) = fingerprints.get_mut(connection_key) {
+                docs.insert(uri_string, fp);
+            } else {
+                fingerprints
+                    .entry(connection_key.clone())
+                    .or_default()
+                    .insert(uri_string, fp);
+            }
+        }
+        self.confirmed_document_versions
+            .lock()
+            .await
+            .entry(connection_key.clone())
+            .or_default()
+            .insert(
+                virtual_uri.to_uri_string(),
+                ConfirmedDocumentRevision {
+                    version: confirmed_version,
+                    host_identity,
+                },
+            );
+    }
+
+    pub(super) async fn refresh_confirmed_host_identity_if_content_unchanged(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: &str,
+        host_identity: (u64, u64),
+    ) -> bool {
+        let uri = virtual_uri.to_uri_string();
+        let fingerprint = content_fingerprint(content);
+        let unchanged = self
             .document_fingerprints
             .lock()
-            .recover_poison("DocumentTracker::document_fingerprints");
-        // Clone the connection key only when first inserting it (common path: the
-        // connection is already present, so look up by borrow).
-        if let Some(docs) = fingerprints.get_mut(connection_key) {
-            docs.insert(uri_string, fp);
-        } else {
-            fingerprints
-                .entry(connection_key.clone())
-                .or_default()
-                .insert(uri_string, fp);
+            .recover_poison("DocumentTracker::refresh_confirmed_host_identity_if_content_unchanged")
+            .get(connection_key)
+            .and_then(|documents| documents.get(&uri))
+            == Some(&fingerprint);
+        if !unchanged {
+            return false;
         }
+        let confirmed_version = {
+            let mut revisions = self.confirmed_document_versions.lock().await;
+            let Some(revision) = revisions
+                .get_mut(connection_key)
+                .and_then(|documents| documents.get_mut(&uri))
+            else {
+                return false;
+            };
+            revision.host_identity = Some(host_identity);
+            revision.version
+        };
+
+        // A failed enqueue may have bumped the raw counter without advancing the
+        // downstream. If a later host edit restores the last confirmed content, no
+        // didChange is needed; discard that unused bump so response fences compare
+        // against the version the downstream actually has.
+        if let Some(version) = self
+            .document_versions
+            .lock()
+            .await
+            .get_mut(connection_key)
+            .and_then(|documents| documents.get_mut(&uri))
+        {
+            *version = confirmed_version;
+        }
+        true
     }
 
     /// Remove a document from `document_versions` and `opened_documents`.
@@ -702,6 +808,14 @@ impl DocumentTracker {
             .document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::document_fingerprints")
+            .get_mut(connection_key)
+        {
+            docs.remove(&uri_string);
+        }
+        if let Some(docs) = self
+            .confirmed_document_versions
+            .lock()
+            .await
             .get_mut(connection_key)
         {
             docs.remove(&uri_string);
@@ -752,6 +866,10 @@ impl DocumentTracker {
         self.document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::document_fingerprints")
+            .remove(connection_key);
+        self.confirmed_document_versions
+            .lock()
+            .await
             .remove(connection_key);
         for uri in &uris {
             self.decrement_opened(uri);
@@ -855,6 +973,14 @@ impl DocumentTracker {
             .document_fingerprints
             .lock()
             .recover_poison("DocumentTracker::rollback_open_claim_if")
+            .get_mut(connection_key)
+        {
+            docs.remove(&uri_string);
+        }
+        if let Some(docs) = self
+            .confirmed_document_versions
+            .lock()
+            .await
             .get_mut(connection_key)
         {
             docs.remove(&uri_string);
@@ -1556,7 +1682,7 @@ mod tests {
             "first didChange sends and bumps the version"
         );
         tracker
-            .record_sent_content_fingerprint(&virtual_uri, &conn, "local x = 1")
+            .record_sent_content_fingerprint(&virtual_uri, &conn, "local x = 1", 2, None)
             .await;
         // Same content now recorded-as-sent → skip (no bump, no re-send).
         assert_eq!(
@@ -1573,6 +1699,118 @@ mod tests {
                 .await,
             Some(3),
             "changed content sends and bumps"
+        );
+    }
+
+    #[tokio::test]
+    async fn sent_fingerprint_records_the_version_that_was_enqueued() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/enqueued-version.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+
+        assert_eq!(
+            tracker
+                .increment_document_version(&virtual_uri, &conn)
+                .await,
+            Some(2),
+            "an overlapping edit may advance the raw counter after didOpen enqueue"
+        );
+        tracker
+            .record_sent_content_fingerprint(&virtual_uri, &conn, "opened", 1, None)
+            .await;
+
+        assert_eq!(
+            tracker
+                .confirmed_document_versions_for_connection(&conn)
+                .await
+                .get(&virtual_uri.to_uri_string()),
+            Some(&1),
+            "confirmation must retain didOpen's enqueued version instead of rereading the newer raw counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_revision_couples_wire_version_and_host_identity() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/confirmed-host.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+        tracker
+            .record_sent_content_fingerprint(&virtual_uri, &conn, "unchanged", 1, Some((7, 3)))
+            .await;
+        assert!(
+            tracker
+                .refresh_confirmed_host_identity_if_content_unchanged(
+                    &virtual_uri,
+                    &conn,
+                    "unchanged",
+                    (7, 4),
+                )
+                .await
+        );
+
+        assert_eq!(
+            tracker
+                .confirmed_document_revisions_for_connection(&conn)
+                .await
+                .get(&virtual_uri.to_uri_string()),
+            Some(&ConfirmedDocumentRevision {
+                version: 1,
+                host_identity: Some((7, 4)),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_sent_content_reconciles_a_version_bumped_by_a_dropped_change() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/reverted-after-drop.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+        tracker
+            .record_sent_content_fingerprint(&virtual_uri, &conn, "original", 1, Some((7, 1)))
+            .await;
+
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "dropped")
+                .await,
+            Some(2),
+        );
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "original")
+                .await,
+            None,
+            "the downstream already has the restored content"
+        );
+        assert!(
+            tracker
+                .refresh_confirmed_host_identity_if_content_unchanged(
+                    &virtual_uri,
+                    &conn,
+                    "original",
+                    (7, 3),
+                )
+                .await
+        );
+
+        assert_eq!(
+            tracker
+                .document_version(&virtual_uri.to_uri_string(), &conn)
+                .await,
+            Some(1),
+            "the unsent raw version must return to the downstream's confirmed version"
         );
     }
 

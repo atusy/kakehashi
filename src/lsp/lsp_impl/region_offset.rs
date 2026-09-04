@@ -80,7 +80,7 @@ impl Kakehashi {
 /// whether the virtual content maps to one contiguous host span; the fourth
 /// is the region's live injection language, so a resolve gate can refuse an
 /// envelope whose echoed language no longer names this region.
-pub(super) fn resolve_region_offset(
+pub(crate) fn resolve_region_offset(
     documents: &DocumentStore,
     language: &Arc<LanguageCoordinator>,
     bridge: &BridgeCoordinator,

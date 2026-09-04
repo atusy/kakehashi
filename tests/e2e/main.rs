@@ -74,3 +74,4 @@ mod e2e_synthetic_push_diagnostic;
 mod e2e_type_hierarchy;
 mod e2e_window_notifications;
 mod e2e_workspace_folder_config;
+mod e2e_workspace_symbol;

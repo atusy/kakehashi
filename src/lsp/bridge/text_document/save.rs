@@ -61,20 +61,16 @@ impl LanguageServerPool {
         &self,
         host_uri: &Url,
         incarnation: u64,
+        content_version: u64,
         injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
     ) {
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
             return;
         };
 
+        self.record_latest_virtual_contents(host_uri, incarnation, content_version, injections);
+
         for injection in injections {
-            self.record_latest_virtual_content(
-                host_uri,
-                incarnation,
-                &injection.language,
-                &injection.region_id,
-                &injection.content,
-            );
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
             let connection_keys = self.connections_opening_or_opened(&virtual_uri);
@@ -127,11 +123,20 @@ impl LanguageServerPool {
                             &virtual_uri,
                             &connection_key,
                             &injection.content,
+                            version,
+                            Some((incarnation, content_version)),
                         )
                         .await;
                     }
                     Some(outcome)
                 } else {
+                    self.refresh_confirmed_host_identity_if_content_unchanged(
+                        &virtual_uri,
+                        &connection_key,
+                        &injection.content,
+                        (incarnation, content_version),
+                    )
+                    .await;
                     None
                 };
 
@@ -261,7 +266,7 @@ mod tests {
             VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
         pool.register_opened_document(&host_uri, &virtual_uri, &key)
             .await;
-        pool.record_sent_content_fingerprint(&virtual_uri, &key, &injection.content)
+        pool.record_sent_content_fingerprint(&virtual_uri, &key, &injection.content, 1, None)
             .await;
 
         let transition = pool.open_transition_lock(&virtual_uri, &key);
@@ -271,7 +276,7 @@ mod tests {
         let task_uri = host_uri.clone();
         let task = tokio::spawn(async move {
             task_pool
-                .sync_and_forward_did_save_to_virtual_docs(&task_uri, 1, &[task_injection])
+                .sync_and_forward_did_save_to_virtual_docs(&task_uri, 1, 0, &[task_injection])
                 .await;
         });
 
@@ -297,6 +302,46 @@ mod tests {
                 .await
                 .is_ok(),
             "connection guard must release after the combined save transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_virtual_save_refreshes_confirmed_host_identity() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("save");
+        let handle = test_helpers::create_handle_accepting_textless_did_save(key.clone()).await;
+        pool.insert_connection(handle).await;
+        let host = Url::parse("file:///test/save.md").unwrap();
+        let injection = BridgeInjection {
+            language: "lua".into(),
+            region_id: ulid::Ulid::generate().to_string(),
+            content: "print(1)".into(),
+        };
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            &injection.language,
+            &injection.region_id,
+        );
+        pool.register_opened_document(&host, &virtual_uri, &key)
+            .await;
+        pool.record_sent_content_fingerprint(
+            &virtual_uri,
+            &key,
+            &injection.content,
+            1,
+            Some((1, 1)),
+        )
+        .await;
+
+        pool.sync_and_forward_did_save_to_virtual_docs(&host, 1, 2, &[injection])
+            .await;
+
+        assert_eq!(
+            pool.confirmed_virtual_document_revisions_for_connection(&key)
+                .await
+                .get(&virtual_uri.to_uri_string())
+                .and_then(|revision| revision.host_identity),
+            Some((1, 2))
         );
     }
 }

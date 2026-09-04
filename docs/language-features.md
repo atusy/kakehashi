@@ -685,13 +685,53 @@ type CapturesDelta = {
   beyond `[A-Za-z0-9_-]+`) is a client error, returned as JSON-RPC
   `InvalidParams`.
 
+## Workspace symbols
+
+`workspace/symbol` searches every configured, runnable language server in the
+client workspace, including servers that have not yet been started by opening a
+document. Results from all capable servers are combined in stable server-name
+order. Legacy `SymbolInformation` results are normalized to `WorkspaceSymbol`.
+For a `preferSharedInstance` server that cannot follow workspace-folder
+changes, searches use a client-root fallback instead of a shared process that
+may have been initialized from one document's marker root.
+
+Servers that cannot follow workspace-folder changes are queried once per
+explicit root. If overlapping roots return the same symbol from that server,
+Kakehashi removes exact duplicates while treating the server's original opaque
+`data` as part of symbol identity; the first duplicate's resolve route is kept.
+Results from different configured servers remain distinct.
+
+An explicit empty `workspaceFolders` list searches no workspace producer;
+`rootUri` is used only when the folder list is absent. Legacy eager results stay
+as `SymbolInformation` for clients without deprecated-tag support, preserving
+the legacy `deprecated` field. Locations that name an exact virtual document
+issued to their producer are translated to the host URI and injection offset;
+stale or closed virtual-document results are dropped, and lazy resolve performs
+the same translation on the resolved range.
+
+When a downstream server supports `workspaceSymbol/resolve`, returned symbols
+carry opaque routing data so a later resolve reaches the same downstream
+process, provided the editor's
+`workspace.symbol.resolveSupport.properties` contains `location.range`. The
+server's original `data` is preserved inside that envelope. If the producing
+process has been replaced or its configuration was removed, resolve fails soft
+by returning the unresolved symbol unchanged.
+
+Partial-result and work-done tokens are not forwarded because one client token
+cannot identify several downstream producers; the client receives one final
+aggregate response.
+
+The aggregate is also bound to one stable workspace-folder and settings
+snapshot. Snapshot capture waits for a normal folder update already underway.
+If the workspace or settings generation changes after capture, or a previous
+update was interrupted before becoming stable, search returns transient `null`
+instead of mixing results from different workspace scopes. Searches resume
+after a complete folder update reconciles any downstream processes that could
+have missed the interrupted change.
+
 ---
 
-## Not currently provided
-
-kakehashi does not yet provide these LSP features:
-
-- Workspace symbol search (`workspace/symbol`)
+## Current limitations
 
 (The static code-action and execute-command providers are advertised only to
 clients with `codeActionLiteralSupport`. Palette command names are registered

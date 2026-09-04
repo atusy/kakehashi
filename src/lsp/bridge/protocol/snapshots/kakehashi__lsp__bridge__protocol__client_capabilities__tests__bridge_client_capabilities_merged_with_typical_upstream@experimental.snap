@@ -12,6 +12,9 @@ expression: merged
         "delete"
       ]
     },
+    "symbol": {
+      "dynamicRegistration": false
+    },
     "executeCommand": {
       "dynamicRegistration": false
     },

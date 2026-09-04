@@ -165,6 +165,8 @@
 //!   Used by
 //!   `tests/e2e/e2e_shared_instance.rs` (#391) to prove the shared-instance opt-in
 //!   grows one downstream process's folder set across roots.
+//! - `workspace-symbol-alpha` / `workspace-symbol-zeta` — advertise workspace symbol search and resolve;
+//!   search returns one lazy symbol and resolve fills its location range.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -546,6 +548,12 @@ fn main() {
                     // opt-in must fall back to per-root instances (#391).
                     "workspace-folders-incapable" => json!({
                         "hoverProvider": true,
+                        "textDocumentSync": 1
+                    }),
+                    "workspace-symbol-alpha"
+                    | "workspace-symbol-zeta"
+                    | "workspace-symbol-virtual" => json!({
+                        "workspaceSymbolProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
                     _ => json!({
@@ -1259,6 +1267,52 @@ fn main() {
                     }
                 }
                 respond(&mut writer, id, json!({ "executed": command }));
+            }
+            "workspace/symbol" => {
+                let query = message
+                    .pointer("/params/query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let location_uri = if mode == "workspace-symbol-virtual" {
+                    documents
+                        .keys()
+                        .find(|uri| uri.contains("kakehashi-virtual-uri-"))
+                        .cloned()
+                        .unwrap_or_else(|| "file:///workspace/not-yet-open.rs".into())
+                } else {
+                    format!("file:///workspace/{mode}.rs")
+                };
+                respond(
+                    &mut writer,
+                    id,
+                    json!([{
+                        "name": format!("{mode}:{query}"),
+                        "kind": 12,
+                        "location": { "uri": location_uri },
+                        "data": { "mock": query, "producer": mode }
+                    }]),
+                );
+            }
+            "workspaceSymbol/resolve" => {
+                let mut symbol = message.get("params").cloned().unwrap_or(Value::Null);
+                let line = match mode.as_str() {
+                    "workspace-symbol-alpha" => 4,
+                    "workspace-symbol-virtual" => 0,
+                    _ => 8,
+                };
+                let location_uri = if mode == "workspace-symbol-virtual" {
+                    symbol["location"]["uri"].clone()
+                } else {
+                    json!(format!("file:///workspace/{mode}.rs"))
+                };
+                symbol["location"] = json!({
+                    "uri": location_uri,
+                    "range": {
+                        "start": { "line": line, "character": 1 },
+                        "end": { "line": line, "character": 8 }
+                    }
+                });
+                respond(&mut writer, id, symbol);
             }
             "textDocument/diagnostic" => {
                 if mode == "diagnostics-save" {
