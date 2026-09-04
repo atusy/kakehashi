@@ -811,9 +811,9 @@ print("hello")
         // The snapshot is the SAME both times; only the live reader changes.
         let snapshot: std::sync::Arc<str> = std::sync::Arc::from("fn snapshot() {}");
         let reader_v1: crate::lsp::bridge::HostTextReader =
-            std::sync::Arc::new(|| Some(std::sync::Arc::from("fn live_v1() {}")));
+            std::sync::Arc::new(|| Some((std::sync::Arc::from("fn live_v1() {}"), 1)));
         let reader_v2: crate::lsp::bridge::HostTextReader =
-            std::sync::Arc::new(|| Some(std::sync::Arc::from("fn live_v2() {}")));
+            std::sync::Arc::new(|| Some((std::sync::Arc::from("fn live_v2() {}"), 2)));
 
         server.bridge.eager_sync_host_document_on_servers(
             &uri,

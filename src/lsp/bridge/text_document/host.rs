@@ -124,7 +124,7 @@ async fn resync_open_host_document<S: MessageSender>(
 /// the document store + URI) and hands a clone to each task; the task passes it
 /// to [`sync_host_document`], which evaluates it under the `host_documents` lock
 /// so a late task sends the latest text rather than a stale snapshot (#422).
-pub(crate) type HostTextReader = Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>;
+pub(crate) type HostTextReader = Arc<dyn Fn() -> Option<(Arc<str>, u64)> + Send + Sync>;
 
 /// Open or re-sync the host document on a downstream server, mutating the
 /// pool's sync-state map in place.
@@ -158,7 +158,7 @@ pub(super) async fn sync_host_document<S: MessageSender>(
     sender: &mut S,
     docs: &mut std::collections::HashMap<(String, ConnectionKey), HostDocSyncState>,
     doc: &HostDocument<'_>,
-    live_text_reader: Option<&(dyn Fn() -> Option<Arc<str>> + Send + Sync)>,
+    live_text_reader: Option<&(dyn Fn() -> Option<(Arc<str>, u64)> + Send + Sync)>,
     connection_key: &ConnectionKey,
 ) -> io::Result<()> {
     let uri_lsp = host_url_to_lsp_uri(doc.uri)?;
@@ -169,9 +169,15 @@ pub(super) async fn sync_host_document<S: MessageSender>(
     // snapshot. The effective text drives both the fingerprint dedup and the sent
     // content, so re-syncing the same current text stays a no-op.
     let live = live_text_reader.and_then(|read| read());
-    let text: &str = live.as_deref().unwrap_or(doc.text);
+    let text: &str = live.as_ref().map(|(text, _)| &**text).unwrap_or(doc.text);
     let fp = fingerprint(text);
-    let content_version = doc.revision.map(|revision| revision.content_version);
+    // The revision the text being sent was read at: the live reader's own
+    // (it read both under this lock), else the caller's stamp, else none
+    // (speculative text is synced verbatim and never moves the watermark).
+    let content_version = live
+        .as_ref()
+        .map(|(_, version)| *version)
+        .or(doc.revision.map(|revision| revision.content_version));
 
     match docs.entry(key) {
         Entry::Vacant(entry) => {
@@ -1263,8 +1269,30 @@ mod tests {
             sync_host_document(&mut sender, &mut docs, &stamped("v4", 4), None, &key).await;
         assert!(older_again.is_err());
 
+        // An eager re-sync reads text and revision together under this lock
+        // and moves the watermark to what it sent, so a stamped request that
+        // read the text before that edit is refused rather than rolling the
+        // downstream back.
+        let eager = || Some((Arc::<str>::from("v8"), 8u64));
+        sync_host_document(
+            &mut sender,
+            &mut docs,
+            &host_doc(&uri, "stale"),
+            Some(&eager),
+            &key,
+        )
+        .await
+        .unwrap();
+        rx.try_recv().expect("eager re-sync sent the live text");
+        let behind_eager =
+            sync_host_document(&mut sender, &mut docs, &stamped("v7", 7), None, &key).await;
+        assert!(
+            behind_eager.is_err(),
+            "a stamped text older than the eager re-sync must be refused"
+        );
+
         // A newer stamped text syncs and moves the watermark.
-        sync_host_document(&mut sender, &mut docs, &stamped("v7", 7), None, &key)
+        sync_host_document(&mut sender, &mut docs, &stamped("v9", 9), None, &key)
             .await
             .unwrap();
         rx.try_recv().expect("newer stamped text synced");
@@ -1282,7 +1310,7 @@ mod tests {
         let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(16);
         let uri = Url::parse("file:///test/host.md").unwrap();
 
-        let reader = || Some(Arc::<str>::from("fresh"));
+        let reader = || Some((Arc::<str>::from("fresh"), 2));
         sync_host_document(
             &mut sender,
             &mut docs,
@@ -1314,7 +1342,7 @@ mod tests {
         let mut docs = std::collections::HashMap::new();
         let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(16);
         let uri = Url::parse("file:///test/host.md").unwrap();
-        let reader = || Some(Arc::<str>::from("current"));
+        let reader = || Some((Arc::<str>::from("current"), 2));
 
         sync_host_document(
             &mut sender,
