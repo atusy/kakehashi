@@ -581,11 +581,6 @@ impl LanguageCoordinator {
         language: &tree_sitter::Language,
     ) -> LanguageLoadResult {
         self.query_store.remove_queries(derived_name);
-        self.register_configured_language(derived_name, language.clone());
-        self.derived_languages
-            .write()
-            .recover_poison("LanguageCoordinator::register_derived_from_base(derived_languages)")
-            .insert(derived_name.to_string());
 
         let mut events = Vec::new();
         let should_load_derived_queries = config.queries.is_some()
@@ -605,6 +600,14 @@ impl LanguageCoordinator {
                 }
             }
         }
+
+        // Queries BEFORE the parser, as on every other publication path: a
+        // reader that finds the derived parser must find its queries.
+        self.register_configured_language(derived_name, language.clone());
+        self.derived_languages
+            .write()
+            .recover_poison("LanguageCoordinator::register_derived_from_base(derived_languages)")
+            .insert(derived_name.to_string());
 
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
