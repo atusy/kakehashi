@@ -1109,10 +1109,11 @@ impl DiagnosticPublisher {
                     // language's auto-install reload. Retry once it settles;
                     // a document whose language stays unsettled (a load that
                     // failed for good) ends the retry at its deadline.
-                    let host_language = self.documents.get(host).and_then(|doc| {
-                        doc.snapshot()?;
-                        doc.language_id().map(str::to_string)
-                    });
+                    let host_language = self
+                        .documents
+                        .get(host)
+                        .and_then(|doc| doc.snapshot().map(|_| ()))
+                        .and_then(|()| self.settled_host_language(host));
                     if let Some(host_language) = host_language {
                         self.retry_republish_when_settled(host, host_language);
                     }
@@ -1629,6 +1630,27 @@ impl DiagnosticPublisher {
         });
     }
 
+    /// The host's language as the settled parse names it (a current snapshot
+    /// with a tree; a reload that re-detects the document publishes the new
+    /// language there only), else the id the document was opened under.
+    /// Shared by the geometry computation and the deferral retry, so the
+    /// retry waits for — and re-publishes — the language the geometry will
+    /// use, not a removed one.
+    fn settled_host_language(&self, host: &Url) -> Option<String> {
+        let settled = self.documents.latest_snapshot(host).and_then(|view| {
+            view.slot.snapshot.as_ref().and_then(|current| {
+                (current.parsed_version == view.content_version && current.tree.is_some())
+                    .then(|| current.language.clone())
+                    .flatten()
+            })
+        });
+        settled.or_else(|| {
+            self.documents
+                .get(host)
+                .and_then(|doc| doc.language_id().map(str::to_string))
+        })
+    }
+
     fn current_region_offsets(&self, host: &Url) -> Option<HashMap<String, RegionOffset>> {
         let mut offsets = HashMap::new();
 
@@ -1647,20 +1669,10 @@ impl DiagnosticPublisher {
         // snapshot only); then the stored id; parser-aware detection last —
         // it answers "none" (or another loaded language) while the declared
         // language is still publishing, and that is not "no regions".
-        let settled_language = self.documents.latest_snapshot(host).and_then(|view| {
-            view.slot.snapshot.as_ref().and_then(|current| {
-                (current.parsed_version == view.content_version && current.tree.is_some())
-                    .then(|| current.language.clone())
-                    .flatten()
-            })
-        });
-        let Some(language_name) = settled_language
-            .or_else(|| doc.language_id().map(str::to_string))
-            .or_else(|| {
-                self.language
-                    .detect_language_trace(host.path(), snapshot.text(), None, None)
-            })
-        else {
+        let Some(language_name) = self.settled_host_language(host).or_else(|| {
+            self.language
+                .detect_language_trace(host.path(), snapshot.text(), None, None)
+        }) else {
             return Some(offsets);
         };
         // A language still publishing (queries land before the parser) has
