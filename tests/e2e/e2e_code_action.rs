@@ -1098,6 +1098,39 @@ fn resolve_fails_soft_after_a_same_shape_edit() {
     shutdown(&mut client);
 }
 
+/// The bridge lets a `didChange` proceed once the resolve is enqueued, so
+/// the document can move while the downstream is still answering; the reply
+/// must then be refused rather than applied to text it was not computed for.
+#[test]
+fn resolve_reply_after_an_edit_during_the_wait_is_discarded() {
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy-delayed-resolve", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+    let actions = code_action_over_fence(&mut client);
+    let lazy = actions[0].clone();
+
+    let request_id = client.send_request_async("codeAction/resolve", lazy.clone());
+    assert!(
+        client.wait_for_log_message("code-action-resolve-started", Duration::from_secs(10)),
+        "resolve must reach the downstream before the edit"
+    );
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{ "text": "# Test\n\n```lua\nlocal y = 1\n```\n" }]
+        }),
+    );
+    let resolved = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        resolved["result"], lazy,
+        "a reply that lands after an edit must leave the action unresolved: {resolved:?}"
+    );
+
+    shutdown(&mut client);
+}
+
 #[test]
 fn lazy_action_is_resolved_via_code_action_resolve() {
     // A resolve-capable client gets the lazy action back with a routing
