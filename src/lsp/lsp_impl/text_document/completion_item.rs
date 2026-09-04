@@ -100,32 +100,56 @@ impl Kakehashi {
             std::sync::Arc::clone(&pool),
             sweep_id,
         );
-        let resolved = match cancel_rx {
+        // A didChange/didClose/didOpen is allowed to proceed once the resolve
+        // was enqueued. Revalidate after the response: the lifetime for both
+        // layers, and for the virt layer the region's identity and start again
+        // — the reply's edits were computed for the region where it was, and
+        // translating them into where it is now would land them on the fence
+        // or on unrelated text. The region's END may still have moved (typing
+        // inside the region keeps the item resolvable). The rebuild can wait
+        // for a reparse, so it sits INSIDE the cancellable future.
+        let resolve = async {
+            let resolved = dispatch.await;
+            if let (Some(envelope), Some(unresolved)) = (envelope, unresolved) {
+                let Ok(host_url) = Url::parse(&envelope.host_uri) else {
+                    return unresolved;
+                };
+                if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "completionItem/resolve: {} was reopened while resolving; returning item unresolved",
+                        envelope.host_uri
+                    );
+                    return unresolved;
+                }
+                if !envelope.is_host_layer()
+                    && !self
+                        .region_offset_is_fresh(
+                            &envelope.host_uri,
+                            &envelope.region_id,
+                            &envelope.offset,
+                            envelope.incarnation,
+                        )
+                        .await
+                {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "completionItem/resolve: the region of {} moved while resolving; returning item unresolved",
+                        envelope.host_uri
+                    );
+                    return unresolved;
+                }
+            }
+            resolved
+        };
+        match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
                 _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
-                item = dispatch => Ok(item),
+                item = resolve => Ok(item),
             },
-            None => Ok(dispatch.await),
-        }?;
-        // A didClose/didOpen is allowed to proceed once the resolve was
-        // enqueued. Revalidate the lifetime after the response so fields
-        // computed for the closed document are not surfaced into the
-        // reopened one.
-        if let (Some(envelope), Some(unresolved)) = (envelope, unresolved) {
-            let Ok(host_url) = Url::parse(&envelope.host_uri) else {
-                return Ok(unresolved);
-            };
-            if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
-                log::debug!(
-                    target: "kakehashi::bridge",
-                    "completionItem/resolve: {} was reopened while resolving; returning item unresolved",
-                    envelope.host_uri
-                );
-                return Ok(unresolved);
-            }
+            None => Ok(resolve.await),
         }
-        Ok(resolved)
     }
 
     /// Whether the envelope still names the region it was produced for; on
