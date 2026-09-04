@@ -958,4 +958,88 @@ mod tests {
             assert_eq!(a.content, b.content, "clean content must match");
         }
     }
+
+    /// A reload publishes a version-current placeholder with no tree while
+    /// the replacement parse is still queued. With a parser published, such a
+    /// document could not be looked at; without one no tree will ever come,
+    /// and the reading is genuinely empty.
+    #[tokio::test]
+    async fn tree_less_document_is_undeterminable_only_while_a_parser_exists() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"((string_literal (string_content) @injection.content)
+                (#set! injection.language "html"))"#,
+        )
+        .expect("valid query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
+        let uri = Url::parse("file:///tree_less.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".into()),
+            None,
+        );
+        server.documents.invalidate_all_parses();
+        let injection = server.injection_coordinator();
+
+        assert!(
+            injection
+                .resolve_injection_data(&uri, "rust")
+                .is_some_and(|regions| regions.is_empty()),
+            "without a parser nothing will ever be parsed: read as empty"
+        );
+
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), language);
+        assert!(
+            injection.resolve_injection_data(&uri, "rust").is_none(),
+            "with a parser, a tree-less document could not be looked at"
+        );
+    }
+
+    /// Queries are published before the parser, so a language whose parser is
+    /// visible and whose injection query is absent genuinely has none; only a
+    /// language still publishing is undeterminable.
+    #[tokio::test]
+    async fn missing_injection_query_is_definitive_once_the_parser_is_published() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let text = "fn main() {}";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("set language");
+        let tree = parser.parse(text, None).expect("parse rust");
+        let uri = Url::parse("file:///no_query.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), text.to_string(), Some("rust".into()), None);
+        server
+            .documents
+            .update_document(uri.clone(), text.to_string(), Some(tree));
+        let injection = server.injection_coordinator();
+
+        assert!(
+            injection.resolve_injection_data(&uri, "rust").is_none(),
+            "no parser published: the load may still be publishing its queries"
+        );
+
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), language);
+        assert!(
+            injection
+                .resolve_injection_data(&uri, "rust")
+                .is_some_and(|regions| regions.is_empty()),
+            "parser published and no injection query: genuinely no injections"
+        );
+    }
 }
