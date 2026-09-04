@@ -1063,6 +1063,41 @@ fn resolve_fails_soft_when_envelope_offset_diverges_from_live() {
     shutdown(&mut client);
 }
 
+/// A same-shape edit inside the fence leaves the region's geometry intact
+/// but changes the content the lazy action was computed against; resolving
+/// it afterwards must fail soft (no edit, envelope intact) rather than bind
+/// an edit computed on the old text to the new one.
+#[test]
+fn resolve_fails_soft_after_a_same_shape_edit() {
+    let (mut client, init_response, _config_dir) =
+        init_client_mode("code-action-lazy", resolve_support_caps());
+    assert_advertised(&init_response);
+    open_markdown(&mut client);
+
+    let actions = code_action_over_fence(&mut client);
+    let lazy = actions[0].clone();
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{ "text": "# Test\n\n```lua\nlocal y = 1\n```\n" }]
+        }),
+    );
+
+    let resolved = client.send_request("codeAction/resolve", lazy.clone());
+    let resolved = &resolved["result"];
+    assert!(
+        resolved["edit"].is_null(),
+        "an action computed against the previous text must fail soft (no edit), got: {resolved:?}"
+    );
+    assert_eq!(
+        resolved["data"]["kakehashi"]["origin"], "mock-codeaction",
+        "the routing envelope is kept intact for a re-request, got: {resolved:?}"
+    );
+
+    shutdown(&mut client);
+}
+
 #[test]
 fn lazy_action_is_resolved_via_code_action_resolve() {
     // A resolve-capable client gets the lazy action back with a routing
