@@ -598,8 +598,16 @@ impl InjectionCoordinator {
             // user simply closed.
             Ok(SnapshotWait::Gone) => ParseWait::Gone,
             // Trailing, never parsed, or out of budget: whatever the injection
-            // resolution says next is not evidence about this document.
-            Ok(SnapshotWait::Stale | SnapshotWait::Unparsed) | Err(_) => ParseWait::Unsettled,
+            // resolution says next is not evidence about this document — unless
+            // the parse landed between the check above and the timeout, which
+            // a zero budget makes likely enough to look once more.
+            Ok(SnapshotWait::Stale | SnapshotWait::Unparsed) | Err(_) => {
+                if self.snapshot_is_current(uri) {
+                    ParseWait::Current
+                } else {
+                    ParseWait::Unsettled
+                }
+            }
         }
     }
 
