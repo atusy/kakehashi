@@ -1605,8 +1605,9 @@ fn spawn_upstream_request(
                 // `done` applies its own `REOPEN_WAIT` and fails soft when it
                 // passes; expiry here releases nobody — `done` stays pending
                 // until the sweep really finishes, so a command arriving later
-                // finds a settled answer. The sweep never stops early: once
-                // its parse-wait deadline passes it stops WAITING for pending
+                // finds a settled answer. The sweep does not stop early on its
+                // parse-wait deadline (only on `done` losing every waiter): once
+                // that deadline passes it stops WAITING for pending
                 // parses but still opens every document whose parse is
                 // current (a document nothing else will touch — no pending
                 // parse, no request on it — is otherwise never re-opened),
