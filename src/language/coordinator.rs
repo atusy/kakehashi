@@ -3601,6 +3601,35 @@ mod tests {
         assert!(coordinator.configured_load_failed("racing", generation));
     }
 
+    /// A reader that finds the parser registered must also find its queries:
+    /// `has_parser_available` does not take the registration lock, so a parse
+    /// admitted between the two publishes would run its injection query pass
+    /// against an empty store and record the document as injection-free.
+    #[test]
+    fn dynamic_publication_registers_the_parser_after_its_queries() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&WorkspaceSettings::default());
+        let generation = coordinator
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let parser_seen_while_publishing_queries = std::cell::Cell::new(None);
+        assert!(coordinator.publish_dynamic_language(
+            "ordered",
+            tree_sitter_rust::LANGUAGE.into(),
+            generation,
+            || {
+                parser_seen_while_publishing_queries
+                    .set(Some(coordinator.has_parser_available("ordered")));
+            },
+        ));
+        assert_eq!(
+            parser_seen_while_publishing_queries.get(),
+            Some(false),
+            "the queries must be published before the parser becomes visible"
+        );
+        assert!(coordinator.has_parser_available("ordered"));
+    }
+
     #[test]
     fn reload_without_override_preserves_builtin_queries() {
         let coordinator = LanguageCoordinator::new();
