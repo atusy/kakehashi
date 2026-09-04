@@ -50,13 +50,14 @@
 //!   resolve with `detail` and a `textEdit` on line 2 (the host verbatim
 //!   path); `completion-resolve-plain` fills only `detail`, so the reply
 //!   survives the virt edit guard inside a one-line region.
-//! - `code-action-lazy-delayed-resolve` / `completion-resolve-reopen-delayed` /
+//! - `code-action-lazy-delayed-resolve` / `code-lens-delayed-resolve` /
+//!   `document-link-delayed-resolve` / `completion-resolve-reopen-delayed` /
 //!   `code-lens-reopen-delayed-resolve` / `document-link-reopen-delayed-resolve`
 //!   — like their base modes, but park the resolve reply (after a
 //!   `window/logMessage` `<kind>-resolve-started`) until the next
-//!   `textDocument/didChange` (code action) or the next request of their own
-//!   kind (the others), so a test can edit or close and reopen the host while
-//!   the resolve is in flight.
+//!   `textDocument/didChange` (the `-delayed-resolve` ones) or the next request
+//!   of their own kind (the `-reopen-delayed-` ones), so a test can edit or
+//!   close and reopen the host while the resolve is in flight.
 //! - `inlay-hint-resolve` / `inlay-hint-resolve-replacement` — advertise
 //!   `inlayHintProvider.resolveProvider = true`; answer `textDocument/inlayHint`
 //!   with one hint (label part with a location and a command, an accept edit,
@@ -248,7 +249,8 @@ fn main() {
                     "code-lens"
                     | "code-lens-replacement"
                     | "code-lens-slow-resolve"
-                    | "code-lens-reopen-delayed-resolve" => json!({
+                    | "code-lens-reopen-delayed-resolve"
+                    | "code-lens-delayed-resolve" => json!({
                         "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -257,6 +259,7 @@ fn main() {
                         "textDocumentSync": 1
                     }),
                     "document-link-reopen-delayed-resolve"
+                    | "document-link-delayed-resolve"
                     | "document-link-resolve"
                     | "document-link-resolve-replacement"
                     | "document-link-slow-resolve" => json!({
@@ -548,8 +551,12 @@ fn main() {
                     {
                         respond(&mut writer, pending_id, pending_result);
                     }
-                    if mode == "code-action-lazy-delayed-resolve"
-                        && let Some((pending_id, pending_result)) = pending_resolve.take()
+                    if matches!(
+                        mode.as_str(),
+                        "code-action-lazy-delayed-resolve"
+                            | "code-lens-delayed-resolve"
+                            | "document-link-delayed-resolve"
+                    ) && let Some((pending_id, pending_result)) = pending_resolve.take()
                     {
                         respond(&mut writer, pending_id, pending_result);
                     }
@@ -1491,7 +1498,8 @@ fn main() {
                     },
                     "data": data
                 });
-                if mode == "code-lens-reopen-delayed-resolve" {
+                if mode == "code-lens-reopen-delayed-resolve" || mode == "code-lens-delayed-resolve"
+                {
                     notify(
                         &mut writer,
                         "window/logMessage",
@@ -1584,7 +1592,9 @@ fn main() {
                     ),
                     "data": data
                 });
-                if mode == "document-link-reopen-delayed-resolve" {
+                if mode == "document-link-reopen-delayed-resolve"
+                    || mode == "document-link-delayed-resolve"
+                {
                     notify(
                         &mut writer,
                         "window/logMessage",

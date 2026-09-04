@@ -704,3 +704,37 @@ fn e2e_virtual_code_lens_resolve_reply_after_a_reopen_is_discarded() {
 
     shutdown(&mut client);
 }
+
+/// A `didChange` can land while the downstream is still answering a resolve;
+/// the lens envelope carries no revision stamp, so the region geometry is
+/// checked again after the reply, and a region the edit moved refuses the
+/// command.
+#[test]
+fn e2e_virtual_code_lens_resolve_reply_after_an_edit_that_moved_the_region_is_discarded() {
+    let (mut client, _config_dir) = init_client_with_mode("code-lens-delayed-resolve");
+    open_markdown(&mut client);
+    let lens = code_lens_with_retry(&mut client).remove(0);
+
+    let request_id = client.send_request_async("codeLens/resolve", lens.clone());
+    assert!(
+        client.wait_for_log_message("code-lens-resolve-started", Duration::from_secs(10)),
+        "resolve must reach the downstream before the edit"
+    );
+    // A line inserted above the fence moves the region; the fence content
+    // changes too, so the downstream receives the virtual didChange that
+    // releases its parked reply.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{ "text": "# Test\n\nmoved\n\n```lua\nlocal x = 12\n```\n" }]
+        }),
+    );
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response["result"], lens,
+        "a reply that lands after the region moved must leave the lens unresolved: {response}"
+    );
+
+    shutdown(&mut client);
+}
