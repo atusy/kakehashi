@@ -686,9 +686,11 @@ pub(crate) struct SnapshotView {
 /// snapshot's own admission rule decides the publish independently.
 pub(crate) struct ParseInputs<'a> {
     pub(crate) text: &'a str,
-    /// `Some(id)` requires the document's stored language to still be `id`
-    /// (an off-ingress reparse must not attach to a relabelled reopen);
-    /// `None` leaves the language to the snapshot (first-parse detection).
+    /// `Some(expected)` requires the document's stored language to still be
+    /// `expected` (`Some(None)`: still unlabelled) — an off-ingress reparse
+    /// must not attach to a relabelled reopen — and leaves the stored
+    /// language as it is; the tree alone is attached. `None` lets the
+    /// snapshot's language (first-parse detection) become the stored one.
     pub(crate) language_id: Option<Option<&'a str>>,
     pub(crate) incarnation: u64,
     pub(crate) content_version: u64,
@@ -739,7 +741,14 @@ impl DocumentStore {
                 let inputs_unchanged = doc.incarnation() == expected.incarnation
                     && doc.content_version() == expected.content_version
                     && doc.text() == expected.text;
-                let language = snapshot.language.clone();
+                // A checked language is kept as stored: the reparses attach
+                // a tree, they do not relabel (the snapshot carries the
+                // detected name for its own readers). Only the open parse
+                // (`language_id: None`) records what it detected.
+                let language = match expected.language_id {
+                    None => snapshot.language.clone(),
+                    Some(_) => doc.language_id().map(String::from),
+                };
                 let tree = snapshot.tree.clone();
                 let published = doc.publish_snapshot(snapshot);
                 let attached = inputs_unchanged && published;
@@ -844,6 +853,78 @@ mod tests {
                     && s.parsed_version != view.content_version)),
             "the stale snapshot is in the cell, trailing the edited revision"
         );
+    }
+
+    /// A reparse checks the stored language and attaches the tree without
+    /// relabelling the document: detection may resolve a stored `sh` to its
+    /// `bash` base, and the stored id stays `sh` (the snapshot carries the
+    /// detected name). The open parse, which checks nothing, records what it
+    /// detected — the label a client-supplied `text` becomes `markdown`.
+    #[test]
+    fn install_parse_relabels_only_on_the_open_parse() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///label.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(uri.clone(), text.to_string(), Some("sh".into()), None);
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        let reparse = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: Some(Some("sh")),
+                incarnation,
+                content_version,
+            },
+            Arc::new(super::super::snapshot::ParseSnapshot {
+                text: Arc::clone(&expected_text),
+                tree: Some(markdown_tree(text)),
+                language: Some("bash".to_string()),
+                parsed_version: content_version,
+                incarnation,
+                injection_regions: None,
+                bridge_regions: None,
+                resolved_regions: None,
+                layer_trees: std::sync::OnceLock::new(),
+            }),
+        );
+        assert!(reparse.attached && reparse.published);
+        assert_eq!(
+            store.get(&uri).unwrap().language_id(),
+            Some("sh"),
+            "a checked reparse keeps the stored language"
+        );
+
+        let uri2 = Url::parse("file:///label2.md").unwrap();
+        let incarnation2 = store.insert(uri2.clone(), text.to_string(), Some("text".into()), None);
+        let (expected_text2, content_version2) = {
+            let doc = store.get(&uri2).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        let open = store.install_parse(
+            &uri2,
+            ParseInputs {
+                text: &expected_text2,
+                language_id: None,
+                incarnation: incarnation2,
+                content_version: content_version2,
+            },
+            parse_snapshot(
+                &expected_text2,
+                Some(markdown_tree(text)),
+                content_version2,
+                incarnation2,
+            ),
+        );
+        assert!(open.attached && open.published);
+        assert_eq!(
+            store.get(&uri2).unwrap().language_id(),
+            Some("markdown"),
+            "the open parse records the detected language"
+        );
+        assert!(store.get(&uri2).unwrap().tree().is_some());
     }
 
     /// An off-ingress reparse names the language it parsed under; a reopen
