@@ -1663,7 +1663,9 @@ impl DiagnosticPublisher {
             return None;
         }
         let Some(injection_query) = injection_query else {
-            return Some(offsets);
+            // Definitive only while still settled: a reload beginning right
+            // here removes queries, and "no query" would read as no regions.
+            return settled().then_some(offsets);
         };
 
         let resolved_regions = match self
