@@ -564,17 +564,19 @@ impl InjectionCoordinator {
     /// screening many candidate documents can ask the configuration question
     /// before paying for a parse wait and an injection resolution.
     ///
-    /// Parser-aware detection answers `None` until the language's parser is
-    /// published, which a language load in progress makes true for a moment
-    /// (queries land first); the language the document was opened or parsed
-    /// under is then the answer, so the caller reads "could not look" from
-    /// the resolution instead of "no language" from here.
+    /// The language the document was opened or parsed under comes first:
+    /// parser-aware detection answers `None` — or, worse, another loaded
+    /// language the path or content also matches — until the declared
+    /// language's parser is published, which a load in progress makes true
+    /// for a moment (queries land first). Detection is the fallback for a
+    /// document with no stored language, so the caller reads "could not
+    /// look" from the resolution instead of "no language" or the wrong one
+    /// from here.
     pub(crate) fn document_language(&self, uri: &Url) -> Option<String> {
-        self.get_language_for_document(uri).or_else(|| {
-            self.documents
-                .get(uri)
-                .and_then(|document| document.language_id().map(str::to_string))
-        })
+        self.documents
+            .get(uri)
+            .and_then(|document| document.language_id().map(str::to_string))
+            .or_else(|| self.get_language_for_document(uri))
     }
 
     /// `uri`'s reopen generation, which scopes a downstream `didOpen` to the
