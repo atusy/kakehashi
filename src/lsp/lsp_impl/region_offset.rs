@@ -116,6 +116,7 @@ impl Kakehashi {
         region_id: &str,
         offset: &EnvelopeOffset,
         incarnation: Option<u64>,
+        injection_language: &str,
     ) -> bool {
         let Ok(host_url) = Url::parse(host_uri) else {
             return false;
@@ -134,7 +135,14 @@ impl Kakehashi {
             &host_url,
             region_id,
         )
-        .is_some_and(|(live_offset, _, _, _)| live_offset == RegionOffset::from(offset))
+        // The language too: an edit can re-route a region (a shebang change
+        // under an `unknown` injection) while keeping its id and geometry,
+        // and an item produced for the old language must not resolve on the
+        // server the region now routes to. An envelope with no language
+        // (cleared by the client) names no region.
+        .is_some_and(|(live_offset, _, _, live_language)| {
+            live_offset == RegionOffset::from(offset) && live_language == injection_language
+        })
     }
 }
 
