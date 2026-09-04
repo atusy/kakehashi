@@ -414,16 +414,22 @@ impl Document {
     /// allocation, and a copy of the edit tail), so the caller's store guard
     /// is released before the replay's per-edit path copies run — on the
     /// compute pool, with the parse. `None` when nothing is published, the
-    /// published snapshot is tree-less, or it predates a full-text sync or
-    /// reload (`seed_floor`). **Read only by `reparse_latest`** — readers go
-    /// through [`tree`](Self::tree), which never serves a pre-reparse tree.
-    pub(crate) fn incremental_seed(&self) -> Option<IncrementalSeed> {
+    /// published snapshot is tree-less, it predates a full-text sync or
+    /// reload (`seed_floor`), or its tree was produced by a grammar other
+    /// than `language` — detection on the edited text may select another
+    /// language, and tree-sitter does not check that an old tree belongs to
+    /// the parser it is handed. **Read only by `reparse_latest`** — readers
+    /// go through [`tree`](Self::tree), which never serves a pre-reparse
+    /// tree.
+    pub(crate) fn incremental_seed(&self, language: &str) -> Option<IncrementalSeed> {
         let slot = self.snapshot_tx.borrow();
         let snapshot = slot
             .snapshot
             .as_ref()
             .filter(|snapshot| snapshot.incarnation == self.incarnation)?;
-        if snapshot.parsed_version < self.seed_floor {
+        if snapshot.parsed_version < self.seed_floor
+            || snapshot.language.as_deref() != Some(language)
+        {
             return None;
         }
         let tree = snapshot.tree.clone()?;

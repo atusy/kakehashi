@@ -892,7 +892,6 @@ impl ParseCoordinator {
             // (#498) — cheap on this reparse hot path.
             let text = doc.text_arc();
             let language_id = doc.language_id().map(|s| s.to_string());
-            let seed = doc.incremental_seed();
             // The lifetime this parse is for: a close+reopen before the install
             // changes it, and the cell rejects on the mismatch (so a tree from
             // this lifetime never reaches a reopened document).
@@ -900,6 +899,12 @@ impl ParseCoordinator {
             let language_name =
                 self.language
                     .detect_language(uri.path(), &text, None, language_id.as_deref());
+            // The seed is bound to the grammar that produced its tree: a
+            // detection that moved with the edit (a changed shebang) parses
+            // from scratch rather than reusing another grammar's tree.
+            let seed = language_name
+                .as_deref()
+                .and_then(|language| doc.incremental_seed(language));
             (
                 language_name,
                 language_id,
