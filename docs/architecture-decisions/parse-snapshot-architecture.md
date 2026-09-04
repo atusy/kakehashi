@@ -14,7 +14,7 @@ large-paste races it set out to close, but two costs it did not address surfaced
 as a user-visible regression against v0.7.0 (which parsed inline on `didChange`):
 
 1. **Per-keystroke read latency on large documents.** `Document::apply_edit_and_seed`
-   does `self.tree.take()`: after an edit there is **no servable tree** until the
+   did `self.tree.take()`: after an edit there was **no servable tree** until the
    off-ingress reparse republishes one. So every tree reader —
    `textDocument/semanticTokens`, `kakehashi/captures`, `kakehashi/node/*`,
    `documentSymbol`, selection ranges — must **block** waiting for the reparse
@@ -49,10 +49,12 @@ internally-consistent snapshots that readers observe without blocking.
 
 ### 1. `Document` holds inputs only
 
-`Document` carries `text: Arc<str>`, `language_id`, `incarnation`, and a
-monotonic `content_version` (bumped on every edit, `0` at `didOpen`). It no
-longer holds `tree` or `pending_seed`, and `apply_edit` never clears a tree — it
-installs the new text and bumps the version. The document lifecycle
+`Document` carries `text: Arc<str>`, `language_id`, `incarnation`, a
+monotonic `content_version` (bumped on every edit, `0` at `didOpen`), and the
+input side of the incremental seed (`seed_edits`, each `InputEdit` tagged with
+the version it produced, and `seed_floor`). It no longer holds `tree` or
+`pending_seed`, and `apply_edit` never clears a tree — it installs the new text,
+bumps the version and logs the edit. The document lifecycle
 (`didOpen`/`didChange`/`didClose`) becomes independent of parsing: it mutates
 inputs and returns, never awaiting or gating on a parse. `content_version` is a
 **new input-side field** that threads into `DocumentSnapshot` and (as
@@ -187,19 +189,23 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
   gets from the watermark sender dropping, made explicit because the snapshot channel
   outlives more clones.
 
-The incremental-parse **seed** re-homes onto `ParseScheduler`'s per-document state
-(accumulated `InputEdit`s + the `base_version` they extend). Two obligations,
-enforced by co-location today, become explicit scheduler invariants:
+The incremental-parse **seed** is derived, not stored: `Document` keeps an edit
+log (`seed_edits`, each `InputEdit` tagged with the content version it produced)
+and a `seed_floor`; `Document::incremental_seed` hands the reparse a clone of
+the published tree plus the logged edits tagged after its `parsed_version`, and
+the replay (`IncrementalSeed::replay`) runs on the compute pool with the parse.
+Two obligations:
 
-- The seed is applied to the snapshot's tree **iff `snapshot.parsed_version ==
-  base_version` and `snapshot.tree` is `Some`**; on a version mismatch (a publish
-  raced) *or* a tree-less base snapshot (resolved-but-parser-less), there is nothing
-  to incrementally seed from, so it parses from scratch — it never applies edits to
-  a tree they do not match (the `#348` external-scanner corruption) nor to an absent
-  tree.
-- A full-text sync **resets** `(pending_edits, base_version)`, so it parses from
-  scratch. "Leaves no accumulated edits" is an explicit reset, not an emergent
-  property.
+- The seed is `None` when nothing is published, the published snapshot is
+  tree-less (resolved-but-parser-less), or `parsed_version < seed_floor` — it
+  never applies edits to a tree they do not match (the `#348` external-scanner
+  corruption) nor to an absent tree. Any eligible published version seeds: the
+  edits it has not seen are exactly the log entries tagged after it.
+- A full-text sync, a grammar reload, and an edit log that outgrows
+  `MAX_SEED_EDITS` raise `seed_floor` to the version they produce and clear the
+  log, so the next parse is from scratch. "Leaves no accumulated edits" is an
+  explicit cut, not an emergent property. Entries at or below the published
+  `parsed_version` are pruned on the next edit.
 
 A parse pass therefore has a **single version/incarnation-guarded commit sequence**, so no reader-visible publication or downstream emission ever escapes for a snapshot that lost the admission:
 compute the tree, region map, and tokens on the tree value (the populate pass
@@ -560,7 +566,7 @@ inside the existing safety contracts at each step:
   changes, not before. Per the repo's structural-vs-behavioral separation
   guideline, the **pure dead-code / doc-pruning** parts of this stage (dropping the
   now-unused fields, deleting the superseded ADR passages) land as **separate PRs**
-  from the behavioral collapse (the CAS→publish merge, scheduler seed re-homing),
+  from the behavioral collapse (the CAS→publish merge, the seed derivation from the cell),
   each shipped only after its behavioral prerequisite is in.
 
 ## Considered Options
