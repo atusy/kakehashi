@@ -1297,7 +1297,7 @@ impl Kakehashi {
                                 uri: &t.uri,
                                 language_id: &t.language_id,
                                 text: &t.text,
-                                revision: None,
+                                revision: Some(t.revision),
                             },
                             request_method,
                             params,

@@ -528,6 +528,10 @@ impl Kakehashi {
                                 uri: &t.uri,
                                 language_id: &t.language_id,
                                 text: &t.text,
+                                // Speculative scratch text (`ctx.text` was
+                                // replaced above): the context's revision does
+                                // not describe it, so it must not advance the
+                                // sync watermark.
                                 revision: None,
                             },
                             "textDocument/formatting",
