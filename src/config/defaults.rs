@@ -149,6 +149,13 @@ fn default_languages() -> HashMap<String, LanguageSettings> {
                         },
                     ),
                     (
+                        "textDocument/semanticTokens/full".to_string(),
+                        LayerAggregationConfig {
+                            priorities: None,
+                            strategy: Some(AggregationStrategy::Concatenated),
+                        },
+                    ),
+                    (
                         "textDocument/diagnostic".to_string(),
                         LayerAggregationConfig {
                             priorities: None,

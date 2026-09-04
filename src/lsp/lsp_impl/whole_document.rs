@@ -23,20 +23,31 @@ use tower_lsp_server::ls_types::{NumberOrString, Uri};
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, dispatch_host_preferred, dispatch_preferred,
-    dispatch_preferred_with_tokens, mint_region_progress_source,
+    dispatch_preferred_with_tokens, expand_priorities, mint_region_progress_source,
+    truncate_entries,
 };
-use crate::lsp::bridge::{ClientProgressAggregator, ClientProgressDeregisterGuard, HostDocument};
+use crate::lsp::bridge::{
+    ClientProgressAggregator, ClientProgressDeregisterGuard, HostDocument, ResolvedServerConfig,
+};
 
-use super::bridge_context::{DocumentRequestContext, parse_host_verbatim};
+use super::bridge_context::DocumentRequestContext;
 use super::{Kakehashi, uri_to_url};
 
 pub(super) struct HostWholeDocumentResponse<T> {
     pub(super) items: Vec<T>,
     pub(super) server_name: String,
     pub(super) host_uri: url::Url,
+    pub(super) host_text: Arc<str>,
     pub(super) incarnation: Option<u64>,
     pub(super) connection_generation: u64,
     pub(super) handle: Arc<crate::lsp::bridge::ConnectionHandle>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct WholeDocumentSnapshotIdentity {
+    pub(super) incarnation: u64,
+    pub(super) parsed_version: u64,
+    pub(super) generation: u64,
 }
 
 impl Kakehashi {
@@ -54,22 +65,41 @@ impl Kakehashi {
     /// `Some`, one shared aggregator relays the first region to begin as a single
     /// `Begin → … → End` on that token (ls-bridge-client-progress); `None` (the
     /// fast methods that don't advertise `workDoneProgress`) keeps prior behavior.
-    pub(super) async fn whole_document_fan_out<T, F, Fut, H>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn whole_document_fan_out<T, N, F, Fut, P, H, R, M>(
         &self,
         lsp_uri: &Uri,
         method_name: &'static str,
         raw_params: serde_json::Value,
         client_progress_token: Option<NumberOrString>,
+        expected_snapshot: Option<WholeDocumentSnapshotIdentity>,
+        bridge_attempted: Option<Arc<std::sync::atomic::AtomicBool>>,
+        require_all_layers: bool,
+        preserve_empty: bool,
+        nested_regions_first: bool,
+        run_virtual_layer: bool,
+        native: N,
         send: F,
+        parse_host: P,
         on_host_winner: H,
+        merge_regions: R,
+        merge_layers: M,
     ) -> Result<Option<Vec<T>>>
     where
-        T: Send + 'static + serde::de::DeserializeOwned,
+        T: Send + 'static,
+        N: Future<Output = Result<Option<Vec<T>>>>,
         F: Fn(FanOutTask) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = io::Result<Option<Vec<T>>>> + Send + 'static,
-        H: FnOnce(HostWholeDocumentResponse<T>) -> Option<Vec<T>> + Send,
+        P: Fn(serde_json::Value) -> Option<Vec<T>> + Clone + Send + 'static,
+        H: Fn(HostWholeDocumentResponse<T>) -> Option<Vec<T>> + Clone + Send + 'static,
+        R: Fn(Vec<T>, Vec<T>) -> Vec<T> + Copy + Send,
+        M: Fn(Vec<T>, Vec<T>) -> Vec<T>,
     {
+        let host_bridge_attempted = bridge_attempted;
         let virt = async {
+            if !run_virtual_layer {
+                return Ok(None);
+            }
             // Convert ls_types::Uri to url::Url for internal use
             let Ok(uri) = uri_to_url(lsp_uri) else {
                 log::warn!("Invalid URI in {}: {}", method_name, lsp_uri.as_str());
@@ -96,6 +126,13 @@ impl Kakehashi {
                     return Ok(None);
                 }
             };
+            if expected_snapshot.is_some_and(|expected| {
+                snapshot.incarnation != expected.incarnation
+                    || snapshot.parsed_version != expected.parsed_version
+                    || self.cache.semantic_token_generation() != expected.generation
+            }) {
+                return Ok(None);
+            }
             let Some(language_name) = snapshot.language.clone() else {
                 log::debug!("{}: No language detected", method_name);
                 return Ok(None);
@@ -137,6 +174,11 @@ impl Kakehashi {
             if all_regions.is_empty() {
                 return Ok(None);
             }
+            let region_ranges = all_regions
+                .iter()
+                .map(|resolved| resolved.region.byte_range.clone())
+                .collect::<Vec<_>>();
+            let region_merge_order = region_merge_order(&region_ranges, nested_regions_first);
 
             // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
             let upstream_request_id = crate::lsp::current_upstream_id();
@@ -168,32 +210,80 @@ impl Kakehashi {
             // support this method before the per-region fan-out spawns their
             // tasks (capability-prefilter-fanout). One pool query for the whole
             // request; the resulting set is a cheap per-region lookup.
-            let incapable_servers = self
-                .incapable_virt_servers(
+            let exact_semantic_capabilities = method_name == "textDocument/semanticTokens/full";
+            let incapable_servers = if exact_semantic_capabilities {
+                std::collections::HashSet::new()
+            } else {
+                self.incapable_virt_servers(
                     &language_name,
                     all_regions.iter().map(|r| r.injection_language.as_str()),
                     method_name,
                 )
-                .await;
+                .await
+            };
+            let mut exact_capability_by_connection = std::collections::HashMap::new();
 
             for (region_index, resolved) in all_regions.iter().enumerate() {
+                // A combined injection concatenates disjoint host spans into one
+                // virtual document. Full semantic-token responses only carry
+                // delta coordinates, so the single-offset projection cannot map
+                // tokens after a removed gap back to the host safely.
+                if method_name == "textDocument/semanticTokens/full" && !resolved.contiguous {
+                    continue;
+                }
                 // Get ALL bridge server configs for this injection language
                 let mut configs = self.bridge_configs_for_injection_language(
                     &language_name,
                     &resolved.injection_language,
                 );
-                if !incapable_servers.is_empty() {
+                if exact_semantic_capabilities {
+                    let Ok(routing_uri) = url::Url::parse(
+                        &crate::lsp::bridge::VirtualDocumentUri::new(
+                            lsp_uri,
+                            &resolved.injection_language,
+                            &resolved.region.region_id,
+                        )
+                        .to_uri_string(),
+                    ) else {
+                        continue;
+                    };
+                    let mut exact_incapable = std::collections::HashSet::new();
+                    for config in &configs {
+                        let key = pool
+                            .resolved_connection_key(
+                                &config.server_name,
+                                &config.config,
+                                &routing_uri,
+                            )
+                            .await;
+                        let known_incapable = match exact_capability_by_connection.get(&key) {
+                            Some(known_incapable) => *known_incapable,
+                            None => {
+                                let known_incapable =
+                                    pool.connection_known_incapable(&key, method_name).await;
+                                exact_capability_by_connection.insert(key, known_incapable);
+                                known_incapable
+                            }
+                        };
+                        if known_incapable {
+                            exact_incapable.insert(config.server_name.clone());
+                        }
+                    }
+                    configs.retain(|config| !exact_incapable.contains(&config.server_name));
+                } else if !incapable_servers.is_empty() {
                     configs.retain(|c| !incapable_servers.contains(&c.server_name));
                 }
                 if configs.is_empty() {
                     continue;
                 }
-
                 let agg = self.resolve_aggregation_config(
                     &language_name,
                     &resolved.injection_language,
                     method_name,
                 );
+                if !request_selects_servers(&agg.priorities, &configs, agg.max_fan_out) {
+                    continue;
+                }
                 let region_ctx = DocumentRequestContext {
                     uri: uri.clone(),
                     resolved: resolved.clone(),
@@ -216,6 +306,7 @@ impl Kakehashi {
 
                 let pool = Arc::clone(&pool);
                 let send = send.clone();
+                let merge_order = region_merge_order[region_index];
 
                 outer_join_set.spawn(async move {
                     let is_nonempty =
@@ -241,7 +332,7 @@ impl Kakehashi {
                         FanInResult::Done(items) => items,
                         FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
                     };
-                    (region_index, items)
+                    (merge_order, items)
                 });
             }
 
@@ -270,15 +361,21 @@ impl Kakehashi {
                 )
                 .await;
 
-            Ok(nonempty_whole_document_items(flatten_ordered_region_items(
-                completion_order_items?,
-            )))
+            Ok(nonempty_whole_document_items(
+                flatten_ordered_region_items_with(completion_order_items?, merge_regions),
+            ))
         };
 
         let host = async {
             let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, method_name) else {
                 return Ok(None);
             };
+            if expected_snapshot.is_some_and(|expected| ctx.incarnation != expected.incarnation) {
+                return Ok(None);
+            }
+            if !request_selects_servers(&ctx.priorities, &ctx.configs, ctx.max_fan_out) {
+                return Ok(None);
+            }
             let (cancel_rx, _cancel_guard) =
                 self.subscribe_cancel(ctx.upstream_request_id.as_ref());
             let incarnation = ctx.incarnation;
@@ -290,62 +387,175 @@ impl Kakehashi {
                 pool.clone(),
                 move |t| {
                     let params = raw_params.clone();
+                    let parse_host = parse_host.clone();
+                    let on_host_winner = on_host_winner.clone();
+                    let attempted = host_bridge_attempted.clone();
                     async move {
-                        let raw = t
-                            .pool
-                            .send_host_raw_request_for_incarnation(
-                                &t.server_name,
-                                &t.server_config,
-                                &HostDocument {
-                                    uri: &t.uri,
-                                    language_id: &t.language_id,
-                                    text: &t.text,
-                                },
-                                method_name,
-                                params,
-                                t.upstream_id,
-                                incarnation,
-                            )
-                            .await?;
+                        let raw = match attempted {
+                            Some(attempted) => {
+                                t.pool
+                                    .send_host_raw_request_for_incarnation_with_attempt_marker(
+                                        &t.server_name,
+                                        &t.server_config,
+                                        &HostDocument {
+                                            uri: &t.uri,
+                                            language_id: &t.language_id,
+                                            text: &t.text,
+                                        },
+                                        method_name,
+                                        params,
+                                        t.upstream_id,
+                                        incarnation,
+                                        attempted,
+                                    )
+                                    .await?
+                            }
+                            None => {
+                                t.pool
+                                    .send_host_raw_request_for_incarnation(
+                                        &t.server_name,
+                                        &t.server_config,
+                                        &HostDocument {
+                                            uri: &t.uri,
+                                            language_id: &t.language_id,
+                                            text: &t.text,
+                                        },
+                                        method_name,
+                                        params,
+                                        t.upstream_id,
+                                        incarnation,
+                                    )
+                                    .await?
+                            }
+                        };
                         let Some(raw) = raw else {
                             return Ok(None);
                         };
-                        let Some(items) = parse_host_verbatim::<Vec<T>>(raw.value) else {
+                        let Some(items) = parse_host(raw.value) else {
                             return Ok(None);
                         };
-                        Ok(Some(HostWholeDocumentResponse {
+                        Ok(on_host_winner(HostWholeDocumentResponse {
                             items,
                             server_name: t.server_name,
                             host_uri: t.uri,
+                            host_text: t.text,
                             incarnation: Some(raw.incarnation),
                             connection_generation: raw.connection_generation,
                             handle: raw.handle,
                         }))
                     }
                 },
-                |opt| matches!(opt, Some(v) if !v.items.is_empty()),
+                |opt| matches!(opt, Some(items) if !items.is_empty()),
                 cancel_rx,
             )
             .await;
-            self.host_layer_result(fan_in, method_name, |won| won.and_then(on_host_winner))
-                .await
+            self.host_layer_result(fan_in, method_name, |won| won).await
         };
 
-        let result = self
-            .walk_layers_by_strategy(
+        let result = if require_all_layers {
+            self.walk_layers_concatenated(
                 lsp_uri,
                 method_name,
                 method_name,
                 virt,
                 host,
-                std::future::ready(Ok(None)),
-                |items: &Vec<T>| !items.is_empty(),
-                concat_whole_document_items,
+                native,
+                merge_layers,
             )
-            .await?;
+            .await?
+        } else {
+            self.walk_layers_by_strategy(
+                lsp_uri,
+                method_name,
+                method_name,
+                virt,
+                host,
+                native,
+                |items: &Vec<T>| !items.is_empty(),
+                merge_layers,
+            )
+            .await?
+        };
 
-        Ok(result.and_then(nonempty_whole_document_items))
+        Ok(if preserve_empty {
+            result
+        } else {
+            result.and_then(nonempty_whole_document_items)
+        })
     }
+}
+
+pub(super) fn request_selects_servers(
+    priorities: &[String],
+    configs: &[ResolvedServerConfig],
+    max_fan_out: Option<usize>,
+) -> bool {
+    !truncate_entries(expand_priorities(priorities, configs), max_fan_out).is_empty()
+}
+
+fn region_merge_order(ranges: &[std::ops::Range<usize>], nested_regions_first: bool) -> Vec<usize> {
+    region_merge_order_with_observer(ranges, nested_regions_first, || {})
+}
+
+fn region_merge_order_with_observer(
+    ranges: &[std::ops::Range<usize>],
+    nested_regions_first: bool,
+    mut inspect: impl FnMut(),
+) -> Vec<usize> {
+    let mut indices = (0..ranges.len()).collect::<Vec<_>>();
+    if nested_regions_first {
+        // Count strict containing ranges as a two-dimensional dominance query:
+        // process starts ascending and ends descending, then query how many
+        // previously inserted ends are >= this end. Equal ranges are handled as
+        // one group and inserted only after their shared depth is read.
+        let mut ends = ranges.iter().map(|range| range.end).collect::<Vec<_>>();
+        ends.sort_unstable();
+        ends.dedup();
+        indices.sort_unstable_by_key(|&index| {
+            (ranges[index].start, std::cmp::Reverse(ranges[index].end))
+        });
+        let mut tree = vec![0usize; ends.len() + 1];
+        let mut inserted = 0usize;
+        let mut depths = vec![0usize; ranges.len()];
+        let mut group_start = 0usize;
+        while group_start < indices.len() {
+            let range = &ranges[indices[group_start]];
+            let mut group_end = group_start + 1;
+            while group_end < indices.len() && ranges[indices[group_end]] == *range {
+                group_end += 1;
+            }
+            let end_index = ends
+                .binary_search(&range.end)
+                .expect("range end came from the compressed set");
+            let mut prefix_before = 0usize;
+            let mut cursor = end_index;
+            while cursor > 0 {
+                inspect();
+                prefix_before += tree[cursor];
+                cursor &= cursor - 1;
+            }
+            let depth = inserted - prefix_before;
+            for &index in &indices[group_start..group_end] {
+                depths[index] = depth;
+            }
+            for _ in group_start..group_end {
+                let mut cursor = end_index + 1;
+                while cursor < tree.len() {
+                    inspect();
+                    tree[cursor] += 1;
+                    cursor += cursor & cursor.wrapping_neg();
+                }
+                inserted += 1;
+            }
+            group_start = group_end;
+        }
+        indices.sort_unstable_by_key(|&index| (std::cmp::Reverse(depths[index]), index));
+    }
+    let mut order = vec![0; ranges.len()];
+    for (rank, index) in indices.into_iter().enumerate() {
+        order[index] = rank;
+    }
+    order
 }
 
 #[cfg(feature = "e2e")]
@@ -368,6 +578,7 @@ async fn wait_for_host_admission_release() {
     }
 }
 
+#[cfg(test)]
 fn concat_whole_document_items<T>(mut acc: Vec<T>, next: Vec<T>) -> Vec<T> {
     acc.extend(next);
     acc
@@ -381,8 +592,21 @@ fn nonempty_whole_document_items<T>(items: Vec<T>) -> Option<Vec<T>> {
 /// order (the region index recorded at fan-out time), regardless of task
 /// completion order.
 pub(super) fn flatten_ordered_region_items<T>(
-    mut region_items: Vec<(usize, Option<Vec<T>>)>,
+    region_items: Vec<(usize, Option<Vec<T>>)>,
 ) -> Vec<T> {
+    flatten_ordered_region_items_with(region_items, |mut acc, mut next| {
+        acc.append(&mut next);
+        acc
+    })
+}
+
+fn flatten_ordered_region_items_with<T, M>(
+    mut region_items: Vec<(usize, Option<Vec<T>>)>,
+    merge: M,
+) -> Vec<T>
+where
+    M: Fn(Vec<T>, Vec<T>) -> Vec<T>,
+{
     region_items.sort_unstable_by_key(|(region_index, _)| *region_index);
     let total_len = region_items
         .iter()
@@ -397,8 +621,8 @@ pub(super) fn flatten_ordered_region_items<T>(
         return Vec::new();
     };
     flattened.reserve(total_len - flattened.len());
-    for mut items in ordered_items {
-        flattened.append(&mut items);
+    for items in ordered_items {
+        flattened = merge(flattened, items);
     }
     flattened
 }
@@ -407,6 +631,7 @@ pub(super) fn flatten_ordered_region_items<T>(
 mod tests {
     use super::*;
     use crate::config::WorkspaceSettings;
+    use crate::config::settings::BridgeServerConfig;
     use crate::config::settings::{
         AggregationStrategy, LanguageSettings, LayerAggregationConfig, LayerSource, LayersConfig,
     };
@@ -427,6 +652,26 @@ mod tests {
     fn empty_whole_document_layer_items_are_absent() {
         assert_eq!(nonempty_whole_document_items::<i32>(vec![]), None);
         assert_eq!(nonempty_whole_document_items(vec![1]), Some(vec![1]));
+    }
+
+    #[test]
+    fn disabled_fan_out_selects_no_bridge_server() {
+        let configs = vec![ResolvedServerConfig {
+            server_name: "tokens".into(),
+            config: Arc::new(BridgeServerConfig::default()),
+        }];
+
+        assert!(!request_selects_servers(&[], &configs, None));
+        assert!(!request_selects_servers(
+            &[crate::config::settings::PRIORITIES_WILDCARD.into()],
+            &configs,
+            Some(0),
+        ));
+        assert!(request_selects_servers(
+            &[crate::config::settings::PRIORITIES_WILDCARD.into()],
+            &configs,
+            None,
+        ));
     }
 
     #[tokio::test]
@@ -492,6 +737,7 @@ mod tests {
 #[cfg(test)]
 mod ordered_region_tests {
     use super::*;
+    use tower_lsp_server::ls_types::SemanticToken;
 
     #[test]
     fn flattens_region_results_by_source_order() {
@@ -503,5 +749,108 @@ mod ordered_region_tests {
         ]);
 
         assert_eq!(flattened, vec!["early", "late", "last"]);
+    }
+
+    #[test]
+    fn rebases_independently_encoded_semantic_token_regions() {
+        let token = |delta_line| SemanticToken {
+            delta_line,
+            delta_start: 2,
+            length: 4,
+            token_type: 1,
+            token_modifiers_bitset: 0,
+        };
+
+        let flattened = flatten_ordered_region_items_with(
+            vec![(1, Some(vec![token(10)])), (0, Some(vec![token(3)]))],
+            crate::lsp::bridge::merge_semantic_token_layers,
+        );
+
+        assert_eq!(flattened, vec![token(3), token(7)]);
+    }
+
+    #[test]
+    fn nested_semantic_region_overlays_its_outer_region() {
+        let orders = region_merge_order(&[0..10, 2..5], true);
+        let token = |delta_start, length, token_type| SemanticToken {
+            delta_line: 0,
+            delta_start,
+            length,
+            token_type,
+            token_modifiers_bitset: 0,
+        };
+
+        let flattened = flatten_ordered_region_items_with(
+            vec![
+                (orders[0], Some(vec![token(0, 10, 1)])),
+                (orders[1], Some(vec![token(2, 3, 2)])),
+            ],
+            crate::lsp::bridge::merge_semantic_token_layers,
+        );
+
+        assert_eq!(
+            flattened,
+            vec![token(0, 2, 1), token(2, 3, 2), token(3, 5, 1)]
+        );
+    }
+
+    #[test]
+    fn nested_region_order_scales_with_ordered_sweep() {
+        let disjoint = (0..10_000)
+            .map(|index| index * 2..index * 2 + 1)
+            .collect::<Vec<_>>();
+        let mut inspections = 0usize;
+        let order = region_merge_order_with_observer(&disjoint, true, || inspections += 1);
+
+        assert_eq!(order, (0..disjoint.len()).collect::<Vec<_>>());
+        let nested = (0..10_000)
+            .map(|index| index..20_000 - index)
+            .collect::<Vec<_>>();
+        let nested_order = region_merge_order_with_observer(&nested, true, || inspections += 1);
+        assert_eq!(nested_order[9_999], 0);
+        assert!(
+            inspections < (disjoint.len() + nested.len()) * 40,
+            "region depth calculation must stay O(n log n), got {inspections} tree operations"
+        );
+    }
+
+    #[test]
+    fn ordered_region_depth_matches_quadratic_containment_contract() {
+        let oracle = |ranges: &[std::ops::Range<usize>]| {
+            let mut indices = (0..ranges.len()).collect::<Vec<_>>();
+            let depth = |index: usize| {
+                ranges
+                    .iter()
+                    .enumerate()
+                    .filter(|(other_index, outer)| {
+                        *other_index != index
+                            && outer.start <= ranges[index].start
+                            && ranges[index].end <= outer.end
+                            && *outer != &ranges[index]
+                    })
+                    .count()
+            };
+            indices.sort_by_key(|&index| (std::cmp::Reverse(depth(index)), index));
+            let mut order = vec![0; ranges.len()];
+            for (rank, index) in indices.into_iter().enumerate() {
+                order[index] = rank;
+            }
+            order
+        };
+        let cases = [
+            vec![],
+            vec![0..1, 1..2, 2..3],
+            vec![0..10, 2..8, 3..4],
+            vec![0..5, 2..8, 4..6],
+            vec![0..10, 0..8, 0..8, 2..8, 2..10],
+            vec![0..10, 0..10, 2..5, 2..5],
+        ];
+        for ranges in cases {
+            assert_eq!(region_merge_order(&ranges, true), oracle(&ranges));
+            assert_eq!(
+                region_merge_order(&ranges, false),
+                (0..ranges.len()).collect::<Vec<_>>()
+            );
+        }
     }
 }

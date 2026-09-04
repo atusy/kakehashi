@@ -21,7 +21,9 @@ Phased roadmap:
    settings arc), keyed `textDocument/publishDiagnostics` to match its
    aggregation config. With host bridging (host-document-bridge)
    implemented for the bridged request methods (`semanticTokens/range` is
-   covered for injection-contained requests; full/delta remain native-only),
+   covered for injection-contained requests; full uses its required overlay
+   barrier; full/delta re-enters that overlay when a bridge becomes applicable
+   but does not establish a merged delta lineage),
    handlers run the real
    stage-2 `preferred` walk (`Kakehashi::walk_layers` →
    `race_layers_preferred`): the virt and host layers fan out
@@ -275,7 +277,14 @@ independent — e.g., diagnostics can be `concatenated` across layers while
 - **Nested injections stay implicit.** When injections nest
   (markdown → python → sql), the virt layer resolves deepest-first,
   consistent with the semantic-token priority convention (deeper wins). Depth
-  order is not user-configurable.
+  order is not user-configurable. Whole-document semantic-token bridge results
+  derive that depth from strict host-span containment; unrelated regions retain
+  document order.
+- **Participation begins after server selection.** A discovered virtual or
+  host target whose server allowlist is empty (including `priorities: []` or
+  `maxFanOut: 0`) did not bridge the request. In particular, an unchanged native
+  semantic-full response retains its native `resultId` and delta lineage when
+  no bridge server was selected.
 
 ### Out of Scope
 
@@ -292,11 +301,12 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   inexpressible. The practical need is still unproven; if it materializes,
   a host-relative weight on `bridge.<inj>` is the extension point — not
   entries in `priorities`.
-- **Semantic tokens**: the progressive-refinement strategy
-  (language-server-bridge-request-strategies Strategy 1) is a *temporal*
-  merge — native immediately, bridged tokens replacing them later — not an
-  ordering. Semantic tokens stay outside this mechanism (native-only today);
-  a future `merged`-style strategy may bring them in.
+- **Semantic tokens**: full-document requests use a required barrier overlay,
+  not the configurable preferred/concatenated choice: a virtual-only winner
+  cannot represent the surrounding host document. Range requests retain the
+  ordinary preferred walk because one injection wholly owns their bridged
+  range. Full/delta re-enters the full overlay when a native lineage encounters
+  a newly applicable bridge, returning a full response without a merged lineage.
 
 ## Consequences
 

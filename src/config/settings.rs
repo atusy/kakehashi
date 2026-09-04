@@ -291,7 +291,9 @@ fn default_aggregation_strategy_for_method(method: &str) -> AggregationStrategy 
 /// target produce *competing* whole-document edits.
 fn default_layer_strategy_for_method(method: &str) -> AggregationStrategy {
     match method {
-        "textDocument/formatting" => AggregationStrategy::Concatenated,
+        "textDocument/formatting" | "textDocument/semanticTokens/full" => {
+            AggregationStrategy::Concatenated
+        }
         _ => default_aggregation_strategy_for_method(method),
     }
 }

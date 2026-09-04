@@ -718,6 +718,14 @@ impl CacheCoordinator {
         self.request_tracker.finish_request(uri, request_id);
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_request(
+        &self,
+        uri: &Url,
+    ) -> Option<(RequestId, crate::cancel::CancelToken)> {
+        self.request_tracker.active_request(uri)
+    }
+
     /// Cancel all requests for a given URI (test helper).
     #[cfg(test)]
     pub(crate) fn cancel_requests(&self, uri: &Url) {

@@ -1225,6 +1225,22 @@ impl LanguageServerPool {
             .collect()
     }
 
+    /// Whether the exact document-routed connection is ready and definitively
+    /// lacks `method`. Missing or non-ready connections remain capability-unknown.
+    pub(crate) async fn connection_known_incapable(
+        &self,
+        connection_key: &ConnectionKey,
+        method: &str,
+    ) -> bool {
+        self.connections
+            .lock()
+            .await
+            .get(connection_key)
+            .is_some_and(|handle| {
+                handle.state() == ConnectionState::Ready && !handle.has_capability(method)
+            })
+    }
+
     /// Host-document sync state (host-document-bridge). Used by the host
     /// request path in `text_document/host.rs`.
     pub(super) async fn host_documents(
@@ -1972,7 +1988,7 @@ impl LanguageServerPool {
 
     /// Resolve the exact `(server, root)` connection a document currently
     /// routes to, including shared-instance capability fallback.
-    pub(super) async fn resolved_connection_key(
+    pub(crate) async fn resolved_connection_key(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
@@ -9304,6 +9320,36 @@ mod tests {
         assert!(
             incapable.is_empty(),
             "a capable instance makes the whole server capable across roots"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_known_incapable_is_scoped_to_the_resolved_root() {
+        use tower_lsp_server::ls_types::{HoverProviderCapability, ServerCapabilities};
+
+        let pool = LanguageServerPool::new();
+        let root_a_key = ConnectionKey::new("srv", Some("/a".to_string()));
+        let root_a = create_handle_with_key(ConnectionState::Ready, root_a_key.clone()).await;
+        root_a.set_server_capabilities(ServerCapabilities::default());
+        pool.insert_connection(root_a).await;
+
+        let root_b_key = ConnectionKey::new("srv", Some("/b".to_string()));
+        let root_b = create_handle_with_key(ConnectionState::Ready, root_b_key.clone()).await;
+        root_b.set_server_capabilities(ServerCapabilities {
+            hover_provider: Some(HoverProviderCapability::Simple(true)),
+            ..Default::default()
+        });
+        pool.insert_connection(root_b).await;
+
+        assert!(
+            pool.connection_known_incapable(&root_a_key, "textDocument/hover")
+                .await,
+            "another root's capable instance must not make this root eligible"
+        );
+        assert!(
+            !pool
+                .connection_known_incapable(&root_b_key, "textDocument/hover")
+                .await
         );
     }
 

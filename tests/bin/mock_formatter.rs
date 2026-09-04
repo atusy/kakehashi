@@ -340,6 +340,26 @@ fn main() {
                         },
                         "textDocumentSync": 1
                     }),
+                    "semantic-tokens-full-host" => json!({
+                        "semanticTokensProvider": {
+                            "legend": {
+                                "tokenTypes": ["variable", "keyword"],
+                                "tokenModifiers": ["static"]
+                            },
+                            "full": true
+                        },
+                        "textDocumentSync": 1
+                    }),
+                    "semantic-tokens-full-host-invalid" => json!({
+                        "semanticTokensProvider": {
+                            "legend": {
+                                "tokenTypes": ["custom"],
+                                "tokenModifiers": []
+                            },
+                            "full": true
+                        },
+                        "textDocumentSync": 1
+                    }),
                     "semantic-tokens-range-virt" | "semantic-tokens-range-delayed" => json!({
                         "semanticTokensProvider": {
                             "legend": {
@@ -347,6 +367,28 @@ fn main() {
                                 "tokenModifiers": ["static"]
                             },
                             "range": true
+                        },
+                        "textDocumentSync": 1
+                    }),
+                    "semantic-tokens-full-virt"
+                    | "semantic-tokens-full-delayed"
+                    | "semantic-tokens-full-marker" => json!({
+                        "semanticTokensProvider": {
+                            "legend": {
+                                "tokenTypes": ["custom", "variable"],
+                                "tokenModifiers": ["static"]
+                            },
+                            "full": true
+                        },
+                        "textDocumentSync": 1
+                    }),
+                    "semantic-tokens-full-nested" => json!({
+                        "semanticTokensProvider": {
+                            "legend": {
+                                "tokenTypes": ["variable", "keyword"],
+                                "tokenModifiers": ["static"]
+                            },
+                            "full": true
                         },
                         "textDocumentSync": 1
                     }),
@@ -1686,6 +1728,44 @@ fn main() {
                 if mode == "semantic-tokens-range-delayed" {
                     record_mock_event(&mode, "request", &message);
                     wait_for_mock_release(&mode);
+                }
+                respond(&mut writer, id, result);
+            }
+            "textDocument/semanticTokens/full" => {
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .and_then(|uri| documents.get(uri))
+                    .map(|text| {
+                        if mode == "semantic-tokens-full-nested" {
+                            let marker = text.find("code").expect("nested fixture marker");
+                            let before = &text[..marker];
+                            let line = before.bytes().filter(|byte| *byte == b'\n').count();
+                            let column = before
+                                .rsplit_once('\n')
+                                .map_or(before.len(), |(_, tail)| tail.len());
+                            // The outer Rust virtual document contains the
+                            // function declaration; the nested identifier does not.
+                            // Both tokens project to the same host span.
+                            let token_type = usize::from(text.contains("fn "));
+                            let modifiers = u8::from(text.contains("fn "));
+                            return json!({ "data": [line, column, 4, token_type, modifiers] });
+                        }
+                        let (length, token_type) = if mode == "semantic-tokens-full-host" {
+                            (8, 1)
+                        } else if mode == "semantic-tokens-full-host-invalid" {
+                            (8, 0)
+                        } else {
+                            (4, 1)
+                        };
+                        json!({ "data": [0, 0, length, token_type, 1] })
+                    })
+                    .unwrap_or(Value::Null);
+                if mode == "semantic-tokens-full-delayed" {
+                    record_mock_event(&mode, "request", &message);
+                    wait_for_mock_release(&mode);
+                } else if mode == "semantic-tokens-full-marker" {
+                    record_mock_event(&mode, "request", &message);
                 }
                 respond(&mut writer, id, result);
             }

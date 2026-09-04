@@ -107,6 +107,13 @@ impl SemanticRequestTracker {
             .remove_if(uri, |_, entry| entry.id == request_id);
     }
 
+    #[cfg(test)]
+    pub fn active_request(&self, uri: &Url) -> Option<(u64, CancelToken)> {
+        self.active_requests
+            .get(uri)
+            .map(|entry| (entry.id, entry.cancel.clone()))
+    }
+
     /// Cancels all requests for a given URI.
     /// Useful when a document is closed: the removed request's token is flipped
     /// so any in-flight compute for the now-gone document stops.
