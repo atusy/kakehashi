@@ -678,63 +678,50 @@ pub(crate) struct SnapshotView {
     pub(crate) content_version: u64,
 }
 
-/// What a parse pass expects the document to still be when its result is
-/// installed: the exact inputs it parsed. A relabelled language rejects the
-/// whole install; otherwise the cell's admission rule decides the publish,
-/// and the legacy tree is attached only when the snapshot was admitted AND
-/// the text, incarnation and content version are unchanged — so a document
-/// that moved on (an edit, a close and reopen) can still publish an older
-/// snapshot without attaching its tree, and an equal-version sibling parse
-/// attaches nothing even with unchanged inputs.
-pub(crate) struct ParseInputs<'a> {
-    /// The exact text allocation the parse read (`Document::text_arc`);
-    /// compared by identity, not content — this is the large-document open
-    /// path and the compare runs under the shard's write guard.
-    pub(crate) text: &'a Arc<str>,
-    /// `Some(expected)` requires the document's stored language to still be
-    /// `expected` (`Some(None)`: still unlabelled) — an off-ingress reparse
-    /// must not attach to a relabelled reopen — and leaves the stored
-    /// language as it is; the tree alone is attached. `None` lets the
-    /// snapshot's language (first-parse detection) become the stored one.
-    pub(crate) language_id: Option<Option<&'a str>>,
-    pub(crate) incarnation: u64,
-    pub(crate) content_version: u64,
+/// How `install_parse` treats the document's stored language.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LanguageCheck<'a> {
+    /// The open parse: the snapshot's detected language becomes the stored
+    /// one when the parse is current.
+    Record,
+    /// An off-ingress reparse: the stored language must still be the one
+    /// the parse was run for (`None`: still unlabelled) or the whole install
+    /// is rejected — a tree from the old grammar must not reach a relabelled
+    /// reopen — and the stored language is left as it is.
+    Expect(Option<&'a str>),
 }
 
 /// The outcome of [`DocumentStore::install_parse`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ParseInstall {
-    /// The legacy tree (and language) were attached: the inputs were
-    /// unchanged and the snapshot was admitted (implies `published`).
-    pub(crate) attached: bool,
+    /// The snapshot is the document's current parse: it was admitted and its
+    /// `parsed_version` is the document's content version (implies
+    /// `published`). Gates the tree-dependent downstream (`has_tree`, the
+    /// open parse's follow-ups); a stale-but-consistent parse publishes
+    /// without it.
+    pub(crate) current: bool,
     /// The snapshot landed in the document's cell: the language matched and
     /// the slot admitted it.
     pub(crate) published: bool,
 }
 
 impl DocumentStore {
-    /// Install a parse result: attach its tree (and language) to the legacy
-    /// document iff `expected` still describes the document, and publish
-    /// `snapshot` iff the cell admits it — both under the document's entry
-    /// lock, as the one way a parse reaches readers. The `parse_states`
-    /// `has_tree` flip runs after that guard is released (a different map);
-    /// it is non-inserting, so a `didClose` between the two leaves no ghost
-    /// entry.
-    ///
-    /// The two writes share one `get_mut` guard, and the tree is attached
-    /// only when the snapshot was admitted, so no reader can observe a tree
-    /// whose snapshot is not in the cell and no path can attach a tree
-    /// without publishing: this is the only attach entry point. The reverse
-    /// is allowed — the snapshot may land while the tree does not, when the
-    /// inputs moved on: a parse of text an edit has moved on from is stale
-    /// but consistent, which serve-stale readers consume (parse-snapshot
-    /// ADR), and the cell's admission rule rejects an out-of-order version on
-    /// its own. A language check that fails rejects both: the tree belongs
-    /// to a language the document no longer has, and so does the snapshot.
+    /// Install a parse result: publish `snapshot` iff the stored language
+    /// passes `language` and the cell admits it, under the document's entry
+    /// lock — the one way a parse reaches readers (`Document::tree` is the
+    /// published snapshot's tree). Whether the parse is *current* is the
+    /// snapshot's own stamps against the document: the cell already requires
+    /// its lifetime, and its `parsed_version` must be the content version.
+    /// A stale-but-consistent parse (an edit landed since) still publishes,
+    /// which serve-stale readers consume (parse-snapshot ADR); the cell
+    /// rejects an out-of-order version on its own; a failed language check
+    /// rejects the install outright. The `parse_states` `has_tree` flip runs
+    /// after the guard is released (a different map); it is non-inserting,
+    /// so a `didClose` between the two leaves no ghost entry.
     pub(crate) fn install_parse(
         &self,
         uri: &Url,
-        expected: ParseInputs<'_>,
+        language: LanguageCheck<'_>,
         snapshot: Arc<super::snapshot::ParseSnapshot>,
     ) -> ParseInstall {
         let has_tree = snapshot.tree.is_some();
@@ -749,32 +736,22 @@ impl DocumentStore {
             .get_mut(uri)
             .map_or_else(ParseInstall::default, |mut doc| {
                 evicted = doc.latest_snapshot_slot().snapshot;
-                if expected
-                    .language_id
-                    .is_some_and(|language_id| doc.language_id() != language_id)
+                if let LanguageCheck::Expect(expected) = language
+                    && doc.language_id() != expected
                 {
                     return ParseInstall::default();
                 }
-                let inputs_unchanged = doc.incarnation() == expected.incarnation
-                    && doc.content_version() == expected.content_version
-                    && Arc::ptr_eq(&doc.text_arc(), expected.text);
-                // A checked language is kept as stored: the reparses attach
-                // a tree, they do not relabel (the snapshot carries the
-                // detected name for its own readers). Only the open parse
-                // (`language_id: None`) records what it detected.
-                let language = match expected.language_id {
-                    None => snapshot.language.clone(),
-                    Some(_) => doc.language_id().map(String::from),
-                };
+                let parsed_current_version = snapshot.parsed_version == doc.content_version();
+                let detected = snapshot.language.clone();
                 let published = doc.publish_snapshot(&snapshot);
-                let attached = inputs_unchanged && published;
-                if attached {
-                    doc.set_parse_result(language);
+                let current = published && parsed_current_version;
+                // The reparses do not relabel (the snapshot carries the
+                // detected name for its own readers); only the open parse
+                // records what it detected.
+                if current && matches!(language, LanguageCheck::Record) {
+                    doc.set_parse_result(detected);
                 }
-                ParseInstall {
-                    attached,
-                    published,
-                }
+                ParseInstall { current, published }
             });
         // Likewise a rejected `snapshot` (still owned here: the publish
         // borrows) — destroyed only after the guard is released.
@@ -788,7 +765,7 @@ impl DocumentStore {
         }
         // A different map (`parse_states`): touched only after the document
         // guard above is released.
-        if outcome.attached && has_tree {
+        if outcome.current && has_tree {
             self.mark_tree_available_if_tracked(uri);
         }
         outcome
@@ -849,12 +826,7 @@ mod tests {
         store.update_document(uri.clone(), "# doc edited\n".to_string(), None);
         let outcome = store.install_parse(
             &uri,
-            ParseInputs {
-                text: &expected_text,
-                language_id: Some(Some("markdown")),
-                incarnation,
-                content_version,
-            },
+            LanguageCheck::Expect(Some("markdown")),
             parse_snapshot(
                 &expected_text,
                 Some(markdown_tree(text)),
@@ -865,7 +837,7 @@ mod tests {
         assert_eq!(
             outcome,
             ParseInstall {
-                attached: false,
+                current: false,
                 published: true
             }
         );
@@ -898,12 +870,7 @@ mod tests {
         };
         let reparse = store.install_parse(
             &uri,
-            ParseInputs {
-                text: &expected_text,
-                language_id: Some(Some("sh")),
-                incarnation,
-                content_version,
-            },
+            LanguageCheck::Expect(Some("sh")),
             Arc::new(super::super::snapshot::ParseSnapshot {
                 text: Arc::clone(&expected_text),
                 tree: Some(markdown_tree(text)),
@@ -916,7 +883,7 @@ mod tests {
                 layer_trees: std::sync::OnceLock::new(),
             }),
         );
-        assert!(reparse.attached && reparse.published);
+        assert!(reparse.current && reparse.published);
         assert_eq!(
             store.get(&uri).unwrap().language_id(),
             Some("sh"),
@@ -931,12 +898,7 @@ mod tests {
         };
         let open = store.install_parse(
             &uri2,
-            ParseInputs {
-                text: &expected_text2,
-                language_id: None,
-                incarnation: incarnation2,
-                content_version: content_version2,
-            },
+            LanguageCheck::Record,
             parse_snapshot(
                 &expected_text2,
                 Some(markdown_tree(text)),
@@ -944,7 +906,7 @@ mod tests {
                 incarnation2,
             ),
         );
-        assert!(open.attached && open.published);
+        assert!(open.current && open.published);
         assert_eq!(
             store.get(&uri2).unwrap().language_id(),
             Some("markdown"),
@@ -988,15 +950,13 @@ mod tests {
         // parse holding the reopened text (a re-read that raced the close)
         // must still be told apart by the lifetime alone.
         let reopened_text = store.get(&uri).unwrap().text_arc();
-        for language_id in [Some(Some("markdown")), None] {
+        for language in [
+            LanguageCheck::Expect(Some("markdown")),
+            LanguageCheck::Record,
+        ] {
             let stale = store.install_parse(
                 &uri,
-                ParseInputs {
-                    text: &reopened_text,
-                    language_id,
-                    incarnation,
-                    content_version,
-                },
+                language,
                 parse_snapshot(
                     &reopened_text,
                     Some(markdown_tree(text)),
@@ -1007,7 +967,7 @@ mod tests {
             assert_eq!(
                 stale,
                 ParseInstall::default(),
-                "the prior lifetime's parse must land nothing (mode {language_id:?})"
+                "the prior lifetime's parse must land nothing (mode {language:?})"
             );
             assert!(store.get(&uri).unwrap().tree().is_none());
         }
@@ -1035,12 +995,7 @@ mod tests {
         store.parse_states.remove(&uri);
         let installed = store.install_parse(
             &uri,
-            ParseInputs {
-                text: &expected_text,
-                language_id: None,
-                incarnation,
-                content_version,
-            },
+            LanguageCheck::Record,
             parse_snapshot(
                 &expected_text,
                 Some(markdown_tree(text)),
@@ -1048,7 +1003,7 @@ mod tests {
                 incarnation,
             ),
         );
-        assert!(installed.attached, "the document itself is still there");
+        assert!(installed.current, "the document itself is still there");
         assert!(
             !store.parse_states.contains_key(&uri),
             "a parse state the close already dropped must not be recreated"
@@ -1085,12 +1040,7 @@ mod tests {
         assert_ne!(reopened, incarnation);
         let stale = store.install_parse(
             &uri,
-            ParseInputs {
-                text: &expected_text,
-                language_id: Some(Some("markdown")),
-                incarnation,
-                content_version,
-            },
+            LanguageCheck::Expect(Some("markdown")),
             parse_snapshot(
                 &expected_text,
                 Some(markdown_tree(text)),
@@ -1110,12 +1060,7 @@ mod tests {
         let cell_before = store.latest_snapshot(&uri).and_then(|v| v.slot.snapshot);
         let mismatched = store.install_parse(
             &uri,
-            ParseInputs {
-                text: &reopened_text,
-                language_id: Some(Some("markdown")),
-                incarnation: reopened,
-                content_version: reopened_version,
-            },
+            LanguageCheck::Expect(Some("markdown")),
             parse_snapshot(
                 &reopened_text,
                 Some(markdown_tree(text)),
@@ -1159,12 +1104,7 @@ mod tests {
         );
         let outcome = store.install_parse(
             &uri,
-            ParseInputs {
-                text: &other_allocation,
-                language_id: Some(Some("markdown")),
-                incarnation,
-                content_version,
-            },
+            LanguageCheck::Expect(Some("markdown")),
             parse_snapshot(
                 &other_allocation,
                 Some(markdown_tree(text)),
@@ -1175,7 +1115,7 @@ mod tests {
         assert_eq!(
             outcome,
             ParseInstall {
-                attached: true,
+                current: true,
                 published: true
             },
             "same version, same lifetime: the current parse, whichever allocation it read"
@@ -1198,18 +1138,13 @@ mod tests {
         };
         let installed = store.install_parse(
             &uri,
-            ParseInputs {
-                text: &expected_text,
-                language_id: None,
-                incarnation,
-                content_version,
-            },
+            LanguageCheck::Record,
             parse_snapshot(&expected_text, None, content_version, incarnation),
         );
         assert_eq!(
             installed,
             ParseInstall {
-                attached: true,
+                current: true,
                 published: true
             }
         );
@@ -1221,12 +1156,7 @@ mod tests {
         store.remove(&uri);
         store.install_parse(
             &uri,
-            ParseInputs {
-                text: &expected_text,
-                language_id: None,
-                incarnation,
-                content_version,
-            },
+            LanguageCheck::Record,
             parse_snapshot(
                 &expected_text,
                 Some(markdown_tree(text)),
@@ -1261,12 +1191,7 @@ mod tests {
 
         let outcome = store.install_parse(
             &uri,
-            ParseInputs {
-                text: &expected_text,
-                language_id: Some(Some("markdown")),
-                incarnation,
-                content_version,
-            },
+            LanguageCheck::Expect(Some("markdown")),
             parse_snapshot(
                 &expected_text,
                 Some(markdown_tree(text)),
@@ -1277,7 +1202,7 @@ mod tests {
         assert_eq!(
             outcome,
             ParseInstall {
-                attached: true,
+                current: true,
                 published: true
             }
         );
@@ -1297,16 +1222,19 @@ mod tests {
         // snapshot. Identity, not just the reported outcome: the stored tree
         // and the cell's snapshot must be the very ones the first install
         // landed.
-        let landed_tree = store.get(&uri).unwrap().tree().map(|t| t.root_node().id());
+        // `Tree` clones share subtrees but not the root handle: a child node's
+        // id is the identity that survives the clone.
+        let first_child = |t: &tree_sitter::Tree| t.root_node().named_child(0).map(|n| n.id());
+        let landed_tree = store
+            .get(&uri)
+            .unwrap()
+            .tree()
+            .as_ref()
+            .and_then(first_child);
         let landed_snapshot = store.latest_snapshot(&uri).and_then(|v| v.slot.snapshot);
         let again = store.install_parse(
             &uri,
-            ParseInputs {
-                text: &expected_text,
-                language_id: Some(Some("markdown")),
-                incarnation,
-                content_version,
-            },
+            LanguageCheck::Expect(Some("markdown")),
             parse_snapshot(
                 &expected_text,
                 Some(markdown_tree(text)),
@@ -1320,7 +1248,12 @@ mod tests {
             "an equal-version duplicate lands neither tree nor snapshot"
         );
         assert_eq!(
-            store.get(&uri).unwrap().tree().map(|t| t.root_node().id()),
+            store
+                .get(&uri)
+                .unwrap()
+                .tree()
+                .as_ref()
+                .and_then(first_child),
             landed_tree,
             "the duplicate must not swap the attached tree"
         );
@@ -1338,12 +1271,7 @@ mod tests {
         store.update_document(uri.clone(), "# doc edited\n".to_string(), None);
         let stale = store.install_parse(
             &uri,
-            ParseInputs {
-                text: &expected_text,
-                language_id: Some(Some("markdown")),
-                incarnation,
-                content_version,
-            },
+            LanguageCheck::Expect(Some("markdown")),
             parse_snapshot(
                 &expected_text,
                 Some(markdown_tree(text)),
@@ -1361,12 +1289,7 @@ mod tests {
         store.remove(&uri);
         let gone = store.install_parse(
             &uri,
-            ParseInputs {
-                text: &expected_text,
-                language_id: None,
-                incarnation,
-                content_version,
-            },
+            LanguageCheck::Record,
             parse_snapshot(
                 &expected_text,
                 Some(markdown_tree(text)),
@@ -1403,12 +1326,7 @@ mod tests {
         let stale_tree = parser.parse("fn main() {}", None).unwrap();
         let stale = store.install_parse(
             &uri,
-            ParseInputs {
-                text: &pre_reload_text,
-                language_id: Some(Some("rust")),
-                incarnation,
-                content_version: 0,
-            },
+            LanguageCheck::Expect(Some("rust")),
             Arc::new(super::super::snapshot::ParseSnapshot {
                 text: Arc::clone(&pre_reload_text),
                 tree: Some(stale_tree),
@@ -1422,7 +1340,7 @@ mod tests {
             }),
         );
         assert!(
-            !stale.attached && !stale.published,
+            !stale.current && !stale.published,
             "a pre-reload parse must neither restore the legacy tree nor land its snapshot"
         );
 
