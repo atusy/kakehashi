@@ -4587,11 +4587,14 @@ mod tests {
 /// Order the documents a re-open sweep considers so that every document
 /// whose parse is already current comes before any whose parse is pending.
 ///
-/// The sweep has one budget for the whole pass and pays a parse wait per
+/// The sweep has one parse-wait budget for the whole pass and pays a wait per
 /// pending document; iterating the store's own (hash) order let a pending
-/// document ahead of a current one spend the budget the current one needed,
-/// and a current document behind it then went un-reopened. Stable: documents
-/// keep their relative order within each group.
+/// document ahead of a current one spend the budget the current one needed.
+/// The sweep keeps walking once the budget is spent and a current snapshot is
+/// recognised without waiting, so the order decides how much of the budget
+/// the pending documents get (and so how many settle in time), not whether a
+/// current document is visited. Stable: documents keep their relative order
+/// within each group.
 fn order_reopen_candidates(
     hosts: Vec<url::Url>,
     is_current: impl Fn(&url::Url) -> bool,
