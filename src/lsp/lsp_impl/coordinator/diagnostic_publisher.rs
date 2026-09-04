@@ -1104,13 +1104,15 @@ impl DiagnosticPublisher {
                     // A deferral with a parse snapshot present is the
                     // language still publishing or a reload in progress, not
                     // a pending tree — and no reparse follows an injected
-                    // language's auto-install reload. Retry once it settles.
-                    if self
-                        .documents
-                        .get(host)
-                        .is_some_and(|doc| doc.snapshot().is_some())
-                    {
-                        self.retry_republish_when_settled(host);
+                    // language's auto-install reload. Retry once it settles;
+                    // a document whose language stays unsettled (a load that
+                    // failed for good) ends the retry at its deadline.
+                    let host_language = self.documents.get(host).and_then(|doc| {
+                        doc.snapshot()?;
+                        doc.language_id().map(str::to_string)
+                    });
+                    if let Some(host_language) = host_language {
+                        self.retry_republish_when_settled(host, host_language);
                     }
                     return RepublishOutcome::Deferred;
                 }
@@ -1572,7 +1574,7 @@ impl DiagnosticPublisher {
     /// Re-run `republish` for `host` once no reload is in progress, bounded:
     /// the deferral otherwise relies on the reparse loop, which an injected
     /// language's auto-install reload never triggers for the host.
-    fn retry_republish_when_settled(&self, host: &Url) {
+    fn retry_republish_when_settled(&self, host: &Url, host_language: String) {
         const REPUBLISH_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
         const REPUBLISH_RETRY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
         let this = self.clone();
@@ -1589,7 +1591,7 @@ impl DiagnosticPublisher {
                     .lock()
                     .recover_poison("DiagnosticPublisher::retry_republish_when_settled")
                     .reload_in_progress();
-                if !reloading {
+                if !reloading && this.language.has_parser_available(&host_language) {
                     log::debug!(
                         target: LOG_TARGET,
                         "retry republish for {host}: reload settled"
