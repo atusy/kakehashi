@@ -419,7 +419,7 @@ impl ParseCoordinator {
     /// calling this, so the parse re-reads that stored text (a cheap `Arc<str>`
     /// refcount bump, [`text_arc`](crate::document::Document::text_arc)) rather than
     /// carrying a second owned `String`, and records the detected language + tree
-    /// **in place** through the non-inserting, text + incarnation guarded
+    /// **in place** through the non-inserting, cell-admitted
     /// [`install_parse`](crate::document::DocumentStore::install_parse) instead of
     /// re-inserting a fresh copy of the text. Net: zero full-document text copies
     /// in the open parse.
