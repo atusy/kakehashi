@@ -128,6 +128,16 @@ impl InjectionCoordinator {
         if reload_in_progress() {
             return None;
         }
+        // Nor is anything evidence before the language's parser is published
+        // (queries land first): regions a prior lifetime's parser derived, or
+        // an inline run of a query the published parser may not pair with,
+        // would let the sweep report a document repaired from unsettled
+        // state. The generation is read around the parser and query reads so
+        // a reload starting in between shows.
+        let generation_before = self.cache.semantic_token_generation();
+        if !self.language.has_parser_available(host_language) {
+            return None;
+        }
         // Fast path (parse-snapshot ADR §3, never discover twice): the parse
         // pass that scheduled this downstream already derived the bridge
         // regions from its single injection-query run and published them on
@@ -160,34 +170,30 @@ impl InjectionCoordinator {
         // `None` below means "could not be looked at", which the re-open sweep
         // must tell apart from "has nothing" — the latter releases commands.
         //
-        // The parser check and the query read are two reads of state a
+        // The parser check above and the query read are two reads of state a
         // settings reload swaps in place (registry, then query store, under
         // the reload guard). A pair straddling that swap could combine the old
         // parser with a not-yet-published query and read as definitive, so a
         // reload in progress — or one that started between the reads, which
         // the generation bump reveals — makes the whole answer undeterminable.
-        let generation_before = self.cache.semantic_token_generation();
-        let parser_published = self.language.has_parser_available(host_language);
         let injection_query = self.language.injection_query(host_language);
         if reload_in_progress() || self.cache.semantic_token_generation() != generation_before {
             return None;
         }
         let Some(injection_query) = injection_query else {
             // Queries are published before the parser, so a visible parser
-            // with no injection query is definitive. Without the parser the
-            // load is still publishing (or failed, and nothing will parse).
-            return parser_published.then(Vec::new);
+            // with no injection query is definitive.
+            return Some(Vec::new());
         };
 
         let Some(doc) = self.documents.get(uri) else {
             return Some(Vec::new());
         };
         let Some(tree) = doc.tree().cloned() else {
-            // No tree: with the parser published, a reload placeholder
+            // No tree under a published parser: a reload placeholder
             // (`Document::invalidate_parse`, version-current and tree-less) or
-            // a parse that yielded nothing; without it, a publication still
-            // in progress (the query above arrived first). Either way the
-            // document could not be looked at.
+            // a parse that yielded nothing. The document could not be looked
+            // at.
             return None;
         };
         let text = doc.text_arc();
@@ -944,6 +950,11 @@ mod tests {
             .language
             .query_store()
             .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
+        // The resolution answers only for a published parser.
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), language.clone());
         let text = r#"fn main() { let open = "<div>"; let close = "</div>"; }"#;
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language).expect("load rust grammar");
@@ -1104,7 +1115,7 @@ mod tests {
 
         assert!(
             injection.resolve_injection_data(&uri, "rust").is_none(),
-            "no parser published: the load may still be publishing its queries"
+            "no parser published: the load is still publishing"
         );
 
         server
