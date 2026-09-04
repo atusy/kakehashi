@@ -197,9 +197,11 @@ the replay (`IncrementalSeed::replay`) runs on the compute pool with the parse.
 Two obligations:
 
 - The seed is `None` when nothing is published, the published snapshot is
-  tree-less (resolved-but-parser-less), or `parsed_version < seed_floor` — it
-  never applies edits to a tree they do not match (the `#348` external-scanner
-  corruption) nor to an absent tree. Any eligible published version seeds: the
+  tree-less (resolved-but-parser-less), `parsed_version < seed_floor`, or the
+  snapshot's `language` is not the grammar the reparse will use (detection on
+  the edited text may select another) — it never applies edits to a tree they
+  do not match (the `#348` external-scanner corruption), nor to an absent tree,
+  nor hands one grammar's tree to another's parser. Any eligible published version seeds: the
   edits it has not seen are exactly the log entries tagged after it.
 - A full-text sync, a grammar reload, and an edit log that outgrows
   `MAX_SEED_EDITS` raise `seed_floor` to the version they produce and clear the

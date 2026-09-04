@@ -777,7 +777,7 @@ impl InjectionCoordinator {
     /// Wait (bounded by `budget`) for `uri`'s tree to be current before its
     /// injections are resolved.
     ///
-    /// `didChange` clears the tree and reparses off-ingress, so a re-open
+    /// `didChange` stales the tree and reparses off-ingress, so a re-open
     /// landing right after an edit would resolve ZERO injections and silently
     /// open nothing — the same reason every request path waits for a fresh tree
     /// (execute-command-routing-token). This NARROWS that window rather than

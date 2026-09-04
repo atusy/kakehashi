@@ -141,7 +141,7 @@ impl Kakehashi {
         // spawned, coalescing parse loop instead of holding the writer ticket.
         //
         // The debounced diagnostic in particular MUST run post-parse, not here: this
-        // handler just cleared the tree, and `prepare_diagnostic_snapshot` returns
+        // handler just made the tree stale, and `prepare_diagnostic_snapshot` returns
         // `None` without one (`Document::snapshot()` requires a tree). A `None`
         // snapshot makes the debounce a no-op, skipping the on-edit host re-sync
         // (#431) that keeps a push-only `_self` host server's diagnostics following
