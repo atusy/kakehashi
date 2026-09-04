@@ -685,7 +685,10 @@ pub(crate) struct SnapshotView {
 /// a close and reopen, a relabelled language) rejects the legacy tree; the
 /// snapshot's own admission rule decides the publish independently.
 pub(crate) struct ParseInputs<'a> {
-    pub(crate) text: &'a str,
+    /// The exact text allocation the parse read (`Document::text_arc`);
+    /// compared by identity, not content — this is the large-document open
+    /// path and the compare runs under the shard's write guard.
+    pub(crate) text: &'a Arc<str>,
     /// `Some(expected)` requires the document's stored language to still be
     /// `expected` (`Some(None)`: still unlabelled) — an off-ingress reparse
     /// must not attach to a relabelled reopen — and leaves the stored
@@ -740,7 +743,7 @@ impl DocumentStore {
                 }
                 let inputs_unchanged = doc.incarnation() == expected.incarnation
                     && doc.content_version() == expected.content_version
-                    && doc.text() == expected.text;
+                    && Arc::ptr_eq(&doc.text_arc(), expected.text);
                 // A checked language is kept as stored: the reparses attach
                 // a tree, they do not relabel (the snapshot carries the
                 // detected name for its own readers). Only the open parse
