@@ -1585,15 +1585,26 @@ impl DiagnosticPublisher {
         // reload in progress, during which an already-visible parser keeps
         // its registration while its queries are cleared and republished. A
         // visible parser with no injection query is otherwise definitive.
-        let reload_in_progress = self
-            .parser_pool
-            .lock()
-            .recover_poison("DiagnosticPublisher::current_region_offsets")
-            .reload_in_progress();
-        if reload_in_progress || !self.language.has_parser_available(&language_name) {
+        // Re-asked before every definitive answer, with the generation read
+        // around the parser and query reads: a reload starting in between
+        // would otherwise turn a query removed mid-swap into "no regions".
+        let generation_before = self.cache.semantic_token_generation();
+        let settled = || {
+            let reload_in_progress = self
+                .parser_pool
+                .lock()
+                .recover_poison("DiagnosticPublisher::current_region_offsets")
+                .reload_in_progress();
+            !reload_in_progress && self.cache.semantic_token_generation() == generation_before
+        };
+        if !settled() || !self.language.has_parser_available(&language_name) {
             return None;
         }
-        let Some(injection_query) = self.language.injection_query(&language_name) else {
+        let injection_query = self.language.injection_query(&language_name);
+        if !settled() {
+            return None;
+        }
+        let Some(injection_query) = injection_query else {
             return Some(offsets);
         };
 
@@ -1621,7 +1632,7 @@ impl DiagnosticPublisher {
                 ),
             );
         }
-        Some(offsets)
+        settled().then_some(offsets)
     }
 }
 
