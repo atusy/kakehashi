@@ -1687,6 +1687,10 @@ fn spawn_upstream_request(
                         // direction. (A `languageId` change needs
                         // didClose+didOpen, which bumps the incarnation, so the
                         // stale-reject window is narrow rather than absent.)
+                        // `document_language` falls back to the language the
+                        // document was opened under while its parser is still
+                        // being published, so a load in progress reads as
+                        // "could not look" below, not as "no language" here.
                         let screened_at = injection.document_incarnation(&host);
                         let reachable =
                             injection

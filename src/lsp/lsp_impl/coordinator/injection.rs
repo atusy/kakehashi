@@ -545,8 +545,18 @@ impl InjectionCoordinator {
     /// The cheap half of what [`Self::bridge_injections`] returns, so a caller
     /// screening many candidate documents can ask the configuration question
     /// before paying for a parse wait and an injection resolution.
+    ///
+    /// Parser-aware detection answers `None` until the language's parser is
+    /// published, which a language load in progress makes true for a moment
+    /// (queries land first); the language the document was opened or parsed
+    /// under is then the answer, so the caller reads "could not look" from
+    /// the resolution instead of "no language" from here.
     pub(crate) fn document_language(&self, uri: &Url) -> Option<String> {
-        self.get_language_for_document(uri)
+        self.get_language_for_document(uri).or_else(|| {
+            self.documents
+                .get(uri)
+                .and_then(|document| document.language_id().map(str::to_string))
+        })
     }
 
     /// `uri`'s reopen generation, which scopes a downstream `didOpen` to the
@@ -568,7 +578,7 @@ impl InjectionCoordinator {
         &self,
         uri: &Url,
     ) -> Option<(String, Option<Vec<BridgeInjection>>)> {
-        let host_language = self.get_language_for_document(uri)?;
+        let host_language = self.document_language(uri)?;
         let injections = self.resolve_injection_data(uri, &host_language);
         Some((host_language, injections))
     }
