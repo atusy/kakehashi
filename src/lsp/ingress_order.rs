@@ -40,6 +40,10 @@
 //!   tail ticket at `call` time and run only once that ticket is done, so a
 //!   request observes every edit that preceded it on the wire — without
 //!   serializing its computation against later edits or other documents.
+//! - **Workspace diagnostics** run one at a time in wire order. A downstream
+//!   producer can exit after its contribution is accepted and request a refresh
+//!   before that response reaches the socket; serializing a refresh-induced pull
+//!   behind the accepted handler keeps the newer response from overtaking it.
 //!
 //! Everything else passes through untouched.
 
@@ -74,6 +78,10 @@ tokio::task_local! {
     /// Read via [`current_reader_tail`].
     static READER_TAIL: u64;
 
+    /// Writer tails for every document known when a workspace-wide reader was
+    /// received. The handler awaits their parse/downstream-sync watermarks.
+    static WORKSPACE_READER_TAILS: Vec<(String, u64)>;
+
     /// Set by a reclaimable writer handler after it determines that the URI
     /// has no live document. The outer gate then removes idle sequencing state
     /// without resetting tickets for a live document.
@@ -98,6 +106,12 @@ pub(crate) fn current_reader_tail() -> Option<u64> {
     READER_TAIL.try_with(|ticket| *ticket).ok()
 }
 
+pub(crate) fn current_workspace_reader_tails() -> Vec<(String, u64)> {
+    WORKSPACE_READER_TAILS
+        .try_with(Clone::clone)
+        .unwrap_or_default()
+}
+
 /// Ask the ingress gate to remove this writer's per-URI sequencing entry once
 /// the handler completes, provided no later writer was already ticketed.
 pub(crate) fn reclaim_current_writer_sequence() {
@@ -108,6 +122,8 @@ pub(crate) fn reclaim_current_writer_sequence() {
 struct DocSeq {
     /// Last issued writer ticket (tickets start at 1; 0 = none issued).
     tail: u64,
+    /// Last writer ticket whose off-ingress parse/downstream sync must settle.
+    sync_tail: u64,
     /// Completion channel + out-of-order ledger shared with issued guards.
     completion: Arc<DocCompletion>,
 }
@@ -167,27 +183,35 @@ pub(crate) struct DocumentSequencer {
 impl DocumentSequencer {
     /// Take the next writer ticket for `uri`.
     pub(crate) fn issue_writer_ticket(&self, uri: &str) -> WriterGate {
+        self.issue_writer_ticket_with_sync(uri, true)
+    }
+
+    fn issue_writer_ticket_with_sync(&self, uri: &str, waits_for_sync: bool) -> WriterGate {
         // Fast path: rapid didChange streams hit an existing entry, where
         // `get_mut` borrows the key without allocating; only a miss pays for
         // the owned key.
         if let Some(mut entry) = self.docs.get_mut(uri) {
-            return Self::next_ticket(&mut entry);
+            return Self::next_ticket(&mut entry, waits_for_sync);
         }
         let mut entry = self.docs.entry(uri.to_string()).or_insert_with(|| DocSeq {
             tail: 0,
+            sync_tail: 0,
             completion: Arc::new(DocCompletion {
                 done: watch::Sender::new(0),
                 early: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             }),
         });
-        Self::next_ticket(&mut entry)
+        Self::next_ticket(&mut entry, waits_for_sync)
     }
 
     /// Bump `seq`'s tail and build the gate for the new ticket. Only copies
     /// fields out, so callers' shard guards span just the bump.
-    fn next_ticket(seq: &mut DocSeq) -> WriterGate {
+    fn next_ticket(seq: &mut DocSeq, waits_for_sync: bool) -> WriterGate {
         seq.tail += 1;
         let ticket = seq.tail;
+        if waits_for_sync {
+            seq.sync_tail = ticket;
+        }
         let rx = seq.completion.done.subscribe();
         let completion = Arc::clone(&seq.completion);
         WriterGate {
@@ -229,6 +253,27 @@ impl DocumentSequencer {
         // writers taking the shard's write lock (issue_writer_ticket / finish_close).
         drop(entry);
         (barrier, (tail > 0).then_some(tail))
+    }
+
+    fn workspace_barriers_and_tails(&self) -> (Vec<ReaderBarrier>, Vec<(String, u64)>) {
+        let mut barriers = Vec::new();
+        let mut tails = Vec::new();
+        for entry in &self.docs {
+            if entry.sync_tail > 0 {
+                tails.push((entry.key().clone(), entry.sync_tail));
+            }
+            let has_pending_writer = {
+                let done = *entry.completion.done.borrow();
+                done < entry.tail
+            };
+            if has_pending_writer {
+                barriers.push(ReaderBarrier {
+                    target: entry.tail,
+                    rx: entry.completion.done.subscribe(),
+                });
+            }
+        }
+        (barriers, tails)
     }
 
     /// Drop `uri`'s sequencing state after a close completed, unless later
@@ -292,9 +337,14 @@ enum Role {
         uri: String,
         close: bool,
         reclaim_if_missing: bool,
+        waits_for_sync: bool,
     },
     /// Reads the document tree; waits for writers that preceded it.
     Reader { uri: String },
+    /// Produces a workspace-wide diagnostic snapshot; serialized globally.
+    WorkspaceDiagnostic,
+    /// Mutates the workspace scope observed by workspace-wide requests.
+    WorkspaceMutation,
 }
 
 /// Classify a request and extract its `textDocument.uri`, both synchronously.
@@ -328,6 +378,10 @@ enum Role {
 fn classify(req: &Request) -> Option<Role> {
     let method = req.method();
     match method {
+        "workspace/didChangeConfiguration" | "workspace/didChangeWorkspaceFolders" => {
+            Some(Role::WorkspaceMutation)
+        }
+        "workspace/diagnostic" => Some(Role::WorkspaceDiagnostic),
         "textDocument/didSave" => {
             // Cleanup for a missing save is signalled by the typed handler.
             // Decode the complete params before issuing a ticket so malformed
@@ -342,6 +396,7 @@ fn classify(req: &Request) -> Option<Role> {
                 uri,
                 close: false,
                 reclaim_if_missing: true,
+                waits_for_sync: false,
             })
         }
         "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didClose" => {
@@ -350,6 +405,7 @@ fn classify(req: &Request) -> Option<Role> {
                 uri,
                 close: method == "textDocument/didClose",
                 reclaim_if_missing: false,
+                waits_for_sync: method != "textDocument/didClose",
             })
         }
         "textDocument/semanticTokens/full"
@@ -431,6 +487,8 @@ pub(crate) fn normalize_uri(raw: &str) -> String {
 pub struct IngressOrderGate<S> {
     inner: S,
     sequencer: Arc<DocumentSequencer>,
+    workspace_diagnostic_sequencer: Arc<DocumentSequencer>,
+    cancel_forwarder: Option<crate::lsp::request_id::CancelForwarder>,
 }
 
 impl<S> IngressOrderGate<S> {
@@ -438,6 +496,20 @@ impl<S> IngressOrderGate<S> {
         Self {
             inner,
             sequencer: Arc::new(DocumentSequencer::default()),
+            workspace_diagnostic_sequencer: Arc::new(DocumentSequencer::default()),
+            cancel_forwarder: None,
+        }
+    }
+
+    pub fn with_cancel_forwarder(
+        inner: S,
+        cancel_forwarder: crate::lsp::request_id::CancelForwarder,
+    ) -> Self {
+        Self {
+            inner,
+            sequencer: Arc::new(DocumentSequencer::default()),
+            workspace_diagnostic_sequencer: Arc::new(DocumentSequencer::default()),
+            cancel_forwarder: Some(cancel_forwarder),
         }
     }
 }
@@ -458,18 +530,112 @@ where
 
     fn call(&mut self, req: Request) -> Self::Future {
         let role = classify(&req);
+        let request_id = req.id().cloned();
         // The inner call must stay synchronous inside `call` so nested
         // middleware (e.g. RequestIdCapture) keeps seeing wire order too.
         let inner_fut = self.inner.call(req);
         match role {
             None => Box::pin(inner_fut),
+            Some(Role::WorkspaceMutation) => {
+                let mut gate = self
+                    .workspace_diagnostic_sequencer
+                    .issue_writer_ticket("workspace/diagnostic");
+                Box::pin(async move {
+                    gate.wait_turn().await;
+                    let result = inner_fut.await;
+                    drop(gate);
+                    result
+                })
+            }
+            Some(Role::WorkspaceDiagnostic) => {
+                let (document_barriers, document_tails) =
+                    self.sequencer.workspace_barriers_and_tails();
+                let mut gate = self
+                    .workspace_diagnostic_sequencer
+                    .issue_writer_ticket("workspace/diagnostic");
+                let cancellation = self.cancel_forwarder.as_ref().and_then(|forwarder| {
+                    let upstream_id = match request_id.as_ref()? {
+                        tower_lsp_server::jsonrpc::Id::Number(id) => {
+                            crate::lsp::bridge::UpstreamId::Number(*id)
+                        }
+                        tower_lsp_server::jsonrpc::Id::String(id) => {
+                            crate::lsp::bridge::UpstreamId::String(id.clone())
+                        }
+                        tower_lsp_server::jsonrpc::Id::Null => return None,
+                    };
+                    forwarder
+                        .subscribe(upstream_id.clone())
+                        .ok()
+                        .map(|receiver| (forwarder.clone(), upstream_id, receiver))
+                });
+                Box::pin(async move {
+                    if let Some((forwarder, upstream_id, mut cancel_rx)) = cancellation {
+                        let wait_for_document_writers = async {
+                            for barrier in document_barriers {
+                                barrier.wait().await;
+                            }
+                        };
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancel_rx => {
+                                forwarder.unsubscribe(&upstream_id);
+                                drop(inner_fut);
+                                drop(gate);
+                                return Ok(request_id.map(|id| {
+                                    Response::from_error(
+                                        id,
+                                        tower_lsp_server::jsonrpc::Error::request_cancelled(),
+                                    )
+                                }));
+                            }
+                            _ = wait_for_document_writers => {}
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancel_rx => {
+                                forwarder.unsubscribe(&upstream_id);
+                                drop(inner_fut);
+                                drop(gate);
+                                return Ok(request_id.map(|id| {
+                                    Response::from_error(
+                                        id,
+                                        tower_lsp_server::jsonrpc::Error::request_cancelled(),
+                                    )
+                                }));
+                            }
+                            _ = gate.wait_turn() => {}
+                        }
+                        if forwarder.unsubscribe_and_take_cancelled(&upstream_id) {
+                            drop(inner_fut);
+                            drop(gate);
+                            return Ok(request_id.map(|id| {
+                                Response::from_error(
+                                    id,
+                                    tower_lsp_server::jsonrpc::Error::request_cancelled(),
+                                )
+                            }));
+                        }
+                    } else {
+                        for barrier in document_barriers {
+                            barrier.wait().await;
+                        }
+                        gate.wait_turn().await;
+                    }
+                    let result = WORKSPACE_READER_TAILS
+                        .scope(document_tails, inner_fut)
+                        .await;
+                    drop(gate);
+                    result
+                })
+            }
             Some(Role::Writer {
                 uri,
                 close,
                 reclaim_if_missing,
+                waits_for_sync,
             }) => {
                 let sequencer = Arc::clone(&self.sequencer);
-                let mut gate = sequencer.issue_writer_ticket(&uri);
+                let mut gate = sequencer.issue_writer_ticket_with_sync(&uri, waits_for_sync);
                 let ticket = gate.ticket();
                 Box::pin(async move {
                     gate.wait_turn().await;
@@ -783,6 +949,11 @@ mod tests {
 
     #[test]
     fn classify_routes_methods() {
+        assert!(matches!(
+            classify(&notification("workspace/diagnostic", URI)),
+            Some(Role::WorkspaceDiagnostic)
+        ));
+
         let writer = classify(&notification("textDocument/didChange", URI));
         assert!(matches!(writer, Some(Role::Writer { close: false, .. })));
 
@@ -1024,6 +1195,8 @@ mod tests {
             "textDocument/didOpen" => "open",
             "textDocument/didChange" => "change",
             "textDocument/didClose" => "close",
+            "workspace/didChangeConfiguration" => "config",
+            "workspace/didChangeWorkspaceFolders" => "folders",
             _ => "reader",
         }
     }
@@ -1040,8 +1213,9 @@ mod tests {
         fn call(&mut self, req: Request) -> Self::Future {
             let log = Arc::clone(&self.log);
             let label = mock_label(req.method());
-            if req.method() == self.stall_method {
-                let release = self.release.take().expect("one stalled call expected");
+            if req.method() == self.stall_method
+                && let Some(release) = self.release.take()
+            {
                 Box::pin(async move {
                     let _ = release.await;
                     log.lock().recover_poison("MockInner::call").push(label);
@@ -1087,6 +1261,179 @@ mod tests {
         assert_eq!(
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["change", "reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_serializes_workspace_diagnostic_responses() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "workspace/diagnostic",
+            release: Some(release_rx),
+        });
+
+        let first_fut = gate.call(notification("workspace/diagnostic", URI));
+        let second_fut = gate.call(notification("workspace/diagnostic", URI));
+        let mut first = tokio_test::task::spawn(first_fut);
+        let mut second = tokio_test::task::spawn(second_fut);
+
+        assert!(first.poll().is_pending());
+        assert!(
+            second.poll().is_pending(),
+            "a refresh-induced pull must not complete before the accepted response"
+        );
+        release_tx.send(()).expect("first pull is waiting");
+        assert!(first.poll().is_ready());
+        assert!(second.is_woken());
+        assert!(second.poll().is_ready());
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["reader", "reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_runs_workspace_diagnostic_after_preceding_scope_mutation() {
+        async fn assert_order(method: &'static str, label: &'static str) {
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let mut gate = IngressOrderGate::new(MockInner {
+                log: Arc::clone(&log),
+                stall_method: method,
+                release: Some(release_rx),
+            });
+
+            let mutation_fut = gate.call(notification(method, URI));
+            let diagnostic_fut = gate.call(notification("workspace/diagnostic", URI));
+            let mut mutation = tokio_test::task::spawn(mutation_fut);
+            let mut diagnostic = tokio_test::task::spawn(diagnostic_fut);
+
+            assert!(diagnostic.poll().is_pending());
+            assert!(mutation.poll().is_pending());
+            assert!(diagnostic.poll().is_pending());
+            release_tx.send(()).expect("scope mutation is waiting");
+            assert!(mutation.poll().is_ready());
+            assert!(diagnostic.is_woken());
+            assert!(diagnostic.poll().is_ready());
+            assert_eq!(
+                *log.lock().recover_poison("ingress_order::tests"),
+                vec![label, "reader"]
+            );
+        }
+
+        assert_order("workspace/didChangeWorkspaceFolders", "folders").await;
+        assert_order("workspace/didChangeConfiguration", "config").await;
+    }
+
+    #[test]
+    fn workspace_snapshot_retains_completed_writer_sync_tail() {
+        let sequencer = DocumentSequencer::default();
+        let writer = sequencer.issue_writer_ticket(URI);
+        let ticket = writer.ticket();
+        drop(writer);
+
+        let (barriers, tails) = sequencer.workspace_barriers_and_tails();
+
+        assert!(barriers.is_empty());
+        assert_eq!(tails, vec![(URI.to_owned(), ticket)]);
+    }
+
+    #[tokio::test]
+    async fn gate_runs_workspace_diagnostic_after_all_preceding_document_writes() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "textDocument/didChange",
+            release: Some(release_rx),
+        });
+
+        let writer_fut = gate.call(notification("textDocument/didChange", URI));
+        let diagnostic_fut = gate.call(notification("workspace/diagnostic", URI));
+        let mut writer = tokio_test::task::spawn(writer_fut);
+        let mut diagnostic = tokio_test::task::spawn(diagnostic_fut);
+
+        assert!(diagnostic.poll().is_pending());
+        assert!(writer.poll().is_pending());
+        assert!(diagnostic.poll().is_pending());
+        release_tx.send(()).expect("didChange is waiting");
+        assert!(writer.poll().is_ready());
+        assert!(diagnostic.is_woken());
+        assert!(diagnostic.poll().is_ready());
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["change", "reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_workspace_diagnostic_leaves_the_ingress_queue() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let forwarder = crate::lsp::request_id::CancelForwarder::new(Arc::new(
+            crate::lsp::bridge::LanguageServerPool::new(),
+        ));
+        let inner = crate::lsp::request_id::RequestIdCapture::with_cancel_forwarder(
+            MockInner {
+                log,
+                stall_method: "workspace/diagnostic",
+                release: Some(release_rx),
+            },
+            forwarder.clone(),
+        );
+        let mut gate = IngressOrderGate::with_cancel_forwarder(inner, forwarder);
+
+        let first_fut = gate.call(
+            Request::build("workspace/diagnostic")
+                .id(1)
+                .params(serde_json::json!({}))
+                .finish(),
+        );
+        let second_fut = gate.call(
+            Request::build("workspace/diagnostic")
+                .id(2)
+                .params(serde_json::json!({}))
+                .finish(),
+        );
+        let mut first = tokio_test::task::spawn(first_fut);
+        let mut second = tokio_test::task::spawn(second_fut);
+        assert!(first.poll().is_pending());
+        assert!(second.poll().is_pending());
+
+        gate.call(
+            Request::build("$/cancelRequest")
+                .params(serde_json::json!({ "id": 2 }))
+                .finish(),
+        )
+        .await
+        .unwrap();
+
+        // Make the predecessor and cancellation ready before polling the
+        // queued request again. The biased handoff must retain cancellation.
+        release_tx.send(()).expect("first pull is waiting");
+        assert!(first.poll().is_ready());
+        tokio::task::yield_now().await;
+
+        let mut outcome = None;
+        for _ in 0..3 {
+            match second.poll() {
+                Poll::Ready(ready) => {
+                    outcome = Some(ready);
+                    break;
+                }
+                Poll::Pending => tokio::task::yield_now().await,
+            }
+        }
+        let response = outcome
+            .expect("the cancelled request must win a simultaneous gate handoff")
+            .expect("the ingress service must not fail")
+            .expect("the cancelled request must produce an error response");
+        assert_eq!(response.id(), &tower_lsp_server::jsonrpc::Id::Number(2));
+        assert_eq!(
+            response.error().expect("request must fail").code,
+            tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled
         );
     }
 

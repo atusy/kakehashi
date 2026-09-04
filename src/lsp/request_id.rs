@@ -88,6 +88,11 @@ type CancelSubscriberRegistry = std::sync::Mutex<CancelSubscriberState>;
 #[derive(Clone)]
 pub struct CancelForwarder {
     pool: Arc<LanguageServerPool>,
+    /// Makes downstream admission atomic against `$/cancelRequest` capture.
+    /// Only the cancel-forward path and
+    /// `register_downstream_request_if_current` take it; ordinary ingress
+    /// never touches it, so it cannot throttle unrelated messages.
+    admission_gate: Arc<std::sync::Mutex<()>>,
     /// Registry of subscribers waiting for cancel notifications.
     ///
     /// When a `$/cancelRequest` arrives, we look up the sender and notify it.
@@ -100,8 +105,50 @@ impl CancelForwarder {
     pub fn new(pool: Arc<LanguageServerPool>) -> Self {
         Self {
             pool,
+            admission_gate: Arc::new(std::sync::Mutex::new(())),
             subscribers: Arc::new(std::sync::Mutex::new(CancelSubscriberState::default())),
         }
+    }
+
+    /// Atomically admit one downstream request against this upstream request's
+    /// exact middleware generation. The admission gate is shared with raw
+    /// `$/cancelRequest` capture: registration wins and is captured, or cancel
+    /// wins and leaves a generation-scoped tombstone that rejects this late
+    /// registration before it reaches the downstream writer.
+    pub(crate) fn register_downstream_request_if_current(
+        &self,
+        upstream_id: UpstreamId,
+        handle: &Arc<crate::lsp::bridge::ConnectionHandle>,
+    ) -> std::io::Result<(
+        crate::lsp::bridge::RequestId,
+        tokio::sync::oneshot::Receiver<serde_json::Value>,
+    )> {
+        let _admission_guard = self
+            .admission_gate
+            .lock()
+            .recover_poison("CancelForwarder::register_downstream_request_if_current");
+        let admissible = {
+            let state = self
+                .subscribers
+                .lock()
+                .recover_poison("CancelForwarder::register_downstream_request_if_current");
+            let Some(generation) = state.active_requests.get(&upstream_id).copied() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "upstream request is no longer active",
+                ));
+            };
+            state.pending_cancellations.get(&upstream_id).copied() != Some(generation)
+                && state.delivered_cancellations.get(&upstream_id).copied() != Some(generation)
+        };
+        if !admissible {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "upstream request was cancelled before downstream admission",
+            ));
+        }
+        self.pool
+            .register_request_for_handle_with_upstream(Some(upstream_id), handle)
     }
 
     /// Forward a cancel request to the downstream server(s) for `upstream_id`,
@@ -126,6 +173,14 @@ impl CancelForwarder {
         upstream_id: UpstreamId,
         generation: Option<u64>,
     ) -> std::io::Result<()> {
+        // Hold the admission gate across capture so a downstream registration
+        // either lands before this pass (and is captured) or observes the
+        // generation tombstone it leaves behind. Everything below is
+        // synchronous, so the guard never spans an await.
+        let _admission_guard = self
+            .admission_gate
+            .lock()
+            .recover_poison("CancelForwarder::forward_cancel_for_generation");
         let validate_forwarder = self.clone();
         let notify_forwarder = self.clone();
         let validate_id = upstream_id.clone();
@@ -207,6 +262,26 @@ impl CancelForwarder {
         subscribers.subscribers.remove(upstream_id);
     }
 
+    /// Atomically release one subscriber and report whether cancellation was
+    /// already delivered for the request's active generation. A cancellation
+    /// arriving after this lock is released becomes pending for the next
+    /// subscriber, so middleware can hand cancellation ownership downstream
+    /// without an unsubscribe gap.
+    pub(crate) fn unsubscribe_and_take_cancelled(&self, upstream_id: &UpstreamId) -> bool {
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .recover_poison("CancelForwarder::unsubscribe_and_take_cancelled");
+        subscribers.subscribers.remove(upstream_id);
+        let generation = subscribers.active_requests.get(upstream_id).copied();
+        generation.is_some()
+            && subscribers
+                .delivered_cancellations
+                .get(upstream_id)
+                .copied()
+                == generation
+    }
+
     /// Notify a subscriber that its request was cancelled, or retain the signal
     /// while an accepted request has not subscribed yet. Returns whether the ID
     /// belongs to an active request or subscriber.
@@ -285,6 +360,16 @@ impl CancelForwarder {
         state.next_generation = state.next_generation.wrapping_add(1);
         state.active_requests.insert(upstream_id, generation);
         generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_request_for_test(&self, upstream_id: UpstreamId) -> u64 {
+        self.register_request(upstream_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unregister_request_for_test(&self, upstream_id: &UpstreamId, generation: u64) {
+        self.unregister_request(upstream_id, generation);
     }
 
     fn unregister_request(&self, upstream_id: &UpstreamId, generation: u64) {
@@ -527,6 +612,9 @@ pub(crate) fn current_upstream_id() -> Option<UpstreamId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::bridge::ConnectionKey;
+    use crate::lsp::bridge::ConnectionState;
+    use crate::lsp::bridge::test_helpers::create_handle_with_key;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
@@ -1159,6 +1247,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_handoff_observes_delivered_or_retains_later_cancel() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+
+        let delivered_id = UpstreamId::Number(42);
+        let _delivered_guard = ActiveRequestGuard::new(forwarder.clone(), delivered_id.clone());
+        let _delivered_rx = forwarder.subscribe(delivered_id.clone()).unwrap();
+        assert!(forwarder.notify_cancel(&delivered_id));
+        assert!(forwarder.unsubscribe_and_take_cancelled(&delivered_id));
+
+        let later_id = UpstreamId::Number(43);
+        let _later_guard = ActiveRequestGuard::new(forwarder.clone(), later_id.clone());
+        let _outer_rx = forwarder.subscribe(later_id.clone()).unwrap();
+        assert!(!forwarder.unsubscribe_and_take_cancelled(&later_id));
+        assert!(forwarder.notify_cancel(&later_id));
+        let mut inner_rx = forwarder.subscribe(later_id).unwrap();
+        assert!(matches!(inner_rx.try_recv(), Ok(())));
+    }
+
+    #[tokio::test]
     async fn subscribe_succeeds_after_notify_cancel() {
         let pool = Arc::new(LanguageServerPool::new());
         let forwarder = CancelForwarder::new(pool);
@@ -1174,5 +1282,39 @@ mod tests {
         // Second subscription should now succeed
         let result = forwarder.subscribe(upstream_id);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_generation_rejects_late_downstream_registration_but_id_reuse_does_not() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(Arc::clone(&pool));
+        let upstream_id = UpstreamId::Number(42);
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("diagnostics"),
+        )
+        .await;
+
+        let generation = forwarder.register_request(upstream_id.clone());
+        forwarder
+            .forward_cancel_for_generation(upstream_id.clone(), Some(generation))
+            .unwrap();
+        let error = forwarder
+            .register_downstream_request_if_current(upstream_id.clone(), &handle)
+            .expect_err("cancel capture must fence a later provider admission");
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(handle.router().pending_count(), 0);
+        assert_eq!(pool.upstream_request_count(&upstream_id), 0);
+
+        forwarder.unregister_request(&upstream_id, generation);
+        let replacement_generation = forwarder.register_request(upstream_id.clone());
+        assert_ne!(replacement_generation, generation);
+        let (request_id, _response) = forwarder
+            .register_downstream_request_if_current(upstream_id.clone(), &handle)
+            .expect("a replacement generation may reuse the raw JSON-RPC ID");
+        assert_eq!(handle.router().pending_count(), 1);
+        handle.router().remove(request_id);
+        pool.unregister_upstream_request(&upstream_id, handle.key());
+        forwarder.unregister_request(&upstream_id, replacement_generation);
     }
 }

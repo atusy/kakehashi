@@ -112,7 +112,7 @@ impl Kakehashi {
         let raw = outcome
             .raw_settings
             .unwrap_or_else(crate::config::defaults::default_settings);
-        match WorkspaceSettings::try_from_settings(
+        let (warnings, reload_error) = match WorkspaceSettings::try_from_settings(
             &raw,
             self.home_dir.as_deref(),
             crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
@@ -121,19 +121,31 @@ impl Kakehashi {
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 self.settings_manager.set_root_path(root_path);
                 self.apply_raw_settings_locked(&reload, raw, settings).await;
-                workspace_change.finish();
-                drop(reload);
-                self.warn_on_misconfigured_settings(&warnings).await;
+                (Some(warnings), None)
             }
-            Err(error) => {
-                workspace_change.finish();
-                drop(reload);
-                self.notifier()
-                    .log_warning(format!(
-                        "Workspace root changed, but reloaded settings were invalid: {error}"
-                    ))
-                    .await;
-            }
+            Err(error) => (None, Some(error)),
+        };
+        workspace_change.finish();
+        drop(reload);
+
+        // Folder changes alter the workspace diagnostic search scope even
+        // when the provider configuration itself is unchanged. Publish only
+        // after the folder/settings transaction becomes stable so a re-pull
+        // cannot observe its odd, partially applied generation.
+        let _ = self
+            .bridge
+            .pool()
+            .upstream_tx()
+            .send(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged);
+        if let Some(warnings) = warnings {
+            self.warn_on_misconfigured_settings(&warnings).await;
+        }
+        if let Some(error) = reload_error {
+            self.notifier()
+                .log_warning(format!(
+                    "Workspace root changed, but reloaded settings were invalid: {error}"
+                ))
+                .await;
         }
     }
 }
@@ -209,6 +221,7 @@ mod tests {
 
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
+        let mut upstream = server.bridge.take_upstream_rx().unwrap();
         let before = server.settings_manager.load_settings_pair();
 
         tokio::time::timeout(
@@ -228,6 +241,10 @@ mod tests {
             Arc::ptr_eq(&before, &after),
             "an event that names no folder must not run the settings-reload \
              transaction at all"
+        );
+        assert!(
+            upstream.try_recv().is_err(),
+            "a no-op folder event must not request a diagnostic refresh"
         );
     }
 
@@ -267,6 +284,7 @@ mod tests {
 
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
+        let mut upstream = server.bridge.take_upstream_rx().unwrap();
         let before = server.settings_manager.load_settings_pair();
 
         tokio::time::timeout(
@@ -288,6 +306,11 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&before, &after),
             "a real folder change must still run the settings-reload transaction"
+        );
+        assert_eq!(
+            upstream.try_recv(),
+            Ok(crate::lsp::bridge::UpstreamNotification::DiagnosticProviderChanged),
+            "a committed folder change must force a diagnostic re-pull"
         );
     }
 }

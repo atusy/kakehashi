@@ -137,6 +137,7 @@ pub(crate) struct DroppedCapability {
 #[derive(Debug)]
 pub(crate) struct ParsedInitializeCapabilities {
     pub(crate) capabilities: ServerCapabilities,
+    pub(crate) raw_diagnostic_provider: Option<serde_json::Value>,
     pub(crate) dropped: Vec<DroppedCapability>,
     pub(crate) bridge_routing: bool,
     pub(crate) type_hierarchy_provider: bool,
@@ -195,6 +196,7 @@ pub(crate) fn parse_initialize_response_capabilities(
     else {
         return Ok(ParsedInitializeCapabilities {
             capabilities: ServerCapabilities::default(),
+            raw_diagnostic_provider: None,
             dropped: Vec::new(),
             bridge_routing: false,
             type_hierarchy_provider: false,
@@ -217,7 +219,9 @@ pub(crate) fn parse_initialize_response_capabilities(
     let type_hierarchy_provider = capabilities
         .get("typeHierarchyProvider")
         .is_some_and(|value| value == true || value.is_object());
+    let raw_diagnostic_provider = capabilities.get("diagnosticProvider").cloned();
     let mut parsed = recover_server_capabilities(capabilities)?;
+    parsed.raw_diagnostic_provider = raw_diagnostic_provider;
     parsed.type_hierarchy_provider = type_hierarchy_provider;
     parsed.bridge_routing = bridge_routing;
     Ok(parsed)
@@ -273,6 +277,7 @@ fn recover_server_capabilities(
         })?;
     Ok(ParsedInitializeCapabilities {
         capabilities,
+        raw_diagnostic_provider: None,
         dropped,
         bridge_routing: false,
         type_hierarchy_provider: false,
@@ -639,6 +644,27 @@ mod tests {
             parsed.capabilities.experimental,
             Some(serde_json::json!(["preserve", "me"]))
         );
+    }
+
+    #[test]
+    fn raw_diagnostic_provider_preserves_relative_patterns() {
+        let provider = serde_json::json!({
+            "workspaceDiagnostics": true,
+            "interFileDependencies": true,
+            "documentSelector": [{
+                "pattern": {
+                    "baseUri": "file:///workspace",
+                    "pattern": "*.rs"
+                }
+            }]
+        });
+        let response = serde_json::json!({
+            "result": { "capabilities": { "diagnosticProvider": provider.clone() } }
+        });
+
+        let parsed = parse_initialize_response_capabilities(&response).unwrap();
+
+        assert_eq!(parsed.raw_diagnostic_provider, Some(provider));
     }
 
     #[test]

@@ -167,6 +167,11 @@
 //!   grows one downstream process's folder set across roots.
 //! - `workspace-symbol-alpha` / `workspace-symbol-zeta` — advertise workspace symbol search and resolve;
 //!   search returns one lazy symbol and resolve fills its location range.
+//! - `workspace-diagnostic-alpha` / `workspace-diagnostic-zeta` — advertise workspace diagnostics;
+//!   return overlapping full reports so bridge aggregation and provider-private state stripping
+//!   can be verified without opening a document.
+//! - `workspace-diagnostic-dynamic` — dynamically registers two diagnostic
+//!   providers and records the exact params sent to each identifier.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -556,6 +561,19 @@ fn main() {
                         "workspaceSymbolProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
+                    "workspace-diagnostic-alpha" | "workspace-diagnostic-zeta" => json!({
+                        "diagnosticProvider": {
+                            "identifier": mode.as_str(),
+                            "interFileDependencies": true,
+                            "workspaceDiagnostics": true
+                        },
+                        "textDocumentSync": 1
+                    }),
+                    "workspace-diagnostic-dynamic" | "workspace-diagnostic-dynamic-cancel" => {
+                        json!({
+                            "textDocumentSync": 1
+                        })
+                    }
                     _ => json!({
                         "documentFormattingProvider": true,
                         "textDocumentSync": 1
@@ -587,6 +605,51 @@ fn main() {
                         json!({ "type": 3, "message": "mock log line" }),
                     );
                 }
+            }
+            "initialized"
+                if matches!(
+                    mode.as_str(),
+                    "workspace-diagnostic-dynamic" | "workspace-diagnostic-dynamic-cancel"
+                ) =>
+            {
+                request_with_params(
+                    &mut writer,
+                    json!(900),
+                    "client/registerCapability",
+                    json!({
+                        "registrations": [
+                            {
+                                "id": "alpha-registration",
+                                "method": "textDocument/diagnostic",
+                                "registerOptions": {
+                                    "identifier": "alpha",
+                                    "interFileDependencies": true,
+                                    "workspaceDiagnostics": true
+                                }
+                            },
+                            {
+                                "id": "zeta-registration",
+                                "method": "textDocument/diagnostic",
+                                "registerOptions": {
+                                    "identifier": "zeta",
+                                    "interFileDependencies": true,
+                                    "workspaceDiagnostics": true
+                                }
+                            }
+                        ]
+                    }),
+                );
+            }
+            "" if matches!(
+                mode.as_str(),
+                "workspace-diagnostic-dynamic" | "workspace-diagnostic-dynamic-cancel"
+            ) && id == Some(json!(900)) =>
+            {
+                notify(
+                    &mut writer,
+                    "window/logMessage",
+                    json!({ "type": 2, "message": "dynamic-diagnostics-registered" }),
+                );
             }
             "shutdown" => respond(&mut writer, id, Value::Null),
             "exit" => break,
@@ -771,6 +834,16 @@ fn main() {
             }
             "$/cancelRequest" => {
                 record_mock_event(&mode, "cancel", &message);
+                if mode == "workspace-diagnostic-dynamic-cancel" {
+                    if let Some(id) = message.pointer("/params/id") {
+                        let id = match id {
+                            Value::String(id) => id.clone(),
+                            other => other.to_string(),
+                        };
+                        record_mock_event(&mode, &format!("cancel-id-{id}"), &message);
+                    }
+                    increment_mock_event_count(&mode, "cancel");
+                }
             }
             "textDocument/willSaveWaitUntil" => {
                 // `will-save-slow` stalls past kakehashi's 5s save budget so the
@@ -1313,6 +1386,94 @@ fn main() {
                     }
                 });
                 respond(&mut writer, id, symbol);
+            }
+            "workspace/diagnostic" => {
+                let params = message.get("params").cloned().unwrap_or(Value::Null);
+                if matches!(
+                    mode.as_str(),
+                    "workspace-diagnostic-dynamic" | "workspace-diagnostic-dynamic-cancel"
+                ) {
+                    let identifier = params
+                        .get("identifier")
+                        .and_then(Value::as_str)
+                        .unwrap_or("missing");
+                    record_mock_event(
+                        &mode,
+                        &format!("workspace-diagnostic-{identifier}"),
+                        &message,
+                    );
+                    if mode == "workspace-diagnostic-dynamic-cancel" {
+                        continue;
+                    }
+                    let isolated = matches!(identifier, "alpha" | "zeta")
+                        && params
+                            .get("previousResultIds")
+                            .and_then(Value::as_array)
+                            .is_some_and(Vec::is_empty)
+                        && params.get("partialResultToken").is_none()
+                        && params.get("workDoneToken").is_none();
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({ "items": [{
+                            "kind": "full",
+                            "uri": "file:///workspace/dynamic.rs",
+                            "version": 1,
+                            "items": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 1 }
+                                },
+                                "message": if isolated { identifier } else { "leaked-state" }
+                            }]
+                        }] }),
+                    );
+                    continue;
+                }
+                let isolated = params
+                    .get("previousResultIds")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                    && params.get("identifier").and_then(Value::as_str) == Some(mode.as_str())
+                    && params.get("partialResultToken").is_none_or(Value::is_null)
+                    && params.get("workDoneToken").is_none_or(Value::is_null);
+                let message = if isolated {
+                    documents
+                        .get("file:///workspace/open.rs")
+                        .map(String::as_str)
+                        .unwrap_or(mode.as_str())
+                } else {
+                    "leaked-state"
+                };
+                let mut items = vec![json!({
+                    "kind": "full",
+                    "uri": "file:///workspace/shared.rs",
+                    "version": 4,
+                    "resultId": format!("private-{mode}"),
+                    "items": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 1 }
+                        },
+                        "message": message
+                    }]
+                })];
+                if mode == "workspace-diagnostic-zeta" {
+                    items.push(json!({
+                        "kind": "full",
+                        "uri": "file:///workspace/zeta.rs",
+                        "version": null,
+                        "resultId": "private-zeta",
+                        "items": []
+                    }));
+                    items.push(json!({
+                        "kind": "full",
+                        "uri": "file:///workspace/kakehashi-virtual-uri-region-0.lua",
+                        "version": 1,
+                        "items": []
+                    }));
+                }
+                respond(&mut writer, id, json!({ "items": items }));
             }
             "textDocument/diagnostic" => {
                 if mode == "diagnostics-save" {

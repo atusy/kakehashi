@@ -721,8 +721,8 @@ impl Kakehashi {
                 // pull-first-diagnostic-forwarding: Pull-first diagnostic forwarding
                 diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
                     DiagnosticOptions {
-                        inter_file_dependencies: false,
-                        workspace_diagnostics: false,
+                        inter_file_dependencies: true,
+                        workspace_diagnostics: true,
                         ..Default::default()
                     },
                 )),
@@ -739,8 +739,9 @@ impl Kakehashi {
         // (workspace/applyEdit is answered locally instead when the editor
         // never declared the capability). The reader tasks feed three
         // channels:
-        // - unbounded `upstream_rx` (loss-intolerant): DiagnosticRefresh and
-        //   work-done progress (create/$progress/forget).
+        // - unbounded `upstream_rx` (loss-intolerant): diagnostic refresh and
+        //   provider-registration events, plus work-done progress
+        //   (create/$progress/forget).
         // - bounded `window_rx` (best-effort, drop-on-full): window/logMessage,
         //   window/showMessage, and telemetry/event.
         // - unbounded `upstream_request_rx` (loss-intolerant): downstream
@@ -967,8 +968,8 @@ async fn forward_upstream_request(
 ///
 /// Consumes from three channels (loss-tolerance split, #378) and dispatches them
 /// to the LSP client:
-/// - `upstream_rx` (unbounded): `DiagnosticRefresh` — forwarded as
-///   `workspace/diagnostic/refresh` — the server-declared work-done progress
+/// - `upstream_rx` (unbounded): diagnostic refresh and provider-registration
+///   events — forwarded as `workspace/diagnostic/refresh` — the server-declared work-done progress
 ///   notifications (`CreateWorkDoneProgress`/`Progress`/`ForgetWorkDoneProgress`,
 ///   window-work-done-progress), and `PublishDiagnostics`/`EvictConnectionDiagnostics`,
 ///   which may not be lost. Each wake-up drains a capped burst and coalesces
@@ -2095,19 +2096,24 @@ async fn deliver_upstream_notification(
     use tower_lsp_server::ls_types::{ProgressParamsValue, WorkDoneProgress};
     match notification {
         UpstreamNotification::DiagnosticRefresh => {
-            // A downstream server asked the editor to re-pull diagnostics. Route it
-            // through `request_forwarded_diagnostic_refresh`, which runs the leading
-            // cycle immediately (prefetch, then a conditional editor forward — an
-            // unchanged covering prefetch absorbs the nudge) and debounces later
-            // burst activity, reusing the capability-gated, detached forced-refresh
-            // path when it does send. Detaching avoids blocking this delivery loop
-            // on the editor round-trip (head-of-line). A `None` publisher (test
-            // loop) has no settings to gate on, so the forward is dropped;
+            // A downstream server asked the editor to re-pull diagnostics.
+            // Refreshes induced by kakehashi's active workspace pull were
+            // discarded at the per-connection reader. Anything surviving that
+            // pull-scoped loop breaker may represent a workspace-only change,
+            // so open-document prefetch must not absorb it. A `None` publisher
+            // (test loop) has no settings to gate on, so the forward is dropped;
             // production always has one (#521, #789).
             if let Some(publisher) =
                 delivery_context.map(|context| context.diagnostic_publisher.as_ref())
             {
-                publisher.request_forwarded_diagnostic_refresh();
+                publisher.request_forwarded_workspace_diagnostic_refresh();
+            }
+        }
+        UpstreamNotification::DiagnosticProviderChanged => {
+            if let Some(publisher) =
+                delivery_context.map(|context| context.diagnostic_publisher.as_ref())
+            {
+                publisher.request_pull_diagnostic_refresh(true);
             }
         }
         UpstreamNotification::PublishDiagnostics {
@@ -3990,6 +3996,53 @@ mod tests {
                 .await
                 .is_err(),
             "missing policy context must not bypass the global log gate"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn downstream_diagnostic_refresh_preserves_workspace_only_changes() {
+        use tower_lsp_server::LspService;
+        use tower_lsp_server::ls_types::{
+            ClientCapabilities, DiagnosticWorkspaceClientCapabilities, WorkspaceClientCapabilities,
+        };
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let publisher = Arc::new(crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(
+            server,
+        ));
+        let delivery_context = UpstreamDeliveryContext {
+            diagnostic_publisher: Arc::clone(&publisher),
+            settings_manager: Arc::clone(&server.settings_manager),
+            injection: server.injection_coordinator(),
+        };
+
+        deliver_upstream_notification(
+            &server.client,
+            crate::lsp::bridge::UpstreamNotification::DiagnosticRefresh,
+            &mut std::collections::HashSet::new(),
+            &mut std::collections::HashSet::new(),
+            Some(&delivery_context),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let metrics = server.diagnostics.metrics_snapshot();
+        assert_eq!(metrics.refreshes_requested, 1);
+        assert_eq!(
+            metrics.refreshes_sent, 1,
+            "a surviving downstream refresh may represent an unopened-file change"
         );
     }
 

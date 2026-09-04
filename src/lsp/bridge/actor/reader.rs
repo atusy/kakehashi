@@ -39,7 +39,7 @@ use crate::lsp::bridge::workspace::{self, WorkspaceFolderSet};
 /// keeping the bridge module decoupled from tower-lsp's Client type.
 ///
 /// Two channels carry these, split by loss tolerance:
-/// - `DiagnosticRefresh` travels on an **unbounded** channel: dropping one
+/// - Diagnostic refresh events travel on an **unbounded** channel: dropping one
 ///   would silently stale the editor's diagnostics, and its volume is tiny
 ///   (one per downstream `workspace/diagnostic/refresh`).
 /// - `LogMessage`/`ShowMessage`/`TelemetryEvent` travel on a **bounded** channel
@@ -56,6 +56,10 @@ pub(crate) enum UpstreamNotification {
     /// Request upstream to re-pull diagnostics.
     /// Sent when downstream server issues `workspace/diagnostic/refresh`.
     DiagnosticRefresh,
+    /// A workspace-diagnostic provider became routable after initialization.
+    /// Unlike a downstream refresh, this changes the producer plan itself, so
+    /// the upstream delivery path must bypass prefetch absorption.
+    DiagnosticProviderChanged,
     /// A downstream-initiated `textDocument/publishDiagnostics`
     /// (push-propagation-diagnostic-forwarding). The forwarding loop classifies
     /// `uri`: a virtual injection URI resolves to its host document + region (a
@@ -343,6 +347,7 @@ struct ProgressPurgeGuard {
     /// Cancel any forwarded requests still in flight when this connection's
     /// reader exits, so their editor dialogs don't linger (#404).
     inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
+    dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
 }
 
 impl Drop for ProgressPurgeGuard {
@@ -365,6 +370,21 @@ impl Drop for ProgressPurgeGuard {
             .send(UpstreamNotification::EvictConnectionDiagnostics {
                 connection_id: self.connection_id,
             });
+        // Workspace pull diagnostics are not stored in the pushed-diagnostic
+        // cache above. Refresh only when this connection is an actual producer;
+        // otherwise a crashing unrelated server could cause refresh/pull/respawn
+        // loops merely by exiting.
+        let has_workspace_diagnostic_provider = self
+            .dynamic_capabilities
+            .has_workspace_diagnostic_provider();
+        let workspace_diagnostic_contributed = self
+            .dynamic_capabilities
+            .mark_workspace_diagnostic_reader_exited();
+        if has_workspace_diagnostic_provider && workspace_diagnostic_contributed {
+            let _ = self
+                .upstream_tx
+                .send(UpstreamNotification::DiagnosticProviderChanged);
+        }
     }
 }
 
@@ -736,6 +756,7 @@ async fn reader_loop_with_liveness(
         connection_id: server_request_deps.progress_connection_id,
         upstream_tx: server_request_deps.upstream_tx.clone(),
         inbound_request_registry: server_request_deps.inbound_request_registry.clone(),
+        dynamic_capabilities: Arc::clone(&server_request_deps.dynamic_capabilities),
     };
 
     // Consolidated liveness timer state (ls-bridge-async-connection)
@@ -888,6 +909,10 @@ async fn handle_message(
     match classify_message(&message) {
         MessageKind::Response => {
             let id = message.get("id").cloned();
+            if let Some(request_id) = crate::lsp::bridge::protocol::RequestId::from_json(&message) {
+                deps.dynamic_capabilities
+                    .mark_workspace_diagnostic_response_received(request_id);
+            }
             match router.route(message) {
                 RouteResult::Delivered => {
                     // Response delivered successfully - no logging needed for normal case
@@ -1017,6 +1042,15 @@ async fn handle_server_request(
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
     let method = message.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    // Snapshot this at request arrival. A refresh emitted before the response
+    // to kakehashi's outstanding workspace pull is covered by that response;
+    // forwarding it would make the pull trigger another identical pull. Once
+    // the response has arrived, even while the composite is still aggregating,
+    // a refresh may describe newer workspace state and must remain visible.
+    let diagnostic_refresh_covered_by_pending_pull = method == "workspace/diagnostic/refresh"
+        && deps
+            .dynamic_capabilities
+            .workspace_diagnostic_refresh_is_covered();
 
     // Deferred request handlers forward to the editor (or, for a
     // workspace/applyEdit the editor never declared support for, answer
@@ -1040,12 +1074,19 @@ async fn handle_server_request(
         _ => {}
     }
 
+    let mut pending_registrations = None;
+    let mut pending_unregistrations = None;
     let body: jsonrpc::Result<serde_json::Value> = match method {
-        "client/registerCapability" => {
-            client::register_capability::handle(&message, server_prefix, deps)
-        }
+        "client/registerCapability" => client::register_capability::handle(&message, server_prefix)
+            .map(|reply| {
+                pending_registrations = Some(reply.registrations);
+                serde_json::Value::Null
+            }),
         "client/unregisterCapability" => {
-            client::unregister_capability::handle(&message, server_prefix, deps)
+            client::unregister_capability::handle(&message, server_prefix).map(|reply| {
+                pending_unregistrations = Some(reply.unregisterations);
+                serde_json::Value::Null
+            })
         }
         "window/workDoneProgress/create" => {
             window::work_done_progress_create::handle(&message, server_prefix, deps)
@@ -1067,15 +1108,76 @@ async fn handle_server_request(
         }
     };
 
+    let workspace_diagnostics_unregistered =
+        pending_unregistrations
+            .as_ref()
+            .is_some_and(|unregistrations| {
+                deps.dynamic_capabilities
+                    .registrations_for_method("textDocument/diagnostic")
+                    .iter()
+                    .any(|registration| {
+                        unregistrations.iter().any(|unregistration| {
+                            unregistration.id == registration.id
+                                && unregistration.method == registration.method
+                        }) && registration
+                            .register_options
+                            .as_ref()
+                            .and_then(|options| options.get("workspaceDiagnostics"))
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                    })
+            });
+    if let Some(unregistrations) = pending_unregistrations {
+        // Removal takes the registry write lease before its acknowledgement.
+        // Any request already holding a provider read lease therefore enters
+        // the writer FIFO first, while no new request can admit the removed
+        // provider after the acknowledgement.
+        deps.dynamic_capabilities.unregister(unregistrations);
+    }
+
+    let workspace_diagnostics_changed = if let Some(registrations) = pending_registrations {
+        // Registration takes the registry write lease before its acknowledgement.
+        // An old-plan workspace pull already holding a provider read lease enters
+        // the writer FIFO first and cannot complete after the server sees the ack.
+        deps.dynamic_capabilities.register(registrations)
+    } else {
+        false
+    };
+    let publish_workspace_diagnostic_registration_refresh = workspace_diagnostics_changed
+        && deps
+            .dynamic_capabilities
+            .request_or_defer_workspace_diagnostic_registration_refresh();
+
     let response = match body {
         Ok(result) => jsonrpc::Response::from_ok(id, result),
         Err(error) => jsonrpc::Response::from_error(id, error),
     };
-    send_server_response(&deps.response_tx, response, server_prefix, method).await;
+    let response_queued =
+        send_server_response(&deps.response_tx, response, server_prefix, method).await;
+    if response_queued {
+        // A first workspace pull can race the post-initialized registration.
+        // The registry writer fence precedes the acknowledgement; this
+        // capability-gated upstream path then schedules a fresh pull against
+        // the committed provider set after the acknowledgement is queued.
+        if publish_workspace_diagnostic_registration_refresh {
+            let _ = deps
+                .upstream_tx
+                .send(UpstreamNotification::DiagnosticProviderChanged);
+        }
+    }
+    if workspace_diagnostics_unregistered
+        && deps
+            .dynamic_capabilities
+            .has_workspace_diagnostic_contributed()
+    {
+        let _ = deps
+            .upstream_tx
+            .send(UpstreamNotification::DiagnosticProviderChanged);
+    }
     // A downstream server may wait for this response before answering the
     // diagnostic pull triggered by the refresh. Queue the acknowledgement
     // first so prefetch can never deadlock behind its own server request.
-    if method == "workspace/diagnostic/refresh" {
+    if method == "workspace/diagnostic/refresh" && !diagnostic_refresh_covered_by_pending_pull {
         let _ = deps
             .upstream_tx
             .send(UpstreamNotification::DiagnosticRefresh);
@@ -1102,7 +1204,7 @@ pub(in crate::lsp::bridge) async fn send_server_response(
     response: jsonrpc::Response,
     server_prefix: &str,
     method: &str,
-) {
+) -> bool {
     // Response implements Serialize, so convert to Value for OutboundMessage.
     // Serialization cannot fail in practice, but the project bans panics in
     // production code; dropping the response is the only sane fallback here.
@@ -1114,7 +1216,7 @@ pub(in crate::lsp::bridge) async fn send_server_response(
                 "{}Failed to serialize response for server request '{}': {}",
                 server_prefix, method, e
             );
-            return;
+            return false;
         }
     };
 
@@ -1127,7 +1229,9 @@ pub(in crate::lsp::bridge) async fn send_server_response(
             "{}Failed to send response for server request '{}': {}",
             server_prefix, method, e
         );
+        return false;
     }
+    true
 }
 
 #[cfg(test)]
@@ -1512,6 +1616,9 @@ mod tests {
         let downstream_token = NumberOrString::Number(1);
         let (upstream_token, _) =
             progress_registry.register(conn, downstream_token.clone(), response_tx.clone());
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        dynamic_capabilities.set_static_workspace_diagnostic_provider(true);
+        let _ = dynamic_capabilities.try_mark_workspace_diagnostic_contributed();
 
         let handle = spawn_reader_task_for_server(
             reader,
@@ -1522,7 +1629,7 @@ mod tests {
                 server_name: None,
                 connection_key: ConnectionKey::for_server("test"),
                 response_tx,
-                dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
+                dynamic_capabilities,
                 upstream_tx,
                 window_tx,
                 upstream_request_tx: mpsc::unbounded_channel().0,
@@ -1558,25 +1665,89 @@ mod tests {
         // `Drop` runs `purge_connection` *then* the sends, so the purge above can be
         // observed before the eviction send lands — `recv().await` (not a single
         // `try_recv`) so we wait for it rather than racing the guard's Drop.
-        let saw_eviction = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while let Some(notification) = upstream_rx.recv().await {
-                if let UpstreamNotification::EvictConnectionDiagnostics { connection_id } =
-                    notification
-                {
-                    assert_eq!(
-                        connection_id, conn,
-                        "eviction must target the exited connection"
-                    );
-                    return true;
+        let (saw_eviction, saw_provider_change) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut saw_eviction = false;
+                let mut saw_provider_change = false;
+                while let Some(notification) = upstream_rx.recv().await {
+                    match notification {
+                        UpstreamNotification::EvictConnectionDiagnostics { connection_id } => {
+                            assert_eq!(
+                                connection_id, conn,
+                                "eviction must target the exited connection"
+                            );
+                            saw_eviction = true;
+                        }
+                        UpstreamNotification::DiagnosticProviderChanged => {
+                            saw_provider_change = true;
+                        }
+                        _ => {}
+                    }
+                    if saw_eviction && saw_provider_change {
+                        break;
+                    }
                 }
-            }
-            false // channel closed (all senders dropped) without an eviction
-        })
-        .await
-        .expect("EvictConnectionDiagnostics must arrive after reader exit");
+                (saw_eviction, saw_provider_change)
+            })
+            .await
+            .expect("diagnostic cleanup notifications must arrive after reader exit");
         assert!(
             saw_eviction,
             "reader exit must emit EvictConnectionDiagnostics for its connection"
+        );
+        assert!(
+            saw_provider_change,
+            "reader exit must refresh workspace pull diagnostics"
+        );
+    }
+
+    #[test]
+    fn non_diagnostic_reader_exit_does_not_request_workspace_refresh() {
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let connection_id = progress_registry.new_connection_id();
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+
+        drop(ProgressPurgeGuard {
+            registry: progress_registry,
+            connection_id,
+            upstream_tx,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
+        });
+
+        assert!(matches!(
+            upstream_rx.try_recv(),
+            Ok(UpstreamNotification::EvictConnectionDiagnostics { .. })
+        ));
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "an unrelated server exit must not trigger a workspace diagnostic pull"
+        );
+    }
+
+    #[test]
+    fn unproductive_diagnostic_reader_exit_does_not_request_workspace_refresh() {
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let connection_id = progress_registry.new_connection_id();
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        dynamic_capabilities.set_static_workspace_diagnostic_provider(true);
+
+        drop(ProgressPurgeGuard {
+            registry: progress_registry,
+            connection_id,
+            upstream_tx,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            dynamic_capabilities,
+        });
+
+        assert!(matches!(
+            upstream_rx.try_recv(),
+            Ok(UpstreamNotification::EvictConnectionDiagnostics { .. })
+        ));
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "a diagnostic server that never completed a contribution must not create a refresh/respawn loop"
         );
     }
 
@@ -1970,7 +2141,8 @@ mod tests {
         let router = ResponseRouter::new();
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
-        let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let _ = dynamic_capabilities.try_mark_workspace_diagnostic_contributed();
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
             settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
@@ -1997,7 +2169,7 @@ mod tests {
                     {
                         "id": "diag-1",
                         "method": "textDocument/diagnostic",
-                        "registerOptions": null
+                        "registerOptions": { "workspaceDiagnostics": true }
                     }
                 ]
             }
@@ -2017,22 +2189,98 @@ mod tests {
             }
             _ => panic!("Expected Untracked variant"),
         }
+        assert_eq!(
+            upstream_rx
+                .try_recv()
+                .expect("registration schedules a retry"),
+            UpstreamNotification::DiagnosticProviderChanged
+        );
+    }
+
+    #[tokio::test]
+    async fn register_capability_binds_cold_refresh_before_its_ack_is_queued() {
+        let router = ResponseRouter::new();
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        response_tx
+            .send(OutboundMessage::Untracked(json!({ "blocker": true })))
+            .await
+            .unwrap();
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        dynamic_capabilities.mark_workspace_diagnostic_pull_active();
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let deps = ServerRequestDeps {
+            settings: Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
+            response_tx,
+            dynamic_capabilities: Arc::clone(&dynamic_capabilities),
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+        };
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "client/registerCapability",
+            "params": {
+                "registrations": [{
+                    "id": "diag-1",
+                    "method": "textDocument/diagnostic",
+                    "registerOptions": { "workspaceDiagnostics": true }
+                }]
+            }
+        });
+        let handling = handle_message(request, &router, "", &deps);
+        tokio::pin!(handling);
+        assert!(futures::poll!(handling.as_mut()).is_pending());
+        assert!(
+            dynamic_capabilities.has_registration("textDocument/diagnostic"),
+            "the registry writer fence must be established before the ack enters the queue"
+        );
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "the retry event must not overtake the registration acknowledgement"
+        );
+        dynamic_capabilities.mark_workspace_diagnostic_pull_aborted(true);
+        let _blocker = response_rx.recv().await.expect("prefilled blocker");
+        assert!(futures::poll!(handling.as_mut()).is_ready());
+        let ack = response_rx.recv().await.expect("registration ack");
+        assert!(matches!(ack, OutboundMessage::Untracked(value) if value["id"] == 1));
+        assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "an aborted cold pull must clear the refresh bound before acknowledgement"
+        );
     }
 
     #[tokio::test]
     async fn handle_message_unregister_capability_updates_registry() {
         let router = ResponseRouter::new();
-        let (response_tx, mut response_rx) = mpsc::channel(16);
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        response_tx
+            .send(OutboundMessage::Untracked(json!({ "blocker": true })))
+            .await
+            .unwrap();
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
-        let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
 
         // First register a capability
         dynamic_capabilities.register(vec![tower_lsp_server::ls_types::Registration {
             id: "diag-1".to_string(),
             method: "textDocument/diagnostic".to_string(),
-            register_options: None,
+            register_options: Some(json!({
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
         }]);
+        let _ = dynamic_capabilities.try_mark_workspace_diagnostic_contributed();
         assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
 
         let deps = ServerRequestDeps {
@@ -2066,13 +2314,17 @@ mod tests {
             }
         });
 
-        handle_message(message, &router, "", &deps).await;
-
-        // Registry should no longer have the registration
+        let handling = handle_message(message, &router, "", &deps);
+        tokio::pin!(handling);
+        assert!(futures::poll!(handling.as_mut()).is_pending());
         assert!(!dynamic_capabilities.has_registration("textDocument/diagnostic"));
+        assert!(upstream_rx.try_recv().is_err());
+
+        let _blocker = response_rx.recv().await.expect("prefilled blocker");
+        assert!(futures::poll!(handling.as_mut()).is_ready());
 
         // A success response should have been sent
-        let response = response_rx.try_recv().expect("should have response");
+        let response = response_rx.recv().await.expect("should have response");
         match response {
             OutboundMessage::Untracked(val) => {
                 assert_eq!(val["id"], 2);
@@ -2080,6 +2332,119 @@ mod tests {
             }
             _ => panic!("Expected Untracked variant"),
         }
+        assert_eq!(
+            upstream_rx.try_recv().expect("provider removal retry"),
+            UpstreamNotification::DiagnosticProviderChanged
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_refreshes_after_ack_queue_failure() {
+        let router = ResponseRouter::new();
+        let (response_tx, response_rx) = mpsc::channel(1);
+        drop(response_rx);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        dynamic_capabilities.register(vec![tower_lsp_server::ls_types::Registration {
+            id: "diag-1".into(),
+            method: "textDocument/diagnostic".into(),
+            register_options: Some(json!({
+                "workspaceDiagnostics": true,
+                "interFileDependencies": true
+            })),
+        }]);
+        let _ = dynamic_capabilities.try_mark_workspace_diagnostic_contributed();
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let deps = ServerRequestDeps {
+            settings: Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
+            response_tx,
+            dynamic_capabilities: Arc::clone(&dynamic_capabilities),
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+        };
+
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "client/unregisterCapability",
+                "params": {
+                    "unregisterations": [{
+                        "id": "diag-1",
+                        "method": "textDocument/diagnostic"
+                    }]
+                }
+            }),
+            &router,
+            "",
+            &deps,
+        )
+        .await;
+
+        assert!(!dynamic_capabilities.has_registration("textDocument/diagnostic"));
+        assert_eq!(
+            upstream_rx.try_recv().expect("provider removal retry"),
+            UpstreamNotification::DiagnosticProviderChanged
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_cold_workspace_diagnostic_provider_does_not_refresh() {
+        let router = ResponseRouter::new();
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        dynamic_capabilities.register(vec![tower_lsp_server::ls_types::Registration {
+            id: "diag-1".into(),
+            method: "textDocument/diagnostic".into(),
+            register_options: Some(json!({ "workspaceDiagnostics": true })),
+        }]);
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let deps = ServerRequestDeps {
+            settings: Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
+            response_tx,
+            dynamic_capabilities: Arc::clone(&dynamic_capabilities),
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+        };
+
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "client/unregisterCapability",
+                "params": {
+                    "unregisterations": [{
+                        "id": "diag-1",
+                        "method": "textDocument/diagnostic"
+                    }]
+                }
+            }),
+            &router,
+            "",
+            &deps,
+        )
+        .await;
+
+        let _response = response_rx.recv().await.expect("unregistration response");
+        assert!(!dynamic_capabilities.has_registration("textDocument/diagnostic"));
+        assert!(upstream_rx.try_recv().is_err());
     }
 
     /// A downstream `window/workDoneProgress/create` is acknowledged to the
@@ -2749,6 +3114,72 @@ mod tests {
             .try_recv()
             .expect("should have upstream notification after response");
         assert_eq!(notification, UpstreamNotification::DiagnosticRefresh);
+    }
+
+    #[tokio::test]
+    async fn handle_message_diagnostic_refresh_before_pull_response_is_suppressed() {
+        let router = ResponseRouter::new();
+        let (response_tx, mut response_rx) = mpsc::channel(16);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        dynamic_capabilities.mark_workspace_diagnostic_pull_active();
+        dynamic_capabilities.mark_workspace_diagnostic_request_sent(
+            crate::lsp::bridge::protocol::RequestId::new(7),
+        );
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let deps = ServerRequestDeps {
+            settings: Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: None,
+            connection_key: ConnectionKey::for_server("test"),
+            response_tx,
+            dynamic_capabilities: Arc::clone(&dynamic_capabilities),
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+        };
+        let refresh = |id| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "workspace/diagnostic/refresh",
+                "params": null
+            })
+        };
+
+        handle_message(refresh(10), &router, "", &deps).await;
+
+        assert!(matches!(
+            response_rx.try_recv(),
+            Ok(OutboundMessage::Untracked(value)) if value["id"] == 10
+        ));
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "a refresh induced by the active workspace pull must not trigger another pull"
+        );
+
+        handle_message(
+            json!({"jsonrpc": "2.0", "id": 7, "result": {"items": []}}),
+            &router,
+            "",
+            &deps,
+        )
+        .await;
+        handle_message(refresh(11), &router, "", &deps).await;
+
+        assert!(matches!(
+            response_rx.try_recv(),
+            Ok(OutboundMessage::Untracked(value)) if value["id"] == 11
+        ));
+        assert_eq!(
+            upstream_rx.try_recv().expect("refresh outside pull scope"),
+            UpstreamNotification::DiagnosticRefresh,
+            "workspace-only changes outside the pull scope must remain visible"
+        );
     }
 
     /// workspace/workspaceFolders must be answered with the folders the

@@ -217,6 +217,42 @@ async fn sync_host_document_for_revision<S: MessageSender>(
 }
 
 impl LanguageServerPool {
+    /// Queue the live host document on the exact workspace producer connection
+    /// that will receive `workspace/diagnostic`. Workspace connections are
+    /// deliberately isolated from document-routing handles, so normal `_self`
+    /// eager synchronization cannot establish this ordering.
+    pub(crate) async fn sync_workspace_document_to_handle(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        uri: &Url,
+        language_id: &str,
+        text: &str,
+    ) -> io::Result<()> {
+        let connections = self.connections().await;
+        if !connections.get(handle.key()).is_some_and(|current| {
+            Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "workspace diagnostic producer was replaced before document sync",
+            ));
+        }
+        let mut docs = self.host_documents().await;
+        let mut sender = ConnectionHandleSender(handle);
+        sync_host_document(
+            &mut sender,
+            &mut docs,
+            &HostDocument {
+                uri,
+                language_id,
+                text,
+            },
+            None,
+            handle.key(),
+        )
+        .await
+    }
+
     /// Send `didClose` for the host document to every server that has it
     /// open via the host bridge, and drop the sync state.
     ///

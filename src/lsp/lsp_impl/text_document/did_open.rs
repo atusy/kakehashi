@@ -231,9 +231,9 @@ impl Kakehashi {
         // - **interactive LSP (#6)**: flip the present-parser parse OFF the ingress
         //   ticket, mirroring the auto-install spawn — a slow/large open parse no
         //   longer holds the writer ticket and wedges later same-URI readers/writers.
-        //   The handler returns immediately; the spawned parse advances the watermark
-        //   to `ticket` (releasing a reader gated behind this open) and runs the
-        //   tree-dependent downstream once the tree lands.
+        //   The handler returns immediately; the spawned task parses, runs the
+        //   tree-dependent downstream, then advances the watermark to `ticket`
+        //   (releasing a reader gated behind this open).
         if skip_parse {
             if let Some(ticket) = ticket {
                 // Parsing is deferred to the spawned off-ingress install reparse.
@@ -271,6 +271,10 @@ impl Kakehashi {
             self.injection_coordinator()
                 .process_injections(&uri, false)
                 .await;
+            if let Some(ticket) = ticket {
+                self.documents
+                    .advance_watermark_for_incarnation(&uri, ticket, incarnation);
+            }
         } else {
             // #6 off-ingress open flip (interactive LSP). The owned coordinators /
             // Arcs are captured into the spawned task; the handler returns without
@@ -279,6 +283,7 @@ impl Kakehashi {
             let injection = self.injection_coordinator();
             let diagnostic_scheduler = self.diagnostic_scheduler();
             let client = self.client.clone();
+            let documents = std::sync::Arc::clone(&self.documents);
             let settings_manager = std::sync::Arc::clone(&self.settings_manager);
             let parse_uri = uri.clone();
             let parse_language_id = language_id.clone();
@@ -308,7 +313,10 @@ impl Kakehashi {
                             .log_language_events(&deferred)
                             .await;
                     }
-                    diagnostic_scheduler.spawn_synthetic_diagnostic_task(parse_uri);
+                    diagnostic_scheduler.spawn_synthetic_diagnostic_task(parse_uri.clone());
+                }
+                if let Some(ticket) = ticket {
+                    documents.advance_watermark_for_incarnation(&parse_uri, ticket, incarnation);
                 }
             });
         }
@@ -746,21 +754,18 @@ print("hello")
             None,
         );
         timeout(Duration::from_secs(1), async {
-            loop {
-                if server
-                    .bridge
-                    .pool()
-                    .host_document_version(&uri, "rust_ls")
-                    .await
-                    == Some(1)
-                {
-                    break;
-                }
+            while server
+                .bridge
+                .pool()
+                .host_document_version(&uri, "rust_ls")
+                .await
+                != Some(1)
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("first eager-sync should didOpen the host document at version 1");
+        .expect("first eager-sync should enqueue didOpen");
 
         // A re-sync with changed text must send a didChange, advancing to version 2.
         server.bridge.eager_sync_host_document_on_servers(
@@ -771,21 +776,18 @@ print("hello")
             None,
         );
         timeout(Duration::from_secs(1), async {
-            loop {
-                if server
-                    .bridge
-                    .pool()
-                    .host_document_version(&uri, "rust_ls")
-                    .await
-                    == Some(2)
-                {
-                    break;
-                }
+            while server
+                .bridge
+                .pool()
+                .host_document_version(&uri, "rust_ls")
+                .await
+                != Some(2)
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("re-sync with changed text should send a didChange advancing to version 2");
+        .expect("changed eager-sync should enqueue didChange");
     }
 
     /// Live-reader wiring (#422): the on-edit eager re-sync syncs the reader's
@@ -1554,8 +1556,8 @@ print("hello")
     }
 
     /// Off-ingress edit reparse (per-document-parse-scheduler flip): `reparse_latest`
-    /// parses the latest store text and advances the watermark, but must NOT
-    /// resurrect a document a `didClose` removed mid-parse.
+    /// parses the latest store text but must NOT resurrect a document a `didClose`
+    /// removed mid-parse.
     #[tokio::test]
     async fn reparse_latest_does_not_resurrect_closed_document() {
         let (service, _socket) = LspService::new(Kakehashi::new);
@@ -1564,7 +1566,7 @@ print("hello")
 
         let uri = Url::parse("file:///test/closed_during_reparse.rs").unwrap();
         // Document already closed (removed) — models a didClose racing the
-        // scheduled reparse. The watermark ticket still resolves.
+        // scheduled reparse. Dropping the document also wakes watermark waiters.
         server
             .parse_coordinator()
             .reparse_latest(&uri, Some(7))
@@ -1576,10 +1578,10 @@ print("hello")
         );
     }
 
-    /// `reparse_latest` attaches a fresh tree to the open document (whose tree was
-    /// cleared by the edit) and advances the watermark to the edit's ticket.
+    /// `reparse_latest` attaches a fresh tree but leaves the writer watermark
+    /// pending until its caller finishes downstream synchronization.
     #[tokio::test]
-    async fn reparse_latest_parses_and_advances_watermark() {
+    async fn reparse_latest_does_not_advance_the_downstream_watermark() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         configure_rust_self_host(server);
@@ -1594,6 +1596,7 @@ print("hello")
             None,
         );
         assert!(server.documents.get(&uri).unwrap().tree().is_none());
+        let incarnation = server.documents.get(&uri).unwrap().incarnation();
 
         server
             .parse_coordinator()
@@ -1604,9 +1607,52 @@ print("hello")
             server.documents.get(&uri).unwrap().tree().is_some(),
             "the off-ingress reparse attaches a tree to the edited document"
         );
-        // The watermark advance itself is still exercised by the store's own
-        // watermark tests; the reader-side wait (`wait_for_epoch`) was removed
-        // with the snapshot conversion (parse-snapshot ADR Stage 2).
+        assert!(
+            timeout(
+                Duration::from_millis(10),
+                server.documents.wait_for_watermark(&uri, 3)
+            )
+            .await
+            .is_err(),
+            "parsing alone must not release a workspace reader before downstream sync"
+        );
+
+        server
+            .documents
+            .advance_watermark_for_incarnation(&uri, 3, incarnation);
+        timeout(
+            Duration::from_secs(1),
+            server.documents.wait_for_watermark(&uri, 3),
+        )
+        .await
+        .expect("the post-sync watermark must release the reader");
+    }
+
+    #[tokio::test]
+    async fn scheduled_reparse_advances_watermark_after_downstream_sync() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///test/scheduled_sync.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn synced() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        server.schedule_reparse(uri.clone(), Some(4));
+
+        timeout(
+            Duration::from_secs(2),
+            server.documents.wait_for_watermark(&uri, 4),
+        )
+        .await
+        .expect("the scheduled parse pipeline must publish its post-sync watermark");
+        assert!(server.documents.get(&uri).unwrap().tree().is_some());
     }
 
     /// If a concurrent `didChange` already parsed the document (a tree is

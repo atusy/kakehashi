@@ -300,7 +300,8 @@ Returns monikers for the symbol under the cursor. Default combine strategy: `pre
 [`textDocument/diagnostic`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_diagnostic)
 (pull) and
 [`textDocument/publishDiagnostics`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_publishDiagnostics)
-(push)
+(push), and
+[`workspace/diagnostic`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_diagnostic)
 
 Reports errors and warnings from every embedded block, merged into the document.
 The default combine strategy here is **`concatenated`** (shared with code
@@ -316,6 +317,36 @@ pulled). When those cached pushes later answer a client PULL
 (`pushFallback`), only push-driven servers' slots fold in, under the
 cross-layer priorities/strategy only — server-level `priorities`/
 `maxFanOut` are not reapplied.
+
+Workspace diagnostic pulls start every explicitly configured, runnable server
+that supports them, including cold servers, and combine full reports for real
+workspace files. Reports for one URI are concatenated in stable server-name
+order. Each connection's first provider plan gives post-initialize dynamic
+registration one bounded settle window and collects registrations through the
+deadline even if another provider is already visible. Later provider changes
+request another pull when the editor advertises
+`workspace.diagnostics.refreshSupport`. Without that client
+capability, a provider registered after the settle window becomes visible on
+the client's next pull because LSP provides no way for the server to initiate
+one. A failure from any planned provider or server fails the request instead of
+returning a partial composite that could replace previously reported
+diagnostics. Every successful provider contribution is retained because
+provider requests can cross a document close/reopen and downstream version
+counters can reset. Those
+numeric versions are also bridge-local rather than editor document versions, so
+the upstream composite always uses `null`.
+Downstream result IDs, provider identifiers, and progress tokens are not shared
+across producers, so workspace pulls currently return full, non-streamed
+reports. Internal virtual-document reports are filtered: open embedded regions
+are already served through the range-aware `textDocument/diagnostic` path.
+Because Kakehashi sends no downstream previous-result IDs, an `unchanged`
+downstream item cannot be reconstructed and fails the aggregate.
+For a shared server that cannot follow workspace-folder changes, the pull uses
+the client-root fallback rather than a process seeded from one marker root.
+Each aggregate is bound to one workspace/settings snapshot: capture waits for
+a normal folder update. A generation that is unstable at capture or crosses
+after capture fails the request instead of returning mixed workspace scopes or
+an empty replacement composite.
 
 ### Code actions
 

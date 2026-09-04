@@ -349,6 +349,7 @@ pub(crate) struct HostVirtualContents {
 
 type LatestVirtualContents = DashMap<Url, HostVirtualContents>;
 type LatestVirtualContentSnapshot = (Option<Arc<str>>, (u64, u64));
+type ConnectionAcquiredObserver<'a> = dyn Fn(&Arc<ConnectionHandle>, bool) + Sync + 'a;
 
 impl OpenClaimGuard {
     fn disarm(&mut self) {
@@ -1006,6 +1007,15 @@ impl LanguageServerPool {
     #[cfg(test)]
     pub(crate) async fn connection_count(&self) -> usize {
         self.connections.lock().await.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_test_connection(
+        &self,
+        key: ConnectionKey,
+        handle: Arc<ConnectionHandle>,
+    ) {
+        self.connections.lock().await.insert(key, handle);
     }
 
     /// Get access to the connections map.
@@ -2061,6 +2071,7 @@ impl LanguageServerPool {
                     rootless: false,
                     admit: None,
                 },
+                None,
             )
             .await
         {
@@ -2877,6 +2888,7 @@ impl LanguageServerPool {
             document_uri,
             timeout,
             None,
+            None,
         )
         .await
     }
@@ -2888,12 +2900,31 @@ impl LanguageServerPool {
     /// fallback, including documents outside the client workspace. Only a
     /// distinct key guarantees that workspace-wide results cannot depend on
     /// document-open history.
+    #[cfg(test)]
     pub(super) async fn get_or_create_workspace_connection_wait_ready_admitted(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
         timeout: Duration,
         admit: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<(Arc<ConnectionHandle>, u64)> {
+        self.get_or_create_workspace_connection_wait_ready_admitted_inner(
+            server_name,
+            server_config,
+            timeout,
+            admit,
+            None,
+        )
+        .await
+    }
+
+    async fn get_or_create_workspace_connection_wait_ready_admitted_inner(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        timeout: Duration,
+        admit: &(dyn Fn() -> bool + Sync),
+        on_acquired: Option<&ConnectionAcquiredObserver<'_>>,
     ) -> io::Result<(Arc<ConnectionHandle>, u64)> {
         let workspace_generation = self.workspace_generation.load(Ordering::Acquire);
         if workspace_generation & 1 != 0 {
@@ -2913,6 +2944,7 @@ impl LanguageServerPool {
                     rootless: false,
                     admit: Some(admit),
                 },
+                on_acquired,
             )
             .await?;
         if !admit()
@@ -2940,6 +2972,63 @@ impl LanguageServerPool {
         timeout: Duration,
         admit: &(dyn Fn() -> bool + Sync),
     ) -> io::Result<(Vec<Arc<ConnectionHandle>>, u64)> {
+        self.get_or_create_workspace_connections_wait_ready_admitted_observed(
+            server_name,
+            server_config,
+            timeout,
+            admit,
+            &|_, _| {},
+        )
+        .await
+    }
+
+    pub(super) async fn get_or_create_workspace_connections_wait_ready_admitted_observed(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        timeout: Duration,
+        admit: &(dyn Fn() -> bool + Sync),
+        on_acquired: &ConnectionAcquiredObserver<'_>,
+    ) -> io::Result<(Vec<Arc<ConnectionHandle>>, u64)> {
+        self.get_or_create_workspace_connections_wait_ready_admitted_inner(
+            server_name,
+            server_config,
+            timeout,
+            admit,
+            on_acquired,
+            false,
+        )
+        .await
+    }
+
+    pub(super) async fn get_or_create_complete_workspace_connections_wait_ready_admitted_observed(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        timeout: Duration,
+        admit: &(dyn Fn() -> bool + Sync),
+        on_acquired: &ConnectionAcquiredObserver<'_>,
+    ) -> io::Result<(Vec<Arc<ConnectionHandle>>, u64)> {
+        self.get_or_create_workspace_connections_wait_ready_admitted_inner(
+            server_name,
+            server_config,
+            timeout,
+            admit,
+            on_acquired,
+            true,
+        )
+        .await
+    }
+
+    async fn get_or_create_workspace_connections_wait_ready_admitted_inner(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        timeout: Duration,
+        admit: &(dyn Fn() -> bool + Sync),
+        on_acquired: &ConnectionAcquiredObserver<'_>,
+        require_complete_roots: bool,
+    ) -> io::Result<(Vec<Arc<ConnectionHandle>>, u64)> {
         let initial_workspace_generation = self.workspace_generation.load(Ordering::Acquire);
         if initial_workspace_generation & 1 != 0 || !admit() {
             return Err(io::Error::new(
@@ -2958,11 +3047,12 @@ impl LanguageServerPool {
             return Ok((Vec::new(), initial_workspace_generation));
         }
         let primary = self
-            .get_or_create_workspace_connection_wait_ready_admitted(
+            .get_or_create_workspace_connection_wait_ready_admitted_inner(
                 server_name,
                 server_config,
                 timeout,
                 admit,
+                Some(on_acquired),
             )
             .await;
         let Some(folders) = self.workspace_folders() else {
@@ -3058,24 +3148,28 @@ impl LanguageServerPool {
         // instead of inheriting an exhausted primary budget.
         let secondary_timeout = timeout;
         let acquisitions = targets.map(|(key, root, folder)| async move {
-            self.acquire_resolved_wait_ready(
-                server_name,
-                server_config,
-                key,
-                Some((root, folder)),
-                WaitReadyOptions {
-                    timeout: secondary_timeout,
-                    rootless: false,
-                    admit: Some(&workspace_admit),
-                },
-            )
-            .await
+            let handle = self
+                .acquire_resolved_wait_ready(
+                    server_name,
+                    server_config,
+                    key,
+                    Some((root, folder)),
+                    WaitReadyOptions {
+                        timeout: secondary_timeout,
+                        rootless: false,
+                        admit: Some(&workspace_admit),
+                    },
+                    Some(on_acquired),
+                )
+                .await?;
+            Ok::<_, io::Error>(handle)
         });
-        for handle in futures::future::join_all(acquisitions)
-            .await
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        for acquisition in futures::future::join_all(acquisitions).await {
+            let handle = match acquisition {
+                Ok(handle) => handle,
+                Err(error) if require_complete_roots => return Err(error),
+                Err(_) => continue,
+            };
             if !handles
                 .iter()
                 .any(|existing| Arc::ptr_eq(existing, &handle))
@@ -3170,6 +3264,7 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
         admit: Option<&(dyn Fn() -> bool + Sync)>,
+        on_acquired: Option<&ConnectionAcquiredObserver<'_>>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         // `timeout` is the caller's overall budget; the incapable-shared divert
         // below acquires a second connection, so track elapsed time and hand it
@@ -3198,6 +3293,7 @@ impl LanguageServerPool {
                     rootless,
                     admit,
                 },
+                on_acquired,
             )
             .await?;
 
@@ -3248,6 +3344,7 @@ impl LanguageServerPool {
                             rootless: false,
                             admit,
                         },
+                        on_acquired,
                     )
                     .await;
             }
@@ -3275,6 +3372,7 @@ impl LanguageServerPool {
         connection_key: ConnectionKey,
         marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
         options: WaitReadyOptions<'_>,
+        on_acquired: Option<&ConnectionAcquiredObserver<'_>>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         let WaitReadyOptions {
             timeout,
@@ -3294,6 +3392,7 @@ impl LanguageServerPool {
                 timeout,
                 rootless,
                 admit,
+                on_acquired,
             )
             .await
         {
@@ -3328,6 +3427,9 @@ impl LanguageServerPool {
                             io::Error::other("bridge: connection disappeared during wait")
                         })?
                 };
+                if let Some(on_acquired) = on_acquired {
+                    on_acquired(&handle, false);
+                }
                 handle.wait_for_ready(timeout).await?;
                 if admit.is_some_and(|admit| !admit()) {
                     return Err(io::Error::new(
@@ -3788,6 +3890,7 @@ impl LanguageServerPool {
             timeout,
             rootless,
             admit,
+            None,
         )
         .await
     }
@@ -3813,6 +3916,7 @@ impl LanguageServerPool {
         timeout: Duration,
         rootless: bool,
         admit: Option<&(dyn Fn() -> bool + Sync)>,
+        on_acquired: Option<&ConnectionAcquiredObserver<'_>>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         let mut connections = self.connections.lock().await;
 
@@ -3881,6 +3985,9 @@ impl LanguageServerPool {
                 let handle = existing.cloned().ok_or_else(|| {
                     io::Error::other("bridge: connection disappeared before ReturnExisting")
                 })?;
+                if let Some(on_acquired) = on_acquired {
+                    on_acquired(&handle, false);
+                }
                 // Release the pool lock before announcing: `announce_shared_root`
                 // re-locks `connections` itself for its Arc::ptr_eq liveness
                 // check, so it must not be held here (the tokio mutex is not
@@ -3892,6 +3999,15 @@ impl LanguageServerPool {
                 return Ok(handle);
             }
             ConnectionAction::FailFast(err) => {
+                if err.is_initializing()
+                    && let (Some(on_acquired), Some(handle)) = (on_acquired, existing.cloned())
+                {
+                    // The detached handshake already owns this handle. Publish
+                    // acquisition ownership under the original pool lock so a
+                    // cancelled waiter cannot disappear before attaching its
+                    // cleanup guard.
+                    on_acquired(&handle, false);
+                }
                 // Log once when server is disabled due to repeated panics
                 if matches!(err, BridgeError::Disabled) {
                     log::error!(
@@ -4082,6 +4198,9 @@ impl LanguageServerPool {
 
         // Insert into pool immediately so concurrent requests see Initializing state
         connections.insert(connection_key.clone(), Arc::clone(&handle));
+        if let Some(on_acquired) = on_acquired {
+            on_acquired(&handle, true);
+        }
 
         // Release lock before spawning handshake task
         drop(connections);
@@ -4747,6 +4866,16 @@ impl LanguageServerPool {
             .contains_key(upstream_id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn upstream_request_count(&self, upstream_id: &UpstreamId) -> usize {
+        self.upstream_request_registry
+            .lock()
+            .recover_poison("LanguageServerPool::upstream_request_count")
+            .get(upstream_id)
+            .map(|connections| connections.values().copied().sum())
+            .unwrap_or(0)
+    }
+
     /// Record `upstream_id → connection_key` so `$/cancelRequest` from the
     /// client can be forwarded to every downstream connection handling that ID.
     ///
@@ -4796,6 +4925,60 @@ impl LanguageServerPool {
         {
             producers.push(Arc::downgrade(handle));
         }
+    }
+
+    /// Register the router request and its exact producer in one critical
+    /// section relative to synchronous cancellation target capture.
+    pub(crate) fn register_request_for_handle_with_upstream(
+        &self,
+        upstream_id: Option<UpstreamId>,
+        handle: &Arc<ConnectionHandle>,
+    ) -> io::Result<(RequestId, tokio::sync::oneshot::Receiver<serde_json::Value>)> {
+        self.register_request_for_handle_with_upstream_inner(upstream_id, handle, || {})
+    }
+
+    fn register_request_for_handle_with_upstream_inner(
+        &self,
+        upstream_id: Option<UpstreamId>,
+        handle: &Arc<ConnectionHandle>,
+        after_router_registration: impl FnOnce(),
+    ) -> io::Result<(RequestId, tokio::sync::oneshot::Receiver<serde_json::Value>)> {
+        let Some(upstream_id) = upstream_id else {
+            return handle.register_request_with_upstream(None);
+        };
+        let connection_key = handle.key();
+        // Match the production cancel path's lock order: registry, exact
+        // handles, then the router lock acquired by registration. Cancellation
+        // therefore observes either neither mapping or both mappings.
+        let mut registry = self
+            .upstream_request_registry
+            .lock()
+            .recover_poison("LanguageServerPool::register_request_for_handle_with_upstream");
+        let mut handles = self
+            .upstream_cancel_handles
+            .lock()
+            .recover_poison("LanguageServerPool::register_request_for_handle_with_upstream");
+        let request = handle.register_request_with_upstream(Some(upstream_id.clone()))?;
+        after_router_registration();
+        *registry
+            .entry(upstream_id.clone())
+            .or_default()
+            .entry(connection_key.clone())
+            .or_insert(0) += 1;
+        let producers = handles
+            .entry(upstream_id)
+            .or_default()
+            .entry(connection_key.clone())
+            .or_default();
+        producers.retain(|producer| producer.strong_count() > 0);
+        if !producers
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|producer| Arc::ptr_eq(&producer, handle))
+        {
+            producers.push(Arc::downgrade(handle));
+        }
+        Ok(request)
     }
 
     /// Unregister one in-flight request for `(upstream_id, connection_key)`.
@@ -7771,6 +7954,7 @@ mod tests {
                 Duration::from_millis(100),
                 true,
                 None,
+                None,
             )
             .await;
 
@@ -8883,6 +9067,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn request_registration_is_atomic_with_synchronous_cancel_capture() {
+        let pool = LanguageServerPool::new();
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
+        let upstream_id = UpstreamId::Number(4242);
+        let (request_id, _response_rx) = pool
+            .register_request_for_handle_with_upstream_inner(
+                Some(upstream_id.clone()),
+                &handle,
+                || {
+                    assert!(
+                        pool.upstream_request_registry.try_lock().is_err(),
+                        "request registry must stay locked through router registration"
+                    );
+                    assert!(
+                        pool.upstream_cancel_handles.try_lock().is_err(),
+                        "exact-handle registry must stay locked through router registration"
+                    );
+                },
+            )
+            .unwrap();
+        pool.forward_cancel_by_upstream_id_if_current_sync(upstream_id, || true, || {})
+            .unwrap();
+
+        assert!(
+            !handle.router().claim_for_write(request_id),
+            "cancel capture must mark the atomically registered queued request"
+        );
+        let (_, _, _, unknown_id, not_in_registry) = pool.cancel_metrics.snapshot();
+        assert_eq!((unknown_id, not_in_registry), (0, 0));
+    }
+
     /// `forward_cancel_downstream` sends the cancel for the EXACT downstream
     /// id it is given, with no upstream-id lookup — the formatting pipeline's
     /// per-step timeout uses it because the timed-out step's upstream-id
@@ -9603,6 +9820,100 @@ mod tests {
             // - May be Initializing if timeout hasn't elapsed yet
             // - May be Failed if handshake timed out
         }
+    }
+
+    #[tokio::test]
+    async fn acquisition_observer_runs_before_the_detached_handshake_wait() {
+        let pool = LanguageServerPool::new();
+        let config = devnull_config();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_handles = Arc::clone(&observed);
+        let on_acquired = move |_handle: &Arc<ConnectionHandle>, started_by_pull: bool| {
+            observed_handles.lock().unwrap().push(started_by_pull);
+        };
+        let admit = || true;
+        let acquire = pool.get_or_create_connection_wait_ready_with_admit(
+            "observed",
+            &config,
+            None,
+            Duration::from_secs(1),
+            Some(&admit),
+            Some(&on_acquired),
+        );
+        tokio::pin!(acquire);
+
+        assert!(futures::poll!(acquire.as_mut()).is_pending());
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![true],
+            "the newly spawned handle must be observable before cancellation can drop the handshake wait"
+        );
+        drop(acquire);
+    }
+
+    #[tokio::test]
+    async fn acquisition_observer_retains_a_handle_when_later_admission_fails() {
+        let pool = LanguageServerPool::new();
+        let config = devnull_config();
+        let key = ConnectionKey::workspace("observed-existing");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.record_launch_config(&config);
+        pool.connections
+            .lock()
+            .await
+            .insert(key, Arc::clone(&handle));
+        let admitted = AtomicBool::new(true);
+        let observed = std::sync::Mutex::new(Vec::new());
+        let on_acquired = |_handle: &Arc<ConnectionHandle>, started_by_pull: bool| {
+            observed.lock().unwrap().push(started_by_pull);
+            admitted.store(false, Ordering::Release);
+        };
+
+        let result = pool
+            .get_or_create_workspace_connections_wait_ready_admitted_observed(
+                "observed-existing",
+                &config,
+                Duration::from_secs(1),
+                &|| admitted.load(Ordering::Acquire),
+                &on_acquired,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(*observed.lock().unwrap(), vec![false]);
+    }
+
+    #[tokio::test]
+    async fn acquisition_observer_sees_initializing_handle_under_the_original_lock() {
+        let pool = LanguageServerPool::new();
+        let config = devnull_config();
+        let key = ConnectionKey::for_server("observed-initializing");
+        let handle = create_handle_with_key(ConnectionState::Initializing, key.clone()).await;
+        handle.record_launch_config(&config);
+        pool.connections
+            .lock()
+            .await
+            .insert(key.clone(), Arc::clone(&handle));
+        let observed = std::sync::Mutex::new(Vec::new());
+        let on_acquired = |_handle: &Arc<ConnectionHandle>, started_by_pull: bool| {
+            observed.lock().unwrap().push(started_by_pull);
+        };
+
+        let result = pool
+            .get_or_create_connection_resolved(
+                "observed-initializing",
+                &config,
+                key,
+                None,
+                Duration::from_secs(1),
+                false,
+                None,
+                Some(&on_acquired),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(*observed.lock().unwrap(), vec![false]);
     }
 
     /// Test that ensure_server_ready is idempotent - calling twice doesn't spawn a second server.

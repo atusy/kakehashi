@@ -1,8 +1,9 @@
 //! `client/unregisterCapability` server-request handler.
 //!
 //! Inbound (downstream → bridge). A downstream server unregisters a dynamic
-//! capability it previously registered; the bridge drops it from the shared
-//! [`DynamicCapabilityRegistry`] and acks with `null`. Param-parse failures (or
+//! capability it previously registered; the handler parses the removal so the
+//! reader can update the shared [`DynamicCapabilityRegistry`] before queuing
+//! the acknowledgement. Param-parse failures (or
 //! a missing `params` field) reply with InvalidParams (-32602), mirroring
 //! [`register_capability`](super::register_capability).
 //!
@@ -13,15 +14,16 @@ use serde::Deserialize;
 use tower_lsp_server::jsonrpc;
 use tower_lsp_server::ls_types::UnregistrationParams;
 
-use crate::lsp::bridge::actor::ServerRequestDeps;
+pub(in crate::lsp::bridge) struct UnregistrationReply {
+    pub(in crate::lsp::bridge) unregisterations: Vec<tower_lsp_server::ls_types::Unregistration>,
+}
 
-/// Handle a `client/unregisterCapability` request, returning the JSON-RPC body
-/// the dispatcher wraps in a response.
+/// Parse a `client/unregisterCapability` request into removals the reader
+/// commits before queuing the acknowledgement.
 pub(in crate::lsp::bridge) fn handle(
     message: &serde_json::Value,
     server_prefix: &str,
-    deps: &ServerRequestDeps,
-) -> jsonrpc::Result<serde_json::Value> {
+) -> jsonrpc::Result<UnregistrationReply> {
     let Some(params) = message.get("params") else {
         warn!(
             target: "kakehashi::bridge::reader",
@@ -44,9 +46,9 @@ pub(in crate::lsp::bridge) fn handle(
                     server_prefix, unreg.method, unreg.id
                 );
             }
-            deps.dynamic_capabilities
-                .unregister(unreg_params.unregisterations);
-            Ok(serde_json::Value::Null)
+            Ok(UnregistrationReply {
+                unregisterations: unreg_params.unregisterations,
+            })
         }
         Err(e) => {
             warn!(

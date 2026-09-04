@@ -13,9 +13,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
     CodeActionOptions, CodeActionProviderCapability, ColorProviderCapability,
-    DeclarationCapability, FoldingRangeProviderCapability, HoverProviderCapability,
-    ImplementationProviderCapability, LinkedEditingRangeServerCapabilities, OneOf, RenameOptions,
-    SaveOptions, SelectionRangeProviderCapability, SemanticTokensFullOptions, SemanticTokensLegend,
+    DeclarationCapability, DiagnosticServerCapabilities, FoldingRangeProviderCapability,
+    HoverProviderCapability, ImplementationProviderCapability,
+    LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, SaveOptions,
+    SelectionRangeProviderCapability, SemanticTokensFullOptions, SemanticTokensLegend,
     SemanticTokensServerCapabilities, ServerCapabilities, TextDocumentSyncCapability,
     TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
 };
@@ -142,6 +143,7 @@ pub(crate) struct ConnectionHandle {
     /// Server capabilities from the initialize response, used to skip unsupported
     /// requests. `OnceLock` for set-once/read-many.
     server_capabilities: OnceLock<ServerCapabilities>,
+    raw_diagnostic_provider: OnceLock<serde_json::Value>,
     /// Whether the downstream is currently eligible for Kakehashi's
     /// bridge-routing protocol. This starts false, is set from the initialize
     /// advertisement, and may be cleared after a downstream MethodNotFound.
@@ -274,6 +276,7 @@ impl ConnectionHandle {
             // which is pre-registered before spawning the reader task.
             next_request_id: AtomicI64::new(2),
             server_capabilities: OnceLock::new(),
+            raw_diagnostic_provider: OnceLock::new(),
             bridge_routing: AtomicBool::new(false),
             type_hierarchy_provider: AtomicBool::new(false),
             dynamic_capabilities,
@@ -315,7 +318,7 @@ impl ConnectionHandle {
     }
 
     /// The root this connection's `initialize` was rooted at, when recorded.
-    pub(super) fn spawn_root(&self) -> Option<&str> {
+    pub(crate) fn spawn_root(&self) -> Option<&str> {
         self.spawn_root.get().and_then(|root| root.as_deref())
     }
 
@@ -631,6 +634,22 @@ impl ConnectionHandle {
     /// Called once after successful LSP handshake, before transitioning to Ready.
     /// Subsequent calls are ignored (OnceLock semantics).
     pub(super) fn set_server_capabilities(&self, capabilities: ServerCapabilities) {
+        let typed_workspace_diagnostics = match capabilities.diagnostic_provider.as_ref() {
+            Some(DiagnosticServerCapabilities::Options(options)) => options.workspace_diagnostics,
+            Some(DiagnosticServerCapabilities::RegistrationOptions(options)) => {
+                options.diagnostic_options.workspace_diagnostics
+            }
+            None => false,
+        };
+        let raw_workspace_diagnostics = self
+            .raw_diagnostic_provider()
+            .and_then(|provider| provider.get("workspaceDiagnostics"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        self.dynamic_capabilities
+            .set_static_workspace_diagnostic_provider(
+                typed_workspace_diagnostics || raw_workspace_diagnostics,
+            );
         // OnceLock::set() returns Err if already set - ignore since handshake
         // happens exactly once per connection.
         let _ = self.server_capabilities.set(capabilities);
@@ -652,6 +671,14 @@ impl ConnectionHandle {
     /// compile-time-safe capability checks.
     pub(crate) fn server_capabilities(&self) -> Option<&ServerCapabilities> {
         self.server_capabilities.get()
+    }
+
+    pub(crate) fn set_raw_diagnostic_provider(&self, provider: serde_json::Value) {
+        let _ = self.raw_diagnostic_provider.set(provider);
+    }
+
+    pub(crate) fn raw_diagnostic_provider(&self) -> Option<&serde_json::Value> {
+        self.raw_diagnostic_provider.get()
     }
 
     pub(crate) fn semantic_tokens_legend(&self) -> Option<&SemanticTokensLegend> {
@@ -756,11 +783,27 @@ impl ConnectionHandle {
         {
             return true;
         }
+        if method == "workspace/diagnostic"
+            && self
+                .dynamic_capabilities()
+                .registration_options_flag("textDocument/diagnostic", "workspaceDiagnostics")
+        {
+            return true;
+        }
         // Fall back to static capabilities from initialize response
         let Some(caps) = self.server_capabilities() else {
             return false;
         };
         match method {
+            "workspace/diagnostic" => match caps.diagnostic_provider.as_ref() {
+                Some(DiagnosticServerCapabilities::Options(options)) => {
+                    options.workspace_diagnostics
+                }
+                Some(DiagnosticServerCapabilities::RegistrationOptions(options)) => {
+                    options.diagnostic_options.workspace_diagnostics
+                }
+                None => false,
+            },
             "textDocument/diagnostic" => caps.diagnostic_provider.is_some(),
             "textDocument/hover" => matches!(
                 caps.hover_provider,
@@ -2340,6 +2383,64 @@ mod tests {
             register_options: None,
         }]);
         assert!(handle.has_capability("textDocument/diagnostic"));
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostic_requires_the_provider_subcapability() {
+        use tower_lsp_server::ls_types::{
+            DiagnosticOptions, DiagnosticServerCapabilities, Registration,
+        };
+
+        let static_handle = spawn_sink_handle().await;
+        static_handle.set_server_capabilities(ServerCapabilities {
+            diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
+                workspace_diagnostics: true,
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        assert!(static_handle.has_capability("workspace/diagnostic"));
+
+        let document_only = spawn_sink_handle().await;
+        document_only.set_server_capabilities(ServerCapabilities {
+            diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                DiagnosticOptions::default(),
+            )),
+            ..Default::default()
+        });
+        assert!(!document_only.has_capability("workspace/diagnostic"));
+
+        let dynamic_handle = spawn_sink_handle().await;
+        dynamic_handle
+            .dynamic_capabilities()
+            .register(vec![Registration {
+                id: "workspace-diag".into(),
+                method: "textDocument/diagnostic".into(),
+                register_options: Some(serde_json::json!({ "workspaceDiagnostics": true })),
+            }]);
+        assert!(dynamic_handle.has_capability("workspace/diagnostic"));
+    }
+
+    #[tokio::test]
+    async fn raw_static_workspace_diagnostic_provider_participates_in_lifecycle() {
+        let handle = spawn_sink_handle().await;
+        handle.set_raw_diagnostic_provider(serde_json::json!({
+            "workspaceDiagnostics": true,
+            "interFileDependencies": true,
+            "documentSelector": [{
+                "pattern": {
+                    "baseUri": "file:///workspace",
+                    "pattern": "*.rs"
+                }
+            }]
+        }));
+        handle.set_server_capabilities(ServerCapabilities::default());
+
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .has_workspace_diagnostic_provider()
+        );
     }
 
     /// Test has_capability returns true when both static and dynamic.
