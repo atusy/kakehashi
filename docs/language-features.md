@@ -210,7 +210,8 @@ configured, the default `preferred` strategy uses the first server in
 the servers named in `priorities` format the block one after another, each
 seeing the previous formatter's output (e.g. `black` then `isort`). The
 pipeline requires explicitly named servers — `"*"` is ignored there, since a
-reproducible pipeline needs a deterministic order.
+reproducible pipeline needs a deterministic order. It runs at most 64 named
+servers per region; `maxFanOut` can set a lower limit.
 
 A response whose edits would corrupt the host document around the embedded
 block (escape the region, break blockquote `> ` prefixes, or merge content
@@ -324,6 +325,27 @@ Default combine strategy: `concatenated`, across servers and across the
 virt/host layers. Advertised only to clients with
 `codeActionLiteralSupport`; see the README's bridged-requests list for the
 palette/registered-list caveats.
+
+### Call hierarchy
+
+[`textDocument/prepareCallHierarchy`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_prepareCallHierarchy),
+[`callHierarchy/incomingCalls`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#callHierarchy_incomingCalls),
+and [`callHierarchy/outgoingCalls`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#callHierarchy_outgoingCalls)
+
+Call hierarchy works for both embedded virtual documents and host-language
+servers enabled with `bridge._self`. Prepared items remember the exact
+downstream process that produced them, so incoming and outgoing expansion do
+not silently switch to a replacement server. Virtual item ranges and call-site
+ranges are translated back to host coordinates; real external-file items stay
+in their original coordinate space. Results that point at another virtual
+region are filtered because their coordinates cannot be represented safely in
+the requesting host region.
+
+Expansion fails softly with `null` when an item has no kakehashi routing data,
+the host document changed or reopened, the embedded region moved or became
+non-contiguous, or the producing downstream connection was replaced. Returned
+callers and callees carry fresh routing data so clients can expand the tree
+recursively.
 
 ### Document color (experimental)
 
@@ -611,7 +633,7 @@ type CapturesDelta = {
 
 kakehashi does not yet provide these LSP features:
 
-- Call hierarchy / type hierarchy
+- Type hierarchy
 - Workspace symbol search (`workspace/symbol`)
 
 (The static code-action and execute-command providers are advertised only to

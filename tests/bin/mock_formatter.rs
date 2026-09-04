@@ -207,6 +207,7 @@ fn main() {
     // sent-state barrier for post-response freshness tests.
     let mut pending_inlay_resolve: Option<(Option<Value>, Value)> = None;
     let mut pending_call_hierarchy_incoming: Option<(Option<Value>, Value)> = None;
+    let mut pending_call_hierarchy_outgoing: Option<(Option<Value>, Value)> = None;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -232,7 +233,9 @@ fn main() {
                     | "call-hierarchy-replacement"
                     | "call-hierarchy-marker-incoming"
                     | "call-hierarchy-slow-incoming"
-                    | "call-hierarchy-delayed-incoming" => json!({
+                    | "call-hierarchy-delayed-incoming"
+                    | "call-hierarchy-slow-outgoing"
+                    | "call-hierarchy-delayed-outgoing" => json!({
                         "callHierarchyProvider": true,
                         "textDocumentSync": 1
                     }),
@@ -535,6 +538,12 @@ fn main() {
                     if mode == "call-hierarchy-delayed-incoming"
                         && let Some((pending_id, pending_result)) =
                             pending_call_hierarchy_incoming.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
+                    if mode == "call-hierarchy-delayed-outgoing"
+                        && let Some((pending_id, pending_result)) =
+                            pending_call_hierarchy_outgoing.take()
                     {
                         respond(&mut writer, pending_id, pending_result);
                     }
@@ -1662,6 +1671,86 @@ fn main() {
                         json!({ "type": 3, "message": "call-hierarchy-incoming-started" }),
                     );
                     pending_call_hierarchy_incoming = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
+            }
+            "callHierarchy/outgoingCalls" => {
+                if mode == "call-hierarchy-slow-outgoing" {
+                    record_mock_event(&mode, "request", &message);
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "call-hierarchy-outgoing-started" }),
+                    );
+                    continue;
+                }
+                let item = message.pointer("/params/item").cloned();
+                let result = item
+                    .as_ref()
+                    .and_then(|item| item.get("uri").and_then(Value::as_str))
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        let observation = json!({
+                            "receivedUri": uri,
+                            "receivedRange": item.as_ref().and_then(|item| item.get("range")),
+                            "receivedSelectionRange": item
+                                .as_ref()
+                                .and_then(|item| item.get("selectionRange")),
+                            "receivedData": item.as_ref().and_then(|item| item.get("data")),
+                        });
+                        json!([
+                            {
+                                "to": {
+                                    "name": "mock-callee",
+                                    "detail": observation.to_string(),
+                                    "kind": 12,
+                                    "uri": uri,
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 5 }
+                                    },
+                                    "selectionRange": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 4 }
+                                    },
+                                    "data": { "mock": "outgoing-callee" }
+                                },
+                                "fromRanges": [{
+                                    "start": { "line": 0, "character": 1 },
+                                    "end": { "line": 0, "character": 2 }
+                                }]
+                            },
+                            {
+                                "to": {
+                                    "name": "external-callee",
+                                    "kind": 12,
+                                    "uri": "file:///external.lua",
+                                    "range": {
+                                        "start": { "line": 8, "character": 0 },
+                                        "end": { "line": 8, "character": 5 }
+                                    },
+                                    "selectionRange": {
+                                        "start": { "line": 8, "character": 0 },
+                                        "end": { "line": 8, "character": 4 }
+                                    },
+                                    "data": { "mock": "external-callee" }
+                                },
+                                "fromRanges": [{
+                                    "start": { "line": 0, "character": 2 },
+                                    "end": { "line": 0, "character": 3 }
+                                }]
+                            }
+                        ])
+                    })
+                    .unwrap_or(Value::Null);
+                if mode == "call-hierarchy-delayed-outgoing" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "call-hierarchy-outgoing-started" }),
+                    );
+                    pending_call_hierarchy_outgoing = Some((id, result));
                 } else {
                     respond(&mut writer, id, result);
                 }

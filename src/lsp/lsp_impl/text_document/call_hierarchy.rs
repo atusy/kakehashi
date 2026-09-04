@@ -3,7 +3,8 @@
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
-    CallHierarchyPrepareParams, NumberOrString, Position, Uri,
+    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
+    NumberOrString, Position, Uri,
 };
 
 use super::super::Kakehashi;
@@ -60,6 +61,42 @@ impl Kakehashi {
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let sweep_id = upstream_id.clone();
         let dispatch = pool.dispatch_call_hierarchy_incoming(params, &settings, upstream_id);
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            std::sync::Arc::clone(&pool),
+            sweep_id,
+        );
+        let calls = match cancel_rx {
+            Some(rx) => tokio::select! {
+                biased;
+                _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                calls = dispatch => Ok(calls),
+            },
+            None => Ok(dispatch.await),
+        }?;
+
+        if !self.call_hierarchy_envelope_is_fresh(&envelope, &pool) {
+            return Ok(None);
+        }
+        Ok(calls)
+    }
+
+    pub(crate) async fn call_hierarchy_outgoing_impl(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let Some(envelope) = extract_call_hierarchy_envelope(&params.item) else {
+            return Ok(None);
+        };
+        let pool = self.bridge.pool_arc();
+        if !self.call_hierarchy_envelope_is_fresh(&envelope, &pool) {
+            return Ok(None);
+        }
+
+        let settings = self.settings_manager.load_settings();
+        let upstream_id = current_upstream_id();
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let sweep_id = upstream_id.clone();
+        let dispatch = pool.dispatch_call_hierarchy_outgoing(params, &settings, upstream_id);
         let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
             std::sync::Arc::clone(&pool),
             sweep_id,
