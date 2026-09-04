@@ -70,7 +70,12 @@ impl Kakehashi {
         // lens to content the user has since edited.
         if !envelope.is_host_layer()
             && !self
-                .region_offset_is_fresh(&envelope.host_uri, &envelope.region_id, &envelope.offset)
+                .region_offset_is_fresh(
+                    &envelope.host_uri,
+                    &envelope.region_id,
+                    &envelope.offset,
+                    envelope.incarnation,
+                )
                 .await
         {
             log::debug!(
