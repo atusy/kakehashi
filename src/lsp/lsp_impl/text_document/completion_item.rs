@@ -39,10 +39,10 @@ impl Kakehashi {
         // boundary (the envelope round-trips through unprotected client `data`)
         // — it guards against accidental bypass, and the host path fails soft.
         let envelope = extract_envelope(&params);
-        // The region's live end, rebuilt by the gate below, so the resolved
-        // edits are validated against the region as it is now rather than
-        // as it was when the item was produced.
-        let mut live_region_end = None;
+        // The region's live geometry, rebuilt by the gate below, so the
+        // resolved edits are translated and validated against the region as
+        // it is now rather than as it was when the item was produced.
+        let mut live_geometry = None;
         if let Some(envelope) = &envelope {
             let Ok(host_url) = Url::parse(&envelope.host_uri) else {
                 log::warn!(
@@ -71,7 +71,7 @@ impl Kakehashi {
             }
             if !envelope.is_host_layer() {
                 match self.completion_envelope_is_fresh(envelope).await {
-                    Some(region_end) => live_region_end = Some(region_end),
+                    Some(geometry) => live_geometry = Some(geometry),
                     None => return Ok(params),
                 }
             }
@@ -89,7 +89,7 @@ impl Kakehashi {
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let sweep_id = upstream_id.clone();
         let dispatch =
-            pool.dispatch_completion_resolve(params, &settings, upstream_id, live_region_end);
+            pool.dispatch_completion_resolve(params, &settings, upstream_id, live_geometry);
         // The cancel arm DROPS the in-flight dispatch, which then never reaches
         // its own unregister. An RAII sweep covers that — and, unlike a trailing
         // statement, also runs when this whole handler future is dropped (client
@@ -122,16 +122,11 @@ impl Kakehashi {
                     );
                     return unresolved;
                 }
+                // The same rule as before dispatch: identity, start,
+                // contiguity and language — not the whole offset, which
+                // typing inside a blockquoted fence grows.
                 if !envelope.is_host_layer()
-                    && !self
-                        .region_offset_is_fresh(
-                            &envelope.host_uri,
-                            &envelope.region_id,
-                            &envelope.offset,
-                            envelope.incarnation,
-                            &envelope.injection_language,
-                        )
-                        .await
+                    && self.completion_envelope_is_fresh(&envelope).await.is_none()
                 {
                     log::debug!(
                         target: "kakehashi::bridge",
@@ -154,10 +149,14 @@ impl Kakehashi {
     }
 
     /// Whether the envelope still names the region it was produced for; on
-    /// success, the region's live end. Only the region's identity, start and
-    /// contiguity are compared — its end moves with ordinary typing inside
-    /// the region, which a completion list is designed to outlive.
-    async fn completion_envelope_is_fresh(&self, envelope: &KakehashiEnvelope) -> Option<Position> {
+    /// success, the region's live offset and end. Only the region's identity,
+    /// start and contiguity are compared — its end, and the per-line column
+    /// vector of a blockquoted fence, move with ordinary typing inside the
+    /// region, which a completion list is designed to outlive.
+    async fn completion_envelope_is_fresh(
+        &self,
+        envelope: &KakehashiEnvelope,
+    ) -> Option<(RegionOffset, Position)> {
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             return None;
         };
@@ -165,15 +164,33 @@ impl Kakehashi {
         // find no snapshot and read as a stale region; wait (bounded) for the
         // current parse before rebuilding the region.
         self.wait_for_resolve_parse(&host_url).await;
-        let (offset, region_end, contiguous, live_language) = resolve_region_offset(
+        let Some((offset, region_end, contiguous, live_language)) = resolve_region_offset(
             &self.documents,
             &self.language,
             &self.bridge,
             &host_url,
             &envelope.region_id,
-        )?;
-        completion_geometry_matches(envelope, &offset, contiguous, &live_language)
-            .then_some(region_end)
+        ) else {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "completionItem/resolve: region {} of {} is stale; returning item unresolved",
+                envelope.region_id,
+                envelope.host_uri
+            );
+            return None;
+        };
+        if !completion_geometry_matches(envelope, &offset, contiguous, &live_language) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "completionItem/resolve: region {} of {} moved, lost contiguity or changed language \
+                 (live offset {:?}, contiguous {contiguous}, language {live_language}); returning item unresolved",
+                envelope.region_id,
+                envelope.host_uri,
+                offset
+            );
+            return None;
+        }
+        Some((offset, region_end))
     }
 }
 
@@ -183,9 +200,13 @@ fn completion_geometry_matches(
     contiguous: bool,
     live_language: &str,
 ) -> bool {
+    let produced_at = RegionOffset::from(&envelope.offset);
     !envelope.region_id.is_empty()
         && contiguous
-        && RegionOffset::from(&envelope.offset) == *live_offset
+        // The start identifies the region; the per-line columns below it
+        // grow with the region and are read live for translation.
+        && produced_at.line() == live_offset.line()
+        && produced_at.columns().first() == live_offset.columns().first()
         // The region may have been re-routed (a shebang edit under an
         // `unknown` injection) without moving; the item belongs to the
         // language it was produced for.
@@ -229,6 +250,11 @@ mod tests {
         assert!(
             !completion_geometry_matches(&region, &offset, true, "python"),
             "a region re-routed to another language is not the region the item was produced for"
+        );
+        let grown = RegionOffset::with_per_line_offsets(3, vec![2, 2, 2]);
+        assert!(
+            completion_geometry_matches(&region, &grown, true, "lua"),
+            "a blockquoted region that grew is still the region the item was produced for"
         );
     }
 }

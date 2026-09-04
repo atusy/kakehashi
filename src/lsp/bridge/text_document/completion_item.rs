@@ -48,16 +48,17 @@ impl LanguageServerPool {
     /// a host-layer item, `send_completion_resolve_request` (coordinate
     /// translation + region guard) otherwise. If any routing step fails (no
     /// envelope, server not configured), the item is returned as-is.
-    /// `live_region_end` is the region's end as rebuilt by the caller's
-    /// freshness gate; the resolved edits are guarded against it rather than
-    /// the completion-time snapshot the envelope carries, so typing that grew
-    /// the region since the item was produced does not strip valid edits.
+    /// `live_geometry` is the region's offset and end as rebuilt by the
+    /// caller's freshness gate; the item's ranges are translated with them,
+    /// and the resolved edits guarded against them, rather than with the
+    /// completion-time snapshot the envelope carries, so typing that grew the
+    /// region since the item was produced does not strip valid edits.
     pub(crate) async fn dispatch_completion_resolve(
         &self,
         mut item: CompletionItem,
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
-        live_region_end: Option<Position>,
+        live_geometry: Option<(RegionOffset, Position)>,
     ) -> CompletionItem {
         // Extract envelope — if absent, this item wasn't produced by Kakehashi
         let Some(envelope) = strip_envelope(&mut item) else {
@@ -97,7 +98,7 @@ impl LanguageServerPool {
                 .await;
         }
 
-        self.send_completion_resolve_request(&config, item, envelope, upstream_id, live_region_end)
+        self.send_completion_resolve_request(&config, item, envelope, upstream_id, live_geometry)
             .await
     }
 
@@ -201,9 +202,16 @@ impl LanguageServerPool {
         mut item: CompletionItem,
         envelope: KakehashiEnvelope,
         upstream_id: Option<UpstreamId>,
-        live_region_end: Option<Position>,
+        live_geometry: Option<(RegionOffset, Position)>,
     ) -> CompletionItem {
         let server_name = &envelope.origin;
+        // The region as it is now when the caller rebuilt it, else as it was
+        // when the item was produced (a host-layer item never reaches here).
+        let (offset, region_end) = live_geometry.unwrap_or_else(|| {
+            let offset = RegionOffset::from(&envelope.offset);
+            let region_end = resolve_guard_region_end(&envelope, &offset);
+            (offset, region_end)
+        });
         // Route to the SAME `(server, root)` connection the completion request
         // ran on (#382): the envelope carries the originating host URI, which
         // resolves to the same connection key. Without it (legacy envelope with
@@ -272,16 +280,13 @@ impl LanguageServerPool {
 
         // The original host-coordinate `item` is kept untouched for the
         // fail-soft returns below; the outgoing clone carries virtual ranges.
-        let outgoing = prepare_completion_resolve_item(&item, &envelope);
+        let outgoing = prepare_completion_resolve_item(&item, &offset);
 
         match self
             .send_completion_resolve_on_handle(&handle, outgoing, upstream_id)
             .await
         {
             Some(mut resolved) => {
-                let offset = RegionOffset::from(&envelope.offset);
-                let region_end =
-                    live_region_end.unwrap_or_else(|| resolve_guard_region_end(&envelope, &offset));
                 if transform_completion_item(&mut resolved, &offset, region_end, None) {
                     re_envelope_item(&mut resolved, &envelope);
                     resolved
@@ -414,12 +419,9 @@ fn parse_completion_resolve_response(mut response: serde_json::Value) -> Option<
 /// would otherwise get them re-translated on the way back — a double shift
 /// the safety guard can't always catch). Mirrors the codeAction resolve path.
 /// The HOST path has no such translation to undo and skips this entirely.
-fn prepare_completion_resolve_item(
-    item: &CompletionItem,
-    envelope: &KakehashiEnvelope,
-) -> CompletionItem {
+fn prepare_completion_resolve_item(item: &CompletionItem, offset: &RegionOffset) -> CompletionItem {
     let mut outgoing = item.clone();
-    translate_item_ranges_host_to_virtual(&mut outgoing, &RegionOffset::from(&envelope.offset));
+    translate_item_ranges_host_to_virtual(&mut outgoing, offset);
     outgoing
 }
 
@@ -1019,7 +1021,7 @@ mod tests {
         // Go through the SAME request-preparation helper production uses, and
         // assert on the serialized request.
         let request = build_completion_resolve_request(
-            prepare_completion_resolve_item(&item, &envelope),
+            prepare_completion_resolve_item(&item, &RegionOffset::from(&envelope.offset)),
             RequestId::new(7),
         );
         let wire = serde_json::to_value(&request).unwrap();
