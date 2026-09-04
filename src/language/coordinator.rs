@@ -1620,7 +1620,7 @@ impl LanguageCoordinator {
             ) {
                 Ok(lang) => lang,
                 Err(result) => {
-                    self.record_configured_load_failure_locked(lang_name, generation);
+                    self.record_configured_load_failure(lang_name, generation);
                     self.record_failed_load(lang_name, generation);
                     return result;
                 }
@@ -1661,17 +1661,10 @@ impl LanguageCoordinator {
             .insert(language_id.to_string(), generation);
     }
 
+    /// Record that `language_id`'s configured parser failed to load under
+    /// `generation`. The caller holds `registration_lock` (the configured load
+    /// runs as one registration section).
     fn record_configured_load_failure(&self, language_id: &str, generation: u64) {
-        let _registration = self
-            .registration_lock
-            .lock()
-            .recover_poison("LanguageCoordinator::record_configured_load_failure");
-        self.record_configured_load_failure_locked(language_id, generation);
-    }
-
-    /// [`record_configured_load_failure`](Self::record_configured_load_failure)
-    /// for a caller already holding `registration_lock`.
-    fn record_configured_load_failure_locked(&self, language_id: &str, generation: u64) {
         self.configured_load_failures
             .insert(language_id.to_string(), generation);
         self.language_registry.unregister(language_id);
