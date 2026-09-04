@@ -80,13 +80,29 @@ pub(crate) struct PopulatedInjections {
 }
 
 impl PopulatedInjections {
-    /// No regions (no injection query, or none matched): the downstream skips
-    /// its work, exactly as the inline resolution's empty result did.
+    /// No regions (the query ran and none matched): the downstream skips its
+    /// work, exactly as the inline resolution's empty result did.
     pub(crate) fn empty(generation: u64) -> Self {
         Self {
             discovery: None,
             bridge_regions: Some(Vec::new()),
             resolved_regions: Some(Vec::new()),
+            generation,
+        }
+    }
+
+    /// The pass could not look: the host language's injection query was not
+    /// in the store (a lazy load or a reload still swapping queries in).
+    /// Distinct from [`Self::empty`] on purpose — a definitive empty set
+    /// would be consumed by every reader until the next edit, skipping
+    /// documents that do have injections once the query is loaded. Riding
+    /// without regions makes readers fall back to inline resolution, which
+    /// finds the query as soon as it is there.
+    pub(crate) fn undetermined(generation: u64) -> Self {
+        Self {
+            discovery: None,
+            bridge_regions: None,
+            resolved_regions: None,
             generation,
         }
     }
@@ -269,18 +285,20 @@ impl CacheCoordinator {
         let injection_query = match language.injection_query(language_name) {
             Some(q) => q,
             None => {
-                // No injection query = no injections to track. Clear any
-                // stale injection caches — but only when no edit landed
-                // during this pass (a stale pass must not clobber state the
-                // newer text's own populate maintains). A refused clear
-                // aborts the pass (`None`): reporting ran-and-empty while
-                // the old entries survive would leave them unreclaimed
-                // until another parse.
+                // No injection query in the store = nothing this pass can
+                // track. Clear any stale injection caches — but only when
+                // no edit landed during this pass (a stale pass must not
+                // clobber state the newer text's own populate maintains). A
+                // refused clear aborts the pass (`None`): reporting a result
+                // while the old entries survive would leave them unreclaimed
+                // until another parse. The result is UNDETERMINED, not
+                // empty: the query may simply not be loaded yet, and a
+                // definitive empty set would stand until the next edit.
                 tracker.commit_if_unshifted(uri, entry_mint_epoch, incarnation, || {
                     self.injection_map.clear(uri);
                     self.injection_token_cache.clear_document(uri);
                 })?;
-                return Some(PopulatedInjections::empty(generation));
+                return Some(PopulatedInjections::undetermined(generation));
             }
         };
 
