@@ -29,15 +29,17 @@ Partially implemented:
   no per-method request builders or response transformers. Handlers run the
   layer walk (`Kakehashi::walk_layers`, cross-layer-aggregation,
   `preferred` semantics): layers are tried lazily in `priorities` — by default
-  virt first, host as fallback. Five methods consume per-server identity in
+  virt first, host as fallback. Six method families consume per-server identity in
   the host arm: codeAction for the `"{title} — {server}"` suffix, completion
-  and inlayHint for their resolve-routing envelopes, and codeLens and
-  documentLink for the winning server's resolve capability and envelope.
-  CodeAction, completion, and inlayHint build their own host arms; codeLens
-  and documentLink use the shared whole-document winner hook. Covered: definition, hover, declaration,
+  and inlayHint for their resolve-routing envelopes, codeLens and
+  documentLink for the winning server's resolve capability and envelope, and
+  call hierarchy for follow-up routing.
+  CodeAction, completion, and inlayHint build custom host arms; codeLens and
+  documentLink use the shared whole-document winner hook. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
   inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
+  prepareCallHierarchy, incomingCalls,
   formatting, and rangeFormatting (which shares the formatting layer key).
   Diagnostics are covered with real cross-layer `concatenated` (the
   cross-layer-aggregation diagnostics phase): pull and synthetic push both
@@ -94,6 +96,17 @@ Partially implemented:
   non-contiguous combined injections fail soft before dispatch because a lazy
   edit could otherwise cross a masked host-only gap. Safe resolves apply the
   same all-or-nothing edit guard as initial hint retrieval.
+  `callHierarchy/incomingCalls` follows the same exact-producer contract.
+  Preparation stamps each item with host content/incarnation, connection key
+  and generation, region geometry, and whether its URI/ranges were projected
+  from a virtual document. Expansion reverses only projected items, strips
+  progress and partial-result tokens that the bridge cannot transform, and
+  re-envelopes returned callers for recursive expansion. It rejects stale
+  content, reopen incarnations, moved/non-contiguous regions, and replaced
+  producers before dispatch, then rechecks content and producer identity after
+  the response; cancellation targets the exact downstream request. The
+  upstream `callHierarchyProvider` stays hidden until both incoming and
+  outgoing expansion are implemented.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one

@@ -12,7 +12,9 @@ use log::warn;
 use tower_lsp_server::ls_types::{Position, Uri};
 use url::Url;
 
-use super::{ConnectionHandle, ConnectionHandleSender, LanguageServerPool, UpstreamId};
+use super::{
+    ConnectionHandle, ConnectionHandleSender, ConnectionState, LanguageServerPool, UpstreamId,
+};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, host_position_within_region_bounds,
@@ -240,10 +242,9 @@ impl LanguageServerPool {
         // connections → document tracker matches the respawn purge.
         {
             let connections = self.connections().await;
-            if !connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle))
-            {
+            if !connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+            }) {
                 drop(connections);
                 // router_guard drops here, cleaning up the router entry
                 if let Some(ref id) = upstream_request_id {

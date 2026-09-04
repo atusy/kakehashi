@@ -108,6 +108,18 @@ pub(super) fn resolve_region_offset(
     Some(resolved_region_geometry(resolved))
 }
 
+/// Same rebuild under the name the call hierarchy gate was written against
+/// before the language joined the [`resolve_region_offset`] tuple.
+pub(super) fn resolve_region_offset_and_language(
+    documents: &DocumentStore,
+    language: &Arc<LanguageCoordinator>,
+    bridge: &BridgeCoordinator,
+    host_url: &Url,
+    region_id: &str,
+) -> Option<(RegionOffset, Position, bool, String)> {
+    resolve_region_offset(documents, language, bridge, host_url, region_id)
+}
+
 /// Consume a resolved region into the geometry shared by freshness and edit
 /// validation. The end is derived from the exact virtual content rather than
 /// the raw content-node range, whose trailing named children may be excluded.

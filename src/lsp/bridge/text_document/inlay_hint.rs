@@ -38,7 +38,7 @@ use serde_json::Value;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Position, Range, Uri};
 use url::Url;
 
-use super::super::pool::{ConnectionKey, LanguageServerPool, UpstreamId};
+use super::super::pool::{ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId};
 use tower_lsp_server::ls_types::{
     InlayHintParams, NumberOrString, TextDocumentIdentifier, WorkDoneProgressParams,
 };
@@ -478,9 +478,9 @@ impl LanguageServerPool {
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
         let send_result = {
             let connections = self.connections().await;
-            let producer_is_live = connections
-                .get(connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle));
+            let producer_is_live = connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+            });
             let generation_matches =
                 self.document_connection_generation(connection_key) == expected_generation;
             if !producer_is_live || !generation_matches {
@@ -879,8 +879,75 @@ fn transform_inlay_hint_response_to_host(
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
+    use crate::lsp::bridge::test_helpers::{
+        create_handle_advertising_resolve_methods, wait_for_sent_request,
+    };
     use rstest::rstest;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn resolve_response_rejects_a_retired_producer_after_send() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua-ls");
+        let handle = create_handle_advertising_resolve_methods(key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_uri = Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let generation = pool.document_connection_generation(&key);
+        let hint: InlayHint = serde_json::from_value(json!({
+            "position": { "line": 0, "character": 0 },
+            "label": ": old",
+            "data": { "token": 1 }
+        }))
+        .unwrap();
+        let envelope = InlayHintEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            content_version: Some(1),
+            connection_generation: Some(generation),
+            connection_key: Some(key),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            inner: Some(json!({ "token": 1 })),
+            host_layer: true,
+            translated_locations: Vec::new(),
+        };
+        let upstream_id = UpstreamId::Number(77);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_inlay_hint_resolve_request(
+                    &BridgeServerConfig::default(),
+                    hint,
+                    envelope,
+                    Some(upstream_id),
+                    None,
+                )
+                .await
+            })
+        };
+        let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+        handle.begin_shutdown();
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": {
+                "position": { "line": 0, "character": 0 },
+                "label": ": stale",
+                "textEdits": [{
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
+                    "newText": "stale"
+                }]
+            }
+        }));
+
+        let result = request.await.unwrap();
+        assert!(result.text_edits.is_none());
+        assert!(extract_inlay_hint_envelope(&result).is_some());
+    }
 
     // ==========================================================================
     // Inlay hint request builder tests

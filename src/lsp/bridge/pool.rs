@@ -1245,6 +1245,16 @@ impl LanguageServerPool {
         self.document_tracker.host_virtual_docs(host_uri).await
     }
 
+    pub(super) async fn observe_virtual_uris_for_connection(
+        &self,
+        connection_key: &ConnectionKey,
+        generation: u64,
+    ) -> document_tracker::VirtualUriObserver {
+        self.document_tracker
+            .observe_virtual_uris_for_connection(connection_key, generation)
+            .await
+    }
+
     /// Remove and return all virtual documents for a host URI.
     ///
     /// Used by did_close module for cleanup.
@@ -1748,6 +1758,49 @@ impl LanguageServerPool {
                 Arc::ptr_eq(current, &transition) && Arc::strong_count(current) == 2
             });
         }
+    }
+
+    /// Retire the exact connection whose didClose could not be enqueued.
+    ///
+    /// A dropped close makes that process's document namespace unknowable: the
+    /// downstream may still have the URI open while local callers need it gone.
+    /// Purging the generation and arming a reopen restores one coherent state on
+    /// the next acquisition. The identity check must happen under `connections`
+    /// so a delayed cleanup cannot evict a replacement process.
+    pub(super) async fn invalidate_connection_after_didclose_failure(
+        &self,
+        connection_key: &ConnectionKey,
+        failed_handle: &Arc<ConnectionHandle>,
+    ) -> bool {
+        let mut connections = self.connections.lock().await;
+        let Some(current) = connections.get(connection_key) else {
+            return false;
+        };
+        if !Arc::ptr_eq(current, failed_handle) {
+            return false;
+        }
+        // Mark Failed before the first cleanup await. If this invalidation
+        // future is cancelled, the next acquisition takes the existing
+        // Failed/SpawnNew path and repeats the idempotent purge instead of
+        // leaving a Closing entry that fails fast forever.
+        failed_handle.set_state(ConnectionState::Failed);
+        // Own teardown independently of this cleanup future. The purge below
+        // can await several locks and be cancelled; the detached, bounded
+        // shutdown must still retire the live process before a replacement is
+        // allowed to coexist with it.
+        shutdown_invalidated_connection(connection_key.clone(), Arc::clone(failed_handle));
+        self.host_documents
+            .lock()
+            .await
+            .retain(|(_, key), _| key != connection_key);
+        self.clear_host_routing_for_connection(connection_key);
+        self.document_tracker.purge_connection(connection_key).await;
+        self.pending_reopen.arm(connection_key);
+        self.invalidate_diagnostic_connections(std::slice::from_ref(connection_key));
+        self.purge_open_transition_locks(connection_key).await;
+        connections.remove(connection_key);
+        drop(connections);
+        true
     }
 
     /// Wait for an in-flight virtual-document re-open on `key` before sending on

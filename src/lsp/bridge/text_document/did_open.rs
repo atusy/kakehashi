@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::super::pool::{
-    ConnectionHandleSender, ConnectionKey, INIT_TIMEOUT_SECS, LanguageServerPool,
+    ConnectionHandleSender, ConnectionKey, ConnectionState, INIT_TIMEOUT_SECS, LanguageServerPool,
 };
 use super::super::protocol::VirtualDocumentUri;
 use super::super::protocol::{RoutingLanguageServer, RoutingParams, RoutingTextDocument};
@@ -292,10 +292,9 @@ impl LanguageServerPool {
             // respawn replaced the handle mid-loop, stop: the purge lets the next
             // real request re-open cleanly.
             let connections = self.connections().await;
-            if !connections
-                .get(&connection_key)
-                .is_some_and(|current| Arc::ptr_eq(current, &handle))
-            {
+            if !connections.get(&connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+            }) {
                 log::debug!(
                     target: "kakehashi::bridge",
                     "Eager open: connection {} replaced mid-loop; stopping",
@@ -438,10 +437,9 @@ impl LanguageServerPool {
             match handle.request_routing(routing_params).await {
                 Ok(Some(answer)) => {
                     let connections = self.connections().await;
-                    if !connections
-                        .get(connection_key)
-                        .is_some_and(|current| Arc::ptr_eq(current, &handle))
-                    {
+                    if !connections.get(connection_key).is_some_and(|current| {
+                        Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+                    }) {
                         return;
                     }
                     if answer
@@ -482,10 +480,9 @@ impl LanguageServerPool {
         // `execute_host_request`, so a concurrent respawn purge cannot interleave
         // and leave sync state the replacement never saw.
         let connections = self.connections().await;
-        if !connections
-            .get(connection_key)
-            .is_some_and(|current| Arc::ptr_eq(current, &handle))
-        {
+        if !connections.get(connection_key).is_some_and(|current| {
+            Arc::ptr_eq(current, &handle) && current.state() == ConnectionState::Ready
+        }) {
             // Replaced by a respawn between wait-ready and here; the new connection
             // will sync lazily on its first request.
             return;

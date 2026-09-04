@@ -77,6 +77,19 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_connection_stays_retryable_during_shutdown() {
+        let handle = create_handle_with_state(ConnectionState::Failed).await;
+
+        handle.begin_shutdown();
+
+        assert_eq!(
+            handle.state(),
+            ConnectionState::Failed,
+            "a mapped invalidation must remain eligible for replacement"
+        );
+    }
+
     /// Test that Closing state transitions to Closed on completion.
     ///
     /// ls-bridge-message-ordering: Closing → Closed transition occurs when LSP shutdown/exit

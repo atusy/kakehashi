@@ -17,13 +17,14 @@
 //! HOST path (#958) forwards verbatim: its item is already in host
 //! coordinates, so neither the translation nor that region guard applies.
 
+use std::io;
 use std::sync::Arc;
 
 use log::{debug, warn};
 use tower_lsp_server::ls_types::{CompletionItem, Position};
 use url::Url;
 
-use super::super::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
+use super::super::pool::{ConnectionHandle, ConnectionState, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error,
     translate_host_range_to_virtual,
@@ -344,7 +345,20 @@ impl LanguageServerPool {
         let request = build_completion_resolve_request(outgoing, request_id);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        if let Err(e) = handle.send_request(request, request_id) {
+        let send_result = {
+            let connections = self.connections().await;
+            if connections.get(connection_key).is_some_and(|current| {
+                Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+            }) {
+                handle.send_request(request, request_id).map_err(Into::into)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "completion producer retired before resolve send",
+                ))
+            }
+        };
+        if let Err(e) = send_result {
             warn!(
                 target: "kakehashi::bridge",
                 "completionItem/resolve: failed to send request on {connection_key:?}: {e}"
@@ -364,7 +378,13 @@ impl LanguageServerPool {
         }
 
         match response {
-            Ok(response) => parse_completion_resolve_response(response),
+            Ok(response) => {
+                let connections = self.connections().await;
+                let producer_is_live = connections.get(connection_key).is_some_and(|current| {
+                    Arc::ptr_eq(current, handle) && current.state() == ConnectionState::Ready
+                });
+                producer_is_live.then(|| parse_completion_resolve_response(response))?
+            }
             Err(e) => {
                 warn!(
                     target: "kakehashi::bridge",
@@ -491,7 +511,9 @@ fn resolve_guard_region_end(envelope: &KakehashiEnvelope, offset: &RegionOffset)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::bridge::ConnectionKey;
     use crate::lsp::bridge::envelope::ENVELOPE_KEY;
+    use crate::lsp::bridge::test_helpers::create_handle_with_key;
     use crate::lsp::bridge::text_document::completion::envelope_host_item;
     use serde_json::json;
     use tower_lsp_server::ls_types::CompletionItem;
@@ -514,6 +536,65 @@ mod tests {
             region_end: Some((9, 0)),
             host_layer: false,
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_response_rejects_a_retired_producer_after_send() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua-ls");
+        let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let upstream_id = UpstreamId::Number(77);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let handle = Arc::clone(&handle);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_completion_resolve_on_handle(
+                    &handle,
+                    CompletionItem {
+                        label: "old".into(),
+                        ..Default::default()
+                    },
+                    Some(upstream_id),
+                )
+                .await
+            })
+        };
+        let downstream_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = handle
+                    .router()
+                    .lookup_downstream_ids(&upstream_id)
+                    .into_iter()
+                    .next()
+                {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolve request must be admitted");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !handle.router().is_sent(downstream_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resolve request must be sent before retirement");
+
+        handle.begin_shutdown();
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0",
+            "id": downstream_id.as_i64(),
+            "result": { "label": "stale" }
+        }));
+
+        assert!(
+            request.await.unwrap().is_none(),
+            "a response from a no-longer-Ready completion producer must be discarded"
+        );
     }
 
     // ==========================================================================

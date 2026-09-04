@@ -14,7 +14,8 @@ pub(in crate::lsp::bridge) use crate::config::settings::BridgeServerConfig;
 
 use crate::lsp::bridge::actor::{ResponseRouter, spawn_reader_task};
 use crate::lsp::bridge::connection::AsyncBridgeConnection;
-use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionKey, ConnectionState};
+use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionKey, ConnectionState, UpstreamId};
+use crate::lsp::bridge::protocol::RequestId;
 
 // Test ULID constants - valid 26-char alphanumeric strings matching ULID format.
 // Using realistic ULIDs ensures tests reflect actual runtime behavior.
@@ -181,6 +182,63 @@ pub(in crate::lsp::bridge) async fn create_handle_resolving_inlay_hints(
         ..Default::default()
     });
     handle
+}
+
+pub(in crate::lsp::bridge) async fn create_handle_advertising_resolve_methods(
+    key: ConnectionKey,
+) -> Arc<ConnectionHandle> {
+    use tower_lsp_server::ls_types::{
+        CodeLensOptions, DocumentLinkOptions, InlayHintOptions, InlayHintServerCapabilities, OneOf,
+        ServerCapabilities,
+    };
+
+    let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+    handle.set_server_capabilities(ServerCapabilities {
+        code_lens_provider: Some(CodeLensOptions {
+            resolve_provider: Some(true),
+        }),
+        document_link_provider: Some(DocumentLinkOptions {
+            resolve_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        }),
+        inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+            InlayHintOptions {
+                resolve_provider: Some(true),
+                ..Default::default()
+            },
+        ))),
+        ..Default::default()
+    });
+    handle
+}
+
+pub(in crate::lsp::bridge) async fn wait_for_sent_request(
+    handle: &ConnectionHandle,
+    upstream_id: &UpstreamId,
+) -> RequestId {
+    let request_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let Some(id) = handle
+                .router()
+                .lookup_downstream_ids(upstream_id)
+                .into_iter()
+                .next()
+            {
+                break id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request must be admitted");
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !handle.router().is_sent(request_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request must be sent before producer retirement");
+    request_id
 }
 
 /// Like [`create_handle_with_key`], but also advertises `commands` as the
