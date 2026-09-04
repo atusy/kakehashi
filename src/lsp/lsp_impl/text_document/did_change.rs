@@ -106,7 +106,7 @@ impl Kakehashi {
         // A full-text sync (`edits` empty) forbids seeding and parses from
         // scratch (#348).
         let ticket = crate::lsp::current_writer_ticket();
-        self.documents.apply_edit_clearing_tree(&uri, text, &edits);
+        self.documents.apply_edit(&uri, text, &edits);
 
         // NOTE: We intentionally do NOT invalidate the semantic token cache here.
         // The cached tokens (with their result_id) are needed for delta calculations.
