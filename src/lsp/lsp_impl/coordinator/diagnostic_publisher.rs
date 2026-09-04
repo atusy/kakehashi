@@ -1588,7 +1588,7 @@ impl DiagnosticPublisher {
         let this = self.clone();
         let host = host.clone();
         tokio::spawn(async move {
-            let _claim = claim;
+            let claim = claim;
             let deadline = tokio::time::Instant::now() + REPUBLISH_RETRY_BUDGET;
             loop {
                 tokio::select! {
@@ -1615,6 +1615,10 @@ impl DiagnosticPublisher {
                         target: LOG_TARGET,
                         "retry republish for {host}: reload settled"
                     );
+                    // Release the slot BEFORE republishing: a reload
+                    // starting right now makes it defer again, and that
+                    // deferral must be able to claim the slot this waiter held.
+                    drop(claim);
                     let _ = this.republish(&host).await;
                     return;
                 }
@@ -1638,13 +1642,25 @@ impl DiagnosticPublisher {
         // region slots are present (every keystroke settle during a typing
         // burst) — the debug variant would re-grow the per-event
         // `language_detection` log volume PR #677 moved off hot paths.
-        // Stored language first: parser-aware detection answers "none" (or
-        // another loaded language) while the declared language is still
-        // publishing, and that is not "no regions".
-        let Some(language_name) = doc.language_id().map(str::to_string).or_else(|| {
-            self.language
-                .detect_language_trace(host.path(), snapshot.text(), None, None)
-        }) else {
+        // The settled parse names the language authoritatively (a reload
+        // that re-detects the document publishes the new language on the
+        // snapshot only); then the stored id; parser-aware detection last —
+        // it answers "none" (or another loaded language) while the declared
+        // language is still publishing, and that is not "no regions".
+        let settled_language = self.documents.latest_snapshot(host).and_then(|view| {
+            view.slot.snapshot.as_ref().and_then(|current| {
+                (current.parsed_version == view.content_version && current.tree.is_some())
+                    .then(|| current.language.clone())
+                    .flatten()
+            })
+        });
+        let Some(language_name) = settled_language
+            .or_else(|| doc.language_id().map(str::to_string))
+            .or_else(|| {
+                self.language
+                    .detect_language_trace(host.path(), snapshot.text(), None, None)
+            })
+        else {
             return Some(offsets);
         };
         // A language still publishing (queries land before the parser) has
