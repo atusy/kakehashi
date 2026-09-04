@@ -360,17 +360,16 @@ Any reader that must resolve against **live** positions is position-critical
   rarely fires (a parked request records the served version at settle); it
   remains for the backstop path and non-edit token changes. The `CancelToken`
   bail stays narrowed to reclaiming a superseded compute's CPU (§4).
-- **Serve-stale, passively refreshed** — whole-document, no-position reads:
-  `documentSymbol`, `documentColor`, plus the `whole_document_fan_out` family
-  (`documentLink`, `foldingRange`, `codeLens`), and pull-mode
-  `textDocument/diagnostic` (the `virt_enabled` branch that calls
-  `ensure_document_parsed`). `did_save`'s synthetic-diagnostic effect is likewise
-  passive (a notification, not a request — its *diagnostics* may trail a snapshot,
-  self-healing on republish). No server→client refresh exists for these and adding
-  one is out of scope; they serve the latest snapshot and self-correct on the
-  client's **next** request (re-requested on redraw/scroll, not held live). The
-  staleness window is one or more edits (unbounded under sustained typing) but
-  non-visual-jarring; this is the deliberate, user-sanctioned relaxation.
+- **Passively refreshed whole-document reads** — `documentSymbol` and pull-mode
+  `textDocument/diagnostic` may serve the latest stale snapshot. The
+  `whole_document_fan_out` family (`documentColor`, `documentLink`,
+  `foldingRange`, `codeLens`) instead waits up to 200 ms for a current snapshot
+  and contributes no virtual result if it remains stale, because its fallback
+  region resolution can mint tracker identities. `did_save`'s synthetic-diagnostic
+  effect is likewise passive (a notification, not a request — its diagnostics may
+  trail a snapshot, self-healing on republish). No server→client refresh exists
+  for these and adding one is out of scope; they self-correct on the client's
+  **next** request (re-requested on redraw/scroll, not held live).
 - **Staleness-reject** — every **position/range** reader, because its
   coordinates are authored against the **live** text: `semanticTokens/range`,
   `kakehashi/node/*`, `selectionRange`, `formatting`, `rangeFormatting`,
@@ -718,8 +717,8 @@ Two Stage-2 pieces remain deliberately open:
   of serving stale: a stale read must never mint, and currency remains the
   way to guarantee that until those readers consume snapshot-owned region
   identity instead of minting.
-- Several notification-path consumers (pull diagnostics, `did_save`,
-  `documentSymbol`/`documentColor`) still read the legacy store tree after the
+- Several notification-path consumers (pull diagnostics, `did_save`, and
+  `documentSymbol`) still read the legacy store tree after the
   bounded current-wait; they migrate to `latest_snapshot` with the Stage-3
   consolidation.
 

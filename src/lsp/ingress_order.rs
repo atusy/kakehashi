@@ -35,7 +35,7 @@
 //!   (#480) is therefore a liveness fix, not just a latency one; until then
 //!   the exposure is one-time, first open of an uninstalled parser.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
-//!   triple, the edit-producing formatting/rename requests, and pull
+//!   triple, the edit-producing formatting/rename/color-presentation requests, and pull
 //!   diagnostics) snapshot the current
 //!   tail ticket at `call` time and run only once that ticket is done, so a
 //!   request observes every edit that preceded it on the wire — without
@@ -361,6 +361,8 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/prepareRename"
         | "textDocument/codeAction"
         | "textDocument/inlayHint"
+        | "textDocument/documentColor"
+        | "textDocument/colorPresentation"
         | "textDocument/prepareCallHierarchy"
         | "textDocument/prepareTypeHierarchy"
         | "textDocument/diagnostic"
@@ -810,6 +812,8 @@ mod tests {
             "textDocument/prepareRename",
             "textDocument/codeAction",
             "textDocument/inlayHint",
+            "textDocument/documentColor",
+            "textDocument/colorPresentation",
             "textDocument/diagnostic",
             "kakehashi/captures/full",
             "kakehashi/captures/full/delta",
@@ -1076,6 +1080,70 @@ mod tests {
         assert!(reader.is_woken(), "writer completion must wake the reader");
         assert!(reader.poll().is_ready());
 
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["change", "reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_runs_color_presentation_only_after_preceding_change() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "textDocument/didChange",
+            release: Some(release_rx),
+        });
+
+        let writer_fut = gate.call(notification("textDocument/didChange", URI));
+        let presentation_fut = gate.call(notification("textDocument/colorPresentation", URI));
+        let mut writer = tokio_test::task::spawn(writer_fut);
+        let mut presentation = tokio_test::task::spawn(presentation_fut);
+
+        assert!(presentation.poll().is_pending());
+        assert!(
+            writer.poll().is_pending(),
+            "didChange stalls on the oneshot"
+        );
+        assert!(
+            presentation.poll().is_pending(),
+            "colorPresentation must remain behind the preceding didChange"
+        );
+
+        release_tx.send(()).expect("didChange is waiting");
+        assert!(writer.poll().is_ready());
+        assert!(presentation.is_woken());
+        assert!(presentation.poll().is_ready());
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["change", "reader"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_runs_document_color_only_after_preceding_change() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "textDocument/didChange",
+            release: Some(release_rx),
+        });
+
+        let writer_fut = gate.call(notification("textDocument/didChange", URI));
+        let color_fut = gate.call(notification("textDocument/documentColor", URI));
+        let mut writer = tokio_test::task::spawn(writer_fut);
+        let mut color = tokio_test::task::spawn(color_fut);
+
+        assert!(color.poll().is_pending());
+        assert!(writer.poll().is_pending());
+        assert!(color.poll().is_pending());
+
+        release_tx.send(()).expect("didChange is waiting");
+        assert!(writer.poll().is_ready());
+        assert!(color.is_woken());
+        assert!(color.poll().is_ready());
         assert_eq!(
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["change", "reader"]

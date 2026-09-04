@@ -1,6 +1,6 @@
 //! Shared fan-out for whole-document bridged requests.
 //!
-//! documentLink, foldingRange, and codeLens all follow the same shape: no
+//! documentLink, documentColor, foldingRange, and codeLens all follow the same shape: no
 //! position parameter, so the request fans out to every resolved bridge
 //! virtual document, uses the preferred strategy within each document, and
 //! concatenates those results. This module hosts that shape once; the per-method
@@ -281,6 +281,9 @@ impl Kakehashi {
             };
             let (cancel_rx, _cancel_guard) =
                 self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+            let incarnation = ctx.incarnation;
+            #[cfg(feature = "e2e")]
+            wait_for_host_admission_release().await;
             let pool = self.bridge.pool_arc();
             let fan_in = dispatch_host_preferred(
                 &ctx,
@@ -290,7 +293,7 @@ impl Kakehashi {
                     async move {
                         let raw = t
                             .pool
-                            .send_host_raw_request(
+                            .send_host_raw_request_for_incarnation(
                                 &t.server_name,
                                 &t.server_config,
                                 &HostDocument {
@@ -301,6 +304,7 @@ impl Kakehashi {
                                 method_name,
                                 params,
                                 t.upstream_id,
+                                incarnation,
                             )
                             .await?;
                         let Some(raw) = raw else {
@@ -341,6 +345,26 @@ impl Kakehashi {
             .await?;
 
         Ok(result.and_then(nonempty_whole_document_items))
+    }
+}
+
+#[cfg(feature = "e2e")]
+async fn wait_for_host_admission_release() {
+    let Ok(dir) = std::env::var("KAKEHASHI_E2E_WHOLE_DOCUMENT_HOST_BARRIER_DIR") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir);
+    if std::fs::create_dir_all(dir).is_err()
+        || std::fs::write(dir.join("captured"), b"captured").is_err()
+    {
+        return;
+    }
+    let release = dir.join("release");
+    for _ in 0..300 {
+        if release.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 

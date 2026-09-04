@@ -38,15 +38,16 @@ Partially implemented:
   documentLink use the shared whole-document winner hook. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
-  inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
+  inlayHint, documentSymbol, documentLink, documentColor, colorPresentation,
+  foldingRange, codeLens,
   prepareCallHierarchy, incomingCalls, outgoingCalls, prepareTypeHierarchy,
   supertypes, subtypes,
   formatting, and rangeFormatting (which shares the formatting layer key).
   Diagnostics are covered with real cross-layer `concatenated` (the
   cross-layer-aggregation diagnostics phase): pull and synthetic push both
   merge host-server pulls (real URI) with the virt regions' results per the
-  layer strategy. Not covered: semantic tokens (native-only) and the experimental
-  documentColor/colorPresentation pair. `completionItem/resolve` routes by
+  layer strategy. Not covered: semantic tokens (native-only).
+  `completionItem/resolve` routes by
   the envelope stamped into `CompletionItem.data`; the host layer stamps one
   too (marked `host_layer`, so the resolve forwards VERBATIM — no coordinate
   translation and no injection-region edit guard). Both layers mint under

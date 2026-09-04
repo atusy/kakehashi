@@ -20,8 +20,8 @@ Phased roadmap:
    `resolve_layer_config_from_settings` directly (it already holds a loaded
    settings arc), keyed `textDocument/publishDiagnostics` to match its
    aggregation config. With host bridging (host-document-bridge)
-   implemented for the bridged request methods (documented exceptions:
-   document color is virt-only), handlers run the real
+   implemented for the bridged request methods (semantic tokens remain
+   native-only), handlers run the real
    stage-2 `preferred` walk (`Kakehashi::walk_layers` →
    `race_layers_preferred`): the virt and host layers fan out
    **concurrently** — the layer-level analogue of the stage-1 `preferred`
@@ -93,6 +93,12 @@ Phased roadmap:
    are collapsed to the first occurrence
    (`resolve_preferred_collision`); `preferred` returns the first non-empty
    layer instead.
+6. **List result aggregation** — ✅ implemented for the whole-document
+   `documentColor`, `documentLink`, `foldingRange`, and `codeLens` methods,
+   plus range-based `colorPresentation`. Their default remains `preferred`;
+   an explicit `concatenated` appends non-empty layer results in configured
+   priority order. `colorPresentation` has no producer envelope in the LSP
+   item, so its follow-up routing is determined by the supplied range.
 
 ## Context
 
@@ -162,7 +168,7 @@ priorities = ["virt", "host", "native"]   # innermost-first; mirrors "deeper win
 # enabled flags decide whether a bridge target exists at all.
 # strategy: per-method default (concatenated for diagnostics, codeAction,
 # and formatting; otherwise preferred). List-shaped whole-document methods
-# such as documentLink/foldingRange/codeLens can opt into concatenated.
+# and colorPresentation can opt into concatenated.
 
 # ---- User: markdown hover should prefer the host LS, and drop native ----
 [languages.markdown.layers.aggregation."textDocument/hover"]

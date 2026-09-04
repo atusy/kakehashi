@@ -83,6 +83,8 @@
 //! - `document-link-slow-host` / `document-link-slow-virt` — like
 //!   `document-link`, but sleeps before answering and records request-start
 //!   and downstream `$/cancelRequest` markers under `MOCK_LSP_CANCEL_DIR`.
+//! - `document-color` — advertises `colorProvider`, returns one red color for
+//!   every open document, and presents it as `#ff0000`.
 //! - `diagnostics` — advertises `diagnosticProvider`; answers
 //!   `textDocument/diagnostic` with a full report carrying one diagnostic
 //!   that echoes the requested URI, but only for documents it received via
@@ -278,6 +280,14 @@ fn main() {
                     "document-link-no-resolve-reserved-data"
                     | "document-link-no-resolve-plain-data" => json!({
                         "documentLinkProvider": { "resolveProvider": false },
+                        "textDocumentSync": 1
+                    }),
+                    "document-color"
+                    | "document-color-host"
+                    | "document-color-virt"
+                    | "document-color-empty-presentation"
+                    | "document-color-slow-presentation" => json!({
+                        "colorProvider": true,
                         "textDocumentSync": 1
                     }),
                     "inlay-hint-resolve"
@@ -1523,6 +1533,57 @@ fn main() {
                         json!([link])
                     })
                     .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "textDocument/documentColor" => {
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|_| {
+                        json!([{
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 4 }
+                            },
+                            "color": {
+                                "red": 1.0,
+                                "green": 0.0,
+                                "blue": 0.0,
+                                "alpha": 1.0
+                            }
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "textDocument/colorPresentation" => {
+                if mode == "document-color-slow-presentation" {
+                    record_mock_event(&mode, "request", &message);
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+                let range = message.pointer("/params/range").cloned();
+                let result = if mode == "document-color-empty-presentation" {
+                    json!([])
+                } else {
+                    let (label, new_text) = if mode == "document-color-virt" {
+                        ("virt-color", "#00ff00")
+                    } else {
+                        ("host-color", "#ff0000")
+                    };
+                    message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .filter(|uri| documents.contains_key(*uri))
+                        .and(range)
+                        .map(|range| {
+                            json!([{
+                                "label": label,
+                                "textEdit": { "range": range, "newText": new_text }
+                            }])
+                        })
+                        .unwrap_or(Value::Null)
+                };
                 respond(&mut writer, id, result);
             }
             "documentLink/resolve" => {

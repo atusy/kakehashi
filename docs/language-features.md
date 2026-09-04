@@ -106,9 +106,8 @@ embedded blocks. Works for any grammar, no setup required.
 ## Bridged features
 
 The features below are served by a language server configured for the
-embedded language — most of them also on the surrounding document itself,
-by a `bridge._self` host server (document color is the exception and stays
-injection-only).
+embedded language — also on the surrounding document itself where a
+`bridge._self` host server is configured.
 Placing the cursor outside an embedded
 code block yields no result from the injection bridges; with `bridge._self`
 configured, the host language's own servers still answer there.
@@ -364,6 +363,14 @@ external-file URIs and their coordinate spaces are preserved.
 and [`textDocument/colorPresentation`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_colorPresentation)
 
 Shows color swatches and color picker presentations for embedded blocks.
+Document colors can also combine embedded and host-language server results;
+set `layers.aggregation."textDocument/documentColor".strategy = "concatenated"`
+to retain both layers. Presentation routing is range-based because the LSP
+color item carries no producer identity: outside an injection the host server
+receives the real URI, range, and edits unchanged; inside an injection the
+default `virt → host` preference can select the virtual server even for a
+host-produced color. Configure `textDocument/colorPresentation` as
+`concatenated` to retain answers from both layers in that ambiguous case.
 Presentations whose primary edit (explicit, or the implicit label replacement)
 would corrupt the host document around the embedded block are dropped
 fail-closed; unsafe additional edits are dropped as one atomic set while the
