@@ -298,12 +298,10 @@ Lazy actions resolve back to their origin server (`codeAction/resolve`) —
 client-driven resolve routing additionally requires the client to declare
 `dataSupport` and `resolveSupport` covering `"edit"`; without those,
 injection-layer lazy actions are eagerly resolved by the bridge and
-host-layer ones are disabled or dropped. (Known limitation: CLIENT-driven
-resolve of lazy actions in runtime-range-adjusted regions (`#offset!` /
-`#trim!`) such as bundled
-YAML/TOML frontmatter always fails soft — the resolve freshness check cannot
-match there; the eager-resolve path taken for non-envelope clients bypasses
-that check.)
+host-layer ones are disabled or dropped. Runtime-range-adjusted regions
+(`#offset!` / `#trim!`, such as bundled YAML/TOML frontmatter) resolve like
+any other: the freshness check rebuilds the same adjusted geometry the
+action was minted from.
 Command-carrying actions execute through the bridged
 `workspace/executeCommand`. A resolve is refused, and the action returned
 unchanged, when the host document was edited (even a same-size edit inside
