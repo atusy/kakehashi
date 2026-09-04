@@ -364,6 +364,41 @@ impl Document {
 mod tests {
     use super::*;
 
+    fn rust_tree(text: &str) -> Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        parser.parse(text, None).unwrap()
+    }
+
+    /// A tree reaches readers only through a published, current snapshot:
+    /// the document has no tree of its own.
+    #[test]
+    fn a_published_current_snapshot_is_the_readers_tree() {
+        let text = "fn main() {}";
+        let doc = Document::with_language(text.to_string(), "rust".to_string(), 7);
+        assert!(doc.tree().is_none(), "unparsed: no tree");
+        let tree = rust_tree(text);
+        assert!(doc.publish_snapshot(Arc::new(ParseSnapshot {
+            text: doc.text_arc(),
+            tree: Some(tree.clone()),
+            language: Some("rust".to_string()),
+            parsed_version: doc.content_version(),
+            incarnation: 7,
+            injection_regions: None,
+            bridge_regions: None,
+            resolved_regions: None,
+            layer_trees: std::sync::OnceLock::new(),
+        })));
+        assert_eq!(
+            doc.tree().map(|t| t.root_node().id()),
+            Some(tree.root_node().id()),
+            "the published snapshot's tree is the document's tree"
+        );
+        assert!(doc.snapshot().is_some());
+    }
+
     #[test]
     fn test_document_creation() {
         let doc = Document::new("hello world".to_string(), 0);
