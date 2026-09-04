@@ -23,7 +23,7 @@ use serde_json::Value;
 use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
-use crate::lsp::bridge::envelope::{ENVELOPE_KEY, wrap_envelope};
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, HostRevision, wrap_envelope};
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionDisabled, CodeActionOrCommand, CodeActionParams,
     CodeActionResponse, DocumentChangeOperation, DocumentChanges, NumberOrString,
@@ -72,6 +72,11 @@ pub(crate) struct CodeActionEnvelope {
     pub(crate) original_title: String,
     /// The downstream server's original `data` value (preserved verbatim).
     pub(crate) inner: Option<Value>,
+    /// Text revision (mutation count since open) the action was computed
+    /// against; a resolve refuses an action whose document has moved past
+    /// it. Missing for legacy data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) content_version: Option<u64>,
     /// Host open incarnation that produced this action. Missing for legacy data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) incarnation: Option<u64>,
@@ -108,6 +113,7 @@ pub(crate) struct CodeActionEnvelopeContext<'a> {
     injection_language: &'a str,
     offset: &'a RegionOffset,
     incarnation: Option<u64>,
+    content_version: Option<u64>,
 }
 
 /// Wrap `action.data` in a Kakehashi envelope for origin tracking, capturing
@@ -127,6 +133,7 @@ fn envelope_action_data(action: &mut CodeAction, ctx: &CodeActionEnvelopeContext
         offset: EnvelopeOffset::from(ctx.offset),
         original_title: action.title.clone(),
         inner: None,
+        content_version: ctx.content_version,
         incarnation: ctx.incarnation,
         host_layer: false,
     };
@@ -142,7 +149,7 @@ fn envelope_host_action(
     action: &mut CodeAction,
     server_name: &str,
     host_uri: &str,
-    incarnation: Option<u64>,
+    revision: Option<HostRevision>,
 ) {
     let inner = action.data.take();
     let envelope = CodeActionEnvelope {
@@ -158,7 +165,8 @@ fn envelope_host_action(
         },
         original_title: action.title.clone(),
         inner: None,
-        incarnation,
+        content_version: revision.map(|r| r.content_version),
+        incarnation: revision.map(|r| r.incarnation),
         host_layer: true,
     };
     action.data = Some(wrap_envelope(&envelope, inner));
@@ -201,6 +209,7 @@ fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
             offset: envelope.offset.clone(),
             original_title: envelope.original_title.clone(),
             inner: None,
+            content_version: envelope.content_version,
             incarnation: envelope.incarnation,
             host_layer: envelope.host_layer,
         },
@@ -436,6 +445,7 @@ impl LanguageServerPool {
         region_end: Position,
         offset: RegionOffset,
         virtual_content: &str,
+        content_version: u64,
         upstream_request_id: Option<UpstreamId>,
         client_progress_token: Option<NumberOrString>,
         upstream_caps: UpstreamCodeActionCaps,
@@ -517,6 +527,7 @@ impl LanguageServerPool {
             host_uri_string: host_uri.as_str(),
             server_name,
             incarnation: host_incarnation,
+            content_version: Some(content_version),
         };
         Ok(Some(bridge_code_actions(
             actions,
@@ -1283,6 +1294,7 @@ pub(crate) struct VirtLayerContext<'a> {
     host_uri_string: &'a str,
     server_name: &'a str,
     incarnation: Option<u64>,
+    content_version: Option<u64>,
 }
 
 impl VirtLayerContext<'_> {
@@ -1294,6 +1306,7 @@ impl VirtLayerContext<'_> {
             injection_language: self.injection_language,
             offset: self.offset,
             incarnation: self.incarnation,
+            content_version: self.content_version,
         }
     }
 }
@@ -1338,7 +1351,7 @@ pub(crate) fn bridge_code_actions(
     upstream_caps: UpstreamCodeActionCaps,
     server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
-    host_incarnation: Option<u64>,
+    host_revision: Option<HostRevision>,
 ) -> Vec<CodeActionOrCommand> {
     actions
         .into_iter()
@@ -1350,7 +1363,7 @@ pub(crate) fn bridge_code_actions(
                 upstream_caps,
                 server_resolves,
                 virt,
-                host_incarnation,
+                host_revision,
             )
         })
         .collect()
@@ -1369,7 +1382,7 @@ fn bridge_code_action(
     upstream_caps: UpstreamCodeActionCaps,
     server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
-    host_incarnation: Option<u64>,
+    host_revision: Option<HostRevision>,
 ) -> Option<CodeActionOrCommand> {
     // The key's server IS the config server name the envelope and titles use;
     // deriving it here keeps one source of truth for the origin.
@@ -1506,7 +1519,7 @@ fn bridge_code_action(
                 // (host coordinates, no translation — #627). Otherwise it can
                 // never be completed here, so disable it.
                 if virt.is_none() && server_resolves && upstream_caps.can_envelope() {
-                    envelope_host_action(&mut action, server_name, host_uri, host_incarnation);
+                    envelope_host_action(&mut action, server_name, host_uri, host_revision);
                     action.title = suffix_title(action.title, server_name);
                     return Some(CodeActionOrCommand::CodeAction(action));
                 }
@@ -1962,6 +1975,7 @@ mod tests {
             host_uri_string: "file:///test.md",
             server_name: "ruff",
             incarnation: Some(1),
+            content_version: Some(0),
         };
         Some(bridge_code_actions(
             actions,
@@ -2406,7 +2420,10 @@ mod tests {
             caps_resolve(),
             true, // host server advertises codeAction/resolve
             None, // host layer
-            Some(1),
+            Some(HostRevision {
+                incarnation: 1,
+                content_version: 0,
+            }),
         );
         assert_eq!(bridged.len(), 1);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
@@ -2733,6 +2750,7 @@ mod tests {
             injection_language: "lua",
             offset,
             incarnation: Some(1),
+            content_version: None,
         }
     }
 

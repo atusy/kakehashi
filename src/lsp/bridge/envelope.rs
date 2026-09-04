@@ -9,6 +9,15 @@ use serde_json::Value;
 /// Wrapper key inside an item's `data` that marks kakehashi routing metadata.
 pub(crate) const ENVELOPE_KEY: &str = "kakehashi";
 
+/// The document lifetime and text revision a host-layer item was computed
+/// under, read with the text it was computed from. Both ride in the item's
+/// envelope so a resolve can refuse an item the document has moved past.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HostRevision {
+    pub(crate) incarnation: u64,
+    pub(crate) content_version: u64,
+}
+
 /// Serialize an envelope into `{"kakehashi": {…}}`, MOVING the item's own
 /// `data` into `inner`.
 ///
