@@ -306,14 +306,20 @@ impl InjectionCoordinator {
         // lands once the language is in place run this pass for real.
         let Some(injections) = self.resolve_injection_data(uri, &host_language) else {
             // Nothing else re-runs this pass for a document whose sole parse
-            // overlapped the window (an injected language's auto-install
-            // reload does not reparse hosts), so arrange the retry here.
-            self.retry_injection_pass_when_settled(
-                uri,
-                &host_language,
-                forward_did_change,
-                incarnation,
-            );
+            // overlapped a publication or reload window (an injected
+            // language's auto-install reload does not reparse hosts), so
+            // arrange the retry here — for THAT cause only. A document that
+            // is tree-less under a settled language gets a tree from its own
+            // next parse or never; retrying it would re-schedule itself on
+            // every attempt.
+            if self.language_is_unsettled(&host_language) {
+                self.retry_injection_pass_when_settled(
+                    uri,
+                    &host_language,
+                    forward_did_change,
+                    incarnation,
+                );
+            }
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
             return true;
         };
@@ -554,6 +560,17 @@ impl InjectionCoordinator {
     fn get_language_for_document(&self, uri: &Url) -> Option<String> {
         detect_document_language(&self.language, &self.documents, uri)
     }
+    /// Whether `language`'s parser is not published yet or a reload is in
+    /// progress — the two transient reasons a resolution cannot look.
+    fn language_is_unsettled(&self, language: &str) -> bool {
+        let reloading = self
+            .parser_pool
+            .lock()
+            .recover_poison("InjectionCoordinator::language_is_unsettled")
+            .reload_in_progress();
+        reloading || !self.language.has_parser_available(language)
+    }
+
     /// Re-run the tree-derived downstream pass for `uri` once the language's
     /// publication or reload has settled, bounded (`INJECTION_RETRY_BUDGET`):
     /// a pass that answered "could not look" opened nothing, and without an
@@ -576,12 +593,7 @@ impl InjectionCoordinator {
             let deadline = tokio::time::Instant::now() + INJECTION_RETRY_BUDGET;
             loop {
                 tokio::time::sleep(INJECTION_RETRY_POLL).await;
-                let reloading = this
-                    .parser_pool
-                    .lock()
-                    .recover_poison("InjectionCoordinator::retry_injection_pass_when_settled")
-                    .reload_in_progress();
-                if !reloading && this.language.has_parser_available(&host_language) {
+                if !this.language_is_unsettled(&host_language) {
                     log::debug!(
                         target: "kakehashi::bridge",
                         "Re-running the injection pass for {uri}: {host_language} has settled"
