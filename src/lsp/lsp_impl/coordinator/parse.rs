@@ -694,7 +694,7 @@ impl ParseCoordinator {
             let Some(doc) = self.documents.get(&uri) else {
                 return;
             };
-            if doc.tree().is_some() {
+            if doc.has_current_tree() {
                 return;
             }
             if required_incarnation.is_some_and(|required| doc.incarnation() != required) {
@@ -741,7 +741,7 @@ impl ParseCoordinator {
                 let Some(doc) = self.documents.get(&uri) else {
                     break;
                 };
-                if doc.tree().is_some() {
+                if doc.has_current_tree() {
                     break;
                 }
                 if doc.incarnation() != expected_incarnation {

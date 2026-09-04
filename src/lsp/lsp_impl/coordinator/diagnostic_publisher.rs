@@ -421,7 +421,7 @@ impl DiagnosticPublisher {
                 if self
                     .documents
                     .get(&uri)
-                    .is_some_and(|doc| doc.snapshot().is_none())
+                    .is_some_and(|doc| !doc.has_current_tree())
                 {
                     summary.coverage_incomplete = true;
                 }
