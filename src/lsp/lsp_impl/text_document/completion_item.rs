@@ -40,7 +40,7 @@ impl Kakehashi {
         // — it guards against accidental bypass, and the host path fails soft.
         if let Some(envelope) = extract_envelope(&params)
             && !envelope.is_host_layer()
-            && !self.completion_envelope_is_fresh(&envelope)
+            && !self.completion_envelope_is_fresh(&envelope).await
         {
             return Ok(params);
         }
@@ -74,10 +74,14 @@ impl Kakehashi {
         }
     }
 
-    fn completion_envelope_is_fresh(&self, envelope: &KakehashiEnvelope) -> bool {
+    async fn completion_envelope_is_fresh(&self, envelope: &KakehashiEnvelope) -> bool {
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             return false;
         };
+        // A resolve issued while the post-edit reparse is still running would
+        // find no snapshot and read as a stale region; wait for the current
+        // parse the way the request handlers do before their preamble.
+        self.ensure_document_parsed(&host_url).await;
         let Some((offset, region_end, contiguous, _)) = resolve_region_offset(
             &self.documents,
             &self.language,

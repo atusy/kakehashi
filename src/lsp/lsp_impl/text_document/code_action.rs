@@ -187,7 +187,7 @@ impl Kakehashi {
         let region_end = if envelope.is_host_layer() {
             Position::default()
         } else {
-            match self.code_action_region_end_if_fresh(&envelope) {
+            match self.code_action_region_end_if_fresh(&envelope).await {
                 Ok(region_end) => region_end,
                 Err(RegionEndUnavailable::MalformedEnvelope) => {
                     // Already warned with the malformed field; no stale-debug.
@@ -264,7 +264,7 @@ impl Kakehashi {
     /// directives exactly as minting did, so a region under one of them
     /// (markdown frontmatter, blockquote prose) compares equal while unchanged
     /// and its actions resolve.
-    fn code_action_region_end_if_fresh(
+    async fn code_action_region_end_if_fresh(
         &self,
         envelope: &CodeActionEnvelope,
     ) -> std::result::Result<Position, RegionEndUnavailable> {
@@ -288,6 +288,10 @@ impl Kakehashi {
             );
             return Err(RegionEndUnavailable::MalformedEnvelope);
         }
+        // A resolve issued while the post-edit reparse is still running would
+        // find no snapshot and read as a stale region; wait for the current
+        // parse the way the request handlers do before their preamble.
+        self.ensure_document_parsed(&host_url).await;
         self.code_action_region_end_live(envelope, &host_url)
             .ok_or(RegionEndUnavailable::Stale)
     }

@@ -45,6 +45,10 @@ impl Kakehashi {
     /// and inlay hint need the region end and contiguity as well, so they
     /// call [`resolve_region_offset`] directly and compare the same offset.
     ///
+    /// The document is awaited to its current parse first: `didChange` clears
+    /// the tree and reparses off-ingress, and a resolve issued in that window
+    /// would otherwise find no snapshot and report the region stale.
+    ///
     /// Contiguity is deliberately NOT required here. A non-contiguous
     /// combined region masks its host gaps with whitespace, so its line
     /// geometry — and therefore range translation — stays valid; only
@@ -52,7 +56,7 @@ impl Kakehashi {
     /// (`method_requires_contiguous_injection`), and code lenses and document
     /// links are minted for them on purpose. Refusing to resolve what was
     /// deliberately produced would leave those items permanently unresolved.
-    pub(super) fn region_offset_is_fresh(
+    pub(super) async fn region_offset_is_fresh(
         &self,
         host_uri: &str,
         region_id: &str,
@@ -61,6 +65,7 @@ impl Kakehashi {
         let Ok(host_url) = Url::parse(host_uri) else {
             return false;
         };
+        self.ensure_document_parsed(&host_url).await;
         resolve_region_offset(
             &self.documents,
             &self.language,

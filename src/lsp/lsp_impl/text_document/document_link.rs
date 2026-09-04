@@ -59,11 +59,9 @@ impl Kakehashi {
             return Ok(link);
         };
         if !envelope.is_host_layer()
-            && !self.region_offset_is_fresh(
-                &envelope.host_uri,
-                &envelope.region_id,
-                &envelope.offset,
-            )
+            && !self
+                .region_offset_is_fresh(&envelope.host_uri, &envelope.region_id, &envelope.offset)
+                .await
         {
             return Ok(link);
         }
