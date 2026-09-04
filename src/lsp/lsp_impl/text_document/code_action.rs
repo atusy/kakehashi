@@ -558,6 +558,7 @@ impl Kakehashi {
                             uri: &t.uri,
                             language_id: &t.language_id,
                             text: &t.text,
+                            revision: Some(host_revision),
                         },
                         METHOD,
                         params,

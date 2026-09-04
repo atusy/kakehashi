@@ -499,6 +499,7 @@ impl LanguageServerPool {
             uri: host_uri,
             language_id,
             text,
+            revision: None,
         };
         if let Err(e) = super::host::sync_host_document(
             &mut sender,

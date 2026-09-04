@@ -1712,6 +1712,7 @@ print("hello")
             uri: &uri,
             language_id: "lua",
             text,
+            revision: None,
         };
         let result = timeout(Duration::from_secs(1), server.bridge.pool().send_host_raw_request(
             "rust_ls", &settings.language_servers["rust_ls"], &stale,

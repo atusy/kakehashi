@@ -69,6 +69,10 @@ impl Kakehashi {
         // under the reopened document's incarnation, and a reopened document
         // restarts its content version, so both stamps could pass.
         let (expected_incarnation, content_version) = (ctx.incarnation, ctx.content_version);
+        let revision = crate::lsp::bridge::HostRevision {
+            incarnation: expected_incarnation,
+            content_version,
+        };
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
         let fan_in = dispatch_host_preferred(
@@ -86,6 +90,7 @@ impl Kakehashi {
                                 uri: &t.uri,
                                 language_id: &t.language_id,
                                 text: &t.text,
+                                revision: Some(revision),
                             },
                             METHOD,
                             params,

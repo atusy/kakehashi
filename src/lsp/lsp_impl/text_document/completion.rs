@@ -80,6 +80,10 @@ impl Kakehashi {
         // racing the request would otherwise answer for the closed text under
         // the reopened document's incarnation.
         let expected_incarnation = ctx.incarnation;
+        let revision = crate::lsp::bridge::HostRevision {
+            incarnation: expected_incarnation,
+            content_version: ctx.content_version,
+        };
         let pool = self.bridge.pool_arc();
         let f = move |t: HostFanOutTask| {
             let params = raw_params.clone();
@@ -93,6 +97,7 @@ impl Kakehashi {
                             uri: &t.uri,
                             language_id: &t.language_id,
                             text: &t.text,
+                            revision: Some(revision),
                         },
                         METHOD,
                         params,
