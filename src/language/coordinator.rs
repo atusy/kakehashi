@@ -1550,6 +1550,15 @@ impl LanguageCoordinator {
         config: &LanguageSettings,
         search_paths: &[PathBuf],
     ) -> LanguageLoadResult {
+        // One critical section from query removal through parser
+        // registration, like `publish_dynamic_language`: a same-generation
+        // dynamic load of this language would otherwise slip its queries in
+        // between the configured queries and the configured parser, leaving
+        // the registry with a configured parser over dynamic queries.
+        let _registration = self
+            .registration_lock
+            .lock()
+            .recover_poison("LanguageCoordinator::load_single_language");
         let generation = self
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1611,7 +1620,7 @@ impl LanguageCoordinator {
             ) {
                 Ok(lang) => lang,
                 Err(result) => {
-                    self.record_configured_load_failure(lang_name, generation);
+                    self.record_configured_load_failure_locked(lang_name, generation);
                     self.record_failed_load(lang_name, generation);
                     return result;
                 }
@@ -1622,7 +1631,7 @@ impl LanguageCoordinator {
         // its queries.
         let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
         if !pre_registered_is_builtin {
-            self.register_configured_language(lang_name, language.clone());
+            self.register_configured_language_locked(lang_name, language.clone());
         }
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
@@ -1636,6 +1645,12 @@ impl LanguageCoordinator {
             .registration_lock
             .lock()
             .recover_poison("LanguageCoordinator::register_configured_language");
+        self.register_configured_language_locked(language_id, language);
+    }
+
+    /// [`register_configured_language`](Self::register_configured_language)
+    /// for a caller already holding `registration_lock`.
+    fn register_configured_language_locked(&self, language_id: &str, language: Language) {
         self.language_registry
             .register(language_id.to_string(), language);
         self.configured_load_failures.remove(language_id);
@@ -1651,6 +1666,12 @@ impl LanguageCoordinator {
             .registration_lock
             .lock()
             .recover_poison("LanguageCoordinator::record_configured_load_failure");
+        self.record_configured_load_failure_locked(language_id, generation);
+    }
+
+    /// [`record_configured_load_failure`](Self::record_configured_load_failure)
+    /// for a caller already holding `registration_lock`.
+    fn record_configured_load_failure_locked(&self, language_id: &str, generation: u64) {
         self.configured_load_failures
             .insert(language_id.to_string(), generation);
         self.language_registry.unregister(language_id);
