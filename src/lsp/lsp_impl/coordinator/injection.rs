@@ -175,11 +175,12 @@ impl InjectionCoordinator {
             return Some(Vec::new());
         };
         let Some(tree) = doc.tree().cloned() else {
-            // No tree although a parser is published: a reload placeholder
+            // No tree: with the parser published, a reload placeholder
             // (`Document::invalidate_parse`, version-current and tree-less) or
-            // a parse that yielded nothing — either way the document could not
-            // be looked at. No parser: nothing will ever be parsed here.
-            return (!parser_published).then(Vec::new);
+            // a parse that yielded nothing; without it, a publication still
+            // in progress (the query above arrived first). Either way the
+            // document could not be looked at.
+            return None;
         };
         let text = doc.text_arc();
         let incarnation = doc.incarnation();
@@ -993,11 +994,11 @@ mod tests {
     }
 
     /// A reload publishes a version-current placeholder with no tree while
-    /// the replacement parse is still queued. With a parser published, such a
-    /// document could not be looked at; without one no tree will ever come,
-    /// and the reading is genuinely empty.
+    /// the replacement parse is still queued, and a language publishes its
+    /// queries before its parser. A tree-less document could not be looked
+    /// at in either state.
     #[tokio::test]
-    async fn tree_less_document_is_undeterminable_only_while_a_parser_exists() {
+    async fn tree_less_document_is_undeterminable() {
         let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
         let server = service.inner();
         let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
@@ -1022,10 +1023,8 @@ mod tests {
         let injection = server.injection_coordinator();
 
         assert!(
-            injection
-                .resolve_injection_data(&uri, "rust")
-                .is_some_and(|regions| regions.is_empty()),
-            "without a parser nothing will ever be parsed: read as empty"
+            injection.resolve_injection_data(&uri, "rust").is_none(),
+            "query published, parser not yet: the publication is in progress"
         );
 
         server
