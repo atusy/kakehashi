@@ -195,19 +195,37 @@ impl InjectionCoordinator {
             return settled().then(Vec::new);
         };
 
-        let Some(doc) = self.documents.get(uri) else {
+        // Tree, text, language and lifetime from ONE current snapshot: the
+        // legacy document's tree can already be a replacement parse's while
+        // the current snapshot (and the language the caller screened) is
+        // still the previous one, and running one language's query against
+        // the other's tree would answer empty as if it had looked.
+        let Some(view) = self.documents.latest_snapshot(uri) else {
             return Some(Vec::new());
         };
-        let Some(tree) = doc.tree().cloned() else {
+        let Some(snapshot) = view
+            .slot
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.parsed_version == view.content_version)
+        else {
+            // Trailing or never parsed: could not look.
+            return None;
+        };
+        let Some(tree) = snapshot.tree.clone() else {
             // No tree under a published parser: a reload placeholder
             // (`Document::invalidate_parse`, version-current and tree-less) or
             // a parse that yielded nothing. The document could not be looked
             // at.
             return None;
         };
-        let text = doc.text_arc();
-        let incarnation = doc.incarnation();
-        drop(doc);
+        if snapshot.language.as_deref() != Some(host_language) {
+            // The tree belongs to another language than the one asked about
+            // (a re-detection between the caller's screen and this read).
+            return None;
+        }
+        let text = std::sync::Arc::clone(&snapshot.text);
+        let incarnation = snapshot.incarnation;
 
         let Some(regions) =
             collect_all_injections(&tree.root_node(), &text, Some(injection_query.as_ref()))
@@ -1098,6 +1116,39 @@ mod tests {
         );
     }
 
+    /// Publish `tree` as `uri`'s current parse snapshot under `language`,
+    /// the way a settled parse would.
+    fn publish_test_snapshot(
+        server: &crate::lsp::lsp_impl::Kakehashi,
+        uri: &Url,
+        text: &str,
+        tree: tree_sitter::Tree,
+        language: &str,
+    ) {
+        let content_version = server.documents.get(uri).unwrap().content_version();
+        let incarnation = server.documents.get(uri).unwrap().incarnation();
+        let landed = server
+            .documents
+            .get(uri)
+            .map(|doc| {
+                doc.publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: Some(tree),
+                        language: Some(language.to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test publish must land");
+    }
+
     /// The snapshot fast path of `resolve_injection_data` must produce
     /// exactly what the inline (live-tree) resolution produces — the fast
     /// path's output is forwarded verbatim to downstream servers, so a
@@ -1335,7 +1386,8 @@ mod tests {
             .insert(uri.clone(), text.to_string(), Some("rust".into()), None);
         server
             .documents
-            .update_document(uri.clone(), text.to_string(), Some(tree));
+            .update_document(uri.clone(), text.to_string(), Some(tree.clone()));
+        publish_test_snapshot(server, &uri, text, tree, "rust");
         let injection = server.injection_coordinator();
 
         assert!(
@@ -1385,6 +1437,13 @@ mod tests {
             )
             .expect("current pass populates");
         let bridge_regions = populated.bridge_regions.expect("gate was true");
+        // A new revision, so the fast-path snapshot below is admitted (a
+        // second publish at the same revision is refused).
+        server.documents.update_document(
+            uri.clone(),
+            text.to_string(),
+            Some(parser.parse(text, None).expect("parse rust")),
+        );
         let content_version = server.documents.get(&uri).unwrap().content_version();
         let incarnation = server.documents.get(&uri).unwrap().incarnation();
         let landed = server
@@ -1394,7 +1453,9 @@ mod tests {
                 doc.publish_snapshot(std::sync::Arc::new(
                     crate::document::snapshot::ParseSnapshot {
                         text: std::sync::Arc::from(text),
-                        tree: None,
+                        // With a tree: a tree-less snapshot would not be
+                        // admitted over the tree-bearing one already current.
+                        tree: Some(parser.parse(text, None).expect("parse rust")),
                         language: Some("rust".to_string()),
                         parsed_version: content_version,
                         incarnation,
@@ -1505,7 +1566,8 @@ mod tests {
             .insert(uri.clone(), text.to_string(), Some("rust".into()), None);
         server
             .documents
-            .update_document(uri.clone(), text.to_string(), Some(tree));
+            .update_document(uri.clone(), text.to_string(), Some(tree.clone()));
+        publish_test_snapshot(server, &uri, text, tree, "rust");
         let injection = server.injection_coordinator();
 
         assert!(
