@@ -506,7 +506,7 @@ impl ParseCoordinator {
             // This is the document-open parse: there is no prior tree to seed an
             // incremental parse from, so it is always a full parse. (The off-ingress
             // edit reparse — `reparse_latest` — is the incremental path, seeded from
-            // `Document::pending_seed`.) A full parse is also the only safe option
+            // `Document::incremental_seed`.) A full parse is also the only safe option
             // without an edited old tree: reusing an unedited tree against different
             // text violates tree-sitter's incremental contract and corrupts external
             // scanners (#348).
@@ -868,11 +868,12 @@ impl ParseCoordinator {
     /// Re-parse `uri`'s **latest** store text off the ingress path, for the
     /// per-document parse scheduler (`Kakehashi::schedule_reparse`).
     ///
-    /// `did_change` clears the reader-visible tree synchronously and schedules this;
-    /// it runs in a spawned loop, *not* on the writer ticket. When the edit stashed a
-    /// `pending_seed` (the pre-edit tree with this edit's `InputEdit`s applied) the
-    /// parse is **incremental**, seeded from it; a full-text sync stashes no seed and
-    /// parses from scratch (which keeps #348 closed). The tree write is the
+    /// `did_change` bumps the content version synchronously (which makes the
+    /// published tree stale for readers) and schedules this; it runs in a spawned
+    /// loop, *not* on the writer ticket. When the document can derive an
+    /// `incremental_seed` (the published tree with the edits since replayed) the
+    /// parse is **incremental**, seeded from it; after a full-text sync there is no
+    /// seed and it parses from scratch (which keeps #348 closed). The tree write is the
     /// non-inserting, text **and language** guarded
     /// [`install_parse`](crate::document::DocumentStore::install_parse): a closed (Vacant) document is
     /// left gone (resurrection-safe), a text that moved on (a `didChange` landed
@@ -897,9 +898,9 @@ impl ParseCoordinator {
         // needed: only the post-read paths below (which captured it) advance, and
         // they gate on it. `language_id` is captured so the tree write can reject a
         // reopen that changed the language while this parse was in flight. The
-        // `pending_seed` (a cheap `Tree` refcount-clone) is the edit's incremental
-        // parse seed stashed by `didChange`; `None` for a full-text sync / freshly
-        // installed parse, in which case we parse from scratch.
+        // `incremental_seed` is the published tree (a cheap `Tree` clone) with the
+        // edits logged since replayed; `None` after a full-text sync or for a
+        // never-parsed document, in which case we parse from scratch.
         let (language_name, language_id, text, seed, incarnation, content_version, version_cancel) = {
             let Some(doc) = self.documents.get(uri) else {
                 return;
@@ -908,7 +909,7 @@ impl ParseCoordinator {
             // (#498) — cheap on this reparse hot path.
             let text = doc.text_arc();
             let language_id = doc.language_id().map(|s| s.to_string());
-            let seed = doc.pending_seed().cloned();
+            let seed = doc.incremental_seed();
             // The lifetime this parse is for: a close+reopen before the tree write
             // changes it, and the CAS below rejects on the mismatch (so a tree from
             // this lifetime never attaches to a reopened document).

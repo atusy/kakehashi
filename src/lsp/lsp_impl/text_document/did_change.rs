@@ -99,11 +99,12 @@ impl Kakehashi {
         // edit lock serializes didClose, so this update is in-place, not a
         // resurrection.
         //
-        // The pre-edit tree is NOT discarded: with `edits` applied it is stashed as
-        // the off-ingress reparse's incremental seed (`pending_seed`, read only by
-        // `reparse_latest`, never by readers), so a single edit reparses
-        // incrementally rather than from scratch. A full-text sync (`edits` empty)
-        // keeps no seed and parses from scratch (#348).
+        // The pre-edit tree is NOT discarded: `edits` are logged so the off-ingress
+        // reparse's incremental seed (`Document::incremental_seed`, read only by
+        // `reparse_latest`, never by readers) can replay them onto the published
+        // tree, so a single edit reparses incrementally rather than from scratch.
+        // A full-text sync (`edits` empty) forbids seeding and parses from
+        // scratch (#348).
         let ticket = crate::lsp::current_writer_ticket();
         self.documents.apply_edit_clearing_tree(&uri, text, &edits);
 
