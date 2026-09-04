@@ -1064,9 +1064,10 @@ impl LanguageCoordinator {
         // Log warnings for skipped patterns
         for skipped in &result.skipped {
             let preview = truncate_preview(&skipped.text, MAX_PREVIEW_LEN);
-            // When inheritance is used, line numbers refer to the combined query,
-            // not the original source file
-            let line_note = if result.used_inheritance {
+            // When several files were combined (inherits parents, extends
+            // overlays), line numbers refer to the combined query, not any
+            // one source file
+            let line_note = if result.multi_file {
                 " (in combined query)"
             } else {
                 ""
@@ -2316,6 +2317,74 @@ mod tests {
         assert!(
             coordinator.highlight_query("rust").is_some(),
             "Highlight query should be loaded via filename inference"
+        );
+    }
+
+    /// A skipped-pattern warning quotes line numbers of the text that was
+    /// compiled. When an overlay was merged that text is not any one file,
+    /// so the warning must say so; for a single file it must not, or the
+    /// reader hunts for an offset that does not exist.
+    #[test]
+    fn skipped_pattern_warning_notes_a_combined_query_only_when_files_merged() {
+        use tempfile::TempDir;
+
+        fn write_highlights(base: &Path, lang: &str, content: &str) {
+            let dir = base.join("queries").join(lang);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("highlights.scm"), content).unwrap();
+        }
+        fn skipped_warnings(
+            coordinator: &LanguageCoordinator,
+            bases: &[PathBuf],
+            lang: &str,
+        ) -> Vec<String> {
+            let language: Language = tree_sitter_rust::LANGUAGE.into();
+            let mut events = Vec::new();
+            coordinator.load_all_queries(&language, bases, lang, "test", &mut events);
+            events
+                .into_iter()
+                .filter_map(|event| match event {
+                    LanguageEvent::Log { message, .. }
+                        if message.contains("Skipped invalid pattern") =>
+                    {
+                        Some(message)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let coordinator = LanguageCoordinator::new();
+        let base = TempDir::new().unwrap();
+        let overlay = TempDir::new().unwrap();
+        // `(no_such_node)` is invalid against the Rust grammar and is skipped.
+        write_highlights(
+            base.path(),
+            "alone",
+            "(identifier) @variable\n(no_such_node) @bogus\n",
+        );
+        write_highlights(base.path(), "extended", "(identifier) @variable\n");
+        write_highlights(
+            overlay.path(),
+            "extended",
+            ";; extends\n(no_such_node) @bogus\n",
+        );
+        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+
+        let alone = skipped_warnings(&coordinator, &bases, "alone");
+        assert_eq!(alone.len(), 1, "{alone:?}");
+        assert!(
+            !alone[0].contains("(in combined query)"),
+            "one file, the line numbers are its own: {}",
+            alone[0]
+        );
+
+        let extended = skipped_warnings(&coordinator, &bases, "extended");
+        assert_eq!(extended.len(), 1, "{extended:?}");
+        assert!(
+            extended[0].contains("(in combined query)"),
+            "an overlay shifted the line numbers: {}",
+            extended[0]
         );
     }
 

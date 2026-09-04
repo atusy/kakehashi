@@ -20,7 +20,7 @@ A first iteration shipped `kakehashi/query`: a one-shot method taking a **client
 * **Live-consumer economy**: repeat requests (cursor move, scroll, edit) must not resend the query or the full unchanged result.
 * **Server-owned, dynamically discovered kinds**: the query is named by a free-form `kind` resolved as `queries/<lang>/<kind>.scm` from `searchPaths` — *not* a hard-coded enum — so new kinds appear by dropping files into a search path, and a future method can enumerate available kinds from the directory structure.
 * **Match correlation preserved**: `@context` and `@context.end` within one pattern must stay grouped; a flat capture stream loses which `.end` bounds which `@context`.
-* **Reuse proven mechanics**: the semanticTokens `full`/`delta`/`range` interaction model, the existing tolerant query compilation (`; inherits:`, per-pattern skip), predicate evaluation, ULID minting, and the prefix/suffix single-edit delta algorithm.
+* **Reuse proven mechanics**: the semanticTokens `full`/`delta`/`range` interaction model, the existing tolerant query compilation (`inherits`/`extends` modelines, per-pattern skip), predicate evaluation, ULID minting, and the prefix/suffix single-edit delta algorithm.
 * **Minimal API surface**: one protocol for query execution; `kakehashi/query` is replaced, not kept alongside.
 * **Raw capture identity**: capture names on this protocol are the query's names
   after removing `@`; semantic-token `captureMappings` never renames or filters
@@ -70,7 +70,7 @@ type CapturesRangeResult = { matches: Match[]; skipped: SkippedPattern[] };
 
 type SkippedPattern = { language: string; startLine: number; endLine: number; reason: string };
 // startLine/endLine are 1-indexed lines in the query file — or in the combined
-// query string when `; inherits:` is used (the loader concatenates parents first).
+// query string when several files combine (the loader concatenates `inherits` parents, then the base, then `extends` overlays).
 ```
 
 `language` is present on every match — including host-only requests — so the
@@ -113,7 +113,7 @@ nvim-treesitter.
 
 ### Kind resolution
 
-`kind` names a query file: the server resolves `queries/<language>/<kind>.scm` across its configured `searchPaths` (first hit wins), honoring `; inherits:` directives and tolerant per-pattern compilation — the identical pipeline used for highlights/bindings/injections. `kind` is validated as `[A-Za-z0-9_-]+`; anything else (path separators, dots) is rejected as `InvalidParams` before touching the filesystem. The fixed `QueryKind` enum remains an internal detail of config-time loading; this protocol deliberately does **not** extend it, so available kinds are defined purely by what files exist — enabling a future `kakehashi/captures/kinds` discovery method with no protocol change.
+`kind` names a query file: the server resolves `queries/<language>/<kind>.scm` across its configured `searchPaths` (the first plain file is the base; `;; extends` overlays in any search path merge onto it), honoring `inherits` modelines and tolerant per-pattern compilation — the identical pipeline used for highlights/bindings/injections. `kind` is validated as `[A-Za-z0-9_-]+`; anything else (path separators, dots) is rejected as `InvalidParams` before touching the filesystem. The fixed `QueryKind` enum remains an internal detail of config-time loading; this protocol deliberately does **not** extend it, so available kinds are defined purely by what files exist — enabling a future `kakehashi/captures/kinds` discovery method with no protocol change.
 
 ### The `injection` parameter
 

@@ -1,5 +1,6 @@
 //! Query file downloading from nvim-treesitter repository.
 
+use crate::language::query_modeline::{InheritedLanguage, parse_modeline};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -132,18 +133,7 @@ pub struct QueryInstallResult {
     pub files_downloaded: Vec<String>,
 }
 
-/// Whether a language name is safe to use as a path and URL segment.
-///
-/// Language names are used as path segments (`queries/<name>/`) and URL
-/// segments, so anything outside nvim-treesitter's `[a-z0-9_]+` naming is
-/// rejected: a name like `../../x` (from a caller or a `; inherits:` line in
-/// a compromised or custom query source) must not escape the data dir.
-pub fn is_safe_language_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-}
+pub use crate::language::query_modeline::is_safe_language_name;
 
 fn validate_safe_language_name(language: &str) -> Result<(), QueryInstallError> {
     if is_safe_language_name(language) {
@@ -155,30 +145,70 @@ fn validate_safe_language_name(language: &str) -> Result<(), QueryInstallError> 
     }
 }
 
-/// Languages an installed query directory inherits, across every query kind.
+/// Languages an installed query directory inherits, across the kinds the
+/// installer manages (`QUERY_FILES`).
 ///
 /// Each kind resolves its own `; inherits:` chain when it loads, and a parent it
 /// names but that is not installed makes that load fail outright — so
-/// injections.scm's parents matter exactly as much as highlights.scm's.
-fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<String>> {
-    let mut parents: Vec<String> = Vec::new();
+/// injections.scm's parents matter exactly as much as highlights.scm's. A
+/// kind the installer does not fetch (bindings, captures kinds) resolves its
+/// parents the same way, but only from files the user placed on a search
+/// path; nothing here can install those.
+fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<InheritedLanguage>> {
+    let mut parents: Vec<InheritedLanguage> = Vec::new();
     for query_file in QUERY_FILES {
-        let content = match fs::read_to_string(queries_dir.join(query_file)) {
+        let path = queries_dir.join(query_file);
+        let content = match fs::read_to_string(&path) {
             Ok(content) => content,
-            // A kind this language does not have.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // A kind this language does not have — but only when there is no
+            // entry at all. The loader probes with `symlink_metadata` and
+            // counts a dangling symlink as a present, broken hit that fails
+            // the load; calling the chain complete over it would leave the
+            // user with a language nothing will install and nothing can load.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && fs::symlink_metadata(&path).is_err() =>
+            {
+                continue;
+            }
             // A kind it has but that cannot be read. Answering "no parents"
             // would let a caller call the chain complete on a file it never
             // saw, so say the chain cannot be determined instead.
             Err(_) => return None,
         };
-        for parent in parse_inherits_directive(&content) {
-            if !parents.contains(&parent) {
-                parents.push(parent);
+        for parent in parse_modeline(&content).inherits {
+            match parents.iter_mut().find(|p| p.name == parent.name) {
+                // Required by one kind, required for the language.
+                Some(known) => known.optional &= parent.optional,
+                None => parents.push(parent),
             }
         }
     }
     Some(parents)
+}
+
+/// The parents a language actually needs on disk, given how it is reached.
+///
+/// The loader inherits an optional parent, `(cpp)`, only when the file is
+/// loaded for its own language; a language reached as another's parent skips
+/// its optional parents, so a chain stops there. The installer asks the same
+/// question the same way, or it would fetch and lock a grandparent the loader
+/// never looks for — and call a chain incomplete over a language the loader
+/// would load.
+///
+/// One coarsening remains: the loader resolves each kind's chain on its own,
+/// while the installer works per language, on the union of its kinds. A
+/// parent one kind names bare and another in parentheses is required here
+/// whenever either kind would need it — a superset of what any one kind
+/// loads, never less.
+fn required_parents(
+    parents: Vec<InheritedLanguage>,
+    is_included: bool,
+) -> impl Iterator<Item = String> {
+    parents
+        .into_iter()
+        .filter(move |parent| !(parent.optional && is_included))
+        .map(|parent| parent.name)
 }
 
 /// Hold every language in an inheritance chain still, and report whether all of
@@ -198,12 +228,13 @@ pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec
     fn walk(
         data_dir: &Path,
         language: &str,
+        is_included: bool,
         seen: &mut Vec<String>,
         guards: &mut Vec<LanguageLock>,
     ) -> bool {
-        // An inheritance cycle among on-disk files (a self-inherit typo, A↔B)
-        // is the loader's problem to report, not a reason to call the install
-        // incomplete and re-download forever.
+        // A language already on the path — a file naming its own language
+        // (read as `extends`), or an A↔B cycle for the loader to report — is
+        // not a reason to call the install incomplete and re-download forever.
         if seen.iter().any(|visited| visited == language) {
             return true;
         }
@@ -220,57 +251,13 @@ pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec
         let queries_dir = data_dir.join("queries").join(language);
         query_install_is_complete(&queries_dir)
             && inherited_languages_on_disk(&queries_dir).is_some_and(|parents| {
-                parents
-                    .into_iter()
-                    .all(|parent| walk(data_dir, &parent, seen, guards))
+                required_parents(parents, is_included)
+                    .all(|parent| walk(data_dir, &parent, true, seen, guards))
             })
     }
 
     let mut guards = Vec::new();
-    walk(data_dir, language, &mut Vec::new(), &mut guards).then_some(guards)
-}
-
-/// Strip the parentheses nvim-treesitter puts around some inherited names.
-///
-/// Must match what the query loader does with the same line
-/// (`language::query_loader::normalize_inherited_language_name`): the loader
-/// resolves `(cpp)` as `cpp`, so an installer that dropped it as an unsafe name
-/// would report success and leave the loader looking for a language nothing
-/// fetched.
-fn normalize_inherited_language_name(name: &str) -> String {
-    // Character for character what `query_loader` does, including only
-    // stripping a *matched* pair: on `(cpp` the loader looks for a language
-    // literally called `(cpp`, and an installer that helpfully fetched `cpp`
-    // would report success over a language it still cannot load.
-    name.strip_prefix('(')
-        .and_then(|name| name.strip_suffix(')'))
-        .unwrap_or(name)
-        .trim()
-        .to_string()
-}
-
-/// Parse the `; inherits: lang1,lang2` directive from query content.
-/// Returns the list of parent languages, dropping unsafe names
-/// (see [`is_safe_language_name`]).
-fn parse_inherits_directive(content: &str) -> Vec<String> {
-    let first_line = content.lines().next().unwrap_or("");
-    if let Some(rest) = first_line.strip_prefix("; inherits:") {
-        rest.split(',')
-            .map(|s| normalize_inherited_language_name(s.trim()))
-            .filter(|s| !s.is_empty())
-            .filter(|s| {
-                let safe = is_safe_language_name(s);
-                if !safe {
-                    // Debug-format: the name is untrusted input and could
-                    // smuggle ANSI escapes into the terminal if printed raw.
-                    eprintln!("Warning: ignoring unsafe inherited language name {:?}", s);
-                }
-                safe
-            })
-            .collect()
-    } else {
-        Vec::new()
-    }
+    walk(data_dir, language, false, &mut Vec::new(), &mut guards).then_some(guards)
 }
 
 /// Download and install query files for a language, including inherited dependencies.
@@ -536,9 +523,12 @@ impl StagedQueryInstall {
             let Some(parents) = inherited_languages_on_disk(&queries_dir) else {
                 return Some(language);
             };
-            if parents
-                .iter()
-                .any(|parent| !self.dependencies.contains(parent))
+            // Only the requested language is loaded for itself; every other
+            // dependency is reached as a parent, where its optional parents
+            // are not needed.
+            let is_included = language != &self.language;
+            if required_parents(parents, is_included)
+                .any(|parent| !self.dependencies.contains(&parent))
             {
                 return Some(language);
             }
@@ -598,7 +588,8 @@ impl StagedQueryInstall {
                 Ok(PublishQueryDirOutcome::AlreadyComplete) => {
                     let chain_matches = inherited_languages_on_disk(&entry.queries_dir)
                         .is_some_and(|parents| {
-                            parents.iter().all(|parent| dependencies.contains(parent))
+                            required_parents(parents, !requested)
+                                .all(|parent| dependencies.contains(&parent))
                         });
                     if !chain_matches {
                         let residue = publish.rollback();
@@ -880,8 +871,8 @@ fn stage_queries_with_dependencies(
     let outcome = stage_queries_recursive(
         base_url,
         language,
+        StageRole::Requested { force },
         data_dir,
-        force,
         &mut staged,
         &mut entries,
         http_policy,
@@ -909,15 +900,38 @@ fn stage_queries_with_dependencies(
 /// the languages it inherits, so `entries` comes out in dependency order and
 /// publishing it forward puts every base language in place before the language
 /// that needs it.
+/// How a language is reached while staging an install.
+///
+/// Only the requested language is loaded for itself, and only it may be
+/// forced; every other language in the chain is reached as a parent, where
+/// its optional parents are not needed and an existing copy is kept.
+#[derive(Clone, Copy)]
+enum StageRole {
+    Requested { force: bool },
+    Parent,
+}
+
+impl StageRole {
+    fn is_included(self) -> bool {
+        matches!(self, Self::Parent)
+    }
+
+    fn force(self) -> bool {
+        matches!(self, Self::Requested { force: true })
+    }
+}
+
 fn stage_queries_recursive(
     base_url: &str,
     language: &str,
+    role: StageRole,
     data_dir: &Path,
-    force: bool,
     staged: &mut std::collections::HashSet<String>,
     entries: &mut Vec<StagedQueryDir>,
     http_policy: QueryHttpPolicy,
 ) -> Result<StageOutcome, QueryInstallError> {
+    let is_included = role.is_included();
+    let force = role.force();
     // The name becomes a path and URL segment below; reject anything that
     // could escape the data dir (e.g. a caller-provided `../../x`).
     // Escape the untrusted name: the error's Display is printed raw by
@@ -946,9 +960,9 @@ fn stage_queries_recursive(
     // as incomplete so a later install can repair it without --force.
     if query_install_is_complete(&queries_dir) && !force {
         // Mark as staged BEFORE recursing into parents: an inheritance
-        // cycle among on-disk query files (self-inherit typo, A↔B) would
-        // otherwise recurse forever and overflow the stack. The download
-        // branch below already inserts before its parent loop.
+        // cycle among on-disk query files (a file naming its own language,
+        // A↔B) would otherwise recurse forever and overflow the stack. The
+        // download branch below already inserts before its parent loop.
         staged.insert(language.to_string());
 
         // Even if skipping, we need to check for inherited dependencies
@@ -957,13 +971,13 @@ fn stage_queries_recursive(
                 "cannot read the query files installed for '{language}' to find what it inherits"
             )))
         })?;
-        for parent in parents {
+        for parent in required_parents(parents, is_included) {
             // Stage parent dependencies (don't force, just ensure they exist)
             stage_queries_recursive(
                 base_url,
                 &parent,
+                StageRole::Parent,
                 data_dir,
-                false,
                 staged,
                 entries,
                 http_policy,
@@ -994,9 +1008,16 @@ fn stage_queries_recursive(
             Ok(content) => {
                 // Every query kind resolves its own `; inherits:` chain at load
                 // time, so a parent named by injections.scm is as load-bearing
-                // as one named by highlights.scm.
-                for parent in parse_inherits_directive(&content) {
-                    if !parents_to_install.contains(&parent) {
+                // as one named by highlights.scm. A file naming its own
+                // language is read as `extends`, not as a parent, and an
+                // optional parent is needed only when the language is loaded
+                // for itself (see `required_parents`).
+                for parent in parse_modeline(&content).inherits {
+                    if parent.optional && is_included {
+                        continue;
+                    }
+                    let parent = parent.name;
+                    if parent != language && !parents_to_install.contains(&parent) {
                         parents_to_install.push(parent);
                     }
                 }
@@ -1047,8 +1068,8 @@ fn stage_queries_recursive(
         stage_queries_recursive(
             base_url,
             &parent,
+            StageRole::Parent,
             data_dir,
-            false,
             staged,
             entries,
             http_policy,
@@ -2987,46 +3008,94 @@ mod tests {
     }
 
     /// Inherited language names become path segments (`queries/<name>/`) and
-    /// URL segments, so anything outside nvim-treesitter's `[a-z0-9_]+`
-    /// naming must be dropped — `; inherits: ../../x` from a compromised or
-    /// custom query source must not escape the data dir.
-    /// nvim-treesitter parenthesizes some inherited names, and the query loader
-    /// resolves `(cpp)` as `cpp`. An installer that read it any other way would
-    /// report success and leave the loader looking for a language nothing
-    /// fetched.
+    /// URL segments. The modeline grammar itself admits only `[a-z0-9_]+`
+    /// names — a line naming `../../x` is a comment, not a parent — and that
+    /// grammar is the one the query loader reads, so what the installer walks
+    /// is exactly what the loader will look for, in every form Neovim
+    /// accepts: repeated `;`, no colon, a directive on the second line of
+    /// the block, and parenthesized names read as bare ones.
+    /// The loader counts a dangling symlink as a present, broken file and
+    /// fails the load; the chain must not be called complete over one.
+    #[cfg(unix)]
     #[test]
-    fn parse_inherits_directive_strips_parentheses_like_the_loader() {
-        assert_eq!(
-            parse_inherits_directive("; inherits: c, (cpp), (cuda)\n"),
-            vec!["c".to_string(), "cpp".to_string(), "cuda".to_string()]
-        );
-    }
+    fn a_dangling_query_symlink_leaves_the_chain_undetermined() {
+        use std::os::unix::fs::symlink;
 
-    /// Only a matched pair is a wrapper. An unmatched one is part of the name
-    /// as far as the loader is concerned, so it must be part of it here too —
-    /// and such a name is then rejected as unsafe rather than turned into a
-    /// different language's.
-    #[test]
-    fn parse_inherits_directive_keeps_unmatched_parentheses() {
+        let temp_dir = TempDir::new().unwrap();
+        let queries_dir = temp_dir.path().join("queries").join("child");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        symlink("missing-target.scm", queries_dir.join("injections.scm")).unwrap();
+
         assert!(
-            parse_inherits_directive("; inherits: (cpp\n").is_empty(),
-            "an unmatched leading parenthesis is part of the name, and unsafe"
-        );
-        assert!(
-            parse_inherits_directive("; inherits: cpp)\n").is_empty(),
-            "and so is an unmatched trailing one"
+            inherited_languages_on_disk(&queries_dir).is_none(),
+            "a present-but-broken kind must not read as absent"
         );
     }
 
     #[test]
-    fn parse_inherits_directive_drops_unsafe_language_names() {
-        let parents = parse_inherits_directive(
-            "; inherits: ../../evil, html_tags, UPPER, with-dash, c3\n(comment) @comment\n",
+    fn on_disk_parents_follow_the_shared_modeline_grammar() {
+        let temp_dir = TempDir::new().unwrap();
+        let queries_dir = temp_dir.path().join("queries").join("child");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(
+            queries_dir.join("highlights.scm"),
+            ";; extends\n;; inherits c,(cpp)\n(comment) @comment\n",
+        )
+        .unwrap();
+        fs::write(
+            queries_dir.join("injections.scm"),
+            "; inherits: ../../evil, html_tags\n; inherits: c3\n(comment) @injection.content\n",
+        )
+        .unwrap();
+
+        let parents = inherited_languages_on_disk(&queries_dir).unwrap();
+        assert_eq!(
+            parents
+                .iter()
+                .map(|parent| (parent.name.as_str(), parent.optional))
+                .collect::<Vec<_>>(),
+            vec![("c", false), ("cpp", true), ("c3", false)],
+            "a line whose operand is not a name list is a comment, the rest are parents"
         );
         assert_eq!(
-            parents,
-            vec!["html_tags".to_string(), "c3".to_string()],
-            "only lowercase/digit/underscore names may survive"
+            required_parents(parents, true).collect::<Vec<_>>(),
+            vec!["c".to_string(), "c3".to_string()],
+            "reached as a parent, the language does not need its optional parent"
+        );
+    }
+
+    /// The loader inherits `(cpp)` only when `c` is loaded for itself, so a
+    /// `cuda` that inherits `c` never looks for `cpp`. The installer must ask
+    /// the same question: installing or checking `cuda` must not require —
+    /// or try to fetch — a `cpp` that only a direct load of `c` needs.
+    #[test]
+    fn an_optional_grandparent_is_not_required_through_an_inherited_parent() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+        let c_dir = data_dir.join("queries").join("c");
+        let cuda_dir = data_dir.join("queries").join("cuda");
+        fs::create_dir_all(&c_dir).unwrap();
+        fs::create_dir_all(&cuda_dir).unwrap();
+        fs::write(c_dir.join("highlights.scm"), "; inherits: (cpp)\n").unwrap();
+        fs::write(cuda_dir.join("highlights.scm"), "; inherits: c\n").unwrap();
+        write_install_marker_for_tests(&c_dir).unwrap();
+        write_install_marker_for_tests(&cuda_dir).unwrap();
+        // No `cpp` on disk, and no network: reaching for it would fail.
+
+        assert!(
+            lock_complete_chain(&data_dir, "cuda").is_some(),
+            "cuda's chain stops at c, whose optional parent it never loads"
+        );
+        assert!(
+            lock_complete_chain(&data_dir, "c").is_none(),
+            "c loaded for itself does need cpp"
+        );
+        let result = install_queries_with_dependencies("cuda", &data_dir, false);
+        assert!(
+            matches!(result, Err(QueryInstallError::AlreadyExists(_))),
+            "installing cuda must not reach for cpp: {:?}",
+            result.err()
         );
     }
 
@@ -3055,9 +3124,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let data_dir = temp_dir.path().to_path_buf();
 
-        // Self-cycle: a query file inheriting its own language (a one-word
-        // typo in a real highlights.scm). No network: both branches hit the
-        // already-exists path.
+        // Self-cycle: a query file inheriting its own language (read as
+        // `extends`). No network: both branches hit the already-exists path.
         let a_dir = data_dir.join("queries").join("cyclic_a");
         fs::create_dir_all(&a_dir).unwrap();
         std::fs::write(a_dir.join("highlights.scm"), "; inherits: cyclic_a\n").unwrap();

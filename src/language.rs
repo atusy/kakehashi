@@ -12,6 +12,7 @@ pub(crate) mod query_assets;
 pub(crate) mod query_directives;
 pub(crate) mod query_exec;
 pub(crate) mod query_loader;
+pub(crate) mod query_modeline;
 pub(crate) mod query_pattern_splitter;
 pub(crate) mod query_predicates;
 pub(crate) mod query_store;

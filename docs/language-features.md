@@ -486,7 +486,7 @@ extraction, fold-range computation, or a
 The query itself is **not sent by the client**. A `kind` (e.g. `"context"`) names a
 per-language query file, resolved as `queries/<language>/<kind>.scm` across the
 configured `searchPaths` — the same place highlight queries live, with the same
-`; inherits:` support. Drop a file into a search path and the kind exists; no
+`inherits`/`extends` modeline support. Drop a file into a search path and the kind exists; no
 server configuration needed. (nvim-treesitter-context's own `context.scm` files
 work as-is once their directory is on a search path.)
 
@@ -511,7 +511,7 @@ type CapturesResult = {
   skipped: {                         // patterns dropped by tolerant compilation
     language: string;                // which language's kind file had the problem
     startLine: number;               // 1-indexed; in the query file — or in the
-    endLine: number;                 // combined query when `; inherits:` is used
+    endLine: number;                 // combined query when several files combine
     reason: string;                  // Tree-sitter's compile error for that pattern
   }[];
 };

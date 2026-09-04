@@ -10,7 +10,7 @@ Provides LSP semantic tokens based on Tree-sitter `highlights.scm` queries. Work
 
 - Supports language injection (e.g., SQL in JavaScript template strings, code blocks in Markdown)
 - Uses nvim-treesitter query files for compatibility
-- Supports query inheritance (e.g., TypeScript inherits from `ecma`)
+- Supports Neovim's query modelines: `; inherits:` (e.g., TypeScript inherits from `ecma`) and `;; extends` overlays
 
 ### Selection Range
 
@@ -283,7 +283,8 @@ Array of base directories to search for parsers and queries. If not specified, u
 **Important:** Specify base directories, not subdirectories. The resolver automatically appends `parser/` and `queries/` subdirectories.
 
 Parsers are searched as `{searchPath}/parser/{language}.{so,dylib,dll}`.
-Queries are searched as `{searchPath}/queries/{language}/{query_type}.scm`.
+Queries are searched as `{searchPath}/queries/{language}/{query_type}.scm`;
+see [Query modelines](#query-modelines) for how several hits combine.
 For implicit lookup, `{language}` must be one normal path component: values
 containing a path separator or a `.`/`..` component do not resolve, and on
 Windows neither do drive (`C:\…`) or UNC (`\\server\share\…`) prefixes. This
@@ -302,11 +303,81 @@ Then list each kind you need under `languages[*].queries[*].path`. Supplying
 `queries` at all disables the implicit lookup for the kinds you leave out, and
 only `highlights`, `injections`, and `bindings` can be given an explicit path.
 
-`; inherits:` is resolved only for implicitly located queries. A query file
-given an explicit path is loaded as-is, so an `; inherits:` line in it is inert
-— tree-sitter reads it as a comment and the parent's patterns are silently
-absent. Inherit only from queries that follow the implicit layout, whose parent
-is itself resolved by language name and so must follow it too.
+Modelines are resolved only for implicitly located queries. A query file
+given an explicit path is loaded as-is, so an `; inherits:` or `;; extends`
+line in it is inert — tree-sitter reads it as a comment, and the parent's
+patterns are silently absent. Inherit only from queries that follow the
+implicit layout, whose parent is itself resolved by language name and so must
+follow it too. Explicit paths of one kind are concatenated in the order
+listed, which is the explicit-path way to layer an overlay.
+
+#### Query modelines
+
+kakehashi reads the comment modelines Neovim documents under
+`:h treesitter-query-modeline`, with Neovim's grammar: any run of `;`, any
+spacing, the colon after `inherits` optional, and directives may repeat. The
+modeline block is the run of `;` lines at the top of the file; the first line
+that does not start with `;` — a blank line included — ends it. The list
+after `inherits` is one run of comma-separated names with no whitespace in
+it, each name `[a-z0-9_]+` (Neovim's own class has no digits; kakehashi adds
+them for languages such as `m68k`). A `;` line that says anything else after
+the keyword — `; inherits the ecma queries` — is a comment, as in Neovim, not
+a parent that fails to load; within a list, an entry that is no name (a stray
+trailing comma, an unmatched parenthesis) is skipped and the names beside it
+still count.
+
+```query
+;; inherits: ecma,jsx
+;; extends
+```
+
+`inherits: {lang},...` prepends the named languages' query of the same kind,
+each resolved through this same lookup (so a parent brings its own parents and
+overlays). A parenthesized name, `(cpp)`, is inherited only when the file is
+loaded for its own language: a file reached as someone else's parent skips
+its parenthesized parents, as in Neovim, so a chain stops there. Along the
+edges actually followed, a cycle between languages is an error; a file naming
+its own language is read as `extends`, as Neovim's `get_files` reads it, and
+so marks the file an overlay.
+
+`extends` marks the file as an overlay to merge onto the language's query
+instead of replacing it. Across `searchPaths`, in order, the first file
+*without* `extends` is the base query and any later plain file is shadowed
+(logged at debug level); every file *with* `extends` is appended after the
+base, in search-path order. The combined query is therefore
+`inherited parents, base, overlays`. A language whose only files are overlays
+loads them alone, as Neovim does.
+
+So to add patterns to a language without copying its query, put an overlay in
+a search path of your own. `searchPaths` replaces the default list, so keep
+the data directory in it:
+
+```toml
+searchPaths = ["~/.config/kakehashi", "${KAKEHASHI_DATA_DIR}"]
+```
+
+```query
+;; ~/.config/kakehashi/queries/markdown/highlights.scm
+;; extends
+((inline) @markup.raw (#match? @markup.raw "^TODO"))
+```
+
+An overlay follows the base wherever it sits in `searchPaths`; position
+decides only which plain file is the base (the first) and the order among
+overlays. Diagnostics for a skipped pattern in a combined query quote line
+numbers of the combined text, not of any one file.
+
+Two things stay strict when files combine. Every hit must be readable: a
+dangling symlink or an unreadable file in any search path fails the language's
+query, as it would as the only hit, rather than loading without it. And every
+parent actually followed must exist as the same kind of file:
+`child/context.scm` inheriting `foo` needs a `foo/context.scm` on some search
+path. Auto-install fetches the parents named by the `highlights.scm` and
+`injections.scm` it installs into the data directory — those two kinds only,
+and not parents named by an overlay elsewhere — so a parent that only your
+overlay names, or that a `bindings.scm` or a captures kind names, must be put
+on a search path by hand or the query fails to load with a message naming the
+file that named it.
 
 #### `languages`
 
@@ -1226,7 +1297,8 @@ Run `kakehashi language list` for the complete list.
 
 ## Query Inheritance
 
-Some languages inherit queries from base languages:
+Some languages inherit queries from base languages (see
+[Query modelines](#query-modelines) for how the loader reads the directive):
 
 | Language | Inherits From |
 |----------|---------------|
@@ -1234,7 +1306,11 @@ Some languages inherit queries from base languages:
 | JavaScript | ecma, jsx |
 | TSX | typescript, jsx |
 
-When you install a language with inheritance, the base queries are automatically downloaded.
+When you install a language with inheritance, the base queries its
+`highlights.scm` and `injections.scm` name are downloaded with it. Those are
+the only kinds the installer fetches: a parent named by `bindings.scm`, by a
+captures kind, or by an overlay on another search path must be put on a search
+path by hand (see [Query modelines](#query-modelines)).
 
 ## Logging
 

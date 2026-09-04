@@ -7,6 +7,7 @@
 mod tests {
     use crate::analysis::bindings::collect::collect;
     use crate::analysis::bindings::model::BindingsModel;
+    use crate::language::query_loader::append_file;
 
     /// The on-disk `bindings.scm` asset for a language.
     fn asset_source(lang_name: &str) -> String {
@@ -31,11 +32,14 @@ mod tests {
     }
 
     /// The asset source with `; inherits:` parents concatenated from the
-    /// on-disk assets, mirroring the loader's resolution. Fails fast on an
+    /// on-disk assets, read through the shared modeline parser and following
+    /// the loader's rules for which parents count: a parent equal to the
+    /// language marks an overlay rather than a chain, and a parenthesized
+    /// parent is inherited only at the top of the chain. Fails fast on an
     /// inheritance cycle (the runtime loader guards likewise) instead of
     /// recursing until the test suite hangs.
     fn resolved_source(lang: &str) -> String {
-        fn resolve(lang: &str, chain: &mut Vec<String>) -> String {
+        fn resolve(lang: &str, is_included: bool, chain: &mut Vec<String>) -> String {
             assert!(
                 !chain.iter().any(|l| l == lang),
                 "inheritance cycle in assets: {chain:?} -> {lang}"
@@ -43,19 +47,17 @@ mod tests {
             chain.push(lang.to_string());
             let source = asset_source(lang);
             let mut combined = String::new();
-            if let Some(first_line) = source.lines().next()
-                && let Some(parents) = first_line.strip_prefix("; inherits:")
-            {
-                for parent in parents.split(',') {
-                    combined.push_str(&resolve(parent.trim(), chain));
-                    combined.push('\n');
+            for parent in crate::language::query_modeline::parse_modeline(&source).inherits {
+                if parent.name == lang || (parent.optional && is_included) {
+                    continue;
                 }
+                append_file(&mut combined, &resolve(&parent.name, true, chain));
             }
             chain.pop();
-            combined.push_str(&source);
+            append_file(&mut combined, &source);
             combined
         }
-        resolve(lang, &mut Vec::new())
+        resolve(lang, false, &mut Vec::new())
     }
 
     /// Every asset must compile in full against the grammar it

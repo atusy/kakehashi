@@ -1,5 +1,6 @@
 use crate::error::{LspError, LspResult};
-use log::warn;
+use crate::language::query_modeline::parse_modeline;
+use log::{debug, warn};
 use path_clean::PathClean;
 use std::fmt::Write;
 use std::fs;
@@ -8,26 +9,26 @@ use tree_sitter::{Language, Query};
 
 /// Parser library file extensions for different platforms
 const PARSER_EXTENSIONS: &[&str] = &["so", "dylib", "dll"];
-const INHERITS_DIRECTIVE_PREFIX: &str = "; inherits:";
 
 /// Information about a pattern that was skipped during tolerant parsing.
 ///
-/// Known limitation: when queries use inheritance (e.g. `; inherits: ecma`),
-/// line numbers refer to the **combined** query string, not the original source
-/// file (a pattern on line 5 of a child whose parent has 100 lines reports 105).
+/// Known limitation: when a query is combined from several files (`inherits`
+/// parents, `extends` overlays), line numbers refer to the **combined** query
+/// string, not the original source file (a pattern on line 5 of a child whose
+/// parent has 100 lines reports 105).
 #[derive(Debug, Clone)]
 pub(crate) struct SkippedPattern {
     /// The pattern text that failed to compile
     pub text: String,
     /// Starting line number (1-indexed for display).
     ///
-    /// **Note**: When query inheritance is used, this refers to the line
-    /// in the combined query string, not the original source file.
+    /// **Note**: When the query is combined from several files, this refers
+    /// to the line in the combined query string, not the original source file.
     pub start_line: usize,
     /// Ending line number (1-indexed for display).
     ///
-    /// **Note**: When query inheritance is used, this refers to the line
-    /// in the combined query string, not the original source file.
+    /// **Note**: When the query is combined from several files, this refers
+    /// to the line in the combined query string, not the original source file.
     pub end_line: usize,
     /// The error message from tree-sitter
     pub error: String,
@@ -61,10 +62,17 @@ pub(crate) struct ParseResult {
     /// If `query` is `None`, this indicates why parsing failed.
     /// When `query` is `Some`, this will be `None`.
     pub failure_reason: Option<ParseFailure>,
-    /// Whether this query used inheritance (e.g., `; inherits: ecma`).
-    /// When true, line numbers in `skipped` refer to the combined query,
-    /// not the original source file.
-    pub used_inheritance: bool,
+    /// Whether more than one file contributed (`inherits` parents, `extends`
+    /// overlays). When true, line numbers in `skipped` refer to the combined
+    /// query, not any one source file.
+    pub multi_file: bool,
+}
+
+/// The text of a query assembled from every file that contributes to it.
+struct ResolvedQuery {
+    content: String,
+    /// How many files were concatenated, across parents and overlays.
+    file_count: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -115,82 +123,141 @@ impl QueryLoader {
             .clean()
     }
 
-    /// Resolve query inheritance and return the combined query content.
+    /// Resolve every query file that makes up `lang_name`'s `file_name`.
     ///
-    /// Recursively resolves parent queries, concatenating parents-first then child,
-    /// and removes the `; inherits:` directive. `preloaded_content` lets the caller
-    /// skip a re-read when it already has the content; `visited` guards against
-    /// circular inheritance.
+    /// Mirrors Neovim's `vim.treesitter.query.get_files`: across the search
+    /// paths, the first file without an `extends` modeline is the base query
+    /// (a later plain file is shadowed), every file marked `extends` is an
+    /// overlay, and the `inherits` parents named by any of them resolve first
+    /// through this same function. The combined text is `parents, base,
+    /// overlays`. Modelines stay in place: tree-sitter reads them as comments,
+    /// and keeping them keeps each file's line numbers intact.
+    ///
+    /// One departure from `get_files`, on purpose: a language reached more
+    /// than once — named twice on a line, by the base and an overlay both, or
+    /// as the shared ancestor of two parents — is concatenated once. Neovim
+    /// appends it each time, and every pattern in it then matches twice;
+    /// nothing relies on that, and no nvim-treesitter query set has such a
+    /// shape. `emitted` is the set of languages already concatenated in this
+    /// resolution.
+    ///
+    /// `is_included` says the language is being resolved as a parent of
+    /// another rather than for itself; Neovim's `get_files(lang, name,
+    /// is_included)` then skips parents written in parentheses, `(cpp)`, and
+    /// so does this.
+    ///
+    /// `visited` holds the languages on the current inheritance path so a
+    /// cycle is an error; a language leaves it on the way back out so a
+    /// diamond (two parents sharing an ancestor) resolves. No error path
+    /// removes anything: every error propagates straight to the top-level
+    /// call, which owns both sets and drops them.
     fn resolve_query_recursive<P: AsRef<Path>>(
         runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
-        preloaded_content: Option<String>,
+        is_included: bool,
         visited: &mut std::collections::HashSet<String>,
-    ) -> LspResult<String> {
-        // Check for circular inheritance
+        emitted: &mut std::collections::HashSet<String>,
+    ) -> Result<ResolvedQuery, QueryLoadError> {
         if visited.contains(lang_name) {
             return Err(LspError::query(format!(
                 "Circular inheritance detected for language '{}'",
                 lang_name
-            )));
+            ))
+            .into());
         }
         visited.insert(lang_name.to_string());
 
-        // Use preloaded content or load from disk
-        let content = match preloaded_content {
-            Some(c) => c,
-            None => Self::load_query_file(runtime_bases, lang_name, file_name)?,
-        };
-
-        // Parse inheritance directive
-        let parents = Self::parse_inherits_directive(&content);
-
-        // Build combined query: parents first, then child
-        let mut combined = String::new();
-
-        // Recursively resolve parent queries (never preloaded)
-        for parent in &parents {
-            let parent_content =
-                Self::resolve_query_recursive(runtime_bases, parent, file_name, None, visited)?;
-            combined.push_str(&parent_content);
-            combined.push('\n');
+        let paths = Self::find_query_files(runtime_bases, lang_name, file_name);
+        if paths.is_empty() {
+            return Err(QueryLoadError::NotFound);
         }
 
-        // Add child content (without the inherits directive line)
-        let child_content = Self::strip_inherits_directive(&content);
-        combined.push_str(&child_content);
+        // Each parent with the file that first named it, so a parent that
+        // cannot be found is reported against the modeline to fix.
+        let mut parents: Vec<(String, &PathBuf)> = Vec::new();
+        let mut base: Option<String> = None;
+        let mut overlays: Vec<String> = Vec::new();
+        for path in &paths {
+            let content = fs::read_to_string(path).map_err(|e| {
+                LspError::query(format!(
+                    "Failed to read query file {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+            let modeline = parse_modeline(&content);
+            // Neovim's `get_files` reads a file naming its own language as an
+            // extension (`add_included_lang` returns true for the
+            // self-reference instead of adding a parent), so the file is an
+            // overlay, not a parent of itself.
+            let mut extends = modeline.extends;
+            for parent in modeline.inherits {
+                if parent.optional && is_included {
+                    // `(cpp)`: inherited when this file is loaded for its own
+                    // language, not when the file is itself being inherited.
+                    // Neovim skips the entry before looking at it at all, so
+                    // an optional self-name does not mark an overlay either.
+                } else if parent.name == lang_name {
+                    extends = true;
+                } else if !parents.iter().any(|(name, _)| *name == parent.name) {
+                    parents.push((parent.name, path));
+                }
+            }
+            if extends {
+                overlays.push(content);
+            } else if base.is_none() {
+                base = Some(content);
+            } else {
+                debug!(
+                    "Query file {} is shadowed by an earlier search path (mark it `;; extends` to merge it)",
+                    path.display()
+                );
+            }
+        }
+
+        // A shadowed plain file contributed no text, so it does not count.
+        let mut file_count = usize::from(base.is_some()) + overlays.len();
+        let mut combined = String::new();
+        for (parent, declared_in) in &parents {
+            if emitted.contains(parent) {
+                continue;
+            }
+            let resolved = match Self::resolve_query_recursive(
+                runtime_bases,
+                parent,
+                file_name,
+                true,
+                visited,
+                emitted,
+            ) {
+                Ok(resolved) => resolved,
+                Err(QueryLoadError::NotFound) => {
+                    return Err(LspError::query(format!(
+                        "Query file {} not found for language {} (inherited by {} in {}) in search paths: {}",
+                        file_name,
+                        parent,
+                        lang_name,
+                        declared_in.display(),
+                        format_search_paths(runtime_bases)
+                    ))
+                    .into());
+                }
+                Err(other) => return Err(other),
+            };
+            append_file(&mut combined, &resolved.content);
+            file_count += resolved.file_count;
+            emitted.insert(parent.clone());
+        }
+        for content in base.into_iter().chain(overlays) {
+            append_file(&mut combined, &content);
+        }
 
         visited.remove(lang_name);
-
-        Ok(combined)
-    }
-
-    /// Remove the `; inherits:` line from query content.
-    fn strip_inherits_directive(content: &str) -> String {
-        let first_line = content.lines().next().unwrap_or("");
-        if first_line.starts_with(INHERITS_DIRECTIVE_PREFIX) {
-            // Skip the first line
-            content.lines().skip(1).collect::<Vec<_>>().join("\n")
-        } else {
-            content.to_string()
-        }
-    }
-
-    /// Parse the `; inherits: lang1,lang2` directive from query content.
-    ///
-    /// nvim-treesitter queries declare inheritance via this first-line directive;
-    /// returns the parent language names (empty if absent).
-    fn parse_inherits_directive(content: &str) -> Vec<String> {
-        let first_line = content.lines().next().unwrap_or("");
-        if let Some(rest) = first_line.strip_prefix(INHERITS_DIRECTIVE_PREFIX) {
-            rest.split(',')
-                .map(|s| normalize_inherited_language_name(s.trim()))
-                .filter(|s| !s.is_empty())
-                .collect()
-        } else {
-            Vec::new()
-        }
+        Ok(ResolvedQuery {
+            content: combined,
+            file_count,
+        })
     }
 
     /// Load query content from paths (without parsing).
@@ -200,10 +267,7 @@ impl QueryLoader {
         for path in paths {
             let normalized_path = path.as_ref().clean();
             match fs::read_to_string(&normalized_path) {
-                Ok(content) => {
-                    combined_query.push_str(&content);
-                    combined_query.push('\n');
-                }
+                Ok(content) => append_file(&mut combined_query, &content),
                 Err(e) => {
                     return Err(LspError::query(format!(
                         "Failed to read query file {}: {e}",
@@ -216,60 +280,41 @@ impl QueryLoader {
         Ok(combined_query)
     }
 
-    /// Find a query file in search paths.
+    /// Every `<base>/queries/<lang_name>/<file_name>` across the search paths,
+    /// in search-path order, each path once: Neovim dedupes its runtime hits
+    /// the same way, so a directory listed twice in `searchPaths` does not
+    /// append its overlays twice.
     ///
-    /// `pub(crate)` so the captures handler can distinguish "kind file absent"
-    /// (expected, debug log) from "file exists but failed to load" (asset
-    /// trouble, warn) — captures-protocol §"Null vs. error semantics".
+    /// Returns nothing without touching the filesystem when `lang_name` is not
+    /// a single normal path component, so a document-controlled injection
+    /// language cannot escape `<base>/queries/`.
     ///
-    /// Returns `None` without touching the filesystem when `lang_name` is not a
-    /// single normal path component, so a document-controlled injection language
-    /// cannot escape `<base>/queries/`.
-    pub(crate) fn find_query_file<P: AsRef<Path>>(
+    /// An entry that exists but cannot be probed (a dangling symlink, an
+    /// unreadable directory) is listed too: presence probing must not
+    /// downgrade a broken asset to an ordinary absence, so the real read
+    /// reports its concrete I/O error.
+    fn find_query_files<P: AsRef<Path>>(
         runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
-    ) -> Option<PathBuf> {
+    ) -> Vec<PathBuf> {
         // Name-only, so it cannot vary per base: reject once, before the search.
         if !is_single_path_component(lang_name) {
-            return None;
+            return Vec::new();
         }
+        let mut found: Vec<PathBuf> = Vec::new();
         for base in runtime_bases {
             let candidate = Self::query_file_path(base.as_ref(), lang_name, file_name);
+            if found.contains(&candidate) {
+                continue;
+            }
             match fs::symlink_metadata(&candidate) {
-                Ok(_) => return Some(candidate),
+                Ok(_) => found.push(candidate),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                // Presence probing must not downgrade inaccessible/broken
-                // assets to an ordinary optional-kind absence. Return the
-                // candidate so the real read reports its concrete I/O error.
-                Err(_) => return Some(candidate),
+                Err(_) => found.push(candidate),
             }
         }
-        None
-    }
-
-    /// Load a query file from search paths; `; inherits:` parents resolve
-    /// through this same lookup.
-    fn load_query_file<P: AsRef<Path>>(
-        runtime_bases: &[P],
-        lang_name: &str,
-        file_name: &str,
-    ) -> LspResult<String> {
-        match Self::find_query_file(runtime_bases, lang_name, file_name) {
-            Some(path) => fs::read_to_string(&path).map_err(|e| {
-                LspError::query(format!(
-                    "Failed to read query file {}: {}",
-                    path.display(),
-                    e
-                ))
-            }),
-            None => Err(LspError::query(format!(
-                "Query file {} not found for language {} in search paths: {}",
-                file_name,
-                lang_name,
-                format_search_paths(runtime_bases)
-            ))),
-        }
+        found
     }
 
     /// Parse a query string with fault tolerance.
@@ -280,7 +325,7 @@ impl QueryLoader {
     pub(crate) fn parse_query(
         language: &Language,
         query_str: &str,
-        used_inheritance: bool,
+        multi_file: bool,
     ) -> ParseResult {
         use crate::language::query_pattern_splitter::split_patterns;
 
@@ -294,7 +339,7 @@ impl QueryLoader {
                 query: Some(query),
                 skipped: Vec::new(),
                 failure_reason: None,
-                used_inheritance,
+                multi_file,
             };
         }
 
@@ -309,7 +354,7 @@ impl QueryLoader {
                     query: None,
                     skipped: Vec::new(),
                     failure_reason: Some(ParseFailure::PatternSplitFailed(reason)),
-                    used_inheritance,
+                    multi_file,
                 };
             }
         };
@@ -339,17 +384,17 @@ impl QueryLoader {
                 query: None,
                 skipped,
                 failure_reason: Some(ParseFailure::AllPatternsInvalid),
-                used_inheritance,
+                multi_file,
             };
         }
 
-        let combined = valid_patterns.join("\n");
-        match Query::new(language, &combined) {
+        let valid_query = valid_patterns.join("\n");
+        match Query::new(language, &valid_query) {
             Ok(q) => ParseResult {
                 query: Some(q),
                 skipped,
                 failure_reason: None,
-                used_inheritance,
+                multi_file,
             },
             Err(e) => {
                 // Defensive: handle the rare case where individually-valid patterns
@@ -363,7 +408,7 @@ impl QueryLoader {
                     query: None,
                     skipped,
                     failure_reason: Some(ParseFailure::CombinationFailed(e.message)),
-                    used_inheritance,
+                    multi_file,
                 }
             }
         }
@@ -372,49 +417,44 @@ impl QueryLoader {
     /// Load and parse a query from explicit paths with fault tolerance.
     ///
     /// Tolerant parsing skips invalid patterns instead of failing the whole query;
-    /// errors only on a missing/unreadable file.
+    /// errors only on a missing/unreadable file. Several paths concatenate in
+    /// the order given, and the result then says so through `multi_file`.
     pub(crate) fn load_query_from_paths<P: AsRef<Path>>(
         language: &Language,
         paths: &[P],
     ) -> LspResult<ParseResult> {
         let query_str = Self::load_content_from_paths(paths)?;
-        Ok(Self::parse_query(language, &query_str, false))
+        Ok(Self::parse_query(language, &query_str, paths.len() > 1))
     }
 
     /// Load and parse a query with inheritance resolution and fault tolerance.
     ///
-    /// Resolves `; inherits:` directives, concatenates parent queries, and skips
-    /// invalid patterns instead of failing the whole query. When inheritance is
-    /// used, line numbers in [`SkippedPattern`] refer to the combined query string,
-    /// not the original source file.
+    /// Resolves `inherits` parents and `extends` overlays across the search
+    /// paths (see [`Self::resolve_query_recursive`]) and skips invalid patterns
+    /// instead of failing the whole query. When more than one file contributes,
+    /// line numbers in [`SkippedPattern`] refer to the combined query string,
+    /// not any one source file.
     pub(crate) fn load_query_with_inheritance<P: AsRef<Path>>(
         language: &Language,
         runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
     ) -> Result<ParseResult, QueryLoadError> {
-        // Load the original file once and pass to resolver to avoid double-loading
-        let Some(path) = Self::find_query_file(runtime_bases, lang_name, file_name) else {
-            return Err(QueryLoadError::NotFound);
-        };
-        let original_content = fs::read_to_string(&path).map_err(|e| {
-            LspError::query(format!(
-                "Failed to read query file {}: {}",
-                path.display(),
-                e
-            ))
-        })?;
-        let used_inheritance = !Self::parse_inherits_directive(&original_content).is_empty();
-
         let mut visited = std::collections::HashSet::new();
-        let query_str = Self::resolve_query_recursive(
+        let mut emitted = std::collections::HashSet::new();
+        let resolved = Self::resolve_query_recursive(
             runtime_bases,
             lang_name,
             file_name,
-            Some(original_content),
+            false,
             &mut visited,
+            &mut emitted,
         )?;
-        Ok(Self::parse_query(language, &query_str, used_inheritance))
+        Ok(Self::parse_query(
+            language,
+            &resolved.content,
+            resolved.file_count > 1,
+        ))
     }
 
     /// Resolve library path for a language.
@@ -481,18 +521,23 @@ impl QueryLoader {
 /// stay readable, whereas the write side may be stricter because the name also
 /// becomes a URL segment. Rejection here is a path-shape decision only; it is
 /// not a charset filter and must not be relied on as one.
+/// Append one file's text so the next file starts on a fresh line and no
+/// line is added that the file did not have: a file's line numbers in the
+/// combined text are then its own plus the lines of what precedes it, which
+/// is what a skipped-pattern warning quotes. An empty file has no lines and
+/// contributes none. `pub(crate)` so the asset tests join sources the same
+/// way and count lines the loader would.
+pub(crate) fn append_file(combined: &mut String, content: &str) {
+    combined.push_str(content);
+    if !content.is_empty() && !content.ends_with('\n') {
+        combined.push('\n');
+    }
+}
+
 fn is_single_path_component(value: &str) -> bool {
     let mut components = Path::new(value).components();
     matches!(components.next(), Some(Component::Normal(name)) if name == value)
         && components.next().is_none()
-}
-
-fn normalize_inherited_language_name(name: &str) -> String {
-    name.strip_prefix('(')
-        .and_then(|name| name.strip_suffix(')'))
-        .unwrap_or(name)
-        .trim()
-        .to_string()
 }
 
 #[cfg(test)]
@@ -503,20 +548,27 @@ mod tests {
 
     const NO_SEARCH_PATHS: &[PathBuf] = &[];
 
-    /// Test helper: resolve query without preloaded content
+    /// Test helper: the combined query text for a language.
     fn resolve_query<P: AsRef<Path>>(
         runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
     ) -> LspResult<String> {
         let mut visited = std::collections::HashSet::new();
+        let mut emitted = std::collections::HashSet::new();
         QueryLoader::resolve_query_recursive(
             runtime_bases,
             lang_name,
             file_name,
-            None,
+            false,
             &mut visited,
+            &mut emitted,
         )
+        .map(|resolved| resolved.content)
+        .map_err(|e| match e {
+            QueryLoadError::Other(e) => e,
+            not_found @ QueryLoadError::NotFound => LspError::query(not_found.to_string()),
+        })
     }
 
     #[test]
@@ -539,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_query_file() {
+    fn test_find_query_files() {
         let dir = tempdir().unwrap();
         let base_path = dir.path().to_str().unwrap().to_string();
 
@@ -552,18 +604,17 @@ mod tests {
         fs::write(&query_file, "(identifier) @variable").unwrap();
 
         // Test finding the file
-        let result = QueryLoader::find_query_file(&[base_path], "rust", "highlights.scm");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), query_file);
+        let result = QueryLoader::find_query_files(&[base_path], "rust", "highlights.scm");
+        assert_eq!(result, vec![query_file]);
 
         // Test not finding a non-existent file
-        let result = QueryLoader::find_query_file(NO_SEARCH_PATHS, "rust", "highlights.scm");
-        assert!(result.is_none());
+        let result = QueryLoader::find_query_files(NO_SEARCH_PATHS, "rust", "highlights.scm");
+        assert!(result.is_empty());
     }
 
     #[cfg(unix)]
     #[test]
-    fn find_query_file_treats_dangling_symlink_as_present_asset() {
+    fn find_query_files_treats_dangling_symlink_as_present_asset() {
         use std::os::unix::fs::symlink;
 
         let dir = tempdir().unwrap();
@@ -573,12 +624,12 @@ mod tests {
         symlink("missing-target.scm", &query_file).unwrap();
 
         assert_eq!(
-            QueryLoader::find_query_file(&[dir.path()], "rust", "highlights.scm"),
-            Some(query_file),
+            QueryLoader::find_query_files(&[dir.path()], "rust", "highlights.scm"),
+            vec![query_file],
             "a broken configured asset must not be classified as ordinary absence"
         );
 
-        let error = QueryLoader::load_query_file(&[dir.path()], "rust", "highlights.scm")
+        let error = resolve_query(&[dir.path()], "rust", "highlights.scm")
             .expect_err("the present-but-broken asset must surface its read failure");
         let message = error.to_string();
         assert!(message.contains("Failed to read query file"), "{message}");
@@ -586,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn find_query_file_rejects_language_path_traversal() {
+    fn find_query_files_rejects_language_path_traversal() {
         let dir = tempdir().unwrap();
         let runtime = dir.path().join("runtime");
         let outside = dir.path().join("outside");
@@ -595,23 +646,23 @@ mod tests {
 
         // `runtime/queries` sits two components below the tempdir root, so the
         // pre-fix join cleaned to exactly the file planted above.
-        let result = QueryLoader::find_query_file(
+        let result = QueryLoader::find_query_files(
             std::slice::from_ref(&runtime),
             "../../outside",
             "highlights.scm",
         );
 
-        assert_eq!(result, None);
+        assert!(result.is_empty());
 
         // An absolute name is the worse variant: `join` discards the base
         // outright, so no `..` arithmetic is needed to escape.
-        let result = QueryLoader::find_query_file(
+        let result = QueryLoader::find_query_files(
             std::slice::from_ref(&runtime),
             outside.to_str().unwrap(),
             "highlights.scm",
         );
 
-        assert_eq!(result, None);
+        assert!(result.is_empty());
 
         // Positive control on the same base: an ordinary name still resolves,
         // so the assertions above pin the gate rather than a broken fixture.
@@ -619,17 +670,18 @@ mod tests {
         fs::create_dir_all(&inside).unwrap();
         fs::write(inside.join("highlights.scm"), "(identifier) @variable").unwrap();
 
-        let result = QueryLoader::find_query_file(&[runtime], "rust", "highlights.scm");
+        let result = QueryLoader::find_query_files(&[runtime], "rust", "highlights.scm");
 
-        assert_eq!(result, Some(inside.join("highlights.scm")));
+        assert_eq!(result, vec![inside.join("highlights.scm")]);
     }
 
     #[test]
     fn resolve_query_rejects_traversing_inherits_parent() {
-        // The parent language name comes from the first line of an on-disk query
-        // file, so it is the content-driven route into find_query_file -- and
-        // parse_inherits_directive, unlike its install-side twin, applies no
-        // filter of its own.
+        // A parent language name comes from a modeline in an on-disk query
+        // file, so it is the content-driven route into the search paths. The
+        // modeline grammar admits only `[a-z0-9_]+` names, and the lookup
+        // itself rejects anything but a single path component; either alone
+        // must keep the smuggled content out of the combined query.
         let dir = tempdir().unwrap();
         let runtime = dir.path().join("runtime");
 
@@ -645,13 +697,16 @@ mod tests {
         )
         .unwrap();
 
-        let result = resolve_query(&[runtime], "child", "highlights.scm");
-
-        // An unresolvable parent fails the whole child query; what matters is
-        // that the smuggled content never reaches the combined output.
+        let content = resolve_query(&[runtime], "child", "highlights.scm")
+            .expect("a traversal-shaped modeline is a comment, and the child loads");
+        assert!(content.contains("@string"));
         assert!(
-            result.is_err(),
-            "expected traversal to fail, got {result:?}"
+            !content.contains("@smuggled"),
+            "content outside queries/ must never reach the combined query:\n{content}"
+        );
+        assert!(
+            QueryLoader::find_query_files(&[dir.path()], "../outside", "highlights.scm").is_empty(),
+            "and the lookup gate holds on its own, without the grammar"
         );
     }
 
@@ -771,6 +826,39 @@ mod tests {
     }
 
     #[test]
+    fn explicit_paths_report_multi_file_only_when_several_are_given() {
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let dir = tempdir().unwrap();
+        let one = dir.path().join("one.scm");
+        let two = dir.path().join("two.scm");
+        fs::write(&one, "(identifier) @variable\n").unwrap();
+        fs::write(&two, "(string_literal) @string\n").unwrap();
+
+        let single = QueryLoader::load_query_from_paths(&language, &[&one]).unwrap();
+        assert!(!single.multi_file, "one file, line numbers are its own");
+        let layered = QueryLoader::load_query_from_paths(&language, &[&one, &two]).unwrap();
+        assert!(
+            layered.multi_file,
+            "a second explicit path shifts line numbers like an overlay does"
+        );
+    }
+
+    #[test]
+    fn explicit_paths_join_on_a_line_boundary_without_blank_lines() {
+        let dir = tempdir().unwrap();
+        let one = dir.path().join("one.scm");
+        let two = dir.path().join("two.scm");
+        fs::write(&one, "(identifier) @variable\n").unwrap();
+        fs::write(&two, "(string_literal) @string").unwrap();
+
+        let content = QueryLoader::load_content_from_paths(&[&one, &two]).unwrap();
+        assert_eq!(
+            content,
+            "(identifier) @variable\n(string_literal) @string\n"
+        );
+    }
+
+    #[test]
     fn test_load_content_from_paths_with_pathbuf() {
         let dir = tempdir().unwrap();
         let file1 = dir.path().join("query1.scm");
@@ -782,13 +870,6 @@ mod tests {
         let result = QueryLoader::load_content_from_paths(&paths).unwrap();
         assert!(result.contains("(identifier) @variable"));
         assert!(result.contains("(string) @string"));
-    }
-
-    #[test]
-    fn parse_inherits_directive_strips_parenthesized_language_names() {
-        let parents = QueryLoader::parse_inherits_directive("; inherits: c, (cpp), (cuda)\n");
-
-        assert_eq!(parents, vec!["c", "cpp", "cuda"]);
     }
 
     /// Create a directory with non-UTF-8 bytes in its name under the given temp dir.
@@ -806,7 +887,7 @@ mod tests {
     #[cfg(unix)]
     #[cfg_attr(target_os = "macos", ignore)]
     #[test]
-    fn test_find_query_file_with_non_utf8_search_path() {
+    fn test_find_query_files_with_non_utf8_search_path() {
         let dir = tempdir().unwrap();
         let non_utf8_base = create_non_utf8_base(&dir);
         let query_dir = non_utf8_base.join("queries").join("rust");
@@ -814,9 +895,9 @@ mod tests {
         fs::write(query_dir.join("highlights.scm"), "(identifier) @variable").unwrap();
 
         let search_paths = vec![non_utf8_base];
-        let result = QueryLoader::find_query_file(&search_paths, "rust", "highlights.scm");
+        let result = QueryLoader::find_query_files(&search_paths, "rust", "highlights.scm");
         assert!(
-            result.is_some(),
+            !result.is_empty(),
             "Should find query file under non-UTF-8 path"
         );
     }
@@ -842,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_query_file_with_path_ref() {
+    fn test_find_query_files_with_path_ref() {
         let dir = tempdir().unwrap();
         let query_dir = dir.path().join("queries").join("rust");
         fs::create_dir_all(&query_dir).unwrap();
@@ -850,8 +931,8 @@ mod tests {
         fs::write(&query_file, "(identifier) @variable").unwrap();
 
         let search_paths: Vec<&Path> = vec![dir.path()];
-        let result = QueryLoader::find_query_file(&search_paths, "rust", "highlights.scm");
-        assert_eq!(result.unwrap(), query_file);
+        let result = QueryLoader::find_query_files(&search_paths, "rust", "highlights.scm");
+        assert_eq!(result, vec![query_file]);
     }
 
     #[test]
@@ -904,46 +985,578 @@ mod tests {
         assert!(result.is_ok(), "Should resolve with PathBuf search paths");
         let parsed = result.unwrap();
         assert!(parsed.query.is_some(), "Should produce a valid query");
-        assert!(parsed.used_inheritance, "Should detect inheritance");
+        assert!(parsed.multi_file, "Should detect inheritance");
+    }
+
+    // Tests for `;; extends` overlays across search paths
+
+    /// Write `<base>/queries/<lang>/highlights.scm` under a fresh base dir.
+    fn write_highlights(base: &Path, lang: &str, content: &str) {
+        let dir = base.join("queries").join(lang);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("highlights.scm"), content).unwrap();
+    }
+
+    fn position(haystack: &str, needle: &str) -> usize {
+        haystack
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} missing from:\n{haystack}"))
+    }
+
+    #[test]
+    fn find_query_files_lists_every_search_path_hit_in_order() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        let third = tempdir().unwrap();
+        write_highlights(first.path(), "rust", "(a) @a\n");
+        write_highlights(third.path(), "rust", "(c) @c\n");
+
+        let bases = [
+            first.path().to_path_buf(),
+            second.path().to_path_buf(),
+            third.path().to_path_buf(),
+        ];
+        let found = QueryLoader::find_query_files(&bases, "rust", "highlights.scm");
+        assert_eq!(
+            found,
+            vec![
+                first.path().join("queries/rust/highlights.scm"),
+                third.path().join("queries/rust/highlights.scm"),
+            ]
+        );
+        assert!(QueryLoader::find_query_files(&bases, "../rust", "highlights.scm").is_empty());
+    }
+
+    /// Neovim runs its runtime hits through `dedupe_files`; without the same,
+    /// a search path listed twice would append every overlay in it twice.
+    #[test]
+    fn a_search_path_listed_twice_contributes_its_overlay_once() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "rust", "(identifier) @base\n");
+        write_highlights(
+            overlay.path(),
+            "rust",
+            ";; extends\n(string_literal) @overlay\n",
+        );
+
+        let bases = [
+            base.path().to_path_buf(),
+            overlay.path().to_path_buf(),
+            overlay.path().join("."),
+        ];
+        let content = resolve_query(&bases, "rust", "highlights.scm").unwrap();
+        assert_eq!(
+            content.matches("@overlay").count(),
+            1,
+            "the same file must not be concatenated twice:\n{content}"
+        );
+    }
+
+    #[test]
+    fn extends_overlay_in_a_later_search_path_is_appended_to_the_base() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "rust", "(identifier) @base\n");
+        write_highlights(
+            overlay.path(),
+            "rust",
+            ";; extends\n(string_literal) @overlay\n",
+        );
+
+        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        let content = resolve_query(&bases, "rust", "highlights.scm").unwrap();
+        assert!(
+            position(&content, "@base") < position(&content, "@overlay"),
+            "the base query comes first, then the overlay:\n{content}"
+        );
+    }
+
+    /// Neovim orders `base, extensions...` regardless of where in the runtime
+    /// path each was found: an overlay stays an overlay even when it sorts
+    /// ahead of the base.
+    #[test]
+    fn extends_overlay_in_an_earlier_search_path_still_follows_the_base() {
+        let overlay = tempdir().unwrap();
+        let base = tempdir().unwrap();
+        write_highlights(
+            overlay.path(),
+            "rust",
+            ";; extends\n(string_literal) @overlay\n",
+        );
+        write_highlights(base.path(), "rust", "(identifier) @base\n");
+
+        let bases = [overlay.path().to_path_buf(), base.path().to_path_buf()];
+        let content = resolve_query(&bases, "rust", "highlights.scm").unwrap();
+        assert!(
+            position(&content, "@base") < position(&content, "@overlay"),
+            "the base query comes first, then the overlay:\n{content}"
+        );
+    }
+
+    #[test]
+    fn a_second_plain_query_is_shadowed_by_the_first() {
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        write_highlights(first.path(), "rust", "(identifier) @first\n");
+        write_highlights(second.path(), "rust", "(identifier) @second\n");
+
+        let bases = [first.path().to_path_buf(), second.path().to_path_buf()];
+        let content = resolve_query(&bases, "rust", "highlights.scm").unwrap();
+        assert!(content.contains("@first"));
+        assert!(
+            !content.contains("@second"),
+            "a plain query in a later search path replaces nothing:\n{content}"
+        );
+
+        let parsed =
+            QueryLoader::load_query_with_inheritance(&language, &bases, "rust", "highlights.scm")
+                .unwrap();
+        assert!(
+            !parsed.multi_file,
+            "a shadowed file contributed nothing, so line numbers are the base file's own"
+        );
+    }
+
+    /// Neovim reads the modeline of every hit, shadowed ones included, so a
+    /// parent named only by the shadowed file is still prepended. This is
+    /// the one way a shadowed file still matters.
+    #[test]
+    fn a_shadowed_plain_query_still_contributes_its_parents() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        write_highlights(first.path(), "rust", "(identifier) @first\n");
+        write_highlights(first.path(), "parent", "(boolean_literal) @parent\n");
+        write_highlights(
+            second.path(),
+            "rust",
+            "; inherits: parent\n(string_literal) @second\n",
+        );
+
+        let bases = [first.path().to_path_buf(), second.path().to_path_buf()];
+        let content = resolve_query(&bases, "rust", "highlights.scm").unwrap();
+        assert!(
+            position(&content, "@parent") < position(&content, "@first"),
+            "the shadowed file's parent still comes first:\n{content}"
+        );
+        assert!(!content.contains("@second"), "{content}");
+    }
+
+    #[test]
+    fn every_extends_overlay_is_appended_in_search_path_order() {
+        let base = tempdir().unwrap();
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        write_highlights(base.path(), "rust", "(identifier) @base\n");
+        write_highlights(first.path(), "rust", ";; extends\n(a) @first\n");
+        write_highlights(second.path(), "rust", ";; extends\n(b) @second\n");
+
+        let bases = [
+            first.path().to_path_buf(),
+            base.path().to_path_buf(),
+            second.path().to_path_buf(),
+        ];
+        let content = resolve_query(&bases, "rust", "highlights.scm").unwrap();
+        let base_at = position(&content, "@base");
+        let first_at = position(&content, "@first");
+        let second_at = position(&content, "@second");
+        assert!(base_at < first_at && first_at < second_at, "{content}");
+    }
+
+    /// Neovim loads a language whose only query files are overlays (its
+    /// `base_query` stays nil and the extensions load alone); so does kakehashi.
+    #[test]
+    fn extends_overlays_load_without_a_base() {
+        let overlay = tempdir().unwrap();
+        write_highlights(overlay.path(), "rust", ";; extends\n(identifier) @only\n");
+
+        let content =
+            resolve_query(&[overlay.path().to_path_buf()], "rust", "highlights.scm").unwrap();
+        assert!(content.contains("@only"));
+    }
+
+    /// Neovim's `add_included_lang` treats `; inherits: rust` inside rust's
+    /// own query file as the `extends` marker, so the file must merge as an
+    /// overlay rather than trip the cycle check and drop the language's query.
+    #[test]
+    fn a_file_that_inherits_its_own_language_is_an_overlay() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "rust", "(identifier) @base\n");
+        write_highlights(
+            overlay.path(),
+            "rust",
+            "; inherits: rust\n(string_literal) @overlay\n",
+        );
+
+        // The self-inheriting file sits first, where a plain file would be the
+        // base: it must still follow the real base as an overlay.
+        let bases = [overlay.path().to_path_buf(), base.path().to_path_buf()];
+        let content = resolve_query(&bases, "rust", "highlights.scm").unwrap();
+        assert!(
+            position(&content, "@base") < position(&content, "@overlay"),
+            "the base query comes first, then the self-inheriting overlay:\n{content}"
+        );
+    }
+
+    /// Every hit must be readable: a broken overlay in a later search path
+    /// fails the language rather than silently loading without it, the same
+    /// "present but broken is not absence" rule the single-hit case follows
+    /// (and what Neovim's `get_files` does — `io.open` failure is an error).
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_overlay_in_a_later_search_path_fails_the_load() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "rust", "(identifier) @base\n");
+        let overlay_dir = overlay.path().join("queries/rust");
+        fs::create_dir_all(&overlay_dir).unwrap();
+        let dangling = overlay_dir.join("highlights.scm");
+        symlink("missing-target.scm", &dangling).unwrap();
+
+        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        let err = resolve_query(&bases, "rust", "highlights.scm")
+            .expect_err("a present-but-broken overlay must surface its read failure");
+        let message = err.to_string();
+        assert!(message.contains("Failed to read query file"), "{message}");
+        assert!(
+            message.contains(&dangling.display().to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn extends_overlay_may_pull_in_inherits_parents() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "parent", "(identifier) @parent\n");
+        write_highlights(base.path(), "child", "(string_literal) @child\n");
+        write_highlights(
+            overlay.path(),
+            "child",
+            ";; extends\n;; inherits: parent\n(boolean_literal) @overlay\n",
+        );
+
+        // Overlay first in the search paths, so the asserted order is not
+        // the search-path order.
+        let bases = [overlay.path().to_path_buf(), base.path().to_path_buf()];
+        let content = resolve_query(&bases, "child", "highlights.scm").unwrap();
+        let parent_at = position(&content, "@parent");
+        let child_at = position(&content, "@child");
+        let overlay_at = position(&content, "@overlay");
+        assert!(
+            parent_at < child_at && child_at < overlay_at,
+            "parents, then base, then overlays:\n{content}"
+        );
+    }
+
+    /// Neovim's `get_files` inherits a parenthesized parent, `(cpp)`, only
+    /// when the file is loaded for its own language; a file reached as a
+    /// parent skips its optional parents, so a chain stops there instead of
+    /// pulling in — or failing on — a grandparent the child never asked for.
+    #[test]
+    fn an_optional_parent_is_inherited_only_at_the_top_of_the_chain() {
+        let base = tempdir().unwrap();
+        write_highlights(base.path(), "cpp", "(identifier) @cpp\n");
+        write_highlights(base.path(), "c", "; inherits: (cpp)\n(string_literal) @c\n");
+        write_highlights(
+            base.path(),
+            "cuda",
+            "; inherits: c\n(boolean_literal) @cuda\n",
+        );
+
+        let bases = [base.path().to_path_buf()];
+        let c = resolve_query(&bases, "c", "highlights.scm").unwrap();
+        assert!(
+            position(&c, "@cpp") < position(&c, "@c\n"),
+            "loaded for itself, c inherits (cpp):\n{c}"
+        );
+        let cuda = resolve_query(&bases, "cuda", "highlights.scm").unwrap();
+        assert!(
+            !cuda.contains("@cpp"),
+            "reached as a parent, c skips its optional (cpp):\n{cuda}"
+        );
+        assert!(position(&cuda, "@c\n") < position(&cuda, "@cuda"), "{cuda}");
+
+        // The skipped grandparent need not even exist for the child to load.
+        fs::remove_file(base.path().join("queries/cpp/highlights.scm")).unwrap();
+        assert!(resolve_query(&bases, "cuda", "highlights.scm").is_ok());
+        assert!(resolve_query(&bases, "c", "highlights.scm").is_err());
+    }
+
+    /// Neovim skips a parenthesized entry of an inherited file before
+    /// looking at it, so `; inherits: (c)` in c's own file marks an overlay
+    /// when c is loaded for itself but not when c is reached as a parent —
+    /// there the file is c's base, shadowing a plain c in a later path.
+    #[test]
+    fn an_optional_self_name_marks_an_overlay_only_at_the_top_of_the_chain() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        write_highlights(first.path(), "c", "; inherits: (c)\n(identifier) @first\n");
+        write_highlights(second.path(), "c", "(string_literal) @second\n");
+        write_highlights(
+            second.path(),
+            "cuda",
+            "; inherits: c\n(boolean_literal) @cuda\n",
+        );
+
+        let bases = [first.path().to_path_buf(), second.path().to_path_buf()];
+        let c = resolve_query(&bases, "c", "highlights.scm").unwrap();
+        assert!(
+            position(&c, "@second") < position(&c, "@first"),
+            "loaded for itself, the self-naming file is an overlay on the plain one:\n{c}"
+        );
+        let cuda = resolve_query(&bases, "cuda", "highlights.scm").unwrap();
+        assert!(cuda.contains("@first"), "{cuda}");
+        assert!(
+            !cuda.contains("@second"),
+            "reached as a parent, the self-naming file is c's base and shadows the other:\n{cuda}"
+        );
+    }
+
+    /// A base and an overlay may inherit different parents that share an
+    /// ancestor; that ancestor's patterns must not be compiled twice.
+    #[test]
+    fn a_shared_ancestor_of_base_and_overlay_parents_is_concatenated_once() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "shared", "(identifier) @shared\n");
+        write_highlights(
+            base.path(),
+            "a",
+            "; inherits: shared\n(string_literal) @a\n",
+        );
+        write_highlights(
+            base.path(),
+            "b",
+            "; inherits: shared\n(raw_string_literal) @b\n",
+        );
+        write_highlights(
+            base.path(),
+            "child",
+            "; inherits: a\n(boolean_literal) @child\n",
+        );
+        write_highlights(
+            overlay.path(),
+            "child",
+            ";; extends\n;; inherits: b\n(integer_literal) @overlay\n",
+        );
+
+        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        let content = resolve_query(&bases, "child", "highlights.scm").unwrap();
+        assert_eq!(content.matches("@shared").count(), 1, "{content}");
+        for capture in ["@a", "@b", "@child", "@overlay"] {
+            assert_eq!(content.matches(capture).count(), 1, "{capture}:\n{content}");
+        }
+    }
+
+    /// Files join on a line boundary and nothing else: a file that ends in
+    /// a newline gets no blank line after it, one that does not gets exactly
+    /// the newline it lacks, so every line number in the combined text is the
+    /// file's own offset by the lines before it.
+    #[test]
+    fn files_join_on_a_line_boundary_without_blank_lines() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "parent", "(identifier) @parent\n");
+        write_highlights(
+            base.path(),
+            "child",
+            "; inherits: parent\n(string_literal) @child",
+        );
+        write_highlights(
+            overlay.path(),
+            "child",
+            ";; extends\n(boolean_literal) @overlay\n",
+        );
+
+        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        let content = resolve_query(&bases, "child", "highlights.scm").unwrap();
+        assert_eq!(
+            content,
+            "(identifier) @parent\n; inherits: parent\n(string_literal) @child\n;; extends\n(boolean_literal) @overlay\n"
+        );
+
+        // An empty parent has no lines and must not push the child down one.
+        write_highlights(base.path(), "parent", "");
+        let content = resolve_query(&bases, "child", "highlights.scm").unwrap();
+        assert_eq!(
+            content,
+            "; inherits: parent\n(string_literal) @child\n;; extends\n(boolean_literal) @overlay\n"
+        );
+    }
+
+    /// An entry skipped as optional is never entered into the parent list,
+    /// so a later file naming the same parent bare still has it followed —
+    /// in either file order, and however the language is reached.
+    #[test]
+    fn an_optional_entry_in_one_file_does_not_suppress_a_bare_one_in_another() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        write_highlights(second.path(), "cpp", "(identifier) @cpp\n");
+        write_highlights(
+            first.path(),
+            "c",
+            ";; extends\n;; inherits: (cpp)\n(string_literal) @overlay\n",
+        );
+        write_highlights(
+            second.path(),
+            "c",
+            "; inherits: cpp\n(boolean_literal) @base\n",
+        );
+        write_highlights(
+            second.path(),
+            "cuda",
+            "; inherits: c\n(integer_literal) @cuda\n",
+        );
+
+        let bases = [first.path().to_path_buf(), second.path().to_path_buf()];
+        for lang in ["c", "cuda"] {
+            let content = resolve_query(&bases, lang, "highlights.scm").unwrap();
+            assert_eq!(
+                content.matches("@cpp").count(),
+                1,
+                "{lang}: the base's bare `cpp` is followed once:\n{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parent_named_by_both_base_and_overlay_is_concatenated_once() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "parent", "(identifier) @parent\n");
+        write_highlights(
+            base.path(),
+            "child",
+            "; inherits: parent\n(string_literal) @child\n",
+        );
+        write_highlights(
+            overlay.path(),
+            "child",
+            ";; extends\n;; inherits: parent\n(boolean_literal) @overlay\n",
+        );
+
+        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        let content = resolve_query(&bases, "child", "highlights.scm").unwrap();
+        assert_eq!(
+            content.matches("@parent").count(),
+            1,
+            "one parent, however many files name it:\n{content}"
+        );
+    }
+
+    #[test]
+    fn an_inherited_parent_brings_its_own_extends_overlays() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "parent", "(identifier) @parent\n");
+        write_highlights(
+            base.path(),
+            "child",
+            "; inherits: parent\n(string_literal) @child\n",
+        );
+        write_highlights(
+            overlay.path(),
+            "parent",
+            ";; extends\n(boolean_literal) @parent_overlay\n",
+        );
+
+        // Overlay first in the search paths, so the asserted order is not
+        // the search-path order.
+        let bases = [overlay.path().to_path_buf(), base.path().to_path_buf()];
+        let content = resolve_query(&bases, "child", "highlights.scm").unwrap();
+        let parent_at = position(&content, "@parent\n");
+        let parent_overlay_at = position(&content, "@parent_overlay");
+        let child_at = position(&content, "@child");
+        assert!(
+            parent_at < parent_overlay_at && parent_overlay_at < child_at,
+            "a parent resolves with its overlays before the child:\n{content}"
+        );
+    }
+
+    #[test]
+    fn multi_file_flag_reports_any_multi_file_query() {
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "alone", "(identifier) @variable\n");
+        write_highlights(base.path(), "extended", "(identifier) @variable\n");
+        write_highlights(
+            overlay.path(),
+            "extended",
+            ";; extends\n(string_literal) @string\n",
+        );
+
+        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        let alone =
+            QueryLoader::load_query_with_inheritance(&language, &bases, "alone", "highlights.scm")
+                .unwrap();
+        assert!(!alone.multi_file, "one file, line numbers are the file's");
+        let extended = QueryLoader::load_query_with_inheritance(
+            &language,
+            &bases,
+            "extended",
+            "highlights.scm",
+        )
+        .unwrap();
+        assert!(
+            extended.multi_file,
+            "an overlay shifts line numbers like a parent does"
+        );
+        assert!(extended.query.is_some());
+    }
+
+    /// With a base and any number of overlays each allowed to name parents,
+    /// the error for a parent that does not exist must say which file named
+    /// it, or a typo in one overlay sends the reader through every file.
+    #[test]
+    fn a_missing_parent_is_reported_against_the_file_that_named_it() {
+        let base = tempdir().unwrap();
+        let overlay = tempdir().unwrap();
+        write_highlights(base.path(), "rust", "(identifier) @base\n");
+        write_highlights(
+            overlay.path(),
+            "rust",
+            ";; extends\n;; inherits: rsut\n(string_literal) @overlay\n",
+        );
+
+        let bases = [base.path().to_path_buf(), overlay.path().to_path_buf()];
+        let err = resolve_query(&bases, "rust", "highlights.scm").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("not found for language rsut"), "{message}");
+        assert!(
+            message.contains(&format!(
+                "inherited by rust in {}",
+                overlay.path().join("queries/rust/highlights.scm").display()
+            )),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn missing_query_is_not_found_even_when_the_search_path_holds_other_languages() {
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let base = tempdir().unwrap();
+        write_highlights(base.path(), "other", "(identifier) @variable\n");
+
+        let result = QueryLoader::load_query_with_inheritance(
+            &language,
+            &[base.path().to_path_buf()],
+            "rust",
+            "highlights.scm",
+        );
+        assert!(matches!(result, Err(QueryLoadError::NotFound)));
     }
 
     // Tests for query inheritance
 
     #[test]
-    fn test_parse_inherits_directive_single() {
-        // TypeScript inherits from ecma
-        let content = "; inherits: ecma\n\n\"require\" @keyword.import\n";
-        let result = QueryLoader::parse_inherits_directive(content);
-        assert_eq!(result, vec!["ecma"]);
-    }
-
-    #[test]
-    fn test_parse_inherits_directive_multiple() {
-        // JavaScript inherits from ecma and jsx
-        let content = "; inherits: ecma,jsx\n\n(identifier) @variable\n";
-        let result = QueryLoader::parse_inherits_directive(content);
-        assert_eq!(result, vec!["ecma", "jsx"]);
-    }
-
-    #[test]
-    fn test_parse_inherits_directive_none() {
-        // ecma has no inheritance
-        let content = "(identifier) @variable\n";
-        let result = QueryLoader::parse_inherits_directive(content);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_parse_inherits_directive_with_spaces() {
-        // Handle spaces around language names
-        let content = "; inherits: ecma , jsx\n";
-        let result = QueryLoader::parse_inherits_directive(content);
-        assert_eq!(result, vec!["ecma", "jsx"]);
-    }
-
-    #[test]
     fn test_resolve_query_no_inheritance() {
-        // ecma has no inheritance - should return content as-is
+        // ecma has no inheritance - the content is the file's own
         let dir = tempdir().unwrap();
 
         // Create ecma query
@@ -1030,36 +1643,42 @@ mod tests {
             result.err()
         );
         let content = result.unwrap();
-        assert!(content.contains("(identifier) @shared"));
+        assert_eq!(
+            content.matches("(identifier) @shared").count(),
+            1,
+            "a shared ancestor is concatenated once, not once per path to it:\n{content}"
+        );
         assert!(content.contains("(string_literal) @parent_a"));
         assert!(content.contains("(raw_string_literal) @parent_b"));
         assert!(content.contains("(boolean_literal) @child"));
     }
 
     #[test]
-    fn test_resolve_query_removes_directive() {
-        // The "; inherits:" line should be removed from output
+    fn test_resolve_query_keeps_the_modeline_as_an_inert_comment() {
+        // Nothing needs to strip the directive: tree-sitter reads a `;` line
+        // as a comment, and leaving it keeps the child's line numbers intact.
         let dir = tempdir().unwrap();
 
-        // Create ecma query
         let ecma_dir = dir.path().join("queries").join("ecma");
         fs::create_dir_all(&ecma_dir).unwrap();
         fs::write(ecma_dir.join("highlights.scm"), "(identifier) @variable\n").unwrap();
 
-        // Create typescript query with inherits
         let ts_dir = dir.path().join("queries").join("typescript");
         fs::create_dir_all(&ts_dir).unwrap();
         fs::write(
             ts_dir.join("highlights.scm"),
-            "; inherits: ecma\n\"require\" @keyword\n",
+            "; inherits: ecma\n(string_literal) @string\n",
         )
         .unwrap();
 
-        let result = resolve_query(&[dir.path().to_path_buf()], "typescript", "highlights.scm");
-        let content = result.unwrap();
-
-        // The inherits directive should not be in the output
-        assert!(!content.contains("; inherits:"));
+        let content =
+            resolve_query(&[dir.path().to_path_buf()], "typescript", "highlights.scm").unwrap();
+        assert!(content.contains("; inherits: ecma"));
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        assert!(
+            tree_sitter::Query::new(&language, &content).is_ok(),
+            "the directive must compile away as a comment"
+        );
     }
 
     #[test]
@@ -1096,12 +1715,6 @@ mod tests {
         assert!(
             content.contains("@keyword.import"),
             "Should contain typescript patterns"
-        );
-
-        // Should NOT have the inherits directive
-        assert!(
-            !content.contains("; inherits:"),
-            "Should strip inherits directive"
         );
     }
 
@@ -1168,12 +1781,6 @@ mod tests {
         assert!(
             content.contains("@variable.parameter"),
             "Should contain javascript patterns"
-        );
-
-        // Should NOT have the inherits directive
-        assert!(
-            !content.contains("; inherits:"),
-            "Should strip inherits directive"
         );
     }
 
