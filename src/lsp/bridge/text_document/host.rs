@@ -125,6 +125,9 @@ async fn resync_open_host_document<S: MessageSender>(
 /// to [`sync_host_document`], which evaluates it under the `host_documents` lock
 /// so a late task sends the latest text rather than a stale snapshot (#422).
 pub(crate) type HostTextReader = Arc<dyn Fn() -> Option<(Arc<str>, u64)> + Send + Sync>;
+/// A borrowed [`HostTextReader`], for the sync paths that take one by
+/// reference.
+pub(crate) type HostTextReaderRef<'a> = &'a (dyn Fn() -> Option<(Arc<str>, u64)> + Send + Sync);
 
 /// Open or re-sync the host document on a downstream server, mutating the
 /// pool's sync-state map in place.
@@ -158,7 +161,7 @@ pub(super) async fn sync_host_document<S: MessageSender>(
     sender: &mut S,
     docs: &mut std::collections::HashMap<(String, ConnectionKey), HostDocSyncState>,
     doc: &HostDocument<'_>,
-    live_text_reader: Option<&(dyn Fn() -> Option<(Arc<str>, u64)> + Send + Sync)>,
+    live_text_reader: Option<HostTextReaderRef<'_>>,
     connection_key: &ConnectionKey,
 ) -> io::Result<()> {
     let uri_lsp = host_url_to_lsp_uri(doc.uri)?;
