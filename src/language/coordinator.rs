@@ -886,12 +886,16 @@ impl LanguageCoordinator {
         {
             return false;
         }
+        // Queries BEFORE the parser: `has_parser_available` reads the registry
+        // without this lock, so a parse admitted the instant the parser lands
+        // would otherwise run its injection pass against a store the queries
+        // have not reached yet and record the document as injection-free.
+        self.query_store.remove_queries(language_id);
+        publish_queries();
         self.language_registry
             .register(language_id.to_string(), language);
         self.reload_scoped_registrations
             .insert(language_id.to_string(), expected_generation);
-        self.query_store.remove_queries(language_id);
-        publish_queries();
         true
     }
 
@@ -1610,11 +1614,13 @@ impl LanguageCoordinator {
                 }
             }
         };
+        // Queries BEFORE the parser, for the same reason as
+        // `publish_dynamic_language`: a reader that finds the parser must find
+        // its queries.
+        let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
         if !pre_registered_is_builtin {
             self.register_configured_language(lang_name, language.clone());
         }
-
-        let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
             format!("Language {lang_name} loaded."),
