@@ -5,8 +5,12 @@
 //!
 //! The structure mirrors `lsp_impl/text_document/` for consistency.
 
+mod call_hierarchy;
 mod code_action;
 mod code_lens;
+pub(crate) use call_hierarchy::{
+    CallHierarchyDocumentRevision, envelope_host_call_hierarchy_items,
+};
 mod color_presentation;
 
 pub(crate) use code_action::{

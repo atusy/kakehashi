@@ -87,6 +87,7 @@ impl LanguageServerPool {
             &offset,
             virtual_content,
             upstream_request_id,
+            None,
             move |virtual_uri, request_id| {
                 build_range_formatting_request(
                     virtual_uri,

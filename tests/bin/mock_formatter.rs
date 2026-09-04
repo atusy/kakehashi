@@ -73,6 +73,8 @@
 //!   `documentLinkProvider` with `resolveProvider: false` and answer with a
 //!   link carrying opaque `data`: an ordinary payload, and one that occupies
 //!   the reserved `kakehashi` key.
+//! - `call-hierarchy-prepare` — advertises `callHierarchyProvider` and returns
+//!   one preparation item that echoes the requested document URI.
 //! - `document-link` / `document-link-resolve` / `document-link-resolve-replacement` — advertise
 //!   `textDocument/documentLink` with one link whose tooltip identifies the
 //!   requested URI. The resolve mode initially returns data only and materializes
@@ -222,6 +224,10 @@ fn main() {
                     "definition" => json!({
                         "definitionProvider": true,
                         "hoverProvider": true,
+                        "textDocumentSync": 1
+                    }),
+                    "call-hierarchy-prepare" => json!({
+                        "callHierarchyProvider": true,
                         "textDocumentSync": 1
                     }),
                     "code-lens" | "code-lens-replacement" | "code-lens-slow-resolve" => json!({
@@ -1554,6 +1560,34 @@ fn main() {
                                 "newText": "existing "
                             }],
                             "data": data
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "textDocument/prepareCallHierarchy" => {
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        let position = message.pointer("/params/position").map(|position| {
+                            format!("{}:{}", position["line"], position["character"])
+                        });
+                        json!([{
+                            "name": "mock-call",
+                            "detail": position,
+                            "kind": 12,
+                            "uri": uri,
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 5 }
+                            },
+                            "selectionRange": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 4 }
+                            },
+                            "data": { "mock": "call-item" }
                         }])
                     })
                     .unwrap_or(Value::Null);

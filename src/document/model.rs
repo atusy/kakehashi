@@ -10,6 +10,7 @@ pub(crate) struct DocumentSnapshot {
     text: Arc<str>,
     tree: Tree,
     incarnation: u64,
+    content_version: u64,
 }
 
 impl DocumentSnapshot {
@@ -32,6 +33,10 @@ impl DocumentSnapshot {
 
     pub(crate) fn incarnation(&self) -> u64 {
         self.incarnation
+    }
+
+    pub(crate) fn content_version(&self) -> u64 {
+        self.content_version
     }
 }
 
@@ -242,6 +247,7 @@ impl Document {
             text: self.text.clone(),
             tree: self.tree.as_ref()?.clone(),
             incarnation: self.incarnation,
+            content_version: self.content_version,
         })
     }
 

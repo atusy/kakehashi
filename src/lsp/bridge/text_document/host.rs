@@ -384,8 +384,56 @@ impl LanguageServerPool {
         server_config: &BridgeServerConfig,
         doc: &HostDocument<'_>,
         method: &'static str,
+        params: serde_json::Value,
+        upstream_request_id: Option<UpstreamId>,
+    ) -> io::Result<Option<HostRawResponse>> {
+        self.send_host_raw_request_inner(
+            server_name,
+            server_config,
+            doc,
+            method,
+            params,
+            upstream_request_id,
+            None,
+        )
+        .await
+    }
+
+    /// Variant of [`Self::send_host_raw_request`] that rejects a request if
+    /// the host document was closed and reopened after its source snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_host_raw_request_for_incarnation(
+        &self,
+        server_name: &str,
+        server_config: &BridgeServerConfig,
+        doc: &HostDocument<'_>,
+        method: &'static str,
+        params: serde_json::Value,
+        upstream_request_id: Option<UpstreamId>,
+        expected_incarnation: u64,
+    ) -> io::Result<Option<HostRawResponse>> {
+        self.send_host_raw_request_inner(
+            server_name,
+            server_config,
+            doc,
+            method,
+            params,
+            upstream_request_id,
+            Some(expected_incarnation),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_host_raw_request_inner(
+        &self,
+        server_name: &str,
+        server_config: &BridgeServerConfig,
+        doc: &HostDocument<'_>,
+        method: &'static str,
         mut params: serde_json::Value,
         upstream_request_id: Option<UpstreamId>,
+        expected_incarnation: Option<u64>,
     ) -> io::Result<Option<HostRawResponse>> {
         strip_progress_tokens(&mut params);
         let handle = self
@@ -405,6 +453,7 @@ impl LanguageServerPool {
                 handle,
                 doc,
                 upstream_request_id,
+                expected_incarnation,
                 |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
                 move |response, incarnation, connection_generation| {
                     (
@@ -454,6 +503,7 @@ impl LanguageServerPool {
             handle,
             doc,
             upstream_request_id,
+            None,
             |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
             // The parser promotes error responses, missing results, and
             // malformed payloads to `Err` (request failure) — mirrors
@@ -535,6 +585,7 @@ impl LanguageServerPool {
                 handle,
                 doc,
                 upstream_request_id,
+                None,
                 |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
                 move |response, _incarnation, _connection_generation| {
                     if response_has_jsonrpc_error(&response, method) {
@@ -572,13 +623,20 @@ impl LanguageServerPool {
         handle: Arc<ConnectionHandle>,
         doc: &HostDocument<'_>,
         upstream_request_id: Option<UpstreamId>,
+        expected_incarnation: Option<u64>,
         build_request: impl FnOnce(RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, u64, u64) -> T,
     ) -> io::Result<T> {
         // Route per-connection state by this handle's pool key (#382).
         let connection_key = handle.key();
         self.wait_for_host_routing(doc.uri).await;
-        let host_lifecycle = self.request_host_lifecycle(doc.uri).await?;
+        let host_lifecycle = match expected_incarnation {
+            Some(expected) => {
+                self.request_host_lifecycle_for_incarnation(doc.uri, expected)
+                    .await?
+            }
+            None => self.request_host_lifecycle(doc.uri).await?,
+        };
         if self.is_host_routing_suppressed(doc.uri, connection_key) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,

@@ -244,6 +244,10 @@ pub(crate) struct PositionRequestContext {
     pub(crate) document: DocumentRequestContext,
     /// The cursor position within the document.
     pub(crate) position: Position,
+    /// Open-document lifetime of the snapshot that produced the region.
+    pub(crate) incarnation: u64,
+    /// Input revision of the snapshot that produced the region.
+    pub(crate) content_version: u64,
 }
 
 /// Document context plus a range.
@@ -265,6 +269,8 @@ struct PreambleResult {
     /// End-of-content derived for the bounds precheck, carried so no later
     /// stage re-derives it.
     region_end: Position,
+    incarnation: u64,
+    content_version: u64,
 }
 
 fn resolve_bridge_language_config_from_settings(
@@ -991,6 +997,8 @@ impl Kakehashi {
                 language_name,
                 upstream_request_id,
                 region_end,
+                incarnation: snapshot.incarnation(),
+                content_version: snapshot.content_version(),
             },
             position,
             range_end,
@@ -1586,11 +1594,18 @@ impl Kakehashi {
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
         let (preamble, position, _) =
             self.resolve_bridge_preamble(lsp_uri, position, None, method_name)?;
+        let incarnation = preamble.incarnation;
+        let content_version = preamble.content_version;
         let document = self
             .preamble_to_document_context(preamble, method_name)
             .await?;
 
-        Some(PositionRequestContext { document, position })
+        Some(PositionRequestContext {
+            document,
+            position,
+            incarnation,
+            content_version,
+        })
     }
 
     /// Wait for / on-demand the document's tree before a sync bridge-preamble
@@ -1728,6 +1743,8 @@ impl Kakehashi {
                 resolved,
                 language_name: language_name.clone(),
                 upstream_request_id: upstream_request_id.clone(),
+                incarnation: snapshot.incarnation(),
+                content_version: snapshot.content_version(),
             };
             // A region that resolves to no bridge config contributes nothing.
             let Some(document) = self
