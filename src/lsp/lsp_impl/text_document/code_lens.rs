@@ -86,6 +86,9 @@ impl Kakehashi {
             return Ok(lens);
         }
 
+        // Kept for the post-response check; the gate above returns `lens`
+        // itself, so only a resolve that is actually dispatched pays for it.
+        let unresolved = lens.clone();
         let settings = self.settings_manager.load_settings();
         let pool = self.bridge.pool_arc();
         let upstream_id = current_upstream_id();
@@ -96,13 +99,28 @@ impl Kakehashi {
             std::sync::Arc::clone(&pool),
             sweep_id,
         );
-        match cancel_rx {
+        let resolved = match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
                 _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
                 lens = dispatch => Ok(lens),
             },
             None => Ok(dispatch.await),
+        }?;
+        // A didClose/didOpen is allowed to proceed once the resolve was
+        // enqueued. Revalidate the lifetime after the response so a command
+        // or target resolved for the closed document is not surfaced into the
+        // reopened one.
+        if let Ok(host_url) = url::Url::parse(&envelope.host_uri)
+            && !self.host_incarnation_is_current(&host_url, envelope.incarnation)
+        {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "codeLens/resolve: {} was reopened while resolving; returning lens unresolved",
+                envelope.host_uri
+            );
+            return Ok(unresolved);
         }
+        Ok(resolved)
     }
 }
