@@ -1140,12 +1140,12 @@ mod tests {
         );
     }
 
-    /// The text is compared by allocation identity, not content: a parse that
-    /// read a different `Arc<str>` with the same bytes did not read the
-    /// document's own text, so its tree is not attached — while the snapshot,
-    /// judged only by the cell's admission rule, still publishes.
+    /// Currency is judged by the snapshot's own stamps — its version and
+    /// lifetime against the document's — not by which allocation the parse
+    /// read: within a lifetime one content version has one text, so a parse
+    /// of equal bytes from another allocation is the current parse.
     #[test]
-    fn install_parse_compares_the_text_by_identity_not_content() {
+    fn install_parse_judges_currency_by_version_not_text_identity() {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///identity.md").unwrap();
         let text = "# doc\n";
@@ -1175,15 +1175,12 @@ mod tests {
         assert_eq!(
             outcome,
             ParseInstall {
-                attached: false,
+                attached: true,
                 published: true
             },
-            "equal bytes from another allocation are not the document's text"
+            "same version, same lifetime: the current parse, whichever allocation it read"
         );
-        assert!(
-            store.get(&uri).unwrap().tree().is_some(),
-            "readers see the published current tree regardless of the legacy attach"
-        );
+        assert!(store.get(&uri).unwrap().tree().is_some());
     }
 
     /// A parse that found a language but produced no tree still records the
