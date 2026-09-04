@@ -11,7 +11,9 @@
 //! translation nor a resolve gate can disagree with goto on the same region.
 //! The region's content-precise host end and contiguity are returned
 //! alongside so an edit translator can reject a range that escapes the
-//! region or targets a combined document with masked host gaps.
+//! region or targets a combined document with masked host gaps. The
+//! revision and incarnation gates the completion and code action resolves
+//! share live here too.
 //!
 //! [`ShowDocumentTranslator`]: super::show_document_translation::ShowDocumentTranslator
 //! [`ApplyEditTranslator`]: super::apply_edit_translation::ApplyEditTranslator

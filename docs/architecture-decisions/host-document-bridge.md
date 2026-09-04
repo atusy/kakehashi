@@ -94,6 +94,15 @@ Partially implemented:
   non-contiguous combined injections fail soft before dispatch because a lazy
   edit could otherwise cross a masked host-only gap. Safe resolves apply the
   same all-or-nothing edit guard as initial hint retrieval.
+  `completionItem/resolve` and `codeAction/resolve` carry and check the same
+  revision and incarnation stamps, before dispatch and after the reply; every
+  host-layer producer (completion, codeAction, codeLens, documentLink,
+  inlayHint) stamps its items with the incarnation and revision the host
+  text was read under, from one store read, and discards a reply the
+  downstream synchronized under another incarnation. Every resolve gate waits
+  for the document's current parse before rebuilding the region, so a resolve
+  issued during the post-edit reparse is judged by its stamps, not by parse
+  timing.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one
