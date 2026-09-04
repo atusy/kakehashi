@@ -1772,6 +1772,21 @@ fn spawn_upstream_request(
                         else {
                             continue;
                         };
+                        let Some(injections) = injections else {
+                            // The host language's injection query is not in
+                            // the store right now (a lazy load or a reload
+                            // still swapping queries in): this pass could not
+                            // look, which is not "nothing to repair". Report
+                            // the connection incomplete; the parse that
+                            // follows the query's arrival re-opens eagerly.
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "Re-open of {key}: {host} has no injection query loaded yet; \
+                                 reporting the connection incomplete"
+                            );
+                            repaired = false;
+                            continue;
+                        };
                         if injections.is_empty() {
                             // Empty means one of two very different things: this
                             // host genuinely has no region for this server, or

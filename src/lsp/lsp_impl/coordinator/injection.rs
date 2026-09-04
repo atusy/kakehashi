@@ -105,11 +105,15 @@ impl InjectionCoordinator {
     ///
     /// Lock safety: the document store lock is held only long enough to clone the
     /// tree and text, then released before the tree traversal — no DashMap deadlock risk.
+    /// `None` when the host language's injection query is not in the store
+    /// — a lazy load or a reload still swapping queries in — so the caller
+    /// can tell "could not look" from "looked and found none": the re-open
+    /// sweep must not report a document repaired on the former.
     pub(crate) fn resolve_injection_data(
         &self,
         uri: &Url,
         host_language: &str,
-    ) -> Vec<BridgeInjection> {
+    ) -> Option<Vec<BridgeInjection>> {
         // Fast path (parse-snapshot ADR §3, never discover twice): the parse
         // pass that scheduled this downstream already derived the bridge
         // regions from its single injection-query run and published them on
@@ -127,25 +131,25 @@ impl InjectionCoordinator {
             // query would not discover. Mismatch falls back inline below.
             && *stamped_generation == self.cache.semantic_token_generation()
         {
-            return bridge_regions
-                .iter()
-                .map(|region| BridgeInjection {
-                    language: region.language.clone(),
-                    region_id: region.region_id.clone(),
-                    content: region.content.clone(),
-                })
-                .collect();
+            return Some(
+                bridge_regions
+                    .iter()
+                    .map(|region| BridgeInjection {
+                        language: region.language.clone(),
+                        region_id: region.region_id.clone(),
+                        content: region.content.clone(),
+                    })
+                    .collect(),
+            );
         }
 
-        let Some(injection_query) = self.language.injection_query(host_language) else {
-            return Vec::new();
-        };
+        let injection_query = self.language.injection_query(host_language)?;
 
         let Some(doc) = self.documents.get(uri) else {
-            return Vec::new();
+            return Some(Vec::new());
         };
         let Some(tree) = doc.tree().cloned() else {
-            return Vec::new();
+            return Some(Vec::new());
         };
         let text = doc.text_arc();
         let incarnation = doc.incarnation();
@@ -154,28 +158,30 @@ impl InjectionCoordinator {
         let Some(regions) =
             collect_all_injections(&tree.root_node(), &text, Some(injection_query.as_ref()))
         else {
-            return Vec::new();
+            return Some(Vec::new());
         };
 
         if regions.is_empty() {
-            return Vec::new();
+            return Some(Vec::new());
         }
 
-        InjectionResolver::resolve_from_regions(
-            &self.language,
-            self.bridge.node_tracker(),
-            uri,
-            &regions,
-            &text,
-            incarnation,
+        Some(
+            InjectionResolver::resolve_from_regions(
+                &self.language,
+                self.bridge.node_tracker(),
+                uri,
+                &regions,
+                &text,
+                incarnation,
+            )
+            .into_iter()
+            .map(|region| BridgeInjection {
+                language: region.injection_language,
+                region_id: region.region.region_id,
+                content: region.virtual_content,
+            })
+            .collect(),
         )
-        .into_iter()
-        .map(|region| BridgeInjection {
-            language: region.injection_language,
-            region_id: region.region.region_id,
-            content: region.virtual_content,
-        })
-        .collect()
     }
 
     /// Process injected languages: resolve injection data, optionally forward didChange,
@@ -240,7 +246,11 @@ impl InjectionCoordinator {
             self.bridge.cancel_eager_open(uri);
             return false;
         };
-        let injections = self.resolve_injection_data(uri, &host_language);
+        // `None` (query not loaded yet) opens nothing now; the parse that
+        // follows the query's arrival re-runs this eager open.
+        let injections = self
+            .resolve_injection_data(uri, &host_language)
+            .unwrap_or_default();
         if injections.is_empty() {
             self.bridge.cancel_eager_open(uri);
             return true;
@@ -517,7 +527,13 @@ impl InjectionCoordinator {
     /// when the document has no detectable language. Lets a caller re-derive the
     /// injected regions on demand (the respawn re-open), mirroring the
     /// didOpen/didChange discovery.
-    pub(crate) fn bridge_injections(&self, uri: &Url) -> Option<(String, Vec<BridgeInjection>)> {
+    /// The inner `None` means the host language's injection query is not in
+    /// the store right now: the document could not be looked at, which is
+    /// not the same as having no injections.
+    pub(crate) fn bridge_injections(
+        &self,
+        uri: &Url,
+    ) -> Option<(String, Option<Vec<BridgeInjection>>)> {
         let host_language = self.get_language_for_document(uri)?;
         let injections = self.resolve_injection_data(uri, &host_language);
         Some((host_language, injections))
@@ -888,7 +904,9 @@ mod tests {
             assert!(landed, "test publish must land");
         };
         publish(None, content_version);
-        let inline = injection.resolve_injection_data(&uri, "rust");
+        let inline = injection
+            .resolve_injection_data(&uri, "rust")
+            .expect("query present");
         assert_eq!(inline.len(), 1, "combined captures form one eager document");
 
         // FAST PATH: populate derives the bridge regions from the same tree
@@ -916,7 +934,9 @@ mod tests {
             Some((populated.generation, std::sync::Arc::new(bridge_regions))),
             content_version,
         );
-        let fast = injection.resolve_injection_data(&uri, "rust");
+        let fast = injection
+            .resolve_injection_data(&uri, "rust")
+            .expect("query present");
 
         assert_eq!(
             inline.len(),
