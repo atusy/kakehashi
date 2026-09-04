@@ -460,7 +460,10 @@ the installer kills when the deadline fires, with an in-subprocess watchdog that
 group-kills the compile even if the parent dies first. Readers wait on the
 `(incarnation, ticket)` epoch watermark rather than on tree presence. Every tree
 write is the one non-inserting `install_parse`: the cell admits a snapshot only
-for the captured incarnation and a newer version, the reparse's language check
+for the captured incarnation and a newer version — or the same version when the
+incoming snapshot brings a tree the held one lacks, which is how a reparse fills
+in a reload placeholder or a give-up snapshot instead of leaving the document
+tree-less until the next edit — the reparse's language check
 rejects a relabelled document, and the watermark advance is incarnation-guarded, so a
 close-then-reopen during an in-flight parse fails its epoch check at the write
 rather than resurrecting the closed document. Injection orchestration runs

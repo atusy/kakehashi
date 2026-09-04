@@ -1231,7 +1231,7 @@ print("hello")
     /// Regression (parse-actor flip): the debounced diagnostic — which drives the
     /// on-edit host re-sync (#431) that keeps a push host's diagnostics following
     /// edits — must be scheduled AFTER the off-ingress reparse, not in the
-    /// `did_change` handler. The handler clears the tree, and
+    /// `did_change` handler. The handler makes the tree stale, and
     /// `prepare_diagnostic_snapshot` returns `None` without a tree, so scheduling
     /// the debounce there would capture a `None` snapshot and silently skip the
     /// re-sync (the diagnostics-don't-follow-edits bug). This pins the mechanism:
