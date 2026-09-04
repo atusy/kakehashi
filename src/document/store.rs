@@ -606,33 +606,6 @@ impl DocumentStore {
         stored
     }
 
-    pub(crate) fn set_parse_result_if_inputs_unchanged(
-        &self,
-        uri: &Url,
-        expected_text: &Arc<str>,
-        expected_incarnation: u64,
-        expected_content_version: u64,
-        language: Option<&str>,
-        tree: Option<Tree>,
-    ) -> bool {
-        let has_tree = tree.is_some();
-        let stored = self.documents.get_mut(uri).is_some_and(|mut doc| {
-            if doc.incarnation() == expected_incarnation
-                && doc.content_version() == expected_content_version
-                && Arc::ptr_eq(&doc.text_arc(), expected_text)
-            {
-                doc.set_parse_result(language.map(String::from), tree);
-                true
-            } else {
-                false
-            }
-        });
-        if stored && has_tree {
-            self.mark_tree_available_if_tracked(uri);
-        }
-        stored
-    }
-
     /// Return the per-document `didChange` serialization lock, creating it on
     /// first use. Callers hold the guard across the document's edit critical
     /// section so concurrent edits to the same document apply in order. See the
@@ -1179,16 +1152,29 @@ mod tests {
         assert_eq!(store.invalidate_all_parses(), vec![uri.clone()]);
 
         let stale_tree = parser.parse("fn main() {}", None).unwrap();
-        assert!(
-            !store.set_parse_result_if_inputs_unchanged(
-                &uri,
-                &pre_reload_text,
+        let stale = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &pre_reload_text,
+                language_id: Some(Some("rust")),
                 incarnation,
-                0,
-                Some("rust"),
-                Some(stale_tree),
-            ),
-            "a pre-reload parse must not restore the legacy tree"
+                content_version: 0,
+            },
+            Arc::new(super::super::snapshot::ParseSnapshot {
+                text: Arc::clone(&pre_reload_text),
+                tree: Some(stale_tree),
+                language: Some("rust".to_string()),
+                parsed_version: 0,
+                incarnation,
+                injection_regions: None,
+                bridge_regions: None,
+                resolved_regions: None,
+                layer_trees: std::sync::OnceLock::new(),
+            }),
+        );
+        assert!(
+            !stale.attached && !stale.published,
+            "a pre-reload parse must neither restore the legacy tree nor land its snapshot"
         );
 
         let document = store.get(&uri).unwrap();

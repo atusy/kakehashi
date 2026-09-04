@@ -599,11 +599,17 @@ print("hello")
 
         // The present-parser open parse now runs off the ingress ticket (#6), so the
         // tree + injection cache appear asynchronously after `did_open_impl` returns.
+        // The injection cache is populated BEFORE the tree is installed, so
+        // wait for the tree too.
         wait_until(|| {
             server
                 .cache
                 .get_injections(&uri)
                 .is_some_and(|injections| injections.len() == 1)
+                && server
+                    .documents
+                    .get(&uri)
+                    .is_some_and(|doc| doc.tree().is_some())
         })
         .await;
 

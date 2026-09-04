@@ -590,21 +590,14 @@ impl ParseCoordinator {
                 // `didClose` racing this off-ingress parse can't leave stale
                 // injection entries for a gone document. (`Tree` clone is a
                 // cheap refcount bump.)
-                let stored = self.documents.set_parse_result_if_inputs_unchanged(
-                    &uri,
-                    &text,
-                    incarnation,
-                    content_version,
-                    Some(&language_name),
-                    Some(tree.clone()),
-                );
-                // Populate BEFORE the publish so the derived discovery rides the
-                // snapshot (ADR §3 don't-discover-twice); readers keep serving
-                // the previous snapshot meanwhile. A rejected CAS (raced) skips
-                // populate — the snapshot then publishes without discovery and
-                // readers discover inline for that (already-superseded) snapshot.
-                let regions = if stored {
-                    self.populate_injections_on_pool(
+                // Populate BEFORE the install so the derived discovery rides
+                // the snapshot (ADR §3 don't-discover-twice); populate guards
+                // itself against a pass whose text or lifetime moved on (the
+                // tracker's epoch and incarnation), so it needs no confirmation
+                // from the store first, and the install below then lands the
+                // tree and the snapshot together or rejects both.
+                let regions = self
+                    .populate_injections_on_pool(
                         uri.clone(),
                         text.clone(),
                         tree.clone(),
@@ -613,13 +606,16 @@ impl ParseCoordinator {
                         content_version,
                         version_cancel.clone(),
                     )
-                    .await
-                } else {
-                    PopulatedSnapshotRegions::default()
-                };
-                self.publish_parse_snapshot(
+                    .await;
+                let installed = self.documents.install_parse(
                     &uri,
-                    crate::document::snapshot::ParseSnapshot {
+                    crate::document::ParseInputs {
+                        text: &text,
+                        language_id: None,
+                        incarnation,
+                        content_version,
+                    },
+                    std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                         text: text.clone(),
                         tree: Some(tree.clone()),
                         language: Some(language_name.clone()),
@@ -629,24 +625,22 @@ impl ParseCoordinator {
                         bridge_regions: regions.bridge_regions,
                         resolved_regions: regions.resolved_regions,
                         layer_trees: std::sync::OnceLock::new(),
-                    },
+                    }),
                 );
-                if stored {
-                    // AFTER the publish: a downstream task woken by this mark
+                if installed.attached {
+                    // AFTER the install: a downstream task woken by this mark
                     // on another runtime thread must find the snapshot (and
-                    // its fast-path regions) already in the cell — marking
-                    // first let it read the previous snapshot and fall back
-                    // to inline resolution for one cycle.
+                    // its fast-path regions) already in the cell.
                     self.documents
                         .mark_parse_finished(&uri, parse_generation, true);
                 }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
-                // `stored` is exactly "this call's CAS landed the tree": false when a
+                // `attached` is exactly "this call landed the tree": false when a
                 // racing `didChange`/reopen moved the text or incarnation on and the
                 // edit reparse won, in which case the open downstream must NOT re-run
                 // over the edit's tree.
-                return stored;
+                return installed.attached;
             }
 
             // Parse produced no tree (timeout / parser unavailable / join error) but
@@ -654,20 +648,15 @@ impl ParseCoordinator {
             // through to the no-language path below which would null it out. Host
             // bridging needs only text + language (never a tree), so preserving the
             // language keeps a host-bridged document working after a parse failure.
-            if self.documents.set_parse_result_if_inputs_unchanged(
+            let installed = self.documents.install_parse(
                 &uri,
-                &text,
-                incarnation,
-                content_version,
-                Some(&language_name),
-                None,
-            ) {
-                self.documents
-                    .mark_parse_finished(&uri, parse_generation, false);
-            }
-            self.publish_parse_snapshot(
-                &uri,
-                crate::document::snapshot::ParseSnapshot {
+                crate::document::ParseInputs {
+                    text: &text,
+                    language_id: None,
+                    incarnation,
+                    content_version,
+                },
+                std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                     text: text.clone(),
                     tree: None,
                     language: Some(language_name.clone()),
@@ -677,28 +666,27 @@ impl ParseCoordinator {
                     bridge_regions: None,
                     resolved_regions: None,
                     layer_trees: std::sync::OnceLock::new(),
-                },
+                }),
             );
+            if installed.attached {
+                self.documents
+                    .mark_parse_finished(&uri, parse_generation, false);
+            }
             advance_watermark();
             self.notifier().log_language_events(&events).await;
             return false;
         }
 
         // No language detected at all → store no language, no tree.
-        if self.documents.set_parse_result_if_inputs_unchanged(
+        let installed = self.documents.install_parse(
             &uri,
-            &text,
-            incarnation,
-            content_version,
-            None,
-            None,
-        ) {
-            self.documents
-                .mark_parse_finished(&uri, parse_generation, false);
-        }
-        self.publish_parse_snapshot(
-            &uri,
-            crate::document::snapshot::ParseSnapshot {
+            crate::document::ParseInputs {
+                text: &text,
+                language_id: None,
+                incarnation,
+                content_version,
+            },
+            std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                 text: text.clone(),
                 tree: None,
                 language: None,
@@ -708,8 +696,12 @@ impl ParseCoordinator {
                 bridge_regions: None,
                 resolved_regions: None,
                 layer_trees: std::sync::OnceLock::new(),
-            },
+            }),
         );
+        if installed.attached {
+            self.documents
+                .mark_parse_finished(&uri, parse_generation, false);
+        }
         advance_watermark();
         self.notifier().log_language_events(&events).await;
         false
