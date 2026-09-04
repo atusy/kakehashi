@@ -79,7 +79,8 @@ impl Kakehashi {
     /// and inlay hint need the region end and contiguity as well, so they
     /// call [`resolve_region_offset`] directly and compare the same offset.
     ///
-    /// The document is awaited to its current parse first: `didChange` clears
+    /// The envelope's host incarnation is checked first, then the document
+    /// is awaited to its current parse: `didChange` clears
     /// the tree and reparses off-ingress, and a resolve issued in that window
     /// would otherwise find no snapshot and report the region stale.
     ///
@@ -95,10 +96,17 @@ impl Kakehashi {
         host_uri: &str,
         region_id: &str,
         offset: &EnvelopeOffset,
+        incarnation: Option<u64>,
     ) -> bool {
         let Ok(host_url) = Url::parse(host_uri) else {
             return false;
         };
+        // Lifetime first: an item from a closed and reopened document would
+        // otherwise park on the reopened lifetime's first parse only to be
+        // refused by the region rebuild.
+        if !self.host_incarnation_is_current(&host_url, incarnation) {
+            return false;
+        }
         self.ensure_document_parsed(&host_url).await;
         resolve_region_offset(
             &self.documents,

@@ -186,6 +186,17 @@ impl Kakehashi {
             );
             return Ok(action);
         }
+        // Before the region gate waits for a parse: an action from a closed
+        // and reopened document would otherwise park on the reopened
+        // lifetime's first parse only to be refused.
+        if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: {} was reopened since the action was produced; returning action unresolved",
+                envelope.host_uri
+            );
+            return Ok(action);
+        }
 
         // Fail-soft staleness gate: resolving against a moved or invalidated
         // region would translate a resolved edit with a stale offset and bind
