@@ -9,7 +9,8 @@ use serde_json::Value;
 use tower_lsp_server::ls_types::{
     NumberOrString, PartialResultParams, Position, Range, SymbolKind, SymbolTag,
     TextDocumentIdentifier, TextDocumentPositionParams, TypeHierarchyItem,
-    TypeHierarchyPrepareParams, TypeHierarchySupertypesParams, Uri, WorkDoneProgressParams,
+    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri,
+    WorkDoneProgressParams,
 };
 
 use super::super::pool::ConnectionKey;
@@ -126,14 +127,67 @@ impl LanguageServerPool {
             .await
     }
 
+    pub(crate) async fn dispatch_type_hierarchy_subtypes(
+        &self,
+        params: TypeHierarchySubtypesParams,
+        settings: &crate::config::settings::WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<Vec<TypeHierarchyItem>> {
+        let (params, envelope) = prepare_subtypes_params(params)?;
+        if !crate::config::is_server_spawnable(&settings.language_servers, &envelope.origin) {
+            return None;
+        }
+        let config = resolve_with_wildcard(
+            &settings.language_servers,
+            &envelope.origin,
+            merge_bridge_server_configs,
+        )?;
+        self.send_type_hierarchy_subtypes_request(&config, params, envelope, upstream_id)
+            .await
+    }
+
     async fn send_type_hierarchy_supertypes_request(
         &self,
         server_config: &BridgeServerConfig,
-        mut params: TypeHierarchySupertypesParams,
+        params: TypeHierarchyExpansionParams,
         envelope: TypeHierarchyEnvelope,
         upstream_id: Option<UpstreamId>,
     ) -> Option<Vec<TypeHierarchyItem>> {
-        const METHOD: &str = "typeHierarchy/supertypes";
+        self.send_type_hierarchy_expansion_request(
+            server_config,
+            params,
+            envelope,
+            upstream_id,
+            "typeHierarchy/supertypes",
+        )
+        .await
+    }
+
+    async fn send_type_hierarchy_subtypes_request(
+        &self,
+        server_config: &BridgeServerConfig,
+        params: TypeHierarchyExpansionParams,
+        envelope: TypeHierarchyEnvelope,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<Vec<TypeHierarchyItem>> {
+        self.send_type_hierarchy_expansion_request(
+            server_config,
+            params,
+            envelope,
+            upstream_id,
+            "typeHierarchy/subtypes",
+        )
+        .await
+    }
+
+    async fn send_type_hierarchy_expansion_request(
+        &self,
+        server_config: &BridgeServerConfig,
+        mut params: TypeHierarchyExpansionParams,
+        envelope: TypeHierarchyEnvelope,
+        upstream_id: Option<UpstreamId>,
+        method: &'static str,
+    ) -> Option<Vec<TypeHierarchyItem>> {
         let server_name = &envelope.origin;
         let host_uri = url::Url::parse(&envelope.host_uri).ok()?;
         let expected_incarnation = envelope.incarnation?;
@@ -172,7 +226,7 @@ impl LanguageServerPool {
                 Err(error) => {
                     log::warn!(
                         target: "kakehashi::bridge",
-                        "{METHOD}: failed to register request for {server_name}: {error}"
+                        "{method}: failed to register request for {server_name}: {error}"
                     );
                     if let Some(ref id) = upstream_id {
                         self.unregister_upstream_request(id, connection_key);
@@ -182,7 +236,7 @@ impl LanguageServerPool {
             };
         params.item =
             type_hierarchy_item_to_downstream(params.item, &envelope, virtual_uri.as_ref());
-        let request = build_type_hierarchy_expansion_request(request_id, METHOD, params);
+        let request = build_type_hierarchy_expansion_request(request_id, method, params);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
         let (send_result, virtual_uri_observer) = {
             let connections = self.connections().await;
@@ -195,7 +249,7 @@ impl LanguageServerPool {
                 (
                     Err(io::Error::new(
                         io::ErrorKind::NotConnected,
-                        "producer connection was replaced before supertypes send",
+                        "producer connection was replaced before type hierarchy expansion send",
                     )),
                     None,
                 )
@@ -221,7 +275,7 @@ impl LanguageServerPool {
                     None => (
                         Err(io::Error::new(
                             io::ErrorKind::Unsupported,
-                            "type hierarchy provider was unregistered before supertypes send",
+                            "type hierarchy provider was unregistered before expansion send",
                         )),
                         None,
                     ),
@@ -231,7 +285,7 @@ impl LanguageServerPool {
         if let Err(error) = send_result {
             log::warn!(
                 target: "kakehashi::bridge",
-                "{METHOD}: failed to send request for {server_name}: {error}"
+                "{method}: failed to send request for {server_name}: {error}"
             );
             if let Some(ref id) = upstream_id {
                 self.unregister_upstream_request(id, connection_key);
@@ -258,7 +312,7 @@ impl LanguageServerPool {
         }
         transform_type_hierarchy_expansion_response_to_host(
             response,
-            METHOD,
+            method,
             virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string),
             &host_uri_lsp,
             &envelope,
@@ -323,12 +377,52 @@ fn strip_type_hierarchy_envelope(item: &mut TypeHierarchyItem) -> Option<TypeHie
 }
 
 fn prepare_supertypes_params(
-    mut params: TypeHierarchySupertypesParams,
-) -> Option<(TypeHierarchySupertypesParams, TypeHierarchyEnvelope)> {
+    params: TypeHierarchySupertypesParams,
+) -> Option<(TypeHierarchyExpansionParams, TypeHierarchyEnvelope)> {
+    let mut params = TypeHierarchyExpansionParams::from(params);
     let envelope = strip_type_hierarchy_envelope(&mut params.item)?;
     params.work_done_progress_params = WorkDoneProgressParams::default();
     params.partial_result_params = PartialResultParams::default();
     Some((params, envelope))
+}
+
+fn prepare_subtypes_params(
+    params: TypeHierarchySubtypesParams,
+) -> Option<(TypeHierarchyExpansionParams, TypeHierarchyEnvelope)> {
+    let mut params = TypeHierarchyExpansionParams::from(params);
+    let envelope = strip_type_hierarchy_envelope(&mut params.item)?;
+    params.work_done_progress_params = WorkDoneProgressParams::default();
+    params.partial_result_params = PartialResultParams::default();
+    Some((params, envelope))
+}
+
+#[derive(Serialize)]
+struct TypeHierarchyExpansionParams {
+    item: TypeHierarchyItem,
+    #[serde(flatten)]
+    work_done_progress_params: WorkDoneProgressParams,
+    #[serde(flatten)]
+    partial_result_params: PartialResultParams,
+}
+
+impl From<TypeHierarchySupertypesParams> for TypeHierarchyExpansionParams {
+    fn from(params: TypeHierarchySupertypesParams) -> Self {
+        Self {
+            item: params.item,
+            work_done_progress_params: params.work_done_progress_params,
+            partial_result_params: params.partial_result_params,
+        }
+    }
+}
+
+impl From<TypeHierarchySubtypesParams> for TypeHierarchyExpansionParams {
+    fn from(params: TypeHierarchySubtypesParams) -> Self {
+        Self {
+            item: params.item,
+            work_done_progress_params: params.work_done_progress_params,
+            partial_result_params: params.partial_result_params,
+        }
+    }
 }
 
 fn type_hierarchy_item_to_downstream(
@@ -462,7 +556,7 @@ fn build_type_hierarchy_prepare_request(
 fn build_type_hierarchy_expansion_request(
     request_id: RequestId,
     method: &'static str,
-    params: TypeHierarchySupertypesParams,
+    params: TypeHierarchyExpansionParams,
 ) -> JsonRpcRequest<Value> {
     let mut params = serde_json::to_value(params).unwrap_or(Value::Null);
     if let Some(tags) = params.pointer_mut("/item/tags")
@@ -703,6 +797,42 @@ mod tests {
         assert_eq!(value["item"]["data"], serde_json::json!({ "token": 9 }));
         assert!(value.get("workDoneToken").is_none());
         assert!(value.get("partialResultToken").is_none());
+    }
+
+    #[test]
+    fn subtypes_request_restores_virtual_item_and_strips_progress_tokens() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("lua-ls");
+        let params: TypeHierarchySubtypesParams = serde_json::from_value(serde_json::json!({
+            "item": type_item(host_uri.as_str(), serde_json::json!({
+                "kakehashi": test_envelope(&host_uri, &key)
+            })),
+            "workDoneToken": "work",
+            "partialResultToken": "partial"
+        }))
+        .unwrap();
+
+        let (mut params, envelope) = prepare_subtypes_params(params).unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region");
+        params.item = type_hierarchy_item_to_downstream(params.item, &envelope, Some(&virtual_uri));
+        let request = build_type_hierarchy_expansion_request(
+            RequestId::new(8),
+            "typeHierarchy/subtypes",
+            params,
+        );
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["params"]["item"]["uri"], virtual_uri.to_uri_string());
+        assert_eq!(
+            value["params"]["item"]["range"]["start"],
+            serde_json::json!({ "line": 0, "character": 0 })
+        );
+        assert_eq!(
+            value["params"]["item"]["data"],
+            serde_json::json!({ "token": 9 })
+        );
+        assert!(value["params"].get("workDoneToken").is_none());
+        assert!(value["params"].get("partialResultToken").is_none());
     }
 
     #[test]
@@ -1017,7 +1147,7 @@ mod tests {
             tokio::spawn(async move {
                 pool.send_type_hierarchy_supertypes_request(
                     &BridgeServerConfig::default(),
-                    params,
+                    params.into(),
                     envelope,
                     Some(upstream_id),
                 )
@@ -1100,7 +1230,7 @@ mod tests {
             tokio::spawn(async move {
                 pool.send_type_hierarchy_supertypes_request(
                     &BridgeServerConfig::default(),
-                    params,
+                    params.into(),
                     envelope,
                     Some(upstream_id),
                 )
@@ -1189,7 +1319,7 @@ mod tests {
             std::time::Duration::from_secs(1),
             pool.send_type_hierarchy_supertypes_request(
                 &BridgeServerConfig::default(),
-                params,
+                params.into(),
                 envelope,
                 Some(upstream_id.clone()),
             ),

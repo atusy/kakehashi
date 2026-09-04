@@ -314,7 +314,7 @@ enum Role {
 /// document snapshot (#568). `codeLens/resolve`, `codeAction/resolve`, and
 /// `documentLink/resolve`, `inlayHint/resolve`, and
 /// `callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`, and
-/// `typeHierarchy/supertypes` are readers too (#355, #568): their freshness gates read tracker/document
+/// `typeHierarchy/supertypes` and `typeHierarchy/subtypes` are readers too (#355, #568): their freshness gates read tracker/document
 /// state, so they must observe every `didChange` that preceded them on the
 /// wire — but their params carry no `textDocument`, so the URI comes from the
 /// routing envelope (`params.data` for resolve methods and `params.item.data`
@@ -385,7 +385,7 @@ fn classify(req: &Request) -> Option<Role> {
                 uri: normalize_uri(raw),
             })
         }
-        "typeHierarchy/supertypes" => {
+        "typeHierarchy/supertypes" | "typeHierarchy/subtypes" => {
             let raw = req.params()?["item"]["data"]["kakehashi"]["host_uri"].as_str()?;
             Some(Role::Reader {
                 uri: normalize_uri(raw),
@@ -941,6 +941,23 @@ mod tests {
         assert!(
             classify(&unenveloped_supertype).is_none(),
             "unenveloped typeHierarchy/supertypes passes through ungated"
+        );
+
+        let enveloped_subtype = Request::build("typeHierarchy/subtypes")
+            .params(serde_json::json!({
+                "item": { "data": { "kakehashi": { "host_uri": URI } } }
+            }))
+            .finish();
+        assert!(
+            matches!(classify(&enveloped_subtype), Some(Role::Reader { ref uri }) if uri == URI),
+            "enveloped typeHierarchy/subtypes must be keyed by item.data host_uri"
+        );
+        let unenveloped_subtype = Request::build("typeHierarchy/subtypes")
+            .params(serde_json::json!({ "item": { "data": { "custom": true } } }))
+            .finish();
+        assert!(
+            classify(&unenveloped_subtype).is_none(),
+            "unenveloped typeHierarchy/subtypes passes through ungated"
         );
 
         // codeAction/resolve is classified the same way (#568): the URI comes

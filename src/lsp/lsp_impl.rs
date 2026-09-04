@@ -36,8 +36,8 @@ use tower_lsp_server::ls_types::{
     SelectionRange, SelectionRangeParams, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
     SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
     SemanticTokensResult, SignatureHelp, SignatureHelpParams, TextDocumentPositionParams, TextEdit,
-    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySupertypesParams, Uri,
-    WillSaveTextDocumentParams, WorkspaceEdit,
+    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, Uri, WillSaveTextDocumentParams, WorkspaceEdit,
 };
 use tower_lsp_server::ls_types::{
     ColorInformation, ColorPresentation, ColorPresentationParams, DocumentColorParams,
@@ -984,6 +984,13 @@ impl LanguageServer for Kakehashi {
         params: TypeHierarchySupertypesParams,
     ) -> Result<Option<Vec<TypeHierarchyItem>>> {
         self.type_hierarchy_supertypes_impl(params).await
+    }
+
+    async fn subtypes(
+        &self,
+        params: TypeHierarchySubtypesParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        self.type_hierarchy_subtypes_impl(params).await
     }
 
     async fn document_highlight(
