@@ -39,6 +39,10 @@ impl Kakehashi {
         // boundary (the envelope round-trips through unprotected client `data`)
         // — it guards against accidental bypass, and the host path fails soft.
         let envelope = extract_envelope(&params);
+        // The region's live end, rebuilt by the gate below, so the resolved
+        // edits are validated against the region as it is now rather than
+        // as it was when the item was produced.
+        let mut live_region_end = None;
         if let Some(envelope) = &envelope {
             let Ok(host_url) = Url::parse(&envelope.host_uri) else {
                 log::warn!(
@@ -65,8 +69,11 @@ impl Kakehashi {
                 );
                 return Ok(params);
             }
-            if !envelope.is_host_layer() && !self.completion_envelope_is_fresh(envelope).await {
-                return Ok(params);
+            if !envelope.is_host_layer() {
+                match self.completion_envelope_is_fresh(envelope).await {
+                    Some(region_end) => live_region_end = Some(region_end),
+                    None => return Ok(params),
+                }
             }
         }
         // Kept for the post-response check; the gates above return `params`
@@ -81,7 +88,8 @@ impl Kakehashi {
         // response" by the fail-soft parsing. Mirrors `code_action_resolve_impl`.
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let sweep_id = upstream_id.clone();
-        let dispatch = pool.dispatch_completion_resolve(params, &settings, upstream_id);
+        let dispatch =
+            pool.dispatch_completion_resolve(params, &settings, upstream_id, live_region_end);
         // The cancel arm DROPS the in-flight dispatch, which then never reaches
         // its own unregister. An RAII sweep covers that — and, unlike a trailing
         // statement, also runs when this whole handler future is dropped (client
@@ -120,37 +128,37 @@ impl Kakehashi {
         Ok(resolved)
     }
 
-    async fn completion_envelope_is_fresh(&self, envelope: &KakehashiEnvelope) -> bool {
+    /// Whether the envelope still names the region it was produced for; on
+    /// success, the region's live end. Only the region's identity, start and
+    /// contiguity are compared — its end moves with ordinary typing inside
+    /// the region, which a completion list is designed to outlive.
+    async fn completion_envelope_is_fresh(&self, envelope: &KakehashiEnvelope) -> Option<Position> {
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
-            return false;
+            return None;
         };
         // A resolve issued while the post-edit reparse is still running would
         // find no snapshot and read as a stale region; wait for the current
         // parse the way the request handlers do before their preamble.
         self.ensure_document_parsed(&host_url).await;
-        let Some((offset, region_end, contiguous, _)) = resolve_region_offset(
+        let (offset, region_end, contiguous, _) = resolve_region_offset(
             &self.documents,
             &self.language,
             &self.bridge,
             &host_url,
             &envelope.region_id,
-        ) else {
-            return false;
-        };
-        completion_geometry_matches(envelope, &offset, region_end, contiguous)
+        )?;
+        completion_geometry_matches(envelope, &offset, contiguous).then_some(region_end)
     }
 }
 
 fn completion_geometry_matches(
     envelope: &KakehashiEnvelope,
     live_offset: &RegionOffset,
-    live_end: Position,
     contiguous: bool,
 ) -> bool {
     !envelope.region_id.is_empty()
         && contiguous
         && RegionOffset::from(&envelope.offset) == *live_offset
-        && envelope.region_end == Some((live_end.line, live_end.character))
 }
 
 #[cfg(test)]
@@ -172,24 +180,21 @@ mod tests {
     #[test]
     fn completion_resolve_requires_current_contiguous_geometry() {
         let offset = RegionOffset::with_per_line_offsets(3, vec![2]);
-        let end = Position::new(3, 8);
         assert!(completion_geometry_matches(
             &envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
             &offset,
-            end,
             true
         ));
-        assert!(!completion_geometry_matches(
-            &envelope(""),
-            &offset,
-            end,
-            true
-        ));
+        assert!(!completion_geometry_matches(&envelope(""), &offset, true));
         assert!(!completion_geometry_matches(
             &envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
             &offset,
-            end,
             false
         ));
+        let moved = RegionOffset::with_per_line_offsets(4, vec![2]);
+        assert!(
+            !completion_geometry_matches(&envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV"), &moved, true),
+            "a region that moved is not the region the item was produced for"
+        );
     }
 }
