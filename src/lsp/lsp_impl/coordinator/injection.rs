@@ -555,6 +555,15 @@ impl InjectionCoordinator {
         //
         // The caller passes what is LEFT of the shared budget, so a sweep cannot
         // spend it several times over.
+        //
+        // A snapshot that is already current is answered without entering the
+        // timeout: the sweep keeps walking past its deadline with a ZERO
+        // budget, and a zero timeout can expire before the wait future gets
+        // to observe the snapshot — misreporting a current document as
+        // unsettled and leaving it un-reopened.
+        if self.snapshot_is_current(uri) {
+            return ParseWait::Current;
+        }
         use crate::lsp::lsp_impl::snapshot_read::SnapshotWait;
         match tokio::time::timeout(
             budget,
@@ -624,6 +633,69 @@ mod tests {
     use tokio::sync::Notify;
     use tower_lsp_server::LspService;
     use url::Url;
+
+    /// The re-open sweep keeps walking after its parse-wait deadline with a
+    /// zero budget; a document whose snapshot is already current must still
+    /// read as current then, and one whose parse is pending as unsettled.
+    #[tokio::test]
+    async fn zero_budget_wait_answers_from_the_snapshot_state() {
+        use tree_sitter::Parser;
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let injection = server.injection_coordinator();
+
+        let pending = Url::parse("file:///zero-budget-pending.md").unwrap();
+        server.documents.insert(
+            pending.clone(),
+            "# pending".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        assert!(matches!(
+            injection
+                .ensure_document_parsed(&pending, std::time::Duration::ZERO)
+                .await,
+            super::ParseWait::Unsettled
+        ));
+
+        let current = Url::parse("file:///zero-budget-current.md").unwrap();
+        let text = "# current\n";
+        let incarnation = server.documents.insert(
+            current.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let content_version = server.documents.get(&current).unwrap().content_version();
+        let landed = server
+            .documents
+            .get(&current)
+            .map(|doc| {
+                doc.publish_snapshot(Arc::new(crate::document::snapshot::ParseSnapshot {
+                    text: Arc::from(text),
+                    tree: Some(tree),
+                    language: Some("markdown".to_string()),
+                    parsed_version: content_version,
+                    incarnation,
+                    injection_regions: None,
+                    bridge_regions: None,
+                    resolved_regions: None,
+                    layer_trees: std::sync::OnceLock::new(),
+                }))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test publish must land");
+        assert!(matches!(
+            injection
+                .ensure_document_parsed(&current, std::time::Duration::ZERO)
+                .await,
+            super::ParseWait::Current
+        ));
+    }
 
     #[tokio::test]
     async fn process_injections_finishes_before_fast_reopen() {
