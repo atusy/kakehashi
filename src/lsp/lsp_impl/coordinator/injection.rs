@@ -115,6 +115,19 @@ impl InjectionCoordinator {
         uri: &Url,
         host_language: &str,
     ) -> Option<Vec<BridgeInjection>> {
+        // A reload in progress makes nothing below evidence — not even the
+        // snapshot fast path: a parse that checked its parser out just before
+        // the reload began can publish regions derived from the OLD query
+        // under the transitional generation, which the stamp check accepts.
+        let reload_in_progress = || {
+            self.parser_pool
+                .lock()
+                .recover_poison("InjectionCoordinator::resolve_injection_data")
+                .reload_in_progress()
+        };
+        if reload_in_progress() {
+            return None;
+        }
         // Fast path (parse-snapshot ADR §3, never discover twice): the parse
         // pass that scheduled this downstream already derived the bridge
         // regions from its single injection-query run and published them on
@@ -156,12 +169,7 @@ impl InjectionCoordinator {
         let generation_before = self.cache.semantic_token_generation();
         let parser_published = self.language.has_parser_available(host_language);
         let injection_query = self.language.injection_query(host_language);
-        let reload_in_progress = self
-            .parser_pool
-            .lock()
-            .recover_poison("InjectionCoordinator::resolve_injection_data")
-            .reload_in_progress();
-        if reload_in_progress || self.cache.semantic_token_generation() != generation_before {
+        if reload_in_progress() || self.cache.semantic_token_generation() != generation_before {
             return None;
         }
         let Some(injection_query) = injection_query else {
@@ -1148,6 +1156,71 @@ mod tests {
                 .is_some_and(|regions| regions.len() == 1),
             "settled again: the region resolves"
         );
+
+        // The snapshot fast path too: regions a parse published under the
+        // current generation are not evidence while a reload is swapping
+        // the query they were derived from.
+        let populated = server
+            .cache
+            .populate_injections(
+                &uri,
+                text,
+                &parser.parse(text, None).expect("parse rust"),
+                "rust",
+                &server.language,
+                &server.bridge.node_tracker_arc(),
+                server.bridge.node_tracker_arc().mint_epoch(&uri),
+                server.documents.get(&uri).unwrap().incarnation(),
+                true,
+                true,
+            )
+            .expect("current pass populates");
+        let bridge_regions = populated.bridge_regions.expect("gate was true");
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        let incarnation = server.documents.get(&uri).unwrap().incarnation();
+        let landed = server
+            .documents
+            .get(&uri)
+            .map(|doc| {
+                doc.publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: None,
+                        language: Some("rust".to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: Some((
+                            populated.generation,
+                            std::sync::Arc::new(bridge_regions),
+                        )),
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test publish must land");
+        assert!(
+            injection
+                .resolve_injection_data(&uri, "rust")
+                .is_some_and(|regions| regions.len() == 1),
+            "settled: the fast path serves the published regions"
+        );
+        server
+            .parser_pool
+            .lock()
+            .expect("parser pool lock")
+            .begin_reload();
+        assert!(
+            injection.resolve_injection_data(&uri, "rust").is_none(),
+            "mid-reload, published regions are not evidence either"
+        );
+        server
+            .parser_pool
+            .lock()
+            .expect("parser pool lock")
+            .finish_reload();
     }
 
     /// The re-open sweep screens hosts by language before a parser is
