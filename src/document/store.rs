@@ -1095,11 +1095,12 @@ mod tests {
         assert!(store.get(&uri).unwrap().tree().is_none());
         assert_eq!(store.get(&uri).unwrap().language_id(), Some("text"));
         // A language mismatch alone (the document was relabelled in place)
-        // also rejects the tree.
+        // also rejects the tree — and leaves the cell exactly as it was.
         let (reopened_text, reopened_version) = {
             let doc = store.get(&uri).unwrap();
             (doc.text_arc(), doc.content_version())
         };
+        let cell_before = store.latest_snapshot(&uri).and_then(|v| v.slot.snapshot);
         let mismatched = store.install_parse(
             &uri,
             ParseInputs {
@@ -1119,6 +1120,58 @@ mod tests {
             mismatched,
             ParseInstall::default(),
             "a language the document no longer has must neither attach nor publish"
+        );
+        assert!(store.get(&uri).unwrap().tree().is_none());
+        let cell_after = store.latest_snapshot(&uri).and_then(|v| v.slot.snapshot);
+        assert!(
+            match (&cell_before, &cell_after) {
+                (None, None) => true,
+                (Some(then), Some(now)) => Arc::ptr_eq(then, now),
+                _ => false,
+            },
+            "a rejected language must not touch the published snapshot"
+        );
+    }
+
+    /// The text is compared by allocation identity, not content: a parse that
+    /// read a different `Arc<str>` with the same bytes did not read the
+    /// document's own text, so its tree is not attached — while the snapshot,
+    /// judged only by the cell's admission rule, still publishes.
+    #[test]
+    fn install_parse_compares_the_text_by_identity_not_content() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///identity.md").unwrap();
+        let text = "# doc\n";
+        let incarnation =
+            store.insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
+        let content_version = store.get(&uri).unwrap().content_version();
+        let other_allocation: Arc<str> = Arc::from(text);
+        assert_ne!(
+            Arc::as_ptr(&other_allocation),
+            Arc::as_ptr(&store.get(&uri).unwrap().text_arc())
+        );
+        let outcome = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &other_allocation,
+                language_id: Some(Some("markdown")),
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &other_allocation,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(
+            outcome,
+            ParseInstall {
+                attached: false,
+                published: true
+            },
+            "equal bytes from another allocation are not the document's text"
         );
         assert!(store.get(&uri).unwrap().tree().is_none());
     }
@@ -1234,7 +1287,11 @@ mod tests {
         // The same parse installed again (a sibling reparse of the same
         // revision): the cell refuses an equal-version tree swap, and the
         // tree must not be re-attached either — nothing lands without its
-        // snapshot.
+        // snapshot. Identity, not just the reported outcome: the stored tree
+        // and the cell's snapshot must be the very ones the first install
+        // landed.
+        let landed_tree = store.get(&uri).unwrap().tree().map(|t| t.root_node().id());
+        let landed_snapshot = store.latest_snapshot(&uri).and_then(|v| v.slot.snapshot);
         let again = store.install_parse(
             &uri,
             ParseInputs {
@@ -1254,6 +1311,19 @@ mod tests {
             again,
             ParseInstall::default(),
             "an equal-version duplicate lands neither tree nor snapshot"
+        );
+        assert_eq!(
+            store.get(&uri).unwrap().tree().map(|t| t.root_node().id()),
+            landed_tree,
+            "the duplicate must not swap the attached tree"
+        );
+        assert!(
+            store
+                .latest_snapshot(&uri)
+                .and_then(|v| v.slot.snapshot)
+                .zip(landed_snapshot)
+                .is_some_and(|(now, then)| Arc::ptr_eq(&now, &then)),
+            "the duplicate must not swap the published snapshot"
         );
 
         // An edit moved the document on: the parse of the old text attaches
