@@ -918,6 +918,50 @@ mod tests {
         assert!(!cache.is_request_active(&uri, req));
     }
 
+    /// A populate pass that runs before the host language's injection query
+    /// is in the store — a lazy query load or a settings reload still
+    /// swapping queries in — cannot tell "no injections" from "could not
+    /// look". Publishing a definitive empty set would be consumed by every
+    /// reader until the next edit; the snapshot must ride without regions so
+    /// readers fall back to inline resolution, which finds the query once it
+    /// is loaded.
+    #[test]
+    fn populate_without_the_injection_query_leaves_the_regions_undetermined() {
+        use tree_sitter::Parser;
+
+        let cache = CacheCoordinator::new();
+        let tracker = NodeTracker::new();
+        let coordinator = LanguageCoordinator::new();
+        let uri = create_test_uri("no-query-yet.md");
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let text = "```lua\nprint(1)\n```\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+
+        let populated = cache
+            .populate_injections(
+                &uri,
+                text,
+                &tree,
+                "markdown",
+                &coordinator,
+                &tracker,
+                tracker.mint_epoch(&uri),
+                1,
+                true,
+                true,
+            )
+            .expect("the pass ran");
+
+        assert!(
+            populated.bridge_regions.is_none(),
+            "no query available must not publish a definitive empty region set"
+        );
+        assert!(populated.resolved_regions.is_none());
+        assert!(populated.discovery.is_none());
+    }
+
     #[test]
     fn cancelled_populate_commits_no_injection_state() {
         use tree_sitter::{Parser, Query};
