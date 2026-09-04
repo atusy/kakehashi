@@ -50,6 +50,13 @@
 //!   resolve with `detail` and a `textEdit` on line 2 (the host verbatim
 //!   path); `completion-resolve-plain` fills only `detail`, so the reply
 //!   survives the virt edit guard inside a one-line region.
+//! - `code-action-lazy-delayed-resolve` / `completion-resolve-reopen-delayed` /
+//!   `code-lens-reopen-delayed-resolve` / `document-link-reopen-delayed-resolve`
+//!   — like their base modes, but park the resolve reply (after a
+//!   `window/logMessage` `<kind>-resolve-started`) until the next
+//!   `textDocument/didChange` (code action) or the next request of their own
+//!   kind (the others), so a test can edit or close and reopen the host while
+//!   the resolve is in flight.
 //! - `inlay-hint-resolve` / `inlay-hint-resolve-replacement` — advertise
 //!   `inlayHintProvider.resolveProvider = true`; answer `textDocument/inlayHint`
 //!   with one hint (label part with a location and a command, an accept edit,
@@ -209,6 +216,14 @@ fn main() {
     // resolve` on the next `textDocument/inlayHint` — a deterministic
     // sent-state barrier for post-response freshness tests.
     let mut pending_inlay_resolve: Option<(Option<Value>, Value)> = None;
+    // The other delayed resolvers park their reply here (one in flight per
+    // test): `code-action-lazy-delayed-resolve` answers on the next
+    // `didChange`; `completion-resolve-reopen-delayed`,
+    // `code-lens-reopen-delayed-resolve` and
+    // `document-link-reopen-delayed-resolve` on the next request of their
+    // own kind — the test sends that only after closing and reopening the
+    // host, so the reply lands after the reopen was processed upstream.
+    let mut pending_resolve: Option<(Option<Value>, Value)> = None;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -230,7 +245,10 @@ fn main() {
                         "hoverProvider": true,
                         "textDocumentSync": 1
                     }),
-                    "code-lens" | "code-lens-replacement" | "code-lens-slow-resolve" => json!({
+                    "code-lens"
+                    | "code-lens-replacement"
+                    | "code-lens-slow-resolve"
+                    | "code-lens-reopen-delayed-resolve" => json!({
                         "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -238,7 +256,8 @@ fn main() {
                         "codeLensProvider": { "resolveProvider": false },
                         "textDocumentSync": 1
                     }),
-                    "document-link-resolve"
+                    "document-link-reopen-delayed-resolve"
+                    | "document-link-resolve"
                     | "document-link-resolve-replacement"
                     | "document-link-slow-resolve" => json!({
                         "documentLinkProvider": { "resolveProvider": true },
@@ -301,7 +320,8 @@ fn main() {
                     | "code-action-lazy-retitle"
                     | "code-action-lazy-multistep"
                     | "code-action-lazy-fileop"
-                    | "code-action-lazy-oob" => {
+                    | "code-action-lazy-oob"
+                    | "code-action-lazy-delayed-resolve" => {
                         json!({
                             "codeActionProvider": { "resolveProvider": true },
                             "executeCommandProvider": { "commands": ["mock.run"] },
@@ -341,7 +361,9 @@ fn main() {
                     // `completion-no-resolve` answers completion the same way
                     // but does NOT advertise resolveProvider, so the bridge
                     // must not weigh its items down with routing envelopes.
-                    "completion-resolve" | "completion-resolve-plain" => json!({
+                    "completion-resolve"
+                    | "completion-resolve-plain"
+                    | "completion-resolve-reopen-delayed" => json!({
                         "completionProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -526,6 +548,11 @@ fn main() {
                     {
                         respond(&mut writer, pending_id, pending_result);
                     }
+                    if mode == "code-action-lazy-delayed-resolve"
+                        && let Some((pending_id, pending_result)) = pending_resolve.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
                 }
             }
             "textDocument/didClose" => {
@@ -681,6 +708,11 @@ fn main() {
                 }
             }
             "textDocument/codeLens" => {
+                if mode == "code-lens-reopen-delayed-resolve"
+                    && let Some((pending_id, pending_result)) = pending_resolve.take()
+                {
+                    respond(&mut writer, pending_id, pending_result);
+                }
                 // One UNRESOLVED lens (data only, no command) on the first
                 // line of the (virtual) document — the rust-analyzer shape
                 // that motivates codeLens/resolve support (#355).
@@ -718,6 +750,11 @@ fn main() {
             // back, so `completionItem/resolve` can prove the downstream's own
             // data survived the round trip through the routing envelope (#958).
             "textDocument/completion" => {
+                if mode == "completion-resolve-reopen-delayed"
+                    && let Some((pending_id, pending_result)) = pending_resolve.take()
+                {
+                    respond(&mut writer, pending_id, pending_result);
+                }
                 let result = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
@@ -760,7 +797,8 @@ fn main() {
                 // `completion-resolve-plain`: fill only `detail`, so the reply
                 // survives the bridge's edit guard inside a one-line region and
                 // a test can tell a resolved item from an unresolved one.
-                if mode != "completion-resolve-plain" {
+                if mode != "completion-resolve-plain" && mode != "completion-resolve-reopen-delayed"
+                {
                     item["textEdit"] = json!({
                         "range": {
                             "start": { "line": 2, "character": 4 },
@@ -769,7 +807,16 @@ fn main() {
                         "newText": "resolved-edit"
                     });
                 }
-                respond(&mut writer, id, item);
+                if mode == "completion-resolve-reopen-delayed" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "completion-resolve-started" }),
+                    );
+                    pending_resolve = Some((id, item));
+                } else {
+                    respond(&mut writer, id, item);
+                }
             }
             "textDocument/codeAction" => {
                 let result = message
@@ -783,6 +830,7 @@ fn main() {
                             || mode == "code-action-lazy-multistep"
                             || mode == "code-action-lazy-fileop"
                             || mode == "code-action-lazy-oob"
+                            || mode == "code-action-lazy-delayed-resolve"
                         {
                             // One LAZY action: data only, no edit. The payload is
                             // materialized on codeAction/resolve (below).
@@ -1022,26 +1070,32 @@ fn main() {
                 // observe which title actually reached the server. If the bridge
                 // failed to restore the original (unsuffixed) title before
                 // forwarding, the mock would see "... — mock-codeaction" here.
-                respond(
-                    &mut writer,
-                    id,
-                    json!({
-                        "title": response_title,
-                        "kind": "source.organizeImports",
-                        "data": data,
-                        "edit": {
-                            "changes": {
-                                target_uri: [{
-                                    "range": {
-                                        "start": { "line": 0, "character": 0 },
-                                        "end": { "line": 0, "character": 5 }
-                                    },
-                                    "newText": format!("organized:{title}")
-                                }]
-                            }
+                let result = json!({
+                    "title": response_title,
+                    "kind": "source.organizeImports",
+                    "data": data,
+                    "edit": {
+                        "changes": {
+                            target_uri: [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 5 }
+                                },
+                                "newText": format!("organized:{title}")
+                            }]
                         }
-                    }),
-                );
+                    }
+                });
+                if mode == "code-action-lazy-delayed-resolve" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "code-action-resolve-started" }),
+                    );
+                    pending_resolve = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
             }
             "workspace/executeCommand" => {
                 // The bridge stripped its routing prefix, so we see our OWN
@@ -1425,24 +1479,35 @@ fn main() {
                     .pointer("/params/range")
                     .cloned()
                     .unwrap_or(Value::Null);
-                respond(
-                    &mut writer,
-                    id,
-                    json!({
-                        "range": range,
-                        "command": {
-                            "title": format!(
-                                "{} resolved:{}",
-                                if mode == "code-lens-replacement" { "replacement" } else { "mock" },
-                                data["mock"].as_str().unwrap_or("?")
-                            ),
-                            "command": "mock.codelens"
-                        },
-                        "data": data
-                    }),
-                );
+                let result = json!({
+                    "range": range,
+                    "command": {
+                        "title": format!(
+                            "{} resolved:{}",
+                            if mode == "code-lens-replacement" { "replacement" } else { "mock" },
+                            data["mock"].as_str().unwrap_or("?")
+                        ),
+                        "command": "mock.codelens"
+                    },
+                    "data": data
+                });
+                if mode == "code-lens-reopen-delayed-resolve" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "code-lens-resolve-started" }),
+                    );
+                    pending_resolve = Some((id, result));
+                    continue;
+                }
+                respond(&mut writer, id, result);
             }
             "textDocument/documentLink" => {
+                if mode == "document-link-reopen-delayed-resolve"
+                    && let Some((pending_id, pending_result)) = pending_resolve.take()
+                {
+                    respond(&mut writer, pending_id, pending_result);
+                }
                 if matches!(
                     mode.as_str(),
                     "document-link-slow-host" | "document-link-slow-virt"
@@ -1505,24 +1570,30 @@ fn main() {
                     .cloned()
                     .unwrap_or(Value::Null);
                 data["receivedRange"] = range.clone();
-                respond(
-                    &mut writer,
-                    id,
-                    json!({
-                        "range": range,
-                        "target": data["uri"],
-                        "tooltip": format!(
-                            "{} resolved:{}",
-                            if mode == "document-link-resolve-replacement" {
-                                "replacement"
-                            } else {
-                                "mock"
-                            },
-                            data["mock"].as_str().unwrap_or("?")
-                        ),
-                        "data": data
-                    }),
-                );
+                let result = json!({
+                    "range": range,
+                    "target": data["uri"],
+                    "tooltip": format!(
+                        "{} resolved:{}",
+                        if mode == "document-link-resolve-replacement" {
+                            "replacement"
+                        } else {
+                            "mock"
+                        },
+                        data["mock"].as_str().unwrap_or("?")
+                    ),
+                    "data": data
+                });
+                if mode == "document-link-reopen-delayed-resolve" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "document-link-resolve-started" }),
+                    );
+                    pending_resolve = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
             }
             "textDocument/inlayHint" => {
                 // `inlay-hint-reopen-delayed-resolve`: the parked resolve is

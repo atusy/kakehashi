@@ -670,3 +670,37 @@ fn e2e_host_code_lens_resolve_cancel_returns_request_cancelled() {
 
     shutdown(&mut client);
 }
+
+/// A close and reopen can complete while the downstream is still answering a
+/// resolve; the command then belongs to the closed document and must not be
+/// surfaced into the reopened one.
+#[test]
+fn e2e_virtual_code_lens_resolve_reply_after_a_reopen_is_discarded() {
+    let (mut client, _config_dir) = init_client_with_mode("code-lens-reopen-delayed-resolve");
+    open_markdown(&mut client);
+    let lens = code_lens_with_retry(&mut client).remove(0);
+
+    let request_id = client.send_request_async("codeLens/resolve", lens.clone());
+    assert!(
+        client.wait_for_log_message("code-lens-resolve-started", Duration::from_secs(10)),
+        "resolve must reach the downstream before the reopen"
+    );
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": MARKDOWN_URI } }),
+    );
+    open_markdown(&mut client);
+    // The mock answers the parked resolve when the reopened document asks for
+    // lenses again; this request is only that trigger.
+    let _trigger = client.send_request_async(
+        "textDocument/codeLens",
+        json!({ "textDocument": { "uri": MARKDOWN_URI } }),
+    );
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response["result"], lens,
+        "a reply that lands after a reopen must leave the lens unresolved: {response}"
+    );
+
+    shutdown(&mut client);
+}

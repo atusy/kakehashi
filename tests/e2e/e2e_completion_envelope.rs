@@ -170,3 +170,50 @@ fn e2e_virtual_completion_resolve_survives_a_same_shape_edit() {
 
     shutdown_client(&mut client);
 }
+
+/// A close and reopen can complete while the downstream is still answering a
+/// resolve; the reply then belongs to the closed document and must not be
+/// surfaced into the reopened one.
+#[test]
+fn e2e_virtual_completion_resolve_reply_after_a_reopen_is_discarded() {
+    let (mut client, _config_dir, item) =
+        init_virtual_completion_client("completion-resolve-reopen-delayed");
+
+    let request_id = client.send_request_async("completionItem/resolve", item.clone());
+    assert!(
+        client.wait_for_log_message(
+            "completion-resolve-started",
+            std::time::Duration::from_secs(10)
+        ),
+        "resolve must reach the downstream before the reopen"
+    );
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": MARKDOWN_URI } }),
+    );
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": MARKDOWN_URI,
+            "languageId": "markdown",
+            "version": 1,
+            "text": MARKDOWN
+        }}),
+    );
+    // The mock answers the parked resolve when the reopened document asks for
+    // completions again; this request is only that trigger.
+    let _trigger = client.send_request_async(
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI },
+            "position": { "line": 3, "character": 11 }
+        }),
+    );
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response["result"], item,
+        "a reply that lands after a reopen must leave the item unresolved: {response}"
+    );
+
+    shutdown_client(&mut client);
+}

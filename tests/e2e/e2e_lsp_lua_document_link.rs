@@ -788,3 +788,48 @@ More text here.
     // Clean shutdown
     shutdown_client(&mut client);
 }
+
+/// A close and reopen can complete while the downstream is still answering a
+/// resolve; the target then belongs to the closed document and must not be
+/// surfaced into the reopened one.
+#[test]
+fn e2e_virtual_document_link_resolve_reply_after_a_reopen_is_discarded() {
+    let (mut client, _config_dir) =
+        init_mock_document_link_client("document-link-reopen-delayed-resolve", "lua", false, None);
+    let uri = "file:///test_document_link_reopen_during_wait.md";
+    let open = json!({ "textDocument": {
+        "uri": uri,
+        "languageId": "markdown",
+        "version": 1,
+        "text": "```lua\nlocal x = 1\n```\n"
+    }});
+    client.send_notification("textDocument/didOpen", open.clone());
+    let link = document_links_with_retry(&mut client, uri).remove(0);
+
+    let request_id = client.send_request_async("documentLink/resolve", link.clone());
+    assert!(
+        client.wait_for_log_message(
+            "document-link-resolve-started",
+            std::time::Duration::from_secs(10)
+        ),
+        "resolve must reach the downstream before the reopen"
+    );
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    client.send_notification("textDocument/didOpen", open);
+    // The mock answers the parked resolve when the reopened document asks for
+    // links again; this request is only that trigger.
+    let _trigger = client.send_request_async(
+        "textDocument/documentLink",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response["result"], link,
+        "a reply that lands after a reopen must leave the link unresolved: {response}"
+    );
+
+    shutdown_client(&mut client);
+}
