@@ -1129,7 +1129,7 @@ print("hello")
 
     /// Regression (parse-actor flip): the host bridge context needs only the
     /// document text, never the parse tree (parse-decoupled ADR), so it must keep
-    /// resolving after `did_change` clears the tree — otherwise every host-bridged
+    /// resolving after `did_change` stales the tree — otherwise every host-bridged
     /// request (hover / definition / formatting / diagnostics) would bail for the
     /// whole reparse window after each edit.
     #[tokio::test]

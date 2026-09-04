@@ -437,8 +437,8 @@ impl ParseCoordinator {
     /// advance is a document already gone (a `didClose` removed it): its watermark
     /// channel is gone too, so its readers have already fallen back.
     ///
-    /// Returns `true` iff **this** call's CAS landed a tree (i.e. it is the parse
-    /// whose tree is now current). The off-ingress open caller gates its
+    /// Returns `true` iff **this** call's install published the current tree
+    /// (i.e. it is the parse whose tree is now current). The off-ingress open caller gates its
     /// tree-dependent downstream (`process_injections(forward=false)`, the deferred
     /// refresh, the synthetic diagnostic) on this — **not** on "the document has a
     /// tree": a `didChange` racing this parse can move the text on and let the edit
