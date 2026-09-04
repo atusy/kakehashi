@@ -280,7 +280,13 @@ impl LanguageServerPool {
 
         // The original host-coordinate `item` is kept untouched for the
         // fail-soft returns below; the outgoing clone carries virtual ranges.
-        let outgoing = prepare_completion_resolve_item(&item, &offset);
+        // Its ranges were produced under the ENVELOPE's offset, so that is
+        // what maps them back to virtual coordinates — the live offset (a
+        // later blockquote marker edited from `> ` to `>` changes a later
+        // line's column while the start stays) belongs to the reply, which
+        // the downstream computes against the virtual text as it is now.
+        let outgoing =
+            prepare_completion_resolve_item(&item, &RegionOffset::from(&envelope.offset));
 
         match self
             .send_completion_resolve_on_handle(&handle, outgoing, upstream_id)
