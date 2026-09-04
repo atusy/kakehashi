@@ -731,10 +731,16 @@ impl DocumentStore {
         snapshot: Arc<super::snapshot::ParseSnapshot>,
     ) -> ParseInstall {
         let has_tree = snapshot.tree.is_some();
+        let (version, incarnation) = (snapshot.parsed_version, snapshot.incarnation);
+        // The snapshot this install evicts is dropped only after the guard
+        // is released: dropping a tree (and its layer trees) is not free, and
+        // the shard's readers would wait on it otherwise.
+        let mut evicted = None;
         let outcome = self
             .documents
             .get_mut(uri)
             .map_or_else(ParseInstall::default, |mut doc| {
+                evicted = doc.latest_snapshot_slot().snapshot;
                 if expected
                     .language_id
                     .is_some_and(|language_id| doc.language_id() != language_id)
@@ -763,6 +769,13 @@ impl DocumentStore {
                     published,
                 }
             });
+        drop(evicted);
+        if !outcome.published {
+            log::debug!(
+                target: "kakehashi::snapshot",
+                "publish rejected for {uri}: v{version} inc{incarnation}"
+            );
+        }
         // A different map (`parse_states`): touched only after the document
         // guard above is released.
         if outcome.attached && has_tree {
