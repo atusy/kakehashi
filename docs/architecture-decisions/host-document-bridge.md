@@ -94,15 +94,20 @@ Partially implemented:
   non-contiguous combined injections fail soft before dispatch because a lazy
   edit could otherwise cross a masked host-only gap. Safe resolves apply the
   same all-or-nothing edit guard as initial hint retrieval.
-  `completionItem/resolve` and `codeAction/resolve` carry and check the same
-  revision and incarnation stamps, before dispatch and after the reply; every
-  host-layer producer (completion, codeAction, codeLens, documentLink,
-  inlayHint) stamps its items with the incarnation and revision the host
-  text was read under, from one store read, and discards a reply the
-  downstream synchronized under another incarnation. Every resolve gate waits
-  for the document's current parse before rebuilding the region, so a resolve
-  issued during the post-edit reparse is judged by its stamps, not by parse
-  timing.
+  `codeAction/resolve` carries and checks the same revision stamp before
+  dispatch and after the reply, and the incarnation after the reply as well.
+  `completionItem/resolve` checks only the incarnation (before dispatch and
+  after the reply): a completion list is meant to outlive ordinary edits — the
+  editor filters it locally while the user keeps typing and resolves on
+  accept — and the downstream computes the lazy fields against its own,
+  already synchronized text. Every host-layer producer (completion,
+  codeAction, codeLens, documentLink, inlayHint) stamps its items with the
+  incarnation the host text was read under (codeAction and inlayHint with its
+  revision as well), from one store read, and discards a reply the downstream
+  synchronized under another incarnation. Every resolve gate checks the
+  incarnation before waiting for the document's current parse and rebuilding
+  the region, so a resolve issued during the post-edit reparse is judged by
+  its stamps, not by parse timing.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one
