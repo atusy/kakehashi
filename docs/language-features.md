@@ -137,9 +137,9 @@ the item (at resolve time, the unsafe resolved response is discarded and the
 unresolved item is served instead), while an unsafe auto-import set — at either
 stage — is dropped whole and the completion itself still applies. A resolve
 is refused, and the item returned unchanged, when the host document was
-edited (even a same-size edit inside the block) or reopened since the item
-was produced: the resolved fields were computed against text the document no
-longer holds. Default combine strategy: `preferred`.
+closed and reopened since the item was produced (the list is meant to outlive
+ordinary edits: the editor filters it locally while the user keeps typing and
+resolves on accept). Default combine strategy: `preferred`.
 
 ### Signature help
 

@@ -44,6 +44,12 @@
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
 //!   Used by `tests/e2e/e2e_code_lens_resolve.rs` (#355).
+//! - `completion-resolve` / `completion-no-resolve` / `completion-resolve-plain` —
+//!   answer `textDocument/completion` with one item; the first two differ in
+//!   `completionProvider.resolveProvider`. `completion-resolve` answers a
+//!   resolve with `detail` and a `textEdit` on line 2 (the host verbatim
+//!   path); `completion-resolve-plain` fills only `detail`, so the reply
+//!   survives the virt edit guard inside a one-line region.
 //! - `inlay-hint-resolve` / `inlay-hint-resolve-replacement` — advertise
 //!   `inlayHintProvider.resolveProvider = true`; answer `textDocument/inlayHint`
 //!   with one hint (label part with a location and a command, an accept edit,
