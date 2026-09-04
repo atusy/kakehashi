@@ -819,12 +819,7 @@ fn e2e_virtual_document_link_resolve_reply_after_a_reopen_is_discarded() {
         json!({ "textDocument": { "uri": uri } }),
     );
     client.send_notification("textDocument/didOpen", open);
-    // The mock answers the parked resolve when the reopened document asks for
-    // links again; this request is only that trigger.
-    let _trigger = client.send_request_async(
-        "textDocument/documentLink",
-        json!({ "textDocument": { "uri": uri } }),
-    );
+    // The mock answers the parked resolve on the reopened lifetime's didOpen.
     let response = client.receive_response_for_id_public(request_id);
     assert_eq!(
         response["result"], link,

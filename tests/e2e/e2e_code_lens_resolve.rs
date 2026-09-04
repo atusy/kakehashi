@@ -690,12 +690,7 @@ fn e2e_virtual_code_lens_resolve_reply_after_a_reopen_is_discarded() {
         json!({ "textDocument": { "uri": MARKDOWN_URI } }),
     );
     open_markdown(&mut client);
-    // The mock answers the parked resolve when the reopened document asks for
-    // lenses again; this request is only that trigger.
-    let _trigger = client.send_request_async(
-        "textDocument/codeLens",
-        json!({ "textDocument": { "uri": MARKDOWN_URI } }),
-    );
+    // The mock answers the parked resolve on the reopened lifetime's didOpen.
     let response = client.receive_response_for_id_public(request_id);
     assert_eq!(
         response["result"], lens,
