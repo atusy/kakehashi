@@ -51,7 +51,8 @@
 //!   path); `completion-resolve-plain` fills only `detail`, so the reply
 //!   survives the virt edit guard inside a one-line region.
 //! - `code-action-lazy-delayed-resolve` / `code-lens-delayed-resolve` /
-//!   `document-link-delayed-resolve` / `completion-resolve-reopen-delayed` /
+//!   `document-link-delayed-resolve` / `completion-resolve-delayed` /
+//!   `completion-resolve-reopen-delayed` /
 //!   `code-lens-reopen-delayed-resolve` / `document-link-reopen-delayed-resolve`
 //!   — like their base modes, but park the resolve reply (after a
 //!   `window/logMessage` `<kind>-resolve-started`) until the next
@@ -366,7 +367,8 @@ fn main() {
                     // must not weigh its items down with routing envelopes.
                     "completion-resolve"
                     | "completion-resolve-plain"
-                    | "completion-resolve-reopen-delayed" => json!({
+                    | "completion-resolve-reopen-delayed"
+                    | "completion-resolve-delayed" => json!({
                         "completionProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -556,6 +558,7 @@ fn main() {
                         "code-action-lazy-delayed-resolve"
                             | "code-lens-delayed-resolve"
                             | "document-link-delayed-resolve"
+                            | "completion-resolve-delayed"
                     ) && let Some((pending_id, pending_result)) = pending_resolve.take()
                     {
                         respond(&mut writer, pending_id, pending_result);
@@ -804,7 +807,9 @@ fn main() {
                 // `completion-resolve-plain`: fill only `detail`, so the reply
                 // survives the bridge's edit guard inside a one-line region and
                 // a test can tell a resolved item from an unresolved one.
-                if mode != "completion-resolve-plain" && mode != "completion-resolve-reopen-delayed"
+                if mode != "completion-resolve-plain"
+                    && mode != "completion-resolve-reopen-delayed"
+                    && mode != "completion-resolve-delayed"
                 {
                     item["textEdit"] = json!({
                         "range": {
@@ -814,7 +819,12 @@ fn main() {
                         "newText": "resolved-edit"
                     });
                 }
-                if mode == "completion-resolve-reopen-delayed" {
+                // `completion-resolve-delayed` parks the reply until the next
+                // `didChange`, so a test can move the region while the
+                // resolve is in flight.
+                if mode == "completion-resolve-reopen-delayed"
+                    || mode == "completion-resolve-delayed"
+                {
                     notify(
                         &mut writer,
                         "window/logMessage",
