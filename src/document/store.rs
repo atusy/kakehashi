@@ -853,6 +853,48 @@ mod tests {
         );
     }
 
+    /// The open parse records its detected language only when it is current:
+    /// one that lost the race to a `didChange` publishes as stale but must
+    /// not relabel the document under the edit's reparse, which was captured
+    /// against the stored label.
+    #[test]
+    fn install_parse_records_the_language_only_when_current() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///relabel.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        store.update_document(uri.clone(), "# doc edited\n".to_string(), None);
+        let mut snapshot = parse_snapshot(
+            &expected_text,
+            Some(markdown_tree(text)),
+            content_version,
+            incarnation,
+        );
+        Arc::get_mut(&mut snapshot).unwrap().language = Some("relabelled".to_string());
+        let outcome = store.install_parse(&uri, LanguageCheck::Record, snapshot);
+        assert_eq!(
+            outcome,
+            ParseInstall {
+                current: false,
+                published: true
+            }
+        );
+        assert_eq!(
+            store.get(&uri).unwrap().language_id(),
+            Some("markdown"),
+            "a stale open parse must not relabel the document"
+        );
+    }
+
     /// A reparse checks the stored language and publishes the tree without
     /// relabelling the document: detection may resolve a stored `sh` to its
     /// `bash` base, and the stored id stays `sh` (the snapshot carries the
