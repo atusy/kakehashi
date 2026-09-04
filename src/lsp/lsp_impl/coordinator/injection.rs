@@ -291,7 +291,12 @@ impl InjectionCoordinator {
             return false;
         }
 
-        let Some(host_language) = self.get_language_for_document(uri) else {
+        // Stored language first (see `document_language`): parser-aware
+        // detection answers `None` while the language is still publishing,
+        // which would cancel the eager batch and exit as if the document had
+        // no language, before the resolution below can answer "could not
+        // look" and leave existing state alone.
+        let Some(host_language) = self.document_language(uri) else {
             self.bridge.cancel_eager_open(uri);
             return false;
         };
