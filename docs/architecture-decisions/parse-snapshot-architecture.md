@@ -201,7 +201,7 @@ enforced by co-location today, become explicit scheduler invariants:
   scratch. "Leaves no accumulated edits" is an explicit reset, not an emergent
   property.
 
-A parse pass therefore has a **single version/incarnation-guarded commit sequence**, so no downstream effect ever escapes for a snapshot that lost the admission:
+A parse pass therefore has a **single version/incarnation-guarded commit sequence**, so no reader-visible publication or downstream emission ever escapes for a snapshot that lost the admission:
 compute the tree, region map, and tokens on the tree value (the populate pass
 commits its injection caches under its own tracker-epoch/lifetime guard, so a
 pass whose text moved on commits nothing there); run the one install
@@ -210,7 +210,11 @@ attach, under one entry guard); and emit the downstream — `semanticTokens/refr
 injected-language forwarding, diagnostic republish — gated on the install's
 result, in the order the per-document-parse-scheduler loop already uses
 (`populate → install → mark finished → downstream`). A rejected publish (a racing
-edit or reopen advanced the slot) emits nothing and attaches nothing. The two
+edit or reopen advanced the slot) emits nothing and attaches nothing. (Two
+parses of the *same* version — an install reparse racing the edit reparse — may
+both commit their populate bookkeeping before one of them loses the equal-version
+admission; those commits are equivalent, keyed by the same tree coordinates under
+the same epoch, so the loser's cache entries are the winner's.) The two
 Stage-2 stores are written by one primitive but are not co-equal: the **snapshot
 publish is the sole commit point**; the legacy tree attach that accompanies it is
 a Stage-2-only compatibility shim feeding the incremental seed (which still reads
