@@ -1057,4 +1057,69 @@ mod tests {
             "parser published and no injection query: genuinely no injections"
         );
     }
+
+    /// A settings reload swaps parsers and queries in place while the reload
+    /// guard is held; a parser and a query read in that window may come from
+    /// different generations, so nothing read then is evidence. The inline
+    /// resolution must answer "could not look" for its duration.
+    #[tokio::test]
+    async fn inline_resolution_is_undeterminable_while_a_reload_is_in_progress() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"((string_literal (string_content) @injection.content)
+                (#set! injection.language "html"))"#,
+        )
+        .expect("valid query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), language.clone());
+        let text = r#"fn main() { let open = "<div>"; }"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("set language");
+        let tree = parser.parse(text, None).expect("parse rust");
+        let uri = Url::parse("file:///reloading.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), text.to_string(), Some("rust".into()), None);
+        server
+            .documents
+            .update_document(uri.clone(), text.to_string(), Some(tree));
+        let injection = server.injection_coordinator();
+
+        assert!(
+            injection
+                .resolve_injection_data(&uri, "rust")
+                .is_some_and(|regions| regions.len() == 1),
+            "settled: the region resolves"
+        );
+
+        server
+            .parser_pool
+            .lock()
+            .expect("parser pool lock")
+            .begin_reload();
+        assert!(
+            injection.resolve_injection_data(&uri, "rust").is_none(),
+            "mid-reload, parser and query may disagree: could not look"
+        );
+        server
+            .parser_pool
+            .lock()
+            .expect("parser pool lock")
+            .finish_reload();
+        assert!(
+            injection
+                .resolve_injection_data(&uri, "rust")
+                .is_some_and(|regions| regions.len() == 1),
+            "settled again: the region resolves"
+        );
+    }
 }
