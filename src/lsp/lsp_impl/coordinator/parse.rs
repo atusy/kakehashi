@@ -660,8 +660,9 @@ impl ParseCoordinator {
     /// Because the install is now off-ingress, a `didChange` can run *concurrently*
     /// with this reparse (it is no longer gated behind the install). A `didChange`
     /// that lands while the parser is still loading stores its new text with **no
-    /// tree** (the parser wasn't available), and would then CAS-reject this
-    /// reparse's now-stale tree — leaving the document tree-less. To converge, this
+    /// tree** (the parser wasn't available), and would then make this reparse's
+    /// tree not current (it publishes as stale; `tree()` stays `None`) — leaving
+    /// the document tree-less. To converge, this
     /// re-reads the latest text and retries a bounded number of times until the
     /// tree lands (or another parse wins). Sustained editing falls back to the
     /// reader's on-demand parse; the parse actor replaces this with a proper
@@ -735,7 +736,7 @@ impl ParseCoordinator {
             // already has a tree => a concurrent parse won; a changed incarnation =>
             // a close+reopen, whose new lifetime drives its own parse — stop rather
             // than parse its text with this lifetime's (possibly relabelled-away)
-            // grammar (the CAS would reject it anyway; this just avoids the wasted
+            // grammar (the cell would reject it anyway; this just avoids the wasted
             // parses).
             let (text, content_version, version_cancel) = {
                 let Some(doc) = self.documents.get(&uri) else {
@@ -748,7 +749,7 @@ impl ParseCoordinator {
                     break;
                 }
                 // `text_arc()` is a refcount bump, not a full copy (#498) — the
-                // original stays here for the CAS while a cheap clone goes to the
+                // original stays here for the install while a cheap clone goes to the
                 // blocking parse closure.
                 (
                     doc.text_arc(),
@@ -759,7 +760,7 @@ impl ParseCoordinator {
 
             let text_len = text.len();
             // Hand a cheap `Arc<str>` clone (refcount bump) to the blocking closure;
-            // the original stays here for the CAS below, so the (potentially large)
+            // the original stays here for the install below, so the (potentially large)
             // document text is never copied.
             let text_for_parse = text.clone();
             let parsed = self
@@ -832,9 +833,10 @@ impl ParseCoordinator {
             if installed.current {
                 break;
             }
-            // Install rejected: the text moved under us (a concurrent
-            // `didChange`), or a sibling parse already installed this
-            // version. Loop to re-read the latest text and try again.
+            // Not current: the text moved under us (a concurrent `didChange`
+            // — the snapshot may still have published as stale-but-
+            // consistent), or a sibling parse already installed this version.
+            // Loop to re-read the latest text and try again.
         }
 
         // Covers the give-up exits of the retry loop (parser still

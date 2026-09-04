@@ -712,7 +712,7 @@ impl Kakehashi {
     /// (injected-language processing + bridge `didChange` forwarding, then the
     /// diagnostic geometry re-merge), then loops if another edit arrived.
     ///
-    /// Resurrection-safe with no teardown: the parse's non-inserting CAS no-ops
+    /// Resurrection-safe with no teardown: the parse's non-inserting `install_parse` no-ops
     /// once a `didClose` removed the document, so a `Close` needs no actor
     /// coordination.
     pub(crate) fn schedule_reparse(&self, uri: Url, ticket: Option<u64>) {

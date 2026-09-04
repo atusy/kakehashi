@@ -48,7 +48,7 @@ pub(crate) struct ParseSnapshot {
     pub(crate) text: Arc<str>,
     pub(crate) tree: Option<Tree>,
     /// The parse's own content-detected language — the snapshot architecture's
-    /// reader-facing refinement, independent of whether the legacy store-backed
+    /// reader-facing refinement, independent of whether the open parse
     /// path also writes the detection back to `Document::language_id` (ADR §1).
     pub(crate) language: Option<String>,
     /// The `Document::content_version` the parse consumed.

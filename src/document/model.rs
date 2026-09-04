@@ -53,16 +53,17 @@ pub struct Document {
     /// seeding (a full parse is cheaper than an unbounded log).
     seed_edits: Vec<(u64, InputEdit)>,
     /// The content version below which no published tree may seed a parse.
-    /// A full-text sync (`apply_edit` with no `InputEdit`s) and a
-    /// grammar reload set it to the version they produce: seeding an unedited
-    /// tree against wholly-replaced text violates tree-sitter's incremental
-    /// contract and corrupted external scanners (#348), and the edits that
-    /// follow cannot be replayed onto a tree from before the sync either.
+    /// A full-text sync (`apply_edit` with no `InputEdit`s), a grammar
+    /// reload, and an edit log that outgrows [`MAX_SEED_EDITS`] set it to the
+    /// version they produce: seeding an unedited tree against wholly-replaced
+    /// text violates tree-sitter's incremental contract and corrupted
+    /// external scanners (#348), and the edits that follow cannot be replayed
+    /// onto a tree from before the cut either.
     seed_floor: u64,
     /// The document's **open incarnation** — a process-wide-unique number drawn
     /// from [`DocumentStore`](crate::document::store::DocumentStore)'s monotonic
     /// counter at every construction (so a `didClose` + reopen of the same URI
-    /// yields a fresh value). Stored *on the document* so a tree-write CAS or a
+    /// yields a fresh value). Stored *on the document* so `install_parse` or a
     /// watermark advance can check it **atomically with the document state**
     /// under the same shard lock — closing the residual where an in-flight
     /// off-ingress parse from a prior lifetime publishes against the reopened
@@ -787,7 +788,7 @@ mod tests {
         assert!(doc.tree().is_none());
     }
 
-    /// A non-empty edit stashes an incremental parse seed and clears the
+    /// A non-empty edit logs its `InputEdit` for the seed and stales the
     /// reader-visible tree (readers must not see a pre-reparse tree).
     #[test]
     fn apply_edit_logs_the_edit_for_the_seed_and_stales_the_tree() {
@@ -842,8 +843,8 @@ mod tests {
         );
     }
 
-    /// Coalesced edits accumulate onto the same seed: after a first edit clears the
-    /// visible tree, a second edit chains its `InputEdit` onto the stashed seed.
+    /// Coalesced edits accumulate in the log: after a first edit stales the
+    /// published tree, a second edit's `InputEdit` is replayed after the first.
     #[test]
     fn apply_edit_coalesces_across_edits() {
         let mut parser = tree_sitter::Parser::new();
@@ -864,8 +865,8 @@ mod tests {
         doc.apply_edit("fn main() { }".to_string(), &[edit1]);
         assert!(doc.tree().is_none());
 
-        // Second edit lands while the visible tree is still cleared: it must chain
-        // onto the accumulated seed, not silently drop incrementality.
+        // Second edit lands while the published tree is still stale: it must
+        // join the log, not silently drop incrementality.
         let edit2 = InputEdit {
             start_byte: 12,
             old_end_byte: 12,
