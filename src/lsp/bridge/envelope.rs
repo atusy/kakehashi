@@ -12,9 +12,9 @@ pub(crate) const ENVELOPE_KEY: &str = "kakehashi";
 /// The document lifetime and text revision a host-layer item was computed
 /// under, read with the text it was computed from. Code action and inlay
 /// hint envelopes carry both so a resolve can refuse an item the document has
-/// moved past; completion envelopes carry the lifetime only (a completion
-/// list outlives edits), and code lens / document link envelopes neither
-/// (they rebuild the region instead). The transport binds every stamped host
+/// moved past; completion, code lens and document link envelopes carry the
+/// lifetime but no revision (a completion list outlives edits; code lens and
+/// document link rebuild the region instead). The transport binds every stamped host
 /// sync to the lifetime and refuses text older than the revision already
 /// synced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
