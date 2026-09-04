@@ -743,7 +743,15 @@ impl InjectionCoordinator {
         &self,
         uri: &Url,
     ) -> Option<(String, Option<Vec<BridgeInjection>>)> {
-        let host_language = self.document_language(uri)?;
+        let (host_language, settled) = self.screen_language(uri)?;
+        if !settled {
+            // The language did not come from a settled parse: between a
+            // reload and its replacement parse's publish, the stored id is
+            // the pre-reload language while the live tree may already be
+            // the replacement's — resolving would run one language's query
+            // against the other's tree. Nothing was looked at.
+            return Some((host_language, None));
+        }
         let injections = self.resolve_injection_data(uri, &host_language);
         Some((host_language, injections))
     }
