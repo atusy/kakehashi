@@ -1845,11 +1845,12 @@ fn spawn_upstream_request(
                         }
                     }
                     // Report what actually happened. `true` releases waiters;
-                    // `false` leaves them to time out and fail soft, which is
-                    // correct when the claimed connection is still empty — a
-                    // command sent there would fail downstream anyway, less
-                    // legibly. A send error means a later respawn's claim
-                    // superseded this barrier, and that respawn owns it now.
+                    // `false` (and the sender dropping right after) makes them
+                    // fail soft at once, which is correct when the claimed
+                    // connection is still empty — a command sent there would
+                    // fail downstream anyway, less legibly. A send error means
+                    // a later respawn's claim superseded this barrier, and
+                    // that respawn owns it now.
                     let _ = done.send(repaired);
                 });
                 // Bound only how long THIS task waits. The work owns the signal,

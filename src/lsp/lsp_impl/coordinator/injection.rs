@@ -546,9 +546,10 @@ impl InjectionCoordinator {
     /// landing right after an edit would resolve ZERO injections and silently
     /// open nothing — the same reason every request path waits for a fresh tree
     /// (execute-command-routing-token). This NARROWS that window rather than
-    /// closing it: the wait is bounded, and on expiry the re-open proceeds and
-    /// may still open nothing. Degrading to the pre-existing lazy heal (the next
-    /// parse re-opens) is preferred over stalling the barrier.
+    /// closing it: the wait is bounded, and on expiry the caller reads
+    /// `Unsettled`, skips the document and reports its sweep incomplete, leaving
+    /// the document to its own pending parse's eager open. Degrading to that
+    /// lazy heal is preferred over stalling the barrier.
     /// Returns which of the three outcomes a caller must distinguish. They are
     /// not interchangeable: `Gone` is nothing to do, `Unsettled` is something
     /// this pass could not determine, and collapsing them makes a closed buffer
