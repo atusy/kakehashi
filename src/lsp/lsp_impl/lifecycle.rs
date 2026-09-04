@@ -1697,6 +1697,14 @@ fn spawn_upstream_request(
                         // being published, so a load in progress reads as
                         // "could not look" below, not as "no language" here.
                         let screened_at = injection.document_incarnation(&host);
+                        // The tree state is read BEFORE the language: a
+                        // replacement parse landing between the two reads
+                        // then shows as "no settled tree" (and the rejection
+                        // is not trusted) rather than pairing a language read
+                        // before it with a tree read after it. Both are read
+                        // before the lifetime is re-checked below, so a close
+                        // and reopen in between shows as a lifetime change.
+                        let settled_tree = injection.snapshot_has_tree(&host);
                         let reachable =
                             injection
                                 .document_language(&host)
@@ -1720,12 +1728,6 @@ fn spawn_upstream_request(
                         // stored language in place until the replacement
                         // parse lands, so a rejection read from it is not
                         // definitive either.
-                        // The tree state is read BEFORE the lifetime is
-                        // re-checked, so a close and reopen between the two
-                        // reads shows up as a lifetime change (and falls
-                        // through) rather than pairing the old language's
-                        // rejection with the new lifetime's tree.
-                        let settled_tree = injection.snapshot_has_tree(&host);
                         if !reachable
                             && settled_tree
                             && injection.document_incarnation(&host) == screened_at
