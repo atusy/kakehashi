@@ -1139,4 +1139,48 @@ mod tests {
             "settled again: the region resolves"
         );
     }
+
+    /// The re-open sweep screens hosts by language before a parser is
+    /// necessarily published (queries land first). A document whose stored
+    /// language is known but whose parser is still on its way must read as
+    /// "could not look" (inner `None`), not as having no language (outer
+    /// `None`, which the sweep skips as not this connection's document).
+    #[tokio::test]
+    async fn bridge_injections_falls_back_to_the_stored_language_while_the_parser_is_pending() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"((string_literal (string_content) @injection.content)
+                (#set! injection.language "html"))"#,
+        )
+        .expect("valid query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
+        let uri = Url::parse("file:///pending_parser.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".into()),
+            None,
+        );
+        let injection = server.injection_coordinator();
+
+        assert_eq!(
+            injection.document_language(&uri).as_deref(),
+            Some("rust"),
+            "the stored language names the host while its parser is pending"
+        );
+        let (host_language, injections) = injection
+            .bridge_injections(&uri)
+            .expect("the stored language must name the host");
+        assert_eq!(host_language, "rust");
+        assert!(
+            injections.is_none(),
+            "no parser yet: the document could not be looked at"
+        );
+    }
 }
