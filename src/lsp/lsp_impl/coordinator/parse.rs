@@ -243,6 +243,7 @@ impl HostLanguageReconciler {
                         return;
                     }
                     let text = document.text_arc();
+                    let content_version = document.content_version();
                     let settings = this.settings_manager.load_settings_pair();
                     // A reload can make the preserved label an alias for another
                     // grammar while this task waits. Match current host contexts
@@ -255,8 +256,28 @@ impl HostLanguageReconciler {
                     };
                     drop(document);
                     if let Some(language) = replacement.as_deref() {
+                        // Same live-reader contract as the open path: a late
+                        // send stamps the text as it is then, instead of
+                        // rolling the downstream back to this snapshot.
+                        let documents = std::sync::Arc::clone(&this.documents);
+                        let host_uri = uri.clone();
+                        let live_text_reader: crate::lsp::bridge::HostTextReader =
+                            std::sync::Arc::new(move || {
+                                documents
+                                    .get(&host_uri)
+                                    .filter(|doc| doc.incarnation() == incarnation)
+                                    .map(|doc| (doc.text_arc(), doc.content_version()))
+                            });
                         this.bridge.eager_open_host_document_on_servers(
-                            &settings.settings, language, &uri, &text,
+                            &settings.settings,
+                            language,
+                            &uri,
+                            &text,
+                            crate::lsp::bridge::HostRevision {
+                                incarnation,
+                                content_version,
+                            },
+                            live_text_reader,
                         );
                     }
                 } => {}
