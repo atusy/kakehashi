@@ -238,7 +238,7 @@ preference order:
   from one atomic snapshot — physically one unit, so there is **no reader-side gate
   to get wrong**: a snapshot carries discovery (reuse) or does not (the
   on-demand-parse fallback tree → discover inline). The only gate is on the
-  *writer* side — the install below attaches discovery only to the tree it
+  *writer* side — the install below publishes discovery only with the tree it
   was built for. Realizability, given `populate_injections` runs *before* the
   install (`DocumentStore::install_parse`, invoked from
   `src/lsp/lsp_impl/coordinator/parse.rs`) on the tree value, guarding its own
@@ -260,7 +260,8 @@ preference order:
   - **Publication scheme:** build discovery on the tree value first, then install
     tree and discovery-carrying snapshot in one `install_parse`; there is no window
     in which the snapshot exists without its discovery, and discovery is never
-    attached to the wrong tree (the install rejects a tree whose inputs moved on).
+    served against the wrong tree (the cell admits one snapshot per version and
+    lifetime, and readers derive the tree from it).
 - **Alternative — a parse epoch.** If coupling into the parse result is too
   invasive, key a separate `DiscoveredInjectionCache` on a **fresh monotonic
   per-parse epoch** — *not* `incarnation` (preserved across edits, so it cannot
