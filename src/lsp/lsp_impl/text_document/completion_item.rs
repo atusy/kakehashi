@@ -88,6 +88,9 @@ impl Kakehashi {
         // response" by the fail-soft parsing. Mirrors `code_action_resolve_impl`.
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let sweep_id = upstream_id.clone();
+        // The end the reply is translated and guarded against, kept for the
+        // post-reply comparison below.
+        let end_then = live_geometry.as_ref().map(|(_, end)| *end);
         let dispatch =
             pool.dispatch_completion_resolve(params, &settings, upstream_id, live_geometry);
         // The cancel arm DROPS the in-flight dispatch, which then never reaches
@@ -124,16 +127,24 @@ impl Kakehashi {
                 }
                 // The same rule as before dispatch: identity, start,
                 // contiguity and language — not the whole offset, which
-                // typing inside a blockquoted fence grows.
-                if !envelope.is_host_layer()
-                    && self.completion_envelope_is_fresh(&envelope).await.is_none()
-                {
-                    log::debug!(
-                        target: "kakehashi::bridge",
-                        "completionItem/resolve: the region of {} moved while resolving; returning item unresolved",
-                        envelope.host_uri
-                    );
-                    return unresolved;
+                // typing inside a blockquoted fence grows. The end may grow
+                // too, but not shrink: the resolved edits were guarded
+                // against the end the region had when the reply was
+                // translated, and a region that shrank since may no longer
+                // contain them.
+                if !envelope.is_host_layer() {
+                    let still_the_region = self
+                        .completion_envelope_is_fresh(&envelope)
+                        .await
+                        .is_some_and(|(_, end_now)| end_then.is_none_or(|then| then <= end_now));
+                    if !still_the_region {
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "completionItem/resolve: the region of {} moved or shrank while resolving; returning item unresolved",
+                            envelope.host_uri
+                        );
+                        return unresolved;
+                    }
                 }
             }
             resolved
