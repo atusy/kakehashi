@@ -959,9 +959,169 @@ pub(crate) struct SnapshotView {
     pub(crate) content_version: u64,
 }
 
+/// What a parse pass expects the document to still be when its result is
+/// installed: the exact inputs it parsed. A document that moved on (an edit,
+/// a close and reopen, a relabelled language) rejects the legacy tree; the
+/// snapshot's own admission rule decides the publish independently.
+pub(crate) struct ParseInputs<'a> {
+    pub(crate) text: &'a str,
+    /// `Some(id)` requires the document's stored language to still be `id`
+    /// (an off-ingress reparse must not attach to a relabelled reopen);
+    /// `None` leaves the language to the snapshot (first-parse detection).
+    pub(crate) language_id: Option<Option<&'a str>>,
+    pub(crate) incarnation: u64,
+    pub(crate) content_version: u64,
+}
+
+/// The outcome of [`DocumentStore::install_parse`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParseInstall {
+    /// The legacy tree (and language) were attached: the inputs were unchanged.
+    pub(crate) attached: bool,
+    /// The snapshot landed in the document's cell: the slot admitted it.
+    pub(crate) published: bool,
+}
+
+impl DocumentStore {
+    /// Install a parse result: attach its tree (and language) to the legacy
+    /// document iff `expected` still describes the document, and publish
+    /// `snapshot` iff the cell admits it — both under the document's entry
+    /// lock, as the one way a parse reaches readers.
+    pub(crate) fn install_parse(
+        &self,
+        _uri: &Url,
+        _expected: ParseInputs<'_>,
+        _snapshot: Arc<super::snapshot::ParseSnapshot>,
+    ) -> ParseInstall {
+        ParseInstall::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn markdown_tree(text: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_md::LANGUAGE.into())
+            .unwrap();
+        parser.parse(text, None).unwrap()
+    }
+
+    fn parse_snapshot(
+        text: &Arc<str>,
+        tree: Option<tree_sitter::Tree>,
+        parsed_version: u64,
+        incarnation: u64,
+    ) -> Arc<super::super::snapshot::ParseSnapshot> {
+        Arc::new(super::super::snapshot::ParseSnapshot {
+            text: Arc::clone(text),
+            tree,
+            language: Some("markdown".to_string()),
+            parsed_version,
+            incarnation,
+            injection_regions: None,
+            bridge_regions: None,
+            resolved_regions: None,
+            layer_trees: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The one way a parse reaches readers: the legacy tree and the snapshot
+    /// land together, or — when the document moved on — neither the tree
+    /// (inputs changed) nor a snapshot the cell does not admit.
+    #[test]
+    fn install_parse_lands_tree_and_snapshot_together_or_not_at_all() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///install.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+
+        let outcome = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: Some(Some("markdown")),
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(
+            outcome,
+            ParseInstall {
+                attached: true,
+                published: true
+            }
+        );
+        assert!(store.get(&uri).unwrap().tree().is_some(), "tree attached");
+        assert!(
+            store.latest_snapshot(&uri).is_some_and(|view| view
+                .slot
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.parsed_version == view.content_version && s.tree.is_some())),
+            "snapshot published and current"
+        );
+
+        // An edit moved the document on: the parse of the old text attaches
+        // nothing, and its snapshot (an older version) is not admitted.
+        store.update_document(uri.clone(), "# doc edited\n".to_string(), None);
+        let stale = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: Some(Some("markdown")),
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(stale, ParseInstall::default());
+        assert!(
+            store.get(&uri).unwrap().tree().is_none(),
+            "a stale parse must not attach to the edited document"
+        );
+
+        // A closed document: nothing to install into.
+        store.remove(&uri);
+        let gone = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: None,
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(gone, ParseInstall::default());
+    }
 
     #[test]
     fn reload_invalidation_clears_open_document_trees() {
