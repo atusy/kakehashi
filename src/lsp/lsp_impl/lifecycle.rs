@@ -1597,18 +1597,21 @@ fn spawn_upstream_request(
                 // and saying so is how the derivation stays scoped to
                 // `(server, root)` instead of cross-opening one root's documents
                 // onto another root's process.
-                // Bound the WAIT, not the work — the shape the inline heal used.
-                // `ensure_server_documents_open` can block up to the init timeout
-                // on a cold downstream, and `done` gates every command on this
-                // connection: an unbounded loop would keep the barrier
-                // outstanding for tens of seconds, making each command pay the
-                // full wait repeatedly. On expiry the opens keep running detached
-                // and waiters are released, degrading to the pre-existing lazy
-                // heal rather than stalling. The sweep itself never stops early:
-                // once the budget is spent it stops WAITING for pending parses,
-                // but still opens every document whose parse is current — a
-                // document nothing else will touch (no pending parse, no
-                // request on it) is otherwise never re-opened at all.
+                // `REOPEN_WAIT` bounds two things, neither of them the sweep's
+                // total lifetime: how long the sweep WAITS for pending parses
+                // (one shared deadline for the pass, below) and how long this
+                // actor watches the sweep before letting it finish in the
+                // background (the `timeout` after the spawn). Each waiter on
+                // `done` applies its own `REOPEN_WAIT` and fails soft when it
+                // passes; expiry here releases nobody — `done` stays pending
+                // until the sweep really finishes, so a command arriving later
+                // finds a settled answer. The sweep never stops early: once
+                // its parse-wait deadline passes it stops WAITING for pending
+                // parses but still opens every document whose parse is
+                // current (a document nothing else will touch — no pending
+                // parse, no request on it — is otherwise never re-opened),
+                // and `repaired` turns false only when an applicable document
+                // stayed unsettled or failed to open.
                 let injection = context.injection.clone();
                 let reopen_server = server.clone();
                 // `done` moves INTO the work task, so ONLY real completion
@@ -1636,10 +1639,10 @@ fn spawn_upstream_request(
                     // release builds do not contain this branch.
                     #[cfg(feature = "e2e")]
                     e2e_stall_reopen().await;
-                    // ONE budget for the whole sweep, not one per host. Each
-                    // surviving host can park waiting for its tree, so a
-                    // per-host bound lets ten of them spend `REOPEN_WAIT` ten
-                    // times over — and the barrier promises to settle inside it
+                    // ONE parse-wait deadline for the whole sweep, not one per
+                    // host. Each surviving host can park waiting for its tree,
+                    // so a per-host bound lets ten of them spend `REOPEN_WAIT`
+                    // ten times over — and a waiter only ever waits that long
                     // ONCE. Deriving the set is what makes that reachable: the
                     // sweep is now sized by the workspace rather than by what
                     // one dead connection held.
@@ -1712,15 +1715,13 @@ fn spawn_upstream_request(
                             .checked_duration_since(std::time::Instant::now())
                             .unwrap_or_default();
                         if remaining.is_zero() && !budget_spent {
-                            // Out of budget with candidates still unexamined.
-                            // Keep going without waiting: a document whose
-                            // parse is current still gets its open, and only a
-                            // document whose parse is pending is left to that
-                            // parse's own eager open. Report the connection as
-                            // NOT caught up: the waiters are about to time out
-                            // anyway, and telling them the sweep finished would
-                            // release commands onto documents this pass never
-                            // reached.
+                            // Parse-wait deadline passed with candidates still
+                            // unexamined. Keep going without waiting: a
+                            // document whose parse is current still gets its
+                            // open, and only a document whose parse is pending
+                            // is left to that parse's own eager open — which
+                            // is what turns `repaired` false below, not the
+                            // deadline itself.
                             log::debug!(
                                 target: "kakehashi::bridge",
                                 "Re-open of {key} ran out of budget with candidates \
