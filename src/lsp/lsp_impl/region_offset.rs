@@ -29,6 +29,10 @@ use crate::language::injection::ResolvedInjection;
 use crate::language::{InjectionResolver, LanguageCoordinator};
 use crate::lsp::bridge::{BridgeCoordinator, EnvelopeOffset, RegionOffset, region_host_end};
 
+/// How long a resolve gate waits for the post-edit reparse before it reads the
+/// region as stale. Matches the request handlers' stale-snapshot deadline.
+const RESOLVE_PARSE_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
 impl Kakehashi {
     /// Whether the host document is still at the text revision a resolve
     /// envelope was minted at. A same-shape edit inside a region keeps its
@@ -91,6 +95,21 @@ impl Kakehashi {
     /// (`method_requires_contiguous_injection`), and code lenses and document
     /// links are minted for them on purpose. Refusing to resolve what was
     /// deliberately produced would leave those items permanently unresolved.
+    /// The parse wait a resolve gate pays before rebuilding its region: a hard
+    /// bound, unlike the request handlers' wait, whose first-parse backstop
+    /// (15s) is right for a request that needs an answer and wrong for a
+    /// gate that fails soft. A reparse still running when it expires reads as
+    /// a stale region; a close+reopen that lands between the lifetime check
+    /// and this wait would otherwise park the resolve on the reopened
+    /// lifetime's first parse.
+    pub(super) async fn wait_for_resolve_parse(&self, host_url: &Url) {
+        let _ = tokio::time::timeout(
+            RESOLVE_PARSE_WAIT,
+            self.wait_for_current_snapshot(host_url, RESOLVE_PARSE_WAIT),
+        )
+        .await;
+    }
+
     pub(super) async fn region_offset_is_fresh(
         &self,
         host_uri: &str,
@@ -107,7 +126,7 @@ impl Kakehashi {
         if !self.host_incarnation_is_current(&host_url, incarnation) {
             return false;
         }
-        self.ensure_document_parsed(&host_url).await;
+        self.wait_for_resolve_parse(&host_url).await;
         resolve_region_offset(
             &self.documents,
             &self.language,
