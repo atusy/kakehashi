@@ -184,7 +184,7 @@ mod tests {
             .documents
             .get(uri)
             .map(|doc| {
-                doc.publish_snapshot(Arc::new(ParseSnapshot {
+                doc.publish_snapshot(&Arc::new(ParseSnapshot {
                     text: Arc::from(text),
                     tree: None,
                     language: Some("rust".to_string()),

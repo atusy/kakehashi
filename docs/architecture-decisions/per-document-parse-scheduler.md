@@ -465,9 +465,10 @@ rather than resurrecting the closed document. Injection orchestration runs
 downstream of the parse, off the ingress path. The text-owning actor of Option 4 is
 not pursued; see Considered Options.
 
-One narrow divergence remains, in injection publication: a close+reopen can slip
-between a successful tree CAS and the subsequent unguarded `injection_map` publish,
-together with a pass-B-no-tree edge. It is benign, and deliberately left scoped-out,
+One narrow divergence remains, in injection publication: the `injection_map`
+publish happens in the populate pass, which now runs *before* the tree install
+and guards its own commit by the tracker's epoch and the lifetime (see
+parse-snapshot-architecture, Stage 2), together with a pass-B-no-tree edge. It is benign, and deliberately left scoped-out,
 for three reasons. First, blast radius: `injection_map` is invalidation bookkeeping —
 read only by `invalidate_for_edits`/`get_injections`, never on the semantic-token
 render path, which re-derives regions from the tree — so a stale entry is at worst a
@@ -476,7 +477,8 @@ transient mis-invalidation for a live document or an unread leak for a closed on
 the single-flight scheduler lets the freshest populate win, and any stale entry is
 replaced on the next successful parse or cleared on reopen. Third, the principled fix —
 tagging `injection_map` with the incarnation — costs a representation change and reader
-threading to close a near-unreachable case (the cross-incarnation overwrite is already
-closed: there is no `.await` between the tree CAS and `populate_injections`, so a fresh
-incarnation cannot squeeze in), and would still miss the same-incarnation
+threading to close a near-unreachable case (the cross-incarnation overwrite is
+closed at populate's own guard — its commit checks the incarnation under the
+tracker entry's lock — not by ordering against the tree install), and would still
+miss the same-incarnation
 pass-B-no-tree edge — a net-negative trade.

@@ -13,3 +13,5 @@ pub(crate) use injections::{
 };
 pub(crate) use model::Document;
 pub use store::DocumentStore;
+
+pub(crate) use store::ParseInputs;
