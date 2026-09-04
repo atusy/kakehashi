@@ -638,7 +638,7 @@ array: ["xxxx"]"#;
         let document = store.get(&url).expect("document should exist");
         let ranges = handle_selection_range(
             document.text(),
-            document.tree(),
+            document.tree().as_ref(),
             document.language_id(),
             &positions,
             &coordinator,
@@ -817,7 +817,7 @@ array: ["xxxx"]"#;
         let document = store.get(&url).expect("document should exist");
         let ranges = handle_selection_range(
             document.text(),
-            document.tree(),
+            document.tree().as_ref(),
             document.language_id(),
             &positions,
             &coordinator,

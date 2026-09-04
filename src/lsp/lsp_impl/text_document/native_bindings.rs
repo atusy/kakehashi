@@ -101,7 +101,7 @@ impl Kakehashi {
         let Some((text, tree, content_version, incarnation)) = ({
             let doc = self.documents.get(&uri);
             doc.and_then(|doc| {
-                let tree = doc.tree()?.clone();
+                let tree = doc.tree()?;
                 Some((
                     doc.text_arc(),
                     tree,
