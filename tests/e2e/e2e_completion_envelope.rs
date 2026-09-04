@@ -190,6 +190,42 @@ fn e2e_virtual_completion_resolve_survives_an_edit_inside_the_region() {
     shutdown_client(&mut client);
 }
 
+/// An edit that moves the region can land while the downstream is still
+/// answering a resolve; the reply's edits were computed for the region where
+/// it was, and must not be translated into where it is now.
+#[test]
+fn e2e_virtual_completion_resolve_reply_after_an_edit_that_moved_the_region_is_discarded() {
+    let (mut client, _config_dir, item) =
+        init_virtual_completion_client("completion-resolve-delayed");
+
+    let request_id = client.send_request_async("completionItem/resolve", item.clone());
+    assert!(
+        client.wait_for_log_message(
+            "completion-resolve-started",
+            std::time::Duration::from_secs(10)
+        ),
+        "resolve must reach the downstream before the edit"
+    );
+    // A line inserted above the fence moves the region; the fence content
+    // changes too, so the downstream receives the virtual didChange that
+    // releases its parked reply.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{ "text": "# Test\n\nmoved\n\n```lua\nlocal x = 12\n```\n" }]
+        }),
+    );
+    let response = client.receive_response_for_id_public(request_id);
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(
+        response["result"]["detail"].is_null(),
+        "a reply for the region where it was must come back unresolved: {response}"
+    );
+
+    shutdown_client(&mut client);
+}
+
 /// A close and reopen can complete while the downstream is still answering a
 /// resolve; the reply then belongs to the closed document and must not be
 /// surfaced into the reopened one.
