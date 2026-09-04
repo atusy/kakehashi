@@ -139,6 +139,7 @@ pub(crate) struct ParsedInitializeCapabilities {
     pub(crate) capabilities: ServerCapabilities,
     pub(crate) dropped: Vec<DroppedCapability>,
     pub(crate) bridge_routing: bool,
+    pub(crate) type_hierarchy_provider: bool,
 }
 
 /// Validates a JSON-RPC initialize response and extracts usable capabilities.
@@ -196,6 +197,7 @@ pub(crate) fn parse_initialize_response_capabilities(
             capabilities: ServerCapabilities::default(),
             dropped: Vec::new(),
             bridge_routing: false,
+            type_hierarchy_provider: false,
         });
     };
     let Some(capabilities) = capabilities.as_object() else {
@@ -212,7 +214,11 @@ pub(crate) fn parse_initialize_response_capabilities(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    let type_hierarchy_provider = capabilities
+        .get("typeHierarchyProvider")
+        .is_some_and(|value| value == true || value.is_object());
     let mut parsed = recover_server_capabilities(capabilities)?;
+    parsed.type_hierarchy_provider = type_hierarchy_provider;
     parsed.bridge_routing = bridge_routing;
     Ok(parsed)
 }
@@ -258,6 +264,7 @@ fn recover_server_capabilities(
         capabilities,
         dropped,
         bridge_routing: false,
+        type_hierarchy_provider: false,
     })
 }
 
@@ -603,6 +610,24 @@ mod tests {
             .strip_prefix("hoverProvider: ")
             .expect("serde error must include the JSON field path");
         assert!(!detail.is_empty(), "serde error must retain its cause");
+    }
+
+    #[test]
+    fn type_hierarchy_provider_survives_missing_typed_server_field() {
+        let response = serde_json::json!({
+            "result": { "capabilities": {
+                "typeHierarchyProvider": true,
+                "experimental": ["preserve", "me"]
+            } }
+        });
+
+        let parsed = parse_initialize_response_capabilities(&response).unwrap();
+
+        assert!(parsed.type_hierarchy_provider);
+        assert_eq!(
+            parsed.capabilities.experimental,
+            Some(serde_json::json!(["preserve", "me"]))
+        );
     }
 
     #[test]

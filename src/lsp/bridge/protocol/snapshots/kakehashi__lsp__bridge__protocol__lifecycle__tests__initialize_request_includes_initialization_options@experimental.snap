@@ -112,6 +112,9 @@ expression: request
         "moniker": {
           "dynamicRegistration": false
         },
+        "typeHierarchy": {
+          "dynamicRegistration": false
+        },
         "inlayHint": {
           "dynamicRegistration": false
         },

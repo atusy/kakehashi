@@ -91,6 +91,9 @@ expression: capabilities
     "moniker": {
       "dynamicRegistration": false
     },
+    "typeHierarchy": {
+      "dynamicRegistration": false
+    },
     "inlayHint": {
       "dynamicRegistration": false
     },

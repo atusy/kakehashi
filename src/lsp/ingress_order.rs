@@ -361,6 +361,7 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/codeAction"
         | "textDocument/inlayHint"
         | "textDocument/prepareCallHierarchy"
+        | "textDocument/prepareTypeHierarchy"
         | "textDocument/diagnostic"
         | "kakehashi/captures/full"
         | "kakehashi/captures/full/delta"
