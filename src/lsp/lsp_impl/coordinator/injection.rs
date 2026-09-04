@@ -590,9 +590,14 @@ impl InjectionCoordinator {
     ) {
         const INJECTION_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
         const INJECTION_RETRY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
-        // One waiter per document: a burst of passes deferred by the same
-        // window re-runs the pass once, when the language settles.
-        let Some(claim) = self.settle_retry_waiters.claim("injection", uri) else {
+        // One waiter per document LIFETIME: a burst of passes deferred by the
+        // same window re-runs the pass once, when the language settles; a
+        // close and reopen in the meantime gets its own waiter, since this
+        // one exits at its lifetime check.
+        let Some(claim) = self
+            .settle_retry_waiters
+            .claim("injection", uri, Some(incarnation))
+        else {
             return;
         };
         let this = self.clone();

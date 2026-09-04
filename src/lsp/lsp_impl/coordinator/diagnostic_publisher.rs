@@ -1582,7 +1582,7 @@ impl DiagnosticPublisher {
         // One waiter per host: every deferral of the same window would
         // otherwise spawn its own poller, and all of them would then
         // serialize through the host's republish lock once settled.
-        let Some(claim) = self.settle_retry_waiters.claim("republish", host) else {
+        let Some(claim) = self.settle_retry_waiters.claim("republish", host, None) else {
             return;
         };
         let this = self.clone();
