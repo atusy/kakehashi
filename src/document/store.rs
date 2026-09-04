@@ -987,13 +987,45 @@ impl DocumentStore {
     /// document iff `expected` still describes the document, and publish
     /// `snapshot` iff the cell admits it — both under the document's entry
     /// lock, as the one way a parse reaches readers.
+    ///
+    /// The two writes share one `get_mut` guard, so no reader can observe a
+    /// tree without its snapshot (or the reverse) and no path can attach a
+    /// tree without publishing: this is the only attach entry point. The
+    /// snapshot may land while the tree does not — a parse of text an edit
+    /// has moved on from is stale but consistent, which serve-stale readers
+    /// consume (parse-snapshot ADR); the cell's admission rule rejects an
+    /// out-of-order version on its own.
     pub(crate) fn install_parse(
         &self,
-        _uri: &Url,
-        _expected: ParseInputs<'_>,
-        _snapshot: Arc<super::snapshot::ParseSnapshot>,
+        uri: &Url,
+        expected: ParseInputs<'_>,
+        snapshot: Arc<super::snapshot::ParseSnapshot>,
     ) -> ParseInstall {
-        ParseInstall::default()
+        let has_tree = snapshot.tree.is_some();
+        let outcome = self
+            .documents
+            .get_mut(uri)
+            .map_or_else(ParseInstall::default, |mut doc| {
+                let inputs_unchanged = doc.incarnation() == expected.incarnation
+                    && doc.content_version() == expected.content_version
+                    && doc.text() == expected.text
+                    && expected
+                        .language_id
+                        .is_none_or(|language_id| doc.language_id() == language_id);
+                if inputs_unchanged {
+                    doc.set_parse_result(snapshot.language.clone(), snapshot.tree.clone());
+                }
+                ParseInstall {
+                    attached: inputs_unchanged,
+                    published: doc.publish_snapshot(snapshot),
+                }
+            });
+        // A different map (`parse_states`): touched only after the document
+        // guard above is released.
+        if outcome.attached && has_tree {
+            self.mark_tree_available_if_tracked(uri);
+        }
+        outcome
     }
 }
 
