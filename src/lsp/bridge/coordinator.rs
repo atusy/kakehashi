@@ -1463,16 +1463,20 @@ impl BridgeCoordinator {
         host_language: &str,
         host_uri: &Url,
         text: &str,
+        live_text_reader: crate::lsp::bridge::HostTextReader,
     ) {
         let configs = self.get_host_configs_for_language(settings, host_language);
-        // Initial open: the snapshot text is current and there is no concurrent
-        // re-sync to race, so no live reader is needed.
+        // The open is fire-and-forget and an edit does not cancel it, so a
+        // stamped request of the same lifetime can sync a newer text first;
+        // the live reader makes a late open send (and stamp) the text as it
+        // is then, instead of rolling the downstream back to the open-time
+        // snapshot, which `text` remains only as the closed-document fallback.
         self.eager_sync_host_document_on_servers(
             host_uri,
             host_language,
             Arc::from(text),
             configs,
-            None,
+            Some(live_text_reader),
         );
     }
 

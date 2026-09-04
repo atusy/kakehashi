@@ -91,8 +91,24 @@ impl Kakehashi {
         // ls-bridge-message-ordering).
         if let Some(ref lang) = language_name {
             let settings = self.settings_manager.load_settings();
-            self.bridge
-                .eager_open_host_document_on_servers(&settings, lang, &uri, &text);
+            // Read under the bridge's `host_documents` lock at send time (see
+            // the debounced re-sync for the lock-ordering argument); the
+            // `Ref` is dropped inside the closure.
+            let documents = std::sync::Arc::clone(&self.documents);
+            let host_uri = uri.clone();
+            let live_text_reader: crate::lsp::bridge::HostTextReader =
+                std::sync::Arc::new(move || {
+                    documents
+                        .get(&host_uri)
+                        .map(|doc| (doc.text_arc(), doc.content_version()))
+                });
+            self.bridge.eager_open_host_document_on_servers(
+                &settings,
+                lang,
+                &uri,
+                &text,
+                live_text_reader,
+            );
         }
 
         // Check if we need to auto-install
@@ -698,9 +714,13 @@ print("hello")
 
         let uri = Url::parse("file:///test/host_eager.rs").unwrap();
         let settings = server.settings_manager.load_settings();
-        server
-            .bridge
-            .eager_open_host_document_on_servers(&settings, "rust", &uri, "fn main() {}");
+        server.bridge.eager_open_host_document_on_servers(
+            &settings,
+            "rust",
+            &uri,
+            "fn main() {}",
+            std::sync::Arc::new(|| None),
+        );
 
         timeout(Duration::from_secs(1), async {
             loop {
