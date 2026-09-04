@@ -138,6 +138,12 @@ impl InjectionCoordinator {
         if !self.language.has_parser_available(host_language) {
             return None;
         }
+        // Re-asked right before every successful answer: a reload that
+        // begins after the checks above (the auto-install reload does not
+        // even invalidate documents) would otherwise turn regions read from
+        // the old query into evidence.
+        let settled =
+            || !reload_in_progress() && self.cache.semantic_token_generation() == generation_before;
         // Fast path (parse-snapshot ADR §3, never discover twice): the parse
         // pass that scheduled this downstream already derived the bridge
         // regions from its single injection-query run and published them on
@@ -155,16 +161,15 @@ impl InjectionCoordinator {
             // query would not discover. Mismatch falls back inline below.
             && *stamped_generation == self.cache.semantic_token_generation()
         {
-            return Some(
-                bridge_regions
-                    .iter()
-                    .map(|region| BridgeInjection {
-                        language: region.language.clone(),
-                        region_id: region.region_id.clone(),
-                        content: region.content.clone(),
-                    })
-                    .collect(),
-            );
+            let regions = bridge_regions
+                .iter()
+                .map(|region| BridgeInjection {
+                    language: region.language.clone(),
+                    region_id: region.region_id.clone(),
+                    content: region.content.clone(),
+                })
+                .collect();
+            return settled().then_some(regions);
         }
 
         // `None` below means "could not be looked at", which the re-open sweep
@@ -177,13 +182,13 @@ impl InjectionCoordinator {
         // reload in progress — or one that started between the reads, which
         // the generation bump reveals — makes the whole answer undeterminable.
         let injection_query = self.language.injection_query(host_language);
-        if reload_in_progress() || self.cache.semantic_token_generation() != generation_before {
+        if !settled() {
             return None;
         }
         let Some(injection_query) = injection_query else {
             // Queries are published before the parser, so a visible parser
             // with no injection query is definitive.
-            return Some(Vec::new());
+            return settled().then(Vec::new);
         };
 
         let Some(doc) = self.documents.get(uri) else {
@@ -203,30 +208,29 @@ impl InjectionCoordinator {
         let Some(regions) =
             collect_all_injections(&tree.root_node(), &text, Some(injection_query.as_ref()))
         else {
-            return Some(Vec::new());
+            return settled().then(Vec::new);
         };
 
         if regions.is_empty() {
-            return Some(Vec::new());
+            return settled().then(Vec::new);
         }
 
-        Some(
-            InjectionResolver::resolve_from_regions(
-                &self.language,
-                self.bridge.node_tracker(),
-                uri,
-                &regions,
-                &text,
-                incarnation,
-            )
-            .into_iter()
-            .map(|region| BridgeInjection {
-                language: region.injection_language,
-                region_id: region.region.region_id,
-                content: region.virtual_content,
-            })
-            .collect(),
+        let resolved = InjectionResolver::resolve_from_regions(
+            &self.language,
+            self.bridge.node_tracker(),
+            uri,
+            &regions,
+            &text,
+            incarnation,
         )
+        .into_iter()
+        .map(|region| BridgeInjection {
+            language: region.injection_language,
+            region_id: region.region.region_id,
+            content: region.virtual_content,
+        })
+        .collect();
+        settled().then_some(resolved)
     }
 
     /// Process injected languages: resolve injection data, optionally forward didChange,
