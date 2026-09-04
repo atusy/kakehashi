@@ -1,4 +1,5 @@
 use crate::document::DocumentStore;
+use crate::document::model::IncrementalSeed;
 use crate::language::{DocumentParserPool, LanguageCoordinator};
 use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::cache::CacheCoordinator;
@@ -943,13 +944,16 @@ impl ParseCoordinator {
 
         let text_len = text.len();
         // Hand a cheap `Arc<str>` clone (refcount bump) to the blocking closure; the
-        // original stays here for the CAS + injection populate below. The seed (also
-        // a cheap `Tree` refcount-clone) makes this an **incremental** parse when an
-        // edit stashed one: tree-sitter reuses the unchanged subtrees and reparses
-        // only the edited region. `None` (full-text sync / install) parses from
-        // scratch. The seed already has this edit's `InputEdit`s applied
-        // (`didChange` → `apply_edit`), satisfying tree-sitter's contract.
+        // original stays here for the install + injection populate below. The seed
+        // makes this an **incremental** parse when the document could derive one:
+        // its edit replay (`IncrementalSeed::replay`, the per-edit path copies)
+        // runs here on the pool with the parse — not under the store guard the
+        // seed was read under — and tree-sitter then reuses the unchanged
+        // subtrees and reparses only the edited region. `None` (full-text sync /
+        // never parsed) parses from scratch.
         let text_for_parse = text.clone();
+        let mut seed = seed;
+        let mut replayed: Option<tree_sitter::Tree> = None;
         let parsed = self
             .parse_with_pool(
                 &language_name,
@@ -957,14 +961,18 @@ impl ParseCoordinator {
                 text_len,
                 Some(version_cancel.clone()),
                 move |mut parser, deadline, generation_retry, cancel| {
+                    let seed_tree = if generation_retry {
+                        None
+                    } else {
+                        if replayed.is_none() {
+                            replayed = seed.take().map(IncrementalSeed::replay);
+                        }
+                        replayed.as_ref()
+                    };
                     let result = parse_text_with_deadline(
                         &mut parser,
                         &text_for_parse,
-                        if generation_retry {
-                            None
-                        } else {
-                            seed.as_ref()
-                        },
+                        seed_tree,
                         deadline,
                         cancel,
                     );
