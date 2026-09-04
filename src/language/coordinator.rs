@@ -1266,6 +1266,21 @@ impl LanguageCoordinator {
         identifier.to_string()
     }
 
+    /// Canonicalize an explicit LSP language ID without consulting document
+    /// content. An explicit non-plaintext ID is authoritative for host routing;
+    /// only configured base aliases and token aliases may normalize it.
+    pub(crate) fn canonical_explicit_language(&self, identifier: &str) -> String {
+        if let Some(base) = self.resolve_base(identifier) {
+            return base;
+        }
+        if identifier == "plaintext" {
+            return identifier.to_string();
+        }
+        super::heuristic::detect_from_token(identifier)
+            .map(|candidate| self.resolve_base(&candidate).unwrap_or(candidate))
+            .unwrap_or_else(|| identifier.to_string())
+    }
+
     fn detect_language_logged(
         &self,
         path: &str,

@@ -85,6 +85,9 @@ expression: capabilities
       "dynamicRegistration": false,
       "tooltipSupport": true
     },
+    "selectionRange": {
+      "dynamicRegistration": false
+    },
     "callHierarchy": {
       "dynamicRegistration": false
     },

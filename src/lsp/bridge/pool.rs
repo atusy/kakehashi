@@ -4055,6 +4055,14 @@ impl LanguageServerPool {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_upstream_request(&self, upstream_id: &UpstreamId) -> bool {
+        self.upstream_request_registry
+            .lock()
+            .recover_poison("LanguageServerPool::has_upstream_request")
+            .contains_key(upstream_id)
+    }
+
     /// Record `upstream_id → connection_key` so `$/cancelRequest` from the
     /// client can be forwarded to every downstream connection handling that ID.
     ///

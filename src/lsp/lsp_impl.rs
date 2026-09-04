@@ -674,6 +674,32 @@ impl Kakehashi {
         detect_document_language(&self.language, &self.documents, uri)
     }
 
+    /// Resolve the host language without requiring a loaded parser.
+    ///
+    /// Host-bridge requests use the real document and do not need a syntax tree,
+    /// so an explicit LSP `languageId` remains routable while parser loading has
+    /// failed or is still in progress.
+    pub(super) fn document_bridge_language(&self, uri: &Url) -> Option<String> {
+        let (stored_language, text) = {
+            let document = self.documents.get(uri)?;
+            (
+                document.language_id().map(str::to_owned),
+                document.text_arc(),
+            )
+        };
+        if let Some(language) = stored_language
+            .as_deref()
+            .filter(|language| *language != "plaintext")
+        {
+            return Some(self.language.canonical_explicit_language(language));
+        }
+        let language = self.document_language(uri).or(stored_language)?;
+        Some(
+            self.language
+                .canonical_injection_language(&language, text.as_ref()),
+        )
+    }
+
     pub(super) fn bridge_configs_for_injection_language(
         &self,
         host_language: &str,

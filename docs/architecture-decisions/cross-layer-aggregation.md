@@ -35,7 +35,12 @@ Phased roadmap:
    the trade-off is downstream load — the host server is queried even when
    virt ends up winning, mirroring how stage-1 queries every server of a
    target. Virt answers inside injections, host answers on the host
-   document when `bridge._self.enabled = true`.
+   document when `bridge._self.enabled = true`. `textDocument/selectionRange`
+   has one method-specific exception: when host is the highest-priority layer,
+   it queries host first for every requested position so a host-only answer does
+   not depend on parser availability. Empty positions then continue through the
+   virt/native walk while reusing non-empty host results; each host position is
+   dispatched at most once.
 3. **Layer-level `concatenated` for `textDocument/formatting` only** — ✅
    implemented as a true sequential cross-layer pipeline in
    `formatting_impl`: layers run in priority order, each formatting the previous
@@ -306,6 +311,10 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   ordinary preferred walk because one injection wholly owns their bridged
   range. Full/delta recomputes the same overlay before diffing its merged
   editor-visible baseline.
+- **Selection range**: multi-position requests resolve the preferred layer per
+  input position rather than once for the whole array. This preserves the LSP
+  one-result-per-position alignment when cursors fall in different virtual and
+  native regions.
 
 ## Consequences
 

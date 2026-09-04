@@ -393,6 +393,18 @@ fn main() {
                         },
                         "textDocumentSync": 1
                     }),
+                    "selection-range-host"
+                    | "selection-range-virt"
+                    | "selection-range-empty"
+                    | "selection-range-mixed-empty"
+                    | "selection-range-delayed" => json!({
+                        "selectionRangeProvider": true,
+                        "textDocumentSync": 1
+                    }),
+                    "selection-range-disabled" => json!({
+                        "selectionRangeProvider": false,
+                        "textDocumentSync": 1
+                    }),
                     "inlay-hint-resolve"
                     | "inlay-hint-resolve-replacement"
                     | "inlay-hint-delayed-resolve"
@@ -1774,6 +1786,44 @@ fn main() {
                 }
                 respond(&mut writer, id, result);
             }
+            "textDocument/selectionRange" => {
+                if mode.starts_with("selection-range-") {
+                    record_mock_event(&mode, "request", &message);
+                    increment_mock_event_count(&mode, "request");
+                }
+                if mode == "selection-range-delayed" {
+                    wait_for_mock_release(&mode);
+                }
+                let result =
+                    (mode != "selection-range-empty")
+                        .then(|| {
+                            message
+                                .pointer("/params/textDocument/uri")
+                                .and_then(Value::as_str)
+                                .filter(|uri| documents.contains_key(*uri))
+                                .and_then(|_| message.pointer("/params/positions/0"))
+                                .and_then(|position| {
+                                    let line = position["line"].as_u64().unwrap_or(0);
+                                    let character = position["character"].as_u64().unwrap_or(0);
+                                    (mode != "selection-range-mixed-empty" || character != 1)
+                                    .then(|| json!([{
+                                    "range": {
+                                        "start": { "line": line, "character": character },
+                                        "end": { "line": line, "character": character + 1 }
+                                    },
+                                    "parent": {
+                                        "range": {
+                                            "start": { "line": line, "character": 0 },
+                                            "end": { "line": line, "character": 4 }
+                                        }
+                                    }
+                                }]))
+                                })
+                        })
+                        .flatten()
+                        .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
             "documentLink/resolve" => {
                 if mode == "document-link-slow-resolve" {
                     record_mock_event(&mode, "request", &message);
@@ -2476,6 +2526,19 @@ fn record_mock_event(mode: &str, event: &str, message: &Value) {
         dir.join(format!("{mode}.{event}.json")),
         serde_json::to_vec(&payload).unwrap_or_default(),
     );
+}
+
+fn increment_mock_event_count(mode: &str, event: &str) {
+    let Ok(dir) = std::env::var("MOCK_LSP_CANCEL_DIR") else {
+        return;
+    };
+    let path = Path::new(&dir).join(format!("{mode}.{event}.count"));
+    let count = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        + 1;
+    let _ = std::fs::write(path, count.to_string());
 }
 
 fn wait_for_mock_release(mode: &str) {

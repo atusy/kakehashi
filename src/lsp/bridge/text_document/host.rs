@@ -192,6 +192,30 @@ pub(super) async fn sync_host_document<S: MessageSender>(
     Ok(())
 }
 
+async fn sync_host_document_for_revision<S: MessageSender>(
+    sender: &mut S,
+    docs: &mut std::collections::HashMap<(String, ConnectionKey), HostDocSyncState>,
+    doc: &HostDocument<'_>,
+    revision_text_reader: Option<&HostTextReader>,
+    connection_key: &ConnectionKey,
+) -> io::Result<()> {
+    let revision_text = match revision_text_reader {
+        Some(read) => Some(read().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "host document revision changed before request synchronization",
+            )
+        })?),
+        None => None,
+    };
+    let revision_doc = HostDocument {
+        uri: doc.uri,
+        language_id: doc.language_id,
+        text: revision_text.as_deref().unwrap_or(doc.text),
+    };
+    sync_host_document(sender, docs, &revision_doc, None, connection_key).await
+}
+
 impl LanguageServerPool {
     /// Send `didClose` for the host document to every server that has it
     /// open via the host bridge, and drop the sync state.
@@ -432,36 +456,6 @@ impl LanguageServerPool {
         .await
     }
 
-    /// Revision-bound host request. The reader is evaluated under the host
-    /// synchronization lock and rejects a superseded document before syncing.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn send_host_raw_request_for_revision(
-        &self,
-        server_name: &str,
-        server_config: &BridgeServerConfig,
-        doc: &HostDocument<'_>,
-        method: &'static str,
-        params: serde_json::Value,
-        upstream_request_id: Option<UpstreamId>,
-        expected_incarnation: u64,
-        revision_text_reader: HostTextReader,
-    ) -> io::Result<Option<HostRawResponse>> {
-        self.send_host_raw_request_inner(
-            server_name,
-            server_config,
-            doc,
-            method,
-            params,
-            upstream_request_id,
-            Some(expected_incarnation),
-            Some(revision_text_reader),
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
     /// Incarnation-fenced host request that marks `attempted` only after the
     /// selected server has initialized and accepted the method capability.
     #[allow(clippy::too_many_arguments)]
@@ -490,6 +484,37 @@ impl LanguageServerPool {
             Some(attempted),
             Some(selected),
             Some(valid_response),
+        )
+        .await
+    }
+
+    /// Revision-bound host request. The reader is evaluated under the host
+    /// synchronization lock and must return the exact current revision; a
+    /// superseded request is rejected before it can sync stale text.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_host_raw_request_for_revision(
+        &self,
+        server_name: &str,
+        server_config: &BridgeServerConfig,
+        doc: &HostDocument<'_>,
+        method: &'static str,
+        params: serde_json::Value,
+        upstream_request_id: Option<UpstreamId>,
+        expected_incarnation: u64,
+        revision_text_reader: HostTextReader,
+    ) -> io::Result<Option<HostRawResponse>> {
+        self.send_host_raw_request_inner(
+            server_name,
+            server_config,
+            doc,
+            method,
+            params,
+            upstream_request_id,
+            Some(expected_incarnation),
+            Some(revision_text_reader),
+            None,
+            None,
+            None,
         )
         .await
     }
@@ -805,32 +830,15 @@ impl LanguageServerPool {
             }
 
             let mut docs = self.host_documents().await;
-            let revision_text = match revision_text_reader.as_ref() {
-                Some(read) => match read() {
-                    Some(text) => Some(text),
-                    None => {
-                        drop(docs);
-                        drop(connections);
-                        if let Some(ref id) = upstream_request_id {
-                            self.unregister_upstream_request(id, connection_key);
-                        }
-                        return Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "host document revision changed before request synchronization",
-                        ));
-                    }
-                },
-                None => None,
-            };
-            let revision_doc = HostDocument {
-                uri: doc.uri,
-                language_id: doc.language_id,
-                text: revision_text.as_deref().unwrap_or(doc.text),
-            };
             let mut sender = ConnectionHandleSender(&handle);
-            if let Err(e) =
-                sync_host_document(&mut sender, &mut docs, &revision_doc, None, connection_key)
-                    .await
+            if let Err(e) = sync_host_document_for_revision(
+                &mut sender,
+                &mut docs,
+                doc,
+                revision_text_reader.as_ref(),
+                connection_key,
+            )
+            .await
             {
                 drop(docs);
                 drop(connections);
@@ -1335,6 +1343,34 @@ mod tests {
             language_id: "markdown",
             text,
         }
+    }
+
+    #[tokio::test]
+    async fn revision_sync_rejects_stale_reader_without_enqueuing_messages() {
+        use crate::lsp::bridge::actor::OutboundMessage;
+
+        let mut docs = std::collections::HashMap::new();
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        let uri = Url::parse("file:///test/stale.md").unwrap();
+        let connection_key = ConnectionKey::for_server("stale");
+        let reader: HostTextReader = Arc::new(|| None);
+
+        let error = sync_host_document_for_revision(
+            &mut sender,
+            &mut docs,
+            &host_doc(&uri, "old"),
+            Some(&reader),
+            &connection_key,
+        )
+        .await
+        .expect_err("a superseded revision must not be synchronized");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(docs.is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

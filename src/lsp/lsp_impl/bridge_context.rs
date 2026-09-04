@@ -70,6 +70,7 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
             | "textDocument/onTypeFormatting"
             | "textDocument/prepareRename"
             | "textDocument/rename"
+            | "textDocument/selectionRange"
             | "textDocument/semanticTokens/range"
     )
 }
@@ -99,6 +100,7 @@ fn region_boundary_for_method(method: &str) -> crate::language::injection::Regio
         "textDocument/completion"
         | "textDocument/signatureHelp"
         | "textDocument/linkedEditingRange"
+        | "textDocument/selectionRange"
         | "textDocument/onTypeFormatting" => RegionBoundary::CaretEndFallback,
         _ => RegionBoundary::HalfOpen,
     }
@@ -271,7 +273,7 @@ pub(crate) struct RangeRequestContext {
 struct PreambleResult {
     uri: Url,
     resolved: ResolvedInjection,
-    language_name: String,
+    bridge_language_name: String,
     upstream_request_id: Option<UpstreamId>,
     /// End-of-content derived for the bounds precheck, carried so no later
     /// stage re-derives it.
@@ -920,6 +922,9 @@ impl Kakehashi {
             log::debug!("kakehashi::{}: No language detected", method_name);
             return None;
         };
+        let bridge_language_name = self
+            .document_bridge_language(&uri)
+            .unwrap_or_else(|| language_name.clone());
 
         // Get injection query to detect injection regions
         let injection_query = self.language.injection_query(&language_name)?;
@@ -1001,7 +1006,7 @@ impl Kakehashi {
             PreambleResult {
                 uri,
                 resolved,
-                language_name,
+                bridge_language_name,
                 upstream_request_id,
                 region_end,
                 incarnation: snapshot.incarnation(),
@@ -1095,17 +1100,17 @@ impl Kakehashi {
         preamble: PreambleResult,
         method_name: &str,
     ) -> Option<DocumentRequestContext> {
-        if !self.virt_layer_enabled(&preamble.language_name, method_name) {
+        if !self.virt_layer_enabled(&preamble.bridge_language_name, method_name) {
             log::debug!(
                 "{}: virt layer disabled for {} via layers.aggregation priorities",
                 method_name,
-                preamble.language_name
+                preamble.bridge_language_name
             );
             return None;
         }
 
         let mut configs = self.bridge_configs_for_injection_language(
-            &preamble.language_name,
+            &preamble.bridge_language_name,
             &preamble.resolved.injection_language,
         );
 
@@ -1113,7 +1118,7 @@ impl Kakehashi {
             log::debug!(
                 "No bridge server configured for language: {} (host: {})",
                 preamble.resolved.injection_language,
-                preamble.language_name
+                preamble.bridge_language_name
             );
             return None;
         }
@@ -1124,7 +1129,7 @@ impl Kakehashi {
         // (capability-prefilter-fanout).
         let incapable = self
             .incapable_virt_servers(
-                &preamble.language_name,
+                &preamble.bridge_language_name,
                 std::iter::once(preamble.resolved.injection_language.as_str()),
                 method_name,
             )
@@ -1177,7 +1182,7 @@ impl Kakehashi {
         }
 
         let agg = self.resolve_aggregation_config(
-            &preamble.language_name,
+            &preamble.bridge_language_name,
             &preamble.resolved.injection_language,
             method_name,
         );
@@ -1245,7 +1250,7 @@ impl Kakehashi {
                 document.content_version(),
             )
         };
-        let language_name = self.document_language(&uri)?;
+        let language_name = self.document_bridge_language(&uri)?;
 
         let settings = self.settings_manager.load_settings();
         let lang_settings = settings.resolve_host_language_settings(&language_name)?;
@@ -1477,22 +1482,75 @@ impl Kakehashi {
         native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
         is_nonempty: impl Fn(&R) -> bool,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
-        let Ok(uri) = uri_to_url(lsp_uri) else {
-            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
-            return Ok(None);
-        };
-        let Some(host_language) = self.document_language(&uri) else {
-            return Ok(None);
-        };
-        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
-        self.run_layer_race(race_layers_preferred(
-            &layer_cfg.priorities,
+        self.walk_layer_futures_with_scope(
+            lsp_uri,
+            layer_method,
+            request_method,
             virt,
             host,
             native,
             is_nonempty,
-        ))
+            true,
+        )
         .await
+    }
+
+    /// Race pre-built layer futures inside a request scope that already owns
+    /// the cancellation subscription and upstream-registry sweep.
+    ///
+    /// This is for one protocol request that fans out into multiple concurrent
+    /// layer walks. A per-walk sweep would remove registrations still owned by
+    /// sibling walks as soon as the first walk completed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn walk_layer_futures_in_request_scope<R>(
+        &self,
+        lsp_uri: &Uri,
+        layer_method: &'static str,
+        request_method: &'static str,
+        virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        is_nonempty: impl Fn(&R) -> bool,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+        self.walk_layer_futures_with_scope(
+            lsp_uri,
+            layer_method,
+            request_method,
+            virt,
+            host,
+            native,
+            is_nonempty,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn walk_layer_futures_with_scope<R>(
+        &self,
+        lsp_uri: &Uri,
+        layer_method: &'static str,
+        request_method: &'static str,
+        virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        is_nonempty: impl Fn(&R) -> bool,
+        owns_request_scope: bool,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+        let Ok(uri) = uri_to_url(lsp_uri) else {
+            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
+            return Ok(None);
+        };
+        let Some(host_language) = self.document_bridge_language(&uri) else {
+            return Ok(None);
+        };
+        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
+        let race = race_layers_preferred(&layer_cfg.priorities, virt, host, native, is_nonempty);
+        if owns_request_scope {
+            self.run_layer_race(race).await
+        } else {
+            race.await
+        }
     }
 
     /// Run a pre-built layer race under a walk-wide cancel subscription, then
@@ -1553,7 +1611,7 @@ impl Kakehashi {
             log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
             return Ok(None);
         };
-        let Some(host_language) = self.document_language(&uri) else {
+        let Some(host_language) = self.document_bridge_language(&uri) else {
             return Ok(None);
         };
         // ONE resolve for both the strategy decision and the priorities passed
@@ -1602,11 +1660,7 @@ impl Kakehashi {
             log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
             return Ok(None);
         };
-        let Some(host_language) = self.document_language(&uri).or_else(|| {
-            self.documents
-                .get(&uri)
-                .and_then(|document| document.language_id().map(str::to_owned))
-        }) else {
+        let Some(host_language) = self.document_bridge_language(&uri) else {
             return Ok(None);
         };
         let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
@@ -1737,6 +1791,9 @@ impl Kakehashi {
         let Some(language_name) = self.document_language(&uri) else {
             return Vec::new();
         };
+        let bridge_language_name = self
+            .document_bridge_language(&uri)
+            .unwrap_or_else(|| language_name.clone());
         let Some(injection_query) = self.language.injection_query(&language_name) else {
             return Vec::new();
         };
@@ -1791,7 +1848,7 @@ impl Kakehashi {
                     ),
                 ),
                 resolved,
-                language_name: language_name.clone(),
+                bridge_language_name: bridge_language_name.clone(),
                 upstream_request_id: upstream_request_id.clone(),
                 incarnation: snapshot.incarnation(),
                 content_version: snapshot.content_version(),
@@ -3204,6 +3261,7 @@ mod tests {
             "textDocument/onTypeFormatting",
             "textDocument/prepareRename",
             "textDocument/rename",
+            "textDocument/selectionRange",
             "textDocument/semanticTokens/range",
         ] {
             assert!(method_requires_contiguous_injection(method), "{method}");
@@ -3306,6 +3364,7 @@ mod tests {
             "textDocument/completion",
             "textDocument/signatureHelp",
             "textDocument/linkedEditingRange",
+            "textDocument/selectionRange",
             // onTypeFormatting has no point-invocation mode at all: its
             // position is the caret right after the typed trigger character.
             "textDocument/onTypeFormatting",
