@@ -96,10 +96,14 @@ Partially implemented:
   same all-or-nothing edit guard as initial hint retrieval.
   `codeAction/resolve` carries and checks the same revision stamp before
   dispatch and after the reply, and the incarnation after the reply as well.
-  `completionItem/resolve` checks only the incarnation (before dispatch and
-  after the reply): a completion list is meant to outlive ordinary edits — the
-  editor filters it locally while the user keeps typing and resolves on
-  accept — and the downstream computes the lazy fields against its own copy
+  `completionItem/resolve` carries no revision stamp: a completion list is
+  meant to outlive ordinary edits — the editor filters it locally while the
+  user keeps typing and resolves on accept — so before dispatch it checks the
+  incarnation and rebuilds the region (identity, start, contiguity and
+  language; the end and per-line offsets are read live for the translation),
+  and after the reply it checks the incarnation and refuses a reply the
+  document was edited under while the request was in flight. The downstream
+  computes the lazy fields against its own copy
   of the text, which the bridge keeps in step (a resolve enqueued before the
   virtual `didChange` for the latest host edit has been forwarded still
   reaches the previous copy; see #1053). Every host-layer producer (completion,
@@ -113,8 +117,11 @@ Partially implemented:
   reparse is judged by its stamps; a reparse that outlasts that budget still
   fails soft as a stale region. Code lens and document link, whose envelopes
   carry no revision, rebuild the region again after the reply for a virtual
-  item (a host item re-checks the lifetime); completion refuses a reply the
-  document was edited under while it was in flight.
+  item (a host item re-checks the lifetime). Completion carries no revision
+  either — a completion list outlives edits — but rebuilds the region before
+  dispatch (identity, start, contiguity, language; the end and per-line
+  offsets are read live for translation) and refuses a reply the document
+  was edited under while it was in flight.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one
