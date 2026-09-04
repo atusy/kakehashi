@@ -260,8 +260,10 @@ preference order:
   - **Publication scheme:** build discovery on the tree value first, then install
     tree and discovery-carrying snapshot in one `install_parse`; there is no window
     in which the snapshot exists without its discovery, and discovery is never
-    served against the wrong tree (the cell admits one snapshot per version and
-    lifetime, and readers derive the tree from it).
+    served against the wrong tree (the cell admits, per lifetime, a newer version
+    or a same-version tree upgrade over a tree-less placeholder, never a
+    same-version tree swap — so a given tree-bearing version has exactly one
+    tree, and readers derive theirs from it).
 - **Alternative — a parse epoch.** If coupling into the parse result is too
   invasive, key a separate `DiscoveredInjectionCache` on a **fresh monotonic
   per-parse epoch** — *not* `incarnation` (preserved across edits, so it cannot
