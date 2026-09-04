@@ -38,6 +38,7 @@ pub(crate) struct InjectionCoordinator {
     bridge: std::sync::Arc<BridgeCoordinator>,
     diagnostics: std::sync::Arc<DiagnosticAggregator>,
     settle_retry_waiters: crate::lsp::lsp_impl::settle_retry::SettleRetryWaiters,
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// What a bounded wait for a current tree actually found.
@@ -65,6 +66,7 @@ impl InjectionCoordinator {
             bridge: std::sync::Arc::clone(&server.bridge),
             diagnostics: std::sync::Arc::clone(&server.diagnostics),
             settle_retry_waiters: server.settle_retry_waiters.clone(),
+            shutdown: server.shutdown_token.clone(),
         }
     }
 
@@ -310,11 +312,16 @@ impl InjectionCoordinator {
             // Nothing else re-runs this pass for a document whose sole parse
             // overlapped a publication or reload window (an injected
             // language's auto-install reload does not reparse hosts), so
-            // arrange the retry here — for THAT cause only. A document that
-            // is tree-less under a settled language gets a tree from its own
-            // next parse or never; retrying it would re-schedule itself on
-            // every attempt.
-            if self.language_is_unsettled(&host_language) {
+            // arrange the retry here. Every cause but one is transient (a
+            // language still publishing, a reload, a generation bump between
+            // the reads), and the cause is not re-sampled — it may already
+            // have settled — so the retry is admitted whenever the document
+            // could be looked at once things settle: it has a tree, or its
+            // language is what is unsettled. The one non-transient cause, a
+            // tree-less document under a settled language, gets a tree from
+            // its own next parse or never; retrying it would re-schedule
+            // itself on every attempt.
+            if self.snapshot_has_tree(uri) || self.language_is_unsettled(&host_language) {
                 self.retry_injection_pass_when_settled(
                     uri,
                     &host_language,
@@ -604,10 +611,13 @@ impl InjectionCoordinator {
         let uri = uri.clone();
         let host_language = host_language.to_string();
         tokio::spawn(async move {
-            let _claim = claim;
+            let claim = claim;
             let deadline = tokio::time::Instant::now() + INJECTION_RETRY_BUDGET;
             loop {
-                tokio::time::sleep(INJECTION_RETRY_POLL).await;
+                tokio::select! {
+                    _ = this.shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(INJECTION_RETRY_POLL) => {}
+                }
                 // A host parser discovered from `searchPaths` (not declared)
                 // loses its registration to the generation bump of any
                 // reload — including an injected language's auto-install,
@@ -626,6 +636,10 @@ impl InjectionCoordinator {
                         target: "kakehashi::bridge",
                         "Re-running the injection pass for {uri}: {host_language} has settled"
                     );
+                    // Release the slot BEFORE the rerun: a reload starting
+                    // right now makes the rerun defer again, and its retry
+                    // must be able to claim the slot this waiter held.
+                    drop(claim);
                     let _ = this
                         .process_injections_for_incarnation(&uri, forward_did_change, incarnation)
                         .await;
