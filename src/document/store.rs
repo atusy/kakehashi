@@ -634,7 +634,7 @@ impl DocumentStore {
             resolved_regions: None,
             layer_trees: std::sync::OnceLock::new(),
         };
-        doc.publish_snapshot(Arc::new(snapshot));
+        doc.publish_snapshot(&Arc::new(snapshot));
     }
 
     /// The CURRENT snapshot's fully resolved injection regions, or `None` when
@@ -741,9 +741,10 @@ impl DocumentStore {
     ) -> ParseInstall {
         let has_tree = snapshot.tree.is_some();
         let (version, incarnation) = (snapshot.parsed_version, snapshot.incarnation);
-        // The snapshot this install evicts is dropped only after the guard
-        // is released: dropping a tree (and its layer trees) is not free, and
-        // the shard's readers would wait on it otherwise.
+        // The snapshot this install evicts — and `snapshot` itself when the
+        // cell rejects it — is dropped only after the guard is released:
+        // dropping a tree (and its layer trees, its region vectors) is not
+        // free, and the shard's readers would wait on it otherwise.
         let mut evicted = None;
         let outcome = self
             .documents
@@ -768,7 +769,7 @@ impl DocumentStore {
                     Some(_) => doc.language_id().map(String::from),
                 };
                 let tree = snapshot.tree.clone();
-                let published = doc.publish_snapshot(snapshot);
+                let published = doc.publish_snapshot(&snapshot);
                 let attached = inputs_unchanged && published;
                 if attached {
                     doc.set_parse_result(language, tree);
@@ -778,7 +779,10 @@ impl DocumentStore {
                     published,
                 }
             });
+        // Likewise a rejected `snapshot` (still owned here: the publish
+        // borrows) — destroyed only after the guard is released.
         drop(evicted);
+        drop(snapshot);
         if !outcome.published {
             log::debug!(
                 target: "kakehashi::snapshot",
@@ -1456,7 +1460,7 @@ mod tests {
         fn publish(store: &DocumentStore, uri: &Url, snapshot: ParseSnapshot) -> bool {
             store
                 .get(uri)
-                .map(|doc| doc.publish_snapshot(Arc::new(snapshot)))
+                .map(|doc| doc.publish_snapshot(&Arc::new(snapshot)))
                 .unwrap_or(false)
         }
 

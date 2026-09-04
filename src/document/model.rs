@@ -200,12 +200,15 @@ impl Document {
     /// `send_if_modified` so the guard and the write are atomic under the
     /// channel's own lock. Returns whether the publish landed; a rejected
     /// publish (a racing edit's newer snapshot, a reopen, a close) must make
-    /// the caller emit no downstream effects.
-    pub(crate) fn publish_snapshot(&self, snapshot: Arc<ParseSnapshot>) -> bool {
+    /// the caller emit no downstream effects. Takes the snapshot by reference
+    /// so the caller keeps ownership of a rejected one and can drop it after
+    /// releasing whatever guard it holds: destroying a tree and its region
+    /// vectors is not free.
+    pub(crate) fn publish_snapshot(&self, snapshot: &Arc<ParseSnapshot>) -> bool {
         let mut installed = false;
         self.snapshot_tx.send_if_modified(|slot| {
-            if slot.admits(&snapshot) {
-                slot.snapshot = Some(Arc::clone(&snapshot));
+            if slot.admits(snapshot) {
+                slot.snapshot = Some(Arc::clone(snapshot));
                 installed = true;
             }
             installed
