@@ -48,6 +48,14 @@ pub(crate) struct HostDocument<'a> {
     pub(crate) uri: &'a Url,
     pub(crate) language_id: &'a str,
     pub(crate) text: &'a str,
+    /// The lifetime and text revision `text` was read at, when the caller
+    /// read them together. With it, the request is refused rather than
+    /// synchronized into a later lifetime (a close and reopen racing the
+    /// request), and a text older than what this connection already holds
+    /// for the same lifetime is refused rather than rolled back onto it.
+    /// `None` synchronizes verbatim (the initial open, speculative formatting
+    /// text, the eager on-edit re-sync).
+    pub(crate) revision: Option<crate::lsp::bridge::envelope::HostRevision>,
 }
 
 /// A raw host-server response plus the very connection that answered it.
@@ -106,10 +114,8 @@ async fn resync_open_host_document<S: MessageSender>(
         },
     );
     sender.send_notification(notification).await?;
-    *state = HostDocSyncState {
-        version,
-        fingerprint: fp,
-    };
+    state.version = version;
+    state.fingerprint = fp;
     Ok(())
 }
 
@@ -165,6 +171,7 @@ pub(super) async fn sync_host_document<S: MessageSender>(
     let live = live_text_reader.and_then(|read| read());
     let text: &str = live.as_deref().unwrap_or(doc.text);
     let fp = fingerprint(text);
+    let content_version = doc.revision.map(|revision| revision.content_version);
 
     match docs.entry(key) {
         Entry::Vacant(entry) => {
@@ -183,10 +190,32 @@ pub(super) async fn sync_host_document<S: MessageSender>(
             entry.insert(HostDocSyncState {
                 version: 1,
                 fingerprint: fp,
+                content_version,
             });
         }
         Entry::Occupied(mut entry) => {
-            resync_open_host_document(sender, entry.get_mut(), uri_lsp, text).await?;
+            let state = entry.get_mut();
+            // Two requests of the same lifetime can reach this lock in the
+            // reverse of the order their text was read in; syncing the older
+            // text would roll the downstream back to it, and the request's
+            // own lineage check would then accept the answer. Refuse the
+            // older one instead; an unstamped sync (no revision) leaves the
+            // watermark alone.
+            if let (Some(incoming), Some(recorded)) = (content_version, state.content_version)
+                && incoming < recorded
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!(
+                        "host text of {} moved past the revision this request read",
+                        doc.uri
+                    ),
+                ));
+            }
+            resync_open_host_document(sender, state, uri_lsp, text).await?;
+            if content_version.is_some() {
+                state.content_version = content_version;
+            }
         }
     }
     Ok(())
@@ -578,7 +607,13 @@ impl LanguageServerPool {
         // Route per-connection state by this handle's pool key (#382).
         let connection_key = handle.key();
         self.wait_for_host_routing(doc.uri).await;
-        let host_lifecycle = self.request_host_lifecycle(doc.uri).await?;
+        let host_lifecycle = match doc.revision {
+            Some(revision) => {
+                self.request_host_lifecycle_for_incarnation(doc.uri, revision.incarnation)
+                    .await?
+            }
+            None => self.request_host_lifecycle(doc.uri).await?,
+        };
         if self.is_host_routing_suppressed(doc.uri, connection_key) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -1108,6 +1143,7 @@ mod tests {
             uri,
             language_id: "markdown",
             text,
+            revision: None,
         }
     }
 
@@ -1182,6 +1218,56 @@ mod tests {
             panic!("expected a notification");
         };
         assert_eq!(payload["params"]["textDocument"]["version"], 3);
+    }
+
+    /// Two stamped requests of one lifetime can reach the sync lock in the
+    /// reverse of the order their text was read in. The older text must be
+    /// refused, not synchronized (which would roll the downstream back to it
+    /// while the request's own lineage check accepts the answer); an
+    /// unstamped sync neither trips nor moves the watermark.
+    #[tokio::test]
+    async fn sync_refuses_a_text_older_than_the_revision_already_synced() {
+        use crate::lsp::bridge::actor::OutboundMessage;
+        use crate::lsp::bridge::envelope::HostRevision;
+
+        let mut docs = std::collections::HashMap::new();
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(16);
+        let uri = Url::parse("file:///test/host.md").unwrap();
+        let key = ConnectionKey::for_server("srv");
+        let stamped = |text: &'static str, content_version: u64| HostDocument {
+            uri: &uri,
+            language_id: "markdown",
+            text,
+            revision: Some(HostRevision {
+                incarnation: 1,
+                content_version,
+            }),
+        };
+
+        sync_host_document(&mut sender, &mut docs, &stamped("v5", 5), None, &key)
+            .await
+            .unwrap();
+        rx.try_recv().expect("didOpen queued");
+
+        let older = sync_host_document(&mut sender, &mut docs, &stamped("v4", 4), None, &key).await;
+        assert!(older.is_err(), "an older revision must be refused");
+        assert!(rx.try_recv().is_err(), "and nothing synced for it");
+
+        // An unstamped sync of newer text still goes out and leaves the
+        // watermark where the last stamped sync put it.
+        sync_host_document(&mut sender, &mut docs, &host_doc(&uri, "v6"), None, &key)
+            .await
+            .unwrap();
+        rx.try_recv().expect("unstamped drift still synced");
+        let older_again =
+            sync_host_document(&mut sender, &mut docs, &stamped("v4", 4), None, &key).await;
+        assert!(older_again.is_err());
+
+        // A newer stamped text syncs and moves the watermark.
+        sync_host_document(&mut sender, &mut docs, &stamped("v7", 7), None, &key)
+            .await
+            .unwrap();
+        rx.try_recv().expect("newer stamped text synced");
     }
 
     #[tokio::test]
@@ -1273,6 +1359,7 @@ mod tests {
                 HostDocSyncState {
                     version: 1,
                     fingerprint: 1,
+                    content_version: None,
                 },
             );
             docs.insert(
@@ -1280,6 +1367,7 @@ mod tests {
                 HostDocSyncState {
                     version: 1,
                     fingerprint: 2,
+                    content_version: None,
                 },
             );
         }

@@ -274,6 +274,10 @@ impl CancelForwardingMetrics {
 pub(super) struct HostDocSyncState {
     pub(super) version: i32,
     pub(super) fingerprint: u64,
+    /// The newest host text revision a stamped request synchronized under
+    /// this lifetime, so an older stamped text is refused rather than
+    /// synced; `None` until a stamped request has synced.
+    pub(super) content_version: Option<u64>,
 }
 
 /// Cancellation-safe rollback for the pre-send virtual-document claim.
