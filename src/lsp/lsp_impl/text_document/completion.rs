@@ -80,6 +80,7 @@ impl Kakehashi {
         // racing the request would otherwise answer for the closed text under
         // the reopened document's incarnation.
         let expected_incarnation = ctx.incarnation;
+        let content_version = ctx.content_version;
         let pool = self.bridge.pool_arc();
         let f = move |t: HostFanOutTask| {
             let params = raw_params.clone();
@@ -116,7 +117,10 @@ impl Kakehashi {
                 };
                 Ok(Some(HostCompletion {
                     response,
-                    incarnation: expected_incarnation,
+                    revision: crate::lsp::bridge::HostRevision {
+                        incarnation: expected_incarnation,
+                        content_version,
+                    },
                     // Two allocations per SERVER, versus an envelope per item
                     // in a task whose result the fan-in may well discard.
                     server_resolves: raw.handle.has_capability("completionItem/resolve"),
@@ -150,6 +154,17 @@ impl Kakehashi {
         lsp_uri: &Uri,
         position: Position,
     ) -> Result<Option<CompletionResponse>> {
+        // Read before the preamble snapshots the document, so the stamp can
+        // only be older than the content the items were computed on, never
+        // newer: an edit landing in between makes the items fail soft on
+        // resolve until the editor's next request, which follows an edit
+        // anyway.
+        let Some(content_version) = url::Url::parse(lsp_uri.as_str())
+            .ok()
+            .and_then(|uri| self.documents.get(&uri).map(|doc| doc.content_version()))
+        else {
+            return Ok(None);
+        };
         // Use shared preamble to resolve injection context with ALL matching servers
         let Some(ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
@@ -179,6 +194,7 @@ impl Kakehashi {
                         &t.region_id,
                         t.offset,
                         &t.virtual_content,
+                        content_version,
                         t.upstream_id,
                     )
                     .await
@@ -206,8 +222,8 @@ struct HostCompletion {
     host_uri: String,
     /// Whether that server advertises `completionItem/resolve`.
     server_resolves: bool,
-    /// The host lifetime the items were computed under.
-    incarnation: u64,
+    /// The host lifetime and text revision the items were computed under.
+    revision: crate::lsp::bridge::HostRevision,
 }
 
 impl HostCompletion {
@@ -216,7 +232,7 @@ impl HostCompletion {
             &mut self.response,
             &self.server_name,
             &self.host_uri,
-            Some(self.incarnation),
+            Some(self.revision),
             self.server_resolves,
         );
         self.response

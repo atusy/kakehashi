@@ -345,6 +345,17 @@ impl Kakehashi {
         // into one menu (#628 multi-region), in document order. Latency scales
         // with the overlapped-region count (bounded by the document's injection
         // count); the common case is a range within a single fence.
+        // Read before the preamble snapshots the document, so the stamp can
+        // only be older than the content the actions were computed on, never
+        // newer: an edit landing in between makes the actions fail soft on
+        // resolve until the editor's next request, which follows an edit
+        // anyway.
+        let Some(content_version) = url::Url::parse(lsp_uri.as_str())
+            .ok()
+            .and_then(|uri| self.documents.get(&uri).map(|doc| doc.content_version()))
+        else {
+            return Ok(None);
+        };
         let contexts = self
             .resolve_bridge_contexts_for_all_overlapping_regions(lsp_uri, range, METHOD)
             .await;
@@ -373,7 +384,7 @@ impl Kakehashi {
                 // The work-done progress token is single-use → first region only.
                 ctx.document.client_progress_token = progress_token.take();
                 if let Some(actions) = self
-                    .dispatch_virt_region_code_action(ctx, &context, upstream_caps)
+                    .dispatch_virt_region_code_action(ctx, &context, upstream_caps, content_version)
                     .await?
                 {
                     merged.extend(actions);
@@ -407,6 +418,7 @@ impl Kakehashi {
         ctx: RangeRequestContext,
         context: &CodeActionContext,
         upstream_caps: UpstreamCodeActionCaps,
+        content_version: u64,
     ) -> Result<Option<CodeActionResponse>> {
         let pool = self.bridge.pool_arc();
         let range = ctx.range;
@@ -425,6 +437,7 @@ impl Kakehashi {
                         t.region_end(),
                         t.offset,
                         &t.virtual_content,
+                        content_version,
                         t.upstream_id,
                         t.client_progress_token,
                         upstream_caps,
@@ -478,6 +491,10 @@ impl Kakehashi {
         // racing the request would otherwise answer for the closed text under
         // the reopened document's incarnation.
         let expected_incarnation = ctx.incarnation;
+        let host_revision = crate::lsp::bridge::HostRevision {
+            incarnation: expected_incarnation,
+            content_version: ctx.content_version,
+        };
         let pool = self.bridge.pool_arc();
         // One fan-out closure, dispatched by the within-host-layer strategy
         // (`bridge._self.aggregation.<method>.strategy`); moves into one arm.
@@ -555,7 +572,7 @@ impl Kakehashi {
                     upstream_caps,
                     server_resolves,
                     None,
-                    Some(expected_incarnation),
+                    Some(host_revision),
                 )))
             }
         };
