@@ -335,7 +335,7 @@ fn main() {
                     // `completion-no-resolve` answers completion the same way
                     // but does NOT advertise resolveProvider, so the bridge
                     // must not weigh its items down with routing envelopes.
-                    "completion-resolve" => json!({
+                    "completion-resolve" | "completion-resolve-plain" => json!({
                         "completionProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -751,13 +751,18 @@ fn main() {
                     .unwrap_or("?")
                     .to_string();
                 item["detail"] = json!(format!("mock-resolved:{path}"));
-                item["textEdit"] = json!({
-                    "range": {
-                        "start": { "line": 2, "character": 4 },
-                        "end": { "line": 2, "character": 9 }
-                    },
-                    "newText": "resolved-edit"
-                });
+                // `completion-resolve-plain`: fill only `detail`, so the reply
+                // survives the bridge's edit guard inside a one-line region and
+                // a test can tell a resolved item from an unresolved one.
+                if mode != "completion-resolve-plain" {
+                    item["textEdit"] = json!({
+                        "range": {
+                            "start": { "line": 2, "character": 4 },
+                            "end": { "line": 2, "character": 9 }
+                        },
+                        "newText": "resolved-edit"
+                    });
+                }
                 respond(&mut writer, id, item);
             }
             "textDocument/codeAction" => {

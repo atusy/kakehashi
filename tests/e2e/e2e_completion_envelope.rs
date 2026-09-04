@@ -128,3 +128,40 @@ fn e2e_virtual_completion_from_resolving_server_is_enveloped() {
 
     shutdown_client(&mut client);
 }
+
+/// A same-shape edit inside the fence leaves the region's geometry intact
+/// but changes the content the items were computed against; a resolve of a
+/// pre-edit item must come back unresolved, with its envelope intact for the
+/// editor's next completion request.
+#[test]
+fn e2e_virtual_completion_resolve_after_same_shape_edit_stays_unresolved() {
+    let (mut client, _config_dir, item) =
+        init_virtual_completion_client("completion-resolve-plain");
+    assert_eq!(item["data"]["kakehashi"]["origin"], "mock-completion");
+
+    // Positive control: before any edit the item resolves.
+    let response = client.send_request("completionItem/resolve", item.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(
+        response["result"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("mock-resolved:")),
+        "the control resolve must reach the downstream: {response}"
+    );
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{ "text": "# Test\n\n```lua\nlocal y = 1\n```\n" }]
+        }),
+    );
+    let response = client.send_request("completionItem/resolve", item.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(
+        response["result"], item,
+        "a resolve of an item computed against the previous text must stay unresolved"
+    );
+
+    shutdown_client(&mut client);
+}
