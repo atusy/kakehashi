@@ -69,11 +69,9 @@ impl Kakehashi {
         // region would translate coordinates with a stale offset and bind the
         // lens to content the user has since edited.
         if !envelope.is_host_layer()
-            && !self.region_offset_is_fresh(
-                &envelope.host_uri,
-                &envelope.region_id,
-                &envelope.offset,
-            )
+            && !self
+                .region_offset_is_fresh(&envelope.host_uri, &envelope.region_id, &envelope.offset)
+                .await
         {
             log::debug!(
                 target: "kakehashi::bridge",
