@@ -281,6 +281,11 @@ impl Kakehashi {
             };
             let (cancel_rx, _cancel_guard) =
                 self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+            // The lifetime the text was read under travels with the items and
+            // a reply synchronized under another one is refused: a close and
+            // reopen racing the request would otherwise answer for the closed
+            // text under the reopened document's incarnation.
+            let expected_incarnation = ctx.incarnation;
             let pool = self.bridge.pool_arc();
             let fan_in = dispatch_host_preferred(
                 &ctx,
@@ -306,6 +311,15 @@ impl Kakehashi {
                         let Some(raw) = raw else {
                             return Ok(None);
                         };
+                        if raw.incarnation != expected_incarnation {
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "{method_name} (host): {} was reopened while {} answered; discarding items computed on the closed text",
+                                t.uri,
+                                t.server_name
+                            );
+                            return Ok(None);
+                        }
                         let Some(items) = parse_host_verbatim::<Vec<T>>(raw.value) else {
                             return Ok(None);
                         };
@@ -313,7 +327,7 @@ impl Kakehashi {
                             items,
                             server_name: t.server_name,
                             host_uri: t.uri,
-                            incarnation: Some(raw.incarnation),
+                            incarnation: Some(expected_incarnation),
                             connection_generation: raw.connection_generation,
                             handle: raw.handle,
                         }))

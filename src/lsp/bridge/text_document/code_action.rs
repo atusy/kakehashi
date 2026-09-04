@@ -138,7 +138,12 @@ fn envelope_action_data(action: &mut CodeAction, ctx: &CodeActionEnvelopeContext
 /// forwarded verbatim, so no region/offset is captured (`host_layer = true`
 /// tells the resolve path to skip all coordinate translation). Captures the
 /// CURRENT (unsuffixed) title as `original_title`; call before suffixing.
-fn envelope_host_action(action: &mut CodeAction, server_name: &str, host_uri: &str) {
+fn envelope_host_action(
+    action: &mut CodeAction,
+    server_name: &str,
+    host_uri: &str,
+    incarnation: Option<u64>,
+) {
     let inner = action.data.take();
     let envelope = CodeActionEnvelope {
         origin: server_name.to_string(),
@@ -153,7 +158,7 @@ fn envelope_host_action(action: &mut CodeAction, server_name: &str, host_uri: &s
         },
         original_title: action.title.clone(),
         inner: None,
-        incarnation: None,
+        incarnation,
         host_layer: true,
     };
     action.data = Some(wrap_envelope(&envelope, inner));
@@ -520,6 +525,7 @@ impl LanguageServerPool {
             upstream_caps,
             handle.has_capability("codeAction/resolve"),
             Some(&virt),
+            None,
         )))
     }
 
@@ -1332,6 +1338,7 @@ pub(crate) fn bridge_code_actions(
     upstream_caps: UpstreamCodeActionCaps,
     server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
+    host_incarnation: Option<u64>,
 ) -> Vec<CodeActionOrCommand> {
     actions
         .into_iter()
@@ -1343,6 +1350,7 @@ pub(crate) fn bridge_code_actions(
                 upstream_caps,
                 server_resolves,
                 virt,
+                host_incarnation,
             )
         })
         .collect()
@@ -1361,6 +1369,7 @@ fn bridge_code_action(
     upstream_caps: UpstreamCodeActionCaps,
     server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
+    host_incarnation: Option<u64>,
 ) -> Option<CodeActionOrCommand> {
     // The key's server IS the config server name the envelope and titles use;
     // deriving it here keeps one source of truth for the origin.
@@ -1497,7 +1506,7 @@ fn bridge_code_action(
                 // (host coordinates, no translation — #627). Otherwise it can
                 // never be completed here, so disable it.
                 if virt.is_none() && server_resolves && upstream_caps.can_envelope() {
-                    envelope_host_action(&mut action, server_name, host_uri);
+                    envelope_host_action(&mut action, server_name, host_uri, host_incarnation);
                     action.title = suffix_title(action.title, server_name);
                     return Some(CodeActionOrCommand::CodeAction(action));
                 }
@@ -1961,6 +1970,7 @@ mod tests {
             upstream_caps,
             server_resolves,
             Some(&virt),
+            None,
         ))
     }
 
@@ -2360,6 +2370,7 @@ mod tests {
             caps(true),
             false,
             None,
+            None,
         );
         assert_eq!(bridged.len(), 2);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
@@ -2395,6 +2406,7 @@ mod tests {
             caps_resolve(),
             true, // host server advertises codeAction/resolve
             None, // host layer
+            Some(1),
         );
         assert_eq!(bridged.len(), 1);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
@@ -2412,6 +2424,11 @@ mod tests {
         );
         assert_eq!(env.origin, "marksman");
         assert_eq!(env.host_uri, "file:///test.md");
+        assert_eq!(
+            env.incarnation,
+            Some(1),
+            "the host lifetime the actions were computed under rides in the envelope"
+        );
         assert_eq!(env.original_title, "Organize imports");
     }
 
@@ -2428,6 +2445,7 @@ mod tests {
             "file:///test.md",
             caps_resolve(),
             false, // host server does NOT advertise resolve
+            None,
             None,
         );
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
@@ -2468,6 +2486,7 @@ mod tests {
             caps_resolve(),
             true,
             None,
+            None,
         );
         assert_eq!(bridged.len(), 1);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
@@ -2492,6 +2511,7 @@ mod tests {
             "file:///test.md",
             caps_resolve(),
             false,
+            None,
             None,
         );
         assert!(
@@ -2826,6 +2846,7 @@ mod tests {
             caps(true),
             false,
             None,
+            None,
         );
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
             panic!("Expected CodeAction");
@@ -3007,8 +3028,15 @@ mod tests {
         .unwrap();
         let key = ConnectionKey::new("sr|v", Some("file:///repo".to_string()));
 
-        let bridged =
-            bridge_code_actions(actions, &key, "file:///test.md", caps_resolve(), true, None);
+        let bridged = bridge_code_actions(
+            actions,
+            &key,
+            "file:///test.md",
+            caps_resolve(),
+            true,
+            None,
+            None,
+        );
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
             panic!("Expected CodeAction");
         };
