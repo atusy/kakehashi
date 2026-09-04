@@ -107,9 +107,12 @@ Partially implemented:
   incarnation the host text was read under (codeAction and inlayHint with its
   revision as well), from one store read, and discards a reply the downstream
   synchronized under another incarnation. Every resolve gate checks the
-  incarnation before waiting for the document's current parse and rebuilding
-  the region, so a resolve issued during the post-edit reparse is judged by
-  its stamps, not by parse timing.
+  incarnation, then waits for the document's current parse — bounded by the
+  same short budget the request handlers use before their preamble — before
+  rebuilding the region, so a resolve issued during an ordinary post-edit
+  reparse is judged by its stamps; a reparse that outlasts that budget still
+  fails soft as a stale region. Code lens and document link, whose envelopes
+  carry no revision, rebuild the region again after the reply.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one
