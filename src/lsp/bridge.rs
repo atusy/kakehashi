@@ -179,7 +179,6 @@ mod tests {
                 "region-0",
                 RegionOffset::new(3, 0),
                 virtual_content,
-                0,                           // content_version
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
             .await;
