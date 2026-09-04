@@ -135,7 +135,11 @@ embedded block (escape the region, break blockquote `> ` prefixes, or merge cont
 into the closing fence) are dropped fail-closed: an unsafe primary edit drops
 the item (at resolve time, the unsafe resolved response is discarded and the
 unresolved item is served instead), while an unsafe auto-import set — at either
-stage — is dropped whole and the completion itself still applies. Default combine strategy: `preferred`.
+stage — is dropped whole and the completion itself still applies. A resolve
+is refused, and the item returned unchanged, when the host document was
+edited (even a same-size edit inside the block) or reopened since the item
+was produced: the resolved fields were computed against text the document no
+longer holds. Default combine strategy: `preferred`.
 
 ### Signature help
 
@@ -301,7 +305,9 @@ YAML/TOML frontmatter always fails soft — the resolve freshness check cannot
 match there; the eager-resolve path taken for non-envelope clients bypasses
 that check.)
 Command-carrying actions execute through the bridged
-`workspace/executeCommand`.
+`workspace/executeCommand`. A resolve is refused, and the action returned
+unchanged, when the host document was edited (even a same-size edit inside
+the block) or reopened since the action was produced.
 
 Edit safety differs by layer and direction. An INJECTION-layer action edit
 that cannot be represented in the host document (touching another injection
