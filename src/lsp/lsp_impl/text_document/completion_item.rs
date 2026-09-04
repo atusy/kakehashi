@@ -129,6 +129,7 @@ impl Kakehashi {
                             &envelope.region_id,
                             &envelope.offset,
                             envelope.incarnation,
+                            &envelope.injection_language,
                         )
                         .await
                 {
@@ -164,14 +165,15 @@ impl Kakehashi {
         // find no snapshot and read as a stale region; wait (bounded) for the
         // current parse before rebuilding the region.
         self.wait_for_resolve_parse(&host_url).await;
-        let (offset, region_end, contiguous, _) = resolve_region_offset(
+        let (offset, region_end, contiguous, live_language) = resolve_region_offset(
             &self.documents,
             &self.language,
             &self.bridge,
             &host_url,
             &envelope.region_id,
         )?;
-        completion_geometry_matches(envelope, &offset, contiguous).then_some(region_end)
+        completion_geometry_matches(envelope, &offset, contiguous, &live_language)
+            .then_some(region_end)
     }
 }
 
@@ -179,10 +181,15 @@ fn completion_geometry_matches(
     envelope: &KakehashiEnvelope,
     live_offset: &RegionOffset,
     contiguous: bool,
+    live_language: &str,
 ) -> bool {
     !envelope.region_id.is_empty()
         && contiguous
         && RegionOffset::from(&envelope.offset) == *live_offset
+        // The region may have been re-routed (a shebang edit under an
+        // `unknown` injection) without moving; the item belongs to the
+        // language it was produced for.
+        && envelope.injection_language == live_language
 }
 
 #[cfg(test)]
@@ -192,6 +199,7 @@ mod tests {
     fn envelope(region_id: &str) -> KakehashiEnvelope {
         serde_json::from_value(serde_json::json!({
             "origin": "lua-ls",
+            "injection_language": "lua",
             "host_uri": "file:///test.md",
             "region_id": region_id,
             "inner": null,
@@ -204,21 +212,23 @@ mod tests {
     #[test]
     fn completion_resolve_requires_current_contiguous_geometry() {
         let offset = RegionOffset::with_per_line_offsets(3, vec![2]);
-        assert!(completion_geometry_matches(
-            &envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
-            &offset,
-            true
-        ));
-        assert!(!completion_geometry_matches(&envelope(""), &offset, true));
+        let region = envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert!(completion_geometry_matches(&region, &offset, true, "lua"));
         assert!(!completion_geometry_matches(
-            &envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            &envelope(""),
             &offset,
-            false
+            true,
+            "lua"
         ));
+        assert!(!completion_geometry_matches(&region, &offset, false, "lua"));
         let moved = RegionOffset::with_per_line_offsets(4, vec![2]);
         assert!(
-            !completion_geometry_matches(&envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV"), &moved, true),
+            !completion_geometry_matches(&region, &moved, true, "lua"),
             "a region that moved is not the region the item was produced for"
+        );
+        assert!(
+            !completion_geometry_matches(&region, &offset, true, "python"),
+            "a region re-routed to another language is not the region the item was produced for"
         );
     }
 }

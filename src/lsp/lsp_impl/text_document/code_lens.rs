@@ -75,6 +75,7 @@ impl Kakehashi {
                     &envelope.region_id,
                     &envelope.offset,
                     envelope.incarnation,
+                    &envelope.injection_language,
                 )
                 .await
         {
@@ -119,6 +120,7 @@ impl Kakehashi {
                     &envelope.region_id,
                     &envelope.offset,
                     envelope.incarnation,
+                    &envelope.injection_language,
                 )
                 .await
             };
