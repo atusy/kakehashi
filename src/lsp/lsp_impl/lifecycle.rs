@@ -1697,24 +1697,27 @@ fn spawn_upstream_request(
                         // being published, so a load in progress reads as
                         // "could not look" below, not as "no language" here.
                         let screened_at = injection.document_incarnation(&host);
-                        // The tree state is read BEFORE the language: a
-                        // replacement parse landing between the two reads
-                        // then shows as "no settled tree" (and the rejection
-                        // is not trusted) rather than pairing a language read
-                        // before it with a tree read after it. Both are read
-                        // before the lifetime is re-checked below, so a close
-                        // and reopen in between shows as a lifetime change.
-                        let settled_tree = injection.snapshot_has_tree(&host);
-                        let reachable =
-                            injection
-                                .document_language(&host)
-                                .is_some_and(|candidate_language| {
+                        // The language and whether it comes from a settled
+                        // tree are read from ONE snapshot view: two reads
+                        // would let a replacement parse landing, or a reload
+                        // invalidating the parse, in between pair a settled
+                        // tree with a language that is not that tree's. Both
+                        // are read before the lifetime is re-checked below,
+                        // so a close and reopen in between shows as a
+                        // lifetime change.
+                        let (reachable, settled_tree) = injection
+                            .screen_language(&host)
+                            .map(|(candidate_language, settled_tree)| {
+                                (
                                     injection.bridge().host_language_can_reach_server(
                                         &settings,
                                         &candidate_language,
                                         &reopen_server,
-                                    )
-                                });
+                                    ),
+                                    settled_tree,
+                                )
+                            })
+                            .unwrap_or((false, false));
                         // Only trust a REJECTION if the document did not change
                         // lifetime underneath it. A close+reopen under a
                         // different `languageId` between the two reads would

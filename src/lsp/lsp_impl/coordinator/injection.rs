@@ -695,6 +695,16 @@ impl InjectionCoordinator {
     /// pre-reload value, so the snapshot's language wins once the parse is
     /// current and carries a tree.
     pub(crate) fn document_language(&self, uri: &Url) -> Option<String> {
+        self.screen_language(uri).map(|(language, _)| language)
+    }
+
+    /// [`Self::document_language`] together with whether the language came
+    /// from a settled parse (a current snapshot with a tree) — read from ONE
+    /// snapshot view, so a reload invalidating the parse (or a replacement
+    /// parse landing) between two reads cannot pair a settled tree with a
+    /// language that is not that tree's. The sweep's screen trusts a
+    /// rejection only when the flag is set.
+    pub(crate) fn screen_language(&self, uri: &Url) -> Option<(String, bool)> {
         let settled = self.documents.latest_snapshot(uri).and_then(|view| {
             view.slot.snapshot.as_ref().and_then(|snapshot| {
                 (snapshot.parsed_version == view.content_version && snapshot.tree.is_some())
@@ -702,13 +712,16 @@ impl InjectionCoordinator {
                     .flatten()
             })
         });
+        if let Some(language) = settled {
+            return Some((language, true));
+        }
         let stored = self
             .documents
             .get(uri)
             .and_then(|document| document.language_id().map(str::to_string));
-        settled
-            .or(stored)
+        stored
             .or_else(|| self.get_language_for_document(uri))
+            .map(|language| (language, false))
     }
 
     /// `uri`'s reopen generation, which scopes a downstream `didOpen` to the
