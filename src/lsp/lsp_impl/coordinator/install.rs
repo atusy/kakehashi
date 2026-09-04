@@ -343,7 +343,7 @@ impl InstallCoordinator {
         if global_loaded && !is_injection {
             // Resurrection-safe, off-ingress reparse: re-detects the language from
             // the current document lifetime and persists through a non-inserting
-            // CAS, so a didClose/reopen during the install can't receive a tree for
+            // `install_parse`, so a didClose/reopen during the install can't receive a tree for
             // the old language. A host waiter whose install claim was won by an
             // injection reaches this same per-URI path after the claim completes.
             self.parse_coordinator()
@@ -400,7 +400,7 @@ impl InstallCoordinator {
                 || self
                     .documents
                     .get(uri)
-                    .is_some_and(|document| document.tree().is_some()))
+                    .is_some_and(|document| document.has_current_tree()))
     }
 
     fn parse_coordinator(&self) -> ParseCoordinator {
@@ -832,7 +832,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_does_not_attach_installed_language_tree_to_relabelled_document() {
+    async fn reload_does_not_publish_installed_language_tree_for_relabelled_document() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         server

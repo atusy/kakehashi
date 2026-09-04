@@ -22,7 +22,7 @@ async fn spawn_synthetic_diagnostic_for_incarnation<F>(
         documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
         return;
     };
-    let eligible = document.incarnation() == incarnation && document.tree().is_some();
+    let eligible = document.incarnation() == incarnation && document.has_current_tree();
     drop(document);
     if eligible {
         diagnostic_scheduler.spawn_synthetic_diagnostic_task(uri);
@@ -167,7 +167,7 @@ impl Kakehashi {
                         // process_injections would otherwise cancel the eager-open
                         // for a still-tree-less document.
                         let has_tree = documents.get(&install_uri).is_some_and(|doc| {
-                            doc.incarnation() == incarnation && doc.tree().is_some()
+                            doc.incarnation() == incarnation && doc.has_current_tree()
                         });
                         if has_tree {
                             let same_lifetime = injection
@@ -291,11 +291,11 @@ impl Kakehashi {
                 let landed = parse
                     .parse_document(parse_uri.clone(), Some(parse_language_id.as_str()), ticket)
                     .await;
-                // Run the open downstream only when THIS parse's CAS landed the tree —
-                // not merely when "a tree exists". A `didChange` racing this open parse
-                // can move the text on and let the edit reparse attach the newer tree
-                // (and run `process_injections(forward=true)`) first; this parse then
-                // loses its CAS (`landed == false`). Re-running the open downstream
+                // Run the open downstream only when THIS parse's install published the
+                // current tree — not merely when "a tree exists". A `didChange` racing
+                // this open parse can move the text on and let the edit reparse publish
+                // the newer tree (and run `process_injections(forward=true)`) first;
+                // this parse is then reported not current (`landed == false`). Re-running the open downstream
                 // (`process_injections(forward=false)`) over the edit's tree would
                 // supersede the edit's eager-open batch. When `landed` is false the
                 // edit reparse owns the current tree and already ran the correct
@@ -623,7 +623,7 @@ print("hello")
             server
                 .documents
                 .get(&uri)
-                .is_some_and(|doc| doc.tree().is_some()),
+                .is_some_and(|doc| doc.has_current_tree()),
             "the eager open must not run before the parse is installed"
         );
     }
@@ -1129,7 +1129,7 @@ print("hello")
 
     /// Regression (parse-actor flip): the host bridge context needs only the
     /// document text, never the parse tree (parse-decoupled ADR), so it must keep
-    /// resolving after `did_change` clears the tree — otherwise every host-bridged
+    /// resolving after `did_change` stales the tree — otherwise every host-bridged
     /// request (hover / definition / formatting / diagnostics) would bail for the
     /// whole reparse window after each edit.
     #[tokio::test]
@@ -1158,7 +1158,7 @@ print("hello")
             "sanity: host context resolves with a tree present"
         );
 
-        // did_change clears the tree synchronously.
+        // did_change stales the tree synchronously (the version bump).
         server
             .documents
             .update_document(uri.clone(), "fn changed() {}".to_string(), None);
@@ -1231,7 +1231,7 @@ print("hello")
     /// Regression (parse-actor flip): the debounced diagnostic — which drives the
     /// on-edit host re-sync (#431) that keeps a push host's diagnostics following
     /// edits — must be scheduled AFTER the off-ingress reparse, not in the
-    /// `did_change` handler. The handler clears the tree, and
+    /// `did_change` handler. The handler makes the tree stale, and
     /// `prepare_diagnostic_snapshot` returns `None` without a tree, so scheduling
     /// the debounce there would capture a `None` snapshot and silently skip the
     /// re-sync (the diagnostics-don't-follow-edits bug). This pins the mechanism:
@@ -1262,7 +1262,7 @@ print("hello")
             "a parsed self-host doc yields a diagnostic snapshot"
         );
 
-        // What did_change does synchronously: apply the edit and CLEAR the tree.
+        // What did_change does synchronously: apply the edit, which stales the tree.
         server
             .documents
             .update_document(uri.clone(), "fn changed() {}".to_string(), None);
@@ -1312,8 +1312,8 @@ print("hello")
         );
     }
 
-    /// The off-ingress install reparse re-reads the latest store text and attaches
-    /// a tree to the still-open document.
+    /// The off-ingress install reparse re-reads the latest store text and publishes
+    /// a tree for the still-open document.
     #[tokio::test]
     async fn reparse_installed_document_parses_the_open_document() {
         let (service, _socket) = LspService::new(Kakehashi::new);
@@ -1338,7 +1338,7 @@ print("hello")
 
         assert!(
             server.documents.get(&uri).unwrap().tree().is_some(),
-            "the reparse must attach a tree to the open document"
+            "the reparse must publish a tree for the open document"
         );
     }
 
@@ -1365,8 +1365,8 @@ print("hello")
         );
     }
 
-    /// `reparse_latest` attaches a fresh tree to the open document (whose tree was
-    /// cleared by the edit) and advances the watermark to the edit's ticket.
+    /// `reparse_latest` publishes a fresh tree for the open document (whose tree the
+    /// edit made stale) and advances the watermark to the edit's ticket.
     #[tokio::test]
     async fn reparse_latest_parses_and_advances_watermark() {
         let (service, _socket) = LspService::new(Kakehashi::new);
@@ -1374,8 +1374,8 @@ print("hello")
         configure_rust_self_host(server);
 
         let uri = Url::parse("file:///test/edited.rs").unwrap();
-        // The edit applied new text and cleared the tree (tree = None), exactly as
-        // did_change does before scheduling the reparse.
+        // The edit applied new text with no tree published for it (tree = None),
+        // exactly what did_change leaves behind before scheduling the reparse.
         server.documents.insert(
             uri.clone(),
             "fn edited() {}".to_string(),
@@ -1391,11 +1391,78 @@ print("hello")
 
         assert!(
             server.documents.get(&uri).unwrap().tree().is_some(),
-            "the off-ingress reparse attaches a tree to the edited document"
+            "the off-ingress reparse publishes a tree for the edited document"
         );
         // The watermark advance itself is still exercised by the store's own
         // watermark tests; the reader-side wait (`wait_for_epoch`) was removed
         // with the snapshot conversion (parse-snapshot ADR Stage 2).
+    }
+
+    /// `reparse_latest` parses incrementally from the derived seed: after an
+    /// edit inside one item, the reparse's tree reuses the untouched item's
+    /// subtree (a reused subtree keeps its node identities; a parse from
+    /// scratch allocates new ones).
+    #[tokio::test]
+    async fn reparse_latest_reuses_untouched_subtrees_through_the_seed() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/incremental.rs").unwrap();
+        let before = "fn keep() {}\nfn edit() {}\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(before, None).unwrap();
+        // The identity of a node *inside* the untouched item: a reused subtree
+        // keeps its children array, so the identifier's id survives the reparse.
+        let keep_name = |t: &tree_sitter::Tree| {
+            t.root_node()
+                .named_child(0)
+                .and_then(|item| item.child_by_field_name("name"))
+                .map(|name| name.id())
+        };
+        let before_id = keep_name(&tree).expect("fn keep has a name");
+        server.documents.insert(
+            uri.clone(),
+            before.to_string(),
+            Some("rust".to_string()),
+            Some(tree),
+        );
+
+        // Insert a space inside `fn edit`'s body: byte 24 is the `}` of line 2.
+        let after = "fn keep() {}\nfn edit() { }\n";
+        let edit = tree_sitter::InputEdit {
+            start_byte: 24,
+            old_end_byte: 24,
+            new_end_byte: 25,
+            start_position: tree_sitter::Point::new(1, 11),
+            old_end_position: tree_sitter::Point::new(1, 11),
+            new_end_position: tree_sitter::Point::new(1, 12),
+        };
+        server
+            .documents
+            .apply_edit(&uri, after.to_string(), &[edit]);
+        assert!(server.documents.get(&uri).unwrap().tree().is_none());
+
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(1))
+            .await;
+
+        let reparsed = server
+            .documents
+            .get(&uri)
+            .unwrap()
+            .tree()
+            .expect("the reparse published a tree");
+        assert_eq!(&*server.documents.get(&uri).unwrap().text(), after);
+        assert_eq!(
+            keep_name(&reparsed),
+            Some(before_id),
+            "the untouched item's subtree must be reused from the seed"
+        );
     }
 
     /// If a concurrent `didChange` already parsed the document (a tree is
@@ -1413,7 +1480,9 @@ print("hello")
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse("fn already() {}", None).unwrap();
-        let tree_id = tree.root_node().id();
+        // A child node's id survives `Tree` clones (the root handle does not).
+        let first_child = |t: &tree_sitter::Tree| t.root_node().named_child(0).map(|n| n.id());
+        let tree_id = first_child(&tree);
         server.documents.insert(
             uri.clone(),
             "fn already() {}".to_string(),
@@ -1428,7 +1497,7 @@ print("hello")
 
         let doc = server.documents.get(&uri).unwrap();
         assert_eq!(
-            doc.tree().unwrap().root_node().id(),
+            doc.tree().as_ref().and_then(first_child),
             tree_id,
             "the existing tree must be left untouched (no redundant reparse)"
         );

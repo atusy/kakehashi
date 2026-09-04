@@ -106,8 +106,9 @@ scheduler settles the same forces with less moving structure.
 ### Writes return at enqueue; the slow work runs off-ingress
 
 `didOpen`, `didChange`, and `didClose` record their effect and return without
-awaiting the parse. On `didChange` the edit is applied to the stored text, the
-reader-visible tree is cleared, and the document is handed to the scheduler, which
+awaiting the parse. On `didChange` the edit is applied to the stored text (which
+makes the published tree stale for readers — see parse-snapshot-architecture),
+and the document is handed to the scheduler, which
 runs the parse **off the ingress ticket**. The scheduler keeps **one parse in
 flight per document** and **coalesces a burst**: an edit arriving while a parse
 runs marks the document dirty rather than starting a second parse, so a run of
@@ -458,8 +459,12 @@ deadline — compilation re-execs a `__compile-parser` subprocess whose process 
 the installer kills when the deadline fires, with an in-subprocess watchdog that
 group-kills the compile even if the parent dies first. Readers wait on the
 `(incarnation, ticket)` epoch watermark rather than on tree presence. Every tree
-write is a non-inserting CAS that checks the captured incarnation alongside the
-text/language it parsed, and the watermark advance is incarnation-guarded, so a
+write is the one non-inserting `install_parse`: the cell admits a snapshot only
+for the captured incarnation and a newer version — or the same version when the
+incoming snapshot brings a tree the held one lacks, which is how a reparse fills
+in a reload placeholder or a give-up snapshot instead of leaving the document
+tree-less until the next edit — the reparse's language check
+rejects a relabelled document, and the watermark advance is incarnation-guarded, so a
 close-then-reopen during an in-flight parse fails its epoch check at the write
 rather than resurrecting the closed document. Injection orchestration runs
 downstream of the parse, off the ingress path. The text-owning actor of Option 4 is
