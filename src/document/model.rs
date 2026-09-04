@@ -273,11 +273,6 @@ impl Document {
     /// Clears `pending_seed`: a present reader-visible tree means the off-ingress
     /// reparse's seed has been consumed (the tree it would have produced is now
     /// here), so the next `didChange` seeds from this fresh tree, not a stale seed.
-    pub(crate) fn set_tree(&mut self, tree: Tree) {
-        self.tree = Some(tree);
-        self.pending_seed = None;
-    }
-
     pub(crate) fn invalidate_parse(&mut self) {
         self.tree = None;
         self.pending_seed = None;
@@ -411,12 +406,6 @@ mod tests {
 
         // A parse-result write does not bump.
         let tree = parser.parse("fn main() { }", None).unwrap();
-        doc.set_tree(tree.clone());
-        assert_eq!(
-            doc.content_version(),
-            1,
-            "set_tree is not an input mutation"
-        );
         doc.set_parse_result(Some("rust".to_string()), Some(tree));
         assert_eq!(
             doc.content_version(),
@@ -571,7 +560,7 @@ mod tests {
         assert!(doc.pending_seed().is_some());
 
         let reparsed = parser.parse("fn main() { }", None).unwrap();
-        doc.set_tree(reparsed);
+        doc.set_parse_result(Some("rust".to_string()), Some(reparsed));
 
         assert!(doc.tree().is_some());
         assert!(
