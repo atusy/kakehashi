@@ -333,8 +333,9 @@ impl ParseCoordinator {
         //   the tracker at `(0, epoch+1)` — indistinguishable from a
         //   reopen's first mint, so the latch alone cannot refuse it; the
         //   reopen case fails the incarnation check);
-        // - currency (`content_version` unchanged since the parse's CAS —
-        //   an edit that already landed makes this pass's tree stale).
+        // - currency (`content_version` unchanged since the parse captured
+        //   its inputs — an edit that already landed makes this pass's tree
+        //   stale).
         // Anything landing AFTER the lock drops is caught by the latch
         // re-check inside the batch mint / commit (`cleanup` bumps the
         // epoch before it removes; an edit-shift bumps the generation).

@@ -273,9 +273,9 @@ impl CacheCoordinator {
         // the token handlers use.
         let generation = self.semantic_token_generation();
         // Entry half of the mint reconciliation (parse-snapshot ADR §3):
-        // populate runs post-CAS but an edit can land DURING this pass and
-        // shift the live-coordinate NodeTracker, making this pass's tree
-        // coordinates stale. `entry_mint_epoch` (latched by the caller,
+        // populate runs before the parse is installed, on the tree value, but
+        // an edit can land DURING this pass and shift the live-coordinate
+        // NodeTracker, making this pass's tree coordinates stale. `entry_mint_epoch` (latched by the caller,
         // BEFORE its liveness validation — see the doc comment) is
         // re-checked inside every tracker-mutating step below (the batch
         // mint and the commit), so a stale pass mints nothing and clobbers
