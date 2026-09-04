@@ -1980,10 +1980,13 @@ fn record_mock_event(mode: &str, event: &str, message: &Value) {
         "id": message.get("id").cloned().unwrap_or(Value::Null),
         "params": message.get("params").cloned().unwrap_or(Value::Null)
     });
-    let _ = std::fs::write(
-        dir.join(format!("{mode}.{event}.json")),
-        serde_json::to_vec(&payload).unwrap_or_default(),
-    );
+    // Write-then-rename: a test polls for the file and parses it as soon as
+    // it exists, and `fs::write` creates it before its content lands.
+    let path = dir.join(format!("{mode}.{event}.json"));
+    let staging = dir.join(format!("{mode}.{event}.json.tmp"));
+    if std::fs::write(&staging, serde_json::to_vec(&payload).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&staging, &path);
+    }
 }
 
 /// Send a JSON-RPC success response for `id` (no-op for notifications).
