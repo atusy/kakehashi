@@ -1772,7 +1772,16 @@ impl DiagnosticPublisher {
                 ),
             );
         }
-        settled().then_some(offsets)
+        // The offsets describe the captured snapshot; an edit (or reopen)
+        // landing since makes them stale positions for the text the editor
+        // now holds, and edits do not move the generation `settled` watches.
+        // Defer instead; the pending parse's republish carries the new
+        // geometry.
+        let document_unchanged = self.documents.latest_snapshot(host).is_some_and(|now| {
+            now.content_version == view.content_version
+                && now.slot.current_incarnation == view.slot.current_incarnation
+        });
+        (settled() && document_unchanged).then_some(offsets)
     }
 }
 
