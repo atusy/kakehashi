@@ -580,6 +580,13 @@ impl LanguageCoordinator {
         search_paths: &[PathBuf],
         language: &tree_sitter::Language,
     ) -> LanguageLoadResult {
+        // One registration section from query removal through registration,
+        // like the configured and dynamic paths, so a same-generation dynamic
+        // load of this name cannot slip its queries in between.
+        let _registration = self
+            .registration_lock
+            .lock()
+            .recover_poison("LanguageCoordinator::register_derived_from_base");
         self.query_store.remove_queries(derived_name);
 
         let mut events = Vec::new();
@@ -888,6 +895,12 @@ impl LanguageCoordinator {
             || self.configured_load_failed(language_id, expected_generation)
         {
             return false;
+        }
+        // A duplicate of a load that already published (concurrent first
+        // loads are admitted): the language is in place, and clearing its
+        // queries again would reopen the parser-without-queries window.
+        if self.has_current_parser_registration(language_id, expected_generation) {
+            return true;
         }
         // Queries BEFORE the parser: `has_parser_available` reads the registry
         // without this lock, so a parse admitted the instant the parser lands
@@ -1631,7 +1644,7 @@ impl LanguageCoordinator {
         // its queries.
         let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
         if !pre_registered_is_builtin {
-            self.register_configured_language_locked(lang_name, language.clone());
+            self.register_configured_language(lang_name, language.clone());
         }
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
@@ -1640,17 +1653,10 @@ impl LanguageCoordinator {
         LanguageLoadResult::success_with(events)
     }
 
+    /// Register a configured (or derived) language's parser. The caller holds
+    /// `registration_lock`: every publication path runs as one section from
+    /// query removal through this registration.
     fn register_configured_language(&self, language_id: &str, language: Language) {
-        let _registration = self
-            .registration_lock
-            .lock()
-            .recover_poison("LanguageCoordinator::register_configured_language");
-        self.register_configured_language_locked(language_id, language);
-    }
-
-    /// [`register_configured_language`](Self::register_configured_language)
-    /// for a caller already holding `registration_lock`.
-    fn register_configured_language_locked(&self, language_id: &str, language: Language) {
         self.language_registry
             .register(language_id.to_string(), language);
         self.configured_load_failures.remove(language_id);
