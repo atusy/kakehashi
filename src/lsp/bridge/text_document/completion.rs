@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::settings::BridgeServerConfig;
-use crate::lsp::bridge::envelope::{ENVELOPE_KEY, HostRevision, should_envelope, wrap_envelope};
+use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope, wrap_envelope};
 use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position};
 use url::Url;
 
@@ -48,7 +48,6 @@ impl LanguageServerPool {
         region_id: &str,
         offset: RegionOffset,
         virtual_content: &str,
-        content_version: u64,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<CompletionList>> {
         let host_incarnation = self.current_host_incarnation(host_uri);
@@ -93,7 +92,6 @@ impl LanguageServerPool {
                         server_name,
                         injection_language,
                         incarnation: host_incarnation,
-                        content_version: Some(content_version),
                         host_uri: host_uri.as_str(),
                         region_id,
                         offset: ctx.offset,
@@ -407,11 +405,6 @@ pub(crate) struct KakehashiEnvelope {
     /// Empty for host-layer and legacy envelopes.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub injection_language: String,
-    /// Text revision (mutation count since open) the item was computed
-    /// against; a resolve refuses an item whose document has moved past it.
-    /// Missing for legacy data.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) content_version: Option<u64>,
     /// Host open incarnation that produced this item. Missing for legacy data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incarnation: Option<u64>,
@@ -520,8 +513,6 @@ pub(crate) struct EnvelopeContext<'a> {
     pub server_name: &'a str,
     pub injection_language: &'a str,
     pub incarnation: Option<u64>,
-    /// Text revision the items were computed against (see the envelope).
-    pub content_version: Option<u64>,
     /// Host document URI the completion ran on, stored in the envelope so
     /// `completionItem/resolve` can route back to the originating connection.
     pub host_uri: &'a str,
@@ -546,7 +537,6 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
         origin: ctx.server_name.to_string(),
         injection_language: ctx.injection_language.to_string(),
         incarnation: ctx.incarnation,
-        content_version: ctx.content_version,
         host_uri: ctx.host_uri.to_string(),
         region_id: ctx.region_id.to_string(),
         inner: None,
@@ -578,7 +568,7 @@ pub(crate) fn bridge_host_completion_items(
     response: &mut tower_lsp_server::ls_types::CompletionResponse,
     server_name: &str,
     host_uri: &str,
-    revision: Option<HostRevision>,
+    incarnation: Option<u64>,
     server_resolves: bool,
 ) {
     use tower_lsp_server::ls_types::CompletionResponse;
@@ -588,7 +578,7 @@ pub(crate) fn bridge_host_completion_items(
     };
     for item in items.iter_mut() {
         if should_envelope(item.data.as_ref(), server_resolves) {
-            envelope_host_item(item, server_name, host_uri, revision);
+            envelope_host_item(item, server_name, host_uri, incarnation);
         }
     }
 }
@@ -602,14 +592,13 @@ pub(super) fn envelope_host_item(
     item: &mut CompletionItem,
     server_name: &str,
     host_uri: &str,
-    revision: Option<HostRevision>,
+    incarnation: Option<u64>,
 ) {
     let inner = item.data.take();
     let envelope = KakehashiEnvelope {
         origin: server_name.to_string(),
         injection_language: String::new(),
-        incarnation: revision.map(|r| r.incarnation),
-        content_version: revision.map(|r| r.content_version),
+        incarnation,
         host_uri: host_uri.to_string(),
         region_id: String::new(),
         inner: None,
@@ -681,7 +670,6 @@ mod tests {
                 server_name: "lua-ls",
                 injection_language: "lua",
                 incarnation: Some(1),
-                content_version: None,
                 host_uri: "file:///test.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset,
@@ -1266,7 +1254,6 @@ mod tests {
             server_name: "lua-ls",
             injection_language: "markdown",
             incarnation: Some(1),
-            content_version: None,
             host_uri: "file:///test/doc.md",
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
@@ -1352,16 +1339,7 @@ mod tests {
             items: vec![item()],
         });
         for response in [&mut array, &mut list] {
-            bridge_host_completion_items(
-                response,
-                "tsudoi-ls",
-                "file:///doc.txt",
-                Some(HostRevision {
-                    incarnation: 1,
-                    content_version: 0,
-                }),
-                true,
-            );
+            bridge_host_completion_items(response, "tsudoi-ls", "file:///doc.txt", Some(1), true);
         }
 
         for (shape, items) in [("array", must_items(&array)), ("list", must_items(&list))] {
@@ -1403,10 +1381,7 @@ mod tests {
             &mut response,
             "tsudoi-ls",
             "file:///doc.txt",
-            Some(HostRevision {
-                incarnation: 1,
-                content_version: 0,
-            }),
+            Some(1),
             false,
         );
 
@@ -1443,15 +1418,7 @@ mod tests {
             data: Some(json!({"pathCompletion": "/tmp/test"})),
             ..Default::default()
         };
-        envelope_host_item(
-            &mut item,
-            "tsudoi-ls",
-            "file:///test/doc.txt",
-            Some(HostRevision {
-                incarnation: 1,
-                content_version: 0,
-            }),
-        );
+        envelope_host_item(&mut item, "tsudoi-ls", "file:///test/doc.txt", Some(1));
 
         // The two fields a host envelope leaves at their defaults must not
         // ride the wire — this rides in every enveloped item of a response.
@@ -1495,7 +1462,6 @@ mod tests {
                 server_name: "lua-ls",
                 injection_language: "markdown",
                 incarnation: Some(1),
-                content_version: None,
                 host_uri: "file:///test/doc.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,
@@ -1520,7 +1486,6 @@ mod tests {
                 server_name: "lua-ls",
                 injection_language: "markdown",
                 incarnation: Some(1),
-                content_version: None,
                 host_uri: "file:///test/doc.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,
@@ -1547,7 +1512,6 @@ mod tests {
             server_name: "lua-ls",
             injection_language: "markdown",
             incarnation: Some(1),
-            content_version: None,
             host_uri: "file:///test/doc.md",
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
@@ -1591,7 +1555,6 @@ mod tests {
                 server_name: "lua-ls",
                 injection_language: "markdown",
                 incarnation: Some(1),
-                content_version: None,
                 host_uri: "file:///test/doc.md",
                 region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 offset: &offset,
