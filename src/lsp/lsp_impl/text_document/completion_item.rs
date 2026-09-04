@@ -41,6 +41,11 @@ impl Kakehashi {
         let envelope = extract_envelope(&params);
         if let Some(envelope) = &envelope {
             let Ok(host_url) = Url::parse(&envelope.host_uri) else {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve: envelope host_uri {:?} is not a valid URL",
+                    envelope.host_uri
+                );
                 return Ok(params);
             };
             // No text-revision gate here, unlike the inlay hint and code
