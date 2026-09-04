@@ -74,16 +74,35 @@ impl Kakehashi {
                 );
                 return Ok(params);
             }
+            // Read BEFORE the region rebuild: an edit landing between the
+            // rebuild and this read would pair geometry of revision N with
+            // revision N+1, and the post-reply check would then let a reply
+            // translated with the old geometry through. Read again after
+            // the rebuild; a moved revision means the geometry is not the
+            // revision's, and the item is returned unresolved (the editor
+            // resolves again on its next accept).
+            revision_then = self
+                .documents
+                .get(&host_url)
+                .map(|document| document.content_version());
             if !envelope.is_host_layer() {
                 match self.completion_envelope_is_fresh(envelope).await {
                     Some(geometry) => live_geometry = Some(geometry),
                     None => return Ok(params),
                 }
+                let revision_after_rebuild = self
+                    .documents
+                    .get(&host_url)
+                    .map(|document| document.content_version());
+                if revision_after_rebuild != revision_then {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "completionItem/resolve: {} was edited while its region was rebuilt; returning item unresolved",
+                        envelope.host_uri
+                    );
+                    return Ok(params);
+                }
             }
-            revision_then = self
-                .documents
-                .get(&host_url)
-                .map(|document| document.content_version());
         }
         // Kept for the post-response check; the gates above return `params`
         // itself, so only a resolve that is actually dispatched pays for it.
