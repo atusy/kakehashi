@@ -1109,13 +1109,12 @@ impl DiagnosticPublisher {
                     // language's auto-install reload. Retry once it settles;
                     // a document whose language stays unsettled (a load that
                     // failed for good) ends the retry at its deadline.
-                    let host_language = self
-                        .documents
-                        .get(host)
-                        .and_then(|doc| doc.snapshot().map(|_| ()))
-                        .and_then(|()| self.settled_host_language(host));
-                    if let Some(host_language) = host_language {
-                        self.retry_republish_when_settled(host, host_language);
+                    let lifetime = self.documents.get(host).and_then(|doc| {
+                        doc.snapshot()?;
+                        Some(doc.incarnation())
+                    });
+                    if let Some(lifetime) = lifetime {
+                        self.retry_republish_when_settled(host, lifetime);
                     }
                     return RepublishOutcome::Deferred;
                 }
@@ -1577,13 +1576,21 @@ impl DiagnosticPublisher {
     /// Re-run `republish` for `host` once no reload is in progress, bounded:
     /// the deferral otherwise relies on the reparse loop, which an injected
     /// language's auto-install reload never triggers for the host.
-    fn retry_republish_when_settled(&self, host: &Url, host_language: String) {
+    ///
+    /// Bound to the document lifetime that deferred: a close and reopen at
+    /// the same URI gets its own waiter, and this one exits when its
+    /// lifetime is gone. The language is re-read on every poll, so a
+    /// re-detection under the same lifetime is followed too.
+    fn retry_republish_when_settled(&self, host: &Url, lifetime: u64) {
         const REPUBLISH_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
         const REPUBLISH_RETRY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
         // One waiter per host: every deferral of the same window would
         // otherwise spawn its own poller, and all of them would then
         // serialize through the host's republish lock once settled.
-        let Some(claim) = self.settle_retry_waiters.claim("republish", host, None) else {
+        let Some(claim) = self
+            .settle_retry_waiters
+            .claim("republish", host, Some(lifetime))
+        else {
             return;
         };
         let this = self.clone();
@@ -1596,6 +1603,15 @@ impl DiagnosticPublisher {
                     _ = this.shutdown.cancelled() => return,
                     _ = tokio::time::sleep(REPUBLISH_RETRY_POLL) => {}
                 }
+                // The lifetime that deferred must still be current, and the
+                // language is whatever the settled parse names NOW.
+                let current = this.documents.get(&host).map(|doc| doc.incarnation());
+                if current != Some(lifetime) {
+                    return;
+                }
+                let Some(host_language) = this.settled_host_language(&host) else {
+                    return;
+                };
                 let reloading = this
                     .parser_pool
                     .lock()
