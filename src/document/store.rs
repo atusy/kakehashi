@@ -307,17 +307,15 @@ impl DocumentStore {
         self.ensure_watermark_entry(&uri, incarnation);
     }
 
-    /// Apply a `didChange`'s new text and stash an **incremental parse seed**,
-    /// clearing the reader-visible tree — the per-document-parse-scheduler flip's edit
-    /// path.
+    /// Apply a `didChange`'s new text and log its edits for the **incremental
+    /// parse seed** — the per-document-parse-scheduler flip's edit path.
     ///
-    /// Replaces the prior `update_document(uri, text, None)`: it still clears the
-    /// reader-visible tree (so a reader never sees a tree predating this edit) and
-    /// keeps the same side effects (tree-availability → false, watermark entry
-    /// ensured), but additionally stashes the pre-edit tree — with `edits` applied —
-    /// as the seed for the off-ingress `reparse_latest`'s incremental parse. With no
-    /// `edits` (full-text sync) no seed is kept (#348). Coalesced edits accumulate
-    /// onto the seed (see [`Document::apply_edit_and_seed`]).
+    /// The version bump makes the published tree stale (so a reader never sees a
+    /// tree predating this edit); the side effects are tree-availability → false
+    /// and the watermark entry ensured; and the `edits` are logged for the
+    /// off-ingress `reparse_latest`'s incremental seed. With no `edits` (full-text
+    /// sync) seeding is forbidden until a fresh tree is published (#348).
+    /// Coalesced edits accumulate in the log (see [`Document::apply_edit_and_seed`]).
     ///
     /// Called under the per-URI edit lock with the document known to exist; the
     /// `Vacant` branch (a reordered notification for an unopened URI) inserts a
