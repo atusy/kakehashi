@@ -92,16 +92,29 @@ impl Kakehashi {
             },
             None => Ok(dispatch.await),
         }?;
-        // A didClose/didOpen is allowed to proceed once the resolve was
-        // enqueued. Revalidate the lifetime after the response so a command
-        // or target resolved for the closed document is not surfaced into the
-        // reopened one.
-        if let Ok(host_url) = url::Url::parse(&envelope.host_uri)
-            && !self.host_incarnation_is_current(&host_url, envelope.incarnation)
-        {
+        // A didChange/didClose/didOpen is allowed to proceed once the resolve
+        // was enqueued. Revalidate after the response: the lifetime for both
+        // layers, and for the virt layer the region geometry again (these
+        // envelopes carry no revision stamp), so a command or target resolved
+        // for a region that moved, or for the closed document, is not
+        // surfaced into the current one.
+        let still_fresh = if envelope.is_host_layer() {
+            url::Url::parse(&envelope.host_uri).is_ok_and(|host_url| {
+                self.host_incarnation_is_current(&host_url, envelope.incarnation)
+            })
+        } else {
+            self.region_offset_is_fresh(
+                &envelope.host_uri,
+                &envelope.region_id,
+                &envelope.offset,
+                envelope.incarnation,
+            )
+            .await
+        };
+        if !still_fresh {
             log::debug!(
                 target: "kakehashi::bridge",
-                "documentLink/resolve: {} was reopened while resolving; returning link unresolved",
+                "documentLink/resolve: {} was revised or reopened while resolving; returning link unresolved",
                 envelope.host_uri
             );
             return Ok(unresolved);
