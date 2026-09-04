@@ -305,6 +305,15 @@ impl InjectionCoordinator {
         // there is no evidence anything changed — and let the parse that
         // lands once the language is in place run this pass for real.
         let Some(injections) = self.resolve_injection_data(uri, &host_language) else {
+            // Nothing else re-runs this pass for a document whose sole parse
+            // overlapped the window (an injected language's auto-install
+            // reload does not reparse hosts), so arrange the retry here.
+            self.retry_injection_pass_when_settled(
+                uri,
+                &host_language,
+                forward_did_change,
+                incarnation,
+            );
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
             return true;
         };
@@ -545,6 +554,54 @@ impl InjectionCoordinator {
     fn get_language_for_document(&self, uri: &Url) -> Option<String> {
         detect_document_language(&self.language, &self.documents, uri)
     }
+    /// Re-run the tree-derived downstream pass for `uri` once the language's
+    /// publication or reload has settled, bounded (`INJECTION_RETRY_BUDGET`):
+    /// a pass that answered "could not look" opened nothing, and without an
+    /// edit no other parse would try again. The retried pass re-reads every
+    /// input and re-checks the lifetime, so a close, reopen or edit in the
+    /// meantime makes it a no-op or the newer text's own pass.
+    fn retry_injection_pass_when_settled(
+        &self,
+        uri: &Url,
+        host_language: &str,
+        forward_did_change: bool,
+        incarnation: u64,
+    ) {
+        const INJECTION_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+        const INJECTION_RETRY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        let this = self.clone();
+        let uri = uri.clone();
+        let host_language = host_language.to_string();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + INJECTION_RETRY_BUDGET;
+            loop {
+                tokio::time::sleep(INJECTION_RETRY_POLL).await;
+                let reloading = this
+                    .parser_pool
+                    .lock()
+                    .recover_poison("InjectionCoordinator::retry_injection_pass_when_settled")
+                    .reload_in_progress();
+                if !reloading && this.language.has_parser_available(&host_language) {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "Re-running the injection pass for {uri}: {host_language} has settled"
+                    );
+                    let _ = this
+                        .process_injections_for_incarnation(&uri, forward_did_change, incarnation)
+                        .await;
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "Giving up the injection pass retry for {uri}: {host_language} did not settle"
+                    );
+                    return;
+                }
+            }
+        });
+    }
+
     /// The bridge coordinator, so the respawn re-open can drive the awaited
     /// `ensure_server_documents_open` (execute-command-routing-token).
     pub(crate) fn bridge(&self) -> &std::sync::Arc<BridgeCoordinator> {
