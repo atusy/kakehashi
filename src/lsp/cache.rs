@@ -281,6 +281,12 @@ impl CacheCoordinator {
         // mint and the commit), so a stale pass mints nothing and clobbers
         // nothing — identity defers to the next current pass.
 
+        // The parser BEFORE the query: a lazy publication lands queries then
+        // parser, so reading the query first could see none, then find the
+        // parser published — and publish a definitive empty set although the
+        // language has an injection query by now. Seen the other way round, a
+        // visible parser makes a missing query definitive.
+        let parser_published = language.has_parser_available(language_name);
         // Get the injection query for this language
         let injection_query = match language.injection_query(language_name) {
             Some(q) => q,
@@ -302,7 +308,7 @@ impl CacheCoordinator {
                 // for it. Without the parser the load is still publishing
                 // and the result is UNDETERMINED — a definitive empty set
                 // would stand until the next edit.
-                return Some(if language.has_parser_available(language_name) {
+                return Some(if parser_published {
                     PopulatedInjections::empty(generation)
                 } else {
                     PopulatedInjections::undetermined(generation)
