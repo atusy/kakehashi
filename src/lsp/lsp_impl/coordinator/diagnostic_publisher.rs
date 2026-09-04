@@ -1681,16 +1681,30 @@ impl DiagnosticPublisher {
         // guard is dropped before any further store lookup: a second lookup
         // under a held guard could queue behind a writer on the same shard
         // that is itself waiting for this guard.
-        let settled_language = self.settled_snapshot_language(host);
-        let (snapshot, stored_language) = {
-            let Some(doc) = self.documents.get(host) else {
-                return Some(offsets); // closed host: nothing to anchor against
-            };
-            let Some(snapshot) = doc.snapshot() else {
-                return None; // open but tree pending: geometry unknown, defer
-            };
-            (snapshot, doc.language_id().map(str::to_string))
+        // Language, tree, text and lifetime from ONE current snapshot: a
+        // replacement parse of a re-detected document attaches its tree to
+        // the legacy document before it publishes, and the old query over
+        // the new tree would anchor region diagnostics wrongly. The view is
+        // an owned clone; no store guard is held across the lookups below.
+        let Some(view) = self.documents.latest_snapshot(host) else {
+            return Some(offsets); // closed host: nothing to anchor against
         };
+        let Some(current) = view
+            .slot
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.parsed_version == view.content_version)
+        else {
+            return None; // open but tree pending: geometry unknown, defer
+        };
+        let Some(tree) = current.tree.as_ref() else {
+            return None; // reload placeholder / parse without a tree: defer
+        };
+        let settled_language = current.language.clone();
+        let stored_language = self
+            .documents
+            .get(host)
+            .and_then(|doc| doc.language_id().map(str::to_string));
         // Trace-level detection: this runs on the republish path whenever
         // region slots are present (every keystroke settle during a typing
         // burst) — the debug variant would re-grow the per-event
@@ -1700,7 +1714,7 @@ impl DiagnosticPublisher {
         // is still publishing, and that is not "no regions".
         let Some(language_name) = settled_language.or(stored_language).or_else(|| {
             self.language
-                .detect_language_trace(host.path(), snapshot.text(), None, None)
+                .detect_language_trace(host.path(), &current.text, None, None)
         }) else {
             return Some(offsets);
         };
@@ -1743,10 +1757,10 @@ impl DiagnosticPublisher {
                 &self.language,
                 self.bridge.node_tracker(),
                 host,
-                snapshot.tree(),
-                snapshot.text(),
+                tree,
+                &current.text,
                 injection_query.as_ref(),
-                snapshot.incarnation(),
+                current.incarnation,
             )),
         };
         for resolved in resolved_regions.iter() {
