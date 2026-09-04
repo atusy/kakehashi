@@ -1653,39 +1653,52 @@ impl DiagnosticPublisher {
     /// retry waits for — and re-publishes — the language the geometry will
     /// use, not a removed one.
     fn settled_host_language(&self, host: &Url) -> Option<String> {
-        let settled = self.documents.latest_snapshot(host).and_then(|view| {
-            view.slot.snapshot.as_ref().and_then(|current| {
-                (current.parsed_version == view.content_version && current.tree.is_some())
-                    .then(|| current.language.clone())
-                    .flatten()
-            })
-        });
-        settled.or_else(|| {
+        self.settled_snapshot_language(host).or_else(|| {
             self.documents
                 .get(host)
                 .and_then(|doc| doc.language_id().map(str::to_string))
         })
     }
 
+    /// The language of the current snapshot when it carries a tree. One
+    /// store lookup, released on return.
+    fn settled_snapshot_language(&self, host: &Url) -> Option<String> {
+        self.documents.latest_snapshot(host).and_then(|view| {
+            view.slot.snapshot.as_ref().and_then(|current| {
+                (current.parsed_version == view.content_version && current.tree.is_some())
+                    .then(|| current.language.clone())
+                    .flatten()
+            })
+        })
+    }
+
     fn current_region_offsets(&self, host: &Url) -> Option<HashMap<String, RegionOffset>> {
         let mut offsets = HashMap::new();
 
-        let Some(doc) = self.documents.get(host) else {
-            return Some(offsets); // closed host: nothing to anchor against
-        };
-        let Some(snapshot) = doc.snapshot() else {
-            return None; // open but tree pending: geometry unknown, defer
+        // The settled parse names the language authoritatively (a reload
+        // that re-detects the document publishes the new language on the
+        // snapshot only); read BEFORE the document guard below, and the
+        // guard is dropped before any further store lookup: a second lookup
+        // under a held guard could queue behind a writer on the same shard
+        // that is itself waiting for this guard.
+        let settled_language = self.settled_snapshot_language(host);
+        let (snapshot, stored_language) = {
+            let Some(doc) = self.documents.get(host) else {
+                return Some(offsets); // closed host: nothing to anchor against
+            };
+            let Some(snapshot) = doc.snapshot() else {
+                return None; // open but tree pending: geometry unknown, defer
+            };
+            (snapshot, doc.language_id().map(str::to_string))
         };
         // Trace-level detection: this runs on the republish path whenever
         // region slots are present (every keystroke settle during a typing
         // burst) — the debug variant would re-grow the per-event
         // `language_detection` log volume PR #677 moved off hot paths.
-        // The settled parse names the language authoritatively (a reload
-        // that re-detects the document publishes the new language on the
-        // snapshot only); then the stored id; parser-aware detection last —
-        // it answers "none" (or another loaded language) while the declared
-        // language is still publishing, and that is not "no regions".
-        let Some(language_name) = self.settled_host_language(host).or_else(|| {
+        // Then the stored id; parser-aware detection last — it answers
+        // "none" (or another loaded language) while the declared language
+        // is still publishing, and that is not "no regions".
+        let Some(language_name) = settled_language.or(stored_language).or_else(|| {
             self.language
                 .detect_language_trace(host.path(), snapshot.text(), None, None)
         }) else {
