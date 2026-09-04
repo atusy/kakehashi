@@ -101,6 +101,29 @@ pub struct Document {
 /// the next parse incrementally.
 const MAX_SEED_EDITS: usize = 1024;
 
+/// A published tree plus the edits it has not seen, in order — the
+/// incremental parse seed before its replay (see
+/// [`Document::incremental_seed`]).
+pub(crate) struct IncrementalSeed {
+    tree: Tree,
+    edits: Vec<InputEdit>,
+}
+
+impl IncrementalSeed {
+    /// Apply the edits to the tree, in order, yielding the seed tree-sitter's
+    /// incremental contract requires: the old tree with exactly the edits
+    /// between its text and the current text applied (#348). Editing the
+    /// clone leaves the published snapshot's own tree untouched (tree-sitter
+    /// copies the edited path on write).
+    pub(crate) fn replay(self) -> Tree {
+        let Self { mut tree, edits } = self;
+        for edit in &edits {
+            tree.edit(edit);
+        }
+        tree
+    }
+}
+
 impl Document {
     /// Create a new document with just text
     pub(crate) fn new(text: String, incarnation: u64) -> Self {
@@ -369,15 +392,18 @@ impl Document {
             .map_or(0, |snapshot| snapshot.parsed_version)
     }
 
-    /// The off-ingress incremental parse seed, if any: a clone of the
-    /// published tree with every logged edit after its version replayed via
-    /// `tree.edit()`, so the reparse can `parser.parse(text, Some(&seed))`
-    /// instead of parsing from scratch. `None` when nothing is published,
-    /// the published snapshot is tree-less, or it predates a full-text sync
-    /// or reload (`seed_floor`). **Read only by `reparse_latest`** — readers
-    /// go through [`tree`](Self::tree), which never serves a pre-reparse
-    /// tree. Editing the clone leaves the snapshot's own tree untouched.
-    pub(crate) fn incremental_seed(&self) -> Option<Tree> {
+    /// The inputs of the off-ingress incremental parse seed, if any: a clone
+    /// of the published tree and the logged edits after its version, for
+    /// [`IncrementalSeed::replay`] to apply via `tree.edit()` so the reparse
+    /// can `parser.parse(text, Some(&seed))` instead of parsing from scratch.
+    /// Only the cheap part happens here (a tree retain plus a small
+    /// allocation, and a copy of the edit tail), so the caller's store guard
+    /// is released before the replay's per-edit path copies run — on the
+    /// compute pool, with the parse. `None` when nothing is published, the
+    /// published snapshot is tree-less, or it predates a full-text sync or
+    /// reload (`seed_floor`). **Read only by `reparse_latest`** — readers go
+    /// through [`tree`](Self::tree), which never serves a pre-reparse tree.
+    pub(crate) fn incremental_seed(&self) -> Option<IncrementalSeed> {
         let slot = self.snapshot_tx.borrow();
         let snapshot = slot
             .snapshot
@@ -386,13 +412,14 @@ impl Document {
         if snapshot.parsed_version < self.seed_floor {
             return None;
         }
-        let mut tree = snapshot.tree.clone()?;
-        for (version, edit) in &self.seed_edits {
-            if *version > snapshot.parsed_version {
-                tree.edit(edit);
-            }
-        }
-        Some(tree)
+        let tree = snapshot.tree.clone()?;
+        let edits = self
+            .seed_edits
+            .iter()
+            .filter(|(version, _)| *version > snapshot.parsed_version)
+            .map(|(_, edit)| *edit)
+            .collect();
+        Some(IncrementalSeed { tree, edits })
     }
 
     /// Update text and clear layers/state
@@ -427,6 +454,10 @@ mod tests {
         }
     }
 
+    fn seed_tree(doc: &Document) -> Option<Tree> {
+        Document::incremental_seed(doc).map(IncrementalSeed::replay)
+    }
+
     fn incremental_parse_matches_fresh(seed: &Tree, text: &str) -> bool {
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -451,12 +482,12 @@ mod tests {
             3,
         );
         assert!(
-            doc.incremental_seed().is_some(),
+            seed_tree(&doc).is_some(),
             "an unedited current tree seeds as is"
         );
 
         doc.apply_edit("fn main() { }".to_string(), &[edit(11, 11, 12)]);
-        let seed = doc.incremental_seed().expect("one edit: seeded");
+        let seed = seed_tree(&doc).expect("one edit: seeded");
         assert!(incremental_parse_matches_fresh(&seed, "fn main() { }"));
         assert!(
             doc.tree().is_none(),
@@ -464,9 +495,7 @@ mod tests {
         );
 
         doc.apply_edit("fn main() { x }".to_string(), &[edit(12, 12, 14)]);
-        let seed = doc
-            .incremental_seed()
-            .expect("coalesced edits: still seeded");
+        let seed = seed_tree(&doc).expect("coalesced edits: still seeded");
         assert!(
             incremental_parse_matches_fresh(&seed, "fn main() { x }"),
             "both edits replayed, in order"
@@ -493,23 +522,20 @@ mod tests {
             3,
         );
         doc.apply_edit("fn other() {}".to_string(), &[]);
-        assert!(
-            doc.incremental_seed().is_none(),
-            "full sync: parse from scratch"
-        );
+        assert!(seed_tree(&doc).is_none(), "full sync: parse from scratch");
         doc.apply_edit("fn other() { }".to_string(), &[edit(12, 12, 13)]);
         assert!(
-            doc.incremental_seed().is_none(),
+            seed_tree(&doc).is_none(),
             "an edit after the sync has no tree it can be replayed onto"
         );
 
         assert!(doc.publish_snapshot(&doc.bare_snapshot(Some(rust_tree("fn other() { }")))));
         assert!(
-            doc.incremental_seed().is_some(),
+            seed_tree(&doc).is_some(),
             "a fresh published tree seeds again"
         );
         doc.apply_edit("fn other() { y }".to_string(), &[edit(13, 13, 15)]);
-        let seed = doc.incremental_seed().expect("seeded from the fresh tree");
+        let seed = seed_tree(&doc).expect("seeded from the fresh tree");
         assert!(incremental_parse_matches_fresh(&seed, "fn other() { y }"));
     }
 
@@ -529,9 +555,7 @@ mod tests {
         // The reparse of version 2 lands.
         assert!(doc.publish_snapshot(&doc.bare_snapshot(Some(rust_tree("fn main() { x }")))));
         doc.apply_edit("fn main() { xy }".to_string(), &[edit(13, 13, 14)]);
-        let seed = doc
-            .incremental_seed()
-            .expect("seeded from the version-2 tree");
+        let seed = seed_tree(&doc).expect("seeded from the version-2 tree");
         assert!(
             incremental_parse_matches_fresh(&seed, "fn main() { xy }"),
             "only the edit after version 2 is replayed"
@@ -675,7 +699,7 @@ mod tests {
 
         assert!(doc.tree().is_none(), "reader-visible tree must be cleared");
         assert!(
-            doc.incremental_seed().is_some(),
+            seed_tree(&doc).is_some(),
             "incremental seed must be stashed"
         );
         assert_eq!(doc.text(), "fn main() { }");
@@ -698,7 +722,7 @@ mod tests {
 
         assert!(doc.tree().is_none());
         assert!(
-            doc.incremental_seed().is_none(),
+            seed_tree(&doc).is_none(),
             "full-text sync must not leave a stale seed (#348)"
         );
     }
@@ -739,7 +763,7 @@ mod tests {
 
         assert!(doc.tree().is_none());
         assert!(
-            doc.incremental_seed().is_some(),
+            seed_tree(&doc).is_some(),
             "coalesced edit must keep the accumulated seed"
         );
         assert_eq!(doc.text(), "fn main() {  }");
