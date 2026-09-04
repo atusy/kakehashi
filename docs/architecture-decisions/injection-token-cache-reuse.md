@@ -243,16 +243,17 @@ preference order:
   install (`DocumentStore::install_parse`, invoked from
   `src/lsp/lsp_impl/coordinator/parse.rs`) on the tree value, guarding its own
   cache commits by the tracker's epoch and the lifetime:
-  - **No *new* `NodeTracker` mutation.** `populate_injections` *already* calls
-    `tracker.get_or_create` today, to mint the `region_id` on each
-    `CacheableInjectionRegion` it inserts into the `InjectionMap` (which
-    `invalidate_for_edits` needs for token-cache eviction). The discovery build
-    must **reuse that same id** — it is produced by the same shared stage, from the
-    same `Q`, so the lever adds *no* off-ingress `get_or_create` beyond today's.
-    (The pre-existing off-ingress minting, and its interaction with a concurrent
-    subsequent edit, is governed by
-    [lazy-node-identity-tracking](lazy-node-identity-tracking.md) and is neither
-    worsened nor in scope to fix here.) Because reuse is bound to the tree
+  - **No *new* `NodeTracker` mutation.** `populate_injections` *already* mints
+    the `region_id` on each `CacheableInjectionRegion` it inserts into the
+    `InjectionMap` (which `invalidate_for_edits` needs for token-cache eviction),
+    through the tracker's epoch/incarnation-guarded batch mint
+    (`mint_batch_if_unshifted`) and commit (`commit_if_unshifted`): a pass whose
+    document was edited, closed, or reopened since it latched its epoch mints
+    nothing and commits nothing. The discovery build must **reuse that same id** —
+    it is produced by the same shared stage, from the same `Q`, so the lever adds
+    *no* off-ingress minting beyond today's, and inherits the same guard
+    ([lazy-node-identity-tracking](lazy-node-identity-tracking.md)). Because reuse
+    is bound to the tree
     identity, a stored `region_id` is only ever served for the exact tree it was
     minted on — consistent with the `InjectionMap` / tracker state for that tree;
     a changed tree misses and the miss-path mints fresh, as today.
