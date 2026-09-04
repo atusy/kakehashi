@@ -1286,9 +1286,16 @@ mod tests {
                 assert!(result.command.is_none(), "lens stays unresolved");
             });
         });
+        // The capture is process-wide while it is armed, so another test's
+        // warning can land in it; only this resolve's own lines prove
+        // whether the gate fired before the handle was consulted.
+        let own: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.contains("codeLens/resolve"))
+            .collect();
         assert!(
-            warnings.is_empty(),
-            "an unbound or mismatched envelope must fail soft before any connection is consulted: {warnings:?}"
+            own.is_empty(),
+            "an unbound or mismatched envelope must fail soft before any connection is consulted: {own:?}"
         );
     }
 }
