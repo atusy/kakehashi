@@ -352,7 +352,7 @@ impl LanguageServerPool {
         host_uri: &url::Url,
         language_id: &str,
         text: &str,
-        live_text_reader: Option<&(dyn Fn() -> Option<Arc<str>> + Send + Sync)>,
+        live_text_reader: Option<&(dyn Fn() -> Option<(Arc<str>, u64)> + Send + Sync)>,
     ) {
         let lifecycle = self.host_lifecycle_lock(host_uri);
         let _lifecycle_guard = lifecycle.write().await;
