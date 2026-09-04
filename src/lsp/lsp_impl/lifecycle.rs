@@ -1623,13 +1623,16 @@ fn spawn_upstream_request(
                 // sender instead, which waiters read as "can never finish".
                 let mut work = tokio::spawn(async move {
                     // Whether this connection ended up holding everything current
-                    // state says it should. Only an APPLICABLE host that failed
-                    // to open clears it — a host that supplies nothing for this
-                    // connection is not a failed repair, it is not this
-                    // connection's document. Counting those would report failure
-                    // on essentially every respawn (most open documents bridge
-                    // nowhere near any one server), holding the barrier shut and
-                    // making every command pay the full wait and then fail soft.
+                    // state says it should. Cleared by an APPLICABLE host that
+                    // failed to open, and by a host this pass could not look at
+                    // (parse unsettled, language still publishing, tree-less
+                    // placeholder) whose applicability is therefore unknown — a
+                    // host that supplies nothing for this connection is not a
+                    // failed repair, it is not this connection's document.
+                    // Counting those would report failure on essentially every
+                    // respawn (most open documents bridge nowhere near any one
+                    // server), holding the barrier shut and making every
+                    // command pay the full wait and then fail soft.
                     let mut repaired = true;
                     // e2e-only fault injection: hold the re-open BEFORE any
                     // didOpen goes out, so the ordering e2e can force the window

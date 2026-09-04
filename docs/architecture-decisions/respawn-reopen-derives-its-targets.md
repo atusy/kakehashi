@@ -275,14 +275,14 @@ rather than implied.
 **An invalidation placeholder reads as a current parse.** `invalidate_parse`
 publishes a tree-less snapshot whose `parsed_version` equals the content
 version, so both the parse wait and the currency re-check classify it as
-settled. The sweep then resolves no injections — because there is no tree, not
-because the host has no regions — and reports success. This matters most on the
-settings-reload path, which invalidates every parse and purges connections in
-the same pass. Distinguishing a placeholder from a legitimately tree-less parse
-(no parser loaded, parse produced nothing) needs a discriminator the snapshot
-does not currently carry, and rejecting every tree-less snapshot instead would
-wedge the barrier shut while a parser is still being installed. Same root cause
-as the reload-placeholder issue (#923).
+settled. The injection resolution answers "could not look" for a tree-less
+document (and for a language whose parser is not published, or a reload in
+progress), so the sweep reports the connection incomplete rather than
+repaired: the command that waits on it fails soft once, the reparse that
+follows re-opens eagerly. Reporting incomplete is the fail-soft direction; the
+cost is that one command, also for a document that stays tree-less (no parser
+will ever come), which has no regions to route anyway. Same root cause as the
+reload-placeholder issue (#923).
 
 **An empty resolution can be confirmed against a NEWER version.** If a
 `didChange` clears the tree and its reparse publishes before the currency
