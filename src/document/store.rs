@@ -709,13 +709,16 @@ impl DocumentStore {
     /// `snapshot` iff the cell admits it — both under the document's entry
     /// lock, as the one way a parse reaches readers.
     ///
-    /// The two writes share one `get_mut` guard, so no reader can observe a
-    /// tree without its snapshot (or the reverse) and no path can attach a
-    /// tree without publishing: this is the only attach entry point. The
-    /// snapshot may land while the tree does not — a parse of text an edit
-    /// has moved on from is stale but consistent, which serve-stale readers
-    /// consume (parse-snapshot ADR); the cell's admission rule rejects an
-    /// out-of-order version on its own.
+    /// The two writes share one `get_mut` guard, and the tree is attached
+    /// only when the snapshot was admitted, so no reader can observe a tree
+    /// whose snapshot is not in the cell and no path can attach a tree
+    /// without publishing: this is the only attach entry point. The reverse
+    /// is allowed — the snapshot may land while the tree does not, when the
+    /// inputs moved on: a parse of text an edit has moved on from is stale
+    /// but consistent, which serve-stale readers consume (parse-snapshot
+    /// ADR), and the cell's admission rule rejects an out-of-order version on
+    /// its own. A language check that fails rejects both: the tree belongs
+    /// to a language the document no longer has, and so does the snapshot.
     pub(crate) fn install_parse(
         &self,
         uri: &Url,
@@ -727,18 +730,25 @@ impl DocumentStore {
             .documents
             .get_mut(uri)
             .map_or_else(ParseInstall::default, |mut doc| {
+                if expected
+                    .language_id
+                    .is_some_and(|language_id| doc.language_id() != language_id)
+                {
+                    return ParseInstall::default();
+                }
                 let inputs_unchanged = doc.incarnation() == expected.incarnation
                     && doc.content_version() == expected.content_version
-                    && doc.text() == expected.text
-                    && expected
-                        .language_id
-                        .is_none_or(|language_id| doc.language_id() == language_id);
-                if inputs_unchanged {
-                    doc.set_parse_result(snapshot.language.clone(), snapshot.tree.clone());
+                    && doc.text() == expected.text;
+                let language = snapshot.language.clone();
+                let tree = snapshot.tree.clone();
+                let published = doc.publish_snapshot(snapshot);
+                let attached = inputs_unchanged && published;
+                if attached {
+                    doc.set_parse_result(language, tree);
                 }
                 ParseInstall {
-                    attached: inputs_unchanged,
-                    published: doc.publish_snapshot(snapshot),
+                    attached,
+                    published,
                 }
             });
         // A different map (`parse_states`): touched only after the document
@@ -779,6 +789,61 @@ mod tests {
             resolved_regions: None,
             layer_trees: std::sync::OnceLock::new(),
         })
+    }
+
+    /// A parse of text an edit has moved on from — before that edit's own
+    /// reparse published — lands its snapshot as stale but consistent (the
+    /// cell admits a newer version than it holds) while the tree, which
+    /// would be a reader-visible tree of the wrong text, does not attach.
+    #[test]
+    fn install_parse_publishes_a_stale_but_consistent_snapshot_without_attaching() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///stale.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        // The edit lands first; its reparse has not published yet.
+        store.update_document(uri.clone(), "# doc edited\n".to_string(), None);
+        let outcome = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: Some(Some("markdown")),
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(
+            outcome,
+            ParseInstall {
+                attached: false,
+                published: true
+            }
+        );
+        assert!(store.get(&uri).unwrap().tree().is_none());
+        assert!(
+            store.latest_snapshot(&uri).is_some_and(|view| view
+                .slot
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.parsed_version == content_version
+                    && s.parsed_version != view.content_version)),
+            "the stale snapshot is in the cell, trailing the edited revision"
+        );
     }
 
     /// An off-ingress reparse names the language it parsed under; a reopen
@@ -848,9 +913,10 @@ mod tests {
                 reopened,
             ),
         );
-        assert!(
-            !mismatched.attached,
-            "a language the document no longer has must not attach"
+        assert_eq!(
+            mismatched,
+            ParseInstall::default(),
+            "a language the document no longer has must neither attach nor publish"
         );
         assert!(store.get(&uri).unwrap().tree().is_none());
     }
@@ -961,6 +1027,31 @@ mod tests {
                 .as_ref()
                 .is_some_and(|s| s.parsed_version == view.content_version && s.tree.is_some())),
             "snapshot published and current"
+        );
+
+        // The same parse installed again (a sibling reparse of the same
+        // revision): the cell refuses an equal-version tree swap, and the
+        // tree must not be re-attached either — nothing lands without its
+        // snapshot.
+        let again = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: Some(Some("markdown")),
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(
+            again,
+            ParseInstall::default(),
+            "an equal-version duplicate lands neither tree nor snapshot"
         );
 
         // An edit moved the document on: the parse of the old text attaches
