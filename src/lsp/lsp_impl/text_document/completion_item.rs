@@ -137,9 +137,9 @@ impl Kakehashi {
             return None;
         };
         // A resolve issued while the post-edit reparse is still running would
-        // find no snapshot and read as a stale region; wait for the current
-        // parse the way the request handlers do before their preamble.
-        self.ensure_document_parsed(&host_url).await;
+        // find no snapshot and read as a stale region; wait (bounded) for the
+        // current parse before rebuilding the region.
+        self.wait_for_resolve_parse(&host_url).await;
         let (offset, region_end, contiguous, _) = resolve_region_offset(
             &self.documents,
             &self.language,
