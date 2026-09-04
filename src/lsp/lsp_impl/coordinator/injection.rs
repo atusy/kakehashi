@@ -633,6 +633,13 @@ impl InjectionCoordinator {
         if self.snapshot_is_current(uri) {
             return ParseWait::Current;
         }
+        // Likewise a document closed since it was enumerated: with a zero
+        // budget the timeout can fire before the wait future looks, which
+        // would misreport a buffer the user closed as unsettled and hold the
+        // barrier shut over it.
+        if self.documents.get(uri).is_none() {
+            return ParseWait::Gone;
+        }
         use crate::lsp::lsp_impl::snapshot_read::SnapshotWait;
         match tokio::time::timeout(
             budget,
@@ -657,6 +664,8 @@ impl InjectionCoordinator {
             Ok(SnapshotWait::Stale | SnapshotWait::Unparsed) | Err(_) => {
                 if self.snapshot_is_current(uri) {
                     ParseWait::Current
+                } else if self.documents.get(uri).is_none() {
+                    ParseWait::Gone
                 } else {
                     ParseWait::Unsettled
                 }
@@ -733,6 +742,23 @@ mod tests {
                 .ensure_document_parsed(&pending, std::time::Duration::ZERO)
                 .await,
             super::ParseWait::Unsettled
+        ));
+
+        // A document closed since the sweep enumerated it is nothing to
+        // repair, whatever the budget.
+        let closed = Url::parse("file:///zero-budget-closed.md").unwrap();
+        server.documents.insert(
+            closed.clone(),
+            "# closed".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        server.documents.remove(&closed);
+        assert!(matches!(
+            injection
+                .ensure_document_parsed(&closed, std::time::Duration::ZERO)
+                .await,
+            super::ParseWait::Gone
         ));
 
         let current = Url::parse("file:///zero-budget-current.md").unwrap();
