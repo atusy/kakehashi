@@ -334,7 +334,18 @@ impl LanguageServerPool {
     /// the server's static capability requests it.
     /// Both notifications are queued while the connection and host-document
     /// maps stay locked, preserving their downstream wire order.
-    pub(crate) async fn sync_and_notify_host_did_save(&self, uri: &Url, text: &str) {
+    ///
+    /// `revision` is the lifetime and revision `text` was read at: the re-sync
+    /// honours the per-connection watermark like every other store-backed
+    /// sync, so a save whose text an eager re-sync has already moved past does
+    /// not roll the downstream back, and a later stamped request cannot roll
+    /// it back past the saved text.
+    pub(crate) async fn sync_and_notify_host_did_save(
+        &self,
+        uri: &Url,
+        text: &str,
+        revision: crate::lsp::bridge::envelope::HostRevision,
+    ) {
         let Ok(uri_lsp) = host_url_to_lsp_uri(uri) else {
             return;
         };
@@ -353,6 +364,14 @@ impl LanguageServerPool {
             let Some(state) = docs.get_mut(&(uri_string.clone(), connection_key.clone())) else {
                 continue;
             };
+            if state
+                .content_version
+                .is_some_and(|recorded| revision.content_version < recorded)
+            {
+                // A newer text already reached this connection; the save's
+                // own notification still goes out below for the text it has.
+                continue;
+            }
 
             let mut sender = ConnectionHandleSender(handle);
             if resync_open_host_document(&mut sender, state, uri_lsp.clone(), text)
@@ -361,6 +380,7 @@ impl LanguageServerPool {
             {
                 continue;
             }
+            state.content_version = Some(revision.content_version);
             let params = if include_text {
                 serde_json::json!({ "textDocument": { "uri": uri.as_str() }, "text": text })
             } else {
