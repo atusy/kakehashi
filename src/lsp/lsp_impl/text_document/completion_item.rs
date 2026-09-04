@@ -52,9 +52,11 @@ impl Kakehashi {
             // action resolves: a completion list is designed to outlive edits
             // (clients filter it locally while the user keeps typing and
             // resolve on accept, which itself edits), and the downstream
-            // computes the lazy fields against its own, already synchronized
-            // text. Only the lifetime and, on the virt layer, the region
-            // geometry are checked.
+            // computes the lazy fields against its own copy of the text,
+            // which the bridge keeps in step (#1053 tracks the window where
+            // a resolve overtakes the forwarded virtual didChange). Only the
+            // lifetime and, on the virt layer, the region geometry are
+            // checked.
             if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
                 log::debug!(
                     target: "kakehashi::bridge",

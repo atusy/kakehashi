@@ -132,9 +132,10 @@ fn e2e_virtual_completion_from_resolving_server_is_enveloped() {
 /// A completion list is designed to outlive edits: the editor filters it
 /// locally while the user keeps typing and resolves an item on accept, which
 /// itself edits. A same-shape edit inside the fence must therefore NOT refuse
-/// the resolve — the downstream computes the lazy fields against its own,
-/// already synchronized text. (Inlay hints and lazy code actions, which the
-/// editor re-requests on every edit, are refused instead.)
+/// the resolve — the downstream computes the lazy fields against its own
+/// copy of the text, which the bridge keeps in step. (Inlay hints and lazy
+/// code actions, which the editor re-requests on every edit, are refused
+/// instead.)
 #[test]
 fn e2e_virtual_completion_resolve_survives_a_same_shape_edit() {
     let (mut client, _config_dir, item) =

@@ -99,8 +99,10 @@ Partially implemented:
   `completionItem/resolve` checks only the incarnation (before dispatch and
   after the reply): a completion list is meant to outlive ordinary edits — the
   editor filters it locally while the user keeps typing and resolves on
-  accept — and the downstream computes the lazy fields against its own,
-  already synchronized text. Every host-layer producer (completion,
+  accept — and the downstream computes the lazy fields against its own copy
+  of the text, which the bridge keeps in step (a resolve enqueued before the
+  virtual `didChange` for the latest host edit has been forwarded still
+  reaches the previous copy; see #1053). Every host-layer producer (completion,
   codeAction, codeLens, documentLink, inlayHint) stamps its items with the
   incarnation the host text was read under (codeAction and inlayHint with its
   revision as well), from one store read, and discards a reply the downstream
