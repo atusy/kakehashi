@@ -143,7 +143,7 @@ impl Kakehashi {
         )
         .await;
         // The envelope pass rides in `on_done`, so only the WINNER pays it.
-        self.host_layer_result(fan_in, METHOD, |won| {
+        self.host_layer_result(fan_in, &ctx, METHOD, |won| {
             won.map(HostCompletion::into_enveloped_response)
         })
         .await

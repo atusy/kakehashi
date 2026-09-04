@@ -342,8 +342,10 @@ impl Kakehashi {
                 cancel_rx,
             )
             .await;
-            self.host_layer_result(fan_in, method_name, |won| won.and_then(on_host_winner))
-                .await
+            self.host_layer_result(fan_in, &ctx, method_name, |won| {
+                won.and_then(on_host_winner)
+            })
+            .await
         };
 
         let result = self

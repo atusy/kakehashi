@@ -644,12 +644,13 @@ impl Kakehashi {
                     cancel_rx,
                 )
                 .await;
-                self.host_layer_result(fan_in, METHOD, |v| v).await
+                self.host_layer_result(fan_in, &ctx, METHOD, |v| v).await
             }
             AggregationStrategy::Concatenated => {
                 let fan_in =
                     dispatch_host_concatenated(&ctx, pool.clone(), f, cancel_rx, None, None).await;
-                self.host_layer_result(fan_in, METHOD, concat_merge).await
+                self.host_layer_result(fan_in, &ctx, METHOD, concat_merge)
+                    .await
             }
         }
     }

@@ -128,7 +128,7 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        self.host_layer_result(fan_in, METHOD, |won| {
+        self.host_layer_result(fan_in, &ctx, METHOD, |won| {
             won.map(HostInlayHints::into_enveloped_hints)
         })
         .await
