@@ -4530,3 +4530,44 @@ mod tests {
         let _ = loop_handle.await;
     }
 }
+
+/// Order the documents a re-open sweep considers so that every document
+/// whose parse is already current comes before any whose parse is pending.
+///
+/// The sweep has one budget for the whole pass and pays a parse wait per
+/// pending document; iterating the store's own (hash) order let a pending
+/// document ahead of a current one spend the budget the current one needed,
+/// and a current document behind it then went un-reopened. Stable: documents
+/// keep their relative order within each group.
+fn order_reopen_candidates(
+    hosts: Vec<url::Url>,
+    is_current: impl Fn(&url::Url) -> bool,
+) -> Vec<url::Url> {
+    let (current, pending): (Vec<_>, Vec<_>) = hosts.into_iter().partition(|host| is_current(host));
+    current.into_iter().chain(pending).collect()
+}
+
+#[cfg(test)]
+mod reopen_order_tests {
+    use super::order_reopen_candidates;
+    use url::Url;
+
+    #[test]
+    fn current_documents_come_before_pending_ones_in_stable_order() {
+        let hosts: Vec<Url> = [
+            "file:///a.md",
+            "file:///b.md",
+            "file:///c.md",
+            "file:///d.md",
+        ]
+        .iter()
+        .map(|u| Url::parse(u).unwrap())
+        .collect();
+        let pending = [hosts[0].clone(), hosts[2].clone()];
+
+        let ordered = order_reopen_candidates(hosts.clone(), |host| !pending.contains(host));
+
+        let names: Vec<&str> = ordered.iter().map(|u| u.path()).collect();
+        assert_eq!(names, vec!["/b.md", "/d.md", "/a.md", "/c.md"]);
+    }
+}
