@@ -556,12 +556,7 @@ impl ParseCoordinator {
                     .await;
                 let installed = self.documents.install_parse(
                     &uri,
-                    crate::document::ParseInputs {
-                        text: &text,
-                        language_id: None,
-                        incarnation,
-                        content_version,
-                    },
+                    crate::document::LanguageCheck::Record,
                     std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                         text: text.clone(),
                         tree: Some(tree.clone()),
@@ -574,7 +569,7 @@ impl ParseCoordinator {
                         layer_trees: std::sync::OnceLock::new(),
                     }),
                 );
-                if installed.attached {
+                if installed.current {
                     // AFTER the install: a downstream task woken by this mark
                     // on another runtime thread must find the snapshot (and
                     // its fast-path regions) already in the cell.
@@ -587,7 +582,7 @@ impl ParseCoordinator {
                 // racing `didChange`/reopen moved the text or incarnation on and the
                 // edit reparse won, in which case the open downstream must NOT re-run
                 // over the edit's tree.
-                return installed.attached;
+                return installed.current;
             }
 
             // Parse produced no tree (timeout / parser unavailable / join error) but
@@ -597,12 +592,7 @@ impl ParseCoordinator {
             // language keeps a host-bridged document working after a parse failure.
             let installed = self.documents.install_parse(
                 &uri,
-                crate::document::ParseInputs {
-                    text: &text,
-                    language_id: None,
-                    incarnation,
-                    content_version,
-                },
+                crate::document::LanguageCheck::Record,
                 std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                     text: text.clone(),
                     tree: None,
@@ -615,7 +605,7 @@ impl ParseCoordinator {
                     layer_trees: std::sync::OnceLock::new(),
                 }),
             );
-            if installed.attached {
+            if installed.current {
                 self.documents
                     .mark_parse_finished(&uri, parse_generation, false);
             }
@@ -627,12 +617,7 @@ impl ParseCoordinator {
         // No language detected at all → store no language, no tree.
         let installed = self.documents.install_parse(
             &uri,
-            crate::document::ParseInputs {
-                text: &text,
-                language_id: None,
-                incarnation,
-                content_version,
-            },
+            crate::document::LanguageCheck::Record,
             std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                 text: text.clone(),
                 tree: None,
@@ -645,7 +630,7 @@ impl ParseCoordinator {
                 layer_trees: std::sync::OnceLock::new(),
             }),
         );
-        if installed.attached {
+        if installed.current {
             self.documents
                 .mark_parse_finished(&uri, parse_generation, false);
         }
@@ -820,12 +805,7 @@ impl ParseCoordinator {
                 .await;
             let installed = self.documents.install_parse(
                 &uri,
-                crate::document::ParseInputs {
-                    text: &text,
-                    language_id: Some(expected_language_id.as_deref()),
-                    incarnation: expected_incarnation,
-                    content_version,
-                },
+                crate::document::LanguageCheck::Expect(expected_language_id.as_deref()),
                 std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                     text: text.clone(),
                     tree: Some(tree.clone()),
@@ -848,7 +828,7 @@ impl ParseCoordinator {
                     language_name.clone(),
                 ));
             }
-            if installed.attached {
+            if installed.current {
                 break;
             }
             // Install rejected: the text moved under us (a concurrent
@@ -1029,12 +1009,7 @@ impl ParseCoordinator {
             });
             let installed = self.documents.install_parse(
                 uri,
-                crate::document::ParseInputs {
-                    text: &text,
-                    language_id: Some(language_id.as_deref()),
-                    incarnation,
-                    content_version,
-                },
+                crate::document::LanguageCheck::Expect(language_id.as_deref()),
                 std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                     text: text.clone(),
                     tree: Some(tree.clone()),
