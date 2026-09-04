@@ -218,6 +218,17 @@ impl Kakehashi {
         };
         // Every fail-soft exit below is the steady state of a hint the editor
         // kept past an edit, so it logs at debug like the sibling gates do.
+        // Lifetime first: a hint from a closed and reopened document (whose
+        // revision can match the reopened one's) would otherwise park on the
+        // reopened lifetime's parse only to be refused after the reply.
+        if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "inlayHint/resolve: {} was reopened since the hint was produced; returning hint unresolved",
+                envelope.host_uri
+            );
+            return Ok(hint);
+        }
         if !self.inlay_hint_content_is_fresh(&host_url, &envelope) {
             log::debug!(
                 target: "kakehashi::bridge",
@@ -231,9 +242,9 @@ impl Kakehashi {
         } else {
             // `didChange` clears the tree and reparses off-ingress; a resolve
             // issued in that window would find no snapshot and fail soft as a
-            // stale region. Wait for the current parse the way the virt
-            // request handlers do before their preamble snapshots it.
-            self.ensure_document_parsed(&host_url).await;
+            // stale region. Wait (bounded) for the current parse before
+            // rebuilding the region.
+            self.wait_for_resolve_parse(&host_url).await;
             let Some((offset, region_end, contiguous, live_language)) =
                 self.inlay_hint_region_geometry(&host_url, &envelope)
             else {
