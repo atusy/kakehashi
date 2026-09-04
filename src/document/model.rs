@@ -43,23 +43,22 @@ pub struct Document {
     /// edit, paid back by the many cheap clones per edit.
     text: Arc<str>,
     language_id: Option<String>,
-    tree: Option<Tree>,
     /// Edited-but-not-yet-reparsed seed for the **off-ingress** incremental parse
     /// (per-document-parse-scheduler).
     ///
-    /// `didChange` clears the reader-visible `tree` (so a reader never sees a tree
-    /// that predates the edit — the flip's reader-safety invariant) but stashes the
-    /// pre-edit tree here with the edit's `InputEdit`s already applied
+    /// `didChange` bumps `content_version` (so a reader never sees a tree that
+    /// predates the edit — the published snapshot is stale from then on) and
+    /// stashes the pre-edit tree here with the edit's `InputEdit`s already applied
     /// (`tree.edit()`). The off-ingress `reparse_latest` consumes it as
     /// `parser.parse(text, Some(seed))` to parse incrementally instead of from
     /// scratch. Coalesced edits accumulate their `InputEdit`s onto this same seed,
     /// so a burst still produces one correctly-edited seed for the final reparse.
     ///
     /// **Read by `reparse_latest` only** — never by `tree()` / `snapshot()`, which
-    /// must stay `None` until the reparse lands. Cleared the moment a fresh tree is
-    /// attached (`set_parse_result`, reached only through
-    /// `DocumentStore::install_parse`) — a present tree means the seed is
-    /// consumed — and on a
+    /// stay `None` until the reparse lands. Cleared the moment a fresh parse is
+    /// recorded (`set_parse_result`, reached only through
+    /// `DocumentStore::install_parse`) — the published tree has consumed the
+    /// seed — and on a
     /// full-text sync (`apply_edit_and_seed` with no `InputEdit`s), where seeding an
     /// unedited tree against wholly-replaced text would violate tree-sitter's
     /// incremental contract and corrupt external scanners (#348).
@@ -108,7 +107,6 @@ impl Document {
         Self {
             text: Arc::from(text),
             language_id: None,
-            tree: None,
             pending_seed: None,
             incarnation,
             content_version: 0,
@@ -122,7 +120,6 @@ impl Document {
         Self {
             text: Arc::from(text),
             language_id: Some(language_id),
-            tree: None,
             pending_seed: None,
             incarnation,
             content_version: 0,
@@ -131,23 +128,18 @@ impl Document {
         }
     }
 
-    /// Create with language and tree
+    /// Create with language and an already-parsed tree: published as the
+    /// lifetime's first snapshot, at version 0.
     pub(crate) fn with_tree(
         text: String,
         language_id: String,
         tree: Tree,
         incarnation: u64,
     ) -> Self {
-        Self {
-            text: Arc::from(text),
-            language_id: Some(language_id),
-            tree: Some(tree),
-            pending_seed: None,
-            incarnation,
-            content_version: 0,
-            snapshot_tx: watch::Sender::new(SnapshotSlot::bootstrap(incarnation)),
-            version_cancel: crate::cancel::CancelToken::default(),
-        }
+        let doc = Self::with_language(text, language_id, incarnation);
+        doc.snapshot_tx
+            .send_replace(doc.slot_with(doc.bare_snapshot(Some(tree))));
+        doc
     }
 
     /// Get the text content
@@ -167,9 +159,50 @@ impl Document {
         self.language_id.as_deref()
     }
 
-    /// Get the tree
-    pub fn tree(&self) -> Option<&Tree> {
-        self.tree.as_ref()
+    /// The current parse's tree: the published snapshot's, iff that snapshot
+    /// is this lifetime's and parsed this content version. An edit or a
+    /// reload makes the published snapshot stale, so this is `None` until the
+    /// reparse lands — a reader never sees a tree that predates the text.
+    /// (`Tree` clone is a refcount bump.)
+    pub(crate) fn tree(&self) -> Option<Tree> {
+        self.current_snapshot()
+            .and_then(|snapshot| snapshot.tree.clone())
+    }
+
+    /// The published snapshot iff it is this lifetime's and parsed the
+    /// current content version (parse-snapshot ADR §2 currency).
+    pub(crate) fn current_snapshot(&self) -> Option<Arc<ParseSnapshot>> {
+        let slot = self.snapshot_tx.borrow();
+        slot.snapshot
+            .as_ref()
+            .filter(|snapshot| {
+                snapshot.incarnation == self.incarnation
+                    && snapshot.parsed_version == self.content_version
+            })
+            .cloned()
+    }
+
+    /// A snapshot of the current inputs carrying `tree` and nothing derived —
+    /// the reload placeholder and the test fixtures' published tree.
+    fn bare_snapshot(&self, tree: Option<Tree>) -> Arc<ParseSnapshot> {
+        Arc::new(ParseSnapshot {
+            text: Arc::clone(&self.text),
+            tree,
+            language: self.language_id.clone(),
+            parsed_version: self.content_version,
+            incarnation: self.incarnation,
+            injection_regions: None,
+            bridge_regions: None,
+            resolved_regions: None,
+            layer_trees: std::sync::OnceLock::new(),
+        })
+    }
+
+    fn slot_with(&self, snapshot: Arc<ParseSnapshot>) -> SnapshotSlot {
+        SnapshotSlot {
+            current_incarnation: self.incarnation,
+            snapshot: Some(snapshot),
+        }
     }
 
     /// The document's open incarnation (see the [`incarnation`](Self::incarnation)
@@ -240,12 +273,13 @@ impl Document {
 
     /// Create an immutable snapshot of current document state
     ///
-    /// Returns None if document is not fully initialized (missing tree).
-    /// The snapshot clones text and tree to enable lock-free processing.
+    /// Returns None while the document has no current tree (see
+    /// [`tree`](Self::tree)). The snapshot clones text and tree to enable
+    /// lock-free processing.
     pub(crate) fn snapshot(&self) -> Option<DocumentSnapshot> {
         Some(DocumentSnapshot {
             text: self.text.clone(),
-            tree: self.tree.as_ref()?.clone(),
+            tree: self.tree()?,
             incarnation: self.incarnation,
         })
     }
@@ -253,81 +287,67 @@ impl Document {
     /// Install a freshly parsed tree together with its text.
     ///
     /// Replaces the text, so it counts as an input mutation and bumps
-    /// `content_version` (its callers pass the text the tree was parsed from,
-    /// which may or may not equal the stored text; bumping unconditionally
-    /// keeps the version a safe upper bound — a spurious bump only marks a
-    /// snapshot stale early, never serves a wrong one).
+    /// `content_version`, then publishes the tree at that version (a newer
+    /// tree-bearing snapshot is always admitted).
     #[cfg(test)]
     pub(crate) fn update_tree_and_text(&mut self, new_tree: Tree, new_text: String) {
         self.text = Arc::from(new_text);
         self.advance_input_version();
-        self.tree = Some(new_tree);
         // Any pending incremental seed is for an edit superseded by this fresh
-        // tree+text; keep the invariant "visible tree present ⟹ no stale seed" so a
-        // later `reparse_latest` can't seed from a tree that predates this text
+        // tree+text; keep the invariant "current tree present ⟹ no stale seed" so
+        // a later `reparse_latest` can't seed from a tree that predates this text
         // (the #348 contract hazard).
         self.pending_seed = None;
+        self.publish_snapshot(&self.bare_snapshot(Some(new_tree)));
     }
 
-    /// Drop the tree and the seed on a settings/grammar reload and publish a
-    /// tree-less placeholder at the bumped version (see `ParseSnapshot`).
+    /// Drop the seed on a settings/grammar reload and publish a tree-less
+    /// placeholder at the bumped version (see `ParseSnapshot`), which is what
+    /// takes the tree away from readers.
     pub(crate) fn invalidate_parse(&mut self) {
-        self.tree = None;
         self.pending_seed = None;
         // Grammar/query settings are parse inputs even when text is unchanged.
         // Advancing the internal version makes every pre-reload parse result
         // stale and lets the scheduled current-generation snapshot supersede it.
         self.advance_input_version();
-        self.snapshot_tx.send_replace(SnapshotSlot {
-            current_incarnation: self.incarnation,
-            snapshot: Some(Arc::new(ParseSnapshot {
-                text: Arc::clone(&self.text),
-                tree: None,
-                language: self.language_id.clone(),
-                parsed_version: self.content_version,
-                incarnation: self.incarnation,
-                injection_regions: None,
-                bridge_regions: None,
-                resolved_regions: None,
-                layer_trees: std::sync::OnceLock::new(),
-            })),
-        });
+        self.snapshot_tx
+            .send_replace(self.slot_with(self.bare_snapshot(None)));
     }
 
-    /// Store a parse result — the `language` and the parsed `tree` (`None` for
-    /// a parsed-to-nothing / no-language parse) — **preserving the existing
-    /// text**. Reached only through `DocumentStore::install_parse`, for every
-    /// parse path (open, installed-grammar reparse, edit reparse); the text
-    /// was stored when the document was registered, so the result is recorded
-    /// in place rather than re-inserting a copy of the (potentially large)
-    /// text.
+    /// Record a parse result's `language` (`None` for a no-language parse)
+    /// **preserving the existing text**; the tree itself reaches readers only
+    /// through the published snapshot. Reached only through
+    /// `DocumentStore::install_parse`, for every parse path (open,
+    /// installed-grammar reparse, edit reparse).
     ///
-    /// Clears `pending_seed`: a present reader-visible tree means the
-    /// off-ingress reparse's seed has been consumed, so the next `didChange`
-    /// seeds from this fresh tree, not a stale seed.
-    pub(crate) fn set_parse_result(&mut self, language: Option<String>, tree: Option<Tree>) {
+    /// Clears `pending_seed`: the published current tree has consumed the
+    /// off-ingress reparse's seed, so the next `didChange` seeds from that
+    /// fresh tree, not a stale seed.
+    pub(crate) fn set_parse_result(&mut self, language: Option<String>) {
         self.language_id = language;
-        self.tree = tree;
         self.pending_seed = None;
     }
 
     /// Apply an edit's new text and stash an **incremental parse seed** for the
-    /// off-ingress reparse, clearing the reader-visible tree.
+    /// off-ingress reparse.
     ///
-    /// The reader-visible `tree` is cleared (a reader must never see a tree that
-    /// predates this edit). The pre-edit tree — or the seed already accumulated by
-    /// an earlier coalesced edit — has `edits` applied via `tree.edit()` and is
-    /// stashed in `pending_seed` for `reparse_latest` to parse incrementally.
+    /// Bumping the content version makes the published snapshot stale, so a
+    /// reader never sees a tree that predates this edit. The pre-edit tree — or
+    /// the seed already accumulated by an earlier coalesced edit — has `edits`
+    /// applied via `tree.edit()` and is stashed in `pending_seed` for
+    /// `reparse_latest` to parse incrementally.
     ///
     /// With **no** `edits` (a full-text sync) the seed is dropped to `None`: seeding
     /// an unedited tree against wholly-replaced text violates tree-sitter's
     /// incremental contract and corrupted external scanners in #348, so a full-text
     /// sync must parse from scratch.
     pub(crate) fn apply_edit_and_seed(&mut self, new_text: String, edits: &[InputEdit]) {
-        // Base the seed on the reader-visible tree if present, else the seed an
-        // earlier coalesced edit already accumulated (the visible tree is cleared
-        // on the first edit of a burst, so subsequent edits chain onto the seed).
-        let base = self.tree.take().or_else(|| self.pending_seed.take());
+        // Base the seed on the current tree if present (read before the
+        // version bump makes it stale), else the seed an earlier coalesced edit
+        // already accumulated (the first edit of a burst makes the tree stale,
+        // so subsequent edits chain onto the seed). Editing a clone of the
+        // published tree leaves the snapshot's own copy untouched.
+        let base = self.tree().or_else(|| self.pending_seed.take());
         self.pending_seed = match base {
             Some(mut tree) if !edits.is_empty() => {
                 for edit in edits {
@@ -353,8 +373,7 @@ impl Document {
     #[cfg(test)]
     pub(crate) fn update_text(&mut self, text: String) {
         self.text = Arc::from(text);
-        // Note: Tree needs to be rebuilt after text change
-        self.tree = None;
+        // The version bump makes the published tree stale: readers see none.
         self.pending_seed = None;
         self.advance_input_version();
     }
@@ -380,7 +399,7 @@ mod tests {
         let doc = Document::with_language(text.to_string(), "rust".to_string(), 7);
         assert!(doc.tree().is_none(), "unparsed: no tree");
         let tree = rust_tree(text);
-        assert!(doc.publish_snapshot(Arc::new(ParseSnapshot {
+        assert!(doc.publish_snapshot(&Arc::new(ParseSnapshot {
             text: doc.text_arc(),
             tree: Some(tree.clone()),
             language: Some("rust".to_string()),
@@ -391,9 +410,12 @@ mod tests {
             resolved_regions: None,
             layer_trees: std::sync::OnceLock::new(),
         })));
+        // `Tree` clones share their subtrees but not the root handle, so a
+        // child node's id is the identity that survives the clone.
+        let first_child = |t: &Tree| t.root_node().named_child(0).map(|n| n.id());
         assert_eq!(
-            doc.tree().map(|t| t.root_node().id()),
-            Some(tree.root_node().id()),
+            doc.tree().as_ref().and_then(first_child),
+            first_child(&tree),
             "the published snapshot's tree is the document's tree"
         );
         assert!(doc.snapshot().is_some());
@@ -440,14 +462,16 @@ mod tests {
         doc.update_text("fn main() { }".to_string());
         assert_eq!(doc.content_version(), 1);
 
-        // A parse-result write does not bump.
+        // A parse-result write (language record + published tree) does not bump.
         let tree = parser.parse("fn main() { }", None).unwrap();
-        doc.set_parse_result(Some("rust".to_string()), Some(tree));
+        doc.set_parse_result(Some("rust".to_string()));
+        assert!(doc.publish_snapshot(&doc.bare_snapshot(Some(tree))));
         assert_eq!(
             doc.content_version(),
             1,
-            "set_parse_result is not an input mutation"
+            "a parse result is not an input mutation"
         );
+        assert!(doc.tree().is_some());
 
         // An incremental edit bumps.
         doc.apply_edit_and_seed("fn main() {  }".to_string(), &[]);
@@ -596,12 +620,13 @@ mod tests {
         assert!(doc.pending_seed().is_some());
 
         let reparsed = parser.parse("fn main() { }", None).unwrap();
-        doc.set_parse_result(Some("rust".to_string()), Some(reparsed));
+        assert!(doc.publish_snapshot(&doc.bare_snapshot(Some(reparsed))));
+        doc.set_parse_result(Some("rust".to_string()));
 
         assert!(doc.tree().is_some());
         assert!(
             doc.pending_seed().is_none(),
-            "attaching a fresh tree must consume the seed"
+            "recording a fresh parse must consume the seed"
         );
     }
 

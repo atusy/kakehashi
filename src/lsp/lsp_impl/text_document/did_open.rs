@@ -1413,7 +1413,9 @@ print("hello")
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse("fn already() {}", None).unwrap();
-        let tree_id = tree.root_node().id();
+        // A child node's id survives `Tree` clones (the root handle does not).
+        let first_child = |t: &tree_sitter::Tree| t.root_node().named_child(0).map(|n| n.id());
+        let tree_id = first_child(&tree);
         server.documents.insert(
             uri.clone(),
             "fn already() {}".to_string(),
@@ -1428,7 +1430,7 @@ print("hello")
 
         let doc = server.documents.get(&uri).unwrap();
         assert_eq!(
-            doc.tree().unwrap().root_node().id(),
+            doc.tree().as_ref().and_then(first_child),
             tree_id,
             "the existing tree must be left untouched (no redundant reparse)"
         );

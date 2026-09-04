@@ -768,11 +768,10 @@ impl DocumentStore {
                     None => snapshot.language.clone(),
                     Some(_) => doc.language_id().map(String::from),
                 };
-                let tree = snapshot.tree.clone();
                 let published = doc.publish_snapshot(&snapshot);
                 let attached = inputs_unchanged && published;
                 if attached {
-                    doc.set_parse_result(language, tree);
+                    doc.set_parse_result(language);
                 }
                 ParseInstall {
                     attached,
@@ -1183,7 +1182,10 @@ mod tests {
             },
             "equal bytes from another allocation are not the document's text"
         );
-        assert!(store.get(&uri).unwrap().tree().is_none());
+        assert!(
+            store.get(&uri).unwrap().tree().is_some(),
+            "readers see the published current tree regardless of the legacy attach"
+        );
     }
 
     /// A parse that found a language but produced no tree still records the
