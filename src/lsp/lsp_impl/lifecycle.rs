@@ -1715,7 +1715,15 @@ fn spawn_upstream_request(
                         // since a skip is indistinguishable from "nothing to
                         // repair". On a mismatch fall through and let the
                         // authoritative path, which re-reads both, decide.
-                        if !reachable && injection.document_incarnation(&host) == screened_at {
+                        // Likewise a document without a current tree: a reload
+                        // that changed how it is detected leaves the OLD
+                        // stored language in place until the replacement
+                        // parse lands, so a rejection read from it is not
+                        // definitive either.
+                        if !reachable
+                            && injection.document_incarnation(&host) == screened_at
+                            && injection.snapshot_has_tree(&host)
+                        {
                             continue;
                         }
                         // Await the tree first: a re-open racing an edit would
