@@ -3653,6 +3653,46 @@ mod tests {
         assert!(coordinator.has_parser_available("ordered"));
     }
 
+    /// Duplicate loads of one language are admitted concurrently; once the
+    /// first has published, a second must not clear the queries again while
+    /// the parser it published stays visible.
+    #[test]
+    fn duplicate_dynamic_publication_keeps_the_published_queries() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&WorkspaceSettings::default());
+        let generation = coordinator
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(&language, "(identifier) @injection.content")
+            .expect("valid query");
+        assert!(coordinator.publish_dynamic_language(
+            "twice",
+            language.clone(),
+            generation,
+            || {
+                coordinator
+                    .query_store
+                    .insert_injection_query("twice".to_string(), std::sync::Arc::new(query));
+            },
+        ));
+        let second_published_queries = std::cell::Cell::new(false);
+        assert!(
+            coordinator.publish_dynamic_language("twice", language, generation, || {
+                second_published_queries.set(true);
+            }),
+            "a duplicate load of a published language is a success"
+        );
+        assert!(
+            !second_published_queries.get(),
+            "the duplicate must not republish (and so not clear) the queries"
+        );
+        assert!(
+            coordinator.query_store.injection_query("twice").is_some(),
+            "the first publication's queries must survive the duplicate"
+        );
+    }
+
     #[test]
     fn reload_without_override_preserves_builtin_queries() {
         let coordinator = LanguageCoordinator::new();
