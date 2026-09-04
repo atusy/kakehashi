@@ -15,6 +15,17 @@ const MARKDOWN: &str = "# Test\n\n```lua\nlocal x = 1\n```\n";
 const MARKDOWN_URI: &str = "file:///test_completion_envelope.md";
 
 fn init_virtual_completion_client(mode: &str) -> (LspClient, tempfile::TempDir, Value) {
+    init_virtual_completion_client_on(mode, MARKDOWN, 3, 11)
+}
+
+/// Like [`init_virtual_completion_client`] over `text`, requesting the
+/// completion at (`line`, `character`).
+fn init_virtual_completion_client_on(
+    mode: &str,
+    text: &str,
+    line: u32,
+    character: u32,
+) -> (LspClient, tempfile::TempDir, Value) {
     let config_dir = tempfile::TempDir::new().expect("temp dir");
     let config_path = config_dir.path().join("completion_envelope.toml");
     std::fs::write(&config_path, "").expect("write config");
@@ -54,7 +65,7 @@ fn init_virtual_completion_client(mode: &str) -> (LspClient, tempfile::TempDir, 
                 "uri": MARKDOWN_URI,
                 "languageId": "markdown",
                 "version": 1,
-                "text": MARKDOWN
+                "text": text
             }
         }),
     );
@@ -65,7 +76,7 @@ fn init_virtual_completion_client(mode: &str) -> (LspClient, tempfile::TempDir, 
                 "textDocument/completion",
                 json!({
                     "textDocument": { "uri": MARKDOWN_URI },
-                    "position": { "line": 3, "character": 11 }
+                    "position": { "line": line, "character": character }
                 }),
             );
             assert!(
@@ -185,6 +196,39 @@ fn e2e_virtual_completion_resolve_survives_an_edit_inside_the_region() {
             .as_str()
             .is_some_and(|detail| detail.starts_with("mock-resolved:")),
         "a resolve after typing that grew the region must still reach the downstream: {response}"
+    );
+
+    shutdown_client(&mut client);
+}
+
+/// A fence inside a blockquote carries a per-line column offset (the `> `
+/// prefix); adding a line to it grows that vector without moving the region.
+/// The item is still resolvable: the region is identified by its id and
+/// start, and the resolved edits are translated with the region as it is now.
+#[test]
+fn e2e_virtual_completion_resolve_survives_growth_of_a_blockquoted_fence() {
+    let (mut client, _config_dir, item) = init_virtual_completion_client_on(
+        "completion-resolve-plain",
+        "> ```lua\n> local x = 1\n> ```\n",
+        1,
+        13,
+    );
+    assert_eq!(item["data"]["kakehashi"]["origin"], "mock-completion");
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{ "text": "> ```lua\n> local y = 12\n> local z = 3\n> ```\n" }]
+        }),
+    );
+    let response = client.send_request("completionItem/resolve", item.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(
+        response["result"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("mock-resolved:")),
+        "a resolve after typing that grew the blockquoted fence must still reach the downstream: {response}"
     );
 
     shutdown_client(&mut client);
