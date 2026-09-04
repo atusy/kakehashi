@@ -1398,6 +1398,73 @@ print("hello")
         // with the snapshot conversion (parse-snapshot ADR Stage 2).
     }
 
+    /// `reparse_latest` parses incrementally from the derived seed: after an
+    /// edit inside one item, the reparse's tree reuses the untouched item's
+    /// subtree (a reused subtree keeps its node identities; a parse from
+    /// scratch allocates new ones).
+    #[tokio::test]
+    async fn reparse_latest_reuses_untouched_subtrees_through_the_seed() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/incremental.rs").unwrap();
+        let before = "fn keep() {}\nfn edit() {}\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(before, None).unwrap();
+        // The identity of a node *inside* the untouched item: a reused subtree
+        // keeps its children array, so the identifier's id survives the reparse.
+        let keep_name = |t: &tree_sitter::Tree| {
+            t.root_node()
+                .named_child(0)
+                .and_then(|item| item.child_by_field_name("name"))
+                .map(|name| name.id())
+        };
+        let before_id = keep_name(&tree).expect("fn keep has a name");
+        server.documents.insert(
+            uri.clone(),
+            before.to_string(),
+            Some("rust".to_string()),
+            Some(tree),
+        );
+
+        // Insert a space inside `fn edit`'s body: byte 24 is the `}` of line 2.
+        let after = "fn keep() {}\nfn edit() { }\n";
+        let edit = tree_sitter::InputEdit {
+            start_byte: 24,
+            old_end_byte: 24,
+            new_end_byte: 25,
+            start_position: tree_sitter::Point::new(1, 11),
+            old_end_position: tree_sitter::Point::new(1, 11),
+            new_end_position: tree_sitter::Point::new(1, 12),
+        };
+        server
+            .documents
+            .apply_edit(&uri, after.to_string(), &[edit]);
+        assert!(server.documents.get(&uri).unwrap().tree().is_none());
+
+        server
+            .parse_coordinator()
+            .reparse_latest(&uri, Some(1))
+            .await;
+
+        let reparsed = server
+            .documents
+            .get(&uri)
+            .unwrap()
+            .tree()
+            .expect("the reparse published a tree");
+        assert_eq!(&*server.documents.get(&uri).unwrap().text(), after);
+        assert_eq!(
+            keep_name(&reparsed),
+            Some(before_id),
+            "the untouched item's subtree must be reused from the seed"
+        );
+    }
+
     /// If a concurrent `didChange` already parsed the document (a tree is
     /// present), the install reparse must short-circuit and not redundantly
     /// reparse / clobber it.
