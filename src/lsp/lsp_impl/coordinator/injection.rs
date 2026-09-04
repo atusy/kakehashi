@@ -37,6 +37,7 @@ pub(crate) struct InjectionCoordinator {
     auto_install: AutoInstallManager,
     bridge: std::sync::Arc<BridgeCoordinator>,
     diagnostics: std::sync::Arc<DiagnosticAggregator>,
+    settle_retry_waiters: crate::lsp::lsp_impl::settle_retry::SettleRetryWaiters,
 }
 
 /// What a bounded wait for a current tree actually found.
@@ -63,6 +64,7 @@ impl InjectionCoordinator {
             auto_install: server.auto_install.clone(),
             bridge: std::sync::Arc::clone(&server.bridge),
             diagnostics: std::sync::Arc::clone(&server.diagnostics),
+            settle_retry_waiters: server.settle_retry_waiters.clone(),
         }
     }
 
@@ -588,10 +590,16 @@ impl InjectionCoordinator {
     ) {
         const INJECTION_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
         const INJECTION_RETRY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        // One waiter per document: a burst of passes deferred by the same
+        // window re-runs the pass once, when the language settles.
+        let Some(claim) = self.settle_retry_waiters.claim("injection", uri) else {
+            return;
+        };
         let this = self.clone();
         let uri = uri.clone();
         let host_language = host_language.to_string();
         tokio::spawn(async move {
+            let _claim = claim;
             let deadline = tokio::time::Instant::now() + INJECTION_RETRY_BUDGET;
             loop {
                 tokio::time::sleep(INJECTION_RETRY_POLL).await;

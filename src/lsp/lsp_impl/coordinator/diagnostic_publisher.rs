@@ -150,6 +150,7 @@ pub(crate) struct DiagnosticPublisher {
     settings_manager: Arc<SettingsManager>,
     cache: Arc<crate::lsp::cache::CacheCoordinator>,
     parser_pool: Arc<std::sync::Mutex<crate::language::DocumentParserPool>>,
+    settle_retry_waiters: crate::lsp::lsp_impl::settle_retry::SettleRetryWaiters,
     snapshot_preparer: DiagnosticSnapshotPreparer,
     aggregator: Arc<DiagnosticAggregator>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -165,6 +166,7 @@ impl DiagnosticPublisher {
             settings_manager: Arc::clone(&server.settings_manager),
             cache: Arc::clone(&server.cache),
             parser_pool: Arc::clone(&server.parser_pool),
+            settle_retry_waiters: server.settle_retry_waiters.clone(),
             snapshot_preparer: DiagnosticSnapshotPreparer::new(server),
             aggregator: Arc::clone(&server.diagnostics),
             shutdown: server.shutdown_token.clone(),
@@ -1577,9 +1579,16 @@ impl DiagnosticPublisher {
     fn retry_republish_when_settled(&self, host: &Url, host_language: String) {
         const REPUBLISH_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
         const REPUBLISH_RETRY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        // One waiter per host: every deferral of the same window would
+        // otherwise spawn its own poller, and all of them would then
+        // serialize through the host's republish lock once settled.
+        let Some(claim) = self.settle_retry_waiters.claim("republish", host) else {
+            return;
+        };
         let this = self.clone();
         let host = host.clone();
         tokio::spawn(async move {
+            let _claim = claim;
             let deadline = tokio::time::Instant::now() + REPUBLISH_RETRY_BUDGET;
             loop {
                 tokio::select! {

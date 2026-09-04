@@ -2,6 +2,7 @@ mod apply_edit_translation;
 pub(crate) mod bridge_context;
 mod cli;
 mod coordinator;
+mod settle_retry;
 pub(crate) use coordinator::DiagnosticPublisher;
 pub(crate) mod kakehashi;
 mod lifecycle;
@@ -368,6 +369,9 @@ pub struct Kakehashi {
     /// dropped. Cancelling the token gives deterministic shutdown: `shutdown()`
     /// cancels → task exits immediately → no waiting for channel drainage.
     shutdown_token: tokio_util::sync::CancellationToken,
+    /// One settle-retry waiter per (kind, host) across the injection pass
+    /// and the diagnostic republish.
+    settle_retry_waiters: settle_retry::SettleRetryWaiters,
     /// Whether a `workspace/configuration` pull is already in flight, and
     /// whether a trigger arrived while one was; see
     /// `pull_client_configuration`.
@@ -510,6 +514,7 @@ impl Kakehashi {
                 crate::lsp::diagnostic_cache::DiagnosticAggregator::new(),
             ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
+            settle_retry_waiters: settle_retry::SettleRetryWaiters::default(),
             configuration_pull_in_flight: std::sync::atomic::AtomicBool::new(false),
             configuration_pull_pending: std::sync::atomic::AtomicBool::new(false),
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
