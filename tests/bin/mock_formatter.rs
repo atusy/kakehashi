@@ -58,9 +58,10 @@
 //!   `code-lens-reopen-delayed-resolve` / `document-link-reopen-delayed-resolve`
 //!   — like their base modes, but park the resolve reply (after a
 //!   `window/logMessage` `<kind>-resolve-started`) until the next
-//!   `textDocument/didChange` (the `-delayed-resolve` ones) or the next request
-//!   of their own kind (the `-reopen-delayed-` ones), so a test can edit or
-//!   close and reopen the host while the resolve is in flight.
+//!   `textDocument/didChange` (the `-delayed-resolve` ones) or the reopened
+//!   lifetime's `textDocument/didOpen` (the `-reopen-delayed-` ones), so a
+//!   test can edit or close and reopen the host while the resolve is in
+//!   flight.
 //! - `inlay-hint-resolve` / `inlay-hint-resolve-replacement` — advertise
 //!   `inlayHintProvider.resolveProvider = true`; answer `textDocument/inlayHint`
 //!   with one hint (label part with a location and a command, an accept edit,
@@ -224,9 +225,9 @@ fn main() {
     // test): `code-action-lazy-delayed-resolve` answers on the next
     // `didChange`; `completion-resolve-reopen-delayed`,
     // `code-lens-reopen-delayed-resolve` and
-    // `document-link-reopen-delayed-resolve` on the next request of their
-    // own kind — the test sends that only after closing and reopening the
-    // host, so the reply lands after the reopen was processed upstream.
+    // `document-link-reopen-delayed-resolve` on the next `didOpen` — the
+    // reopened lifetime's, which the upstream forwards only after it has
+    // processed the close and the reopen, so the reply lands after them.
     let mut pending_resolve: Option<(Option<Value>, Value)> = None;
 
     while let Some(message) = read_message(&mut reader) {
@@ -472,6 +473,20 @@ fn main() {
                         .and_then(Value::as_str),
                 ) {
                     documents.insert(uri.to_string(), text.to_string());
+                    // The `-reopen-delayed-` resolvers answer their parked
+                    // reply on the reopened lifetime's own `didOpen`: the
+                    // upstream has processed the close and the reopen by the
+                    // time it forwards this, so the reply is guaranteed to
+                    // land after them (a trigger request could overtake both).
+                    if matches!(
+                        mode.as_str(),
+                        "completion-resolve-reopen-delayed"
+                            | "code-lens-reopen-delayed-resolve"
+                            | "document-link-reopen-delayed-resolve"
+                    ) && let Some((pending_id, pending_result)) = pending_resolve.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
                     // `diagnostics-push` mode: spontaneously push one diagnostic on
                     // the virtual line 0 (no pull). The bridge translates it to host
                     // coordinates and publishes it to the editor (#427).
@@ -721,11 +736,6 @@ fn main() {
                 }
             }
             "textDocument/codeLens" => {
-                if mode == "code-lens-reopen-delayed-resolve"
-                    && let Some((pending_id, pending_result)) = pending_resolve.take()
-                {
-                    respond(&mut writer, pending_id, pending_result);
-                }
                 // One UNRESOLVED lens (data only, no command) on the first
                 // line of the (virtual) document — the rust-analyzer shape
                 // that motivates codeLens/resolve support (#355).
@@ -763,11 +773,6 @@ fn main() {
             // back, so `completionItem/resolve` can prove the downstream's own
             // data survived the round trip through the routing envelope (#958).
             "textDocument/completion" => {
-                if mode == "completion-resolve-reopen-delayed"
-                    && let Some((pending_id, pending_result)) = pending_resolve.take()
-                {
-                    respond(&mut writer, pending_id, pending_result);
-                }
                 let result = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
@@ -1540,11 +1545,6 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "textDocument/documentLink" => {
-                if mode == "document-link-reopen-delayed-resolve"
-                    && let Some((pending_id, pending_result)) = pending_resolve.take()
-                {
-                    respond(&mut writer, pending_id, pending_result);
-                }
                 if matches!(
                     mode.as_str(),
                     "document-link-slow-host" | "document-link-slow-virt"
@@ -1568,6 +1568,8 @@ fn main() {
                             "document-link-resolve"
                                 | "document-link-resolve-replacement"
                                 | "document-link-slow-resolve"
+                                | "document-link-reopen-delayed-resolve"
+                                | "document-link-delayed-resolve"
                         ) {
                             link["data"] = json!({ "mock": "link-1", "uri": uri });
                         } else if mode == "document-link-no-resolve-reserved-data" {

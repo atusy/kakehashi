@@ -317,15 +317,7 @@ fn e2e_virtual_completion_resolve_reply_after_a_reopen_is_discarded() {
             "text": MARKDOWN
         }}),
     );
-    // The mock answers the parked resolve when the reopened document asks for
-    // completions again; this request is only that trigger.
-    let _trigger = client.send_request_async(
-        "textDocument/completion",
-        json!({
-            "textDocument": { "uri": MARKDOWN_URI },
-            "position": { "line": 3, "character": 11 }
-        }),
-    );
+    // The mock answers the parked resolve on the reopened lifetime's didOpen.
     let response = client.receive_response_for_id_public(request_id);
     assert_eq!(
         response["result"], item,
