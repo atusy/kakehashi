@@ -355,7 +355,7 @@ impl Kakehashi {
         // Re-resolve the region from the LIVE parse (the same construction the
         // goto/showDocument/applyEdit offset paths use), yielding the current
         // per-line offset and the exact mapped host end.
-        let (live_offset, region_end, contiguous, _) = resolve_region_offset(
+        let (live_offset, region_end, contiguous, live_language) = resolve_region_offset(
             &self.documents,
             &self.language,
             &self.bridge,
@@ -367,6 +367,14 @@ impl Kakehashi {
         // host gap. The stable first-region ID/offset alone cannot detect that
         // geometry change, so re-check live edit safety here.
         if !contiguous {
+            return None;
+        }
+        // The region may have been re-routed (a shebang edit under an
+        // `unknown` injection) without moving, and a client can echo the
+        // envelope with another language: an action belongs to the language
+        // it was produced for, and dispatch builds the virtual route from the
+        // echoed value.
+        if live_language != envelope.injection_language {
             return None;
         }
         // Compare the WHOLE offset, not just the start: a diverged interior
