@@ -48,11 +48,17 @@ impl LanguageServerPool {
     /// a host-layer item, `send_completion_resolve_request` (coordinate
     /// translation + region guard) otherwise. If any routing step fails (no
     /// envelope, server not configured), the item is returned as-is.
+    /// `live_geometry` is the region's offset and end as rebuilt by the
+    /// caller's freshness gate; the item's ranges are translated with them,
+    /// and the resolved edits guarded against them, rather than with the
+    /// completion-time snapshot the envelope carries, so typing that grew the
+    /// region since the item was produced does not strip valid edits.
     pub(crate) async fn dispatch_completion_resolve(
         &self,
         mut item: CompletionItem,
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
+        live_geometry: Option<(RegionOffset, Position)>,
     ) -> CompletionItem {
         // Extract envelope — if absent, this item wasn't produced by Kakehashi
         let Some(envelope) = strip_envelope(&mut item) else {
@@ -92,7 +98,7 @@ impl LanguageServerPool {
                 .await;
         }
 
-        self.send_completion_resolve_request(&config, item, envelope, upstream_id)
+        self.send_completion_resolve_request(&config, item, envelope, upstream_id, live_geometry)
             .await
     }
 
@@ -196,8 +202,16 @@ impl LanguageServerPool {
         mut item: CompletionItem,
         envelope: KakehashiEnvelope,
         upstream_id: Option<UpstreamId>,
+        live_geometry: Option<(RegionOffset, Position)>,
     ) -> CompletionItem {
         let server_name = &envelope.origin;
+        // The region as it is now when the caller rebuilt it, else as it was
+        // when the item was produced (a host-layer item never reaches here).
+        let (offset, region_end) = live_geometry.unwrap_or_else(|| {
+            let offset = RegionOffset::from(&envelope.offset);
+            let region_end = resolve_guard_region_end(&envelope, &offset);
+            (offset, region_end)
+        });
         // Route to the SAME `(server, root)` connection the completion request
         // ran on (#382): the envelope carries the originating host URI, which
         // resolves to the same connection key. Without it (legacy envelope with
@@ -266,15 +280,19 @@ impl LanguageServerPool {
 
         // The original host-coordinate `item` is kept untouched for the
         // fail-soft returns below; the outgoing clone carries virtual ranges.
-        let outgoing = prepare_completion_resolve_item(&item, &envelope);
+        // Its ranges were produced under the ENVELOPE's offset, so that is
+        // what maps them back to virtual coordinates — the live offset (a
+        // later blockquote marker edited from `> ` to `>` changes a later
+        // line's column while the start stays) belongs to the reply, which
+        // the downstream computes against the virtual text as it is now.
+        let outgoing =
+            prepare_completion_resolve_item(&item, &RegionOffset::from(&envelope.offset));
 
         match self
             .send_completion_resolve_on_handle(&handle, outgoing, upstream_id)
             .await
         {
             Some(mut resolved) => {
-                let offset = RegionOffset::from(&envelope.offset);
-                let region_end = resolve_guard_region_end(&envelope, &offset);
                 if transform_completion_item(&mut resolved, &offset, region_end, None) {
                     re_envelope_item(&mut resolved, &envelope);
                     resolved
@@ -407,12 +425,9 @@ fn parse_completion_resolve_response(mut response: serde_json::Value) -> Option<
 /// would otherwise get them re-translated on the way back — a double shift
 /// the safety guard can't always catch). Mirrors the codeAction resolve path.
 /// The HOST path has no such translation to undo and skips this entirely.
-fn prepare_completion_resolve_item(
-    item: &CompletionItem,
-    envelope: &KakehashiEnvelope,
-) -> CompletionItem {
+fn prepare_completion_resolve_item(item: &CompletionItem, offset: &RegionOffset) -> CompletionItem {
     let mut outgoing = item.clone();
-    translate_item_ranges_host_to_virtual(&mut outgoing, &RegionOffset::from(&envelope.offset));
+    translate_item_ranges_host_to_virtual(&mut outgoing, offset);
     outgoing
 }
 
@@ -460,15 +475,14 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
     envelope_item_data(item, &ctx);
 }
 
-/// The `region_end` the resolve-path prefix guard runs with.
+/// The `region_end` the resolve-path prefix guard runs with when the caller
+/// could not rebuild the region live (the LSP layer's freshness gate hands
+/// the live end down for every virt-layer resolve it admits).
 ///
-/// Known limitation (pre-existing class, shared with the envelope's `offset`
-/// itself, which has translated resolve responses since #382): both are
-/// completion-time snapshots round-tripped through the client, so an edit
-/// arriving after the region moved translates against stale geometry. A live
-/// re-resolution needs a region identity the envelope doesn't carry — the
-/// codeAction path's freshness gate is the model if this ever bites. Normally the
-/// envelope carries the completion-time snapshot verbatim. A LEGACY envelope
+/// The envelope's `offset` is still a completion-time snapshot round-tripped
+/// through the client; the gate refuses an item whose region moved, so a
+/// resolve that reaches here translates against the offset it was produced
+/// under. Normally the envelope carries the completion-time end verbatim. A LEGACY envelope
 /// (minted before the field existed) has none, and the resolve path cannot
 /// recompute it — fall back to `(region start line, character 0)`, which is
 /// fully fail-closed: with `character == 0` the guard's boundary rule rejects
@@ -686,6 +700,7 @@ mod tests {
             &mut item,
             "tsudoi-ls",
             "file:///test/doc.txt",
+            None,
         );
 
         for round in 1..=2 {
@@ -780,7 +795,7 @@ mod tests {
         let warnings = captured_warnings_for(|| {
             resolved = Some(runtime.block_on(async {
                 let (pool, settings) = pool_with_capability_less_origin().await;
-                pool.dispatch_completion_resolve(item, &settings, None)
+                pool.dispatch_completion_resolve(item, &settings, None, None)
                     .await
             }));
         });
@@ -803,7 +818,7 @@ mod tests {
         };
 
         let result = pool
-            .dispatch_completion_resolve(item.clone(), &settings, None)
+            .dispatch_completion_resolve(item.clone(), &settings, None, None)
             .await;
         assert_eq!(result.label, "plain");
         assert_eq!(result.data, Some(json!({"custom": true})));
@@ -817,7 +832,7 @@ mod tests {
 
         let item = enveloped_item("nonexistent-ls");
         let result = pool
-            .dispatch_completion_resolve(item, &settings, None)
+            .dispatch_completion_resolve(item, &settings, None, None)
             .await;
 
         // Should be re-enveloped (routing info preserved for future attempts)
@@ -843,7 +858,7 @@ mod tests {
 
         let item = enveloped_item("lua-ls");
         let result = pool
-            .dispatch_completion_resolve(item, &settings, None)
+            .dispatch_completion_resolve(item, &settings, None, None)
             .await;
 
         let envelope = extract_envelope(&result).expect("should have envelope");
@@ -883,10 +898,11 @@ mod tests {
             &mut item,
             "tsudoi-ls",
             "file:///test/doc.txt",
+            None,
         );
 
         let result = pool
-            .dispatch_completion_resolve(item, &settings, None)
+            .dispatch_completion_resolve(item, &settings, None, None)
             .await;
 
         let envelope = extract_envelope(&result).expect("should have envelope");
@@ -925,7 +941,7 @@ mod tests {
 
         let item = enveloped_item("lua-ls");
         let result = pool
-            .dispatch_completion_resolve(item, &settings, None)
+            .dispatch_completion_resolve(item, &settings, None, None)
             .await;
 
         let envelope = extract_envelope(&result).expect("should have envelope");
@@ -1011,7 +1027,7 @@ mod tests {
         // Go through the SAME request-preparation helper production uses, and
         // assert on the serialized request.
         let request = build_completion_resolve_request(
-            prepare_completion_resolve_item(&item, &envelope),
+            prepare_completion_resolve_item(&item, &RegionOffset::from(&envelope.offset)),
             RequestId::new(7),
         );
         let wire = serde_json::to_value(&request).unwrap();
@@ -1053,7 +1069,7 @@ mod tests {
             data: Some(json!({"resolve_id": 42})),
             ..Default::default()
         };
-        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md");
+        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md", None);
         let (result, warnings) = resolve_warnings_for(item);
         let envelope = extract_envelope(&result).expect("envelope restored");
         assert!(
@@ -1097,7 +1113,7 @@ mod tests {
             data: Some(forged.clone()),
             ..Default::default()
         };
-        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md");
+        envelope_host_item(&mut item, "lua-ls", "file:///test/doc.md", None);
         let (result, warnings) = resolve_warnings_for(item);
         let envelope = extract_envelope(&result).expect("envelope restored");
         assert!(envelope.is_host_layer());

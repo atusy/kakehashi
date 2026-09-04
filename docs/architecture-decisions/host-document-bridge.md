@@ -94,6 +94,34 @@ Partially implemented:
   non-contiguous combined injections fail soft before dispatch because a lazy
   edit could otherwise cross a masked host-only gap. Safe resolves apply the
   same all-or-nothing edit guard as initial hint retrieval.
+  `codeAction/resolve` carries and checks the same revision stamp before
+  dispatch and after the reply, and the incarnation after the reply as well.
+  `completionItem/resolve` carries no revision stamp: a completion list is
+  meant to outlive ordinary edits — the editor filters it locally while the
+  user keeps typing and resolves on accept — so before dispatch it checks the
+  incarnation and rebuilds the region (identity, start, contiguity and
+  language; the end and per-line offsets are read live for the translation),
+  and after the reply it checks the incarnation and refuses a reply the
+  document was edited under while the request was in flight. The downstream
+  computes the lazy fields against its own copy
+  of the text, which the bridge keeps in step (a resolve enqueued before the
+  virtual `didChange` for the latest host edit has been forwarded still
+  reaches the previous copy; see #1053). Every host-layer producer (completion,
+  codeAction, codeLens, documentLink, inlayHint) stamps its items with the
+  incarnation the host text was read under (codeAction and inlayHint with its
+  revision as well), from one store read, and discards a reply the downstream
+  synchronized under another incarnation. Every resolve gate checks the
+  incarnation, then waits for the document's current parse — bounded by the
+  same short budget the request handlers use before their preamble — before
+  rebuilding the region, so a resolve issued during an ordinary post-edit
+  reparse is judged by its stamps; a reparse that outlasts that budget still
+  fails soft as a stale region. Code lens and document link, whose envelopes
+  carry no revision, rebuild the region again after the reply for a virtual
+  item (a host item re-checks the lifetime). Completion carries no revision
+  either — a completion list outlives edits — but rebuilds the region before
+  dispatch (identity, start, contiguity, language; the end and per-line
+  offsets are read live for translation) and refuses a reply the document
+  was edited under while it was in flight.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one

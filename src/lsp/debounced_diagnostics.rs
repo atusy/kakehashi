@@ -350,12 +350,21 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         // here is dropped within the closure (`text_arc()` cheaply clones the
         // document's `Arc<str>` — a refcount bump, no copy — #498), so it never
         // crosses an `.await`.
-        let live_text_reader: crate::lsp::bridge::HostTextReader =
-            Arc::new(move || documents.get(&host_uri).map(|doc| doc.text_arc()));
+        let expected_incarnation = host.incarnation;
+        let live_text_reader: crate::lsp::bridge::HostTextReader = Arc::new(move || {
+            documents
+                .get(&host_uri)
+                .filter(|doc| doc.incarnation() == expected_incarnation)
+                .map(|doc| (doc.text_arc(), doc.content_version()))
+        });
         bridge.eager_sync_host_document_on_servers(
             &host.uri,
             &host.language_id,
             host.text.clone(),
+            crate::lsp::bridge::HostRevision {
+                incarnation: host.incarnation,
+                content_version: host.content_version,
+            },
             host.configs.clone(),
             Some(live_text_reader),
         );

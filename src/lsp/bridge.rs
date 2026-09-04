@@ -54,6 +54,7 @@ pub(crate) use client_progress::{
 };
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
+pub(crate) use envelope::HostRevision;
 pub(crate) use inbound_request_registry::InboundRequestRegistry;
 #[cfg(test)]
 pub(crate) use pool::ConnectionState;

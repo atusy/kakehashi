@@ -1297,6 +1297,7 @@ impl Kakehashi {
                                 uri: &t.uri,
                                 language_id: &t.language_id,
                                 text: &t.text,
+                                revision: Some(t.revision),
                             },
                             request_method,
                             params,
@@ -1318,7 +1319,7 @@ impl Kakehashi {
         // registry on this arm's completion would drop a live sibling's
         // cancel registrations. The one non-walk caller
         // (`will_save_wait_until`) sweeps for itself.
-        self.host_layer_result(result, request_method, |value| value)
+        self.host_layer_result(result, ctx, request_method, |value| value)
             .await
     }
 
@@ -1337,14 +1338,32 @@ impl Kakehashi {
     /// identity for the arms whose payload already IS the response, and the
     /// hook where a handler post-processes the winner (completion mints its
     /// resolve envelopes there, so only the winner pays for them).
+    /// `ctx` is the context the fan-out ran under: a result is surfaced only
+    /// while the document is still the lifetime that context read. Each
+    /// task discards a reply the downstream synchronized under another
+    /// lifetime, but a close and reopen can land after a task finished and
+    /// before the fan-in returned (a higher-priority server still pending,
+    /// concatenation still draining), and the task's own check compared two
+    /// values of the finished request.
     pub(crate) async fn host_layer_result<T, R>(
         &self,
         result: crate::lsp::aggregation::server::FanInResult<T>,
+        ctx: &HostRequestContext,
         request_method: &str,
         on_done: impl FnOnce(T) -> Option<R>,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
         match result {
-            crate::lsp::aggregation::server::FanInResult::Done(value) => Ok(on_done(value)),
+            crate::lsp::aggregation::server::FanInResult::Done(value) => {
+                if !self.host_incarnation_is_current(&ctx.uri, Some(ctx.incarnation)) {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "{request_method} (host): {} was reopened before its result was surfaced; discarding it",
+                        ctx.uri
+                    );
+                    return Ok(None);
+                }
+                Ok(on_done(value))
+            }
             crate::lsp::aggregation::server::FanInResult::NoResult { errors } => {
                 if errors > 0 {
                     self.notifier()

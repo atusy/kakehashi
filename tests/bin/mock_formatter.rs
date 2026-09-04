@@ -44,6 +44,24 @@
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
 //!   Used by `tests/e2e/e2e_code_lens_resolve.rs` (#355).
+//! - `completion-resolve` / `completion-no-resolve` / `completion-resolve-plain` —
+//!   answer `textDocument/completion` with one item; the first two differ in
+//!   `completionProvider.resolveProvider`. `completion-resolve` answers a
+//!   resolve with `detail` and a `textEdit` on line 2 (the host verbatim
+//!   path); `completion-resolve-plain` fills only `detail`, so the reply
+//!   survives the virt edit guard inside a one-line region.
+//! - `code-action-lazy-delayed-resolve` / `code-lens-delayed-resolve` /
+//!   `document-link-delayed-resolve` / `completion-resolve-delayed` /
+//!   `completion-resolve-additional-edit` (lazy `additionalTextEdits` on the
+//!   second virtual line) /
+//!   `completion-resolve-reopen-delayed` /
+//!   `code-lens-reopen-delayed-resolve` / `document-link-reopen-delayed-resolve`
+//!   — like their base modes, but park the resolve reply (after a
+//!   `window/logMessage` `<kind>-resolve-started`) until the next
+//!   `textDocument/didChange` (the `-delayed-resolve` ones) or the reopened
+//!   lifetime's `textDocument/didOpen` (the `-reopen-delayed-` ones), so a
+//!   test can edit or close and reopen the host while the resolve is in
+//!   flight.
 //! - `inlay-hint-resolve` / `inlay-hint-resolve-replacement` — advertise
 //!   `inlayHintProvider.resolveProvider = true`; answer `textDocument/inlayHint`
 //!   with one hint (label part with a location and a command, an accept edit,
@@ -203,6 +221,14 @@ fn main() {
     // resolve` on the next `textDocument/inlayHint` — a deterministic
     // sent-state barrier for post-response freshness tests.
     let mut pending_inlay_resolve: Option<(Option<Value>, Value)> = None;
+    // The other delayed resolvers park their reply here (one in flight per
+    // test): `code-action-lazy-delayed-resolve` answers on the next
+    // `didChange`; `completion-resolve-reopen-delayed`,
+    // `code-lens-reopen-delayed-resolve` and
+    // `document-link-reopen-delayed-resolve` on the next `didOpen` — the
+    // reopened lifetime's, which the upstream forwards only after it has
+    // processed the close and the reopen, so the reply lands after them.
+    let mut pending_resolve: Option<(Option<Value>, Value)> = None;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -224,7 +250,11 @@ fn main() {
                         "hoverProvider": true,
                         "textDocumentSync": 1
                     }),
-                    "code-lens" | "code-lens-replacement" | "code-lens-slow-resolve" => json!({
+                    "code-lens"
+                    | "code-lens-replacement"
+                    | "code-lens-slow-resolve"
+                    | "code-lens-reopen-delayed-resolve"
+                    | "code-lens-delayed-resolve" => json!({
                         "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -232,7 +262,9 @@ fn main() {
                         "codeLensProvider": { "resolveProvider": false },
                         "textDocumentSync": 1
                     }),
-                    "document-link-resolve"
+                    "document-link-reopen-delayed-resolve"
+                    | "document-link-delayed-resolve"
+                    | "document-link-resolve"
                     | "document-link-resolve-replacement"
                     | "document-link-slow-resolve" => json!({
                         "documentLinkProvider": { "resolveProvider": true },
@@ -295,7 +327,8 @@ fn main() {
                     | "code-action-lazy-retitle"
                     | "code-action-lazy-multistep"
                     | "code-action-lazy-fileop"
-                    | "code-action-lazy-oob" => {
+                    | "code-action-lazy-oob"
+                    | "code-action-lazy-delayed-resolve" => {
                         json!({
                             "codeActionProvider": { "resolveProvider": true },
                             "executeCommandProvider": { "commands": ["mock.run"] },
@@ -335,7 +368,11 @@ fn main() {
                     // `completion-no-resolve` answers completion the same way
                     // but does NOT advertise resolveProvider, so the bridge
                     // must not weigh its items down with routing envelopes.
-                    "completion-resolve" => json!({
+                    "completion-resolve"
+                    | "completion-resolve-plain"
+                    | "completion-resolve-reopen-delayed"
+                    | "completion-resolve-delayed"
+                    | "completion-resolve-additional-edit" => json!({
                         "completionProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -436,6 +473,20 @@ fn main() {
                         .and_then(Value::as_str),
                 ) {
                     documents.insert(uri.to_string(), text.to_string());
+                    // The `-reopen-delayed-` resolvers answer their parked
+                    // reply on the reopened lifetime's own `didOpen`: the
+                    // upstream has processed the close and the reopen by the
+                    // time it forwards this, so the reply is guaranteed to
+                    // land after them (a trigger request could overtake both).
+                    if matches!(
+                        mode.as_str(),
+                        "completion-resolve-reopen-delayed"
+                            | "code-lens-reopen-delayed-resolve"
+                            | "document-link-reopen-delayed-resolve"
+                    ) && let Some((pending_id, pending_result)) = pending_resolve.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
                     // `diagnostics-push` mode: spontaneously push one diagnostic on
                     // the virtual line 0 (no pull). The bridge translates it to host
                     // coordinates and publishes it to the editor (#427).
@@ -517,6 +568,16 @@ fn main() {
                     }
                     if mode == "inlay-hint-delayed-resolve"
                         && let Some((pending_id, pending_result)) = pending_inlay_resolve.take()
+                    {
+                        respond(&mut writer, pending_id, pending_result);
+                    }
+                    if matches!(
+                        mode.as_str(),
+                        "code-action-lazy-delayed-resolve"
+                            | "code-lens-delayed-resolve"
+                            | "document-link-delayed-resolve"
+                            | "completion-resolve-delayed"
+                    ) && let Some((pending_id, pending_result)) = pending_resolve.take()
                     {
                         respond(&mut writer, pending_id, pending_result);
                     }
@@ -751,14 +812,52 @@ fn main() {
                     .unwrap_or("?")
                     .to_string();
                 item["detail"] = json!(format!("mock-resolved:{path}"));
-                item["textEdit"] = json!({
-                    "range": {
-                        "start": { "line": 2, "character": 4 },
-                        "end": { "line": 2, "character": 9 }
-                    },
-                    "newText": "resolved-edit"
-                });
-                respond(&mut writer, id, item);
+                // `completion-resolve-plain`: fill only `detail`, so the reply
+                // survives the bridge's edit guard inside a one-line region and
+                // a test can tell a resolved item from an unresolved one.
+                // `completion-resolve-additional-edit`: a lazy
+                // `additionalTextEdits` on the SECOND virtual line, so a test
+                // can assert the host range it is translated to depends on
+                // the region's live per-line offsets.
+                if mode == "completion-resolve-additional-edit" {
+                    item["additionalTextEdits"] = json!([{
+                        "range": {
+                            "start": { "line": 1, "character": 0 },
+                            "end": { "line": 1, "character": 0 }
+                        },
+                        // No newline: a prefixed (blockquote) region rejects
+                        // inserted lines, which would carry no prefix.
+                        "newText": "--[[resolved]] "
+                    }]);
+                }
+                if mode != "completion-resolve-plain"
+                    && mode != "completion-resolve-reopen-delayed"
+                    && mode != "completion-resolve-delayed"
+                    && mode != "completion-resolve-additional-edit"
+                {
+                    item["textEdit"] = json!({
+                        "range": {
+                            "start": { "line": 2, "character": 4 },
+                            "end": { "line": 2, "character": 9 }
+                        },
+                        "newText": "resolved-edit"
+                    });
+                }
+                // `completion-resolve-delayed` parks the reply until the next
+                // `didChange`, so a test can move the region while the
+                // resolve is in flight.
+                if mode == "completion-resolve-reopen-delayed"
+                    || mode == "completion-resolve-delayed"
+                {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "completion-resolve-started" }),
+                    );
+                    pending_resolve = Some((id, item));
+                } else {
+                    respond(&mut writer, id, item);
+                }
             }
             "textDocument/codeAction" => {
                 let result = message
@@ -772,6 +871,7 @@ fn main() {
                             || mode == "code-action-lazy-multistep"
                             || mode == "code-action-lazy-fileop"
                             || mode == "code-action-lazy-oob"
+                            || mode == "code-action-lazy-delayed-resolve"
                         {
                             // One LAZY action: data only, no edit. The payload is
                             // materialized on codeAction/resolve (below).
@@ -1011,26 +1111,32 @@ fn main() {
                 // observe which title actually reached the server. If the bridge
                 // failed to restore the original (unsuffixed) title before
                 // forwarding, the mock would see "... — mock-codeaction" here.
-                respond(
-                    &mut writer,
-                    id,
-                    json!({
-                        "title": response_title,
-                        "kind": "source.organizeImports",
-                        "data": data,
-                        "edit": {
-                            "changes": {
-                                target_uri: [{
-                                    "range": {
-                                        "start": { "line": 0, "character": 0 },
-                                        "end": { "line": 0, "character": 5 }
-                                    },
-                                    "newText": format!("organized:{title}")
-                                }]
-                            }
+                let result = json!({
+                    "title": response_title,
+                    "kind": "source.organizeImports",
+                    "data": data,
+                    "edit": {
+                        "changes": {
+                            target_uri: [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 5 }
+                                },
+                                "newText": format!("organized:{title}")
+                            }]
                         }
-                    }),
-                );
+                    }
+                });
+                if mode == "code-action-lazy-delayed-resolve" {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "code-action-resolve-started" }),
+                    );
+                    pending_resolve = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
             }
             "workspace/executeCommand" => {
                 // The bridge stripped its routing prefix, so we see our OWN
@@ -1414,22 +1520,29 @@ fn main() {
                     .pointer("/params/range")
                     .cloned()
                     .unwrap_or(Value::Null);
-                respond(
-                    &mut writer,
-                    id,
-                    json!({
-                        "range": range,
-                        "command": {
-                            "title": format!(
-                                "{} resolved:{}",
-                                if mode == "code-lens-replacement" { "replacement" } else { "mock" },
-                                data["mock"].as_str().unwrap_or("?")
-                            ),
-                            "command": "mock.codelens"
-                        },
-                        "data": data
-                    }),
-                );
+                let result = json!({
+                    "range": range,
+                    "command": {
+                        "title": format!(
+                            "{} resolved:{}",
+                            if mode == "code-lens-replacement" { "replacement" } else { "mock" },
+                            data["mock"].as_str().unwrap_or("?")
+                        ),
+                        "command": "mock.codelens"
+                    },
+                    "data": data
+                });
+                if mode == "code-lens-reopen-delayed-resolve" || mode == "code-lens-delayed-resolve"
+                {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "code-lens-resolve-started" }),
+                    );
+                    pending_resolve = Some((id, result));
+                    continue;
+                }
+                respond(&mut writer, id, result);
             }
             "textDocument/documentLink" => {
                 if matches!(
@@ -1455,6 +1568,8 @@ fn main() {
                             "document-link-resolve"
                                 | "document-link-resolve-replacement"
                                 | "document-link-slow-resolve"
+                                | "document-link-reopen-delayed-resolve"
+                                | "document-link-delayed-resolve"
                         ) {
                             link["data"] = json!({ "mock": "link-1", "uri": uri });
                         } else if mode == "document-link-no-resolve-reserved-data" {
@@ -1494,24 +1609,32 @@ fn main() {
                     .cloned()
                     .unwrap_or(Value::Null);
                 data["receivedRange"] = range.clone();
-                respond(
-                    &mut writer,
-                    id,
-                    json!({
-                        "range": range,
-                        "target": data["uri"],
-                        "tooltip": format!(
-                            "{} resolved:{}",
-                            if mode == "document-link-resolve-replacement" {
-                                "replacement"
-                            } else {
-                                "mock"
-                            },
-                            data["mock"].as_str().unwrap_or("?")
-                        ),
-                        "data": data
-                    }),
-                );
+                let result = json!({
+                    "range": range,
+                    "target": data["uri"],
+                    "tooltip": format!(
+                        "{} resolved:{}",
+                        if mode == "document-link-resolve-replacement" {
+                            "replacement"
+                        } else {
+                            "mock"
+                        },
+                        data["mock"].as_str().unwrap_or("?")
+                    ),
+                    "data": data
+                });
+                if mode == "document-link-reopen-delayed-resolve"
+                    || mode == "document-link-delayed-resolve"
+                {
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "document-link-resolve-started" }),
+                    );
+                    pending_resolve = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
             }
             "textDocument/inlayHint" => {
                 // `inlay-hint-reopen-delayed-resolve`: the parked resolve is
@@ -1859,10 +1982,13 @@ fn record_mock_event(mode: &str, event: &str, message: &Value) {
         "id": message.get("id").cloned().unwrap_or(Value::Null),
         "params": message.get("params").cloned().unwrap_or(Value::Null)
     });
-    let _ = std::fs::write(
-        dir.join(format!("{mode}.{event}.json")),
-        serde_json::to_vec(&payload).unwrap_or_default(),
-    );
+    // Write-then-rename: a test polls for the file and parses it as soon as
+    // it exists, and `fs::write` creates it before its content lands.
+    let path = dir.join(format!("{mode}.{event}.json"));
+    let staging = dir.join(format!("{mode}.{event}.json.tmp"));
+    if std::fs::write(&staging, serde_json::to_vec(&payload).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&staging, &path);
+    }
 }
 
 /// Send a JSON-RPC success response for `id` (no-op for notifications).

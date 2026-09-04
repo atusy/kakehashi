@@ -1463,16 +1463,22 @@ impl BridgeCoordinator {
         host_language: &str,
         host_uri: &Url,
         text: &str,
+        revision: crate::lsp::bridge::HostRevision,
+        live_text_reader: crate::lsp::bridge::HostTextReader,
     ) {
         let configs = self.get_host_configs_for_language(settings, host_language);
-        // Initial open: the snapshot text is current and there is no concurrent
-        // re-sync to race, so no live reader is needed.
+        // The open is fire-and-forget and an edit does not cancel it, so a
+        // stamped request of the same lifetime can sync a newer text first;
+        // the live reader makes a late open send (and stamp) the text as it
+        // is then, instead of rolling the downstream back to the open-time
+        // snapshot, which `text` remains only as the closed-document fallback.
         self.eager_sync_host_document_on_servers(
             host_uri,
             host_language,
             Arc::from(text),
+            revision,
             configs,
-            None,
+            Some(live_text_reader),
         );
     }
 
@@ -1647,11 +1653,15 @@ impl BridgeCoordinator {
     /// `text` is taken as `Arc<str>` so the debounced re-sync path can hand over its
     /// existing `HostRequestContext.text` allocation (a cheap clone) rather than
     /// copying the full document on every fire.
+    /// `revision` is the lifetime (and revision) `text` and `language_id`
+    /// were read in: a task of this batch that unparks after a close and
+    /// reopen must not open the reopened document under the old language.
     pub(crate) fn eager_sync_host_document_on_servers(
         &self,
         host_uri: &Url,
         language_id: &str,
         text: Arc<str>,
+        revision: crate::lsp::bridge::HostRevision,
         configs: Vec<ResolvedServerConfig>,
         live_text_reader: Option<crate::lsp::bridge::HostTextReader>,
     ) {
@@ -1724,14 +1734,18 @@ impl BridgeCoordinator {
                 opens.push(tokio::spawn(async move {
                     let server_name = config.server_name;
                     let server_config = config.config;
+                    let doc = crate::lsp::bridge::HostDocument {
+                        uri: &host_uri,
+                        language_id: &language_id,
+                        text: &text,
+                        revision: Some(revision),
+                    };
                     tokio::select! {
                         _ = cancel.cancelled() => {}
                         _ = pool.eager_open_host_document(
                             &server_name,
                             &server_config,
-                            &host_uri,
-                            &language_id,
-                            &text,
+                            &doc,
                             live_text_reader.as_deref(),
                         ) => {}
                     }

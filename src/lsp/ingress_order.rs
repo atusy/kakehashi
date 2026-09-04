@@ -309,7 +309,7 @@ enum Role {
 /// `context.diagnostics` and returned edits are computed against the
 /// document snapshot (#568), and so is `textDocument/inlayHint`, whose
 /// accept-time edits and resolve stamp are computed against it. `codeLens/resolve`, `codeAction/resolve`,
-/// `documentLink/resolve`, and `inlayHint/resolve` are readers too (#355, #568):
+/// `documentLink/resolve`, `inlayHint/resolve` and `completionItem/resolve` are readers too (#355, #568):
 /// their freshness gates read tracker/document
 /// state, so they must observe every `didChange` that preceded them on the
 /// wire — but their params carry no `textDocument`, so the URI comes from the
@@ -365,7 +365,8 @@ fn classify(req: &Request) -> Option<Role> {
         "codeLens/resolve"
         | "codeAction/resolve"
         | "documentLink/resolve"
-        | "inlayHint/resolve" => {
+        | "inlayHint/resolve"
+        | "completionItem/resolve" => {
             let raw = req.params()?["data"][ENVELOPE_KEY]["host_uri"].as_str()?;
             Some(Role::Reader {
                 uri: normalize_uri(raw),
@@ -841,6 +842,28 @@ mod tests {
         assert!(
             classify(&unenveloped).is_none(),
             "unenveloped codeLens/resolve passes through ungated"
+        );
+
+        // completionItem/resolve reads the document too: its revision checks
+        // must observe a wire-earlier didChange, or a resolved edit computed
+        // against the old text could reach the client after it applied the
+        // change.
+        let enveloped_completion = Request::build("completionItem/resolve")
+            .params(serde_json::json!({
+                "label": "x",
+                "data": { "kakehashi": { "host_uri": URI } }
+            }))
+            .finish();
+        assert!(
+            matches!(classify(&enveloped_completion), Some(Role::Reader { ref uri }) if uri == URI),
+            "enveloped completionItem/resolve must be a reader keyed by the envelope's host_uri"
+        );
+        let unenveloped_completion = Request::build("completionItem/resolve")
+            .params(serde_json::json!({ "label": "x", "data": { "custom": true } }))
+            .finish();
+        assert!(
+            classify(&unenveloped_completion).is_none(),
+            "unenveloped completionItem/resolve passes through ungated"
         );
 
         let enveloped_link = Request::build("documentLink/resolve")

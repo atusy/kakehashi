@@ -135,7 +135,11 @@ embedded block (escape the region, break blockquote `> ` prefixes, or merge cont
 into the closing fence) are dropped fail-closed: an unsafe primary edit drops
 the item (at resolve time, the unsafe resolved response is discarded and the
 unresolved item is served instead), while an unsafe auto-import set — at either
-stage — is dropped whole and the completion itself still applies. Default combine strategy: `preferred`.
+stage — is dropped whole and the completion itself still applies. A resolve
+is refused, and the item returned unchanged, when the host document was
+closed and reopened since the item was produced (the list is meant to outlive
+ordinary edits: the editor filters it locally while the user keeps typing and
+resolves on accept). Default combine strategy: `preferred`.
 
 ### Signature help
 
@@ -294,14 +298,14 @@ Lazy actions resolve back to their origin server (`codeAction/resolve`) —
 client-driven resolve routing additionally requires the client to declare
 `dataSupport` and `resolveSupport` covering `"edit"`; without those,
 injection-layer lazy actions are eagerly resolved by the bridge and
-host-layer ones are disabled or dropped. (Known limitation: CLIENT-driven
-resolve of lazy actions in runtime-range-adjusted regions (`#offset!` /
-`#trim!`) such as bundled
-YAML/TOML frontmatter always fails soft — the resolve freshness check cannot
-match there; the eager-resolve path taken for non-envelope clients bypasses
-that check.)
+host-layer ones are disabled or dropped. Runtime-range-adjusted regions
+(`#offset!` / `#trim!`, such as bundled YAML/TOML frontmatter) resolve like
+any other: the freshness check rebuilds the same adjusted geometry the
+action was minted from.
 Command-carrying actions execute through the bridged
-`workspace/executeCommand`.
+`workspace/executeCommand`. A resolve is refused, and the action returned
+unchanged, when the host document was edited (even a same-size edit inside
+the block) or reopened since the action was produced.
 
 Edit safety differs by layer and direction. An INJECTION-layer action edit
 that cannot be represented in the host document (touching another injection

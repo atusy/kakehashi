@@ -167,6 +167,36 @@ impl Kakehashi {
         let Some(envelope) = extract_code_action_envelope(&action) else {
             return Ok(action);
         };
+        let Ok(host_url) = Url::parse(&envelope.host_uri) else {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: envelope host_uri {:?} is not a valid URL",
+                envelope.host_uri
+            );
+            return Ok(action);
+        };
+        // Both layers: the action was computed against one text revision, and
+        // a lazily materialized edit for another must not be applied to this
+        // one even when the region's geometry still matches.
+        if !self.document_revision_is_current(&host_url, envelope.content_version) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: {} was revised since the action was produced; returning action unresolved",
+                envelope.host_uri
+            );
+            return Ok(action);
+        }
+        // Before the region gate waits for a parse: an action from a closed
+        // and reopened document would otherwise park on the reopened
+        // lifetime's first parse only to be refused.
+        if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: {} was reopened since the action was produced; returning action unresolved",
+                envelope.host_uri
+            );
+            return Ok(action);
+        }
 
         // Fail-soft staleness gate: resolving against a moved or invalidated
         // region would translate a resolved edit with a stale offset and bind
@@ -187,7 +217,7 @@ impl Kakehashi {
         let region_end = if envelope.is_host_layer() {
             Position::default()
         } else {
-            match self.code_action_region_end_if_fresh(&envelope) {
+            match self.code_action_region_end_if_fresh(&envelope).await {
                 Ok(region_end) => region_end,
                 Err(RegionEndUnavailable::MalformedEnvelope) => {
                     // Already warned with the malformed field; no stale-debug.
@@ -207,6 +237,9 @@ impl Kakehashi {
             }
         };
 
+        // Kept for the post-response check; the gates above return `action`
+        // itself, so only a resolve that is actually dispatched pays for it.
+        let unresolved = action.clone();
         let settings = self.settings_manager.load_settings();
         let upstream_caps = self.upstream_code_action_caps();
         let upstream_id = crate::lsp::current_upstream_id();
@@ -235,14 +268,29 @@ impl Kakehashi {
             std::sync::Arc::clone(&pool),
             sweep_id,
         );
-        match cancel_rx {
+        let resolved = match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
                 _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
                 resolved = dispatch => Ok(resolved),
             },
             None => Ok(dispatch.await),
+        }?;
+        // A later didChange/didClose is allowed to proceed once the resolve
+        // was enqueued. Revalidate after the response so an edit computed
+        // against the content this resolve observed is not surfaced into a
+        // revised or reopened document.
+        if !self.document_revision_is_current(&host_url, envelope.content_version)
+            || !self.host_incarnation_is_current(&host_url, envelope.incarnation)
+        {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: {} was revised or reopened while resolving; returning action unresolved",
+                envelope.host_uri
+            );
+            return Ok(unresolved);
         }
+        Ok(resolved)
     }
 
     /// The region's current content-precise host-document END position if the
@@ -264,7 +312,7 @@ impl Kakehashi {
     /// directives exactly as minting did, so a region under one of them
     /// (markdown frontmatter, blockquote prose) compares equal while unchanged
     /// and its actions resolve.
-    fn code_action_region_end_if_fresh(
+    async fn code_action_region_end_if_fresh(
         &self,
         envelope: &CodeActionEnvelope,
     ) -> std::result::Result<Position, RegionEndUnavailable> {
@@ -288,6 +336,10 @@ impl Kakehashi {
             );
             return Err(RegionEndUnavailable::MalformedEnvelope);
         }
+        // A resolve issued while the post-edit reparse is still running would
+        // find no snapshot and read as a stale region; wait (bounded) for the
+        // current parse before rebuilding the region.
+        self.wait_for_resolve_parse(&host_url).await;
         self.code_action_region_end_live(envelope, &host_url)
             .ok_or(RegionEndUnavailable::Stale)
     }
@@ -303,7 +355,7 @@ impl Kakehashi {
         // Re-resolve the region from the LIVE parse (the same construction the
         // goto/showDocument/applyEdit offset paths use), yielding the current
         // per-line offset and the exact mapped host end.
-        let (live_offset, region_end, contiguous, _) = resolve_region_offset(
+        let (live_offset, region_end, contiguous, live_language) = resolve_region_offset(
             &self.documents,
             &self.language,
             &self.bridge,
@@ -315,6 +367,14 @@ impl Kakehashi {
         // host gap. The stable first-region ID/offset alone cannot detect that
         // geometry change, so re-check live edit safety here.
         if !contiguous {
+            return None;
+        }
+        // The region may have been re-routed (a shebang edit under an
+        // `unknown` injection) without moving, and a client can echo the
+        // envelope with another language: an action belongs to the language
+        // it was produced for, and dispatch builds the virtual route from the
+        // echoed value.
+        if live_language != envelope.injection_language {
             return None;
         }
         // Compare the WHOLE offset, not just the start: a diverged interior
@@ -341,6 +401,21 @@ impl Kakehashi {
         // into one menu (#628 multi-region), in document order. Latency scales
         // with the overlapped-region count (bounded by the document's injection
         // count); the common case is a range within a single fence.
+        // Read before the preamble snapshots the document, so the stamp can
+        // only be older than the content the actions were computed on, never
+        // newer: an edit landing in between makes the actions fail soft on
+        // resolve until the editor's next request, which follows an edit
+        // anyway.
+        let Some(revision) = url::Url::parse(lsp_uri.as_str()).ok().and_then(|uri| {
+            self.documents
+                .get(&uri)
+                .map(|doc| crate::lsp::bridge::HostRevision {
+                    incarnation: doc.incarnation(),
+                    content_version: doc.content_version(),
+                })
+        }) else {
+            return Ok(None);
+        };
         let contexts = self
             .resolve_bridge_contexts_for_all_overlapping_regions(lsp_uri, range, METHOD)
             .await;
@@ -369,7 +444,7 @@ impl Kakehashi {
                 // The work-done progress token is single-use → first region only.
                 ctx.document.client_progress_token = progress_token.take();
                 if let Some(actions) = self
-                    .dispatch_virt_region_code_action(ctx, &context, upstream_caps)
+                    .dispatch_virt_region_code_action(ctx, &context, upstream_caps, revision)
                     .await?
                 {
                     merged.extend(actions);
@@ -403,6 +478,7 @@ impl Kakehashi {
         ctx: RangeRequestContext,
         context: &CodeActionContext,
         upstream_caps: UpstreamCodeActionCaps,
+        revision: crate::lsp::bridge::HostRevision,
     ) -> Result<Option<CodeActionResponse>> {
         let pool = self.bridge.pool_arc();
         let range = ctx.range;
@@ -421,6 +497,7 @@ impl Kakehashi {
                         t.region_end(),
                         t.offset,
                         &t.virtual_content,
+                        revision,
                         t.upstream_id,
                         t.client_progress_token,
                         upstream_caps,
@@ -469,6 +546,15 @@ impl Kakehashi {
             return Ok(None);
         };
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        // The lifetime the text was read under travels with the actions and a
+        // reply synchronized under another one is refused: a close and reopen
+        // racing the request would otherwise answer for the closed text under
+        // the reopened document's incarnation.
+        let expected_incarnation = ctx.incarnation;
+        let host_revision = crate::lsp::bridge::HostRevision {
+            incarnation: expected_incarnation,
+            content_version: ctx.content_version,
+        };
         let pool = self.bridge.pool_arc();
         // One fan-out closure, dispatched by the within-host-layer strategy
         // (`bridge._self.aggregation.<method>.strategy`); moves into one arm.
@@ -484,6 +570,7 @@ impl Kakehashi {
                             uri: &t.uri,
                             language_id: &t.language_id,
                             text: &t.text,
+                            revision: Some(host_revision),
                         },
                         METHOD,
                         params,
@@ -493,6 +580,15 @@ impl Kakehashi {
                 let Some(raw) = raw else {
                     return Ok(None);
                 };
+                if raw.incarnation != expected_incarnation {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "textDocument/codeAction (host): {} was reopened while {} answered; discarding actions computed on the closed text",
+                        t.uri,
+                        t.server_name
+                    );
+                    return Ok(None);
+                }
                 let answering = raw.handle;
                 let connection_key = answering.key().clone();
                 let Some(actions) = parse_code_actions_leniently(raw.value) else {
@@ -537,6 +633,7 @@ impl Kakehashi {
                     upstream_caps,
                     server_resolves,
                     None,
+                    Some(host_revision),
                 )))
             }
         };
@@ -555,12 +652,13 @@ impl Kakehashi {
                     cancel_rx,
                 )
                 .await;
-                self.host_layer_result(fan_in, METHOD, |v| v).await
+                self.host_layer_result(fan_in, &ctx, METHOD, |v| v).await
             }
             AggregationStrategy::Concatenated => {
                 let fan_in =
                     dispatch_host_concatenated(&ctx, pool.clone(), f, cancel_rx, None, None).await;
-                self.host_layer_result(fan_in, METHOD, concat_merge).await
+                self.host_layer_result(fan_in, &ctx, METHOD, concat_merge)
+                    .await
             }
         }
     }

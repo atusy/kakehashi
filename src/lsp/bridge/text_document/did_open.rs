@@ -345,15 +345,15 @@ impl LanguageServerPool {
     /// support) starts analyzing and pushing diagnostics immediately, instead of
     /// only after the first host-bridged request lazily opens it. Fire-and-forget:
     /// failures are logged at debug and never propagated.
+    /// `doc.revision` must be `Some`: the lifetime the open was scheduled in.
     pub(crate) async fn eager_open_host_document(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
-        host_uri: &url::Url,
-        language_id: &str,
-        text: &str,
-        live_text_reader: Option<&(dyn Fn() -> Option<Arc<str>> + Send + Sync)>,
+        doc: &super::host::HostDocument<'_>,
+        live_text_reader: Option<super::host::HostTextReaderRef<'_>>,
     ) {
+        let host_uri = doc.uri;
         let lifecycle = self.host_lifecycle_lock(host_uri);
         let _lifecycle_guard = lifecycle.write().await;
         let handle = match self
@@ -419,7 +419,7 @@ impl LanguageServerPool {
         let routing_params = RoutingParams {
             text_document: RoutingTextDocument {
                 uri: host_uri.to_string(),
-                language_id: language_id.to_string(),
+                language_id: doc.language_id.to_string(),
                 host: None,
             },
             language_servers: BTreeMap::from([(
@@ -490,17 +490,25 @@ impl LanguageServerPool {
             // will sync lazily on its first request.
             return;
         }
+        // Under the lifecycle lock, right before the sync: a task of a
+        // superseded batch that unparks after a close and reopen would
+        // otherwise open the reopened document under the lifetime's old
+        // language (identical text lets the new batch fingerprint-dedup and
+        // never correct it).
+        if self.current_host_incarnation(host_uri) != doc.revision.map(|r| r.incarnation) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Eager host open: {} was closed or reopened since this open was scheduled; skipping",
+                host_uri
+            );
+            return;
+        }
         let mut docs = self.host_documents().await;
         let mut sender = ConnectionHandleSender(&handle);
-        let doc = super::host::HostDocument {
-            uri: host_uri,
-            language_id,
-            text,
-        };
         if let Err(e) = super::host::sync_host_document(
             &mut sender,
             &mut docs,
-            &doc,
+            doc,
             live_text_reader,
             connection_key,
         )

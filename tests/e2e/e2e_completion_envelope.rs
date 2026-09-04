@@ -15,6 +15,17 @@ const MARKDOWN: &str = "# Test\n\n```lua\nlocal x = 1\n```\n";
 const MARKDOWN_URI: &str = "file:///test_completion_envelope.md";
 
 fn init_virtual_completion_client(mode: &str) -> (LspClient, tempfile::TempDir, Value) {
+    init_virtual_completion_client_on(mode, MARKDOWN, 3, 11)
+}
+
+/// Like [`init_virtual_completion_client`] over `text`, requesting the
+/// completion at (`line`, `character`).
+fn init_virtual_completion_client_on(
+    mode: &str,
+    text: &str,
+    line: u32,
+    character: u32,
+) -> (LspClient, tempfile::TempDir, Value) {
     let config_dir = tempfile::TempDir::new().expect("temp dir");
     let config_path = config_dir.path().join("completion_envelope.toml");
     std::fs::write(&config_path, "").expect("write config");
@@ -29,7 +40,17 @@ fn init_virtual_completion_client(mode: &str) -> (LspClient, tempfile::TempDir, 
         json!({
             "processId": std::process::id(),
             "rootUri": null,
-            "capabilities": {},
+            // LSP 3.18 lets a resolve fill `additionalTextEdits` lazily only
+            // when the client lists it here.
+            "capabilities": {
+                "textDocument": {
+                    "completion": {
+                        "completionItem": {
+                            "resolveSupport": { "properties": ["additionalTextEdits"] }
+                        }
+                    }
+                }
+            },
             "workspaceFolders": null,
             "initializationOptions": {
                 "languageServers": {
@@ -54,7 +75,7 @@ fn init_virtual_completion_client(mode: &str) -> (LspClient, tempfile::TempDir, 
                 "uri": MARKDOWN_URI,
                 "languageId": "markdown",
                 "version": 1,
-                "text": MARKDOWN
+                "text": text
             }
         }),
     );
@@ -65,7 +86,7 @@ fn init_virtual_completion_client(mode: &str) -> (LspClient, tempfile::TempDir, 
                 "textDocument/completion",
                 json!({
                     "textDocument": { "uri": MARKDOWN_URI },
-                    "position": { "line": 3, "character": 11 }
+                    "position": { "line": line, "character": character }
                 }),
             );
             assert!(
@@ -124,6 +145,183 @@ fn e2e_virtual_completion_from_resolving_server_is_enveloped() {
     assert!(
         item["data"]["kakehashi"]["inner"]["mockPath"].is_string(),
         "the downstream payload is nested as inner: {item}"
+    );
+
+    shutdown_client(&mut client);
+}
+
+/// A completion list is designed to outlive edits: the editor filters it
+/// locally while the user keeps typing and resolves an item on accept, which
+/// itself edits. An edit inside the fence — same shape, or typing that grows
+/// the region — must therefore NOT refuse the resolve: the region is
+/// the same region, and the downstream computes the lazy fields against its
+/// own copy of the text, which the bridge keeps in step. (Inlay hints and
+/// lazy code actions, which the editor re-requests on every edit, are
+/// refused instead.)
+#[test]
+fn e2e_virtual_completion_resolve_survives_an_edit_inside_the_region() {
+    let (mut client, _config_dir, item) =
+        init_virtual_completion_client("completion-resolve-plain");
+    assert_eq!(item["data"]["kakehashi"]["origin"], "mock-completion");
+
+    // Positive control: before any edit the item resolves.
+    let response = client.send_request("completionItem/resolve", item.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(
+        response["result"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("mock-resolved:")),
+        "the control resolve must reach the downstream: {response}"
+    );
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{ "text": "# Test\n\n```lua\nlocal y = 1\n```\n" }]
+        }),
+    );
+    let response = client.send_request("completionItem/resolve", item.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(
+        response["result"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("mock-resolved:")),
+        "a resolve after an edit that kept the region must still reach the downstream: {response}"
+    );
+
+    // Typing that grows the fence moves the region's end; the region is
+    // still the same one at the same offset.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 3 },
+            "contentChanges": [{ "text": "# Test\n\n```lua\nlocal y = 12\nlocal z = 3\n```\n" }]
+        }),
+    );
+    let response = client.send_request("completionItem/resolve", item.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(
+        response["result"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("mock-resolved:")),
+        "a resolve after typing that grew the region must still reach the downstream: {response}"
+    );
+
+    shutdown_client(&mut client);
+}
+
+/// A fence inside a blockquote carries a per-line column offset (the `> `
+/// prefix); adding a line to it grows that vector without moving the region.
+/// The item is still resolvable: the region is identified by its id and
+/// start, and the resolved edits are translated with the region as it is
+/// now — a lazy edit on the added line lands after that line's prefix,
+/// which only the grown offset vector knows.
+#[test]
+fn e2e_virtual_completion_resolve_survives_growth_of_a_blockquoted_fence() {
+    let (mut client, _config_dir, item) = init_virtual_completion_client_on(
+        "completion-resolve-additional-edit",
+        "> ```lua\n> local x = 1\n> ```\n",
+        1,
+        13,
+    );
+    assert_eq!(item["data"]["kakehashi"]["origin"], "mock-completion");
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{ "text": "> ```lua\n> local y = 12\n> local z = 3\n> ```\n" }]
+        }),
+    );
+    let response = client.send_request("completionItem/resolve", item.clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(
+        response["result"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("mock-resolved:")),
+        "a resolve after typing that grew the blockquoted fence must still reach the downstream: {response}"
+    );
+    // Virtual line 1 is host line 2 (`> local z = 3`), after its `> ` prefix.
+    assert_eq!(
+        response["result"]["additionalTextEdits"][0]["range"]["start"],
+        json!({ "line": 2, "character": 2 }),
+        "the lazy edit must be translated with the grown per-line offsets: {response}"
+    );
+
+    shutdown_client(&mut client);
+}
+
+/// An edit that moves the region can land while the downstream is still
+/// answering a resolve; the reply's edits were computed for the region where
+/// it was, and must not be translated into where it is now.
+#[test]
+fn e2e_virtual_completion_resolve_reply_after_an_edit_that_moved_the_region_is_discarded() {
+    let (mut client, _config_dir, item) =
+        init_virtual_completion_client("completion-resolve-delayed");
+
+    let request_id = client.send_request_async("completionItem/resolve", item.clone());
+    assert!(
+        client.wait_for_log_message(
+            "completion-resolve-started",
+            std::time::Duration::from_secs(10)
+        ),
+        "resolve must reach the downstream before the edit"
+    );
+    // A line inserted above the fence moves the region; the fence content
+    // changes too, so the downstream receives the virtual didChange that
+    // releases its parked reply.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{ "text": "# Test\n\nmoved\n\n```lua\nlocal x = 12\n```\n" }]
+        }),
+    );
+    let response = client.receive_response_for_id_public(request_id);
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(
+        response["result"]["detail"].is_null(),
+        "a reply for the region where it was must come back unresolved: {response}"
+    );
+
+    shutdown_client(&mut client);
+}
+
+/// A close and reopen can complete while the downstream is still answering a
+/// resolve; the reply then belongs to the closed document and must not be
+/// surfaced into the reopened one.
+#[test]
+fn e2e_virtual_completion_resolve_reply_after_a_reopen_is_discarded() {
+    let (mut client, _config_dir, item) =
+        init_virtual_completion_client("completion-resolve-reopen-delayed");
+
+    let request_id = client.send_request_async("completionItem/resolve", item.clone());
+    assert!(
+        client.wait_for_log_message(
+            "completion-resolve-started",
+            std::time::Duration::from_secs(10)
+        ),
+        "resolve must reach the downstream before the reopen"
+    );
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": MARKDOWN_URI } }),
+    );
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": MARKDOWN_URI,
+            "languageId": "markdown",
+            "version": 1,
+            "text": MARKDOWN
+        }}),
+    );
+    // The mock answers the parked resolve on the reopened lifetime's didOpen.
+    let response = client.receive_response_for_id_public(request_id);
+    assert_eq!(
+        response["result"], item,
+        "a reply that lands after a reopen must leave the item unresolved: {response}"
     );
 
     shutdown_client(&mut client);

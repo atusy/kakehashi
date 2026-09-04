@@ -69,6 +69,10 @@ impl Kakehashi {
         // under the reopened document's incarnation, and a reopened document
         // restarts its content version, so both stamps could pass.
         let (expected_incarnation, content_version) = (ctx.incarnation, ctx.content_version);
+        let revision = crate::lsp::bridge::HostRevision {
+            incarnation: expected_incarnation,
+            content_version,
+        };
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
         let fan_in = dispatch_host_preferred(
@@ -86,6 +90,7 @@ impl Kakehashi {
                                 uri: &t.uri,
                                 language_id: &t.language_id,
                                 text: &t.text,
+                                revision: Some(revision),
                             },
                             METHOD,
                             params,
@@ -123,7 +128,7 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        self.host_layer_result(fan_in, METHOD, |won| {
+        self.host_layer_result(fan_in, &ctx, METHOD, |won| {
             won.map(HostInlayHints::into_enveloped_hints)
         })
         .await
@@ -142,10 +147,14 @@ impl Kakehashi {
         // response fail soft on resolve until the editor's next request,
         // which follows an edit anyway. A reopen in that window is caught by
         // the region id, which the reopened document re-tracks.
-        let Some(content_version) = url::Url::parse(lsp_uri.as_str())
-            .ok()
-            .and_then(|uri| self.documents.get(&uri).map(|doc| doc.content_version()))
-        else {
+        let Some(revision) = url::Url::parse(lsp_uri.as_str()).ok().and_then(|uri| {
+            self.documents
+                .get(&uri)
+                .map(|doc| crate::lsp::bridge::HostRevision {
+                    incarnation: doc.incarnation(),
+                    content_version: doc.content_version(),
+                })
+        }) else {
             return Ok(None);
         };
         let Some(mut ctx) = self
@@ -177,7 +186,7 @@ impl Kakehashi {
                         &t.region_id,
                         t.offset,
                         &t.virtual_content,
-                        content_version,
+                        revision,
                         t.upstream_id,
                         t.client_progress_token,
                     )
@@ -209,6 +218,17 @@ impl Kakehashi {
         };
         // Every fail-soft exit below is the steady state of a hint the editor
         // kept past an edit, so it logs at debug like the sibling gates do.
+        // Lifetime first: a hint from a closed and reopened document (whose
+        // revision can match the reopened one's) would otherwise park on the
+        // reopened lifetime's parse only to be refused after the reply.
+        if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "inlayHint/resolve: {} was reopened since the hint was produced; returning hint unresolved",
+                envelope.host_uri
+            );
+            return Ok(hint);
+        }
         if !self.inlay_hint_content_is_fresh(&host_url, &envelope) {
             log::debug!(
                 target: "kakehashi::bridge",
@@ -222,9 +242,9 @@ impl Kakehashi {
         } else {
             // `didChange` clears the tree and reparses off-ingress; a resolve
             // issued in that window would find no snapshot and fail soft as a
-            // stale region. Wait for the current parse the way the virt
-            // request handlers do before their preamble snapshots it.
-            self.ensure_document_parsed(&host_url).await;
+            // stale region. Wait (bounded) for the current parse before
+            // rebuilding the region.
+            self.wait_for_resolve_parse(&host_url).await;
             let Some((offset, region_end, contiguous, live_language)) =
                 self.inlay_hint_region_geometry(&host_url, &envelope)
             else {
