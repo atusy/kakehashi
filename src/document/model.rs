@@ -471,6 +471,24 @@ mod tests {
         Document::incremental_seed(doc).map(IncrementalSeed::replay)
     }
 
+    /// The seed's own geometry against `text`: tree-sitter's contract is
+    /// that the seed's byte positions already match the new text, so its
+    /// root spans the whole text and its closing brace sits where the text
+    /// has one. This tells a missing, duplicated or reordered edit apart —
+    /// the eventual incremental parse cannot, since tree-sitter recovers
+    /// the right tree from a wrong seed on inputs this small.
+    fn seed_matches_text(seed: &Tree, text: &str) -> bool {
+        let root = seed.root_node();
+        let close = root
+            .named_child(0)
+            .and_then(|function| function.child_by_field_name("body"))
+            .and_then(|body| body.child(body.child_count().saturating_sub(1) as u32));
+        root.end_byte() == text.len()
+            && close.is_some_and(|close| {
+                close.kind() == "}" && Some(close.start_byte()) == text.rfind('}')
+            })
+    }
+
     fn incremental_parse_matches_fresh(seed: &Tree, text: &str) -> bool {
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -478,8 +496,84 @@ mod tests {
             .unwrap();
         let incremental = parser.parse(text, Some(seed)).unwrap();
         let fresh = parser.parse(text, None).unwrap();
-        incremental.root_node().to_sexp() == fresh.root_node().to_sexp()
+        seed_matches_text(seed, text)
+            && incremental.root_node().to_sexp() == fresh.root_node().to_sexp()
             && incremental.root_node().end_byte() == text.len()
+    }
+
+    fn snapshot_at(doc: &Document, text: &str, parsed_version: u64) -> Arc<ParseSnapshot> {
+        Arc::new(ParseSnapshot {
+            text: Arc::from(text),
+            tree: Some(rust_tree(text)),
+            language: Some("rust".to_string()),
+            parsed_version,
+            incarnation: doc.incarnation(),
+            injection_regions: None,
+            bridge_regions: None,
+            resolved_regions: None,
+            layer_trees: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// A tree published for an older version than the log's newest entries
+    /// (a stale-but-consistent publish, the edit's own reparse still to come)
+    /// seeds with only the edits after its version — the filter alone, with
+    /// no edit in between to prune the log for it.
+    #[test]
+    fn a_tree_published_behind_the_log_replays_only_the_edits_after_it() {
+        let mut doc = Document::with_tree(
+            "fn main() {}".to_string(),
+            "rust".to_string(),
+            rust_tree("fn main() {}"),
+            3,
+        );
+        doc.apply_edit("fn main() { }".to_string(), &[edit(11, 11, 12)]);
+        doc.apply_edit("fn main() { x }".to_string(), &[edit(12, 12, 14)]);
+        // The reparse of version 1 lands while the document is at version 2.
+        assert!(doc.publish_snapshot(&snapshot_at(&doc, "fn main() { }", 1)));
+        let seed = seed_tree(&doc).expect("seeded from the version-1 tree");
+        assert!(
+            seed_matches_text(&seed, "fn main() { x }"),
+            "the version-1 edit is consumed; only the version-2 edit is replayed"
+        );
+    }
+
+    /// A burst that outgrows the edit log gives up on seeding: the log is
+    /// cleared and the floor raised to the burst's version, so a tree
+    /// published for an earlier version cannot seed (its edits are gone) and
+    /// only a tree at or past the floor seeds again.
+    #[test]
+    fn an_edit_burst_beyond_the_log_cap_gives_up_seeding_until_a_fresh_tree() {
+        let mut doc = Document::with_tree(
+            "fn main() {}".to_string(),
+            "rust".to_string(),
+            rust_tree("fn main() {}"),
+            3,
+        );
+        let text_after = |edits: usize| format!("fn main() {{{}}}", " ".repeat(edits));
+        for edits in 1..=MAX_SEED_EDITS {
+            doc.apply_edit(text_after(edits), &[edit(11, 11, 12)]);
+        }
+        let seed = seed_tree(&doc).expect("a log at the cap still seeds");
+        assert!(seed_matches_text(&seed, &text_after(MAX_SEED_EDITS)));
+
+        doc.apply_edit(text_after(MAX_SEED_EDITS + 1), &[edit(11, 11, 12)]);
+        assert!(seed_tree(&doc).is_none(), "one past the cap: no seed");
+        let floor = doc.content_version();
+
+        // A tree for the version just before the burst overflowed: below the
+        // floor, and the edit that would bring it up to date is gone.
+        assert!(doc.publish_snapshot(&snapshot_at(&doc, &text_after(MAX_SEED_EDITS), floor - 1)));
+        assert!(
+            seed_tree(&doc).is_none(),
+            "a tree older than the floor must not seed"
+        );
+        assert!(doc.publish_snapshot(&snapshot_at(&doc, &text_after(MAX_SEED_EDITS + 1), floor)));
+        let seed = seed_tree(&doc).expect("a tree at the floor seeds again");
+        assert!(seed_matches_text(&seed, &text_after(MAX_SEED_EDITS + 1)));
+        doc.apply_edit(text_after(MAX_SEED_EDITS + 2), &[edit(11, 11, 12)]);
+        let seed = seed_tree(&doc).expect("and the log fills again");
+        assert!(seed_matches_text(&seed, &text_after(MAX_SEED_EDITS + 2)));
     }
 
     /// The off-ingress reparse's seed is derived, not stored: the published
@@ -572,6 +666,11 @@ mod tests {
         assert!(
             incremental_parse_matches_fresh(&seed, "fn main() { xy }"),
             "only the edit after version 2 is replayed"
+        );
+        assert_eq!(
+            doc.seed_edits.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            vec![3],
+            "the edits the published tree consumed were pruned from the log"
         );
     }
 
@@ -710,10 +809,13 @@ mod tests {
         };
         doc.apply_edit("fn main() { }".to_string(), &[edit]);
 
-        assert!(doc.tree().is_none(), "reader-visible tree must be cleared");
         assert!(
-            seed_tree(&doc).is_some(),
-            "incremental seed must be stashed"
+            doc.tree().is_none(),
+            "the published tree must read as stale"
+        );
+        assert!(
+            seed_tree(&doc).is_some_and(|seed| seed_matches_text(&seed, "fn main() { }")),
+            "an incremental seed with the edit replayed must be derivable"
         );
         assert_eq!(doc.text(), "fn main() { }");
     }
@@ -776,8 +878,8 @@ mod tests {
 
         assert!(doc.tree().is_none());
         assert!(
-            seed_tree(&doc).is_some(),
-            "coalesced edit must keep the accumulated seed"
+            seed_tree(&doc).is_some_and(|seed| seed_matches_text(&seed, "fn main() {  }")),
+            "coalesced edits must still yield a seed with both replayed"
         );
         assert_eq!(doc.text(), "fn main() {  }");
     }
