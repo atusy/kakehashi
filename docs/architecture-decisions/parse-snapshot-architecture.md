@@ -221,8 +221,8 @@ a Stage-2-only compatibility shim feeding the incremental seed (which still read
 `Document::tree` until Stage 3 removes it). `semanticTokens/refresh` gates on the
 publish; the legacy-tree-dependent downstream (`mark_parse_finished`, the open
 parse's tree-dependent follow-ups) gates on the attach until Stage 3, and an
-attach can only be refused when the inputs moved on — in which case the next pass
-reseeds from the current snapshot instead of the legacy tree, a self-correcting
+attach is refused only when the inputs moved on or an equal-version sibling
+already landed the same tree — in either case the next pass reseeds from the current snapshot instead of the legacy tree, a self-correcting
 perf blip, never a served inconsistency, since readers already read the snapshot,
 not the legacy tree. So no reader-visible divergence can arise from the ordering.
 
