@@ -943,6 +943,108 @@ mod tests {
         assert!(store.get(&uri2).unwrap().tree().is_some());
     }
 
+    /// A same-language, identical-text reopen draws a new lifetime with the
+    /// revision counter back at zero: the incarnation is the only input that
+    /// tells the prior lifetime's parse apart, in both check modes.
+    #[test]
+    fn install_parse_rejects_the_prior_lifetime_after_an_identical_reopen() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///reopen.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        store.remove(&uri);
+        let reopened = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        assert_ne!(reopened, incarnation);
+        assert_eq!(
+            store.get(&uri).unwrap().content_version(),
+            content_version,
+            "the reopened lifetime restarts its revision counter"
+        );
+        // The reopened document's allocation differs, but a prior-lifetime
+        // parse holding the reopened text (a re-read that raced the close)
+        // must still be told apart by the lifetime alone.
+        let reopened_text = store.get(&uri).unwrap().text_arc();
+        for language_id in [Some(Some("markdown")), None] {
+            let stale = store.install_parse(
+                &uri,
+                ParseInputs {
+                    text: &reopened_text,
+                    language_id,
+                    incarnation,
+                    content_version,
+                },
+                parse_snapshot(
+                    &reopened_text,
+                    Some(markdown_tree(text)),
+                    content_version,
+                    incarnation,
+                ),
+            );
+            assert_eq!(
+                stale,
+                ParseInstall::default(),
+                "the prior lifetime's parse must land nothing (mode {language_id:?})"
+            );
+            assert!(store.get(&uri).unwrap().tree().is_none());
+        }
+        drop(expected_text);
+    }
+
+    /// `didClose` drops the parse state before the document; an install that
+    /// lands in that window must not recreate the parse state for a
+    /// document that is going away.
+    #[test]
+    fn install_parse_does_not_recreate_parse_state_dropped_by_a_close() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///closing.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        store.parse_states.remove(&uri);
+        let installed = store.install_parse(
+            &uri,
+            ParseInputs {
+                text: &expected_text,
+                language_id: None,
+                incarnation,
+                content_version,
+            },
+            parse_snapshot(
+                &expected_text,
+                Some(markdown_tree(text)),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert!(installed.attached, "the document itself is still there");
+        assert!(
+            !store.parse_states.contains_key(&uri),
+            "a parse state the close already dropped must not be recreated"
+        );
+    }
+
     /// An off-ingress reparse names the language it parsed under; a reopen
     /// that relabelled the URI (same text, new lifetime and language) must
     /// not receive the tree, and neither must a same-language reopen with

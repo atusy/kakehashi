@@ -599,41 +599,32 @@ print("hello")
 
         // The present-parser open parse now runs off the ingress ticket (#6), so the
         // tree + injection cache appear asynchronously after `did_open_impl` returns.
-        // The injection cache is populated BEFORE the tree is installed, so
-        // wait for the tree too.
+        // The injection cache (populated before the install) names the region
+        // whose eager open this test is about.
         wait_until(|| {
             server
                 .cache
                 .get_injections(&uri)
                 .is_some_and(|injections| injections.len() == 1)
-                && server
-                    .documents
-                    .get(&uri)
-                    .is_some_and(|doc| doc.tree().is_some())
         })
         .await;
-
-        assert!(
-            server
-                .documents
-                .get(&uri)
-                .is_some_and(|doc| doc.tree().is_some()),
-            "did_open should parse the document"
-        );
-
         let injections = server
             .cache
             .get_injections(&uri)
             .expect("parse should populate injection cache");
         assert_eq!(injections.len(), 1, "expected one fenced code injection");
-
         let virtual_uri = VirtualDocumentUri::new(&lsp_uri, "rust", &injections[0].region_id);
 
+        // Wait for the observable itself — the eager open — and only then
+        // check that the parse preceded it: the tree must already be
+        // installed the moment the virtual document is seen open.
         wait_until(|| server.bridge.pool().is_document_opened(&virtual_uri)).await;
-
         assert!(
-            server.bridge.pool().is_document_opened(&virtual_uri),
-            "did_open should eagerly open the parsed injection as a virtual document"
+            server
+                .documents
+                .get(&uri)
+                .is_some_and(|doc| doc.tree().is_some()),
+            "the eager open must not run before the parse is installed"
         );
     }
 
