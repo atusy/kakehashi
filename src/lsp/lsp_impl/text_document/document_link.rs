@@ -84,41 +84,46 @@ impl Kakehashi {
             std::sync::Arc::clone(&pool),
             sweep_id,
         );
-        let resolved = match cancel_rx {
-            Some(rx) => tokio::select! {
-                biased;
-                _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
-                link = dispatch => Ok(link),
-            },
-            None => Ok(dispatch.await),
-        }?;
         // A didChange/didClose/didOpen is allowed to proceed once the resolve
         // was enqueued. Revalidate after the response: the lifetime for both
         // layers, and for the virt layer the region geometry again (these
         // envelopes carry no revision stamp), so a command or target resolved
         // for a region that moved, or for the closed document, is not
-        // surfaced into the current one.
-        let still_fresh = if envelope.is_host_layer() {
-            url::Url::parse(&envelope.host_uri).is_ok_and(|host_url| {
-                self.host_incarnation_is_current(&host_url, envelope.incarnation)
-            })
-        } else {
-            self.region_offset_is_fresh(
-                &envelope.host_uri,
-                &envelope.region_id,
-                &envelope.offset,
-                envelope.incarnation,
-            )
-            .await
+        // surfaced into the current one. The revalidation can wait for a
+        // reparse, so it sits INSIDE the cancellable future: a cancel that
+        // lands during that wait is honoured, not answered with a result.
+        let resolve = async {
+            let resolved = dispatch.await;
+            let still_fresh = if envelope.is_host_layer() {
+                url::Url::parse(&envelope.host_uri).is_ok_and(|host_url| {
+                    self.host_incarnation_is_current(&host_url, envelope.incarnation)
+                })
+            } else {
+                self.region_offset_is_fresh(
+                    &envelope.host_uri,
+                    &envelope.region_id,
+                    &envelope.offset,
+                    envelope.incarnation,
+                )
+                .await
+            };
+            if !still_fresh {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "documentLink/resolve: {} was revised or reopened while resolving; returning link unresolved",
+                    envelope.host_uri
+                );
+                return unresolved;
+            }
+            resolved
         };
-        if !still_fresh {
-            log::debug!(
-                target: "kakehashi::bridge",
-                "documentLink/resolve: {} was revised or reopened while resolving; returning link unresolved",
-                envelope.host_uri
-            );
-            return Ok(unresolved);
+        match cancel_rx {
+            Some(rx) => tokio::select! {
+                biased;
+                _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                link = resolve => Ok(link),
+            },
+            None => Ok(resolve.await),
         }
-        Ok(resolved)
     }
 }
