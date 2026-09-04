@@ -100,13 +100,23 @@ impl Kakehashi {
                 std::sync::Arc::new(move || {
                     documents
                         .get(&host_uri)
+                        .filter(|doc| doc.incarnation() == incarnation)
                         .map(|doc| (doc.text_arc(), doc.content_version()))
                 });
+            let revision = crate::lsp::bridge::HostRevision {
+                incarnation,
+                content_version: self
+                    .documents
+                    .get(&uri)
+                    .map(|doc| doc.content_version())
+                    .unwrap_or_default(),
+            };
             self.bridge.eager_open_host_document_on_servers(
                 &settings,
                 lang,
                 &uri,
                 &text,
+                revision,
                 live_text_reader,
             );
         }
@@ -713,12 +723,17 @@ print("hello")
         server.bridge.insert_ready_test_connection("rust_ls").await;
 
         let uri = Url::parse("file:///test/host_eager.rs").unwrap();
+        server.bridge.open_host_incarnation(&uri, 1).await;
         let settings = server.settings_manager.load_settings();
         server.bridge.eager_open_host_document_on_servers(
             &settings,
             "rust",
             &uri,
             "fn main() {}",
+            crate::lsp::bridge::HostRevision {
+                incarnation: 1,
+                content_version: 0,
+            },
             std::sync::Arc::new(|| None),
         );
 
@@ -739,6 +754,77 @@ print("hello")
         .expect("eager-open should send didOpen for the host document to the _self host server");
     }
 
+    /// An eager open scheduled in one lifetime must not open the document
+    /// for the next: a task of a superseded batch that unparks after a close
+    /// and reopen carries the old language, and identical text would let the
+    /// new batch fingerprint-dedup and never correct it.
+    #[tokio::test]
+    async fn eager_open_scheduled_in_a_previous_lifetime_is_skipped() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+
+        let uri = Url::parse("file:///test/host_reopened.rs").unwrap();
+        // The document was closed and reopened: lifetime 2 is current.
+        server.bridge.open_host_incarnation(&uri, 2).await;
+        let settings = server.settings_manager.load_settings();
+        let configs = server
+            .bridge
+            .get_host_configs_for_language(&settings, "rust");
+
+        server.bridge.eager_sync_host_document_on_servers(
+            &uri,
+            "rust",
+            std::sync::Arc::from("fn main() {}"),
+            crate::lsp::bridge::HostRevision {
+                incarnation: 1,
+                content_version: 0,
+            },
+            configs.clone(),
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            server
+                .bridge
+                .pool()
+                .host_document_version(&uri, "rust_ls")
+                .await,
+            None,
+            "an open scheduled in lifetime 1 must not open lifetime 2's document"
+        );
+
+        // The current lifetime's own open goes through.
+        server.bridge.eager_sync_host_document_on_servers(
+            &uri,
+            "rust",
+            std::sync::Arc::from("fn main() {}"),
+            crate::lsp::bridge::HostRevision {
+                incarnation: 2,
+                content_version: 0,
+            },
+            configs,
+            None,
+        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server
+                    .bridge
+                    .pool()
+                    .host_document_version(&uri, "rust_ls")
+                    .await
+                    == Some(1)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the current lifetime's eager open must didOpen the host document");
+    }
+
     /// On-edit host re-sync (#431): a second `eager_sync_host_document_on_servers`
     /// with changed text sends a versioned `didChange` (version advances to 2), so
     /// a push-only host server re-analyzes current text instead of stale text. The
@@ -752,6 +838,7 @@ print("hello")
         server.bridge.insert_ready_test_connection("rust_ls").await;
 
         let uri = Url::parse("file:///test/host_resync.rs").unwrap();
+        server.bridge.open_host_incarnation(&uri, 1).await;
         let settings = server.settings_manager.load_settings();
         let configs = server
             .bridge
@@ -762,6 +849,10 @@ print("hello")
             &uri,
             "rust",
             std::sync::Arc::from("fn main() {}"),
+            crate::lsp::bridge::HostRevision {
+                incarnation: 1,
+                content_version: 0,
+            },
             configs.clone(),
             None,
         );
@@ -787,6 +878,10 @@ print("hello")
             &uri,
             "rust",
             std::sync::Arc::from("fn other() {}"),
+            crate::lsp::bridge::HostRevision {
+                incarnation: 1,
+                content_version: 0,
+            },
             configs,
             None,
         );
@@ -823,6 +918,7 @@ print("hello")
         server.bridge.insert_ready_test_connection("rust_ls").await;
 
         let uri = Url::parse("file:///test/host_reader.rs").unwrap();
+        server.bridge.open_host_incarnation(&uri, 1).await;
         let settings = server.settings_manager.load_settings();
         let configs = server
             .bridge
@@ -839,6 +935,10 @@ print("hello")
             &uri,
             "rust",
             std::sync::Arc::clone(&snapshot),
+            crate::lsp::bridge::HostRevision {
+                incarnation: 1,
+                content_version: 0,
+            },
             configs.clone(),
             Some(reader_v1),
         );
@@ -866,6 +966,10 @@ print("hello")
             &uri,
             "rust",
             snapshot,
+            crate::lsp::bridge::HostRevision {
+                incarnation: 1,
+                content_version: 0,
+            },
             configs,
             Some(reader_v2),
         );
@@ -973,6 +1077,7 @@ print("hello")
         server.bridge.insert_ready_test_connection("rust_ls").await;
 
         let uri = Url::parse("file:///test/host_debounce.rs").unwrap();
+        server.bridge.open_host_incarnation(&uri, 1).await;
         let settings = server.settings_manager.load_settings();
         let configs = server
             .bridge
@@ -1187,6 +1292,7 @@ print("hello")
         configure_rust_self_host(server);
 
         let uri = Url::parse("file:///test/host_snapshot.rs").unwrap();
+        server.bridge.open_host_incarnation(&uri, 1).await;
         let text = "fn main() {}".to_string();
         server
             .documents
@@ -1222,6 +1328,7 @@ print("hello")
         configure_rust_self_host(server);
 
         let uri = Url::parse("file:///test/host_cleared.rs").unwrap();
+        server.bridge.open_host_incarnation(&uri, 1).await;
         let lsp_uri = tower_lsp_server::ls_types::Uri::from_str(uri.as_str()).unwrap();
         server.documents.insert(
             uri.clone(),
@@ -1542,6 +1649,7 @@ print("hello")
         server.bridge.insert_ready_test_connection("rust_ls").await;
 
         let uri = Url::parse("file:///test/host_attach_no_wait.rs").unwrap();
+        server.bridge.open_host_incarnation(&uri, 1).await;
         let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
 
         // Hold the parser-pool lock so the spawned parse parks indefinitely
@@ -1625,6 +1733,7 @@ print("hello")
         server.settings_manager.apply_settings(settings);
 
         let uri = Url::parse("file:///test/host_narrower_than_editor_pull.rs").unwrap();
+        server.bridge.open_host_incarnation(&uri, 1).await;
         let text = "fn main() {}".to_string();
         server
             .documents
@@ -1665,6 +1774,7 @@ print("hello")
         configure_rust_self_host(server);
 
         let uri = Url::parse("file:///test/host_default_not_narrower.rs").unwrap();
+        server.bridge.open_host_incarnation(&uri, 1).await;
         server.documents.insert(
             uri.clone(),
             "fn main() {}".to_string(),
