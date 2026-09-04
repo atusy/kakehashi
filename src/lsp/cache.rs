@@ -291,14 +291,22 @@ impl CacheCoordinator {
                 // clobber state the newer text's own populate maintains). A
                 // refused clear aborts the pass (`None`): reporting a result
                 // while the old entries survive would leave them unreclaimed
-                // until another parse. The result is UNDETERMINED, not
-                // empty: the query may simply not be loaded yet, and a
-                // definitive empty set would stand until the next edit.
+                // until another parse.
                 tracker.commit_if_unshifted(uri, entry_mint_epoch, incarnation, || {
                     self.injection_map.clear(uri);
                     self.injection_token_cache.clear_document(uri);
                 })?;
-                return Some(PopulatedInjections::undetermined(generation));
+                // Queries are published before their parser, so a visible
+                // parser with no injection query is a language that has
+                // none: a definitive empty set, which keeps the fast paths
+                // for it. Without the parser the load is still publishing
+                // and the result is UNDETERMINED — a definitive empty set
+                // would stand until the next edit.
+                return Some(if language.has_parser_available(language_name) {
+                    PopulatedInjections::empty(generation)
+                } else {
+                    PopulatedInjections::undetermined(generation)
+                });
             }
         };
 
@@ -978,6 +986,34 @@ mod tests {
         );
         assert!(populated.resolved_regions.is_none());
         assert!(populated.discovery.is_none());
+
+        // Once the parser is visible its queries are too (they are published
+        // first), so the absence is definitive and the fast paths keep their
+        // empty set.
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), language);
+        let populated = cache
+            .populate_injections(
+                &uri,
+                text,
+                &tree,
+                "markdown",
+                &coordinator,
+                &tracker,
+                tracker.mint_epoch(&uri),
+                1,
+                true,
+                true,
+            )
+            .expect("the pass ran");
+        assert!(
+            populated
+                .bridge_regions
+                .as_ref()
+                .is_some_and(|regions| regions.is_empty()),
+            "a settled language without an injection query publishes a definitive empty set"
+        );
     }
 
     #[test]
