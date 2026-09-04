@@ -53,7 +53,7 @@ pub struct Document {
     /// seeding (a full parse is cheaper than an unbounded log).
     seed_edits: Vec<(u64, InputEdit)>,
     /// The content version below which no published tree may seed a parse.
-    /// A full-text sync (`apply_edit_and_seed` with no `InputEdit`s) and a
+    /// A full-text sync (`apply_edit` with no `InputEdit`s) and a
     /// grammar reload set it to the version they produce: seeding an unedited
     /// tree against wholly-replaced text violates tree-sitter's incremental
     /// contract and corrupted external scanners (#348), and the edits that
@@ -321,7 +321,7 @@ impl Document {
     /// through the published snapshot. Reached only through
     /// `DocumentStore::install_parse`, for every parse path (open,
     /// installed-grammar reparse, edit reparse).
-    pub(crate) fn set_parse_result(&mut self, language: Option<String>) {
+    pub(crate) fn record_language(&mut self, language: Option<String>) {
         self.language_id = language;
     }
 
@@ -338,7 +338,7 @@ impl Document {
     /// an unedited tree against wholly-replaced text violates tree-sitter's
     /// incremental contract and corrupted external scanners in #348, so a full-text
     /// sync must parse from scratch.
-    pub(crate) fn apply_edit_and_seed(&mut self, new_text: String, edits: &[InputEdit]) {
+    pub(crate) fn apply_edit(&mut self, new_text: String, edits: &[InputEdit]) {
         self.text = Arc::from(new_text);
         self.advance_input_version();
         if edits.is_empty() {
@@ -400,7 +400,7 @@ impl Document {
     pub(crate) fn update_text(&mut self, text: String) {
         // A full-text sync: the version bump makes the published tree stale
         // for readers, and nothing may seed against the replaced text.
-        self.apply_edit_and_seed(text, &[]);
+        self.apply_edit(text, &[]);
     }
 }
 
@@ -455,7 +455,7 @@ mod tests {
             "an unedited current tree seeds as is"
         );
 
-        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit(11, 11, 12)]);
+        doc.apply_edit("fn main() { }".to_string(), &[edit(11, 11, 12)]);
         let seed = doc.incremental_seed().expect("one edit: seeded");
         assert!(incremental_parse_matches_fresh(&seed, "fn main() { }"));
         assert!(
@@ -463,7 +463,7 @@ mod tests {
             "the edit made the published tree stale"
         );
 
-        doc.apply_edit_and_seed("fn main() { x }".to_string(), &[edit(12, 12, 14)]);
+        doc.apply_edit("fn main() { x }".to_string(), &[edit(12, 12, 14)]);
         let seed = doc
             .incremental_seed()
             .expect("coalesced edits: still seeded");
@@ -492,12 +492,12 @@ mod tests {
             rust_tree("fn main() {}"),
             3,
         );
-        doc.apply_edit_and_seed("fn other() {}".to_string(), &[]);
+        doc.apply_edit("fn other() {}".to_string(), &[]);
         assert!(
             doc.incremental_seed().is_none(),
             "full sync: parse from scratch"
         );
-        doc.apply_edit_and_seed("fn other() { }".to_string(), &[edit(12, 12, 13)]);
+        doc.apply_edit("fn other() { }".to_string(), &[edit(12, 12, 13)]);
         assert!(
             doc.incremental_seed().is_none(),
             "an edit after the sync has no tree it can be replayed onto"
@@ -508,7 +508,7 @@ mod tests {
             doc.incremental_seed().is_some(),
             "a fresh published tree seeds again"
         );
-        doc.apply_edit_and_seed("fn other() { y }".to_string(), &[edit(13, 13, 15)]);
+        doc.apply_edit("fn other() { y }".to_string(), &[edit(13, 13, 15)]);
         let seed = doc.incremental_seed().expect("seeded from the fresh tree");
         assert!(incremental_parse_matches_fresh(&seed, "fn other() { y }"));
     }
@@ -524,11 +524,11 @@ mod tests {
             rust_tree("fn main() {}"),
             3,
         );
-        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit(11, 11, 12)]);
-        doc.apply_edit_and_seed("fn main() { x }".to_string(), &[edit(12, 12, 14)]);
+        doc.apply_edit("fn main() { }".to_string(), &[edit(11, 11, 12)]);
+        doc.apply_edit("fn main() { x }".to_string(), &[edit(12, 12, 14)]);
         // The reparse of version 2 lands.
         assert!(doc.publish_snapshot(&doc.bare_snapshot(Some(rust_tree("fn main() { x }")))));
-        doc.apply_edit_and_seed("fn main() { xy }".to_string(), &[edit(13, 13, 14)]);
+        doc.apply_edit("fn main() { xy }".to_string(), &[edit(13, 13, 14)]);
         let seed = doc
             .incremental_seed()
             .expect("seeded from the version-2 tree");
@@ -611,7 +611,7 @@ mod tests {
 
         // A parse-result write (language record + published tree) does not bump.
         let tree = parser.parse("fn main() { }", None).unwrap();
-        doc.set_parse_result(Some("rust".to_string()));
+        doc.record_language(Some("rust".to_string()));
         assert!(doc.publish_snapshot(&doc.bare_snapshot(Some(tree))));
         assert_eq!(
             doc.content_version(),
@@ -621,7 +621,7 @@ mod tests {
         assert!(doc.tree().is_some());
 
         // An incremental edit bumps.
-        doc.apply_edit_and_seed("fn main() {  }".to_string(), &[]);
+        doc.apply_edit("fn main() {  }".to_string(), &[]);
         assert_eq!(doc.content_version(), 2);
     }
 
@@ -631,7 +631,7 @@ mod tests {
         let obsolete = doc.version_cancel.clone();
         assert!(!obsolete.is_cancelled());
 
-        doc.apply_edit_and_seed("fn main() { }".to_string(), &[]);
+        doc.apply_edit("fn main() { }".to_string(), &[]);
 
         assert!(
             obsolete.is_cancelled(),
@@ -654,7 +654,7 @@ mod tests {
     /// A non-empty edit stashes an incremental parse seed and clears the
     /// reader-visible tree (readers must not see a pre-reparse tree).
     #[test]
-    fn apply_edit_and_seed_stashes_seed_and_clears_tree() {
+    fn apply_edit_logs_the_edit_for_the_seed_and_stales_the_tree() {
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -671,7 +671,7 @@ mod tests {
             old_end_position: tree_sitter::Point::new(0, 11),
             new_end_position: tree_sitter::Point::new(0, 12),
         };
-        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit]);
+        doc.apply_edit("fn main() { }".to_string(), &[edit]);
 
         assert!(doc.tree().is_none(), "reader-visible tree must be cleared");
         assert!(
@@ -685,7 +685,7 @@ mod tests {
     /// tree against wholly-replaced text is the tree-sitter contract violation that
     /// caused the #348 heap corruption.
     #[test]
-    fn apply_edit_and_seed_drops_seed_on_full_text_sync() {
+    fn apply_edit_forbids_seeding_on_full_text_sync() {
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -694,7 +694,7 @@ mod tests {
         let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree, 0);
 
         // Full-text sync carries no InputEdits.
-        doc.apply_edit_and_seed("totally different content".to_string(), &[]);
+        doc.apply_edit("totally different content".to_string(), &[]);
 
         assert!(doc.tree().is_none());
         assert!(
@@ -706,7 +706,7 @@ mod tests {
     /// Coalesced edits accumulate onto the same seed: after a first edit clears the
     /// visible tree, a second edit chains its `InputEdit` onto the stashed seed.
     #[test]
-    fn apply_edit_and_seed_coalesces_across_edits() {
+    fn apply_edit_coalesces_across_edits() {
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -722,7 +722,7 @@ mod tests {
             old_end_position: tree_sitter::Point::new(0, 11),
             new_end_position: tree_sitter::Point::new(0, 12),
         };
-        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit1]);
+        doc.apply_edit("fn main() { }".to_string(), &[edit1]);
         assert!(doc.tree().is_none());
 
         // Second edit lands while the visible tree is still cleared: it must chain
@@ -735,7 +735,7 @@ mod tests {
             old_end_position: tree_sitter::Point::new(0, 12),
             new_end_position: tree_sitter::Point::new(0, 13),
         };
-        doc.apply_edit_and_seed("fn main() {  }".to_string(), &[edit2]);
+        doc.apply_edit("fn main() {  }".to_string(), &[edit2]);
 
         assert!(doc.tree().is_none());
         assert!(

@@ -441,10 +441,10 @@ impl ParseCoordinator {
     /// tree-dependent downstream (`process_injections(forward=false)`, the deferred
     /// refresh, the synthetic diagnostic) on this — **not** on "the document has a
     /// tree": a `didChange` racing this parse can move the text on and let the edit
-    /// reparse attach the newer tree (and run `process_injections(forward=true)`)
-    /// first; this parse's CAS then rejects, and re-checking `tree().is_some()` would
+    /// reparse publish the newer tree (and run `process_injections(forward=true)`)
+    /// first; this parse's install then reports not current, and re-checking `tree().is_some()` would
     /// wrongly see the edit's tree and re-run the *open* downstream over it,
-    /// superseding the edit's eager-open batch. Gating on the own-CAS result is the
+    /// superseding the edit's eager-open batch. Gating on the own-install result is the
     /// same discipline `reparse_latest` follows for its `populate_injections`.
     pub(crate) async fn parse_document(
         &self,
@@ -540,9 +540,9 @@ impl ParseCoordinator {
                 // itself against a pass whose text or lifetime moved on (the
                 // tracker's epoch and incarnation), so it needs no confirmation
                 // from the store first, and the install below then publishes
-                // the snapshot iff the cell admits it and attaches the tree
-                // only with an admitted snapshot and unchanged inputs (a
-                // language mismatch rejects both outright).
+                // the snapshot iff the cell admits it and reports it current
+                // iff it parsed the document's content version (a language
+                // mismatch rejects it outright).
                 let regions = self
                     .populate_injections_on_pool(
                         uri.clone(),
@@ -578,7 +578,7 @@ impl ParseCoordinator {
                 }
                 advance_watermark();
                 self.notifier().log_language_events(&events).await;
-                // `attached` is exactly "this call landed the tree": false when a
+                // `current` is exactly "this call published the current tree": false when a
                 // racing `didChange`/reopen moved the text or incarnation on and the
                 // edit reparse won, in which case the open downstream must NOT re-run
                 // over the edit's tree.
@@ -682,11 +682,11 @@ impl ParseCoordinator {
         // text (synchronous, no `.await` and no document write under the `Ref`).
         // Capture the grammar **and** the (language_id, incarnation) it is resolved
         // for, together under one read guard. `language_name` is fixed for the whole
-        // loop, so the CAS must check against the language_id/incarnation captured
-        // *here* — not re-read per attempt. Otherwise a relabelling reopen mid-loop
-        // would have its new language_id captured per attempt, satisfy the CAS's
-        // language check, and let a tree parsed by the *old* grammar attach to the
-        // relabelled document. The incarnation is likewise lifetime-stable; only the
+        // loop, so the install must check against the language_id/incarnation
+        // captured *here* — not re-read per attempt. Otherwise a relabelling reopen
+        // mid-loop would have its new language_id captured per attempt, satisfy the
+        // install's language check, and let a tree parsed by the *old* grammar reach
+        // the relabelled document. The incarnation is likewise lifetime-stable; only the
         // text legitimately changes within a lifetime (a `didChange`), so only the
         // text is re-read per attempt.
         let (language_name, expected_language_id, expected_incarnation) = {
@@ -784,14 +784,14 @@ impl ParseCoordinator {
 
             // Populate BEFORE the install so the discovery rides the snapshot
             // (ADR §3); populate guards itself against a pass whose text or
-            // lifetime moved on, and the install then attaches the tree only
-            // with an admitted snapshot and unchanged inputs: a closed
-            // (Vacant) document, one whose text moved (a concurrent
-            // `didChange` — its snapshot may still publish as an older
-            // version, the tree does not attach), and one a concurrent parse
-            // already gave a tree at this version (the cell refuses the
-            // equal-version swap, so the tree is not re-attached either) all
-            // drop this tree. (`Tree` clone is a cheap refcount bump.)
+            // lifetime moved on, and the install then reports the tree
+            // current only when its snapshot was admitted at the document's
+            // content version: a closed (Vacant) document, one whose text
+            // moved (a concurrent `didChange` — its snapshot may still
+            // publish as an older version, not current), and one a
+            // concurrent parse already gave a tree at this version (the cell
+            // refuses the equal-version swap) all leave this tree out.
+            // (`Tree` clone is a cheap refcount bump.)
             let regions = self
                 .populate_injections_on_pool(
                     uri.clone(),
@@ -890,9 +890,9 @@ impl ParseCoordinator {
             let text = doc.text_arc();
             let language_id = doc.language_id().map(|s| s.to_string());
             let seed = doc.incremental_seed();
-            // The lifetime this parse is for: a close+reopen before the tree write
-            // changes it, and the CAS below rejects on the mismatch (so a tree from
-            // this lifetime never attaches to a reopened document).
+            // The lifetime this parse is for: a close+reopen before the install
+            // changes it, and the cell rejects on the mismatch (so a tree from
+            // this lifetime never reaches a reopened document).
             let incarnation = doc.incarnation();
             let language_name =
                 self.language
@@ -948,7 +948,7 @@ impl ParseCoordinator {
         // edit stashed one: tree-sitter reuses the unchanged subtrees and reparses
         // only the edited region. `None` (full-text sync / install) parses from
         // scratch. The seed already has this edit's `InputEdit`s applied
-        // (`didChange` → `apply_edit_and_seed`), satisfying tree-sitter's contract.
+        // (`didChange` → `apply_edit`), satisfying tree-sitter's contract.
         let text_for_parse = text.clone();
         let parsed = self
             .parse_with_pool(
@@ -975,22 +975,22 @@ impl ParseCoordinator {
 
         let mut events = load_result.events;
         if let Some(tree) = parsed {
-            // Attach and publish happen in one `install_parse` under the
-            // entry guard, so a legacy-store reader woken by the publish
-            // always finds the tree already attached. Text + language +
-            // incarnation are checked atomically under that guard: text
-            // rejects a within-lifetime stale parse (a
-            // `didChange` landed mid-parse); language rejects a reopen that
-            // relabelled the URI; incarnation rejects a same-language,
-            // identical-text reopen — the tree belongs to the prior lifetime
-            // and must not attach to the reopened document (nor let the
-            // watermark advance below run on the old lifetime's ticket).
+            // The publish is the one `install_parse` under the entry guard;
+            // readers derive the tree from it. Language + the snapshot's own
+            // stamps are checked under that guard: language rejects a reopen
+            // that relabelled the URI; the cell rejects a same-language,
+            // identical-text reopen by incarnation — the tree belongs to the
+            // prior lifetime and must not reach the reopened document (nor
+            // let the watermark advance below run on the old lifetime's
+            // ticket); a within-lifetime stale parse (a `didChange` landed
+            // mid-parse) publishes as stale-but-consistent and is reported
+            // not current.
             // Populate BEFORE the install so the derived discovery rides the
             // snapshot (ADR §3, don't-discover-twice); readers keep serving the
             // previous snapshot for populate's duration. Populate guards itself
             // against a pass whose text moved on mid-parse (the scheduler's
             // dirty loop is already reparsing the newer text), and the install
-            // then attaches the tree only with an admitted snapshot.
+            // then publishes it.
             let regions = self
                 .populate_injections_on_pool(
                     uri.clone(),

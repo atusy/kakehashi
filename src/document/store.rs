@@ -251,7 +251,7 @@ impl DocumentStore {
         // Hot path (the document already exists): `get_mut` borrows the key, so no
         // `Url` clone. Only a miss falls back to `entry` (owned key), which re-checks
         // for a document a concurrent insert added between the `get_mut` and here —
-        // matching `apply_edit_clearing_tree`.
+        // matching `apply_edit`.
         let (has_tree, incarnation) = if let Some(mut doc) = self.documents.get_mut(&uri) {
             // Update in place, preserving the incarnation (an edit is the same lifetime).
             let has_tree = if let Some(tree) = new_tree {
@@ -315,12 +315,12 @@ impl DocumentStore {
     /// and the watermark entry ensured; and the `edits` are logged for the
     /// off-ingress `reparse_latest`'s incremental seed. With no `edits` (full-text
     /// sync) seeding is forbidden until a fresh tree is published (#348).
-    /// Coalesced edits accumulate in the log (see [`Document::apply_edit_and_seed`]).
+    /// Coalesced edits accumulate in the log (see [`Document::apply_edit`]).
     ///
     /// Called under the per-URI edit lock with the document known to exist; the
     /// `Vacant` branch (a reordered notification for an unopened URI) inserts a
     /// tree-less document to mirror the prior `update_document` behavior.
-    pub(crate) fn apply_edit_clearing_tree(&self, uri: &Url, text: String, edits: &[InputEdit]) {
+    pub(crate) fn apply_edit(&self, uri: &Url, text: String, edits: &[InputEdit]) {
         // Hot path (a live document being edited): `get_mut` borrows the key, so no
         // `Url` clone per keystroke. Only a miss falls back to `entry` (owned key),
         // which also re-checks for a document a concurrent open inserted between the
@@ -329,13 +329,13 @@ impl DocumentStore {
         // parse-state and watermark updates below (separate maps), keeping the
         // `documents` shard lock held no longer than `update_document` did.
         let incarnation = if let Some(mut doc) = self.documents.get_mut(uri) {
-            doc.apply_edit_and_seed(text, edits);
+            doc.apply_edit(text, edits);
             doc.incarnation()
         } else {
             match self.documents.entry(uri.clone()) {
                 Entry::Occupied(mut entry) => {
                     let doc = entry.get_mut();
-                    doc.apply_edit_and_seed(text, edits);
+                    doc.apply_edit(text, edits);
                     doc.incarnation()
                 }
                 Entry::Vacant(entry) => {
@@ -749,7 +749,7 @@ impl DocumentStore {
                 // detected name for its own readers); only the open parse
                 // records what it detected.
                 if current && matches!(language, LanguageCheck::Record) {
-                    doc.set_parse_result(detected);
+                    doc.record_language(detected);
                 }
                 ParseInstall { current, published }
             });
@@ -805,10 +805,10 @@ mod tests {
 
     /// A parse of text an edit has moved on from — before that edit's own
     /// reparse published — lands its snapshot as stale but consistent (the
-    /// cell admits a newer version than it holds) while the tree, which
-    /// would be a reader-visible tree of the wrong text, does not attach.
+    /// cell admits a newer version than it holds) but not current: readers,
+    /// who serve only the current tree, see none.
     #[test]
-    fn install_parse_publishes_a_stale_but_consistent_snapshot_without_attaching() {
+    fn install_parse_publishes_a_stale_but_consistent_snapshot_as_not_current() {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///stale.md").unwrap();
         let text = "# doc\n";
@@ -853,7 +853,7 @@ mod tests {
         );
     }
 
-    /// A reparse checks the stored language and attaches the tree without
+    /// A reparse checks the stored language and publishes the tree without
     /// relabelling the document: detection may resolve a stored `sh` to its
     /// `bash` base, and the stored id stays `sh` (the snapshot carries the
     /// detected name). The open parse, which checks nothing, records what it
@@ -1071,7 +1071,7 @@ mod tests {
         assert_eq!(
             mismatched,
             ParseInstall::default(),
-            "a language the document no longer has must neither attach nor publish"
+            "a language the document no longer has must not publish"
         );
         assert!(store.get(&uri).unwrap().tree().is_none());
         let cell_after = store.latest_snapshot(&uri).and_then(|v| v.slot.snapshot);
@@ -1170,11 +1170,13 @@ mod tests {
         );
     }
 
-    /// The one way a parse reaches readers: the legacy tree and the snapshot
-    /// land together, or — when the document moved on — neither the tree
-    /// (inputs changed) nor a snapshot the cell does not admit.
+    /// One publish per version and lifetime, and currency reported from the
+    /// snapshot's stamps: the first install at a version lands and is current;
+    /// an equal-version duplicate lands nothing and is not current; a parse of
+    /// text an edit moved on from is not current and, being older than the
+    /// cell, not admitted; a closed document takes nothing.
     #[test]
-    fn install_parse_lands_tree_and_snapshot_together_or_not_at_all() {
+    fn install_parse_publishes_once_per_version_and_reports_currency() {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///install.md").unwrap();
         let text = "# doc\n";
@@ -1206,7 +1208,7 @@ mod tests {
                 published: true
             }
         );
-        assert!(store.get(&uri).unwrap().tree().is_some(), "tree attached");
+        assert!(store.get(&uri).unwrap().tree().is_some(), "tree visible");
         assert!(
             store.latest_snapshot(&uri).is_some_and(|view| view
                 .slot
@@ -1217,11 +1219,10 @@ mod tests {
         );
 
         // The same parse installed again (a sibling reparse of the same
-        // revision): the cell refuses an equal-version tree swap, and the
-        // tree must not be re-attached either — nothing lands without its
-        // snapshot. Identity, not just the reported outcome: the stored tree
-        // and the cell's snapshot must be the very ones the first install
-        // landed.
+        // revision): the cell refuses an equal-version tree swap, so nothing
+        // lands and nothing is current. Identity, not just the reported
+        // outcome: the visible tree and the cell's snapshot must be the very
+        // ones the first install landed.
         // `Tree` clones share subtrees but not the root handle: a child node's
         // id is the identity that survives the clone.
         let first_child = |t: &tree_sitter::Tree| t.root_node().named_child(0).map(|n| n.id());
@@ -1255,7 +1256,7 @@ mod tests {
                 .as_ref()
                 .and_then(first_child),
             landed_tree,
-            "the duplicate must not swap the attached tree"
+            "the duplicate must not swap the visible tree"
         );
         assert!(
             store
@@ -1266,8 +1267,8 @@ mod tests {
             "the duplicate must not swap the published snapshot"
         );
 
-        // An edit moved the document on: the parse of the old text attaches
-        // nothing, and its snapshot (an older version) is not admitted.
+        // An edit moved the document on: the parse of the old text is not
+        // current, and its snapshot (an older version) is not admitted.
         store.update_document(uri.clone(), "# doc edited\n".to_string(), None);
         let stale = store.install_parse(
             &uri,
@@ -1282,7 +1283,7 @@ mod tests {
         assert_eq!(stale, ParseInstall::default());
         assert!(
             store.get(&uri).unwrap().tree().is_none(),
-            "a stale parse must not attach to the edited document"
+            "a stale parse must not become the edited document's tree"
         );
 
         // A closed document: nothing to install into.
@@ -1545,7 +1546,7 @@ mod tests {
         let before = store.get(&uri).unwrap().incarnation();
 
         // An edit is the same lifetime — the incarnation must not move.
-        store.apply_edit_clearing_tree(&uri, "xy".to_string(), &[]);
+        store.apply_edit(&uri, "xy".to_string(), &[]);
         let after = store.get(&uri).unwrap().incarnation();
 
         assert_eq!(
@@ -1697,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_edit_clearing_tree_preserves_the_watermark_ticket() {
+    fn apply_edit_preserves_the_watermark_ticket() {
         let store = DocumentStore::new();
         let uri = Url::parse("file:///wm.rs").unwrap();
         seed_document(&store, &uri);
@@ -1708,7 +1709,7 @@ mod tests {
         // An edit is the same lifetime: `ensure_watermark_entry` must hit its
         // matching-incarnation fast path and leave the live ticket untouched (a
         // reset to 0 would prematurely release readers gated behind ticket 7).
-        store.apply_edit_clearing_tree(&uri, "xy".to_string(), &[]);
+        store.apply_edit(&uri, "xy".to_string(), &[]);
         assert_eq!(
             watermark_of(&store, &uri),
             Some(7),

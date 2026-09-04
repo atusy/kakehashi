@@ -291,11 +291,11 @@ impl Kakehashi {
                 let landed = parse
                     .parse_document(parse_uri.clone(), Some(parse_language_id.as_str()), ticket)
                     .await;
-                // Run the open downstream only when THIS parse's CAS landed the tree —
-                // not merely when "a tree exists". A `didChange` racing this open parse
-                // can move the text on and let the edit reparse attach the newer tree
-                // (and run `process_injections(forward=true)`) first; this parse then
-                // loses its CAS (`landed == false`). Re-running the open downstream
+                // Run the open downstream only when THIS parse's install published the
+                // current tree — not merely when "a tree exists". A `didChange` racing
+                // this open parse can move the text on and let the edit reparse publish
+                // the newer tree (and run `process_injections(forward=true)`) first;
+                // this parse is then reported not current (`landed == false`). Re-running the open downstream
                 // (`process_injections(forward=false)`) over the edit's tree would
                 // supersede the edit's eager-open batch. When `landed` is false the
                 // edit reparse owns the current tree and already ran the correct
@@ -1312,8 +1312,8 @@ print("hello")
         );
     }
 
-    /// The off-ingress install reparse re-reads the latest store text and attaches
-    /// a tree to the still-open document.
+    /// The off-ingress install reparse re-reads the latest store text and publishes
+    /// a tree for the still-open document.
     #[tokio::test]
     async fn reparse_installed_document_parses_the_open_document() {
         let (service, _socket) = LspService::new(Kakehashi::new);
@@ -1338,7 +1338,7 @@ print("hello")
 
         assert!(
             server.documents.get(&uri).unwrap().tree().is_some(),
-            "the reparse must attach a tree to the open document"
+            "the reparse must publish a tree for the open document"
         );
     }
 
@@ -1365,8 +1365,8 @@ print("hello")
         );
     }
 
-    /// `reparse_latest` attaches a fresh tree to the open document (whose tree was
-    /// cleared by the edit) and advances the watermark to the edit's ticket.
+    /// `reparse_latest` publishes a fresh tree for the open document (whose tree the
+    /// edit made stale) and advances the watermark to the edit's ticket.
     #[tokio::test]
     async fn reparse_latest_parses_and_advances_watermark() {
         let (service, _socket) = LspService::new(Kakehashi::new);
@@ -1391,7 +1391,7 @@ print("hello")
 
         assert!(
             server.documents.get(&uri).unwrap().tree().is_some(),
-            "the off-ingress reparse attaches a tree to the edited document"
+            "the off-ingress reparse publishes a tree for the edited document"
         );
         // The watermark advance itself is still exercised by the store's own
         // watermark tests; the reader-side wait (`wait_for_epoch`) was removed

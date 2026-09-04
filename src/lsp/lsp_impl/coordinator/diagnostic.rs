@@ -761,7 +761,7 @@ mod tests {
         );
         server
             .documents
-            .apply_edit_clearing_tree(&uri, "# edited\n".to_string(), &[]);
+            .apply_edit(&uri, "# edited\n".to_string(), &[]);
         assert!(!document_matches_lineage(
             &server.documents.get(&uri).unwrap(),
             incarnation,
