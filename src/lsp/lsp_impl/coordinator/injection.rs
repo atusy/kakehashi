@@ -560,15 +560,17 @@ impl InjectionCoordinator {
     fn get_language_for_document(&self, uri: &Url) -> Option<String> {
         detect_document_language(&self.language, &self.documents, uri)
     }
+    fn reload_in_progress(&self) -> bool {
+        self.parser_pool
+            .lock()
+            .recover_poison("InjectionCoordinator::reload_in_progress")
+            .reload_in_progress()
+    }
+
     /// Whether `language`'s parser is not published yet or a reload is in
     /// progress — the two transient reasons a resolution cannot look.
     fn language_is_unsettled(&self, language: &str) -> bool {
-        let reloading = self
-            .parser_pool
-            .lock()
-            .recover_poison("InjectionCoordinator::language_is_unsettled")
-            .reload_in_progress();
-        reloading || !self.language.has_parser_available(language)
+        self.reload_in_progress() || !self.language.has_parser_available(language)
     }
 
     /// Re-run the tree-derived downstream pass for `uri` once the language's
@@ -593,6 +595,19 @@ impl InjectionCoordinator {
             let deadline = tokio::time::Instant::now() + INJECTION_RETRY_BUDGET;
             loop {
                 tokio::time::sleep(INJECTION_RETRY_POLL).await;
+                // A host parser discovered from `searchPaths` (not declared)
+                // loses its registration to the generation bump of any
+                // reload — including an injected language's auto-install,
+                // which re-ensures only the installed language — and nothing
+                // re-publishes it without a request. Ask for it here, or the
+                // wait below would only expire.
+                if !this.reload_in_progress() && !this.language.has_parser_available(&host_language)
+                {
+                    let _ = this
+                        .language
+                        .ensure_language_loaded_async(&host_language)
+                        .await;
+                }
                 if !this.language_is_unsettled(&host_language) {
                     log::debug!(
                         target: "kakehashi::bridge",

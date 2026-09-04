@@ -1591,6 +1591,16 @@ impl DiagnosticPublisher {
                     .lock()
                     .recover_poison("DiagnosticPublisher::retry_republish_when_settled")
                     .reload_in_progress();
+                // A host parser discovered from `searchPaths` loses its
+                // registration to any reload's generation bump and is only
+                // re-published on request; ask for it, or the wait would
+                // only expire.
+                if !reloading && !this.language.has_parser_available(&host_language) {
+                    let _ = this
+                        .language
+                        .ensure_language_loaded_async(&host_language)
+                        .await;
+                }
                 if !reloading && this.language.has_parser_available(&host_language) {
                     log::debug!(
                         target: LOG_TARGET,
