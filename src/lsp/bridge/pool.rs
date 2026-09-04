@@ -31,10 +31,11 @@ pub(crate) use connection_action::BridgeError;
 use connection_action::{ConnectionAction, decide_connection_action};
 use handshake::perform_lsp_handshake;
 
+pub(in crate::lsp::bridge) use connection_handle::REQUEST_TIMEOUT;
 pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
-use document_tracker::DocumentTracker;
+pub(in crate::lsp::bridge) use document_tracker::DocumentTracker;
 pub(crate) use document_tracker::OpenedVirtualDoc;
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
@@ -276,6 +277,9 @@ pub(super) struct HostDocSyncState {
     pub(super) fingerprint: u64,
 }
 
+pub(in crate::lsp::bridge) type HostDocuments =
+    Mutex<HashMap<String, HashMap<ConnectionKey, HostDocSyncState>>>;
+
 /// Cancellation-safe rollback for the pre-send virtual-document claim.
 /// Eager-open tasks are deliberately aborted when a newer parse supersedes
 /// them; dropping the handler between claim and FIFO enqueue must not leave a
@@ -352,6 +356,8 @@ pub struct LanguageServerPool {
     /// workspace root (issue #382); documents sharing a root (or the
     /// client-root fallback) still share one process.
     connections: Mutex<HashMap<ConnectionKey, Arc<ConnectionHandle>>>,
+    /// Weak directory exposed to downstream `kakehashi/bridge/peer*` requests.
+    peer_directory: Arc<super::peer::PeerDirectory>,
     /// Gate that rejects **new** connection spawns once shutdown has begun.
     ///
     /// `shutdown_all` snapshots the live connections and tears them down, but a
@@ -384,7 +390,7 @@ pub struct LanguageServerPool {
     /// (host-document-bridge): the real-URI documents opened on downstream
     /// servers via `bridge._self`, with their version and content
     /// fingerprint for lazy full-text re-sync.
-    host_documents: Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>,
+    host_documents: Arc<HostDocuments>,
     /// Host documents explicitly suppressed by a downstream routing answer.
     host_routing_suppressed: DashMap<(String, ConnectionKey), ()>,
     /// Host/server pairs for which routing has already been decided, including
@@ -505,11 +511,10 @@ pub struct LanguageServerPool {
     /// route an incoming `$/progress`) and the dispatch path (register on
     /// fan-out / deregister on completion).
     client_progress_registry: Arc<super::ClientProgressRegistry>,
-    /// Tracks downstream-initiated requests forwarded to the editor so a
-    /// downstream `$/cancelRequest` (or connection death) can cancel the
-    /// editor-bound request (#404) — capability-gated applyEdits are
-    /// registered too, though answered locally. Shared with every reader task (to register /
-    /// fire) and the forwarding loop (to await / drop). Distinct from
+    /// Tracks downstream-initiated requests forwarded to the editor or another
+    /// peer so `$/cancelRequest` (or connection death) can stop the matching
+    /// operation. Shared with every reader task (to register/fire) and the
+    /// editor/peer forwarding tasks (to await/drop). Distinct from
     /// `upstream_request_registry`, which is the *outbound* (editor → downstream)
     /// cancel direction.
     inbound_request_registry: super::InboundRequestRegistry,
@@ -534,14 +539,20 @@ impl LanguageServerPool {
         let (window_tx, window_rx) =
             tokio::sync::mpsc::channel(super::actor::WINDOW_NOTIFICATION_QUEUE_CAPACITY);
         let (upstream_request_tx, upstream_request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let document_tracker = Arc::new(DocumentTracker::new());
+        let host_documents = Arc::new(Mutex::new(HashMap::new()));
         Self {
             connections: Mutex::new(HashMap::new()),
+            peer_directory: Arc::new(super::peer::PeerDirectory::new(
+                Arc::clone(&document_tracker),
+                Arc::clone(&host_documents),
+            )),
             shutting_down: AtomicBool::new(false),
-            document_tracker: Arc::new(DocumentTracker::new()),
+            document_tracker,
             open_transition_locks: Arc::new(DashMap::new()),
             host_lifecycle_locks: DashMap::new(),
             latest_virtual_contents: DashMap::new(),
-            host_documents: Mutex::new(HashMap::new()),
+            host_documents,
             host_routing_suppressed: DashMap::new(),
             host_routing_decided: DashMap::new(),
             host_routing_by_server: DashMap::new(),
@@ -833,10 +844,10 @@ impl LanguageServerPool {
             if let Some(handle) = connections.get(&key) {
                 handle.begin_shutdown();
             }
-            self.host_documents
-                .lock()
-                .await
-                .retain(|(_, connection_key), _| connection_key != &key);
+            self.host_documents.lock().await.retain(|_, connections| {
+                connections.remove(&key);
+                !connections.is_empty()
+            });
             self.clear_host_routing_for_connection(&key);
             self.document_tracker.purge_connection(&key).await;
             // Arm before the replacement can claim: what this connection held
@@ -991,10 +1002,10 @@ impl LanguageServerPool {
             if let Some(handle) = connections.get(&key) {
                 handle.begin_shutdown();
             }
-            self.host_documents
-                .lock()
-                .await
-                .retain(|(_, connection_key), _| connection_key != &key);
+            self.host_documents.lock().await.retain(|_, connections| {
+                connections.remove(&key);
+                !connections.is_empty()
+            });
             self.clear_host_routing_for_connection(&key);
             self.document_tracker.purge_connection(&key).await;
             // Arm before the replacement can claim: what this connection held
@@ -1217,7 +1228,8 @@ impl LanguageServerPool {
     /// request path in `text_document/host.rs`.
     pub(super) async fn host_documents(
         &self,
-    ) -> tokio::sync::MutexGuard<'_, HashMap<(String, ConnectionKey), HostDocSyncState>> {
+    ) -> tokio::sync::MutexGuard<'_, HashMap<String, HashMap<ConnectionKey, HostDocSyncState>>>
+    {
         self.host_documents.lock().await
     }
 
@@ -1338,8 +1350,8 @@ impl LanguageServerPool {
         let key = host_uri.to_string();
         self.host_documents()
             .await
-            .keys()
-            .any(|(uri, connection_key)| uri == &key && connection_key.server() == server_name)
+            .get(&key)
+            .is_some_and(|connections| connections.keys().any(|key| key.server() == server_name))
     }
 
     /// Whether the host document has been synced on this exact pooled
@@ -1351,7 +1363,8 @@ impl LanguageServerPool {
     ) -> bool {
         self.host_documents()
             .await
-            .contains_key(&(host_uri.to_string(), connection_key.clone()))
+            .get(host_uri.as_str())
+            .is_some_and(|connections| connections.contains_key(connection_key))
     }
 
     pub(crate) fn set_host_routing_suppressed(
@@ -1661,10 +1674,9 @@ impl LanguageServerPool {
         let key = host_uri.to_string();
         self.host_documents()
             .await
+            .get(&key)?
             .iter()
-            .find(|((uri, connection_key), _)| {
-                uri == &key && connection_key.server() == server_name
-            })
+            .find(|(connection_key, _)| connection_key.server() == server_name)
             .map(|(_, state)| state.version)
     }
 
@@ -3096,10 +3108,10 @@ impl LanguageServerPool {
                     // sharing the server name keep their state. Lock order:
                     // connections → host_documents / document tracker,
                     // consistent with close_host_bridge_document's prefetch.
-                    self.host_documents
-                        .lock()
-                        .await
-                        .retain(|(_, key), _| key != &connection_key);
+                    self.host_documents.lock().await.retain(|_, connections| {
+                        connections.remove(&connection_key);
+                        !connections.is_empty()
+                    });
                     self.clear_host_routing_for_connection(&connection_key);
                     self.document_tracker
                         .purge_connection(&connection_key)
@@ -3205,6 +3217,7 @@ impl LanguageServerPool {
                 // The applyEdit version validation scopes downstream-supplied
                 // versions to this connection's version space (PR-L).
                 connection_key: connection_key.clone(),
+                peer_directory: Arc::clone(&self.peer_directory),
                 response_tx: tx.clone(),
                 dynamic_capabilities: Arc::clone(&dynamic_capabilities),
                 upstream_tx: self.upstream_tx.clone(),
@@ -3248,6 +3261,7 @@ impl LanguageServerPool {
 
         // Insert into pool immediately so concurrent requests see Initializing state
         connections.insert(connection_key.clone(), Arc::clone(&handle));
+        self.peer_directory.register(&handle);
 
         // Release lock before spawning handshake task
         drop(connections);

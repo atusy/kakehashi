@@ -27,5 +27,5 @@ pub(crate) use reader::{
 };
 #[cfg(test)]
 pub(crate) use response_router::RouteResult;
-pub(crate) use response_router::{ResponseRouter, RouterCleanupGuard};
+pub(crate) use response_router::{BridgeFailure, ResponseRouter, RouterCleanupGuard};
 pub(crate) use writer::{OUTBOUND_QUEUE_CAPACITY, WriterTaskHandle, spawn_writer_task};

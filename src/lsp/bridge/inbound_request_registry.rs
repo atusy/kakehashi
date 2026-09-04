@@ -1,22 +1,23 @@
-//! Cancellation registry for downstream-initiated requests forwarded to the
-//! editor (`window/showMessageRequest`, `window/showDocument`,
-//! `workspace/applyEdit` — which is registered but answered locally, never
-//! editor-bound, when the editor lacks the capability).
+//! Cancellation registry for downstream-initiated requests forwarded either to
+//! the editor (`window/showMessageRequest`, `window/showDocument`, and
+//! `workspace/applyEdit`) or to another downstream peer.
 //!
 //! When a downstream server sends `$/cancelRequest` for such a request — or its
-//! connection dies while one is in flight — the bridge must tell the editor to
-//! cancel so a `showMessageRequest` dialog is dismissed. tower-lsp's `Client`
+//! connection dies while one is in flight — the bridge must cancel the matching
+//! forwarding operation. For editor-bound requests, tower-lsp's `Client`
 //! exposes no cancel API for an outgoing request, so the forwarding loop instead
 //! sends the request with an id it minted (see `send_editor_request`) and, on
-//! cancel, sends a correlated `$/cancelRequest` to the editor. (A locally
-//! answered request — the capability-gated applyEdit — is unregistered before
+//! cancel, sends a correlated `$/cancelRequest` to the editor. Peer forwarding
+//! similarly retires its target router entry and requests downstream
+//! cancellation when writing has started. (A locally answered request — the
+//! capability-gated applyEdit — is unregistered before
 //! its token is ever awaited, so cancellation has nothing to do there.)
 //!
 //! This registry connects the two halves: the per-connection reader (which sees
 //! the downstream `$/cancelRequest` and the connection lifecycle) registers each
-//! in-flight forwarded request and fires its [`CancellationToken`]; the global
-//! forwarding loop awaits that token. Keyed by `(connection, downstream request
-//! id)`.
+//! in-flight forwarded request and fires its [`CancellationToken`]; the relevant
+//! editor or peer forwarding task awaits that token. Keyed by `(connection,
+//! downstream request id)`.
 //!
 //! Registration happens on the reader **before** the request is enqueued, so a
 //! `$/cancelRequest` that races in immediately after can't miss it. The token is
@@ -42,6 +43,30 @@ struct Entry {
     token: CancellationToken,
 }
 
+/// Per-generation capacity held until target router state and cleanup work are
+/// both gone. It is deliberately independent of the outer request-id registry:
+/// cancellation settles the outer request before a written target request can
+/// be safely retired.
+pub(crate) struct PeerRequestPermit {
+    counts: Arc<Mutex<HashMap<ProgressConnectionId, usize>>>,
+    connection_id: ProgressConnectionId,
+}
+
+impl Drop for PeerRequestPermit {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().recover_poison("PeerRequestPermit::drop");
+        let Some(count) = counts.get_mut(&self.connection_id) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&self.connection_id);
+        }
+    }
+}
+
+pub(crate) const MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION: usize = 64;
+
 /// Shared (cheaply cloneable) registry of in-flight forwarded requests. Nested
 /// `connection → (request id → entry)` so per-id lookups don't clone the id and
 /// a connection's requests can be cancelled and dropped together in one
@@ -50,6 +75,7 @@ struct Entry {
 pub(crate) struct InboundRequestRegistry {
     inner: Arc<Mutex<HashMap<ProgressConnectionId, HashMap<jsonrpc::Id, Entry>>>>,
     next_generation: Arc<AtomicU64>,
+    peer_request_counts: Arc<Mutex<HashMap<ProgressConnectionId, usize>>>,
 }
 
 impl InboundRequestRegistry {
@@ -62,12 +88,51 @@ impl InboundRequestRegistry {
         connection_id: ProgressConnectionId,
         request_id: jsonrpc::Id,
     ) -> (CancellationToken, u64) {
+        self.register_inner(connection_id, request_id)
+    }
+
+    /// Register peer forwarding while bounding the tasks and router state a
+    /// single downstream connection can keep alive without responses.
+    pub(crate) fn try_register_peer(
+        &self,
+        connection_id: ProgressConnectionId,
+        request_id: jsonrpc::Id,
+    ) -> Option<(CancellationToken, u64, PeerRequestPermit)> {
+        let permit = self.try_acquire_peer_permit(connection_id)?;
+        let (token, generation) = self.register_inner(connection_id, request_id);
+        Some((token, generation, permit))
+    }
+
+    fn try_acquire_peer_permit(
+        &self,
+        connection_id: ProgressConnectionId,
+    ) -> Option<PeerRequestPermit> {
+        let mut counts = self
+            .peer_request_counts
+            .lock()
+            .recover_poison("InboundRequestRegistry::try_acquire_peer_permit");
+        let count = counts.entry(connection_id).or_default();
+        if *count >= MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION {
+            return None;
+        }
+        *count += 1;
+        Some(PeerRequestPermit {
+            counts: self.peer_request_counts.clone(),
+            connection_id,
+        })
+    }
+
+    fn register_inner(
+        &self,
+        connection_id: ProgressConnectionId,
+        request_id: jsonrpc::Id,
+    ) -> (CancellationToken, u64) {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let token = CancellationToken::new();
         let replaced = self
             .inner
             .lock()
-            .recover_poison("InboundRequestRegistry::register")
+            .recover_poison("InboundRequestRegistry::register_inner")
             .entry(connection_id)
             .or_default()
             .insert(
@@ -78,8 +143,8 @@ impl InboundRequestRegistry {
                 },
             );
         // A well-behaved downstream never reuses a request id while one is in
-        // flight, but if it does, cancel the orphaned request so its forwarded
-        // editor request (and dialog) doesn't dangle unreachable. The orphan's
+        // flight, but if it does, cancel the orphaned forwarding operation so
+        // it does not dangle unreachable (including any editor dialog). The orphan's
         // later unregister is a no-op — its generation no longer matches.
         if let Some(old) = replaced {
             old.token.cancel();
@@ -129,9 +194,8 @@ impl InboundRequestRegistry {
         }
     }
 
-    /// Cancel and drop every in-flight request for a connection — used when a
-    /// downstream connection's reader exits, so its forwarded requests don't
-    /// linger as open editor dialogs.
+    /// Cancel and drop every in-flight request for a connection when its reader
+    /// exits, dismissing editor interactions and retiring peer forwarding.
     pub(crate) fn cancel_connection(&self, connection_id: ProgressConnectionId) {
         if let Some(requests) = self
             .inner
@@ -232,5 +296,65 @@ mod tests {
         assert!(a.is_cancelled());
         assert!(b.is_cancelled());
         assert!(!other.is_cancelled());
+    }
+
+    #[test]
+    fn peer_forwarding_is_bounded_per_origin_connection() {
+        let registry = InboundRequestRegistry::default();
+        let mut registrations = Vec::new();
+        for n in 0..MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION {
+            registrations.push(
+                registry
+                    .try_register_peer(conn(1), jsonrpc::Id::Number(n as i64))
+                    .expect("requests up to the limit are admitted"),
+            );
+        }
+        assert!(
+            registry
+                .try_register_peer(conn(1), jsonrpc::Id::Number(1000))
+                .is_none(),
+            "one origin cannot grow peer forwarding state past the limit"
+        );
+        assert!(
+            registry
+                .try_register_peer(conn(2), jsonrpc::Id::Number(1000))
+                .is_some(),
+            "a different origin has its own allowance"
+        );
+
+        registry.unregister(conn(1), &jsonrpc::Id::Number(0), registrations[0].1);
+        assert!(
+            registry
+                .try_register_peer(conn(1), jsonrpc::Id::Number(1000))
+                .is_none(),
+            "outer settlement alone does not release target-side capacity"
+        );
+        registrations.remove(0);
+        assert!(
+            registry
+                .try_register_peer(conn(1), jsonrpc::Id::Number(1000))
+                .is_some(),
+            "settlement releases capacity"
+        );
+    }
+
+    #[test]
+    fn reused_outer_id_counts_each_live_peer_generation() {
+        let registry = InboundRequestRegistry::default();
+        let mut registrations = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_PEER_REQUESTS_PER_CONNECTION {
+            registrations.push(
+                registry
+                    .try_register_peer(conn(1), jsonrpc::Id::Number(7))
+                    .expect("each generation owns independent capacity"),
+            );
+        }
+        assert!(
+            registry
+                .try_register_peer(conn(1), jsonrpc::Id::Number(7))
+                .is_none(),
+            "reusing one outer id cannot bypass the generation limit"
+        );
+        drop(registrations);
     }
 }
