@@ -129,12 +129,14 @@ fn e2e_virtual_completion_from_resolving_server_is_enveloped() {
     shutdown_client(&mut client);
 }
 
-/// A same-shape edit inside the fence leaves the region's geometry intact
-/// but changes the content the items were computed against; a resolve of a
-/// pre-edit item must come back unresolved, with its envelope intact for the
-/// editor's next completion request.
+/// A completion list is designed to outlive edits: the editor filters it
+/// locally while the user keeps typing and resolves an item on accept, which
+/// itself edits. A same-shape edit inside the fence must therefore NOT refuse
+/// the resolve — the downstream computes the lazy fields against its own,
+/// already synchronized text. (Inlay hints and lazy code actions, which the
+/// editor re-requests on every edit, are refused instead.)
 #[test]
-fn e2e_virtual_completion_resolve_after_same_shape_edit_stays_unresolved() {
+fn e2e_virtual_completion_resolve_survives_a_same_shape_edit() {
     let (mut client, _config_dir, item) =
         init_virtual_completion_client("completion-resolve-plain");
     assert_eq!(item["data"]["kakehashi"]["origin"], "mock-completion");
@@ -158,9 +160,11 @@ fn e2e_virtual_completion_resolve_after_same_shape_edit_stays_unresolved() {
     );
     let response = client.send_request("completionItem/resolve", item.clone());
     assert!(response.get("error").is_none(), "{response}");
-    assert_eq!(
-        response["result"], item,
-        "a resolve of an item computed against the previous text must stay unresolved"
+    assert!(
+        response["result"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("mock-resolved:")),
+        "a resolve after an edit that kept the region must still reach the downstream: {response}"
     );
 
     shutdown_client(&mut client);

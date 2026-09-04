@@ -43,13 +43,17 @@ impl Kakehashi {
             let Ok(host_url) = Url::parse(&envelope.host_uri) else {
                 return Ok(params);
             };
-            // Both layers: the item was computed against one text revision,
-            // and a lazily materialized edit or documentation for another
-            // must not be surfaced as if it were for this one.
-            if !self.document_revision_is_current(&host_url, envelope.content_version) {
+            // No text-revision gate here, unlike the inlay hint and code
+            // action resolves: a completion list is designed to outlive edits
+            // (clients filter it locally while the user keeps typing and
+            // resolve on accept, which itself edits), and the downstream
+            // computes the lazy fields against its own, already synchronized
+            // text. Only the lifetime and, on the virt layer, the region
+            // geometry are checked.
+            if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
                 log::debug!(
                     target: "kakehashi::bridge",
-                    "completionItem/resolve: {} was revised since the item was produced; returning item unresolved",
+                    "completionItem/resolve: {} was reopened since the item was produced; returning item unresolved",
                     envelope.host_uri
                 );
                 return Ok(params);
@@ -89,20 +93,18 @@ impl Kakehashi {
             },
             None => Ok(dispatch.await),
         }?;
-        // A later didChange/didClose is allowed to proceed once the resolve
-        // was enqueued. Revalidate after the response so fields computed
-        // against the content this resolve observed are not surfaced into a
-        // revised or reopened document.
+        // A didClose/didOpen is allowed to proceed once the resolve was
+        // enqueued. Revalidate the lifetime after the response so fields
+        // computed for the closed document are not surfaced into the
+        // reopened one.
         if let (Some(envelope), Some(unresolved)) = (envelope, unresolved) {
             let Ok(host_url) = Url::parse(&envelope.host_uri) else {
                 return Ok(unresolved);
             };
-            if !self.document_revision_is_current(&host_url, envelope.content_version)
-                || !self.host_incarnation_is_current(&host_url, envelope.incarnation)
-            {
+            if !self.host_incarnation_is_current(&host_url, envelope.incarnation) {
                 log::debug!(
                     target: "kakehashi::bridge",
-                    "completionItem/resolve: {} was revised or reopened while resolving; returning item unresolved",
+                    "completionItem/resolve: {} was reopened while resolving; returning item unresolved",
                     envelope.host_uri
                 );
                 return Ok(unresolved);
