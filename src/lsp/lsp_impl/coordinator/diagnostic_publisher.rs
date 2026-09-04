@@ -18,6 +18,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::document::DocumentStore;
+use crate::error::LockResultExt;
 use crate::language::{InjectionResolver, LanguageCoordinator};
 use crate::lsp::bridge::{
     BridgeCoordinator, ProgressConnectionId, RegionOffset, VirtualDocumentUri,
@@ -148,6 +149,7 @@ pub(crate) struct DiagnosticPublisher {
     bridge: Arc<BridgeCoordinator>,
     settings_manager: Arc<SettingsManager>,
     cache: Arc<crate::lsp::cache::CacheCoordinator>,
+    parser_pool: Arc<std::sync::Mutex<crate::language::DocumentParserPool>>,
     snapshot_preparer: DiagnosticSnapshotPreparer,
     aggregator: Arc<DiagnosticAggregator>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -162,6 +164,7 @@ impl DiagnosticPublisher {
             bridge: Arc::clone(&server.bridge),
             settings_manager: Arc::clone(&server.settings_manager),
             cache: Arc::clone(&server.cache),
+            parser_pool: Arc::clone(&server.parser_pool),
             snapshot_preparer: DiagnosticSnapshotPreparer::new(server),
             aggregator: Arc::clone(&server.diagnostics),
             shutdown: server.shutdown_token.clone(),
@@ -1578,9 +1581,16 @@ impl DiagnosticPublisher {
             return Some(offsets);
         };
         // A language still publishing (queries land before the parser) has
-        // unknown geometry: defer, like a pending tree. A visible parser
-        // with no injection query is definitive.
-        if !self.language.has_parser_available(&language_name) {
+        // unknown geometry: defer, like a pending tree. So does a settings
+        // reload in progress, during which an already-visible parser keeps
+        // its registration while its queries are cleared and republished. A
+        // visible parser with no injection query is otherwise definitive.
+        let reload_in_progress = self
+            .parser_pool
+            .lock()
+            .recover_poison("DiagnosticPublisher::current_region_offsets")
+            .reload_in_progress();
+        if reload_in_progress || !self.language.has_parser_available(&language_name) {
             return None;
         }
         let Some(injection_query) = self.language.injection_query(&language_name) else {
@@ -3391,6 +3401,25 @@ mod tests {
             publisher.current_region_offsets(&publishing).is_none(),
             "a language whose parser is not published has unknown geometry"
         );
+        // Parser published, but a reload is swapping its queries: unknown too.
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), language);
+        server
+            .parser_pool
+            .lock()
+            .expect("parser pool lock")
+            .begin_reload();
+        assert!(
+            publisher.current_region_offsets(&publishing).is_none(),
+            "a reload in progress has unknown geometry"
+        );
+        server
+            .parser_pool
+            .lock()
+            .expect("parser pool lock")
+            .finish_reload();
 
         // Closed (never-opened) document: geometry ABSENT → Some(empty) (stale
         // region slots legitimately drop; didClose's clearing publish proceeds).
