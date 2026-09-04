@@ -1773,15 +1773,16 @@ fn spawn_upstream_request(
                             continue;
                         };
                         let Some(injections) = injections else {
-                            // The host language's injection query is not in
-                            // the store right now (a lazy load or a reload
-                            // still swapping queries in): this pass could not
-                            // look, which is not "nothing to repair". Report
-                            // the connection incomplete; the parse that
-                            // follows the query's arrival re-opens eagerly.
+                            // The document could not be looked at: its
+                            // language is still publishing, or a reload
+                            // placeholder left it tree-less while its
+                            // replacement parse is queued. Not "nothing to
+                            // repair" — report the connection incomplete; the
+                            // parse that lands next re-opens eagerly.
                             log::debug!(
                                 target: "kakehashi::bridge",
-                                "Re-open of {key}: {host} has no injection query loaded yet; \
+                                "Re-open of {key}: {host} could not be looked at \
+                                 (language still publishing, or no tree yet); \
                                  reporting the connection incomplete"
                             );
                             repaired = false;

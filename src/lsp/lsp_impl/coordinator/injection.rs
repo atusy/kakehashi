@@ -143,13 +143,25 @@ impl InjectionCoordinator {
             );
         }
 
-        let injection_query = self.language.injection_query(host_language)?;
+        // `None` below means "could not be looked at", which the re-open sweep
+        // must tell apart from "has nothing" — the latter releases commands.
+        let parser_published = self.language.has_parser_available(host_language);
+        let Some(injection_query) = self.language.injection_query(host_language) else {
+            // Queries are published before the parser, so a visible parser
+            // with no injection query is definitive. Without the parser the
+            // load is still publishing (or failed, and nothing will parse).
+            return parser_published.then(Vec::new);
+        };
 
         let Some(doc) = self.documents.get(uri) else {
             return Some(Vec::new());
         };
         let Some(tree) = doc.tree().cloned() else {
-            return Some(Vec::new());
+            // No tree although a parser is published: a reload placeholder
+            // (`Document::invalidate_parse`, version-current and tree-less) or
+            // a parse that yielded nothing — either way the document could not
+            // be looked at. No parser: nothing will ever be parsed here.
+            return (!parser_published).then(Vec::new);
         };
         let text = doc.text_arc();
         let incarnation = doc.incarnation();
@@ -527,9 +539,9 @@ impl InjectionCoordinator {
     /// when the document has no detectable language. Lets a caller re-derive the
     /// injected regions on demand (the respawn re-open), mirroring the
     /// didOpen/didChange discovery.
-    /// The inner `None` means the host language's injection query is not in
-    /// the store right now: the document could not be looked at, which is
-    /// not the same as having no injections.
+    /// The inner `None` means the document could not be looked at — its
+    /// language is still publishing, or it has no tree although a parser is
+    /// published — which is not the same as having no injections.
     pub(crate) fn bridge_injections(
         &self,
         uri: &Url,
