@@ -43,6 +43,9 @@ impl Kakehashi {
         // resolved edits are translated and validated against the region as
         // it is now rather than as it was when the item was produced.
         let mut live_geometry = None;
+        // The text revision the downstream answers for; an edit landing while
+        // the request is in flight refuses the reply (below).
+        let mut revision_then = None;
         if let Some(envelope) = &envelope {
             let Ok(host_url) = Url::parse(&envelope.host_uri) else {
                 log::warn!(
@@ -53,7 +56,9 @@ impl Kakehashi {
                 return Ok(params);
             };
             // No text-revision gate here, unlike the inlay hint and code
-            // action resolves: a completion list is designed to outlive edits
+            // action resolves (an edit that lands while the resolve is in
+            // flight is refused after the reply instead): a completion list
+            // is designed to outlive edits
             // (clients filter it locally while the user keeps typing and
             // resolve on accept, which itself edits), and the downstream
             // computes the lazy fields against its own copy of the text,
@@ -75,6 +80,10 @@ impl Kakehashi {
                     None => return Ok(params),
                 }
             }
+            revision_then = self
+                .documents
+                .get(&host_url)
+                .map(|document| document.content_version());
         }
         // Kept for the post-response check; the gates above return `params`
         // itself, so only a resolve that is actually dispatched pays for it.
@@ -88,9 +97,6 @@ impl Kakehashi {
         // response" by the fail-soft parsing. Mirrors `code_action_resolve_impl`.
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let sweep_id = upstream_id.clone();
-        // The end the reply is translated and guarded against, kept for the
-        // post-reply comparison below.
-        let end_then = live_geometry.as_ref().map(|(_, end)| *end);
         let dispatch =
             pool.dispatch_completion_resolve(params, &settings, upstream_id, live_geometry);
         // The cancel arm DROPS the in-flight dispatch, which then never reaches
@@ -104,13 +110,14 @@ impl Kakehashi {
             sweep_id,
         );
         // A didChange/didClose/didOpen is allowed to proceed once the resolve
-        // was enqueued. Revalidate after the response: the lifetime for both
-        // layers, and for the virt layer the region's identity and start again
-        // — the reply's edits were computed for the region where it was, and
-        // translating them into where it is now would land them on the fence
-        // or on unrelated text. The region's END may still have moved (typing
-        // inside the region keeps the item resolvable). The rebuild can wait
-        // for a reparse, so it sits INSIDE the cancellable future.
+        // was enqueued. Revalidate after the response: the lifetime, and the
+        // text revision the downstream answered for. Edits BEFORE dispatch
+        // are what a completion list is designed to outlive (the gate above
+        // rebuilt the region for them); an edit landing while the request
+        // was in flight makes the reply's coordinates belong to text the
+        // document no longer holds — an inserted line near the fence start
+        // keeps the region's identity and start yet moves every line the
+        // reply's edits name — so such a reply is refused.
         let resolve = async {
             let resolved = dispatch.await;
             if let (Some(envelope), Some(unresolved)) = (envelope, unresolved) {
@@ -125,26 +132,17 @@ impl Kakehashi {
                     );
                     return unresolved;
                 }
-                // The same rule as before dispatch: identity, start,
-                // contiguity and language — not the whole offset, which
-                // typing inside a blockquoted fence grows. The end may grow
-                // too, but not shrink: the resolved edits were guarded
-                // against the end the region had when the reply was
-                // translated, and a region that shrank since may no longer
-                // contain them.
-                if !envelope.is_host_layer() {
-                    let still_the_region = self
-                        .completion_envelope_is_fresh(&envelope)
-                        .await
-                        .is_some_and(|(_, end_now)| end_then.is_none_or(|then| then <= end_now));
-                    if !still_the_region {
-                        log::debug!(
-                            target: "kakehashi::bridge",
-                            "completionItem/resolve: the region of {} moved or shrank while resolving; returning item unresolved",
-                            envelope.host_uri
-                        );
-                        return unresolved;
-                    }
+                let revision_now = self
+                    .documents
+                    .get(&host_url)
+                    .map(|document| document.content_version());
+                if revision_now != revision_then {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "completionItem/resolve: {} was edited while resolving; returning item unresolved",
+                        envelope.host_uri
+                    );
+                    return unresolved;
                 }
             }
             resolved
