@@ -518,10 +518,11 @@ inside the existing safety contracts at each step:
   channel + `latest_snapshot`. **The parse loop installs the legacy tree and the
   snapshot through one store primitive** (`install_parse`): the legacy tree (the
   incremental seed still reads `Document::tree`/`pending_seed`, which Stage 3
-  removes) is attached iff the parse's inputs still describe the document, the
-  snapshot is published iff the cell admits it, the tree is attached only when the
-  snapshot was, and both happen under the same entry guard — there is no
-  attach-only path. The **snapshot publish is the sole commit point** —
+  removes) is attached iff the parse's inputs still describe the document AND
+  the snapshot was admitted, the snapshot is published iff the language still
+  matches and the cell admits it, and both happen under the same entry guard —
+  there is no attach-only path, while publish-without-attach (a stale but
+  consistent parse) is allowed. The **snapshot publish is the sole commit point** —
   `semanticTokens/refresh` gates on the publish result, and the legacy-tree-
   dependent downstream (`mark_parse_finished`, the open parse's tree-dependent
   follow-ups) gates on the attach until Stage 3 removes the legacy tree (§2). So

@@ -539,8 +539,10 @@ impl ParseCoordinator {
                 // the snapshot (ADR §3 don't-discover-twice); populate guards
                 // itself against a pass whose text or lifetime moved on (the
                 // tracker's epoch and incarnation), so it needs no confirmation
-                // from the store first, and the install below then lands the
-                // tree and the snapshot together or rejects both.
+                // from the store first, and the install below then publishes
+                // the snapshot iff the cell admits it and attaches the tree
+                // only with an admitted snapshot and unchanged inputs (a
+                // language mismatch rejects both outright).
                 let regions = self
                     .populate_injections_on_pool(
                         uri.clone(),
@@ -797,13 +799,14 @@ impl ParseCoordinator {
 
             // Populate BEFORE the install so the discovery rides the snapshot
             // (ADR §3); populate guards itself against a pass whose text or
-            // lifetime moved on, and the install then lands the tree and the
-            // snapshot together — or neither: a closed (Vacant) document, one
-            // whose text moved (a concurrent `didChange`), and one a
-            // concurrent parse already gave a tree at this version (the cell
-            // refuses the equal-version swap, so the tree is not re-attached
-            // either) all drop this tree. (`Tree` clone is a cheap refcount
-            // bump.)
+            // lifetime moved on, and the install then attaches the tree only
+            // with an admitted snapshot and unchanged inputs: a closed
+            // (Vacant) document, one whose text moved (a concurrent
+            // `didChange` — its snapshot may still publish as an older
+            // version, the tree does not attach), and one a concurrent parse
+            // already gave a tree at this version (the cell refuses the
+            // equal-version swap, so the tree is not re-attached either) all
+            // drop this tree. (`Tree` clone is a cheap refcount bump.)
             let regions = self
                 .populate_injections_on_pool(
                     uri.clone(),
@@ -1006,7 +1009,7 @@ impl ParseCoordinator {
             // previous snapshot for populate's duration. Populate guards itself
             // against a pass whose text moved on mid-parse (the scheduler's
             // dirty loop is already reparsing the newer text), and the install
-            // then lands the tree and the snapshot together.
+            // then attaches the tree only with an admitted snapshot.
             let regions = self
                 .populate_injections_on_pool(
                     uri.clone(),

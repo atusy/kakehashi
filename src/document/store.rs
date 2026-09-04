@@ -681,9 +681,13 @@ pub(crate) struct SnapshotView {
 }
 
 /// What a parse pass expects the document to still be when its result is
-/// installed: the exact inputs it parsed. A document that moved on (an edit,
-/// a close and reopen, a relabelled language) rejects the legacy tree; the
-/// snapshot's own admission rule decides the publish independently.
+/// installed: the exact inputs it parsed. A relabelled language rejects the
+/// whole install; otherwise the cell's admission rule decides the publish,
+/// and the legacy tree is attached only when the snapshot was admitted AND
+/// the text, incarnation and content version are unchanged — so a document
+/// that moved on (an edit, a close and reopen) can still publish an older
+/// snapshot without attaching its tree, and an equal-version sibling parse
+/// attaches nothing even with unchanged inputs.
 pub(crate) struct ParseInputs<'a> {
     /// The exact text allocation the parse read (`Document::text_arc`);
     /// compared by identity, not content — this is the large-document open
@@ -702,9 +706,11 @@ pub(crate) struct ParseInputs<'a> {
 /// The outcome of [`DocumentStore::install_parse`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ParseInstall {
-    /// The legacy tree (and language) were attached: the inputs were unchanged.
+    /// The legacy tree (and language) were attached: the inputs were
+    /// unchanged and the snapshot was admitted (implies `published`).
     pub(crate) attached: bool,
-    /// The snapshot landed in the document's cell: the slot admitted it.
+    /// The snapshot landed in the document's cell: the language matched and
+    /// the slot admitted it.
     pub(crate) published: bool,
 }
 
