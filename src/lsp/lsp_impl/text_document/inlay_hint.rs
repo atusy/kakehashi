@@ -147,10 +147,14 @@ impl Kakehashi {
         // response fail soft on resolve until the editor's next request,
         // which follows an edit anyway. A reopen in that window is caught by
         // the region id, which the reopened document re-tracks.
-        let Some(content_version) = url::Url::parse(lsp_uri.as_str())
-            .ok()
-            .and_then(|uri| self.documents.get(&uri).map(|doc| doc.content_version()))
-        else {
+        let Some(revision) = url::Url::parse(lsp_uri.as_str()).ok().and_then(|uri| {
+            self.documents
+                .get(&uri)
+                .map(|doc| crate::lsp::bridge::HostRevision {
+                    incarnation: doc.incarnation(),
+                    content_version: doc.content_version(),
+                })
+        }) else {
             return Ok(None);
         };
         let Some(mut ctx) = self
@@ -182,7 +186,7 @@ impl Kakehashi {
                         &t.region_id,
                         t.offset,
                         &t.virtual_content,
-                        content_version,
+                        revision,
                         t.upstream_id,
                         t.client_progress_token,
                     )

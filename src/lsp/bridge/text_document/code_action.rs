@@ -445,7 +445,7 @@ impl LanguageServerPool {
         region_end: Position,
         offset: RegionOffset,
         virtual_content: &str,
-        content_version: u64,
+        revision: HostRevision,
         upstream_request_id: Option<UpstreamId>,
         client_progress_token: Option<NumberOrString>,
         upstream_caps: UpstreamCodeActionCaps,
@@ -514,7 +514,10 @@ impl LanguageServerPool {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         let virtual_uri_string =
             VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id).to_uri_string();
-        let host_incarnation = self.current_host_incarnation(host_uri);
+        // The lifetime and revision the handler read together, not a fresh
+        // read here: a close and reopen between the two would pair one
+        // lifetime's revision with the other's incarnation, and a later
+        // same-shape edit could then satisfy both stamps at once.
         let virt = VirtLayerContext {
             request_virtual_uri: &virtual_uri_string,
             host_uri: &host_uri_lsp,
@@ -526,8 +529,8 @@ impl LanguageServerPool {
             injection_language,
             host_uri_string: host_uri.as_str(),
             server_name,
-            incarnation: host_incarnation,
-            content_version: Some(content_version),
+            incarnation: Some(revision.incarnation),
+            content_version: Some(revision.content_version),
         };
         Ok(Some(bridge_code_actions(
             actions,
