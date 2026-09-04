@@ -64,6 +64,13 @@ impl DocumentParserPool {
         self.reload_depth = self.reload_depth.saturating_sub(1);
     }
 
+    /// Whether a settings reload is swapping parsers and queries right now.
+    /// Readers that combine a parser check with a query read must not trust
+    /// the pair while this holds: the two can come from different generations.
+    pub(crate) fn reload_in_progress(&self) -> bool {
+        self.reload_depth != 0
+    }
+
     pub(crate) fn acquire_versioned(&mut self, language_id: &str) -> ParserCheckout {
         if self.reload_depth != 0 {
             return ParserCheckout::Reloading;
