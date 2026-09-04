@@ -398,7 +398,7 @@ foldingRange, linkedEditingRange, … — lives in `docs/language-features.md`.
 | hover | ✅ Implemented | Pass-through with position translation |
 | signatureHelp | ✅ Implemented | Pass-through |
 | completion | ✅ Implemented | Fail-closed edit guards; atomic additionalTextEdits drop |
-| completionItem/resolve | ✅ Implemented | Envelope-routed (virt and host layers); an unsafe resolved PRIMARY edit serves the unresolved item, unsafe additionalTextEdits drop as an atomic set. Host-layer items forward verbatim — already host coordinates, so no translation and no region guard (the lifetime and, for code actions, revision stamps still gate them) |
+| completionItem/resolve | ✅ Implemented | Envelope-routed (virt and host layers); an unsafe resolved PRIMARY edit serves the unresolved item, unsafe additionalTextEdits drop as an atomic set. Host-layer items forward verbatim — already host coordinates, so no translation and no region guard (the lifetime stamp still gates them, and a reply the document was edited under in flight is refused) |
 | references | ✅ Implemented | Real-file URIs kept, cross-region virtual URIs dropped |
 | rename | ✅ Implemented | With workspace edit validation |
 | codeAction | ✅ Implemented | Edit-carrying, lazy (`codeAction/resolve` routed to the origin server), command-carrying (`workspace/executeCommand` name-routing + palette dispatch), host layer, multi-region menu merge; strict edit validation (cross-region / region bounds incl. per-line prefix floor) |

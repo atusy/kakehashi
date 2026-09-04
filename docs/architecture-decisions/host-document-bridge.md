@@ -112,7 +112,9 @@ Partially implemented:
   rebuilding the region, so a resolve issued during an ordinary post-edit
   reparse is judged by its stamps; a reparse that outlasts that budget still
   fails soft as a stale region. Code lens and document link, whose envelopes
-  carry no revision, rebuild the region again after the reply.
+  carry no revision, rebuild the region again after the reply for a virtual
+  item (a host item re-checks the lifetime); completion refuses a reply the
+  document was edited under while it was in flight.
   Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one

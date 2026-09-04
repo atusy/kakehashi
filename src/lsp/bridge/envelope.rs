@@ -10,8 +10,13 @@ use serde_json::Value;
 pub(crate) const ENVELOPE_KEY: &str = "kakehashi";
 
 /// The document lifetime and text revision a host-layer item was computed
-/// under, read with the text it was computed from. Both ride in the item's
-/// envelope so a resolve can refuse an item the document has moved past.
+/// under, read with the text it was computed from. Code action and inlay
+/// hint envelopes carry both so a resolve can refuse an item the document has
+/// moved past; completion envelopes carry the lifetime only (a completion
+/// list outlives edits), and code lens / document link envelopes neither
+/// (they rebuild the region instead). The transport binds every stamped host
+/// sync to the lifetime and refuses text older than the revision already
+/// synced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HostRevision {
     pub(crate) incarnation: u64,
