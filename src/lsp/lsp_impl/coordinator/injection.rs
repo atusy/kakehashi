@@ -4,6 +4,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::document::DocumentStore;
+use crate::error::LockResultExt;
 use crate::language::injection::{InjectionResolver, collect_all_injections};
 use crate::language::{DocumentParserPool, LanguageCoordinator, LanguageEvent};
 use crate::lsp::auto_install::AutoInstallManager;
@@ -36,6 +37,8 @@ pub(crate) struct InjectionCoordinator {
     auto_install: AutoInstallManager,
     bridge: std::sync::Arc<BridgeCoordinator>,
     diagnostics: std::sync::Arc<DiagnosticAggregator>,
+    settle_retry_waiters: crate::lsp::lsp_impl::settle_retry::SettleRetryWaiters,
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// What a bounded wait for a current tree actually found.
@@ -62,6 +65,8 @@ impl InjectionCoordinator {
             auto_install: server.auto_install.clone(),
             bridge: std::sync::Arc::clone(&server.bridge),
             diagnostics: std::sync::Arc::clone(&server.diagnostics),
+            settle_retry_waiters: server.settle_retry_waiters.clone(),
+            shutdown: server.shutdown_token.clone(),
         }
     }
 
@@ -105,11 +110,44 @@ impl InjectionCoordinator {
     ///
     /// Lock safety: the document store lock is held only long enough to clone the
     /// tree and text, then released before the tree traversal — no DashMap deadlock risk.
+    /// `None` when the host language's injection query is not in the store
+    /// — a lazy load or a reload still swapping queries in — so the caller
+    /// can tell "could not look" from "looked and found none": the re-open
+    /// sweep must not report a document repaired on the former.
     pub(crate) fn resolve_injection_data(
         &self,
         uri: &Url,
         host_language: &str,
-    ) -> Vec<BridgeInjection> {
+    ) -> Option<Vec<BridgeInjection>> {
+        // A reload in progress makes nothing below evidence — not even the
+        // snapshot fast path: a parse that checked its parser out just before
+        // the reload began can publish regions derived from the OLD query
+        // under the transitional generation, which the stamp check accepts.
+        let reload_in_progress = || {
+            self.parser_pool
+                .lock()
+                .recover_poison("InjectionCoordinator::resolve_injection_data")
+                .reload_in_progress()
+        };
+        if reload_in_progress() {
+            return None;
+        }
+        // Nor is anything evidence before the language's parser is published
+        // (queries land first): regions a prior lifetime's parser derived, or
+        // an inline run of a query the published parser may not pair with,
+        // would let the sweep report a document repaired from unsettled
+        // state. The generation is read around the parser and query reads so
+        // a reload starting in between shows.
+        let generation_before = self.cache.semantic_token_generation();
+        if !self.language.has_parser_available(host_language) {
+            return None;
+        }
+        // Re-asked right before every successful answer: a reload that
+        // begins after the checks above (the auto-install reload does not
+        // even invalidate documents) would otherwise turn regions read from
+        // the old query into evidence.
+        let settled =
+            || !reload_in_progress() && self.cache.semantic_token_generation() == generation_before;
         // Fast path (parse-snapshot ADR §3, never discover twice): the parse
         // pass that scheduled this downstream already derived the bridge
         // regions from its single injection-query run and published them on
@@ -127,7 +165,7 @@ impl InjectionCoordinator {
             // query would not discover. Mismatch falls back inline below.
             && *stamped_generation == self.cache.semantic_token_generation()
         {
-            return bridge_regions
+            let regions = bridge_regions
                 .iter()
                 .map(|region| BridgeInjection {
                     language: region.language.clone(),
@@ -135,33 +173,71 @@ impl InjectionCoordinator {
                     content: region.content.clone(),
                 })
                 .collect();
+            return settled().then_some(regions);
         }
 
-        let Some(injection_query) = self.language.injection_query(host_language) else {
-            return Vec::new();
+        // `None` below means "could not be looked at", which the re-open sweep
+        // must tell apart from "has nothing" — the latter releases commands.
+        //
+        // The parser check above and the query read are two reads of state a
+        // settings reload swaps in place (registry, then query store, under
+        // the reload guard). A pair straddling that swap could combine the old
+        // parser with a not-yet-published query and read as definitive, so a
+        // reload in progress — or one that started between the reads, which
+        // the generation bump reveals — makes the whole answer undeterminable.
+        let injection_query = self.language.injection_query(host_language);
+        if !settled() {
+            return None;
+        }
+        let Some(injection_query) = injection_query else {
+            // Queries are published before the parser, so a visible parser
+            // with no injection query is definitive.
+            return settled().then(Vec::new);
         };
 
-        let Some(doc) = self.documents.get(uri) else {
-            return Vec::new();
+        // Tree, text, language and lifetime from ONE current snapshot: the
+        // legacy document's tree can already be a replacement parse's while
+        // the current snapshot (and the language the caller screened) is
+        // still the previous one, and running one language's query against
+        // the other's tree would answer empty as if it had looked.
+        let Some(view) = self.documents.latest_snapshot(uri) else {
+            return Some(Vec::new());
         };
-        let Some(tree) = doc.tree().cloned() else {
-            return Vec::new();
+        let Some(snapshot) = view
+            .slot
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.parsed_version == view.content_version)
+        else {
+            // Trailing or never parsed: could not look.
+            return None;
         };
-        let text = doc.text_arc();
-        let incarnation = doc.incarnation();
-        drop(doc);
+        let Some(tree) = snapshot.tree.clone() else {
+            // No tree under a published parser: a reload placeholder
+            // (`Document::invalidate_parse`, version-current and tree-less) or
+            // a parse that yielded nothing. The document could not be looked
+            // at.
+            return None;
+        };
+        if snapshot.language.as_deref() != Some(host_language) {
+            // The tree belongs to another language than the one asked about
+            // (a re-detection between the caller's screen and this read).
+            return None;
+        }
+        let text = std::sync::Arc::clone(&snapshot.text);
+        let incarnation = snapshot.incarnation;
 
         let Some(regions) =
             collect_all_injections(&tree.root_node(), &text, Some(injection_query.as_ref()))
         else {
-            return Vec::new();
+            return settled().then(Vec::new);
         };
 
         if regions.is_empty() {
-            return Vec::new();
+            return settled().then(Vec::new);
         }
 
-        InjectionResolver::resolve_from_regions(
+        let resolved = InjectionResolver::resolve_from_regions(
             &self.language,
             self.bridge.node_tracker(),
             uri,
@@ -175,7 +251,8 @@ impl InjectionCoordinator {
             region_id: region.region.region_id,
             content: region.virtual_content,
         })
-        .collect()
+        .collect();
+        settled().then_some(resolved)
     }
 
     /// Process injected languages: resolve injection data, optionally forward didChange,
@@ -236,11 +313,43 @@ impl InjectionCoordinator {
             return false;
         }
 
-        let Some(host_language) = self.get_language_for_document(uri) else {
+        // Stored language first (see `document_language`): parser-aware
+        // detection answers `None` while the language is still publishing,
+        // which would cancel the eager batch and exit as if the document had
+        // no language, before the resolution below can answer "could not
+        // look" and leave existing state alone.
+        let Some(host_language) = self.document_language(uri) else {
             self.bridge.cancel_eager_open(uri);
             return false;
         };
-        let injections = self.resolve_injection_data(uri, &host_language);
+        // `None`: the document could not be looked at (its language is still
+        // publishing, or it has no tree yet). Leave whatever is open alone —
+        // there is no evidence anything changed — and let the parse that
+        // lands once the language is in place run this pass for real.
+        let Some(injections) = self.resolve_injection_data(uri, &host_language) else {
+            // Nothing else re-runs this pass for a document whose sole parse
+            // overlapped a publication or reload window (an injected
+            // language's auto-install reload does not reparse hosts), so
+            // arrange the retry here. Every cause but one is transient (a
+            // language still publishing, a reload, a generation bump between
+            // the reads), and the cause is not re-sampled — it may already
+            // have settled — so the retry is admitted whenever the document
+            // could be looked at once things settle: it has a tree, or its
+            // language is what is unsettled. The one non-transient cause, a
+            // tree-less document under a settled language, gets a tree from
+            // its own next parse or never; retrying it would re-schedule
+            // itself on every attempt.
+            if self.snapshot_has_tree(uri) || self.language_is_unsettled(&host_language) {
+                self.retry_injection_pass_when_settled(
+                    uri,
+                    &host_language,
+                    forward_did_change,
+                    incarnation,
+                );
+            }
+            self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+            return true;
+        };
         if injections.is_empty() {
             self.bridge.cancel_eager_open(uri);
             return true;
@@ -478,6 +587,93 @@ impl InjectionCoordinator {
     fn get_language_for_document(&self, uri: &Url) -> Option<String> {
         detect_document_language(&self.language, &self.documents, uri)
     }
+    fn reload_in_progress(&self) -> bool {
+        self.parser_pool
+            .lock()
+            .recover_poison("InjectionCoordinator::reload_in_progress")
+            .reload_in_progress()
+    }
+
+    /// Whether `language`'s parser is not published yet or a reload is in
+    /// progress — the two transient reasons a resolution cannot look.
+    fn language_is_unsettled(&self, language: &str) -> bool {
+        self.reload_in_progress() || !self.language.has_parser_available(language)
+    }
+
+    /// Re-run the tree-derived downstream pass for `uri` once the language's
+    /// publication or reload has settled, bounded (`INJECTION_RETRY_BUDGET`):
+    /// a pass that answered "could not look" opened nothing, and without an
+    /// edit no other parse would try again. The retried pass re-reads every
+    /// input and re-checks the lifetime, so a close, reopen or edit in the
+    /// meantime makes it a no-op or the newer text's own pass.
+    fn retry_injection_pass_when_settled(
+        &self,
+        uri: &Url,
+        host_language: &str,
+        forward_did_change: bool,
+        incarnation: u64,
+    ) {
+        const INJECTION_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+        const INJECTION_RETRY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        // One waiter per document LIFETIME: a burst of passes deferred by the
+        // same window re-runs the pass once, when the language settles; a
+        // close and reopen in the meantime gets its own waiter, since this
+        // one exits at its lifetime check.
+        let Some(claim) = self
+            .settle_retry_waiters
+            .claim("injection", uri, Some(incarnation))
+        else {
+            return;
+        };
+        let this = self.clone();
+        let uri = uri.clone();
+        let host_language = host_language.to_string();
+        tokio::spawn(async move {
+            let claim = claim;
+            let deadline = tokio::time::Instant::now() + INJECTION_RETRY_BUDGET;
+            loop {
+                tokio::select! {
+                    _ = this.shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(INJECTION_RETRY_POLL) => {}
+                }
+                // A host parser discovered from `searchPaths` (not declared)
+                // loses its registration to the generation bump of any
+                // reload — including an injected language's auto-install,
+                // which re-ensures only the installed language — and nothing
+                // re-publishes it without a request. Ask for it here, or the
+                // wait below would only expire.
+                if !this.reload_in_progress() && !this.language.has_parser_available(&host_language)
+                {
+                    let _ = this
+                        .language
+                        .ensure_language_loaded_async(&host_language)
+                        .await;
+                }
+                if !this.language_is_unsettled(&host_language) {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "Re-running the injection pass for {uri}: {host_language} has settled"
+                    );
+                    // Release the slot BEFORE the rerun: a reload starting
+                    // right now makes the rerun defer again, and its retry
+                    // must be able to claim the slot this waiter held.
+                    drop(claim);
+                    let _ = this
+                        .process_injections_for_incarnation(&uri, forward_did_change, incarnation)
+                        .await;
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "Giving up the injection pass retry for {uri}: {host_language} did not settle"
+                    );
+                    return;
+                }
+            }
+        });
+    }
+
     /// The bridge coordinator, so the respawn re-open can drive the awaited
     /// `ensure_server_documents_open` (execute-command-routing-token).
     pub(crate) fn bridge(&self) -> &std::sync::Arc<BridgeCoordinator> {
@@ -501,8 +697,49 @@ impl InjectionCoordinator {
     /// The cheap half of what [`Self::bridge_injections`] returns, so a caller
     /// screening many candidate documents can ask the configuration question
     /// before paying for a parse wait and an injection resolution.
+    ///
+    /// The language the document was opened or parsed under comes first:
+    /// parser-aware detection answers `None` — or, worse, another loaded
+    /// language the path or content also matches — until the declared
+    /// language's parser is published, which a load in progress makes true
+    /// for a moment (queries land first). Detection is the fallback for a
+    /// document with no stored language, so the caller reads "could not
+    /// look" from the resolution instead of "no language" or the wrong one
+    /// from here.
+    ///
+    /// A settled parse names the language authoritatively: a reload that
+    /// changes how the document is detected publishes the new language on
+    /// the snapshot only (`reparse_latest`), while the stored id keeps the
+    /// pre-reload value, so the snapshot's language wins once the parse is
+    /// current and carries a tree.
     pub(crate) fn document_language(&self, uri: &Url) -> Option<String> {
-        self.get_language_for_document(uri)
+        self.screen_language(uri).map(|(language, _)| language)
+    }
+
+    /// [`Self::document_language`] together with whether the language came
+    /// from a settled parse (a current snapshot with a tree) — read from ONE
+    /// snapshot view, so a reload invalidating the parse (or a replacement
+    /// parse landing) between two reads cannot pair a settled tree with a
+    /// language that is not that tree's. The sweep's screen trusts a
+    /// rejection only when the flag is set.
+    pub(crate) fn screen_language(&self, uri: &Url) -> Option<(String, bool)> {
+        let settled = self.documents.latest_snapshot(uri).and_then(|view| {
+            view.slot.snapshot.as_ref().and_then(|snapshot| {
+                (snapshot.parsed_version == view.content_version && snapshot.tree.is_some())
+                    .then(|| snapshot.language.clone())
+                    .flatten()
+            })
+        });
+        if let Some(language) = settled {
+            return Some((language, true));
+        }
+        let stored = self
+            .documents
+            .get(uri)
+            .and_then(|document| document.language_id().map(str::to_string));
+        stored
+            .or_else(|| self.get_language_for_document(uri))
+            .map(|language| (language, false))
     }
 
     /// `uri`'s reopen generation, which scopes a downstream `didOpen` to the
@@ -517,8 +754,22 @@ impl InjectionCoordinator {
     /// when the document has no detectable language. Lets a caller re-derive the
     /// injected regions on demand (the respawn re-open), mirroring the
     /// didOpen/didChange discovery.
-    pub(crate) fn bridge_injections(&self, uri: &Url) -> Option<(String, Vec<BridgeInjection>)> {
-        let host_language = self.get_language_for_document(uri)?;
+    /// The inner `None` means the document could not be looked at — its
+    /// language is still publishing, or it has no tree although a parser is
+    /// published — which is not the same as having no injections.
+    pub(crate) fn bridge_injections(
+        &self,
+        uri: &Url,
+    ) -> Option<(String, Option<Vec<BridgeInjection>>)> {
+        let (host_language, settled) = self.screen_language(uri)?;
+        if !settled {
+            // The language did not come from a settled parse: between a
+            // reload and its replacement parse's publish, the stored id is
+            // the pre-reload language while the live tree may already be
+            // the replacement's — resolving would run one language's query
+            // against the other's tree. Nothing was looked at.
+            return Some((host_language, None));
+        }
         let injections = self.resolve_injection_data(uri, &host_language);
         Some((host_language, injections))
     }
@@ -530,9 +781,10 @@ impl InjectionCoordinator {
     /// landing right after an edit would resolve ZERO injections and silently
     /// open nothing — the same reason every request path waits for a fresh tree
     /// (execute-command-routing-token). This NARROWS that window rather than
-    /// closing it: the wait is bounded, and on expiry the re-open proceeds and
-    /// may still open nothing. Degrading to the pre-existing lazy heal (the next
-    /// parse re-opens) is preferred over stalling the barrier.
+    /// closing it: the wait is bounded, and on expiry the caller reads
+    /// `Unsettled`, skips the document and reports its sweep incomplete, leaving
+    /// the document to its own pending parse's eager open. Degrading to that
+    /// lazy heal is preferred over stalling the barrier.
     /// Returns which of the three outcomes a caller must distinguish. They are
     /// not interchangeable: `Gone` is nothing to do, `Unsettled` is something
     /// this pass could not determine, and collapsing them makes a closed buffer
@@ -555,6 +807,22 @@ impl InjectionCoordinator {
         //
         // The caller passes what is LEFT of the shared budget, so a sweep cannot
         // spend it several times over.
+        //
+        // A snapshot that is already current is answered without entering the
+        // timeout: the sweep keeps walking past its deadline with a ZERO
+        // budget, and a zero timeout can expire before the wait future gets
+        // to observe the snapshot — misreporting a current document as
+        // unsettled and leaving it un-reopened.
+        if self.snapshot_is_current(uri) {
+            return ParseWait::Current;
+        }
+        // Likewise a document closed since it was enumerated: with a zero
+        // budget the timeout can fire before the wait future looks, which
+        // would misreport a buffer the user closed as unsettled and hold the
+        // barrier shut over it.
+        if self.documents.get(uri).is_none() {
+            return ParseWait::Gone;
+        }
         use crate::lsp::lsp_impl::snapshot_read::SnapshotWait;
         match tokio::time::timeout(
             budget,
@@ -573,9 +841,32 @@ impl InjectionCoordinator {
             // user simply closed.
             Ok(SnapshotWait::Gone) => ParseWait::Gone,
             // Trailing, never parsed, or out of budget: whatever the injection
-            // resolution says next is not evidence about this document.
-            Ok(SnapshotWait::Stale | SnapshotWait::Unparsed) | Err(_) => ParseWait::Unsettled,
+            // resolution says next is not evidence about this document — unless
+            // the parse landed between the check above and the timeout, which
+            // a zero budget makes likely enough to look once more.
+            Ok(SnapshotWait::Stale | SnapshotWait::Unparsed) | Err(_) => {
+                if self.snapshot_is_current(uri) {
+                    ParseWait::Current
+                } else if self.documents.get(uri).is_none() {
+                    ParseWait::Gone
+                } else {
+                    ParseWait::Unsettled
+                }
+            }
         }
+    }
+
+    /// Whether `uri`'s current snapshot carries a tree — i.e. is a parse
+    /// result rather than a reload placeholder or a pre-parse slot. The
+    /// stored language of a document without one may predate the reload
+    /// that invalidated it (`invalidate_parse` keeps it until the replacement
+    /// parse lands), so a screen must not trust a rejection based on it.
+    pub(crate) fn snapshot_has_tree(&self, uri: &Url) -> bool {
+        self.documents.latest_snapshot(uri).is_some_and(|view| {
+            view.slot.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.parsed_version == view.content_version && snapshot.tree.is_some()
+            })
+        })
     }
 
     /// Whether `uri`'s published snapshot still matches its content — a cheap
@@ -624,6 +915,86 @@ mod tests {
     use tokio::sync::Notify;
     use tower_lsp_server::LspService;
     use url::Url;
+
+    /// The re-open sweep keeps walking after its parse-wait deadline with a
+    /// zero budget; a document whose snapshot is already current must still
+    /// read as current then, and one whose parse is pending as unsettled.
+    #[tokio::test]
+    async fn zero_budget_wait_answers_from_the_snapshot_state() {
+        use tree_sitter::Parser;
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let injection = server.injection_coordinator();
+
+        let pending = Url::parse("file:///zero-budget-pending.md").unwrap();
+        server.documents.insert(
+            pending.clone(),
+            "# pending".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        assert!(matches!(
+            injection
+                .ensure_document_parsed(&pending, std::time::Duration::ZERO)
+                .await,
+            super::ParseWait::Unsettled
+        ));
+
+        // A document closed since the sweep enumerated it is nothing to
+        // repair, whatever the budget.
+        let closed = Url::parse("file:///zero-budget-closed.md").unwrap();
+        server.documents.insert(
+            closed.clone(),
+            "# closed".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        server.documents.remove(&closed);
+        assert!(matches!(
+            injection
+                .ensure_document_parsed(&closed, std::time::Duration::ZERO)
+                .await,
+            super::ParseWait::Gone
+        ));
+
+        let current = Url::parse("file:///zero-budget-current.md").unwrap();
+        let text = "# current\n";
+        let incarnation = server.documents.insert(
+            current.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let content_version = server.documents.get(&current).unwrap().content_version();
+        let landed = server
+            .documents
+            .get(&current)
+            .map(|doc| {
+                doc.publish_snapshot(Arc::new(crate::document::snapshot::ParseSnapshot {
+                    text: Arc::from(text),
+                    tree: Some(tree),
+                    language: Some("markdown".to_string()),
+                    parsed_version: content_version,
+                    incarnation,
+                    injection_regions: None,
+                    bridge_regions: None,
+                    resolved_regions: None,
+                    layer_trees: std::sync::OnceLock::new(),
+                }))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test publish must land");
+        assert!(matches!(
+            injection
+                .ensure_document_parsed(&current, std::time::Duration::ZERO)
+                .await,
+            super::ParseWait::Current
+        ));
+    }
 
     #[tokio::test]
     async fn process_injections_finishes_before_fast_reopen() {
@@ -745,6 +1116,39 @@ mod tests {
         );
     }
 
+    /// Publish `tree` as `uri`'s current parse snapshot under `language`,
+    /// the way a settled parse would.
+    fn publish_test_snapshot(
+        server: &crate::lsp::lsp_impl::Kakehashi,
+        uri: &Url,
+        text: &str,
+        tree: tree_sitter::Tree,
+        language: &str,
+    ) {
+        let content_version = server.documents.get(uri).unwrap().content_version();
+        let incarnation = server.documents.get(uri).unwrap().incarnation();
+        let landed = server
+            .documents
+            .get(uri)
+            .map(|doc| {
+                doc.publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: Some(tree),
+                        language: Some(language.to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test publish must land");
+    }
+
     /// The snapshot fast path of `resolve_injection_data` must produce
     /// exactly what the inline (live-tree) resolution produces — the fast
     /// path's output is forwarded verbatim to downstream servers, so a
@@ -769,6 +1173,11 @@ mod tests {
             .language
             .query_store()
             .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
+        // The resolution answers only for a published parser.
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), language.clone());
         let text = r#"fn main() { let open = "<div>"; let close = "</div>"; }"#;
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language).expect("load rust grammar");
@@ -816,7 +1225,9 @@ mod tests {
             assert!(landed, "test publish must land");
         };
         publish(None, content_version);
-        let inline = injection.resolve_injection_data(&uri, "rust");
+        let inline = injection
+            .resolve_injection_data(&uri, "rust")
+            .expect("query present");
         assert_eq!(inline.len(), 1, "combined captures form one eager document");
 
         // FAST PATH: populate derives the bridge regions from the same tree
@@ -844,7 +1255,9 @@ mod tests {
             Some((populated.generation, std::sync::Arc::new(bridge_regions))),
             content_version,
         );
-        let fast = injection.resolve_injection_data(&uri, "rust");
+        let fast = injection
+            .resolve_injection_data(&uri, "rust")
+            .expect("query present");
 
         assert_eq!(
             inline.len(),
@@ -856,5 +1269,376 @@ mod tests {
             assert_eq!(a.region_id, b.region_id, "region id must match");
             assert_eq!(a.content, b.content, "clean content must match");
         }
+    }
+
+    /// A reload publishes a version-current placeholder with no tree while
+    /// the replacement parse is still queued, and a language publishes its
+    /// queries before its parser. A tree-less document could not be looked
+    /// at in either state.
+    #[tokio::test]
+    async fn tree_less_document_is_undeterminable() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"((string_literal (string_content) @injection.content)
+                (#set! injection.language "html"))"#,
+        )
+        .expect("valid query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
+        let uri = Url::parse("file:///tree_less.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".into()),
+            None,
+        );
+        server.documents.invalidate_all_parses();
+        let injection = server.injection_coordinator();
+
+        assert!(
+            injection.resolve_injection_data(&uri, "rust").is_none(),
+            "query published, parser not yet: the publication is in progress"
+        );
+
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), language);
+        assert!(
+            injection.resolve_injection_data(&uri, "rust").is_none(),
+            "with a parser, a tree-less document could not be looked at"
+        );
+    }
+
+    /// Queries are published before the parser, so a language whose parser is
+    /// visible and whose injection query is absent genuinely has none; only a
+    /// language still publishing is undeterminable.
+    #[tokio::test]
+    async fn missing_injection_query_is_definitive_once_the_parser_is_published() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let text = "fn main() {}";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("set language");
+        let tree = parser.parse(text, None).expect("parse rust");
+        let uri = Url::parse("file:///no_query.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), text.to_string(), Some("rust".into()), None);
+        server
+            .documents
+            .update_document(uri.clone(), text.to_string(), Some(tree));
+        let injection = server.injection_coordinator();
+
+        assert!(
+            injection.resolve_injection_data(&uri, "rust").is_none(),
+            "no parser published: the load is still publishing"
+        );
+
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), language);
+        assert!(
+            injection
+                .resolve_injection_data(&uri, "rust")
+                .is_some_and(|regions| regions.is_empty()),
+            "parser published and no injection query: genuinely no injections"
+        );
+    }
+
+    /// A settings reload swaps parsers and queries in place while the reload
+    /// guard is held; a parser and a query read in that window may come from
+    /// different generations, so nothing read then is evidence. The inline
+    /// resolution must answer "could not look" for its duration.
+    #[tokio::test]
+    async fn inline_resolution_is_undeterminable_while_a_reload_is_in_progress() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"((string_literal (string_content) @injection.content)
+                (#set! injection.language "html"))"#,
+        )
+        .expect("valid query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), language.clone());
+        let text = r#"fn main() { let open = "<div>"; }"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("set language");
+        let tree = parser.parse(text, None).expect("parse rust");
+        let uri = Url::parse("file:///reloading.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), text.to_string(), Some("rust".into()), None);
+        server
+            .documents
+            .update_document(uri.clone(), text.to_string(), Some(tree.clone()));
+        publish_test_snapshot(server, &uri, text, tree, "rust");
+        let injection = server.injection_coordinator();
+
+        assert!(
+            injection
+                .resolve_injection_data(&uri, "rust")
+                .is_some_and(|regions| regions.len() == 1),
+            "settled: the region resolves"
+        );
+
+        server
+            .parser_pool
+            .lock()
+            .expect("parser pool lock")
+            .begin_reload();
+        assert!(
+            injection.resolve_injection_data(&uri, "rust").is_none(),
+            "mid-reload, parser and query may disagree: could not look"
+        );
+        server
+            .parser_pool
+            .lock()
+            .expect("parser pool lock")
+            .finish_reload();
+        assert!(
+            injection
+                .resolve_injection_data(&uri, "rust")
+                .is_some_and(|regions| regions.len() == 1),
+            "settled again: the region resolves"
+        );
+
+        // The snapshot fast path too: regions a parse published under the
+        // current generation are not evidence while a reload is swapping
+        // the query they were derived from.
+        let populated = server
+            .cache
+            .populate_injections(
+                &uri,
+                text,
+                &parser.parse(text, None).expect("parse rust"),
+                "rust",
+                &server.language,
+                &server.bridge.node_tracker_arc(),
+                server.bridge.node_tracker_arc().mint_epoch(&uri),
+                server.documents.get(&uri).unwrap().incarnation(),
+                true,
+                true,
+            )
+            .expect("current pass populates");
+        let bridge_regions = populated.bridge_regions.expect("gate was true");
+        // A new revision, so the fast-path snapshot below is admitted (a
+        // second publish at the same revision is refused).
+        server.documents.update_document(
+            uri.clone(),
+            text.to_string(),
+            Some(parser.parse(text, None).expect("parse rust")),
+        );
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        let incarnation = server.documents.get(&uri).unwrap().incarnation();
+        let landed = server
+            .documents
+            .get(&uri)
+            .map(|doc| {
+                doc.publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        // With a tree: a tree-less snapshot would not be
+                        // admitted over the tree-bearing one already current.
+                        tree: Some(parser.parse(text, None).expect("parse rust")),
+                        language: Some("rust".to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: Some((
+                            populated.generation,
+                            std::sync::Arc::new(bridge_regions),
+                        )),
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test publish must land");
+        assert!(
+            injection
+                .resolve_injection_data(&uri, "rust")
+                .is_some_and(|regions| regions.len() == 1),
+            "settled: the fast path serves the published regions"
+        );
+        server
+            .parser_pool
+            .lock()
+            .expect("parser pool lock")
+            .begin_reload();
+        assert!(
+            injection.resolve_injection_data(&uri, "rust").is_none(),
+            "mid-reload, published regions are not evidence either"
+        );
+        server
+            .parser_pool
+            .lock()
+            .expect("parser pool lock")
+            .finish_reload();
+    }
+
+    /// The re-open sweep screens hosts by language before a parser is
+    /// necessarily published (queries land first). A document whose stored
+    /// language is known but whose parser is still on its way must read as
+    /// "could not look" (inner `None`), not as having no language (outer
+    /// `None`, which the sweep skips as not this connection's document).
+    #[tokio::test]
+    async fn bridge_injections_falls_back_to_the_stored_language_while_the_parser_is_pending() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"((string_literal (string_content) @injection.content)
+                (#set! injection.language "html"))"#,
+        )
+        .expect("valid query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
+        let uri = Url::parse("file:///pending_parser.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".into()),
+            None,
+        );
+        let injection = server.injection_coordinator();
+
+        assert_eq!(
+            injection.document_language(&uri).as_deref(),
+            Some("rust"),
+            "the stored language names the host while its parser is pending"
+        );
+        let (host_language, injections) = injection
+            .bridge_injections(&uri)
+            .expect("the stored language must name the host");
+        assert_eq!(host_language, "rust");
+        assert!(
+            injections.is_none(),
+            "no parser yet: the document could not be looked at"
+        );
+    }
+
+    /// A parser not yet published makes the document unlookable even when a
+    /// tree exists (a prior lifetime's parser, or a registry entry a reload
+    /// has scoped out): the query it would run may not be the one the
+    /// published parser will pair with.
+    #[tokio::test]
+    async fn treeful_document_under_a_pending_parser_is_undeterminable() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"((string_literal (string_content) @injection.content)
+                (#set! injection.language "html"))"#,
+        )
+        .expect("valid query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
+        let text = r#"fn main() { let open = "<div>"; }"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("set language");
+        let tree = parser.parse(text, None).expect("parse rust");
+        let uri = Url::parse("file:///treeful_pending.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), text.to_string(), Some("rust".into()), None);
+        server
+            .documents
+            .update_document(uri.clone(), text.to_string(), Some(tree.clone()));
+        publish_test_snapshot(server, &uri, text, tree, "rust");
+        let injection = server.injection_coordinator();
+
+        assert!(
+            injection.resolve_injection_data(&uri, "rust").is_none(),
+            "query present, parser not published: could not look"
+        );
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), language);
+        assert!(
+            injection
+                .resolve_injection_data(&uri, "rust")
+                .is_some_and(|regions| regions.len() == 1),
+            "parser published: the region resolves"
+        );
+    }
+
+    /// A reload that changes how a document is detected publishes the new
+    /// language on the snapshot only; the stored id keeps the pre-reload
+    /// value. Once the replacement parse is current, the snapshot's language
+    /// must win, or the sweep and the eager pass keep working under a
+    /// language the document no longer has.
+    #[tokio::test]
+    async fn document_language_prefers_the_settled_snapshot_over_the_stored_id() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let text = "# doc\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("set language");
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let uri = Url::parse("file:///redetected.md").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("derived-markdown".into()),
+            None,
+        );
+        let injection = server.injection_coordinator();
+        assert_eq!(
+            injection.document_language(&uri).as_deref(),
+            Some("derived-markdown"),
+            "before any parse settles, the stored id names the document"
+        );
+
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        let landed = server
+            .documents
+            .get(&uri)
+            .map(|doc| {
+                doc.publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: Some(tree),
+                        language: Some("markdown".to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test publish must land");
+        assert_eq!(
+            injection.document_language(&uri).as_deref(),
+            Some("markdown"),
+            "a settled parse names the language authoritatively"
+        );
     }
 }

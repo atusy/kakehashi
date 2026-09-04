@@ -580,12 +580,14 @@ impl LanguageCoordinator {
         search_paths: &[PathBuf],
         language: &tree_sitter::Language,
     ) -> LanguageLoadResult {
+        // One registration section from query removal through registration,
+        // like the configured and dynamic paths, so a same-generation dynamic
+        // load of this name cannot slip its queries in between.
+        let _registration = self
+            .registration_lock
+            .lock()
+            .recover_poison("LanguageCoordinator::register_derived_from_base");
         self.query_store.remove_queries(derived_name);
-        self.register_configured_language(derived_name, language.clone());
-        self.derived_languages
-            .write()
-            .recover_poison("LanguageCoordinator::register_derived_from_base(derived_languages)")
-            .insert(derived_name.to_string());
 
         let mut events = Vec::new();
         let should_load_derived_queries = config.queries.is_some()
@@ -605,6 +607,14 @@ impl LanguageCoordinator {
                 }
             }
         }
+
+        // Queries BEFORE the parser, as on every other publication path: a
+        // reader that finds the derived parser must find its queries.
+        self.register_configured_language(derived_name, language.clone());
+        self.derived_languages
+            .write()
+            .recover_poison("LanguageCoordinator::register_derived_from_base(derived_languages)")
+            .insert(derived_name.to_string());
 
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
@@ -886,12 +896,22 @@ impl LanguageCoordinator {
         {
             return false;
         }
+        // A duplicate of a load that already published (concurrent first
+        // loads are admitted): the language is in place, and clearing its
+        // queries again would reopen the parser-without-queries window.
+        if self.has_current_parser_registration(language_id, expected_generation) {
+            return true;
+        }
+        // Queries BEFORE the parser: `has_parser_available` reads the registry
+        // without this lock, so a parse admitted the instant the parser lands
+        // would otherwise run its injection pass against a store the queries
+        // have not reached yet and record the document as injection-free.
+        self.query_store.remove_queries(language_id);
+        publish_queries();
         self.language_registry
             .register(language_id.to_string(), language);
         self.reload_scoped_registrations
             .insert(language_id.to_string(), expected_generation);
-        self.query_store.remove_queries(language_id);
-        publish_queries();
         true
     }
 
@@ -1543,6 +1563,15 @@ impl LanguageCoordinator {
         config: &LanguageSettings,
         search_paths: &[PathBuf],
     ) -> LanguageLoadResult {
+        // One critical section from query removal through parser
+        // registration, like `publish_dynamic_language`: a same-generation
+        // dynamic load of this language would otherwise slip its queries in
+        // between the configured queries and the configured parser, leaving
+        // the registry with a configured parser over dynamic queries.
+        let _registration = self
+            .registration_lock
+            .lock()
+            .recover_poison("LanguageCoordinator::load_single_language");
         let generation = self
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1610,11 +1639,13 @@ impl LanguageCoordinator {
                 }
             }
         };
+        // Queries BEFORE the parser, for the same reason as
+        // `publish_dynamic_language`: a reader that finds the parser must find
+        // its queries.
+        let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
         if !pre_registered_is_builtin {
             self.register_configured_language(lang_name, language.clone());
         }
-
-        let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
             format!("Language {lang_name} loaded."),
@@ -1622,11 +1653,10 @@ impl LanguageCoordinator {
         LanguageLoadResult::success_with(events)
     }
 
+    /// Register a configured (or derived) language's parser. The caller holds
+    /// `registration_lock`: every publication path runs as one section from
+    /// query removal through this registration.
     fn register_configured_language(&self, language_id: &str, language: Language) {
-        let _registration = self
-            .registration_lock
-            .lock()
-            .recover_poison("LanguageCoordinator::register_configured_language");
         self.language_registry
             .register(language_id.to_string(), language);
         self.configured_load_failures.remove(language_id);
@@ -1637,11 +1667,10 @@ impl LanguageCoordinator {
             .insert(language_id.to_string(), generation);
     }
 
+    /// Record that `language_id`'s configured parser failed to load under
+    /// `generation`. The caller holds `registration_lock` (the configured load
+    /// runs as one registration section).
     fn record_configured_load_failure(&self, language_id: &str, generation: u64) {
-        let _registration = self
-            .registration_lock
-            .lock()
-            .recover_poison("LanguageCoordinator::record_configured_load_failure");
         self.configured_load_failures
             .insert(language_id.to_string(), generation);
         self.language_registry.unregister(language_id);
@@ -3599,6 +3628,75 @@ mod tests {
                 .is_none()
         );
         assert!(coordinator.configured_load_failed("racing", generation));
+    }
+
+    /// A reader that finds the parser registered must also find its queries:
+    /// `has_parser_available` does not take the registration lock, so a parse
+    /// admitted between the two publishes would run its injection query pass
+    /// against an empty store and record the document as injection-free.
+    #[test]
+    fn dynamic_publication_registers_the_parser_after_its_queries() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&WorkspaceSettings::default());
+        let generation = coordinator
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let parser_seen_while_publishing_queries = std::cell::Cell::new(None);
+        assert!(coordinator.publish_dynamic_language(
+            "ordered",
+            tree_sitter_rust::LANGUAGE.into(),
+            generation,
+            || {
+                parser_seen_while_publishing_queries
+                    .set(Some(coordinator.has_parser_available("ordered")));
+            },
+        ));
+        assert_eq!(
+            parser_seen_while_publishing_queries.get(),
+            Some(false),
+            "the queries must be published before the parser becomes visible"
+        );
+        assert!(coordinator.has_parser_available("ordered"));
+    }
+
+    /// Duplicate loads of one language are admitted concurrently; once the
+    /// first has published, a second must not clear the queries again while
+    /// the parser it published stays visible.
+    #[test]
+    fn duplicate_dynamic_publication_keeps_the_published_queries() {
+        let coordinator = LanguageCoordinator::new();
+        coordinator.load_settings(&WorkspaceSettings::default());
+        let generation = coordinator
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(&language, "(identifier) @injection.content")
+            .expect("valid query");
+        assert!(coordinator.publish_dynamic_language(
+            "twice",
+            language.clone(),
+            generation,
+            || {
+                coordinator
+                    .query_store
+                    .insert_injection_query("twice".to_string(), std::sync::Arc::new(query));
+            },
+        ));
+        let second_published_queries = std::cell::Cell::new(false);
+        assert!(
+            coordinator.publish_dynamic_language("twice", language, generation, || {
+                second_published_queries.set(true);
+            }),
+            "a duplicate load of a published language is a success"
+        );
+        assert!(
+            !second_published_queries.get(),
+            "the duplicate must not republish (and so not clear) the queries"
+        );
+        assert!(
+            coordinator.query_store.injection_query("twice").is_some(),
+            "the first publication's queries must survive the duplicate"
+        );
     }
 
     #[test]

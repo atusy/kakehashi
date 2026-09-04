@@ -18,6 +18,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::document::DocumentStore;
+use crate::error::LockResultExt;
 use crate::language::{InjectionResolver, LanguageCoordinator};
 use crate::lsp::bridge::{
     BridgeCoordinator, ProgressConnectionId, RegionOffset, VirtualDocumentUri,
@@ -148,6 +149,8 @@ pub(crate) struct DiagnosticPublisher {
     bridge: Arc<BridgeCoordinator>,
     settings_manager: Arc<SettingsManager>,
     cache: Arc<crate::lsp::cache::CacheCoordinator>,
+    parser_pool: Arc<std::sync::Mutex<crate::language::DocumentParserPool>>,
+    settle_retry_waiters: crate::lsp::lsp_impl::settle_retry::SettleRetryWaiters,
     snapshot_preparer: DiagnosticSnapshotPreparer,
     aggregator: Arc<DiagnosticAggregator>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -162,6 +165,8 @@ impl DiagnosticPublisher {
             bridge: Arc::clone(&server.bridge),
             settings_manager: Arc::clone(&server.settings_manager),
             cache: Arc::clone(&server.cache),
+            parser_pool: Arc::clone(&server.parser_pool),
+            settle_retry_waiters: server.settle_retry_waiters.clone(),
             snapshot_preparer: DiagnosticSnapshotPreparer::new(server),
             aggregator: Arc::clone(&server.diagnostics),
             shutdown: server.shutdown_token.clone(),
@@ -1098,6 +1103,19 @@ impl DiagnosticPublisher {
                         target: LOG_TARGET,
                         "defer republish for {host}: tree pending, region geometry unknown"
                     );
+                    // A deferral with a parse snapshot present is the
+                    // language still publishing or a reload in progress, not
+                    // a pending tree — and no reparse follows an injected
+                    // language's auto-install reload. Retry once it settles;
+                    // a document whose language stays unsettled (a load that
+                    // failed for good) ends the retry at its deadline.
+                    let lifetime = self.documents.get(host).and_then(|doc| {
+                        doc.snapshot()?;
+                        Some(doc.incarnation())
+                    });
+                    if let Some(lifetime) = lifetime {
+                        self.retry_republish_when_settled(host, lifetime);
+                    }
                     return RepublishOutcome::Deferred;
                 }
             }
@@ -1555,29 +1573,179 @@ impl DiagnosticPublisher {
     /// regions as gone. `Some(empty)` means there legitimately are no regions to
     /// anchor: the document is closed, or its language resolves to no injection
     /// query — stale region slots drop from the merge.
+    /// Re-run `republish` for `host` once no reload is in progress, bounded:
+    /// the deferral otherwise relies on the reparse loop, which an injected
+    /// language's auto-install reload never triggers for the host.
+    ///
+    /// Bound to the document lifetime that deferred: a close and reopen at
+    /// the same URI gets its own waiter, and this one exits when its
+    /// lifetime is gone. The language is re-read on every poll, so a
+    /// re-detection under the same lifetime is followed too.
+    fn retry_republish_when_settled(&self, host: &Url, lifetime: u64) {
+        const REPUBLISH_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+        const REPUBLISH_RETRY_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        // One waiter per host: every deferral of the same window would
+        // otherwise spawn its own poller, and all of them would then
+        // serialize through the host's republish lock once settled.
+        let Some(claim) = self
+            .settle_retry_waiters
+            .claim("republish", host, Some(lifetime))
+        else {
+            return;
+        };
+        let this = self.clone();
+        let host = host.clone();
+        tokio::spawn(async move {
+            let claim = claim;
+            let deadline = tokio::time::Instant::now() + REPUBLISH_RETRY_BUDGET;
+            loop {
+                tokio::select! {
+                    _ = this.shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(REPUBLISH_RETRY_POLL) => {}
+                }
+                // The lifetime that deferred must still be current, and the
+                // language is whatever the settled parse names NOW.
+                let current = this.documents.get(&host).map(|doc| doc.incarnation());
+                if current != Some(lifetime) {
+                    return;
+                }
+                let Some(host_language) = this.settled_host_language(&host) else {
+                    return;
+                };
+                let reloading = this
+                    .parser_pool
+                    .lock()
+                    .recover_poison("DiagnosticPublisher::retry_republish_when_settled")
+                    .reload_in_progress();
+                // A host parser discovered from `searchPaths` loses its
+                // registration to any reload's generation bump and is only
+                // re-published on request; ask for it, or the wait would
+                // only expire.
+                if !reloading && !this.language.has_parser_available(&host_language) {
+                    let _ = this
+                        .language
+                        .ensure_language_loaded_async(&host_language)
+                        .await;
+                }
+                if !reloading && this.language.has_parser_available(&host_language) {
+                    log::debug!(
+                        target: LOG_TARGET,
+                        "retry republish for {host}: reload settled"
+                    );
+                    // Release the slot BEFORE republishing: a reload
+                    // starting right now makes it defer again, and that
+                    // deferral must be able to claim the slot this waiter held.
+                    drop(claim);
+                    let _ = this.republish(&host).await;
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// The host's language as the settled parse names it (a current snapshot
+    /// with a tree; a reload that re-detects the document publishes the new
+    /// language there only), else the id the document was opened under.
+    /// Shared by the geometry computation and the deferral retry, so the
+    /// retry waits for — and re-publishes — the language the geometry will
+    /// use, not a removed one.
+    fn settled_host_language(&self, host: &Url) -> Option<String> {
+        self.settled_snapshot_language(host).or_else(|| {
+            self.documents
+                .get(host)
+                .and_then(|doc| doc.language_id().map(str::to_string))
+        })
+    }
+
+    /// The language of the current snapshot when it carries a tree. One
+    /// store lookup, released on return.
+    fn settled_snapshot_language(&self, host: &Url) -> Option<String> {
+        self.documents.latest_snapshot(host).and_then(|view| {
+            view.slot.snapshot.as_ref().and_then(|current| {
+                (current.parsed_version == view.content_version && current.tree.is_some())
+                    .then(|| current.language.clone())
+                    .flatten()
+            })
+        })
+    }
+
     fn current_region_offsets(&self, host: &Url) -> Option<HashMap<String, RegionOffset>> {
         let mut offsets = HashMap::new();
 
-        let Some(doc) = self.documents.get(host) else {
+        // The settled parse names the language authoritatively (a reload
+        // that re-detects the document publishes the new language on the
+        // snapshot only); read BEFORE the document guard below, and the
+        // guard is dropped before any further store lookup: a second lookup
+        // under a held guard could queue behind a writer on the same shard
+        // that is itself waiting for this guard.
+        // Language, tree, text and lifetime from ONE current snapshot: a
+        // replacement parse of a re-detected document attaches its tree to
+        // the legacy document before it publishes, and the old query over
+        // the new tree would anchor region diagnostics wrongly. The view is
+        // an owned clone; no store guard is held across the lookups below.
+        let Some(view) = self.documents.latest_snapshot(host) else {
             return Some(offsets); // closed host: nothing to anchor against
         };
-        let Some(snapshot) = doc.snapshot() else {
+        let Some(current) = view
+            .slot
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.parsed_version == view.content_version)
+        else {
             return None; // open but tree pending: geometry unknown, defer
         };
+        let Some(tree) = current.tree.as_ref() else {
+            return None; // reload placeholder / parse without a tree: defer
+        };
+        let settled_language = current.language.clone();
+        let stored_language = self
+            .documents
+            .get(host)
+            .and_then(|doc| doc.language_id().map(str::to_string));
         // Trace-level detection: this runs on the republish path whenever
         // region slots are present (every keystroke settle during a typing
         // burst) — the debug variant would re-grow the per-event
         // `language_detection` log volume PR #677 moved off hot paths.
-        let Some(language_name) = self.language.detect_language_trace(
-            host.path(),
-            snapshot.text(),
-            None,
-            doc.language_id(),
-        ) else {
+        // Then the stored id; parser-aware detection last — it answers
+        // "none" (or another loaded language) while the declared language
+        // is still publishing, and that is not "no regions".
+        let Some(language_name) = settled_language.or(stored_language).or_else(|| {
+            self.language
+                .detect_language_trace(host.path(), &current.text, None, None)
+        }) else {
             return Some(offsets);
         };
-        let Some(injection_query) = self.language.injection_query(&language_name) else {
-            return Some(offsets);
+        // A language still publishing (queries land before the parser) has
+        // unknown geometry: defer, like a pending tree. So does a settings
+        // reload in progress, during which an already-visible parser keeps
+        // its registration while its queries are cleared and republished. A
+        // visible parser with no injection query is otherwise definitive.
+        // Re-asked before every definitive answer, with the generation read
+        // around the parser and query reads: a reload starting in between
+        // would otherwise turn a query removed mid-swap into "no regions".
+        let generation_before = self.cache.semantic_token_generation();
+        let settled = || {
+            let reload_in_progress = self
+                .parser_pool
+                .lock()
+                .recover_poison("DiagnosticPublisher::current_region_offsets")
+                .reload_in_progress();
+            !reload_in_progress && self.cache.semantic_token_generation() == generation_before
+        };
+        if !settled() || !self.language.has_parser_available(&language_name) {
+            return None;
+        }
+        let injection_query = self.language.injection_query(&language_name);
+        if !settled() {
+            return None;
+        }
+        let Some(injection_query) = injection_query else {
+            // Definitive only while still settled: a reload beginning right
+            // here removes queries, and "no query" would read as no regions.
+            return settled().then_some(offsets);
         };
 
         let resolved_regions = match self
@@ -1589,10 +1757,10 @@ impl DiagnosticPublisher {
                 &self.language,
                 self.bridge.node_tracker(),
                 host,
-                snapshot.tree(),
-                snapshot.text(),
+                tree,
+                &current.text,
                 injection_query.as_ref(),
-                snapshot.incarnation(),
+                current.incarnation,
             )),
         };
         for resolved in resolved_regions.iter() {
@@ -1604,7 +1772,16 @@ impl DiagnosticPublisher {
                 ),
             );
         }
-        Some(offsets)
+        // The offsets describe the captured snapshot; an edit (or reopen)
+        // landing since makes them stale positions for the text the editor
+        // now holds, and edits do not move the generation `settled` watches.
+        // Defer instead; the pending parse's republish carries the new
+        // geometry.
+        let document_unchanged = self.documents.latest_snapshot(host).is_some_and(|now| {
+            now.content_version == view.content_version
+                && now.slot.current_incarnation == view.slot.current_incarnation
+        });
+        (settled() && document_unchanged).then_some(offsets)
     }
 }
 
@@ -3342,6 +3519,67 @@ mod tests {
             publisher.current_region_offsets(&pending).is_none(),
             "an open document with no parse snapshot has unknown geometry"
         );
+
+        // Parsed, but its language's parser is not published (still loading
+        // or scoped out by a reload): geometry UNKNOWN → None, not "no
+        // regions" — a republish would otherwise drop every injected
+        // diagnostic until another parse.
+        let publishing = Url::parse("file:///test/publishing.md").unwrap();
+        let text = "```lua\nprint(1)\n```\n";
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let incarnation = server.documents.insert(
+            publishing.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let content_version = server.documents.get(&publishing).unwrap().content_version();
+        let landed = server
+            .documents
+            .get(&publishing)
+            .map(|doc| {
+                doc.publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: Some(tree),
+                        language: Some("markdown".to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test publish must land");
+        assert!(
+            publisher.current_region_offsets(&publishing).is_none(),
+            "a language whose parser is not published has unknown geometry"
+        );
+        // Parser published, but a reload is swapping its queries: unknown too.
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), language);
+        server
+            .parser_pool
+            .lock()
+            .expect("parser pool lock")
+            .begin_reload();
+        assert!(
+            publisher.current_region_offsets(&publishing).is_none(),
+            "a reload in progress has unknown geometry"
+        );
+        server
+            .parser_pool
+            .lock()
+            .expect("parser pool lock")
+            .finish_reload();
 
         // Closed (never-opened) document: geometry ABSENT → Some(empty) (stale
         // region slots legitimately drop; didClose's clearing publish proceeds).

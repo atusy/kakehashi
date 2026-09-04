@@ -79,11 +79,16 @@ connection is a `(server, root)` pair, so a document that bridges to the right
 server but sits under a different root is not its document.
 
 So each candidate host is screened in stages, cheapest first, and the ordering
-is a correctness property rather than a micro-optimization: the re-open runs
-inside a fixed budget that `done` must signal within, so work done per candidate
-is work charged against every command on that connection. Screening after the
-expensive steps would make that budget scale with workspace size instead of
-with the work that belongs to the connection.
+is a correctness property rather than a micro-optimization. Three bounds are
+in play and none is the sweep's lifetime: the sweep WAITS for pending parses
+against one shared deadline (`REOPEN_WAIT`), each command waiting on `done`
+applies its own `REOPEN_WAIT` and fails soft when it passes, and the sweep
+itself keeps walking — without waiting — until every candidate has been
+looked at, however long that takes. Work done per candidate before the
+cheap screen is therefore work charged against every command on that
+connection while the sweep runs; screening after the expensive steps would
+make a command's wait scale with workspace size instead of with the work
+that belongs to the connection.
 
 1. Could a document in this HOST language bridge to this server at all? Pure
    configuration, answered from the per-snapshot memo — no parse, no tree, no
@@ -253,9 +258,10 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
   configuration question is answered first and from a memo, so the cost is a
   map lookup per open document, but it does scale with the workspace rather
   than with what one connection held. The ordering above is what keeps that
-  cost off the barrier's budget; a future change that moves work ahead of the
-  stage-1 screen re-couples them, and the symptom is every command on a
-  respawned connection failing soft on a large workspace.
+  cost off the commands' wait (the sweep itself may outlive it); a future
+  change that moves work ahead of the stage-1 screen re-couples them, and
+  the symptom is every command on a respawned connection failing soft on a
+  large workspace.
 - Marker resolution now runs during the re-open for the server entries that
   lack a route binding record; bound entries answer from the binding
   instead (per exact (document, server) entry — one host's units can
@@ -275,14 +281,14 @@ rather than implied.
 **An invalidation placeholder reads as a current parse.** `invalidate_parse`
 publishes a tree-less snapshot whose `parsed_version` equals the content
 version, so both the parse wait and the currency re-check classify it as
-settled. The sweep then resolves no injections — because there is no tree, not
-because the host has no regions — and reports success. This matters most on the
-settings-reload path, which invalidates every parse and purges connections in
-the same pass. Distinguishing a placeholder from a legitimately tree-less parse
-(no parser loaded, parse produced nothing) needs a discriminator the snapshot
-does not currently carry, and rejecting every tree-less snapshot instead would
-wedge the barrier shut while a parser is still being installed. Same root cause
-as the reload-placeholder issue (#923).
+settled. The injection resolution answers "could not look" for a tree-less
+document (and for a language whose parser is not published, or a reload in
+progress), so the sweep reports the connection incomplete rather than
+repaired: the command that waits on it fails soft once, the reparse that
+follows re-opens eagerly. Reporting incomplete is the fail-soft direction; the
+cost is that one command, also for a document that stays tree-less (no parser
+will ever come), which has no regions to route anyway. Same root cause as the
+reload-placeholder issue (#923).
 
 **An empty resolution can be confirmed against a NEWER version.** If a
 `didChange` clears the tree and its reparse publishes before the currency

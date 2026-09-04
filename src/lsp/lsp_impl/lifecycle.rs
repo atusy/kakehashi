@@ -1575,7 +1575,12 @@ fn spawn_upstream_request(
                 // closed, misses ones opened since, and is simply EMPTY when the
                 // dead connection never got far enough to hold anything, which is
                 // exactly when a replacement most needs the repair.
-                let hosts = context.injection.open_host_uris();
+                // Documents whose parse is already current go first: they
+                // need no wait, and a pending document ahead of them would
+                // spend the sweep's one budget on a wait they never needed.
+                let hosts = order_reopen_candidates(context.injection.open_host_uris(), |host| {
+                    context.injection.snapshot_is_current(host)
+                });
                 log::debug!(
                     target: "kakehashi::bridge",
                     "Bringing {key} up to date after {server:?} respawned: \
@@ -1592,14 +1597,22 @@ fn spawn_upstream_request(
                 // and saying so is how the derivation stays scoped to
                 // `(server, root)` instead of cross-opening one root's documents
                 // onto another root's process.
-                // Bound the WAIT, not the work — the shape the inline heal used.
-                // `ensure_server_documents_open` can block up to the init timeout
-                // on a cold downstream, and `done` gates every command on this
-                // connection: an unbounded loop would keep the barrier
-                // outstanding for tens of seconds, making each command pay the
-                // full wait repeatedly. On expiry the opens keep running detached
-                // and waiters are released, degrading to the pre-existing lazy
-                // heal rather than stalling.
+                // `REOPEN_WAIT` bounds two things, neither of them the sweep's
+                // total lifetime: how long the sweep WAITS for pending parses
+                // (one shared deadline for the pass, below) and how long this
+                // actor watches the sweep before letting it finish in the
+                // background (the `timeout` after the spawn). Each waiter on
+                // `done` applies its own `REOPEN_WAIT` and fails soft when it
+                // passes; expiry here releases nobody — `done` stays pending
+                // until the sweep really finishes, so a command arriving later
+                // finds a settled answer. The sweep does not stop early on its
+                // parse-wait deadline (only on `done` losing every waiter): once
+                // that deadline passes it stops WAITING for pending
+                // parses but still opens every document whose parse is
+                // current (a document nothing else will touch — no pending
+                // parse, no request on it — is otherwise never re-opened),
+                // and `repaired` turns false only when an applicable document
+                // stayed unsettled or failed to open.
                 let injection = context.injection.clone();
                 let reopen_server = server.clone();
                 // `done` moves INTO the work task, so ONLY real completion
@@ -1610,13 +1623,16 @@ fn spawn_upstream_request(
                 // sender instead, which waiters read as "can never finish".
                 let mut work = tokio::spawn(async move {
                     // Whether this connection ended up holding everything current
-                    // state says it should. Only an APPLICABLE host that failed
-                    // to open clears it — a host that supplies nothing for this
-                    // connection is not a failed repair, it is not this
-                    // connection's document. Counting those would report failure
-                    // on essentially every respawn (most open documents bridge
-                    // nowhere near any one server), holding the barrier shut and
-                    // making every command pay the full wait and then fail soft.
+                    // state says it should. Cleared by an APPLICABLE host that
+                    // failed to open, and by a host this pass could not look at
+                    // (parse unsettled, language still publishing, tree-less
+                    // placeholder) whose applicability is therefore unknown — a
+                    // host that supplies nothing for this connection is not a
+                    // failed repair, it is not this connection's document.
+                    // Counting those would report failure on essentially every
+                    // respawn (most open documents bridge nowhere near any one
+                    // server), holding the barrier shut and making every
+                    // command pay the full wait and then fail soft.
                     let mut repaired = true;
                     // e2e-only fault injection: hold the re-open BEFORE any
                     // didOpen goes out, so the ordering e2e can force the window
@@ -1627,14 +1643,15 @@ fn spawn_upstream_request(
                     // release builds do not contain this branch.
                     #[cfg(feature = "e2e")]
                     e2e_stall_reopen().await;
-                    // ONE budget for the whole sweep, not one per host. Each
-                    // surviving host can park waiting for its tree, so a
-                    // per-host bound lets ten of them spend `REOPEN_WAIT` ten
-                    // times over — and the barrier promises to settle inside it
+                    // ONE parse-wait deadline for the whole sweep, not one per
+                    // host. Each surviving host can park waiting for its tree,
+                    // so a per-host bound lets ten of them spend `REOPEN_WAIT`
+                    // ten times over — and a waiter only ever waits that long
                     // ONCE. Deriving the set is what makes that reachable: the
                     // sweep is now sized by the workspace rather than by what
                     // one dead connection held.
                     let sweep_deadline = std::time::Instant::now() + REOPEN_WAIT;
+                    let mut budget_spent = false;
                     for host in hosts {
                         // Stop if nobody can hear the answer. `rearm` and a
                         // later `claim` both drop the registry's receiver, so a
@@ -1656,10 +1673,12 @@ fn spawn_upstream_request(
                         // which is pure configuration, answered from a memo
                         // with no parse, no tree and no I/O. Paying the parse
                         // wait and the injection resolution before asking it
-                        // would spend this connection's fixed budget in
-                        // proportion to WORKSPACE SIZE rather than to the work
-                        // that belongs to it, and the budget is what `done`
-                        // must signal inside.
+                        // would spend the shared parse-wait deadline — and the
+                        // time every command waits on `done` — in proportion
+                        // to WORKSPACE SIZE rather than to the work that
+                        // belongs to this connection. (The sweep itself is
+                        // not bounded: past the deadline it stops waiting,
+                        // not walking.)
                         //
                         // Reading the language before the parse wait keeps the
                         // incarnation/injections ordering intact, because the
@@ -1673,17 +1692,32 @@ fn spawn_upstream_request(
                         // direction. (A `languageId` change needs
                         // didClose+didOpen, which bumps the incarnation, so the
                         // stale-reject window is narrow rather than absent.)
+                        // `document_language` falls back to the language the
+                        // document was opened under while its parser is still
+                        // being published, so a load in progress reads as
+                        // "could not look" below, not as "no language" here.
                         let screened_at = injection.document_incarnation(&host);
-                        let reachable =
-                            injection
-                                .document_language(&host)
-                                .is_some_and(|candidate_language| {
+                        // The language and whether it comes from a settled
+                        // tree are read from ONE snapshot view: two reads
+                        // would let a replacement parse landing, or a reload
+                        // invalidating the parse, in between pair a settled
+                        // tree with a language that is not that tree's. Both
+                        // are read before the lifetime is re-checked below,
+                        // so a close and reopen in between shows as a
+                        // lifetime change.
+                        let (reachable, settled_tree) = injection
+                            .screen_language(&host)
+                            .map(|(candidate_language, settled_tree)| {
+                                (
                                     injection.bridge().host_language_can_reach_server(
                                         &settings,
                                         &candidate_language,
                                         &reopen_server,
-                                    )
-                                });
+                                    ),
+                                    settled_tree,
+                                )
+                            })
+                            .unwrap_or((false, false));
                         // Only trust a REJECTION if the document did not change
                         // lifetime underneath it. A close+reopen under a
                         // different `languageId` between the two reads would
@@ -1692,7 +1726,15 @@ fn spawn_upstream_request(
                         // since a skip is indistinguishable from "nothing to
                         // repair". On a mismatch fall through and let the
                         // authoritative path, which re-reads both, decide.
-                        if !reachable && injection.document_incarnation(&host) == screened_at {
+                        // Likewise a document without a current tree: a reload
+                        // that changed how it is detected leaves the OLD
+                        // stored language in place until the replacement
+                        // parse lands, so a rejection read from it is not
+                        // definitive either.
+                        if !reachable
+                            && settled_tree
+                            && injection.document_incarnation(&host) == screened_at
+                        {
                             continue;
                         }
                         // Await the tree first: a re-open racing an edit would
@@ -1701,19 +1743,20 @@ fn spawn_upstream_request(
                         let remaining = sweep_deadline
                             .checked_duration_since(std::time::Instant::now())
                             .unwrap_or_default();
-                        if remaining.is_zero() {
-                            // Out of budget with candidates still unexamined.
-                            // Report the connection as NOT caught up: the
-                            // waiters are about to time out anyway, and telling
-                            // them the sweep finished would release commands
-                            // onto documents this pass never reached.
+                        if remaining.is_zero() && !budget_spent {
+                            // Parse-wait deadline passed with candidates still
+                            // unexamined. Keep going without waiting: a
+                            // document whose parse is current still gets its
+                            // open, and only a document whose parse is pending
+                            // is left to that parse's own eager open — which
+                            // is what turns `repaired` false below, not the
+                            // deadline itself.
                             log::debug!(
                                 target: "kakehashi::bridge",
                                 "Re-open of {key} ran out of budget with candidates \
-                                 left; reporting it incomplete"
+                                 left; finishing the current ones without waiting"
                             );
-                            repaired = false;
-                            break;
+                            budget_spent = true;
                         }
                         use crate::lsp::lsp_impl::coordinator::ParseWait;
                         match injection.ensure_document_parsed(&host, remaining).await {
@@ -1756,6 +1799,26 @@ fn spawn_upstream_request(
                         };
                         let Some((host_language, injections)) = injection.bridge_injections(&host)
                         else {
+                            continue;
+                        };
+                        let Some(injections) = injections else {
+                            // The document could not be looked at: its
+                            // language is still publishing, or a reload
+                            // placeholder left it tree-less while its
+                            // replacement parse is queued. Not "nothing to
+                            // repair" — report the connection incomplete; a
+                            // parse that lands re-opens eagerly. (A document
+                            // that stays tree-less has no regions to route
+                            // anywhere; the one command that fails soft on
+                            // the incomplete report is the cost of not
+                            // guessing.)
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "Re-open of {key}: {host} could not be looked at \
+                                 (language still publishing, or no tree yet); \
+                                 reporting the connection incomplete"
+                            );
+                            repaired = false;
                             continue;
                         };
                         if injections.is_empty() {
@@ -1816,11 +1879,12 @@ fn spawn_upstream_request(
                         }
                     }
                     // Report what actually happened. `true` releases waiters;
-                    // `false` leaves them to time out and fail soft, which is
-                    // correct when the claimed connection is still empty — a
-                    // command sent there would fail downstream anyway, less
-                    // legibly. A send error means a later respawn's claim
-                    // superseded this barrier, and that respawn owns it now.
+                    // `false` (and the sender dropping right after) makes them
+                    // fail soft at once, which is correct when the claimed
+                    // connection is still empty — a command sent there would
+                    // fail downstream anyway, less legibly. A send error means
+                    // a later respawn's claim superseded this barrier, and
+                    // that respawn owns it now.
                     let _ = done.send(repaired);
                 });
                 // Bound only how long THIS task waits. The work owns the signal,
@@ -4528,5 +4592,49 @@ mod tests {
 
         cancel.cancel();
         let _ = loop_handle.await;
+    }
+}
+
+/// Order the documents a re-open sweep considers so that every document
+/// whose parse is already current comes before any whose parse is pending.
+///
+/// The sweep has one parse-wait budget for the whole pass and pays a wait per
+/// pending document; iterating the store's own (hash) order let a pending
+/// document ahead of a current one spend the budget the current one needed.
+/// The sweep keeps walking once the budget is spent and a current snapshot is
+/// recognised without waiting, so the order decides how much of the budget
+/// the pending documents get (and so how many settle in time), not whether a
+/// current document is visited. Stable: documents keep their relative order
+/// within each group.
+fn order_reopen_candidates(
+    hosts: Vec<url::Url>,
+    is_current: impl Fn(&url::Url) -> bool,
+) -> Vec<url::Url> {
+    let (current, pending): (Vec<_>, Vec<_>) = hosts.into_iter().partition(|host| is_current(host));
+    current.into_iter().chain(pending).collect()
+}
+
+#[cfg(test)]
+mod reopen_order_tests {
+    use super::order_reopen_candidates;
+    use url::Url;
+
+    #[test]
+    fn current_documents_come_before_pending_ones_in_stable_order() {
+        let hosts: Vec<Url> = [
+            "file:///a.md",
+            "file:///b.md",
+            "file:///c.md",
+            "file:///d.md",
+        ]
+        .iter()
+        .map(|u| Url::parse(u).unwrap())
+        .collect();
+        let pending = [hosts[0].clone(), hosts[2].clone()];
+
+        let ordered = order_reopen_candidates(hosts.clone(), |host| !pending.contains(host));
+
+        let names: Vec<&str> = ordered.iter().map(|u| u.path()).collect();
+        assert_eq!(names, vec!["/b.md", "/d.md", "/a.md", "/c.md"]);
     }
 }

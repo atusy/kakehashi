@@ -2,6 +2,7 @@ mod apply_edit_translation;
 pub(crate) mod bridge_context;
 mod cli;
 mod coordinator;
+mod settle_retry;
 pub(crate) use coordinator::DiagnosticPublisher;
 pub(crate) mod kakehashi;
 mod lifecycle;
@@ -200,18 +201,21 @@ pub(super) async fn apply_shared_settings_locked(
     } else {
         Vec::new()
     };
+    // Second bump IMMEDIATELY after the query swap, before any await and
+    // BEFORE the reload guard is released: a request that started after the
+    // transitional bump above but before the swap computed against the OLD
+    // queries yet stamped the new generation — without this bump those
+    // products would be accepted as current for the whole awaited propagate
+    // below, and a publish landing between the guard's release and the bump
+    // would be accepted by readers that treat "no reload in progress" plus a
+    // current stamp as settled. (The final bump after apply_settings covers
+    // the settings-side inputs the apply swaps.)
+    cache.bump_semantic_token_generation();
     // Invalidate again after the synchronous swap: the first bump rejects
     // pre-reload checkouts, while this one rejects parsers acquired while the
     // registry and query stores were being replaced.
     drop(parser_reload);
     crate::analysis::semantic::invalidate_thread_local_parser_caches();
-    // Second bump IMMEDIATELY after the query swap, before any await: a
-    // request that started after the transitional bump above but before the
-    // swap computed against the OLD queries yet stamped the new generation —
-    // without this bump those products would be accepted as current for the
-    // whole awaited propagate below. (The final bump after apply_settings
-    // covers the settings-side inputs the apply swaps.)
-    cache.bump_semantic_token_generation();
     // Publish the settings snapshot before invalidating downstream connections:
     // once propagation exposes a pool miss, a concurrent request must resolve
     // the NEW launch config rather than respawn from the old snapshot (#587).
@@ -365,6 +369,9 @@ pub struct Kakehashi {
     /// dropped. Cancelling the token gives deterministic shutdown: `shutdown()`
     /// cancels → task exits immediately → no waiting for channel drainage.
     shutdown_token: tokio_util::sync::CancellationToken,
+    /// One settle-retry waiter per (kind, host) across the injection pass
+    /// and the diagnostic republish.
+    settle_retry_waiters: settle_retry::SettleRetryWaiters,
     /// Whether a `workspace/configuration` pull is already in flight, and
     /// whether a trigger arrived while one was; see
     /// `pull_client_configuration`.
@@ -507,6 +514,7 @@ impl Kakehashi {
                 crate::lsp::diagnostic_cache::DiagnosticAggregator::new(),
             ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
+            settle_retry_waiters: settle_retry::SettleRetryWaiters::default(),
             configuration_pull_in_flight: std::sync::atomic::AtomicBool::new(false),
             configuration_pull_pending: std::sync::atomic::AtomicBool::new(false),
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),

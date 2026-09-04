@@ -80,13 +80,29 @@ pub(crate) struct PopulatedInjections {
 }
 
 impl PopulatedInjections {
-    /// No regions (no injection query, or none matched): the downstream skips
-    /// its work, exactly as the inline resolution's empty result did.
+    /// No regions (the query ran and none matched): the downstream skips its
+    /// work, exactly as the inline resolution's empty result did.
     pub(crate) fn empty(generation: u64) -> Self {
         Self {
             discovery: None,
             bridge_regions: Some(Vec::new()),
             resolved_regions: Some(Vec::new()),
+            generation,
+        }
+    }
+
+    /// The pass could not look: the host language's injection query was not
+    /// in the store (a lazy load or a reload still swapping queries in).
+    /// Distinct from [`Self::empty`] on purpose — a definitive empty set
+    /// would be consumed by every reader until the next edit, skipping
+    /// documents that do have injections once the query is loaded. Riding
+    /// without regions makes readers fall back to inline resolution, which
+    /// finds the query as soon as it is there.
+    pub(crate) fn undetermined(generation: u64) -> Self {
+        Self {
+            discovery: None,
+            bridge_regions: None,
+            resolved_regions: None,
             generation,
         }
     }
@@ -265,22 +281,38 @@ impl CacheCoordinator {
         // mint and the commit), so a stale pass mints nothing and clobbers
         // nothing — identity defers to the next current pass.
 
+        // The parser BEFORE the query: a lazy publication lands queries then
+        // parser, so reading the query first could see none, then find the
+        // parser published — and publish a definitive empty set although the
+        // language has an injection query by now. Seen the other way round, a
+        // visible parser makes a missing query definitive.
+        let parser_published = language.has_parser_available(language_name);
         // Get the injection query for this language
         let injection_query = match language.injection_query(language_name) {
             Some(q) => q,
             None => {
-                // No injection query = no injections to track. Clear any
-                // stale injection caches — but only when no edit landed
-                // during this pass (a stale pass must not clobber state the
-                // newer text's own populate maintains). A refused clear
-                // aborts the pass (`None`): reporting ran-and-empty while
-                // the old entries survive would leave them unreclaimed
+                // No injection query in the store = nothing this pass can
+                // track. Clear any stale injection caches — but only when
+                // no edit landed during this pass (a stale pass must not
+                // clobber state the newer text's own populate maintains). A
+                // refused clear aborts the pass (`None`): reporting a result
+                // while the old entries survive would leave them unreclaimed
                 // until another parse.
                 tracker.commit_if_unshifted(uri, entry_mint_epoch, incarnation, || {
                     self.injection_map.clear(uri);
                     self.injection_token_cache.clear_document(uri);
                 })?;
-                return Some(PopulatedInjections::empty(generation));
+                // Queries are published before their parser, so a visible
+                // parser with no injection query is a language that has
+                // none: a definitive empty set, which keeps the fast paths
+                // for it. Without the parser the load is still publishing
+                // and the result is UNDETERMINED — a definitive empty set
+                // would stand until the next edit.
+                return Some(if parser_published {
+                    PopulatedInjections::empty(generation)
+                } else {
+                    PopulatedInjections::undetermined(generation)
+                });
             }
         };
 
@@ -916,6 +948,78 @@ mod tests {
         // Cancel all requests
         cache.cancel_requests(&uri);
         assert!(!cache.is_request_active(&uri, req));
+    }
+
+    /// A populate pass that runs before the host language's injection query
+    /// is in the store — a lazy query load or a settings reload still
+    /// swapping queries in — cannot tell "no injections" from "could not
+    /// look". Publishing a definitive empty set would be consumed by every
+    /// reader until the next edit; the snapshot must ride without regions so
+    /// readers fall back to inline resolution, which finds the query once it
+    /// is loaded.
+    #[test]
+    fn populate_without_the_injection_query_leaves_the_regions_undetermined() {
+        use tree_sitter::Parser;
+
+        let cache = CacheCoordinator::new();
+        let tracker = NodeTracker::new();
+        let coordinator = LanguageCoordinator::new();
+        let uri = create_test_uri("no-query-yet.md");
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let text = "```lua\nprint(1)\n```\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+
+        let populated = cache
+            .populate_injections(
+                &uri,
+                text,
+                &tree,
+                "markdown",
+                &coordinator,
+                &tracker,
+                tracker.mint_epoch(&uri),
+                1,
+                true,
+                true,
+            )
+            .expect("the pass ran");
+
+        assert!(
+            populated.bridge_regions.is_none(),
+            "no query available must not publish a definitive empty region set"
+        );
+        assert!(populated.resolved_regions.is_none());
+        assert!(populated.discovery.is_none());
+
+        // Once the parser is visible its queries are too (they are published
+        // first), so the absence is definitive and the fast paths keep their
+        // empty set.
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), language);
+        let populated = cache
+            .populate_injections(
+                &uri,
+                text,
+                &tree,
+                "markdown",
+                &coordinator,
+                &tracker,
+                tracker.mint_epoch(&uri),
+                1,
+                true,
+                true,
+            )
+            .expect("the pass ran");
+        assert!(
+            populated
+                .bridge_regions
+                .as_ref()
+                .is_some_and(|regions| regions.is_empty()),
+            "a settled language without an injection query publishes a definitive empty set"
+        );
     }
 
     #[test]
