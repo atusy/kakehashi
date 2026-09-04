@@ -1720,9 +1720,15 @@ fn spawn_upstream_request(
                         // stored language in place until the replacement
                         // parse lands, so a rejection read from it is not
                         // definitive either.
+                        // The tree state is read BEFORE the lifetime is
+                        // re-checked, so a close and reopen between the two
+                        // reads shows up as a lifetime change (and falls
+                        // through) rather than pairing the old language's
+                        // rejection with the new lifetime's tree.
+                        let settled_tree = injection.snapshot_has_tree(&host);
                         if !reachable
+                            && settled_tree
                             && injection.document_incarnation(&host) == screened_at
-                            && injection.snapshot_has_tree(&host)
                         {
                             continue;
                         }
