@@ -1778,8 +1778,12 @@ fn spawn_upstream_request(
                             // language is still publishing, or a reload
                             // placeholder left it tree-less while its
                             // replacement parse is queued. Not "nothing to
-                            // repair" — report the connection incomplete; the
-                            // parse that lands next re-opens eagerly.
+                            // repair" — report the connection incomplete; a
+                            // parse that lands re-opens eagerly. (A document
+                            // that stays tree-less has no regions to route
+                            // anywhere; the one command that fails soft on
+                            // the incomplete report is the cost of not
+                            // guessing.)
                             log::debug!(
                                 target: "kakehashi::bridge",
                                 "Re-open of {key}: {host} could not be looked at \
