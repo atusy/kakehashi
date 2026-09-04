@@ -528,11 +528,16 @@ impl Kakehashi {
                                 uri: &t.uri,
                                 language_id: &t.language_id,
                                 text: &t.text,
-                                // Speculative scratch text (`ctx.text` was
-                                // replaced above): the context's revision does
-                                // not describe it, so it must not advance the
-                                // sync watermark.
-                                revision: None,
+                                // Stamped even though `ctx.text` is the
+                                // speculative scratch: the stamp binds the
+                                // transport to the lifetime the text was read
+                                // in, and the watermark it advances only says
+                                // that a text at least as new as that revision
+                                // reached the downstream — true of the scratch,
+                                // which the virt layer derived from it. The
+                                // editor text returns on the next stamped sync
+                                // (fingerprint mismatch).
+                                revision: Some(t.revision),
                             },
                             "textDocument/formatting",
                             params,
@@ -559,7 +564,20 @@ impl Kakehashi {
         // client-visible LOG); only real host failures get surfaced —
         // mirroring `host_layer_value_with_ctx`.
         match result {
-            FanInResult::Done(value) => Ok(value),
+            FanInResult::Done(value) => {
+                // The edits were computed for the text of the lifetime the
+                // context was read in; a close and reopen in the meantime
+                // makes them edits for a document that is gone.
+                if !self.host_incarnation_is_current(&ctx.uri, Some(ctx.incarnation)) {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "textDocument/formatting: {} was reopened while formatting; dropping the host edits",
+                        ctx.uri
+                    );
+                    return Ok(None);
+                }
+                Ok(value)
+            }
             FanInResult::NoResult { errors } => {
                 // `errors` was just recorded into the sink above; this arm only
                 // chooses log severity.
