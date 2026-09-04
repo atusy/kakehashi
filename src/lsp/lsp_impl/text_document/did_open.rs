@@ -879,6 +879,65 @@ print("hello")
     /// reading the store (the live reader the debounce builds) makes the second fire
     /// send new text and advance the host version — a snapshot-only / `None`-reader
     /// sync would fingerprint-dedup and stay at version 1.
+    /// Every host fan-out task must carry the revision its context text was
+    /// read at: a task sent unstamped bypasses the downstream sync watermark
+    /// and can roll a document back past an eager re-sync.
+    #[tokio::test]
+    async fn host_fan_out_tasks_carry_the_revision_the_context_text_was_read_at() {
+        use crate::config::settings::AggregationStrategy;
+        use crate::lsp::aggregation::server::{HostFanOutTask, dispatch_host_preferred};
+        use crate::lsp::bridge::HostRevision;
+        use crate::lsp::lsp_impl::bridge_context::HostRequestContext;
+        use std::sync::Arc;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+        let settings = server.settings_manager.load_settings();
+        let configs = server
+            .bridge
+            .get_host_configs_for_language(&settings, "rust");
+        assert!(!configs.is_empty(), "the self-host must select a server");
+        let ctx = HostRequestContext {
+            incarnation: 4,
+            content_version: 9,
+            uri: Url::parse("file:///test/stamped.rs").unwrap(),
+            language_id: "rust".to_string(),
+            text: Arc::from("fn stamped() {}"),
+            configs,
+            priorities: vec!["*".to_string()],
+            strategy: AggregationStrategy::Preferred,
+            max_fan_out: None,
+            upstream_request_id: None,
+        };
+        let seen: Arc<std::sync::Mutex<Option<HostRevision>>> = Arc::default();
+        let _ = dispatch_host_preferred(
+            &ctx,
+            server.bridge.pool_arc(),
+            |t: HostFanOutTask| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    if let Ok(mut slot) = seen.lock() {
+                        *slot = Some(t.revision);
+                    }
+                    Ok::<Option<serde_json::Value>, std::io::Error>(None)
+                }
+            },
+            |value| value.is_some(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            seen.lock().ok().and_then(|slot| *slot),
+            Some(HostRevision {
+                incarnation: 4,
+                content_version: 9
+            }),
+            "the task must be stamped with the context's lifetime and revision"
+        );
+    }
+
     #[tokio::test]
     async fn debounced_fire_resyncs_host_document_from_live_store_text() {
         use crate::config::settings::{AggregationStrategy, LayerSource, ResolvedLayerConfig};

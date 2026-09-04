@@ -755,7 +755,7 @@ async fn send_host_diagnostic_fan_out_request(
                 uri: &t.uri,
                 language_id: &t.language_id,
                 text: &t.text,
-                revision: None,
+                revision: Some(t.revision),
             },
             serde_json::json!({ "textDocument": { "uri": t.uri.as_str() } }),
             t.upstream_id,

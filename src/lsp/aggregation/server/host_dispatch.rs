@@ -32,6 +32,9 @@ pub(crate) struct HostFanOutTask {
     pub(crate) uri: url::Url,
     pub(crate) language_id: String,
     pub(crate) text: Arc<str>,
+    /// The lifetime and revision `text` was read at, so the downstream sync
+    /// can refuse it once an eager re-sync has moved past it.
+    pub(crate) revision: crate::lsp::bridge::HostRevision,
     pub(crate) upstream_id: Option<UpstreamId>,
 }
 
@@ -111,6 +114,10 @@ where
             uri: ctx.uri.clone(),
             language_id: ctx.language_id.clone(),
             text: Arc::clone(&ctx.text),
+            revision: crate::lsp::bridge::HostRevision {
+                incarnation: ctx.incarnation,
+                content_version: ctx.content_version,
+            },
             upstream_id: ctx.upstream_request_id.clone(),
         };
         let fut = f(task);
