@@ -398,10 +398,14 @@ impl Kakehashi {
         // newer: an edit landing in between makes the actions fail soft on
         // resolve until the editor's next request, which follows an edit
         // anyway.
-        let Some(content_version) = url::Url::parse(lsp_uri.as_str())
-            .ok()
-            .and_then(|uri| self.documents.get(&uri).map(|doc| doc.content_version()))
-        else {
+        let Some(revision) = url::Url::parse(lsp_uri.as_str()).ok().and_then(|uri| {
+            self.documents
+                .get(&uri)
+                .map(|doc| crate::lsp::bridge::HostRevision {
+                    incarnation: doc.incarnation(),
+                    content_version: doc.content_version(),
+                })
+        }) else {
             return Ok(None);
         };
         let contexts = self
@@ -432,7 +436,7 @@ impl Kakehashi {
                 // The work-done progress token is single-use → first region only.
                 ctx.document.client_progress_token = progress_token.take();
                 if let Some(actions) = self
-                    .dispatch_virt_region_code_action(ctx, &context, upstream_caps, content_version)
+                    .dispatch_virt_region_code_action(ctx, &context, upstream_caps, revision)
                     .await?
                 {
                     merged.extend(actions);
@@ -466,7 +470,7 @@ impl Kakehashi {
         ctx: RangeRequestContext,
         context: &CodeActionContext,
         upstream_caps: UpstreamCodeActionCaps,
-        content_version: u64,
+        revision: crate::lsp::bridge::HostRevision,
     ) -> Result<Option<CodeActionResponse>> {
         let pool = self.bridge.pool_arc();
         let range = ctx.range;
@@ -485,7 +489,7 @@ impl Kakehashi {
                         t.region_end(),
                         t.offset,
                         &t.virtual_content,
-                        content_version,
+                        revision,
                         t.upstream_id,
                         t.client_progress_token,
                         upstream_caps,
