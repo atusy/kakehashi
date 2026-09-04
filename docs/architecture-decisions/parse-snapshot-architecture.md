@@ -101,7 +101,10 @@ mapping is not one-to-one and must be stated precisely:
 
 - Two distinct predicates replace the old single `has_tree`: **`resolved`** =
   `slot.snapshot.is_some()` (a parse for this lifetime has completed at least once)
-  and **`has_tree`** = `slot.snapshot.as_ref().and_then(|s| s.tree.as_ref()).is_some()`. A
+  and **`has_tree`** = `slot.snapshot.as_ref().and_then(|s| s.tree.as_ref()).is_some()`
+  — the *published* tree, which after a `didChange` is the stale one; the
+  current-tree question adds `parsed_version == content_version`
+  (`Document::has_current_tree`, `snapshot_has_tree` in the injection coordinator). A
   **resolved-but-tree-less** outcome — a parse that completed with no usable tree
   (no parser installed, install failed, no usable tree reached the publish, or a
   settings-reload placeholder awaiting its reparse — see `ParseSnapshot`), distinct

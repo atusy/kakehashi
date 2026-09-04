@@ -704,7 +704,7 @@ impl Kakehashi {
     }
 
     /// Schedule the **off-ingress** (re)parse of `uri` after a `did_change` applied
-    /// the edit and cleared the tree (per-document-parse-scheduler ADR). The parse runs
+    /// the edit and made the current tree stale (per-document-parse-scheduler ADR). The parse runs
     /// in a spawned loop off the writer ticket, so `did_change` returns without
     /// waiting on it; the [`ParseScheduler`](parse_scheduler::ParseScheduler)
     /// coalesces a burst of edits into a single follow-up reparse over the latest
@@ -812,9 +812,9 @@ impl Kakehashi {
                     publisher.request_pull_diagnostic_refresh(true);
                 }
 
-                // Schedule the debounced diagnostic HERE, after the reparse restored
-                // the tree — NOT in the did_change handler, where the tree has just
-                // been cleared. `prepare_diagnostic_snapshot` returns `None` without
+                // Schedule the debounced diagnostic HERE, after the reparse published
+                // a current tree — NOT in the did_change handler, where the tree has
+                // just gone stale. `prepare_diagnostic_snapshot` returns `None` without
                 // a tree (`Document::snapshot()` requires one), and a `None` snapshot
                 // makes the debounce a no-op — skipping the on-edit host re-sync
                 // (#431) that keeps a push-only `_self` host server's diagnostics
