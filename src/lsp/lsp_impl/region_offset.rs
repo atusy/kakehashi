@@ -28,6 +28,38 @@ use crate::language::{InjectionResolver, LanguageCoordinator};
 use crate::lsp::bridge::{BridgeCoordinator, EnvelopeOffset, RegionOffset, region_host_end};
 
 impl Kakehashi {
+    /// Whether the host document is still at the text revision a resolve
+    /// envelope was minted at. A same-shape edit inside a region keeps its
+    /// geometry, so the region gates admit it, yet the downstream's lazily
+    /// materialized fields were computed against the previous text; the
+    /// revision stamp is what refuses that. Envelopes without a stamp (a
+    /// mangled echo) fail closed.
+    pub(super) fn document_revision_is_current(
+        &self,
+        host_url: &Url,
+        expected: Option<u64>,
+    ) -> bool {
+        expected.is_some_and(|expected| {
+            self.documents
+                .get(host_url)
+                .is_some_and(|document| document.content_version() == expected)
+        })
+    }
+
+    /// Whether the host document is still the lifetime a resolve envelope
+    /// was minted under. A close and reopen restarts the revision count, so
+    /// the revision alone cannot tell a reopened document from the one the
+    /// item was computed on. Envelopes without a stamp fail closed.
+    pub(super) fn host_incarnation_is_current(
+        &self,
+        host_url: &Url,
+        expected: Option<u64>,
+    ) -> bool {
+        expected.is_some_and(|expected| {
+            self.bridge.pool_arc().current_host_incarnation(host_url) == Some(expected)
+        })
+    }
+
     /// Whether the injection region a resolve envelope names still resolves
     /// to the offset snapshot the envelope carries.
     ///
