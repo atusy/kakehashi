@@ -1568,14 +1568,21 @@ impl DiagnosticPublisher {
         // region slots are present (every keystroke settle during a typing
         // burst) — the debug variant would re-grow the per-event
         // `language_detection` log volume PR #677 moved off hot paths.
-        let Some(language_name) = self.language.detect_language_trace(
-            host.path(),
-            snapshot.text(),
-            None,
-            doc.language_id(),
-        ) else {
+        // Stored language first: parser-aware detection answers "none" (or
+        // another loaded language) while the declared language is still
+        // publishing, and that is not "no regions".
+        let Some(language_name) = doc.language_id().map(str::to_string).or_else(|| {
+            self.language
+                .detect_language_trace(host.path(), snapshot.text(), None, None)
+        }) else {
             return Some(offsets);
         };
+        // A language still publishing (queries land before the parser) has
+        // unknown geometry: defer, like a pending tree. A visible parser
+        // with no injection query is definitive.
+        if !self.language.has_parser_available(&language_name) {
+            return None;
+        }
         let Some(injection_query) = self.language.injection_query(&language_name) else {
             return Some(offsets);
         };
@@ -3341,6 +3348,48 @@ mod tests {
         assert!(
             publisher.current_region_offsets(&pending).is_none(),
             "an open document with no parse snapshot has unknown geometry"
+        );
+
+        // Parsed, but its language's parser is not published (still loading
+        // or scoped out by a reload): geometry UNKNOWN → None, not "no
+        // regions" — a republish would otherwise drop every injected
+        // diagnostic until another parse.
+        let publishing = Url::parse("file:///test/publishing.md").unwrap();
+        let text = "```lua\nprint(1)\n```\n";
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let incarnation = server.documents.insert(
+            publishing.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let content_version = server.documents.get(&publishing).unwrap().content_version();
+        let landed = server
+            .documents
+            .get(&publishing)
+            .map(|doc| {
+                doc.publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: Some(tree),
+                        language: Some("markdown".to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test publish must land");
+        assert!(
+            publisher.current_region_offsets(&publishing).is_none(),
+            "a language whose parser is not published has unknown geometry"
         );
 
         // Closed (never-opened) document: geometry ABSENT → Some(empty) (stale
