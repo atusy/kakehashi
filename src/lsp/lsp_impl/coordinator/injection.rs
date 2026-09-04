@@ -669,10 +669,26 @@ impl InjectionCoordinator {
     /// document with no stored language, so the caller reads "could not
     /// look" from the resolution instead of "no language" or the wrong one
     /// from here.
+    ///
+    /// A settled parse names the language authoritatively: a reload that
+    /// changes how the document is detected publishes the new language on
+    /// the snapshot only (`reparse_latest`), while the stored id keeps the
+    /// pre-reload value, so the snapshot's language wins once the parse is
+    /// current and carries a tree.
     pub(crate) fn document_language(&self, uri: &Url) -> Option<String> {
-        self.documents
+        let settled = self.documents.latest_snapshot(uri).and_then(|view| {
+            view.slot.snapshot.as_ref().and_then(|snapshot| {
+                (snapshot.parsed_version == view.content_version && snapshot.tree.is_some())
+                    .then(|| snapshot.language.clone())
+                    .flatten()
+            })
+        });
+        let stored = self
+            .documents
             .get(uri)
-            .and_then(|document| document.language_id().map(str::to_string))
+            .and_then(|document| document.language_id().map(str::to_string));
+        settled
+            .or(stored)
             .or_else(|| self.get_language_for_document(uri))
     }
 
@@ -1465,6 +1481,62 @@ mod tests {
                 .resolve_injection_data(&uri, "rust")
                 .is_some_and(|regions| regions.len() == 1),
             "parser published: the region resolves"
+        );
+    }
+
+    /// A reload that changes how a document is detected publishes the new
+    /// language on the snapshot only; the stored id keeps the pre-reload
+    /// value. Once the replacement parse is current, the snapshot's language
+    /// must win, or the sweep and the eager pass keep working under a
+    /// language the document no longer has.
+    #[tokio::test]
+    async fn document_language_prefers_the_settled_snapshot_over_the_stored_id() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let text = "# doc\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("set language");
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let uri = Url::parse("file:///redetected.md").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("derived-markdown".into()),
+            None,
+        );
+        let injection = server.injection_coordinator();
+        assert_eq!(
+            injection.document_language(&uri).as_deref(),
+            Some("derived-markdown"),
+            "before any parse settles, the stored id names the document"
+        );
+
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        let landed = server
+            .documents
+            .get(&uri)
+            .map(|doc| {
+                doc.publish_snapshot(std::sync::Arc::new(
+                    crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: Some(tree),
+                        language: Some("markdown".to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: None,
+                        resolved_regions: None,
+                        layer_trees: std::sync::OnceLock::new(),
+                    },
+                ))
+            })
+            .unwrap_or(false);
+        assert!(landed, "test publish must land");
+        assert_eq!(
+            injection.document_language(&uri).as_deref(),
+            Some("markdown"),
+            "a settled parse names the language authoritatively"
         );
     }
 }
