@@ -174,6 +174,38 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
+fn inline_value_result(message: &Value, documents: &HashMap<String, String>, label: &str) -> Value {
+    let range = message.pointer("/params/range").cloned();
+    let stopped_location = message.pointer("/params/context/stoppedLocation").cloned();
+    message
+        .pointer("/params/textDocument/uri")
+        .and_then(Value::as_str)
+        .filter(|uri| documents.contains_key(*uri))
+        .and(range)
+        .zip(stopped_location)
+        .map(|(range, stopped_location)| {
+            json!([
+                {
+                    "range": range,
+                    "text": format!("{label}:frame={}", message["params"]["context"]["frameId"])
+                },
+                {
+                    "range": stopped_location,
+                    "variableName": label,
+                    "caseSensitiveLookup": true
+                },
+                {
+                    "range": {
+                        "start": { "line": 0, "character": 1 },
+                        "end": { "line": 0, "character": 3 }
+                    },
+                    "expression": label
+                }
+            ])
+        })
+        .unwrap_or(Value::Null)
+}
+
 fn main() {
     let mode = std::env::args()
         .nth(1)
@@ -288,6 +320,14 @@ fn main() {
                     | "document-color-empty-presentation"
                     | "document-color-slow-presentation" => json!({
                         "colorProvider": true,
+                        "textDocumentSync": 1
+                    }),
+                    "inline-value-host"
+                    | "inline-value-record-host"
+                    | "inline-value-virt"
+                    | "inline-value-delayed"
+                    | "inline-value-slow" => json!({
+                        "inlineValueProvider": true,
                         "textDocumentSync": 1
                     }),
                     "inlay-hint-resolve"
@@ -1586,6 +1626,29 @@ fn main() {
                 };
                 respond(&mut writer, id, result);
             }
+            "textDocument/inlineValue" => {
+                let label = if matches!(
+                    mode.as_str(),
+                    "inline-value-host" | "inline-value-record-host"
+                ) {
+                    "host"
+                } else {
+                    "virt"
+                };
+                let result = inline_value_result(&message, &documents, label);
+                if mode == "inline-value-record-host" {
+                    record_mock_event(&mode, "request", &message);
+                }
+                if mode == "inline-value-delayed" {
+                    record_mock_event(&mode, "request", &message);
+                    wait_for_mock_release(&mode);
+                }
+                if mode == "inline-value-slow" {
+                    record_mock_event(&mode, "request", &message);
+                    continue;
+                }
+                respond(&mut writer, id, result);
+            }
             "documentLink/resolve" => {
                 if mode == "document-link-slow-resolve" {
                     record_mock_event(&mode, "request", &message);
@@ -2288,6 +2351,19 @@ fn record_mock_event(mode: &str, event: &str, message: &Value) {
         dir.join(format!("{mode}.{event}.json")),
         serde_json::to_vec(&payload).unwrap_or_default(),
     );
+}
+
+fn wait_for_mock_release(mode: &str) {
+    let Ok(dir) = std::env::var("MOCK_LSP_CANCEL_DIR") else {
+        return;
+    };
+    let release = Path::new(&dir).join(format!("{mode}.release"));
+    for _ in 0..300 {
+        if release.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Send a JSON-RPC success response for `id` (no-op for notifications).

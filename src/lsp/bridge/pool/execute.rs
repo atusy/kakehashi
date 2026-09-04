@@ -179,6 +179,22 @@ impl LanguageServerPool {
             }
             None => self.request_host_lifecycle(host_uri).await?,
         };
+        if expected_incarnation.is_some()
+            && !self
+                .latest_virtual_contents
+                .get(host_uri)
+                .and_then(|host| {
+                    host.contents
+                        .get(injection_language)
+                        .and_then(|regions| regions.get(region_id).map(|_| ()))
+                })
+                .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("bridge: virtual region was invalidated before request: {host_uri}"),
+            ));
+        }
         let routing_uri = url::Url::parse(&virtual_uri.to_uri_string())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if self

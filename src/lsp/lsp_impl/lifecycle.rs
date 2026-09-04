@@ -13,13 +13,14 @@ use tower_lsp_server::ls_types::{
     DocumentRangeFormattingOptions, DocumentSymbolOptions, ExecuteCommandOptions,
     FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
     InitializeParams, InitializeResult, InitializedParams, InlayHintOptions,
-    InlayHintServerCapabilities, LinkedEditingRangeServerCapabilities, OneOf, PositionEncodingKind,
-    ReferenceOptions, RenameOptions, SaveOptions, SelectionRangeProviderCapability,
-    SemanticTokenModifier, SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend,
-    SemanticTokensOptions, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    SignatureHelpOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri,
-    WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
+    InlayHintServerCapabilities, InlineValueOptions, InlineValueServerCapabilities,
+    LinkedEditingRangeServerCapabilities, OneOf, PositionEncodingKind, ReferenceOptions,
+    RenameOptions, SaveOptions, SelectionRangeProviderCapability, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 use url::Url;
 
@@ -545,6 +546,13 @@ impl Kakehashi {
                     ),
                 ),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                inline_value_provider: Some(OneOf::Right(InlineValueServerCapabilities::Options(
+                    InlineValueOptions {
+                        work_done_progress_options: WorkDoneProgressOptions {
+                            work_done_progress: Some(true),
+                        },
+                    },
+                ))),
                 // Advertise `workDoneProgress` so clients attach a `workDoneToken`
                 // we can bridge (ls-bridge-client-progress, #445). Per LSP this is
                 // unconditional — client-initiated progress has no client

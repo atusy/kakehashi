@@ -249,6 +249,21 @@ cross masked gaps. Runtime query offsets such as frontmatter `#offset!` are
 included in the freshness and coordinate checks. Default combine strategy:
 `preferred`.
 
+### Inline values
+
+[`textDocument/inlineValue`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_inlineValue)
+
+Shows values supplied by a debugger-aware language server for the embedded block
+overlapping the requested range. Kakehashi translates both the visible range and
+the debugger's stopped location into the block, then maps every returned text,
+variable-lookup, or evaluatable-expression range back to the host document.
+Virtual results whose ranges escape the block are dropped. A stopped location
+outside the selected block does not have a valid virtual coordinate, so the
+virtual layer is skipped and an enabled `bridge._self` host server may answer.
+Downstream `workspace/inlineValue/refresh` requests are not forwarded; editors
+refresh inline values only through their own debugger/client lifecycle.
+Default combine strategy: `preferred`.
+
 ### Moniker
 
 [`textDocument/moniker`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_moniker)

@@ -31,13 +31,14 @@ use tower_lsp_server::ls_types::{
     DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse,
     ExecuteCommandParams, FoldingRange, FoldingRangeParams, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializeResult,
-    InitializedParams, InlayHint, InlayHintParams, LinkedEditingRangeParams, LinkedEditingRanges,
-    Location, Moniker, MonikerParams, PrepareRenameResponse, ReferenceParams, RenameParams,
-    SelectionRange, SelectionRangeParams, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
-    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
-    SemanticTokensResult, SignatureHelp, SignatureHelpParams, TextDocumentPositionParams, TextEdit,
-    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, Uri, WillSaveTextDocumentParams, WorkspaceEdit,
+    InitializedParams, InlayHint, InlayHintParams, InlineValue, InlineValueParams,
+    LinkedEditingRangeParams, LinkedEditingRanges, Location, Moniker, MonikerParams,
+    PrepareRenameResponse, ReferenceParams, RenameParams, SelectionRange, SelectionRangeParams,
+    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp,
+    SignatureHelpParams, TextDocumentPositionParams, TextEdit, TypeHierarchyItem,
+    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri,
+    WillSaveTextDocumentParams, WorkspaceEdit,
 };
 use tower_lsp_server::ls_types::{
     ColorInformation, ColorPresentation, ColorPresentationParams, DocumentColorParams,
@@ -1073,6 +1074,10 @@ impl LanguageServer for Kakehashi {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         self.inlay_hint_impl(params).await
+    }
+
+    async fn inline_value(&self, params: InlineValueParams) -> Result<Option<Vec<InlineValue>>> {
+        self.inline_value_impl(params).await
     }
 
     async fn inlay_hint_resolve(&self, params: InlayHint) -> Result<InlayHint> {

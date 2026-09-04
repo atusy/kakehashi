@@ -38,7 +38,7 @@ Partially implemented:
   documentLink use the shared whole-document winner hook. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
-  inlayHint, documentSymbol, documentLink, documentColor, colorPresentation,
+  inlayHint, inlineValue, documentSymbol, documentLink, documentColor, colorPresentation,
   foldingRange, codeLens,
   prepareCallHierarchy, incomingCalls, outgoingCalls, prepareTypeHierarchy,
   supertypes, subtypes,

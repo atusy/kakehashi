@@ -149,6 +149,9 @@ expression: merged
     "typeHierarchy": {
       "dynamicRegistration": false
     },
+    "inlineValue": {
+      "dynamicRegistration": false
+    },
     "inlayHint": {
       "dynamicRegistration": false
     },

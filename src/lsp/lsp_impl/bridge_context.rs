@@ -119,7 +119,7 @@ fn normalize_client_position(mapper: &PositionMapper, position: Position) -> Opt
 /// request whose intent is "everything". Over-long characters still clamp
 /// within their own lines. The end is floored at the start so a degenerate
 /// all-overlong input stays well-formed.
-fn normalize_range_endpoints(mapper: &PositionMapper, range: Range) -> Option<Range> {
+pub(super) fn normalize_range_endpoints(mapper: &PositionMapper, range: Range) -> Option<Range> {
     let start = mapper.byte_to_position(mapper.position_to_byte_clamped(range.start))?;
     let end = mapper.byte_to_position(mapper.position_to_byte_clamped(range.end))?;
     Some(Range {
@@ -258,6 +258,10 @@ pub(crate) struct RangeRequestContext {
     pub(crate) document: DocumentRequestContext,
     /// The range within the document.
     pub(crate) range: Range,
+    /// Open-document lifetime of the snapshot that produced the region.
+    pub(crate) incarnation: u64,
+    /// Input revision of the snapshot that produced the region.
+    pub(crate) content_version: u64,
 }
 
 /// Intermediate result from the shared preamble, before server config lookup.
@@ -1628,6 +1632,8 @@ impl Kakehashi {
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
         let (preamble, start, end) =
             self.resolve_bridge_preamble(lsp_uri, range.start, Some(range.end), method_name)?;
+        let incarnation = preamble.incarnation;
+        let content_version = preamble.content_version;
         let document = self
             .preamble_to_document_context(preamble, method_name)
             .await?;
@@ -1642,7 +1648,12 @@ impl Kakehashi {
             start,
             end: end.max(start),
         };
-        Some(RangeRequestContext { document, range })
+        Some(RangeRequestContext {
+            document,
+            range,
+            incarnation,
+            content_version,
+        })
     }
 
     /// Range-overlap variant of [`Self::resolve_bridge_contexts_for_range`]:
@@ -1755,6 +1766,8 @@ impl Kakehashi {
             contexts.push(RangeRequestContext {
                 document,
                 range: clamped,
+                incarnation: snapshot.incarnation(),
+                content_version: snapshot.content_version(),
             });
         }
         contexts
