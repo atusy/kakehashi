@@ -1292,4 +1292,52 @@ mod tests {
             "no parser yet: the document could not be looked at"
         );
     }
+
+    /// A parser not yet published makes the document unlookable even when a
+    /// tree exists (a prior lifetime's parser, or a registry entry a reload
+    /// has scoped out): the query it would run may not be the one the
+    /// published parser will pair with.
+    #[tokio::test]
+    async fn treeful_document_under_a_pending_parser_is_undeterminable() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"((string_literal (string_content) @injection.content)
+                (#set! injection.language "html"))"#,
+        )
+        .expect("valid query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(query));
+        let text = r#"fn main() { let open = "<div>"; }"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("set language");
+        let tree = parser.parse(text, None).expect("parse rust");
+        let uri = Url::parse("file:///treeful_pending.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), text.to_string(), Some("rust".into()), None);
+        server
+            .documents
+            .update_document(uri.clone(), text.to_string(), Some(tree));
+        let injection = server.injection_coordinator();
+
+        assert!(
+            injection.resolve_injection_data(&uri, "rust").is_none(),
+            "query present, parser not published: could not look"
+        );
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), language);
+        assert!(
+            injection
+                .resolve_injection_data(&uri, "rust")
+                .is_some_and(|regions| regions.len() == 1),
+            "parser published: the region resolves"
+        );
+    }
 }
