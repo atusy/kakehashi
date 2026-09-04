@@ -391,6 +391,128 @@ mod tests {
         parser.parse(text, None).unwrap()
     }
 
+    fn edit(start: usize, old_end: usize, new_end: usize) -> InputEdit {
+        InputEdit {
+            start_byte: start,
+            old_end_byte: old_end,
+            new_end_byte: new_end,
+            start_position: tree_sitter::Point::new(0, start),
+            old_end_position: tree_sitter::Point::new(0, old_end),
+            new_end_position: tree_sitter::Point::new(0, new_end),
+        }
+    }
+
+    fn incremental_parse_matches_fresh(seed: &Tree, text: &str) -> bool {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let incremental = parser.parse(text, Some(seed)).unwrap();
+        let fresh = parser.parse(text, None).unwrap();
+        incremental.root_node().to_sexp() == fresh.root_node().to_sexp()
+            && incremental.root_node().end_byte() == text.len()
+    }
+
+    /// The off-ingress reparse's seed is derived, not stored: the published
+    /// tree with every edit since its version replayed onto a clone, so a
+    /// burst of coalesced edits yields one correctly edited seed and the
+    /// published snapshot itself stays unedited.
+    #[test]
+    fn incremental_seed_is_the_published_tree_with_the_edits_since_replayed() {
+        let mut doc = Document::with_tree(
+            "fn main() {}".to_string(),
+            "rust".to_string(),
+            rust_tree("fn main() {}"),
+            3,
+        );
+        assert!(
+            doc.incremental_seed().is_some(),
+            "an unedited current tree seeds as is"
+        );
+
+        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit(11, 11, 12)]);
+        let seed = doc.incremental_seed().expect("one edit: seeded");
+        assert!(incremental_parse_matches_fresh(&seed, "fn main() { }"));
+        assert!(
+            doc.tree().is_none(),
+            "the edit made the published tree stale"
+        );
+
+        doc.apply_edit_and_seed("fn main() { x }".to_string(), &[edit(12, 12, 14)]);
+        let seed = doc
+            .incremental_seed()
+            .expect("coalesced edits: still seeded");
+        assert!(
+            incremental_parse_matches_fresh(&seed, "fn main() { x }"),
+            "both edits replayed, in order"
+        );
+        assert_eq!(
+            doc.latest_snapshot_slot()
+                .snapshot
+                .and_then(|s| s.tree.as_ref().map(|t| t.root_node().end_byte())),
+            Some("fn main() {}".len()),
+            "the published tree is not edited in place"
+        );
+    }
+
+    /// A full-text sync (no `InputEdit`s) invalidates seeding until a fresh
+    /// tree is published: seeding an unedited tree against wholly replaced
+    /// text violates tree-sitter's incremental contract (#348), and the edits
+    /// that follow before the reparse cannot be replayed onto it either.
+    #[test]
+    fn a_full_text_sync_disables_seeding_until_a_fresh_tree_is_published() {
+        let mut doc = Document::with_tree(
+            "fn main() {}".to_string(),
+            "rust".to_string(),
+            rust_tree("fn main() {}"),
+            3,
+        );
+        doc.apply_edit_and_seed("fn other() {}".to_string(), &[]);
+        assert!(
+            doc.incremental_seed().is_none(),
+            "full sync: parse from scratch"
+        );
+        doc.apply_edit_and_seed("fn other() { }".to_string(), &[edit(12, 12, 13)]);
+        assert!(
+            doc.incremental_seed().is_none(),
+            "an edit after the sync has no tree it can be replayed onto"
+        );
+
+        assert!(doc.publish_snapshot(doc.bare_snapshot(Some(rust_tree("fn other() { }")))));
+        assert!(
+            doc.incremental_seed().is_some(),
+            "a fresh published tree seeds again"
+        );
+        doc.apply_edit_and_seed("fn other() { y }".to_string(), &[edit(13, 13, 15)]);
+        let seed = doc.incremental_seed().expect("seeded from the fresh tree");
+        assert!(incremental_parse_matches_fresh(&seed, "fn other() { y }"));
+    }
+
+    /// Edits the published tree already saw are not replayed onto it: a
+    /// parse that landed at version N consumed the edits up to N, so only
+    /// the edits after N are applied to its clone.
+    #[test]
+    fn edits_the_published_tree_already_consumed_are_not_replayed() {
+        let mut doc = Document::with_tree(
+            "fn main() {}".to_string(),
+            "rust".to_string(),
+            rust_tree("fn main() {}"),
+            3,
+        );
+        doc.apply_edit_and_seed("fn main() { }".to_string(), &[edit(11, 11, 12)]);
+        doc.apply_edit_and_seed("fn main() { x }".to_string(), &[edit(12, 12, 14)]);
+        // The reparse of version 2 lands.
+        assert!(doc.publish_snapshot(doc.bare_snapshot(Some(rust_tree("fn main() { x }")))));
+        doc.apply_edit_and_seed("fn main() { xy }".to_string(), &[edit(13, 13, 14)]);
+        let seed = doc
+            .incremental_seed()
+            .expect("seeded from the version-2 tree");
+        assert!(
+            incremental_parse_matches_fresh(&seed, "fn main() { xy }"),
+            "only the edit after version 2 is replayed"
+        );
+    }
+
     /// A tree reaches readers only through a published, current snapshot:
     /// the document has no tree of its own.
     #[test]
