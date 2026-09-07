@@ -1212,6 +1212,95 @@ mod tests {
         );
     }
 
+    /// A parse installs twice per version: the tree with its discovery as
+    /// soon as they exist, then the same version again once the bridge /
+    /// resolved regions are derived. The second install is an upgrade the
+    /// cell admits over the tree it already holds; it is current and
+    /// published like the first, and the same shape a third time lands
+    /// nothing — a version never re-publishes for nothing.
+    #[test]
+    fn install_parse_upgrades_the_current_version_with_regions_once() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///upgrade.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        let tree = markdown_tree(text);
+        let with_regions = || {
+            let mut snapshot = super::super::snapshot::ParseSnapshot {
+                text: Arc::clone(&expected_text),
+                tree: Some(tree.clone()),
+                language: Some("markdown".to_string()),
+                parsed_version: content_version,
+                incarnation,
+                injection_regions: None,
+                bridge_regions: None,
+                resolved_regions: None,
+                layer_trees: std::sync::OnceLock::new(),
+            };
+            snapshot.bridge_regions = Some((1, Arc::new(Vec::new())));
+            Arc::new(snapshot)
+        };
+
+        let first = store.install_parse(
+            &uri,
+            LanguageCheck::Expect(Some("markdown")),
+            parse_snapshot(
+                &expected_text,
+                Some(tree.clone()),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert_eq!(
+            first,
+            ParseInstall {
+                current: true,
+                published: true
+            }
+        );
+        let upgrade = store.install_parse(
+            &uri,
+            LanguageCheck::Expect(Some("markdown")),
+            with_regions(),
+        );
+        assert_eq!(
+            upgrade,
+            ParseInstall {
+                current: true,
+                published: true
+            },
+            "the regions arriving on the published version upgrade it"
+        );
+        assert!(
+            store.latest_snapshot(&uri).is_some_and(|view| view
+                .slot
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.parsed_version == content_version
+                    && s.tree.is_some()
+                    && s.bridge_regions.is_some())),
+            "readers now see the regions on the same version"
+        );
+        let again = store.install_parse(
+            &uri,
+            LanguageCheck::Expect(Some("markdown")),
+            with_regions(),
+        );
+        assert_eq!(
+            again,
+            ParseInstall::default(),
+            "the same shape again is not an upgrade"
+        );
+    }
     /// One publish per version and lifetime, and currency reported from the
     /// snapshot's stamps: the first install at a version lands and is current;
     /// an equal-version duplicate lands nothing and is not current; a parse of
