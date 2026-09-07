@@ -97,8 +97,9 @@ pub(crate) struct PopulatedInjections {
     /// `None` when no bridge server is runnable — bridge readers then fall
     /// back to inline resolution — vs `Some(empty)` for "ran, no regions"
     /// (readers skip their work) vs the roster: every region's language and
-    /// identity, with content only for the regions a runnable server handles
-    /// (the resolution ran iff any region has content).
+    /// identity, with content for every region iff a runnable server handles
+    /// one of the document's region languages (the resolution ran iff the
+    /// regions carry content).
     pub(crate) bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>>,
     /// `Some` iff the resolution ran (a runnable server handles one of the
     /// document's region languages); the whole-document readers resolve

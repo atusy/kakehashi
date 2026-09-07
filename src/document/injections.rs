@@ -117,10 +117,12 @@ pub(crate) struct DiscoveredBridgeRegion {
     /// The exact virtual-document text the bridge opens downstream (excluded
     /// prefixes removed; an `injection.combined` group preserves host line
     /// numbers with empty lines and uses spaces for later gaps on a line):
-    /// `Some` for a region a runnable bridge server handles, `None` for one
-    /// no server handles — the region is on the roster, its language and
-    /// identity still drive the injected-grammar install and the closing of
-    /// a virtual document it used to have, but nothing opens it.
+    /// `Some` for every region of a document one of whose region languages
+    /// a runnable bridge server handles, `None` for every region of a
+    /// document none routes — those regions are on the roster, their
+    /// language and identity still drive the injected-grammar load and the
+    /// closing of a virtual document they used to have, but nothing opens
+    /// them.
     pub content: Option<String>,
 }
 

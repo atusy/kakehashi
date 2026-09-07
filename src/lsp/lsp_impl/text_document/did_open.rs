@@ -517,13 +517,6 @@ mod tests {
         );
     }
 
-    /// A parse publishes twice per version: the tree with its discovery as
-    /// soon as populate hands them out — releasing every reader parked on
-    /// the cell, the token readers above all — and the same version again,
-    /// upgraded with the bridge / resolved regions, once the resolution the
-    /// bridge consumes has run. With the resolution held, the first publish
-    /// is observable on its own: current, tree-bearing, regions absent, and
-    /// a token wait already returns it.
     /// The open parse resolves a document's regions only when the bridge's
     /// own routing rule (host filter, spawnable command, `languages` list)
     /// gives one of its region languages a server — judged on the canonical
@@ -652,6 +645,13 @@ mod tests {
         );
     }
 
+    /// A parse publishes twice per version: the tree with its discovery as
+    /// soon as populate hands them out — releasing every reader parked on
+    /// the cell, the token readers above all — and the same version again,
+    /// upgraded with the bridge / resolved regions, once the resolution the
+    /// bridge consumes has run. With the resolution held, the first publish
+    /// is observable on its own: current, tree-bearing, regions absent, and
+    /// a token wait already returns it.
     #[tokio::test]
     async fn did_open_publishes_the_tree_before_the_regions_are_resolved() {
         let (service, mut socket) = LspService::new(Kakehashi::new);
