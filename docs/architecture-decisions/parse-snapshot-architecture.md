@@ -233,7 +233,13 @@ out, from inside the populate work-unit, so the token readers wake without
 waiting for the resolution only the bridge and the whole-document readers
 consume; then the same version again, upgraded with the bridge / resolved
 regions once the pass has resolved (the equal-version regions upgrade above; a
-pass refused before the hand-off installs once, with no regions); and emit the
+pass refused before the hand-off installs once, with no regions). With a
+runnable bridge server, populate resolves only a document one of whose region
+languages — canonicalized the way the bridge routes — a server handles; a
+document nothing routes publishes a roster instead (every region's language
+and identity, no content), enough for the injected-grammar load and the closing
+of a virtual document a region used to have, and its whole-document readers
+resolve inline as they do without a runnable server; and emit the
 downstream — `semanticTokens/refresh`, injected-language forwarding, diagnostic
 republish — gated on the first install's result, after the upgrade, in the order
 the per-document-parse-scheduler loop already uses
