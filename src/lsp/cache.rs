@@ -94,12 +94,15 @@ pub(crate) struct InjectionDiscovery {
 /// All ride the `ParseSnapshot` the parse publishes.
 pub(crate) struct PopulatedInjections {
     pub(crate) discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
-    /// `None` when the resolution was skipped (no runnable bridge server) —
-    /// bridge readers then fall back to inline resolution — vs `Some(empty)`
-    /// for "ran, nothing matched" (readers skip their work).
+    /// `None` when no bridge server is runnable — bridge readers then fall
+    /// back to inline resolution — vs `Some(empty)` for "ran, no regions"
+    /// (readers skip their work) vs the roster: every region's language and
+    /// identity, with content only for the regions a runnable server handles
+    /// (the resolution ran iff any region has content).
     pub(crate) bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>>,
-    /// The same gate as `bridge_regions`: `None` exactly when it is, and the
-    /// whole-document readers then resolve inline.
+    /// `Some` iff the resolution ran (a runnable server handles one of the
+    /// document's region languages); the whole-document readers resolve
+    /// inline otherwise.
     pub(crate) resolved_regions: Option<Vec<crate::language::injection::ResolvedInjection>>,
     /// The settings generation this populate pass ran under — stamped onto
     /// the snapshot's `bridge_regions` and `resolved_regions` so reload-stale
@@ -463,17 +466,19 @@ impl CacheCoordinator {
             // Judged on the canonical language the bridge routes on; a
             // region whose identifier only its content could canonicalize
             // counts as routable, so it is resolved rather than guessed.
-            let routable = regions.iter().any(|info| {
-                language
-                    .canonical_injection_language_from_identifier(&info.language)
-                    .is_none_or(|canonical| bridged(&canonical))
-            });
+            let canonical: Vec<Option<String>> = regions
+                .iter()
+                .map(|info| language.canonical_injection_language_from_identifier(&info.language))
+                .collect();
+            let routable = canonical
+                .iter()
+                .any(|canonical| canonical.as_deref().is_none_or(bridged));
             log::trace!(
                 target: "kakehashi::populate",
                 "{uri}: {} regions, a bridge server handles one: {routable}",
                 regions.len()
             );
-            let resolved = if build_bridge_regions {
+            let resolved = if build_bridge_regions && routable {
                 let resolved = crate::language::injection::InjectionResolver::resolve_from_prebuilt_cancellable(
                     language,
                     &regions,
@@ -490,22 +495,42 @@ impl CacheCoordinator {
             // (parse-snapshot ADR §3, never discover twice): the exact
             // (resolved language, region_id, clean content) triple
             // `resolve_injection_data` used to re-derive by re-running the
-            // injection query per downstream pass. Gated on a bridge server
-            // actually being configured: populate runs on the pre-publish
-            // critical path, and the per-region content copies are pure
-            // waste for the (common) bridge-less deployment — `None` makes
-            // any late-configured bridge fall back to inline resolution.
+            // injection query per downstream pass. With a runnable bridge
+            // server a document nothing routes publishes a roster instead —
+            // every region's language and identity without the content
+            // copies, enough for the injected-grammar install and the
+            // closing of a virtual document a region used to have. Without
+            // a runnable server, `None`: populate runs on the pre-publish
+            // critical path, and a bridge configured by a later reload
+            // falls back to inline resolution.
             let bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>> =
-                resolved.as_ref().map(|resolved| {
-                    resolved
-                        .iter()
-                        .map(|region| crate::document::DiscoveredBridgeRegion {
-                            language: region.injection_language.clone(),
-                            region_id: region.region.region_id.clone(),
-                            content: Some(region.virtual_content.clone()),
-                        })
-                        .collect()
-                });
+                match &resolved {
+                    Some(resolved) => Some(
+                        resolved
+                            .iter()
+                            .map(|region| crate::document::DiscoveredBridgeRegion {
+                                language: region.injection_language.clone(),
+                                region_id: region.region.region_id.clone(),
+                                content: Some(region.virtual_content.clone()),
+                            })
+                            .collect(),
+                    ),
+                    None if build_bridge_regions => Some(
+                        regions
+                            .iter()
+                            .zip(&cacheable_regions)
+                            .zip(canonical)
+                            .map(|((info, cacheable), canonical)| {
+                                crate::document::DiscoveredBridgeRegion {
+                                    language: canonical.unwrap_or_else(|| info.language.clone()),
+                                    region_id: cacheable.region_id.clone(),
+                                    content: None,
+                                }
+                            })
+                            .collect(),
+                    ),
+                    None => None,
+                };
 
             // The whole-document readers' fully resolved regions, from the
             // same single query run — and from the SAME per-region ids and
