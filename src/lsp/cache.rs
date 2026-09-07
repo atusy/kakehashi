@@ -67,7 +67,7 @@ pub(crate) struct CacheCoordinator {
 /// bridge-downstream region list and the whole-document resolved regions.
 /// All ride the `ParseSnapshot` the parse publishes.
 pub(crate) struct PopulatedInjections {
-    pub(crate) discovery: Option<crate::document::DiscoveredInjections>,
+    pub(crate) discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
     /// `None` when the resolution was skipped (no runnable bridge server) —
     /// bridge readers then fall back to inline resolution — vs `Some(empty)`
     /// for "ran, nothing matched" (readers skip their work).
@@ -511,7 +511,7 @@ impl CacheCoordinator {
             });
             committed?;
             Some(PopulatedInjections {
-                discovery,
+                discovery: discovery.map(std::sync::Arc::new),
                 bridge_regions,
                 resolved_regions,
                 generation,
