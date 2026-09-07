@@ -226,7 +226,6 @@ impl CacheCoordinator {
         entry_mint_epoch: (u64, u64),
         incarnation: u64,
         build_bridge_regions: bool,
-        build_resolved_regions: bool,
     ) -> Option<PopulatedInjections> {
         self.populate_injections_cancellable(
             uri,
@@ -238,7 +237,6 @@ impl CacheCoordinator {
             entry_mint_epoch,
             incarnation,
             build_bridge_regions,
-            build_resolved_regions,
             None,
         )
     }
@@ -255,7 +253,6 @@ impl CacheCoordinator {
         entry_mint_epoch: (u64, u64),
         incarnation: u64,
         build_bridge_regions: bool,
-        build_resolved_regions: bool,
         cancel: Option<&crate::cancel::CancelToken>,
     ) -> Option<PopulatedInjections> {
         if crate::cancel::is_cancelled(cancel) {
@@ -395,7 +392,7 @@ impl CacheCoordinator {
             // virtual content. In production the bridge and whole-document
             // gates rise together, so resolving independently would duplicate
             // the language-detection chain on the parse critical path.
-            let resolved = if build_bridge_regions || build_resolved_regions {
+            let resolved = if build_bridge_regions {
                 let resolved = crate::language::injection::InjectionResolver::resolve_from_prebuilt_cancellable(
                     language,
                     &regions,
@@ -435,7 +432,7 @@ impl CacheCoordinator {
             // same single query run — and from the SAME per-region ids and
             // content hashes already in `cacheable_regions` (no duplicate
             // mint/hash on this critical path).
-            let resolved_regions = build_resolved_regions
+            let resolved_regions = build_bridge_regions
                 .then(|| resolved.expect("whole-document regions requested resolution"));
 
             if crate::cancel::is_cancelled(cancel) {
@@ -982,7 +979,6 @@ mod tests {
                 tracker.mint_epoch(&uri),
                 1,
                 true,
-                true,
             )
             .expect("the pass ran");
 
@@ -1009,7 +1005,6 @@ mod tests {
                 &tracker,
                 tracker.mint_epoch(&uri),
                 1,
-                true,
                 true,
             )
             .expect("the pass ran");
@@ -1057,7 +1052,6 @@ mod tests {
             &tracker,
             tracker.mint_epoch(&uri),
             1,
-            true,
             true,
             Some(&cancel),
         );
@@ -1107,7 +1101,6 @@ mod tests {
             &tracker,
             tracker.mint_epoch(&uri),
             1,
-            true,
             true,
             Some(&cancel),
         );
@@ -1171,7 +1164,6 @@ print("hello")
             tracker.mint_epoch(&uri),
             0,
             true,
-            true,
         );
 
         // Verify we have one injection region
@@ -1233,7 +1225,6 @@ print("hello")
             &tracker,
             tracker.mint_epoch(&uri),
             0,
-            true,
             true,
         );
 
@@ -1314,7 +1305,6 @@ print("hello")
             tracker.mint_epoch(&uri),
             0,
             true,
-            true,
         );
 
         let regions = cache.get_injections(&uri).expect("should have injections");
@@ -1360,7 +1350,6 @@ print("goodbye")
             &tracker,
             tracker.mint_epoch(&uri),
             0,
-            true,
             true,
         );
 
