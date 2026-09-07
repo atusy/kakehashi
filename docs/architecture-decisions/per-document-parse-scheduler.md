@@ -463,7 +463,9 @@ write is the one non-inserting `install_parse`: the cell admits a snapshot only
 for the captured incarnation and a newer version — or the same version when the
 incoming snapshot brings a tree the held one lacks, which is how a reparse fills
 in a reload placeholder or a give-up snapshot instead of leaving the document
-tree-less until the next edit — the reparse's language check
+tree-less until the next edit, or when it brings bridge / resolved regions the
+held tree-bearing one lacks, which is how a parse's second install lands the
+resolution after its first already released the readers — the reparse's language check
 rejects a relabelled document, and the watermark advance is incarnation-guarded, so a
 close-then-reopen during an in-flight parse fails its epoch check at the write
 rather than resurrecting the closed document. Injection orchestration runs
