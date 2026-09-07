@@ -203,6 +203,19 @@ impl Kakehashi {
                 .language
                 .injection_query(&language_name)
                 .map(|injection_query| {
+                    // A roster nothing routes (every region listed, none
+                    // with content: no runnable server handles any of their
+                    // languages) has no virt region to ask about — taken
+                    // from the roster, not resolved inline on every pull.
+                    // Generation-stamped, so a reload that configures a
+                    // server resolves inline below.
+                    if self
+                        .documents
+                        .current_bridge_regions(&uri, self.cache.semantic_token_generation())
+                        .is_some_and(|roster| roster.iter().all(|region| region.content.is_none()))
+                    {
+                        return std::sync::Arc::new(Vec::new());
+                    }
                     match self
                         .documents
                         .current_resolved_regions(&uri, self.cache.semantic_token_generation())
