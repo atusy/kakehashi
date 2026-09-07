@@ -87,6 +87,7 @@ pub(crate) fn detect_from_token(token: &str) -> Option<String> {
     if TOKEN_MEMO.len() >= TOKEN_MEMO_CAP {
         TOKEN_MEMO.clear();
     }
+    TOKEN_MEMO.insert(token.to_string(), detected.clone());
     detected
 }
 
