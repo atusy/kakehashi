@@ -366,6 +366,11 @@ impl ParseCoordinator {
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
         let documents = std::sync::Arc::clone(&self.documents);
+        // Shared with the work-unit rather than moved into it: a panic
+        // inside the pass is contained by the pool and must still leave
+        // this parse installed (once, without regions) — as it always did.
+        let inputs = std::sync::Arc::new(inputs);
+        let check = std::sync::Arc::new(check);
         let entry_mint_epoch = {
             let edit_lock = self.documents.edit_lock(uri);
             let _edit_guard = edit_lock.lock().await;
@@ -400,9 +405,15 @@ impl ParseCoordinator {
             .load_settings()
             .any_bridge_server_runnable();
         let pool_uri = uri.clone();
-        let (first, regions, inputs, check) =
-            run_awaited_populate(&self.compute_pool, version_cancel, move |cancel_for_work| {
-                let mut first: Option<crate::document::ParseInstall> = None;
+        // The first install's verdict lives outside the work-unit too, so a
+        // panic after the hand-off cannot lose a publish that already landed.
+        let first: std::sync::Arc<std::sync::Mutex<Option<crate::document::ParseInstall>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let regions = run_awaited_populate(&self.compute_pool, version_cancel, {
+            let inputs = std::sync::Arc::clone(&inputs);
+            let check = std::sync::Arc::clone(&check);
+            let first = std::sync::Arc::clone(&first);
+            move |cancel_for_work| {
                 let populated = cache.populate_injections_cancellable(
                     &pool_uri,
                     &inputs.text,
@@ -420,14 +431,15 @@ impl ParseCoordinator {
                             inputs.parsed_version,
                             discovered.generation
                         );
-                        first = Some(documents.install_parse(
+                        let installed = documents.install_parse(
                             &pool_uri,
                             check.as_check(),
                             inputs.snapshot(PopulatedSnapshotRegions {
                                 discovery: discovered.discovery,
                                 ..PopulatedSnapshotRegions::default()
                             }),
-                        ));
+                        );
+                        *first.lock().unwrap_or_else(|e| e.into_inner()) = Some(installed);
                     },
                     Some(&cancel_for_work),
                 );
@@ -437,29 +449,36 @@ impl ParseCoordinator {
                 // shape instead would publish "no injections" for a pass
                 // that never derived anything, blanking the document's
                 // injections until the next parse.
-                let regions =
-                    populated.map_or_else(PopulatedSnapshotRegions::default, |populated| {
-                        PopulatedSnapshotRegions {
-                            discovery: populated.discovery,
-                            bridge_regions: populated.bridge_regions.map(|regions| {
-                                (populated.generation, std::sync::Arc::new(regions))
-                            }),
-                            resolved_regions: populated.resolved_regions.map(|regions| {
-                                (populated.generation, std::sync::Arc::new(regions))
-                            }),
-                        }
-                    });
-                (first, regions, inputs, check)
-            })
-            .await
-            .unwrap_or_else(|| unreachable!("the populate work-unit is awaited, never dropped"));
+                populated.map_or_else(PopulatedSnapshotRegions::default, |populated| {
+                    PopulatedSnapshotRegions {
+                        discovery: populated.discovery,
+                        bridge_regions: populated
+                            .bridge_regions
+                            .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
+                        resolved_regions: populated
+                            .resolved_regions
+                            .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
+                    }
+                })
+            }
+        })
+        .await
+        // A work-unit the pool contained (it panicked) derived nothing: the
+        // snapshot rides without regions, exactly as a refused pass.
+        .unwrap_or_default();
+        let first = first.lock().unwrap_or_else(|e| e.into_inner()).take();
         match first {
             // The pass handed its discovery out and the tree is published:
             // land the regions it resolved on the same version. Nothing to
             // land (skipped resolution, refused commit) publishes nothing —
-            // the cell would refuse the same shape anyway.
+            // the cell would refuse the same shape anyway. A first install
+            // the cell refused (a sibling parse of this version landed its
+            // tree first) has nothing to upgrade: the regions would ride the
+            // sibling's tree with a tree the readers never derived from.
             Some(first) => {
-                if regions.bridge_regions.is_some() || regions.resolved_regions.is_some() {
+                if first.published
+                    && (regions.bridge_regions.is_some() || regions.resolved_regions.is_some())
+                {
                     self.documents
                         .install_parse(uri, check.as_check(), inputs.snapshot(regions));
                 }
