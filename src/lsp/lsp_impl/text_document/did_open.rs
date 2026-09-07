@@ -1593,7 +1593,7 @@ print("hello")
             .unwrap()
             .tree()
             .expect("the reparse published a tree");
-        assert_eq!(&*server.documents.get(&uri).unwrap().text(), after);
+        assert_eq!(server.documents.get(&uri).unwrap().text(), after);
         assert_eq!(
             keep_name(&reparsed),
             Some(before_id),

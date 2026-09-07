@@ -1880,11 +1880,11 @@ mod tests {
         let present = temp.path().join("present");
         std::fs::write(&present, "parser").unwrap();
 
-        assert_eq!(remove_parser_entry(&present).unwrap(), true);
+        assert!(remove_parser_entry(&present).unwrap());
         assert!(!present.exists());
         // The same call again: the entry is gone, which is success, but not a
         // removal this run performed.
-        assert_eq!(remove_parser_entry(&present).unwrap(), false);
+        assert!(!remove_parser_entry(&present).unwrap());
     }
 
     /// "Nothing here" and "could not tell" must stay distinguishable: the gate
