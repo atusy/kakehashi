@@ -1309,6 +1309,132 @@ mod tests {
             "the roster's languages drive the injected-grammar load"
         );
     }
+    /// A mixed document — one region a server handles, one nothing routes —
+    /// is resolved in full, so every region carries content; the region
+    /// nothing routes must still lose the virtual document it used to
+    /// have (a reload narrowed the server's languages), while the routed
+    /// region keeps its own.
+    #[tokio::test]
+    async fn a_region_nothing_routes_loses_its_virtual_document_beside_a_routed_one() {
+        use crate::config::WorkspaceSettings;
+        use crate::config::settings::BridgeServerConfig;
+        use crate::lsp::bridge::ConnectionKey;
+        use crate::lsp::bridge::VirtualDocumentUri;
+        use tower_lsp_server::ls_types::{DidOpenTextDocumentParams, TextDocumentItem};
+
+        let (service, mut socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while socket.next().await.is_some() {}
+        });
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), tree_sitter_md::LANGUAGE.into());
+        let markdown_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let injection_query = tree_sitter::Query::new(
+            &markdown_language,
+            r#"
+            (fenced_code_block
+              (info_string
+                (language) @injection.language)
+              (code_fence_content) @injection.content)
+            "#,
+        )
+        .expect("valid markdown injection query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(injection_query));
+        let mut language_servers = std::collections::HashMap::new();
+        language_servers.insert(
+            "python-bridge".to_string(),
+            BridgeServerConfig {
+                cmd: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "cat > /dev/null".to_string(),
+                ]),
+                languages: Some(vec!["python".to_string()]),
+                initialization_options: None,
+                workspace_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+                force_start: None,
+                enabled: None,
+                settings: None,
+            },
+        );
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: false,
+            language_servers,
+            ..Default::default()
+        });
+        server
+            .bridge
+            .insert_ready_test_connection("python-bridge")
+            .await;
+
+        let uri = Url::parse("file:///test/mixed_routing.md").expect("valid test URI");
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
+        let text = "```py\nprint(1)\n```\n\n```lua\nprint(1)\n```\n";
+        server
+            .did_open_impl(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: lsp_uri.clone(),
+                    language_id: "markdown".to_string(),
+                    version: 1,
+                    text: text.to_string(),
+                },
+            })
+            .await;
+        let roster = || {
+            server
+                .documents
+                .latest_snapshot(&uri)
+                .and_then(|view| view.slot.snapshot)
+                .and_then(|snapshot| snapshot.bridge_regions.as_ref().map(|(_, r)| Arc::clone(r)))
+                .filter(|roster| roster.iter().all(|region| region.content.is_some()))
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && roster().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let roster = roster().expect("the mixed document is resolved in full");
+        let region_id = |language: &str| {
+            roster
+                .iter()
+                .find(|region| region.language == language)
+                .map(|region| region.region_id.clone())
+                .unwrap_or_else(|| panic!("a {language} region on the roster"))
+        };
+        let lua_uri = VirtualDocumentUri::new(&lsp_uri, "lua", &region_id("lua"));
+        let python_uri = VirtualDocumentUri::new(&lsp_uri, "python", &region_id("python"));
+        let connection = ConnectionKey::for_server("python-bridge");
+        server
+            .bridge
+            .register_opened_document_for_test(&uri, &lua_uri, &connection)
+            .await;
+        server
+            .bridge
+            .register_opened_document_for_test(&uri, &python_uri, &connection)
+            .await;
+
+        server
+            .injection_coordinator()
+            .process_injections(&uri, false)
+            .await;
+
+        assert!(
+            !server.bridge.pool().is_document_opened(&lua_uri),
+            "no server handles lua: its virtual document is taken"
+        );
+        assert!(
+            server.bridge.pool().is_document_opened(&python_uri),
+            "python-bridge handles python: its virtual document stays"
+        );
+    }
     /// The snapshot fast path of `resolve_injection_data` must produce
     /// exactly what the inline (live-tree) resolution produces — the fast
     /// path's output is forwarded verbatim to downstream servers, so a
