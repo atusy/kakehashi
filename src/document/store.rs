@@ -756,6 +756,19 @@ impl DocumentStore {
                             && held.incarnation == incarnation
                             && held.tree.is_none()
                     });
+                // An equal-version upgrade replaces the held snapshot with one
+                // carrying the same tree: the layer trees a reader already
+                // derived on the held one are carried over rather than
+                // derived again by the next reader. (A snapshot the cell then
+                // refuses is simply dropped with them.)
+                if has_tree
+                    && let Some(held) = evicted.as_ref()
+                    && held.parsed_version == version
+                    && held.incarnation == incarnation
+                    && let Some(layer_trees) = held.layer_trees.get()
+                {
+                    let _ = snapshot.layer_trees.set(layer_trees.clone());
+                }
                 let published = doc.publish_snapshot(&snapshot);
                 let current = published && parsed_current_version;
                 // The reparses do not relabel (the snapshot carries the
