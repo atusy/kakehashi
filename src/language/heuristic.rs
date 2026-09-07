@@ -22,14 +22,72 @@ use syntect::parsing::SyntaxSet;
 /// Lazily initialized syntax set with extended syntaxes (via two-face).
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
 
+/// Scans per token, for the memo tests: other tests look tokens and lines up
+/// concurrently, so a process-wide total would count their scans too.
+#[cfg(test)]
+static SYNTAX_SCANS: LazyLock<dashmap::DashMap<String, usize>> =
+    LazyLock::new(dashmap::DashMap::new);
+
+#[cfg(test)]
+fn record_syntax_scan(key: &str) {
+    *SYNTAX_SCANS.entry(key.to_string()).or_insert(0) += 1;
+}
+
+#[cfg(not(test))]
+fn record_syntax_scan(_key: &str) {}
+
+#[cfg(test)]
+fn syntax_scans(key: &str) -> usize {
+    SYNTAX_SCANS.get(key).map_or(0, |scans| *scans)
+}
+
+/// Token → canonical name memo for [`detect_from_token`]. The lookup is a
+/// scan over every syntax's extension list and name; injection resolution
+/// asks it once per region, and a document repeats a handful of identifiers
+/// thousands of times. Misses are remembered too (an unknown fence
+/// identifier is the common case for prose fences). Bounded by
+/// [`TOKEN_MEMO_CAP`]: identifiers come from document content, so a hostile
+/// document could otherwise grow it without limit.
+static TOKEN_MEMO: LazyLock<dashmap::DashMap<String, Option<String>>> =
+    LazyLock::new(dashmap::DashMap::new);
+
+/// Distinct identifiers the memo holds before it resets. Far above any real
+/// vocabulary of fence identifiers (a few dozen), far below anything that
+/// costs memory: a reset re-scans, it never answers wrong.
+const TOKEN_MEMO_CAP: usize = 4096;
+
+#[cfg(test)]
+fn clear_token_memo() {
+    TOKEN_MEMO.clear();
+}
+
+#[cfg(test)]
+fn token_memo_len() -> usize {
+    TOKEN_MEMO.len()
+}
+
+/// Held by every test that clears or fills the process-wide memo, so two of
+/// them cannot race each other's reset.
+#[cfg(test)]
+static TOKEN_MEMO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Detect language from a token (e.g., "py", "js", "bash").
 ///
 /// Used for code fence language identifiers in Markdown/HTML.
 /// Uses syntect's find_syntax_by_token which searches extension list then name.
 /// Returns the syntax name in lowercase if found, None otherwise.
 pub(crate) fn detect_from_token(token: &str) -> Option<String> {
-    let syntax = SYNTAX_SET.find_syntax_by_token(token)?;
-    Some(normalize_syntax_name(&syntax.name))
+    if let Some(known) = TOKEN_MEMO.get(token) {
+        return known.clone();
+    }
+    record_syntax_scan(token);
+    let detected = SYNTAX_SET
+        .find_syntax_by_token(token)
+        .map(|syntax| normalize_syntax_name(&syntax.name));
+    if TOKEN_MEMO.len() >= TOKEN_MEMO_CAP {
+        TOKEN_MEMO.clear();
+    }
+    detected
 }
 
 /// Detect language from file content's first line (shebang, mode line).
@@ -127,6 +185,58 @@ mod tests {
             "sentinel line unexpectedly matched syntax {:?}; \
              pick a new sentinel so all first-line regexes still get compiled",
             result.map(|s| s.name.clone())
+        );
+    }
+
+    /// A fence identifier is looked up in syntect's syntax set — a scan over
+    /// every syntax's extension list and name — once per identifier, not once
+    /// per region: an injection-heavy document repeats a handful of
+    /// identifiers thousands of times, and the canonicalization sat at the
+    /// top of the per-edit resolution cost. The memo answers repeats,
+    /// including a miss, and is bounded: crossing the cap resets it, after
+    /// which an evicted identifier is scanned again (never answered wrong)
+    /// and the identifier that crossed the cap is kept.
+    #[test]
+    fn detect_from_token_scans_the_syntax_set_once_per_identifier() {
+        let _serial = TOKEN_MEMO_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Tokens no other test looks up, so their scan counts are this
+        // test's alone (the memo is process-wide). A token is matched as a
+        // whole extension or syntax name, so the hit must be a real one.
+        let hit = "clj";
+        let miss = "memo-probe-no-such-language";
+        clear_token_memo();
+        assert_eq!(detect_from_token(hit).as_deref(), Some("clojure"));
+        assert_eq!(detect_from_token(hit).as_deref(), Some("clojure"));
+        assert_eq!(detect_from_token(miss).as_deref(), None);
+        assert_eq!(detect_from_token(miss).as_deref(), None);
+        assert_eq!(
+            (syntax_scans(hit), syntax_scans(miss)),
+            (1, 1),
+            "one scan per distinct identifier, hits and misses alike"
+        );
+
+        clear_token_memo();
+        for i in 0..=TOKEN_MEMO_CAP {
+            let _ = detect_from_token(&format!("memo-probe-synthetic-{i}"));
+        }
+        assert!(
+            token_memo_len() < TOKEN_MEMO_CAP,
+            "the memo is bounded: crossing the cap resets it instead of growing"
+        );
+        assert_eq!(detect_from_token("memo-probe-synthetic-0").as_deref(), None);
+        assert_eq!(
+            syntax_scans("memo-probe-synthetic-0"),
+            2,
+            "an identifier the reset evicted is scanned again, and still answered right"
+        );
+        let crossed = format!("memo-probe-synthetic-{TOKEN_MEMO_CAP}");
+        let _ = detect_from_token(&crossed);
+        assert_eq!(
+            syntax_scans(&crossed),
+            1,
+            "the identifier that crossed the cap is kept by the reset"
         );
     }
 
