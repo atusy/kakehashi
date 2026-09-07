@@ -158,14 +158,15 @@ impl InjectionCoordinator {
         if let Some(view) = self.documents.latest_snapshot(uri)
             && let Some(snapshot) = &view.slot.snapshot
             && snapshot.parsed_version == view.content_version
-            && let Some((stamped_generation, bridge_regions)) = &snapshot.bridge_regions
+            && let Some(regions) = &snapshot.regions
             // Generation gate (like resolved_regions): a reload can change
             // the injection query without a new snapshot — consuming the old
             // query's regions would open/update virtual documents the new
             // query would not discover. Mismatch falls back inline below.
-            && *stamped_generation == self.cache.semantic_token_generation()
+            && regions.generation == self.cache.semantic_token_generation()
         {
-            let regions = bridge_regions
+            let regions = regions
+                .bridge
                 .iter()
                 .map(|region| BridgeInjection {
                     language: region.language.clone(),
@@ -981,8 +982,7 @@ mod tests {
                     parsed_version: content_version,
                     incarnation,
                     injection_regions: None,
-                    bridge_regions: None,
-                    resolved_regions: None,
+                    regions: None,
                     layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
                 }))
             })
@@ -1139,8 +1139,7 @@ mod tests {
                         parsed_version: content_version,
                         incarnation,
                         injection_regions: None,
-                        bridge_regions: None,
-                        resolved_regions: None,
+                        regions: None,
                         layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
                     },
                 ))
@@ -1202,7 +1201,7 @@ mod tests {
             .slot
             .current_incarnation;
         let content_version = server.documents.get(&uri).unwrap().content_version();
-        let publish = |bridge_regions, parsed_version| {
+        let publish = |regions, parsed_version| {
             let landed = server
                 .documents
                 .get(&uri)
@@ -1215,8 +1214,7 @@ mod tests {
                             parsed_version,
                             incarnation,
                             injection_regions: None,
-                            bridge_regions,
-                            resolved_regions: None,
+                            regions,
                             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
                         },
                     ))
@@ -1245,15 +1243,12 @@ mod tests {
             true,
         );
         let populated = populated.expect("current pass populates");
-        let bridge_regions = populated.bridge_regions.expect("gate was true");
+        let regions = populated.regions.expect("gate was true");
         server
             .documents
             .update_document(uri.clone(), text.to_string(), None);
         let content_version = server.documents.get(&uri).unwrap().content_version();
-        publish(
-            Some((populated.generation, std::sync::Arc::new(bridge_regions))),
-            content_version,
-        );
+        publish(Some(regions), content_version);
         let fast = injection
             .resolve_injection_data(&uri, "rust")
             .expect("query present");
@@ -1434,7 +1429,7 @@ mod tests {
                 true,
             )
             .expect("current pass populates");
-        let bridge_regions = populated.bridge_regions.expect("gate was true");
+        let regions = populated.regions.expect("gate was true");
         // A new revision, so the fast-path snapshot below is admitted (a
         // second publish at the same revision is refused).
         server
@@ -1456,11 +1451,7 @@ mod tests {
                         parsed_version: content_version,
                         incarnation,
                         injection_regions: None,
-                        bridge_regions: Some((
-                            populated.generation,
-                            std::sync::Arc::new(bridge_regions),
-                        )),
-                        resolved_regions: None,
+                        regions: Some(regions),
                         layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
                     },
                 ))
@@ -1623,8 +1614,7 @@ mod tests {
                         parsed_version: content_version,
                         incarnation,
                         injection_regions: None,
-                        bridge_regions: None,
-                        resolved_regions: None,
+                        regions: None,
                         layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
                     },
                 ))

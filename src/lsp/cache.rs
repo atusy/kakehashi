@@ -94,17 +94,8 @@ pub(crate) struct InjectionDiscovery {
 /// All ride the `ParseSnapshot` the parse publishes.
 pub(crate) struct PopulatedInjections {
     pub(crate) discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
-    /// `None` when the resolution was skipped (no runnable bridge server) —
-    /// bridge readers then fall back to inline resolution — vs `Some(empty)`
-    /// for "ran, nothing matched" (readers skip their work).
-    pub(crate) bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>>,
-    /// The same gate as `bridge_regions`: `None` exactly when it is, and the
-    /// whole-document readers then resolve inline.
-    pub(crate) resolved_regions: Option<Vec<crate::language::injection::ResolvedInjection>>,
-    /// The settings generation this populate pass ran under — stamped onto
-    /// the snapshot's `bridge_regions` and `resolved_regions` so reload-stale
-    /// resolution is never served (see `ParseSnapshot::resolved_regions`).
-    pub(crate) generation: u64,
+    /// Both resolution views, or unavailable when resolution was skipped.
+    pub(crate) regions: Option<crate::document::snapshot::ResolvedRegions>,
 }
 
 impl PopulatedInjections {
@@ -113,9 +104,9 @@ impl PopulatedInjections {
     pub(crate) fn empty(generation: u64) -> Self {
         Self {
             discovery: None,
-            bridge_regions: Some(Vec::new()),
-            resolved_regions: Some(Vec::new()),
-            generation,
+            regions: Some(crate::document::snapshot::ResolvedRegions::empty(
+                generation,
+            )),
         }
     }
 
@@ -126,12 +117,10 @@ impl PopulatedInjections {
     /// documents that do have injections once the query is loaded. Riding
     /// without regions makes readers fall back to inline resolution, which
     /// finds the query as soon as it is there.
-    pub(crate) fn undetermined(generation: u64) -> Self {
+    pub(crate) fn undetermined() -> Self {
         Self {
             discovery: None,
-            bridge_regions: None,
-            resolved_regions: None,
-            generation,
+            regions: None,
         }
     }
 }
@@ -343,7 +332,7 @@ impl CacheCoordinator {
                 return Some(if parser_published {
                     PopulatedInjections::empty(generation)
                 } else {
-                    PopulatedInjections::undetermined(generation)
+                    PopulatedInjections::undetermined()
                 });
             }
         };
@@ -479,23 +468,21 @@ impl CacheCoordinator {
             // critical path, and the per-region content copies are pure
             // waste for the (common) bridge-less deployment — `None` makes
             // any late-configured bridge fall back to inline resolution.
-            let bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>> =
-                resolved.as_ref().map(|resolved| {
-                    resolved
-                        .iter()
-                        .map(|region| crate::document::DiscoveredBridgeRegion {
-                            language: region.injection_language.clone(),
-                            region_id: region.region.region_id.clone(),
-                            content: region.virtual_content.clone(),
-                        })
-                        .collect()
-                });
-
-            // The whole-document readers' fully resolved regions, from the
-            // same single query run — and from the SAME per-region ids and
-            // content hashes already in `cacheable_regions` (no duplicate
-            // mint/hash on this critical path).
-            let resolved_regions = resolved;
+            let regions = resolved.map(|resolved| {
+                let bridge = resolved
+                    .iter()
+                    .map(|region| crate::document::DiscoveredBridgeRegion {
+                        language: region.injection_language.clone(),
+                        region_id: region.region.region_id.clone(),
+                        content: region.virtual_content.clone(),
+                    })
+                    .collect();
+                crate::document::snapshot::ResolvedRegions {
+                    generation,
+                    bridge: std::sync::Arc::new(bridge),
+                    whole_document: std::sync::Arc::new(resolved),
+                }
+            });
 
             if crate::cancel::is_cancelled(cancel) {
                 return None;
@@ -555,12 +542,7 @@ impl CacheCoordinator {
                     .retain_document(uri, &live_hashes);
             });
             committed?;
-            Some(PopulatedInjections {
-                discovery,
-                bridge_regions,
-                resolved_regions,
-                generation,
-            })
+            Some(PopulatedInjections { discovery, regions })
         }
     }
 
@@ -1051,10 +1033,9 @@ mod tests {
             .expect("the pass ran");
 
         assert!(
-            populated.bridge_regions.is_none(),
+            populated.regions.is_none(),
             "no query available must not publish a definitive empty region set"
         );
-        assert!(populated.resolved_regions.is_none());
         assert!(populated.discovery.is_none());
 
         // Once the parser is visible its queries are too (they are published
@@ -1077,10 +1058,9 @@ mod tests {
             )
             .expect("the pass ran");
         assert!(
-            populated
-                .bridge_regions
-                .as_ref()
-                .is_some_and(|regions| regions.is_empty()),
+            populated.regions.as_ref().is_some_and(
+                |regions| regions.bridge.is_empty() && regions.whole_document.is_empty()
+            ),
             "a settled language without an injection query publishes a definitive empty set"
         );
     }
@@ -1146,11 +1126,12 @@ mod tests {
             .expect("the pass ran");
         assert_eq!(
             handed_out.get(),
-            Some(populated.generation),
+            populated.regions.as_ref().map(|regions| regions.generation),
             "the hand-off carries the pass's generation"
         );
         assert_eq!(
-            populated.bridge_regions.as_ref().map(|regions| regions
+            populated.regions.as_ref().map(|regions| regions
+                .bridge
                 .iter()
                 .map(|region| region.language.as_str())
                 .collect::<Vec<_>>()),

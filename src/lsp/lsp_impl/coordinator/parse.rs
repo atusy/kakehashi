@@ -39,8 +39,7 @@ impl SnapshotInputs {
             parsed_version: self.parsed_version,
             incarnation: self.incarnation,
             injection_regions: regions.discovery,
-            bridge_regions: regions.bridge_regions,
-            resolved_regions: regions.resolved_regions,
+            regions: regions.regions,
             layer_trees,
         })
     }
@@ -73,14 +72,7 @@ impl InstallCheck {
 #[derive(Default)]
 struct PopulatedSnapshotRegions {
     discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
-    bridge_regions: Option<(
-        u64,
-        std::sync::Arc<Vec<crate::document::DiscoveredBridgeRegion>>,
-    )>,
-    resolved_regions: Option<(
-        u64,
-        std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>,
-    )>,
+    regions: Option<crate::document::snapshot::ResolvedRegions>,
 }
 
 /// Timeout for compute-pool parse operations to prevent hangs on pathological inputs.
@@ -481,12 +473,7 @@ impl ParseCoordinator {
                 populated.map_or_else(PopulatedSnapshotRegions::default, |populated| {
                     PopulatedSnapshotRegions {
                         discovery: populated.discovery,
-                        bridge_regions: populated
-                            .bridge_regions
-                            .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
-                        resolved_regions: populated
-                            .resolved_regions
-                            .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
+                        regions: populated.regions,
                     }
                 })
             }
@@ -511,9 +498,7 @@ impl ParseCoordinator {
                 // must not run for a version that is no longer current.
                 // The upgrade re-judges under the entry guard; without one,
                 // the cell is asked whether the version is still current.
-                let upgraded = (first.published
-                    && (regions.bridge_regions.is_some() || regions.resolved_regions.is_some()))
-                .then(|| {
+                let upgraded = (first.published && regions.regions.is_some()).then(|| {
                     self.documents.install_parse(
                         uri,
                         check.as_check(),
@@ -718,8 +703,7 @@ impl ParseCoordinator {
                     parsed_version: content_version,
                     incarnation,
                     injection_regions: None,
-                    bridge_regions: None,
-                    resolved_regions: None,
+                    regions: None,
                     layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
                 }),
             );
@@ -743,8 +727,7 @@ impl ParseCoordinator {
                 parsed_version: content_version,
                 incarnation,
                 injection_regions: None,
-                bridge_regions: None,
-                resolved_regions: None,
+                regions: None,
                 layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             }),
         );

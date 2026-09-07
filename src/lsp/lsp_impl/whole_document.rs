@@ -118,11 +118,11 @@ impl Kakehashi {
             // one value; absent/reload-stale falls back inline over the same
             // tree.
             let all_regions = match snapshot
-                .resolved_regions
+                .regions
                 .as_ref()
-                .filter(|(stamped, _)| *stamped == self.cache.semantic_token_generation())
+                .filter(|regions| regions.generation == self.cache.semantic_token_generation())
             {
-                Some((_, regions)) => std::sync::Arc::clone(regions),
+                Some(regions) => std::sync::Arc::clone(&regions.whole_document),
                 None => std::sync::Arc::new(InjectionResolver::resolve_all(
                     &self.language,
                     self.bridge.node_tracker(),

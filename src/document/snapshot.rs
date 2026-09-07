@@ -65,26 +65,11 @@ pub(crate) struct ParseSnapshot {
     /// binding: text, tree, and regions are one value, so the regions can
     /// never be consumed against a different tree.
     pub(crate) injection_regions: Option<Arc<DiscoveredInjections>>,
-    /// The bridge downstream's region list, derived by the same populate pass
-    /// (`None` when populate didn't run for this snapshot or no bridge server
-    /// was configured — the downstream then resolves inline; `Some(empty)`
-    /// means genuinely no regions). Stamped with the settings generation the
-    /// discovery ran under, like `resolved_regions`: a reload can change the
-    /// injection query without publishing a new snapshot, and the consumer
-    /// must fall back inline rather than open virtual documents for regions
-    /// the new query would not discover.
-    pub(crate) bridge_regions: Option<(u64, Arc<Vec<DiscoveredBridgeRegion>>)>,
-    /// Fully resolved injection regions (`InjectionResolver::resolve_all`'s
-    /// shape) from the same populate pass, for the whole-document readers —
-    /// pull/push diagnostics, documentSymbol/Color, formatting's virt layer —
-    /// which previously each re-ran the injection query per request. Same
-    /// `None`/`Some(empty)` semantics as `bridge_regions`.
-    /// Stamped with the settings generation the populate pass ran under: a
-    /// reload (which can change injection resolution) bumps the generation
-    /// WITHOUT publishing a new snapshot, so consumers gate on the stamp and
-    /// fall back to inline resolution on mismatch (same pattern as
-    /// `DiscoveredInjections.generation` and `layer_trees`).
-    pub(crate) resolved_regions: Option<(u64, Arc<Vec<ResolvedInjection>>)>,
+    /// Both views of one resolution, under one settings generation.
+    /// `None` means unavailable (including skipped/cancelled resolution), not
+    /// necessarily pending. Readers fall back inline. Present empty vectors
+    /// mean the pass established that there are no injection regions.
+    pub(crate) regions: Option<ResolvedRegions>,
     /// Lazily-built, per-snapshot injection layer trees (document-order DFS,
     /// depth ≥ 1) for the captures/node layer walk: the FIRST walking request
     /// on this snapshot builds them (on the compute pool — the same cost the
@@ -102,6 +87,25 @@ pub(crate) struct ParseSnapshot {
     /// seeing a generation mismatch bypasses the cell and walks fresh (the
     /// pre-cache per-request cost) until the next snapshot rebuilds it.
     pub(crate) layer_trees: Arc<std::sync::OnceLock<(u64, Arc<Vec<SnapshotLayerTree>>)>>,
+}
+
+/// The bridge and whole-document views of one resolution. They are published
+/// together, so neither presence nor the settings generation can disagree.
+#[derive(Clone)]
+pub(crate) struct ResolvedRegions {
+    pub(crate) generation: u64,
+    pub(crate) bridge: Arc<Vec<DiscoveredBridgeRegion>>,
+    pub(crate) whole_document: Arc<Vec<ResolvedInjection>>,
+}
+
+impl ResolvedRegions {
+    pub(crate) fn empty(generation: u64) -> Self {
+        Self {
+            generation,
+            bridge: Arc::new(Vec::new()),
+            whole_document: Arc::new(Vec::new()),
+        }
+    }
 }
 
 /// The per-URI `watch` value: the current lifetime plus the latest snapshot.
@@ -176,25 +180,10 @@ impl SnapshotSlot {
     /// bridge / resolved views goes from absent to present. The same shape
     /// again is not an upgrade, so a version never re-publishes for nothing.
     fn regions_upgrade(current: &ParseSnapshot, snapshot: &ParseSnapshot) -> bool {
-        let upgraded = |before: bool, after: bool| !before && after;
-        let downgraded = |before: bool, after: bool| before && !after;
-        let bridge = (
-            current.bridge_regions.is_some(),
-            snapshot.bridge_regions.is_some(),
-        );
-        let resolved = (
-            current.resolved_regions.is_some(),
-            snapshot.resolved_regions.is_some(),
-        );
-        let discovery = (
-            current.injection_regions.is_some(),
-            snapshot.injection_regions.is_some(),
-        );
         Self::same_tree(current, snapshot)
-            && !downgraded(bridge.0, bridge.1)
-            && !downgraded(resolved.0, resolved.1)
-            && !downgraded(discovery.0, discovery.1)
-            && (upgraded(bridge.0, bridge.1) || upgraded(resolved.0, resolved.1))
+            && current.regions.is_none()
+            && snapshot.regions.is_some()
+            && !(current.injection_regions.is_some() && snapshot.injection_regions.is_none())
     }
 
     /// Whether both snapshots carry the same tree. A `Tree` clone gives its
@@ -229,8 +218,7 @@ mod tests {
             parsed_version,
             incarnation,
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
+            regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -276,8 +264,7 @@ mod tests {
             parsed_version,
             incarnation,
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
+            regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -297,99 +284,25 @@ mod tests {
         );
     }
 
-    fn with_regions(mut snapshot: ParseSnapshot, bridge: bool, resolved: bool) -> ParseSnapshot {
-        if bridge {
-            snapshot.bridge_regions = Some((1, Arc::new(Vec::new())));
-        }
-        if resolved {
-            snapshot.resolved_regions = Some((1, Arc::new(Vec::new())));
-        }
-        snapshot
-    }
-
-    /// Clone of a held tree: a parse's two installs carry the same tree, and
-    /// clones share their child nodes even though each clone's root node
-    /// has its own identity.
-    fn upgrade_of(held: &ParseSnapshot, bridge: bool, resolved: bool) -> ParseSnapshot {
-        let mut snapshot = snap_with_tree(held.incarnation, held.parsed_version);
-        snapshot.tree = held.tree.clone();
-        with_regions(snapshot, bridge, resolved)
-    }
-
-    /// A parse publishes its tree as soon as the injection discovery is
-    /// derived, and the bridge/resolved regions — the resolution the token
-    /// readers never consume — land on the same version afterwards. The
-    /// cell admits that as an upgrade: same lifetime, same version, the
-    /// SAME tree on both sides (a tree under an already-issued result id is
-    /// never swapped, not even by a sibling parse of the same text carrying
-    /// regions), and at least one region view going from absent to
-    /// present. Nothing else re-publishes an equal version: the same shape
-    /// again, a tree-less upgrade, a different tree, or any region view
-    /// going from present to absent.
     #[test]
     fn equal_version_regions_upgrade_is_admitted_over_a_tree_bearing_snapshot() {
+        let mut held = snap_with_tree(7, 3);
+        let mut upgrade = snap_with_tree(7, 3);
+        upgrade.tree = held.tree.clone();
+        upgrade.regions = Some(ResolvedRegions::empty(1));
         let mut slot = SnapshotSlot::bootstrap(7);
-        let held = snap_with_tree(7, 3);
-        let held_tree = held.tree.clone();
         slot.snapshot = Some(Arc::new(held));
-        let held = || ParseSnapshot {
-            tree: held_tree.clone(),
-            ..snap_with_tree(7, 3)
-        };
+        assert!(slot.admits(&upgrade));
+        let mut sibling = snap_with_tree(7, 3);
+        sibling.regions = Some(ResolvedRegions::empty(1));
         assert!(
-            slot.admits(&upgrade_of(&held(), true, false)),
-            "bridge regions arriving on the published version upgrade it"
+            !slot.admits(&sibling),
+            "a sibling tree must not replace the published tree"
         );
-        assert!(
-            slot.admits(&upgrade_of(&held(), true, true)),
-            "both region views arriving upgrade it"
-        );
-        assert!(
-            !slot.admits(&with_regions(snap_with_tree(7, 3), true, true)),
-            "a sibling parse's tree of the same text is a swap, never admitted"
-        );
-        assert!(
-            !slot.admits(&{
-                let mut other = upgrade_of(&held(), true, true);
-                other.incarnation = 6;
-                other
-            }),
-            "the incarnation clause is never bypassed by the upgrade"
-        );
-        assert!(
-            !slot.admits(&with_regions(snap(7, 3), true, true)),
-            "an upgrade must carry the tree the readers already derive from"
-        );
-
-        // With one region view present, only the other's arrival upgrades.
-        slot.snapshot = Some(Arc::new(upgrade_of(&held(), true, false)));
-        assert!(
-            slot.admits(&upgrade_of(&held(), true, true)),
-            "the remaining region view arriving still upgrades"
-        );
-        assert!(
-            !slot.admits(&upgrade_of(&held(), true, false)),
-            "the same shape again is not an upgrade"
-        );
-        assert!(
-            !slot.admits(&upgrade_of(&held(), false, true)),
-            "a view going absent is a downgrade even when another arrives"
-        );
-        assert!(
-            !slot.admits(&held()),
-            "a region view going absent is a downgrade, never admitted"
-        );
-        let mut with_discovery = upgrade_of(&held(), true, false);
-        with_discovery.injection_regions = Some(Arc::new(DiscoveredInjections {
-            generation: 1,
-            complete: true,
-            regions: Vec::new(),
-        }));
-        slot.snapshot = Some(Arc::new(with_discovery));
-        assert!(
-            !slot.admits(&upgrade_of(&held(), true, true)),
-            "the discovery going absent is a downgrade even as the resolution arrives"
-        );
+        slot.snapshot = Some(Arc::new(upgrade));
+        assert!(!slot.admits(&sibling), "regions may only arrive once");
+        held = snap_with_tree(7, 3);
+        assert!(!slot.admits(&held), "regions cannot disappear");
     }
 
     #[test]

@@ -589,8 +589,8 @@ mod tests {
                 let snapshot = view.slot.snapshot?;
                 (snapshot.parsed_version == view.content_version && snapshot.tree.is_some())
                     .then_some((
-                        snapshot.bridge_regions.as_ref().map(|(_, r)| r.len()),
-                        snapshot.resolved_regions.as_ref().map(|(_, r)| r.len()),
+                        snapshot.regions.as_ref().map(|r| r.bridge.len()),
+                        snapshot.regions.as_ref().map(|r| r.whole_document.len()),
                     ))
             })
         };

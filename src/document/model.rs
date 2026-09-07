@@ -229,8 +229,7 @@ impl Document {
             parsed_version: self.content_version,
             incarnation: self.incarnation,
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
+            regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
@@ -516,8 +515,7 @@ mod tests {
             parsed_version,
             incarnation: doc.incarnation(),
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
+            regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
@@ -719,8 +717,7 @@ mod tests {
             parsed_version: doc.content_version(),
             incarnation: 7,
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
+            regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })));
         // `Tree` clones share their subtrees but not the root handle, so a

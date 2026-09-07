@@ -689,8 +689,7 @@ mod tests {
                 parsed_version: content_version,
                 incarnation,
                 injection_regions: None,
-                bridge_regions: None,
-                resolved_regions: None,
+                regions: None,
                 layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             }),
         );
@@ -737,8 +736,7 @@ mod tests {
                         parsed_version: content_version,
                         incarnation,
                         injection_regions: None,
-                        bridge_regions: None,
-                        resolved_regions: None,
+                        regions: None,
                         layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
                     }),
                 )

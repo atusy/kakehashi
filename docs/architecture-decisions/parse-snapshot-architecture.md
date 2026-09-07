@@ -151,6 +151,13 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
 > of the bridge / resolved views goes from absent to present. The same shape
 > again is not an upgrade, so a version never re-publishes for nothing.
 
+The bridge and whole-document region views are one `ResolvedRegions` value
+with one settings generation. They become available together; independent
+optional fields would permit partial publication and conflicting stamps that
+no populate pass produces. `None` means unavailable (also after skipped or
+cancelled resolution), not a promise that a later publish will complete it.
+A present pair of empty vectors means the query established no regions.
+
 - **Incarnation-scoped, strict monotonicity.** The `>` is strict — equal-version
   double-publishes (e.g. a racing open-parse and reparse both at version 0) must
   not swap the `Tree` under an already-issued `result_id` and fire a spurious

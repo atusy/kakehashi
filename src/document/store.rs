@@ -628,8 +628,7 @@ impl DocumentStore {
             parsed_version: doc.content_version(),
             incarnation: doc.incarnation(),
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
+            regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
         doc.publish_snapshot(&Arc::new(snapshot));
@@ -651,8 +650,9 @@ impl DocumentStore {
         if snapshot.parsed_version != view.content_version {
             return None;
         }
-        let (stamped_generation, regions) = snapshot.resolved_regions.as_ref()?;
-        (*stamped_generation == current_generation).then(|| std::sync::Arc::clone(regions))
+        let regions = snapshot.regions.as_ref()?;
+        (regions.generation == current_generation)
+            .then(|| std::sync::Arc::clone(&regions.whole_document))
     }
 
     /// Subscribe to `uri`'s snapshot-slot changes for a **bounded** wait (the
@@ -814,8 +814,7 @@ mod tests {
             parsed_version,
             incarnation,
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
+            regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
@@ -939,8 +938,7 @@ mod tests {
                 parsed_version: content_version,
                 incarnation,
                 injection_regions: None,
-                bridge_regions: None,
-                resolved_regions: None,
+                regions: None,
                 layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             }),
         );
@@ -1263,11 +1261,10 @@ mod tests {
                 parsed_version: content_version,
                 incarnation,
                 injection_regions: None,
-                bridge_regions: None,
-                resolved_regions: None,
+                regions: None,
                 layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             };
-            snapshot.bridge_regions = Some((1, Arc::new(Vec::new())));
+            snapshot.regions = Some(super::super::snapshot::ResolvedRegions::empty(1));
             Arc::new(snapshot)
         };
 
@@ -1310,7 +1307,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|s| s.parsed_version == content_version
                     && s.tree.is_some()
-                    && s.bridge_regions.is_some())),
+                    && s.regions.is_some())),
             "readers now see the regions on the same version"
         );
         let again = store.install_parse(
@@ -1376,11 +1373,10 @@ mod tests {
                 parsed_version: content_version,
                 incarnation,
                 injection_regions: None,
-                bridge_regions: None,
-                resolved_regions: None,
+                regions: None,
                 layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             };
-            snapshot.bridge_regions = Some((1, Arc::new(Vec::new())));
+            snapshot.regions = Some(super::super::snapshot::ResolvedRegions::empty(1));
             store.install_parse(
                 &uri,
                 LanguageCheck::Expect(Some("markdown")),
@@ -1559,8 +1555,7 @@ mod tests {
                 parsed_version: 0,
                 incarnation,
                 injection_regions: None,
-                bridge_regions: None,
-                resolved_regions: None,
+                regions: None,
                 layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             }),
         );
@@ -1591,8 +1586,7 @@ mod tests {
                 parsed_version,
                 incarnation: doc.incarnation(),
                 injection_regions: None,
-                bridge_regions: None,
-                resolved_regions: None,
+                regions: None,
                 layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             }
         }
