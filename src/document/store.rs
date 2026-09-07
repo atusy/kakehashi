@@ -703,6 +703,11 @@ pub(crate) struct ParseInstall {
     /// The snapshot landed in the document's cell: the language matched and
     /// the slot admitted it.
     pub(crate) published: bool,
+    /// The publish was the equal-version tree upgrade: a tree landing over a
+    /// tree-less placeholder or give-up of the same version. Read under the
+    /// same entry guard as the publish, so a reparse's refresh gate needs no
+    /// probe of its own that a racing give-up could invalidate.
+    pub(crate) tree_upgrade: bool,
 }
 
 impl DocumentStore {
@@ -751,7 +756,11 @@ impl DocumentStore {
                 if current && matches!(language, LanguageCheck::Record) {
                     doc.record_language(detected);
                 }
-                ParseInstall { current, published }
+                ParseInstall {
+                    current,
+                    published,
+                    tree_upgrade: false,
+                }
             });
         // Likewise a rejected `snapshot` (still owned here: the publish
         // borrows) — destroyed only after the guard is released.
@@ -838,7 +847,8 @@ mod tests {
             outcome,
             ParseInstall {
                 current: false,
-                published: true
+                published: true,
+                tree_upgrade: false
             }
         );
         assert!(store.get(&uri).unwrap().tree().is_none());
@@ -885,7 +895,8 @@ mod tests {
             outcome,
             ParseInstall {
                 current: false,
-                published: true
+                published: true,
+                tree_upgrade: false
             }
         );
         assert_eq!(
@@ -1158,7 +1169,8 @@ mod tests {
             outcome,
             ParseInstall {
                 current: true,
-                published: true
+                published: true,
+                tree_upgrade: false
             },
             "same version, same lifetime: the current parse, whichever allocation it read"
         );
@@ -1187,7 +1199,8 @@ mod tests {
             installed,
             ParseInstall {
                 current: true,
-                published: true
+                published: true,
+                tree_upgrade: false
             }
         );
         let doc = store.get(&uri).unwrap();
@@ -1264,7 +1277,8 @@ mod tests {
             first,
             ParseInstall {
                 current: true,
-                published: true
+                published: true,
+                tree_upgrade: false
             }
         );
         let upgrade = store.install_parse(
@@ -1276,7 +1290,8 @@ mod tests {
             upgrade,
             ParseInstall {
                 current: true,
-                published: true
+                published: true,
+                tree_upgrade: false
             },
             "the regions arriving on the published version upgrade it"
         );
@@ -1301,6 +1316,75 @@ mod tests {
             "the same shape again is not an upgrade"
         );
     }
+
+    /// A reparse's refresh gate needs to know whether its publish upgraded
+    /// a tree-less placeholder of the same version (the client may have
+    /// been served empty against it). The install reports that from under
+    /// the entry guard: true for the tree landing over the placeholder,
+    /// false for a fresh version and for the regions upgrade of a version
+    /// that already had its tree.
+    #[test]
+    fn install_parse_reports_the_tree_upgrade_it_made() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///tree-upgrade.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        let tree = markdown_tree(text);
+
+        let placeholder = store.install_parse(
+            &uri,
+            LanguageCheck::Expect(Some("markdown")),
+            parse_snapshot(&expected_text, None, content_version, incarnation),
+        );
+        assert!(placeholder.published && !placeholder.tree_upgrade);
+        let filled = store.install_parse(
+            &uri,
+            LanguageCheck::Expect(Some("markdown")),
+            parse_snapshot(
+                &expected_text,
+                Some(tree.clone()),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert!(
+            filled.published && filled.tree_upgrade,
+            "the tree landing over the placeholder is the upgrade the refresh gate asks about"
+        );
+        let upgrade = {
+            let mut snapshot = super::super::snapshot::ParseSnapshot {
+                text: Arc::clone(&expected_text),
+                tree: Some(tree.clone()),
+                language: Some("markdown".to_string()),
+                parsed_version: content_version,
+                incarnation,
+                injection_regions: None,
+                bridge_regions: None,
+                resolved_regions: None,
+                layer_trees: std::sync::OnceLock::new(),
+            };
+            snapshot.bridge_regions = Some((1, Arc::new(Vec::new())));
+            store.install_parse(
+                &uri,
+                LanguageCheck::Expect(Some("markdown")),
+                Arc::new(snapshot),
+            )
+        };
+        assert!(
+            upgrade.published && !upgrade.tree_upgrade,
+            "the regions upgrade lands on a version that already had its tree"
+        );
+    }
+
     /// One publish per version and lifetime, and currency reported from the
     /// snapshot's stamps: the first install at a version lands and is current;
     /// an equal-version duplicate lands nothing and is not current; a parse of
@@ -1336,7 +1420,8 @@ mod tests {
             outcome,
             ParseInstall {
                 current: true,
-                published: true
+                published: true,
+                tree_upgrade: false
             }
         );
         assert!(store.get(&uri).unwrap().tree().is_some(), "tree visible");
