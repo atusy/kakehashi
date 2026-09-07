@@ -46,15 +46,24 @@ fn syntax_scans(key: &str) -> usize {
 /// asks it once per region, and a document repeats a handful of identifiers
 /// thousands of times. Misses are remembered too (an unknown fence
 /// identifier is the common case for prose fences). Bounded by
-/// [`TOKEN_MEMO_CAP`]: identifiers come from document content, so a hostile
-/// document could otherwise grow it without limit.
+/// [`TOKEN_MEMO_CAP`] entries of at most [`MEMO_KEY_MAX_LEN`] bytes:
+/// identifiers come from document content (a dynamic capture can be any
+/// text), so a hostile document could otherwise grow it without limit.
 static TOKEN_MEMO: LazyLock<dashmap::DashMap<String, Option<String>>> =
     LazyLock::new(dashmap::DashMap::new);
 
-/// Distinct identifiers the memo holds before it resets. Far above any real
-/// vocabulary of fence identifiers (a few dozen), far below anything that
-/// costs memory: a reset re-scans, it never answers wrong.
+/// Distinct keys a memo holds before it resets. Far above any real
+/// vocabulary of fence identifiers or shebang lines (a few dozen), far below
+/// anything that costs memory at [`MEMO_KEY_MAX_LEN`] bytes per key: a reset
+/// re-scans, it never answers wrong.
 const TOKEN_MEMO_CAP: usize = 4096;
+
+/// Longest key either memo keeps. Syntax names, extensions, shebangs and
+/// mode lines are short; a longer identifier or first line is the start of
+/// prose or code — and an injection capture can be arbitrary document text
+/// — so it is looked up each time instead of retained. Bounds each memo's
+/// memory by the cap times this length.
+const MEMO_KEY_MAX_LEN: usize = 512;
 
 #[cfg(test)]
 fn clear_token_memo() {
@@ -78,15 +87,11 @@ static MEMO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// markdown document, `comment` for every comment of a rust one — and a
 /// keystroke changes the first line of one region at most, so the others
 /// repeat. Misses are remembered (prose first lines are all misses). Bounded
-/// like [`TOKEN_MEMO`]; a line longer than [`FIRST_LINE_MEMO_MAX_LEN`] is
+/// like [`TOKEN_MEMO`]; a line longer than [`MEMO_KEY_MAX_LEN`] is
 /// not memoized at all (its lookup is paid each time, never answered wrong),
 /// so the memo's memory is bounded by the cap times that length.
 static FIRST_LINE_MEMO: LazyLock<dashmap::DashMap<String, Option<String>>> =
     LazyLock::new(dashmap::DashMap::new);
-
-/// Longest first line the memo keys on. Shebangs and mode lines are short;
-/// a longer line is the start of prose or code, looked up each time.
-const FIRST_LINE_MEMO_MAX_LEN: usize = 512;
 
 #[cfg(test)]
 fn clear_first_line_memo() {
@@ -104,17 +109,20 @@ fn first_line_memo_len() -> usize {
 /// Uses syntect's find_syntax_by_token which searches extension list then name.
 /// Returns the syntax name in lowercase if found, None otherwise.
 pub(crate) fn detect_from_token(token: &str) -> Option<String> {
-    if let Some(known) = TOKEN_MEMO.get(token) {
+    let memoized = token.len() <= MEMO_KEY_MAX_LEN;
+    if memoized && let Some(known) = TOKEN_MEMO.get(token) {
         return known.clone();
     }
     record_syntax_scan(token);
     let detected = SYNTAX_SET
         .find_syntax_by_token(token)
         .map(|syntax| normalize_syntax_name(&syntax.name));
-    if TOKEN_MEMO.len() >= TOKEN_MEMO_CAP {
-        TOKEN_MEMO.clear();
+    if memoized {
+        if TOKEN_MEMO.len() >= TOKEN_MEMO_CAP {
+            TOKEN_MEMO.clear();
+        }
+        TOKEN_MEMO.insert(token.to_string(), detected.clone());
     }
-    TOKEN_MEMO.insert(token.to_string(), detected.clone());
     detected
 }
 
@@ -124,7 +132,7 @@ pub(crate) fn detect_from_token(token: &str) -> Option<String> {
 /// Returns the syntax name in lowercase if found, None otherwise.
 pub(crate) fn detect_from_first_line(content: &str) -> Option<String> {
     let first_line = content.lines().next()?;
-    let memoized = first_line.len() <= FIRST_LINE_MEMO_MAX_LEN;
+    let memoized = first_line.len() <= MEMO_KEY_MAX_LEN;
     if memoized && let Some(known) = FIRST_LINE_MEMO.get(first_line) {
         return known.clone();
     }
@@ -234,9 +242,9 @@ mod tests {
     /// per region: an injection-heavy document repeats a handful of
     /// identifiers thousands of times, and the canonicalization sat at the
     /// top of the per-edit resolution cost. The memo answers repeats,
-    /// including a miss, and is bounded: crossing the cap resets it, after
-    /// which an evicted identifier is scanned again (never answered wrong)
-    /// and the identifier that crossed the cap is kept.
+    /// including a miss, and is bounded two ways: crossing the cap resets it,
+    /// after which an evicted identifier is scanned again (never answered
+    /// wrong), and an identifier past the key length limit is never kept.
     #[test]
     fn detect_from_token_scans_the_syntax_set_once_per_identifier() {
         let _serial = MEMO_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -270,12 +278,16 @@ mod tests {
             2,
             "an identifier the reset evicted is scanned again, and still answered right"
         );
-        let crossed = format!("memo-probe-synthetic-{TOKEN_MEMO_CAP}");
-        let _ = detect_from_token(&crossed);
+        // (Whether the identifier that crossed the cap survives the reset is
+        // not asserted: another test's lookup racing the reset can evict it.)
+
+        let long = format!("memo-probe-{}", "x".repeat(MEMO_KEY_MAX_LEN));
+        assert_eq!(detect_from_token(&long).as_deref(), None);
+        assert_eq!(detect_from_token(&long).as_deref(), None);
         assert_eq!(
-            syntax_scans(&crossed),
-            1,
-            "the identifier that crossed the cap is kept by the reset"
+            syntax_scans(&long),
+            2,
+            "an identifier past the key limit is looked up each time, not kept"
         );
     }
 
@@ -290,7 +302,7 @@ mod tests {
         let _serial = MEMO_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let hit = "#!/usr/bin/env python  # memo-probe";
         let miss = "memo-probe: a prose line no syntax claims";
-        let long = format!("memo-probe {}", "x".repeat(FIRST_LINE_MEMO_MAX_LEN));
+        let long = format!("memo-probe {}", "x".repeat(MEMO_KEY_MAX_LEN));
         clear_first_line_memo();
         let content = |line: &str| format!("{line}\nsecond line\n");
         assert_eq!(
