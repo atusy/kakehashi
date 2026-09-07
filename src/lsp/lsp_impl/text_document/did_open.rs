@@ -613,12 +613,13 @@ mod tests {
         // yet — and a token wait already returns it while the resolution is
         // still held.
         wait_until(|| regions_of(&uri) == Some((None, None))).await;
+        let first = server
+            .documents
+            .latest_snapshot(&uri)
+            .and_then(|view| view.slot.snapshot)
+            .expect("the first publish is in the cell");
         assert!(
-            server
-                .documents
-                .latest_snapshot(&uri)
-                .and_then(|view| view.slot.snapshot)
-                .is_some_and(|snapshot| snapshot.injection_regions.is_some()),
+            first.injection_regions.is_some(),
             "the first publish carries the discovery the token readers consume"
         );
         let woke = tokio::time::timeout(
@@ -638,6 +639,18 @@ mod tests {
         // Second publish: the same version, upgraded with the regions.
         drop(hold);
         wait_until(|| regions_of(&uri) == Some((Some(9), Some(9)))).await;
+        // The layer trees a reader derives on the first publish — even one
+        // still deriving them as the upgrade lands — are the upgrade's too:
+        // the two installs share the lazy cell.
+        let upgraded = server
+            .documents
+            .latest_snapshot(&uri)
+            .and_then(|view| view.slot.snapshot)
+            .expect("the upgrade is in the cell");
+        assert!(
+            std::sync::Arc::ptr_eq(&first.layer_trees, &upgraded.layer_trees),
+            "the two installs of one parse share their layer-tree cell"
+        );
     }
 
     #[tokio::test]
