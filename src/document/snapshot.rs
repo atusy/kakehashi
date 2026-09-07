@@ -148,7 +148,12 @@ impl SnapshotSlot {
     ///    (tree-less, releases parked first-parse waiters) must not block
     ///    the real parse of the same version that a later successful install
     ///    produces. Same version means same input text, so the upgrade only
-    ///    adds information; the equal-version tree *swap* stays rejected.
+    ///    adds information; the equal-version tree *swap* stays rejected —
+    ///    **or** an equal-version **regions upgrade** over a tree-bearing
+    ///    snapshot (see [`Self::regions_upgrade`]): a parse publishes its
+    ///    tree as soon as the injection discovery is derived, and the
+    ///    bridge/resolved regions (a resolution the token readers never
+    ///    consume) land on the same version afterwards.
     pub(crate) fn admits(&self, snapshot: &ParseSnapshot) -> bool {
         // The sentinel is reserved: no snapshot legitimately carries it (the
         // store's counter never draws it), so a closed slot admits nothing —
@@ -159,8 +164,37 @@ impl SnapshotSlot {
                 let tree_downgrade = current.tree.is_some() && snapshot.tree.is_none();
                 let tree_upgrade = current.tree.is_none() && snapshot.tree.is_some();
                 (snapshot.parsed_version > current.parsed_version && !tree_downgrade)
-                    || (snapshot.parsed_version == current.parsed_version && tree_upgrade)
+                    || (snapshot.parsed_version == current.parsed_version
+                        && (tree_upgrade || Self::regions_upgrade(current, snapshot)))
             })
+    }
+
+    /// The equal-version regions upgrade: both sides carry a tree (readers
+    /// derive theirs from the published one and must never lose it), no
+    /// region view goes from present to absent, and at least one of the
+    /// bridge / resolved views goes from absent to present. The same shape
+    /// again is not an upgrade, so a version never re-publishes for nothing.
+    fn regions_upgrade(current: &ParseSnapshot, snapshot: &ParseSnapshot) -> bool {
+        let upgraded = |before: bool, after: bool| !before && after;
+        let downgraded = |before: bool, after: bool| before && !after;
+        let bridge = (
+            current.bridge_regions.is_some(),
+            snapshot.bridge_regions.is_some(),
+        );
+        let resolved = (
+            current.resolved_regions.is_some(),
+            snapshot.resolved_regions.is_some(),
+        );
+        let discovery = (
+            current.injection_regions.is_some(),
+            snapshot.injection_regions.is_some(),
+        );
+        current.tree.is_some()
+            && snapshot.tree.is_some()
+            && !downgraded(bridge.0, bridge.1)
+            && !downgraded(resolved.0, resolved.1)
+            && !downgraded(discovery.0, discovery.1)
+            && (upgraded(bridge.0, bridge.1) || upgraded(resolved.0, resolved.1))
     }
 }
 
