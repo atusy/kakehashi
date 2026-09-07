@@ -600,7 +600,6 @@ mod tests {
                     Some((
                         regions
                             .identities()
-                            .into_iter()
                             .map(|(language, _)| (language.to_string(), !regions.is_roster()))
                             .collect::<Vec<_>>(),
                         snapshot.resolved_regions.is_some(),
