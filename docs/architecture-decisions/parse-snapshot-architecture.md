@@ -144,7 +144,12 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
 > incarnation check (clause 1). The equal-version arm is what lets a reparse
 > attach its tree over a same-version tree-less publish — the reload placeholder
 > and the give-up snapshot both depend on it — without which strict `>` alone
-> would strand those documents tree-less until the next edit.
+> would strand those documents tree-less until the next edit. The same arm also
+> admits an equal-version **regions upgrade** over a tree-bearing snapshot: both
+> sides carry a tree (readers derive theirs from the published one and must
+> never lose it), no region view goes from present to absent, and at least one
+> of the bridge / resolved views goes from absent to present. The same shape
+> again is not an upgrade, so a version never re-publishes for nothing.
 
 - **Incarnation-scoped, strict monotonicity.** The `>` is strict — equal-version
   double-publishes (e.g. a racing open-parse and reparse both at version 0) must
@@ -220,12 +225,19 @@ Two obligations:
 A parse pass therefore has a **single version/incarnation-guarded commit sequence**, so no reader-visible publication or downstream emission ever escapes for a snapshot that lost the admission:
 compute the tree, region map, and tokens on the tree value (the populate pass
 commits its injection caches under its own tracker-epoch/lifetime guard, so a
-pass whose text moved on commits nothing there); run the one install
-(`install_parse`: the snapshot publish under the entry guard, reported *current*
-iff the snapshot parsed the document's content version); and emit the downstream — `semanticTokens/refresh`,
-injected-language forwarding, diagnostic republish — gated on the install's
-result, in the order the per-document-parse-scheduler loop already uses
-(`populate → install → mark finished → downstream`). A rejected publish (a racing
+pass whose text moved on commits nothing there); install through the one
+primitive (`install_parse`: the snapshot publish under the entry guard, reported
+*current* iff the snapshot parsed the document's content version) — **twice per
+version**: the tree with its discovery the moment populate hands the discovery
+out, from inside the populate work-unit, so the token readers wake without
+waiting for the resolution only the bridge and the whole-document readers
+consume; then the same version again, upgraded with the bridge / resolved
+regions once the pass has resolved (the equal-version regions upgrade above; a
+pass refused before the hand-off installs once, with no regions); and emit the
+downstream — `semanticTokens/refresh`, injected-language forwarding, diagnostic
+republish — gated on the first install's result, after the upgrade, in the order
+the per-document-parse-scheduler loop already uses
+(`populate → install → install (upgrade) → mark finished → downstream`). A rejected publish (a racing
 edit or reopen advanced the slot) emits nothing and attaches nothing. (Two
 parses of the *same* version — an install reparse racing the edit reparse — may
 both commit their populate bookkeeping before one of them loses the equal-version
@@ -540,7 +552,9 @@ inside the existing safety contracts at each step:
   cell — reads as absent until the reparse lands, so no reader sees a tree that
   predates the text. The populate pass runs *before* the install, on
   the tree value; it guards its own cache commits by the tracker's epoch and the
-  lifetime, so a pass whose text moved on commits nothing. `populate`'s split into geometry derivation and
+  lifetime, so a pass whose text moved on commits nothing — and it hands its
+  discovery out before resolving, which is where the first of the two installs
+  per version lands (§2). `populate`'s split into geometry derivation and
   the latch-gated tracker reconciliation (§3) is **already in**. Take the
   grammar auto-install off the read handlers (`compute_captures` no longer triggers
   `ensure_injection_languages_loaded_for_document` inline): the parse loop

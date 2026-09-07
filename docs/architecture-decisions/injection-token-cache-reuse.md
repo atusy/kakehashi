@@ -281,11 +281,16 @@ obligation), and parse ordering (below) affects only hit-rate.
 **Currency — hit-rate, not correctness.** Correctness rests on the tree-identity
 binding above; ordering only governs how often a reusable discovery is *available*
 when the request runs. In the reparse loop the order is
-`populate_injections` → `install_parse` → `mark_parse_finished` / `advance_watermark`
+`populate_injections` (discovery built, handed out, then the resolution) with the
+first `install_parse` — the tree and the discovery — landing from inside the
+populate work-unit at the hand-off, the second `install_parse` — the same
+version upgraded with the bridge / resolved regions — after the pass returns,
+then `mark_parse_finished` / `advance_watermark`
 (`src/lsp/lsp_impl/coordinator/parse.rs`), and the semantic handler's settle waits on the parse
 watermark + parse-completion before snapshotting the tree
 (`src/lsp/lsp_impl/text_document/semantic_tokens.rs`), so in the common debounced case the
-snapshot already carries (or its epoch already matches) the populated discovery.
+snapshot already carries (or its epoch already matches) the populated discovery —
+and never waits for the resolution the token path does not consume.
 On the branches where `populate_injections` does not run (the no-tree / error
 paths — `advance_watermark` still runs there), when the
 200 ms settle budget expires, or on the on-demand-parse fallback, there is simply
