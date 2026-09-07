@@ -279,7 +279,6 @@ impl InjectionCoordinator {
             let resolved = !regions.is_roster();
             regions
                 .identities()
-                .into_iter()
                 .map(|(language, region_id)| {
                     (region_id.to_string(), language.to_string(), resolved)
                 })

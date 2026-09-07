@@ -721,7 +721,7 @@ mod tests {
                         snapshot
                             .bridge_regions
                             .as_ref()
-                            .map(|(_, r)| r.identities().len()),
+                            .map(|(_, r)| r.identities().count()),
                         snapshot.resolved_regions.as_ref().map(|(_, r)| r.len()),
                     ))
             })

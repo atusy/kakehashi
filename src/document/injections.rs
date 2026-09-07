@@ -134,18 +134,21 @@ impl BridgeRegions {
         matches!(self, Self::Roster(_))
     }
 
-    /// Every region's `(language, region_id)`, resolved or on the roster.
-    pub(crate) fn identities(&self) -> Vec<(&str, &str)> {
-        match self {
-            Self::Resolved(regions) => regions
-                .iter()
-                .map(|region| (region.language.as_str(), region.region_id.as_str()))
-                .collect(),
-            Self::Roster(regions) => regions
-                .iter()
-                .map(|region| (region.language.as_str(), region.region_id.as_str()))
-                .collect(),
-        }
+    /// Every region's `(language, region_id)`, resolved or on the roster,
+    /// borrowed: one of the two chained halves is always empty.
+    pub(crate) fn identities(&self) -> impl Iterator<Item = (&str, &str)> {
+        let (resolved, roster): (&[DiscoveredBridgeRegion], &[BridgeRosterRegion]) = match self {
+            Self::Resolved(regions) => (regions, &[]),
+            Self::Roster(regions) => (&[], regions),
+        };
+        resolved
+            .iter()
+            .map(|region| (region.language.as_str(), region.region_id.as_str()))
+            .chain(
+                roster
+                    .iter()
+                    .map(|region| (region.language.as_str(), region.region_id.as_str())),
+            )
     }
 }
 

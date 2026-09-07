@@ -1134,7 +1134,7 @@ mod tests {
             populated
                 .bridge_regions
                 .as_ref()
-                .is_some_and(|regions| regions.identities().is_empty()),
+                .is_some_and(|regions| regions.identities().next().is_none()),
             "a settled language without an injection query publishes a definitive empty set"
         );
     }
@@ -1207,7 +1207,6 @@ mod tests {
         assert_eq!(
             populated.bridge_regions.as_ref().map(|regions| regions
                 .identities()
-                .into_iter()
                 .map(|(language, _)| language)
                 .collect::<Vec<_>>()),
             Some(vec!["python"; 9]),
@@ -1272,7 +1271,6 @@ mod tests {
         assert_eq!(
             roster
                 .identities()
-                .into_iter()
                 .map(|(language, _)| language)
                 .collect::<Vec<_>>(),
             vec!["lua"],
