@@ -66,10 +66,37 @@ fn token_memo_len() -> usize {
     TOKEN_MEMO.len()
 }
 
-/// Held by every test that clears or fills the process-wide memo, so two of
+/// Held by every test that clears or fills a process-wide memo, so two of
 /// them cannot race each other's reset.
 #[cfg(test)]
-static TOKEN_MEMO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static MEMO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// First line → canonical name memo for [`detect_from_first_line`]. The
+/// lookup runs every syntax's first-line regex (shebangs, mode lines); the
+/// canonicalization falls through to it for every region whose identifier
+/// syntect does not know — `markdown_inline` for every paragraph of a
+/// markdown document, `comment` for every comment of a rust one — and a
+/// keystroke changes the first line of one region at most, so the others
+/// repeat. Misses are remembered (prose first lines are all misses). Bounded
+/// like [`TOKEN_MEMO`]; a line longer than [`FIRST_LINE_MEMO_MAX_LEN`] is
+/// not memoized at all (its lookup is paid each time, never answered wrong),
+/// so the memo's memory is bounded by the cap times that length.
+static FIRST_LINE_MEMO: LazyLock<dashmap::DashMap<String, Option<String>>> =
+    LazyLock::new(dashmap::DashMap::new);
+
+/// Longest first line the memo keys on. Shebangs and mode lines are short;
+/// a longer line is the start of prose or code, looked up each time.
+const FIRST_LINE_MEMO_MAX_LEN: usize = 512;
+
+#[cfg(test)]
+fn clear_first_line_memo() {
+    FIRST_LINE_MEMO.clear();
+}
+
+#[cfg(test)]
+fn first_line_memo_len() -> usize {
+    FIRST_LINE_MEMO.len()
+}
 
 /// Detect language from a token (e.g., "py", "js", "bash").
 ///
@@ -97,8 +124,18 @@ pub(crate) fn detect_from_token(token: &str) -> Option<String> {
 /// Returns the syntax name in lowercase if found, None otherwise.
 pub(crate) fn detect_from_first_line(content: &str) -> Option<String> {
     let first_line = content.lines().next()?;
-    let syntax = SYNTAX_SET.find_syntax_by_first_line(first_line)?;
-    Some(normalize_syntax_name(&syntax.name))
+    let memoized = first_line.len() <= FIRST_LINE_MEMO_MAX_LEN;
+    if memoized && let Some(known) = FIRST_LINE_MEMO.get(first_line) {
+        return known.clone();
+    }
+    record_syntax_scan(first_line);
+    let detected = SYNTAX_SET
+        .find_syntax_by_first_line(first_line)
+        .map(|syntax| normalize_syntax_name(&syntax.name));
+    if FIRST_LINE_MEMO.len() >= TOKEN_MEMO_CAP {
+        FIRST_LINE_MEMO.clear();
+    }
+    detected
 }
 
 /// Extract a token from a file path for language detection.
@@ -199,9 +236,7 @@ mod tests {
     /// and the identifier that crossed the cap is kept.
     #[test]
     fn detect_from_token_scans_the_syntax_set_once_per_identifier() {
-        let _serial = TOKEN_MEMO_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _serial = MEMO_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Tokens no other test looks up, so their scan counts are this
         // test's alone (the memo is process-wide). A token is matched as a
         // whole extension or syntax name, so the hit must be a real one.
@@ -238,6 +273,53 @@ mod tests {
             syntax_scans(&crossed),
             1,
             "the identifier that crossed the cap is kept by the reset"
+        );
+    }
+
+    /// The first-line lookup — every syntax's shebang / mode-line regex —
+    /// is where canonicalization ends up for every region whose identifier
+    /// syntect does not know (`markdown_inline` for each paragraph, `comment`
+    /// for each comment), and a keystroke changes one region's first line at
+    /// most. The memo answers repeats, misses included; a line longer than
+    /// the memo's key limit is looked up each time instead of being kept.
+    #[test]
+    fn detect_from_first_line_scans_the_syntax_set_once_per_line() {
+        let _serial = MEMO_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let hit = "#!/usr/bin/env python  # memo-probe";
+        let miss = "memo-probe: a prose line no syntax claims";
+        let long = format!("memo-probe {}", "x".repeat(FIRST_LINE_MEMO_MAX_LEN));
+        clear_first_line_memo();
+        let content = |line: &str| format!("{line}\nsecond line\n");
+        assert_eq!(
+            detect_from_first_line(&content(hit)).as_deref(),
+            Some("python")
+        );
+        assert_eq!(
+            detect_from_first_line(&content(hit)).as_deref(),
+            Some("python")
+        );
+        assert_eq!(detect_from_first_line(&content(miss)).as_deref(), None);
+        assert_eq!(detect_from_first_line(&content(miss)).as_deref(), None);
+        assert_eq!(
+            (syntax_scans(hit), syntax_scans(miss)),
+            (1, 1),
+            "one scan per distinct first line, hits and misses alike"
+        );
+        assert_eq!(detect_from_first_line(&content(&long)).as_deref(), None);
+        assert_eq!(detect_from_first_line(&content(&long)).as_deref(), None);
+        assert_eq!(
+            syntax_scans(&long),
+            2,
+            "a line past the key limit is looked up each time, not kept"
+        );
+
+        clear_first_line_memo();
+        for i in 0..=TOKEN_MEMO_CAP {
+            let _ = detect_from_first_line(&content(&format!("memo-probe-line-{i}")));
+        }
+        assert!(
+            first_line_memo_len() < TOKEN_MEMO_CAP,
+            "the memo is bounded: crossing the cap resets it instead of growing"
         );
     }
 
