@@ -66,6 +66,17 @@ pub(crate) struct CacheCoordinator {
 /// (a runnable bridge server), two views of one resolution — the
 /// bridge-downstream region list and the whole-document resolved regions.
 /// All ride the `ParseSnapshot` the parse publishes.
+/// The first half of a populate pass, handed out before resolution starts
+/// (see [`CacheCoordinator::populate_injections_cancellable`]): everything
+/// the token readers consume. The parse publishes its tree with this, so a
+/// token request parks only behind the discovery, never behind the
+/// resolution that only the bridge and the whole-document readers use.
+pub(crate) struct InjectionDiscovery {
+    /// The settings generation the pass ran under (the same value the full
+    /// [`PopulatedInjections`] carries).
+    pub(crate) generation: u64,
+}
+
 pub(crate) struct PopulatedInjections {
     pub(crate) discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
     /// `None` when the resolution was skipped (no runnable bridge server) —
@@ -239,6 +250,7 @@ impl CacheCoordinator {
             entry_mint_epoch,
             incarnation,
             build_bridge_regions,
+            &mut |_| {},
             None,
         )
     }
@@ -255,6 +267,7 @@ impl CacheCoordinator {
         entry_mint_epoch: (u64, u64),
         incarnation: u64,
         build_bridge_regions: bool,
+        on_discovered: &mut dyn FnMut(InjectionDiscovery),
         cancel: Option<&crate::cancel::CancelToken>,
     ) -> Option<PopulatedInjections> {
         if crate::cancel::is_cancelled(cancel) {
@@ -455,6 +468,8 @@ impl CacheCoordinator {
                 incarnation,
                 cancel,
             )?;
+
+            on_discovered(InjectionDiscovery { generation });
 
             // Live-hash set for the content-addressed injection-token cache's
             // eviction sweep, taken from the DISCOVERY's own per-region cache
@@ -1015,6 +1030,74 @@ mod tests {
         );
     }
 
+    /// The token readers consume the discovery and the tree, never the
+    /// resolution (virtual content and canonical languages for the bridge),
+    /// so populate hands the discovery out — for the parse to publish —
+    /// before it starts resolving. Resolution canonicalizes each region's
+    /// language through the base map, so a mapping installed by the
+    /// hand-off is the probe: a resolution run after it sees the mapping.
+    #[test]
+    fn populate_hands_the_discovery_out_before_resolving() {
+        use tree_sitter::Parser;
+
+        let cache = CacheCoordinator::new();
+        let tracker = NodeTracker::new();
+        let coordinator = LanguageCoordinator::new();
+        let uri = create_test_uri("handoff.md");
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            "(fenced_code_block (info_string (language) @injection.language) \
+             (code_fence_content) @injection.content)",
+        )
+        .expect("valid markdown injection query");
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(query));
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), language.clone());
+        let text = "```lua\nprint(1)\n```\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+
+        let handed_out = std::cell::Cell::new(None);
+        let mut on_discovered = |discovered: InjectionDiscovery| {
+            handed_out.set(Some(discovered.generation));
+            coordinator.set_base_mapping("lua", "python");
+        };
+        let populated = cache
+            .populate_injections_cancellable(
+                &uri,
+                text,
+                &tree,
+                "markdown",
+                &coordinator,
+                &tracker,
+                tracker.mint_epoch(&uri),
+                1,
+                true,
+                &mut on_discovered,
+                None,
+            )
+            .expect("the pass ran");
+        assert_eq!(
+            handed_out.get(),
+            Some(populated.generation),
+            "the hand-off carries the pass's generation"
+        );
+        assert_eq!(
+            populated
+                .bridge_regions
+                .as_ref()
+                .and_then(|regions| regions.first())
+                .map(|region| region.language.as_str()),
+            Some("python"),
+            "resolution ran after the hand-off: it saw the mapping the hand-off installed"
+        );
+    }
+
     #[test]
     fn cancelled_populate_commits_no_injection_state() {
         use tree_sitter::{Parser, Query};
@@ -1051,6 +1134,7 @@ mod tests {
             tracker.mint_epoch(&uri),
             1,
             true,
+            &mut |_| {},
             Some(&cancel),
         );
 
@@ -1100,6 +1184,7 @@ mod tests {
             tracker.mint_epoch(&uri),
             1,
             true,
+            &mut |_| {},
             Some(&cancel),
         );
 

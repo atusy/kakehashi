@@ -394,6 +394,13 @@ impl ParseCoordinator {
                 entry_mint_epoch,
                 incarnation,
                 build_bridge_regions,
+                &mut |discovered| {
+                    log::trace!(
+                        target: "kakehashi::populate",
+                        "discovery handed out at settings generation {}",
+                        discovered.generation
+                    );
+                },
                 Some(&cancel_for_work),
             ) else {
                 return PopulatedSnapshotRegions::default();
