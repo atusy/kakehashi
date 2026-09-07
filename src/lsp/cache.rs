@@ -33,7 +33,21 @@ pub(crate) type RequestId = u64;
 /// This struct wraps five underlying caches (full tokens, range tokens, the
 /// injection map, injection-region tokens, and request tracking) and provides a
 /// unified API for document lifecycle management, edit handling, and token operations.
+/// Drop to release the populate passes [`CacheCoordinator::hold_resolution`] holds.
+#[cfg(test)]
+pub(crate) struct ResolutionHold(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+#[cfg(test)]
+impl Drop for ResolutionHold {
+    fn drop(&mut self) {
+        *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.0.1.notify_all();
+    }
+}
+
 pub(crate) struct CacheCoordinator {
+    #[cfg(test)]
+    resolution_hold: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     semantic_cache: SemanticTokenCache,
     /// Most-recent `semanticTokens/range` result per URI (#535), keyed by viewport
     /// range + the same `cache_key` as `semantic_cache`. Cleared on a generation
@@ -72,6 +86,7 @@ pub(crate) struct CacheCoordinator {
 /// token request parks only behind the discovery, never behind the
 /// resolution that only the bridge and the whole-document readers use.
 pub(crate) struct InjectionDiscovery {
+    pub(crate) discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
     /// The settings generation the pass ran under (the same value the full
     /// [`PopulatedInjections`] carries).
     pub(crate) generation: u64,
@@ -125,6 +140,11 @@ impl CacheCoordinator {
     /// Create a new cache coordinator with empty caches.
     pub(crate) fn new() -> Self {
         Self {
+            #[cfg(test)]
+            resolution_hold: std::sync::Arc::new((
+                std::sync::Mutex::new(false),
+                std::sync::Condvar::new(),
+            )),
             semantic_cache: SemanticTokenCache::new(),
             semantic_range_cache: SemanticTokenRangeCache::new(),
             injection_map: InjectionMap::new(),
@@ -403,6 +423,37 @@ impl CacheCoordinator {
                 ));
             }
 
+            // Producer half of the discovery lever: build the owned discovery
+            // from the SAME `regions` just collected — the injection query (`Q`)
+            // is not re-run — so a semanticTokens request bound to the snapshot
+            // this parse publishes can rebuild its contexts without
+            // re-discovering. `None` when not worth reusing
+            // (gate/combined/incomplete).
+            let discovery = crate::analysis::semantic::build_document_discovery_cancellable(
+                &regions,
+                &cacheable_regions,
+                injection_query.as_ref(),
+                text,
+                language,
+                uri,
+                tracker,
+                generation,
+                incarnation,
+                cancel,
+            )?;
+
+            // Hand the discovery out before resolving: the parse publishes
+            // its tree with it, releasing the token readers, while the
+            // resolution below — which only the bridge and the whole-document
+            // readers consume — runs afterwards and lands on the same version
+            // as an upgrade (parse-snapshot ADR §2).
+            let discovery = discovery.map(std::sync::Arc::new);
+            on_discovered(InjectionDiscovery {
+                discovery: discovery.clone(),
+                generation,
+            });
+            self.await_resolution_hold();
+
             // One resolution for every consumer that needs resolved languages /
             // virtual content: the bridge regions and the whole-document
             // resolved regions below are two views of this single pass.
@@ -449,27 +500,6 @@ impl CacheCoordinator {
             if crate::cancel::is_cancelled(cancel) {
                 return None;
             }
-
-            // Producer half of the discovery lever: build the owned discovery
-            // from the SAME `regions` just collected — the injection query (`Q`)
-            // is not re-run — so a semanticTokens request bound to the snapshot
-            // this parse publishes can rebuild its contexts without
-            // re-discovering. `None` when not worth reusing
-            // (gate/combined/incomplete).
-            let discovery = crate::analysis::semantic::build_document_discovery_cancellable(
-                &regions,
-                &cacheable_regions,
-                injection_query.as_ref(),
-                text,
-                language,
-                uri,
-                tracker,
-                generation,
-                incarnation,
-                cancel,
-            )?;
-
-            on_discovered(InjectionDiscovery { generation });
 
             // Live-hash set for the content-addressed injection-token cache's
             // eviction sweep, taken from the DISCOVERY's own per-region cache
@@ -526,7 +556,7 @@ impl CacheCoordinator {
             });
             committed?;
             Some(PopulatedInjections {
-                discovery: discovery.map(std::sync::Arc::new),
+                discovery,
                 bridge_regions,
                 resolved_regions,
                 generation,
@@ -542,6 +572,31 @@ impl CacheCoordinator {
 
     /// Share the per-region injection token cache for use on the blocking
     /// semantic-token pool (#529), where the hot path reuses/stores region tokens.
+    /// Test probe: hold every populate pass between its discovery hand-off
+    /// and its resolution until the returned guard is dropped, so a test can
+    /// observe the first install (tree + discovery) as a state of its own.
+    #[cfg(test)]
+    pub(crate) fn hold_resolution(&self) -> ResolutionHold {
+        *self
+            .resolution_hold
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
+        ResolutionHold(std::sync::Arc::clone(&self.resolution_hold))
+    }
+
+    #[cfg(test)]
+    fn await_resolution_hold(&self) {
+        let (held, released) = &*self.resolution_hold;
+        let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+        while *held {
+            held = released.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    #[cfg(not(test))]
+    fn await_resolution_hold(&self) {}
+
     pub(crate) fn injection_token_cache_arc(&self) -> std::sync::Arc<InjectionTokenCache> {
         std::sync::Arc::clone(&self.injection_token_cache)
     }
