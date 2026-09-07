@@ -484,13 +484,29 @@ impl ParseCoordinator {
             // tree first) has nothing to upgrade: the regions would ride the
             // sibling's tree with a tree the readers never derived from.
             Some(first) => {
-                if first.published
-                    && (regions.bridge_regions.is_some() || regions.resolved_regions.is_some())
-                {
+                // The verdict the callers act on is taken now, after the
+                // resolution, not at the first install: an edit landing in
+                // between has moved the document on, and the downstream
+                // must not run for a version that is no longer current.
+                // The upgrade re-judges under the entry guard; without one,
+                // the cell is asked whether the version is still current.
+                let upgraded = (first.published
+                    && (regions.bridge_regions.is_some() || regions.resolved_regions.is_some()))
+                .then(|| {
                     self.documents
-                        .install_parse(uri, check.as_check(), inputs.snapshot(regions));
-                }
-                first
+                        .install_parse(uri, check.as_check(), inputs.snapshot(regions))
+                });
+                let current = match upgraded {
+                    Some(upgrade) => upgrade.current,
+                    None => {
+                        first.current
+                            && self.documents.latest_snapshot(uri).is_some_and(|view| {
+                                view.slot.current_incarnation == inputs.incarnation
+                                    && view.content_version == inputs.parsed_version
+                            })
+                    }
+                };
+                crate::document::ParseInstall { current, ..first }
             }
             // The pass never reached the hand-off: one install, as before.
             None => self
