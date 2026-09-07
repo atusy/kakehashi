@@ -628,9 +628,8 @@ impl DocumentStore {
             parsed_version: doc.content_version(),
             incarnation: doc.incarnation(),
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            regions: None,
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
         doc.publish_snapshot(&Arc::new(snapshot));
     }
@@ -646,13 +645,33 @@ impl DocumentStore {
         uri: &Url,
         current_generation: u64,
     ) -> Option<std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>> {
+        self.current_region_views(uri, current_generation)
+            .map(|regions| regions.whole_document)
+    }
+
+    /// The same currency/generation gate for bridge lifecycle readers.
+    pub(crate) fn current_bridge_regions(
+        &self,
+        uri: &Url,
+        current_generation: u64,
+    ) -> Option<Arc<Vec<super::DiscoveredBridgeRegion>>> {
+        self.current_region_views(uri, current_generation)
+            .map(|regions| regions.bridge)
+    }
+
+    fn current_region_views(
+        &self,
+        uri: &Url,
+        current_generation: u64,
+    ) -> Option<super::snapshot::ResolvedRegions> {
         let view = self.latest_snapshot(uri)?;
         let snapshot = view.slot.snapshot?;
-        if snapshot.parsed_version != view.content_version {
+        if snapshot.incarnation != view.slot.current_incarnation
+            || snapshot.parsed_version != view.content_version
+        {
             return None;
         }
-        let (stamped_generation, regions) = snapshot.resolved_regions.as_ref()?;
-        (*stamped_generation == current_generation).then(|| std::sync::Arc::clone(regions))
+        snapshot.regions_for_generation(current_generation).cloned()
     }
 
     /// Subscribe to `uri`'s snapshot-slot changes for a **bounded** wait (the
@@ -703,9 +722,55 @@ pub(crate) struct ParseInstall {
     /// The snapshot landed in the document's cell: the language matched and
     /// the slot admitted it.
     pub(crate) published: bool,
+    /// The publish was the equal-version tree upgrade: a tree landing over a
+    /// tree-less placeholder or give-up of the same version. Read under the
+    /// same entry guard as the publish, so a reparse's refresh gate needs no
+    /// probe of its own that a racing give-up could invalidate.
+    pub(crate) tree_upgrade: bool,
 }
 
 impl DocumentStore {
+    /// Finish the work for the exact first-published snapshot. If regions
+    /// arrived, enrich it through the restricted channel operation; otherwise
+    /// keep it unchanged. Return whether it is still current AT COMPLETION,
+    /// not whether it was current when initially published. An edit may leave
+    /// the snapshot eligible for stale-but-consistent enrichment, but the
+    /// caller must not run current-version downstream work for it.
+    pub(crate) fn complete_parse(
+        &self,
+        uri: &Url,
+        language: LanguageCheck<'_>,
+        expected: &Arc<super::snapshot::ParseSnapshot>,
+        regions: Option<super::snapshot::ResolvedRegions>,
+    ) -> bool {
+        let current_at_completion = self.documents.get_mut(uri).is_some_and(|doc| {
+            if let LanguageCheck::Expect(language) = language
+                && doc.language_id() != language
+            {
+                return false;
+            }
+            let slot = doc.latest_snapshot_slot();
+            if slot.current_incarnation != expected.incarnation
+                || !slot
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|held| Arc::ptr_eq(held, expected))
+            {
+                return false;
+            }
+            if let Some(regions) = &regions
+                && !doc.enrich_regions(expected, regions)
+            {
+                return false;
+            }
+            expected.parsed_version == doc.content_version()
+        });
+        // Rejected region vectors can be large; destroy them outside the
+        // entry guard, as with install_parse's rejected/evicted snapshots.
+        drop(regions);
+        current_at_completion
+    }
+
     /// Install a parse result: publish `snapshot` iff the stored language
     /// passes `language` and the cell admits it, under the document's entry
     /// lock — the one way a parse reaches readers (`Document::tree` is the
@@ -743,6 +808,14 @@ impl DocumentStore {
                 }
                 let parsed_current_version = snapshot.parsed_version == doc.content_version();
                 let detected = snapshot.language.clone();
+                // Read before the publish, under the same guard: the held
+                // snapshot is what this publish upgrades, if anything.
+                let fills_placeholder = has_tree
+                    && evicted.as_ref().is_some_and(|held| {
+                        held.parsed_version == version
+                            && held.incarnation == incarnation
+                            && held.tree.is_none()
+                    });
                 let published = doc.publish_snapshot(&snapshot);
                 let current = published && parsed_current_version;
                 // The reparses do not relabel (the snapshot carries the
@@ -751,7 +824,11 @@ impl DocumentStore {
                 if current && matches!(language, LanguageCheck::Record) {
                     doc.record_language(detected);
                 }
-                ParseInstall { current, published }
+                ParseInstall {
+                    current,
+                    published,
+                    tree_upgrade: published && fills_placeholder,
+                }
             });
         // Likewise a rejected `snapshot` (still owned here: the publish
         // borrows) — destroyed only after the guard is released.
@@ -797,9 +874,8 @@ mod tests {
             parsed_version,
             incarnation,
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            regions: None,
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -838,7 +914,8 @@ mod tests {
             outcome,
             ParseInstall {
                 current: false,
-                published: true
+                published: true,
+                tree_upgrade: false
             }
         );
         assert!(store.get(&uri).unwrap().tree().is_none());
@@ -885,7 +962,8 @@ mod tests {
             outcome,
             ParseInstall {
                 current: false,
-                published: true
+                published: true,
+                tree_upgrade: false
             }
         );
         assert_eq!(
@@ -920,9 +998,8 @@ mod tests {
                 parsed_version: content_version,
                 incarnation,
                 injection_regions: None,
-                bridge_regions: None,
-                resolved_regions: None,
-                layer_trees: std::sync::OnceLock::new(),
+                regions: None,
+                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             }),
         );
         assert!(reparse.current && reparse.published);
@@ -1158,7 +1235,8 @@ mod tests {
             outcome,
             ParseInstall {
                 current: true,
-                published: true
+                published: true,
+                tree_upgrade: false
             },
             "same version, same lifetime: the current parse, whichever allocation it read"
         );
@@ -1187,7 +1265,8 @@ mod tests {
             installed,
             ParseInstall {
                 current: true,
-                published: true
+                published: true,
+                tree_upgrade: false
             }
         );
         let doc = store.get(&uri).unwrap();
@@ -1210,6 +1289,238 @@ mod tests {
             store.get(&uri).is_none() && !store.parse_states.contains_key(&uri),
             "an install into a closed document must not resurrect it or its parse state"
         );
+    }
+
+    #[test]
+    fn both_region_readers_distinguish_unavailable_empty_and_stale() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///region-readers.md").unwrap();
+        let text: Arc<str> = Arc::from("# doc\n");
+        let incarnation =
+            store.insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
+        let version = store.get(&uri).unwrap().content_version();
+        let first = parse_snapshot(&text, Some(markdown_tree(&text)), version, incarnation);
+        assert!(
+            store
+                .install_parse(&uri, LanguageCheck::Record, Arc::clone(&first))
+                .current
+        );
+        assert!(store.current_bridge_regions(&uri, 1).is_none());
+        assert!(store.current_resolved_regions(&uri, 1).is_none());
+        assert!(store.complete_parse(
+            &uri,
+            LanguageCheck::Record,
+            &first,
+            Some(super::super::snapshot::ResolvedRegions::empty(1))
+        ));
+        assert!(store.current_bridge_regions(&uri, 1).unwrap().is_empty());
+        assert!(store.current_resolved_regions(&uri, 1).unwrap().is_empty());
+        assert!(store.current_bridge_regions(&uri, 2).is_none());
+        assert!(store.current_resolved_regions(&uri, 2).is_none());
+        let bound = store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap();
+        store.update_document(uri.clone(), "# edited\n".into(), None);
+        assert!(store.current_bridge_regions(&uri, 1).is_none());
+        assert!(store.current_resolved_regions(&uri, 1).is_none());
+        assert!(
+            bound.regions_for_generation(1).is_some(),
+            "snapshot-bound reads keep their own regions"
+        );
+        assert!(
+            bound.regions_for_generation(2).is_none(),
+            "even a bound read rejects reload-stale regions"
+        );
+    }
+
+    #[test]
+    fn completion_cannot_overwrite_a_newer_published_tree() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///newer-tree.md").unwrap();
+        let text: Arc<str> = Arc::from("# doc\n");
+        let incarnation =
+            store.insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
+        let version = store.get(&uri).unwrap().content_version();
+        let first = parse_snapshot(&text, Some(markdown_tree(&text)), version, incarnation);
+        assert!(
+            store
+                .install_parse(&uri, LanguageCheck::Record, Arc::clone(&first))
+                .current
+        );
+        let edited: Arc<str> = Arc::from("# edited\n");
+        store.update_document(uri.clone(), edited.to_string(), None);
+        let version = store.get(&uri).unwrap().content_version();
+        let newer = parse_snapshot(&edited, Some(markdown_tree(&edited)), version, incarnation);
+        assert!(
+            store
+                .install_parse(&uri, LanguageCheck::Record, Arc::clone(&newer))
+                .current
+        );
+        for regions in [
+            None,
+            Some(super::super::snapshot::ResolvedRegions::empty(1)),
+        ] {
+            assert!(!store.complete_parse(&uri, LanguageCheck::Record, &first, regions));
+            assert!(Arc::ptr_eq(
+                &newer,
+                &store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn complete_parse_enriches_once_and_notifies_waiters() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///upgrade.md").unwrap();
+        let text: Arc<str> = Arc::from("# doc\n");
+        let incarnation =
+            store.insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
+        let version = store.get(&uri).unwrap().content_version();
+        let first = parse_snapshot(&text, Some(markdown_tree(&text)), version, incarnation);
+        assert!(
+            store
+                .install_parse(
+                    &uri,
+                    LanguageCheck::Expect(Some("markdown")),
+                    Arc::clone(&first)
+                )
+                .current
+        );
+        let mut watcher = store.subscribe_snapshots(&uri).unwrap();
+        watcher.borrow_and_update();
+        let complete = || {
+            store.complete_parse(
+                &uri,
+                LanguageCheck::Expect(Some("markdown")),
+                &first,
+                Some(super::super::snapshot::ResolvedRegions::empty(1)),
+            )
+        };
+        assert!(complete());
+        assert!(watcher.has_changed().unwrap());
+        let enriched = store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap();
+        assert!(enriched.regions.is_some());
+        watcher.borrow_and_update();
+        assert!(!complete());
+        assert!(!watcher.has_changed().unwrap());
+        assert!(Arc::ptr_eq(
+            &enriched,
+            &store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap()
+        ));
+    }
+
+    #[rstest::rstest]
+    #[case(true)]
+    #[case(false)]
+    fn complete_parse_rechecks_currency_after_an_edit(#[case] with_regions: bool) {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///edited-completion.md").unwrap();
+        let text: Arc<str> = Arc::from("# doc\n");
+        let incarnation =
+            store.insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
+        let version = store.get(&uri).unwrap().content_version();
+        let first = parse_snapshot(&text, Some(markdown_tree(&text)), version, incarnation);
+        assert!(
+            store
+                .install_parse(&uri, LanguageCheck::Record, Arc::clone(&first))
+                .current
+        );
+        store.update_document(uri.clone(), "# edited\n".into(), None);
+        assert!(!store.complete_parse(
+            &uri,
+            LanguageCheck::Record,
+            &first,
+            with_regions.then(|| super::super::snapshot::ResolvedRegions::empty(1))
+        ));
+        let stale = store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap();
+        assert_eq!(stale.parsed_version, version);
+        assert_eq!(
+            stale.regions.is_some(),
+            with_regions,
+            "stale enrichment stays internally consistent"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(true)]
+    #[case(false)]
+    fn complete_parse_rejects_a_reopened_or_reloaded_document(#[case] reopen: bool) {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///reopened-completion.md").unwrap();
+        let text: Arc<str> = Arc::from("# doc\n");
+        let incarnation =
+            store.insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
+        let version = store.get(&uri).unwrap().content_version();
+        let first = parse_snapshot(&text, Some(markdown_tree(&text)), version, incarnation);
+        assert!(
+            store
+                .install_parse(&uri, LanguageCheck::Record, Arc::clone(&first))
+                .current
+        );
+        if reopen {
+            store.remove(&uri);
+            assert!(!store.complete_parse(&uri, LanguageCheck::Record, &first, None));
+            store.insert(uri.clone(), text.to_string(), Some("markdown".into()), None);
+        } else {
+            store.invalidate_all_parses();
+        }
+        assert!(!store.complete_parse(
+            &uri,
+            LanguageCheck::Record,
+            &first,
+            Some(super::super::snapshot::ResolvedRegions::empty(1))
+        ));
+        assert!(store.current_resolved_regions(&uri, 1).is_none());
+    }
+
+    /// A reparse's refresh gate needs to know whether its publish upgraded
+    /// a tree-less placeholder of the same version (the client may have
+    /// been served empty against it). The install reports that from under
+    /// the entry guard: true for the tree landing over the placeholder,
+    /// false for a fresh version and for the regions upgrade of a version
+    /// that already had its tree.
+    #[test]
+    fn install_parse_reports_the_tree_upgrade_it_made() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///tree-upgrade.md").unwrap();
+        let text = "# doc\n";
+        let incarnation = store.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (expected_text, content_version) = {
+            let doc = store.get(&uri).unwrap();
+            (doc.text_arc(), doc.content_version())
+        };
+        let tree = markdown_tree(text);
+
+        let placeholder = store.install_parse(
+            &uri,
+            LanguageCheck::Expect(Some("markdown")),
+            parse_snapshot(&expected_text, None, content_version, incarnation),
+        );
+        assert!(placeholder.published && !placeholder.tree_upgrade);
+        let filled = store.install_parse(
+            &uri,
+            LanguageCheck::Expect(Some("markdown")),
+            parse_snapshot(
+                &expected_text,
+                Some(tree.clone()),
+                content_version,
+                incarnation,
+            ),
+        );
+        assert!(
+            filled.published && filled.tree_upgrade,
+            "the tree landing over the placeholder is the upgrade the refresh gate asks about"
+        );
+        let first = store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap();
+        assert!(store.complete_parse(
+            &uri,
+            LanguageCheck::Expect(Some("markdown")),
+            &first,
+            Some(super::super::snapshot::ResolvedRegions::empty(1))
+        ));
     }
 
     /// One publish per version and lifetime, and currency reported from the
@@ -1247,7 +1558,8 @@ mod tests {
             outcome,
             ParseInstall {
                 current: true,
-                published: true
+                published: true,
+                tree_upgrade: false
             }
         );
         assert!(store.get(&uri).unwrap().tree().is_some(), "tree visible");
@@ -1377,9 +1689,8 @@ mod tests {
                 parsed_version: 0,
                 incarnation,
                 injection_regions: None,
-                bridge_regions: None,
-                resolved_regions: None,
-                layer_trees: std::sync::OnceLock::new(),
+                regions: None,
+                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             }),
         );
         assert!(
@@ -1409,9 +1720,8 @@ mod tests {
                 parsed_version,
                 incarnation: doc.incarnation(),
                 injection_regions: None,
-                bridge_regions: None,
-                resolved_regions: None,
-                layer_trees: std::sync::OnceLock::new(),
+                regions: None,
+                layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
             }
         }
 

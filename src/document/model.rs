@@ -229,9 +229,8 @@ impl Document {
             parsed_version: self.content_version,
             incarnation: self.incarnation,
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            regions: None,
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -284,6 +283,17 @@ impl Document {
             installed
         });
         installed
+    }
+
+    /// Complete a published parse without accepting replacement parse inputs.
+    /// The store retains `expected` and `regions` until after its guard drops.
+    pub(super) fn enrich_regions(
+        &self,
+        expected: &Arc<ParseSnapshot>,
+        regions: &super::snapshot::ResolvedRegions,
+    ) -> bool {
+        self.snapshot_tx
+            .send_if_modified(|slot| slot.enrich_regions(expected, regions))
     }
 
     /// Install the terminal closed slot (see
@@ -516,9 +526,8 @@ mod tests {
             parsed_version,
             incarnation: doc.incarnation(),
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            regions: None,
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -719,9 +728,8 @@ mod tests {
             parsed_version: doc.content_version(),
             incarnation: 7,
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            regions: None,
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })));
         // `Tree` clones share their subtrees but not the root handle, so a
         // child node's id is the identity that survives the clone.

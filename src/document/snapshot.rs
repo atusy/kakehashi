@@ -65,26 +65,11 @@ pub(crate) struct ParseSnapshot {
     /// binding: text, tree, and regions are one value, so the regions can
     /// never be consumed against a different tree.
     pub(crate) injection_regions: Option<Arc<DiscoveredInjections>>,
-    /// The bridge downstream's region list, derived by the same populate pass
-    /// (`None` when populate didn't run for this snapshot or no bridge server
-    /// was configured — the downstream then resolves inline; `Some(empty)`
-    /// means genuinely no regions). Stamped with the settings generation the
-    /// discovery ran under, like `resolved_regions`: a reload can change the
-    /// injection query without publishing a new snapshot, and the consumer
-    /// must fall back inline rather than open virtual documents for regions
-    /// the new query would not discover.
-    pub(crate) bridge_regions: Option<(u64, Arc<Vec<DiscoveredBridgeRegion>>)>,
-    /// Fully resolved injection regions (`InjectionResolver::resolve_all`'s
-    /// shape) from the same populate pass, for the whole-document readers —
-    /// pull/push diagnostics, documentSymbol/Color, formatting's virt layer —
-    /// which previously each re-ran the injection query per request. Same
-    /// `None`/`Some(empty)` semantics as `bridge_regions`.
-    /// Stamped with the settings generation the populate pass ran under: a
-    /// reload (which can change injection resolution) bumps the generation
-    /// WITHOUT publishing a new snapshot, so consumers gate on the stamp and
-    /// fall back to inline resolution on mismatch (same pattern as
-    /// `DiscoveredInjections.generation` and `layer_trees`).
-    pub(crate) resolved_regions: Option<(u64, Arc<Vec<ResolvedInjection>>)>,
+    /// Both views of one resolution, under one settings generation.
+    /// `None` means unavailable (including skipped/cancelled resolution), not
+    /// necessarily pending. Readers fall back inline. Present empty vectors
+    /// mean the pass established that there are no injection regions.
+    pub(crate) regions: Option<ResolvedRegions>,
     /// Lazily-built, per-snapshot injection layer trees (document-order DFS,
     /// depth ≥ 1) for the captures/node layer walk: the FIRST walking request
     /// on this snapshot builds them (on the compute pool — the same cost the
@@ -101,7 +86,37 @@ pub(crate) struct ParseSnapshot {
     /// empty embedded layer for the rest of this snapshot's life. A walker
     /// seeing a generation mismatch bypasses the cell and walks fresh (the
     /// pre-cache per-request cost) until the next snapshot rebuilds it.
-    pub(crate) layer_trees: std::sync::OnceLock<(u64, Arc<Vec<SnapshotLayerTree>>)>,
+    pub(crate) layer_trees: Arc<std::sync::OnceLock<(u64, Arc<Vec<SnapshotLayerTree>>)>>,
+}
+
+impl ParseSnapshot {
+    /// Read regions belonging to this snapshot only when their settings are
+    /// still current. A reader already bound to a snapshot must not re-read
+    /// the store and pair its tree with a newer snapshot's regions.
+    pub(crate) fn regions_for_generation(&self, generation: u64) -> Option<&ResolvedRegions> {
+        self.regions
+            .as_ref()
+            .filter(|regions| regions.generation == generation)
+    }
+}
+
+/// The bridge and whole-document views of one resolution. They are published
+/// together, so neither presence nor the settings generation can disagree.
+#[derive(Clone)]
+pub(crate) struct ResolvedRegions {
+    pub(crate) generation: u64,
+    pub(crate) bridge: Arc<Vec<DiscoveredBridgeRegion>>,
+    pub(crate) whole_document: Arc<Vec<ResolvedInjection>>,
+}
+
+impl ResolvedRegions {
+    pub(crate) fn empty(generation: u64) -> Self {
+        Self {
+            generation,
+            bridge: Arc::new(Vec::new()),
+            whole_document: Arc::new(Vec::new()),
+        }
+    }
 }
 
 /// The per-URI `watch` value: the current lifetime plus the latest snapshot.
@@ -148,7 +163,10 @@ impl SnapshotSlot {
     ///    (tree-less, releases parked first-parse waiters) must not block
     ///    the real parse of the same version that a later successful install
     ///    produces. Same version means same input text, so the upgrade only
-    ///    adds information; the equal-version tree *swap* stays rejected.
+    ///    adds information; an equal-version tree swap stays rejected.
+    ///
+    /// Regions use the separate, exact-snapshot [`Self::enrich_regions`]
+    /// operation rather than this general parse-result admission rule.
     pub(crate) fn admits(&self, snapshot: &ParseSnapshot) -> bool {
         // The sentinel is reserved: no snapshot legitimately carries it (the
         // store's counter never draws it), so a closed slot admits nothing —
@@ -161,6 +179,39 @@ impl SnapshotSlot {
                 (snapshot.parsed_version > current.parsed_version && !tree_downgrade)
                     || (snapshot.parsed_version == current.parsed_version && tree_upgrade)
             })
+    }
+
+    /// Add regions only to the exact snapshot the first publish installed.
+    /// The caller cannot replace any parse input or the lazy layer-tree cell.
+    /// Pointer identity is the capability: a sibling parse of the same version
+    /// (even one sharing tree-sitter subtrees) cannot complete this snapshot.
+    pub(super) fn enrich_regions(
+        &mut self,
+        expected: &Arc<ParseSnapshot>,
+        regions: &ResolvedRegions,
+    ) -> bool {
+        if self.current_incarnation == CLOSED_INCARNATION
+            || self.current_incarnation != expected.incarnation
+            || expected.tree.is_none()
+            || expected.regions.is_some()
+            || !self
+                .snapshot
+                .as_ref()
+                .is_some_and(|held| Arc::ptr_eq(held, expected))
+        {
+            return false;
+        }
+        self.snapshot = Some(Arc::new(ParseSnapshot {
+            text: Arc::clone(&expected.text),
+            tree: expected.tree.clone(),
+            language: expected.language.clone(),
+            parsed_version: expected.parsed_version,
+            incarnation: expected.incarnation,
+            injection_regions: expected.injection_regions.clone(),
+            regions: Some(regions.clone()),
+            layer_trees: Arc::clone(&expected.layer_trees),
+        }));
+        true
     }
 }
 
@@ -176,9 +227,8 @@ mod tests {
             parsed_version,
             incarnation,
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            regions: None,
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -223,9 +273,8 @@ mod tests {
             parsed_version,
             incarnation,
             injection_regions: None,
-            bridge_regions: None,
-            resolved_regions: None,
-            layer_trees: std::sync::OnceLock::new(),
+            regions: None,
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -242,6 +291,94 @@ mod tests {
             slot.admits(&snap_with_tree(7, 4)),
             "a newer tree-ful publish advances normally"
         );
+    }
+
+    #[test]
+    fn ordinary_publish_cannot_enrich_even_a_clone_of_the_published_tree() {
+        let held = snap_with_tree(7, 3);
+        let mut incoming = snap_with_tree(7, 3);
+        incoming.tree = held.tree.clone();
+        incoming.text = Arc::clone(&held.text);
+        incoming.regions = Some(ResolvedRegions::empty(1));
+        let slot = SnapshotSlot {
+            current_incarnation: 7,
+            snapshot: Some(Arc::new(held)),
+        };
+        assert!(
+            !slot.admits(&incoming),
+            "region completion must name the exact published snapshot, not submit a replacement tree"
+        );
+    }
+
+    #[test]
+    fn enrichment_requires_the_exact_snapshot_and_preserves_its_inputs() {
+        let mut held = snap_with_tree(7, 3);
+        held.injection_regions = Some(Arc::new(DiscoveredInjections {
+            generation: 1,
+            complete: true,
+            regions: Vec::new(),
+        }));
+        let mut sibling = snap_with_tree(7, 3);
+        sibling.tree = held.tree.clone();
+        sibling.text = Arc::clone(&held.text);
+        let held = Arc::new(held);
+        let mut slot = SnapshotSlot {
+            current_incarnation: 7,
+            snapshot: Some(Arc::clone(&held)),
+        };
+        let regions = ResolvedRegions::empty(1);
+        assert!(!slot.enrich_regions(&Arc::new(sibling), &regions));
+        assert!(slot.enrich_regions(&held, &regions));
+        let enriched = slot.snapshot.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&enriched.text, &held.text));
+        assert!(Arc::ptr_eq(&enriched.layer_trees, &held.layer_trees));
+        assert!(Arc::ptr_eq(
+            enriched.injection_regions.as_ref().unwrap(),
+            held.injection_regions.as_ref().unwrap()
+        ));
+        assert_eq!(
+            enriched
+                .tree
+                .as_ref()
+                .unwrap()
+                .root_node()
+                .child(0)
+                .unwrap()
+                .id(),
+            held.tree
+                .as_ref()
+                .unwrap()
+                .root_node()
+                .child(0)
+                .unwrap()
+                .id()
+        );
+        assert!(enriched.regions.is_some());
+        assert!(
+            held.regions.is_none(),
+            "the already-issued snapshot stays immutable"
+        );
+        assert!(
+            !slot.enrich_regions(&held, &regions),
+            "a completion cannot publish twice"
+        );
+        let enriched = Arc::clone(slot.snapshot.as_ref().unwrap());
+        assert!(
+            !slot.enrich_regions(&enriched, &regions),
+            "regions cannot be replaced either"
+        );
+    }
+
+    #[test]
+    fn enrichment_rejects_a_placeholder_or_closed_lifetime() {
+        let held = Arc::new(snap(7, 3));
+        let regions = ResolvedRegions::empty(1);
+        let mut slot = SnapshotSlot {
+            current_incarnation: 7,
+            snapshot: Some(Arc::clone(&held)),
+        };
+        assert!(!slot.enrich_regions(&held, &regions));
+        assert!(!SnapshotSlot::closed().enrich_regions(&held, &regions));
     }
 
     #[test]

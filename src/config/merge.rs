@@ -865,7 +865,6 @@ mod tests {
                             "keyword".to_string(),
                             "base.keyword".to_string(),
                         )])),
-                        ..Default::default()
                     },
                 ),
             ])),
@@ -955,7 +954,6 @@ mod tests {
                             "type.builtin".to_string(),
                             "rust.type".to_string(),
                         )])),
-                        ..Default::default()
                     },
                 ),
             ])),

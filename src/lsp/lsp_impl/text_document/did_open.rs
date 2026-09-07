@@ -517,6 +517,142 @@ mod tests {
         );
     }
 
+    /// A parse publishes twice per version: the tree with its discovery as
+    /// soon as populate hands them out — releasing every reader parked on
+    /// the cell, the token readers above all — and the same version again,
+    /// upgraded with the bridge / resolved regions, once the resolution the
+    /// bridge consumes has run. With the resolution held, the first publish
+    /// is observable on its own: current, tree-bearing, regions absent, and
+    /// a token wait already returns it.
+    #[tokio::test]
+    async fn did_open_publishes_the_tree_before_the_regions_are_resolved() {
+        let (service, mut socket) = LspService::new(Kakehashi::new);
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while socket.next().await.is_some() {}
+        });
+        let server = service.inner();
+
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), tree_sitter_md::LANGUAGE.into());
+        let markdown_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let injection_query = Query::new(
+            &markdown_language,
+            r#"
+            (fenced_code_block
+              (info_string
+                (language) @injection.language)
+              (code_fence_content) @injection.content)
+            "#,
+        )
+        .expect("valid markdown injection query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(injection_query));
+
+        let mut language_servers = HashMap::new();
+        language_servers.insert(
+            "lua-bridge".to_string(),
+            BridgeServerConfig {
+                cmd: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "cat > /dev/null".to_string(),
+                ]),
+                languages: Some(vec!["lua".to_string()]),
+                initialization_options: None,
+                workspace_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+                force_start: None,
+                enabled: None,
+                settings: None,
+            },
+        );
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: false,
+            language_servers,
+            ..Default::default()
+        });
+        server
+            .bridge
+            .insert_ready_test_connection("lua-bridge")
+            .await;
+
+        let uri = Url::parse("file:///test/two_stage_install.md").expect("valid test URI");
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
+        let regions_of = |uri: &Url| {
+            server.documents.latest_snapshot(uri).and_then(|view| {
+                let snapshot = view.slot.snapshot?;
+                (snapshot.parsed_version == view.content_version && snapshot.tree.is_some())
+                    .then_some((
+                        snapshot.regions.as_ref().map(|r| r.bridge.len()),
+                        snapshot.regions.as_ref().map(|r| r.whole_document.len()),
+                    ))
+            })
+        };
+
+        let hold = server.cache.hold_resolution();
+        server
+            .did_open_impl(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: lsp_uri,
+                    language_id: "markdown".to_string(),
+                    version: 1,
+                    // Enough regions for the discovery to be worth storing,
+                    // so the first publish is seen to carry it.
+                    text: format!("# Example\n\n{}", "```lua\nprint(1)\n```\n".repeat(9)),
+                },
+            })
+            .await;
+
+        // First publish: the current tree with its discovery and no regions
+        // yet — and a token wait already returns it while the resolution is
+        // still held.
+        wait_until(|| regions_of(&uri) == Some((None, None))).await;
+        let first = server
+            .documents
+            .latest_snapshot(&uri)
+            .and_then(|view| view.slot.snapshot)
+            .expect("the first publish is in the cell");
+        assert!(
+            first.injection_regions.is_some(),
+            "the first publish carries the discovery the token readers consume"
+        );
+        let woke = tokio::time::timeout(
+            Duration::from_secs(1),
+            server.wait_for_current_snapshot(&uri, Duration::from_secs(1)),
+        )
+        .await
+        .expect("a token wait must not park behind the resolution");
+        assert!(
+            matches!(
+                woke,
+                crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Current(_)
+            ),
+            "the first publish releases the token readers"
+        );
+
+        // Second publish: the same version, upgraded with the regions.
+        drop(hold);
+        wait_until(|| regions_of(&uri) == Some((Some(9), Some(9)))).await;
+        // The layer trees a reader derives on the first publish — even one
+        // still deriving them as the upgrade lands — are the upgrade's too:
+        // the two installs share the lazy cell.
+        let upgraded = server
+            .documents
+            .latest_snapshot(&uri)
+            .and_then(|view| view.slot.snapshot)
+            .expect("the upgrade is in the cell");
+        assert!(
+            std::sync::Arc::ptr_eq(&first.layer_trees, &upgraded.layer_trees),
+            "the two installs of one parse share their layer-tree cell"
+        );
+    }
+
     #[tokio::test]
     async fn did_open_parses_before_eager_opening_injected_virtual_documents() {
         // Test isolation is automatic via the `cfg(test)` branch in
@@ -1457,7 +1593,7 @@ print("hello")
             .unwrap()
             .tree()
             .expect("the reparse published a tree");
-        assert_eq!(&*server.documents.get(&uri).unwrap().text(), after);
+        assert_eq!(server.documents.get(&uri).unwrap().text(), after);
         assert_eq!(
             keep_name(&reparsed),
             Some(before_id),

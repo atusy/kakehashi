@@ -30,10 +30,24 @@ pub(crate) type RequestId = u64;
 
 /// Coordinates all cache structures for semantic token operations.
 ///
+/// Drop to release the populate passes [`CacheCoordinator::hold_resolution`] holds.
+#[cfg(test)]
+pub(crate) struct ResolutionHold(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+#[cfg(test)]
+impl Drop for ResolutionHold {
+    fn drop(&mut self) {
+        *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.0.1.notify_all();
+    }
+}
+
 /// This struct wraps five underlying caches (full tokens, range tokens, the
 /// injection map, injection-region tokens, and request tracking) and provides a
 /// unified API for document lifecycle management, edit handling, and token operations.
 pub(crate) struct CacheCoordinator {
+    #[cfg(test)]
+    resolution_hold: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     semantic_cache: SemanticTokenCache,
     /// Most-recent `semanticTokens/range` result per URI (#535), keyed by viewport
     /// range + the same `cache_key` as `semantic_cache`. Cleared on a generation
@@ -60,25 +74,29 @@ pub(crate) struct CacheCoordinator {
     served_semantic_versions: dashmap::DashMap<Url, u64>,
 }
 
+/// The first half of a populate pass, handed out before resolution starts
+/// (see [`CacheCoordinator::populate_injections_cancellable`]): everything
+/// the token readers consume. The parse publishes its tree with this, so a
+/// token request parks only behind the discovery, never behind the
+/// resolution that only the bridge and the whole-document readers use.
+pub(crate) struct InjectionDiscovery {
+    pub(crate) discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
+    /// The settings generation the pass ran under (the same value the full
+    /// [`PopulatedInjections`] carries).
+    pub(crate) generation: u64,
+}
+
 /// Everything one `populate_injections` pass derives from its single
 /// injection-query run (parse-snapshot ADR §3, never discover twice): the
 /// semantic-path discovery (below its own reuse gate) and, behind one gate
 /// (a runnable bridge server), two views of one resolution — the
 /// bridge-downstream region list and the whole-document resolved regions.
 /// All ride the `ParseSnapshot` the parse publishes.
+#[derive(Default)]
 pub(crate) struct PopulatedInjections {
-    pub(crate) discovery: Option<crate::document::DiscoveredInjections>,
-    /// `None` when the resolution was skipped (no runnable bridge server) —
-    /// bridge readers then fall back to inline resolution — vs `Some(empty)`
-    /// for "ran, nothing matched" (readers skip their work).
-    pub(crate) bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>>,
-    /// The same gate as `bridge_regions`: `None` exactly when it is, and the
-    /// whole-document readers then resolve inline.
-    pub(crate) resolved_regions: Option<Vec<crate::language::injection::ResolvedInjection>>,
-    /// The settings generation this populate pass ran under — stamped onto
-    /// the snapshot's `bridge_regions` and `resolved_regions` so reload-stale
-    /// resolution is never served (see `ParseSnapshot::resolved_regions`).
-    pub(crate) generation: u64,
+    pub(crate) discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
+    /// Both resolution views, or unavailable when resolution was skipped.
+    pub(crate) regions: Option<crate::document::snapshot::ResolvedRegions>,
 }
 
 impl PopulatedInjections {
@@ -87,9 +105,9 @@ impl PopulatedInjections {
     pub(crate) fn empty(generation: u64) -> Self {
         Self {
             discovery: None,
-            bridge_regions: Some(Vec::new()),
-            resolved_regions: Some(Vec::new()),
-            generation,
+            regions: Some(crate::document::snapshot::ResolvedRegions::empty(
+                generation,
+            )),
         }
     }
 
@@ -100,12 +118,10 @@ impl PopulatedInjections {
     /// documents that do have injections once the query is loaded. Riding
     /// without regions makes readers fall back to inline resolution, which
     /// finds the query as soon as it is there.
-    pub(crate) fn undetermined(generation: u64) -> Self {
+    pub(crate) fn undetermined() -> Self {
         Self {
             discovery: None,
-            bridge_regions: None,
-            resolved_regions: None,
-            generation,
+            regions: None,
         }
     }
 }
@@ -114,6 +130,11 @@ impl CacheCoordinator {
     /// Create a new cache coordinator with empty caches.
     pub(crate) fn new() -> Self {
         Self {
+            #[cfg(test)]
+            resolution_hold: std::sync::Arc::new((
+                std::sync::Mutex::new(false),
+                std::sync::Condvar::new(),
+            )),
             semantic_cache: SemanticTokenCache::new(),
             semantic_range_cache: SemanticTokenRangeCache::new(),
             injection_map: InjectionMap::new(),
@@ -239,6 +260,7 @@ impl CacheCoordinator {
             entry_mint_epoch,
             incarnation,
             build_bridge_regions,
+            &mut |_| {},
             None,
         )
     }
@@ -255,6 +277,7 @@ impl CacheCoordinator {
         entry_mint_epoch: (u64, u64),
         incarnation: u64,
         build_bridge_regions: bool,
+        on_discovered: &mut dyn FnMut(InjectionDiscovery),
         cancel: Option<&crate::cancel::CancelToken>,
     ) -> Option<PopulatedInjections> {
         if crate::cancel::is_cancelled(cancel) {
@@ -310,7 +333,7 @@ impl CacheCoordinator {
                 return Some(if parser_published {
                     PopulatedInjections::empty(generation)
                 } else {
-                    PopulatedInjections::undetermined(generation)
+                    PopulatedInjections::undetermined()
                 });
             }
         };
@@ -390,6 +413,37 @@ impl CacheCoordinator {
                 ));
             }
 
+            // Producer half of the discovery lever: build the owned discovery
+            // from the SAME `regions` just collected — the injection query (`Q`)
+            // is not re-run — so a semanticTokens request bound to the snapshot
+            // this parse publishes can rebuild its contexts without
+            // re-discovering. `None` when not worth reusing
+            // (gate/combined/incomplete).
+            let discovery = crate::analysis::semantic::build_document_discovery_cancellable(
+                &regions,
+                &cacheable_regions,
+                injection_query.as_ref(),
+                text,
+                language,
+                uri,
+                tracker,
+                generation,
+                incarnation,
+                cancel,
+            )?;
+
+            // Hand the discovery out before resolving: the parse publishes
+            // its tree with it, releasing the token readers, while the
+            // resolution below — which only the bridge and the whole-document
+            // readers consume — runs afterwards and lands on the same version
+            // as an upgrade (parse-snapshot ADR §2).
+            let discovery = discovery.map(std::sync::Arc::new);
+            on_discovered(InjectionDiscovery {
+                discovery: discovery.clone(),
+                generation,
+            });
+            self.await_resolution_hold();
+
             // One resolution for every consumer that needs resolved languages /
             // virtual content: the bridge regions and the whole-document
             // resolved regions below are two views of this single pass.
@@ -415,46 +469,25 @@ impl CacheCoordinator {
             // critical path, and the per-region content copies are pure
             // waste for the (common) bridge-less deployment — `None` makes
             // any late-configured bridge fall back to inline resolution.
-            let bridge_regions: Option<Vec<crate::document::DiscoveredBridgeRegion>> =
-                resolved.as_ref().map(|resolved| {
-                    resolved
-                        .iter()
-                        .map(|region| crate::document::DiscoveredBridgeRegion {
-                            language: region.injection_language.clone(),
-                            region_id: region.region.region_id.clone(),
-                            content: region.virtual_content.clone(),
-                        })
-                        .collect()
-                });
-
-            // The whole-document readers' fully resolved regions, from the
-            // same single query run — and from the SAME per-region ids and
-            // content hashes already in `cacheable_regions` (no duplicate
-            // mint/hash on this critical path).
-            let resolved_regions = resolved;
+            let regions = resolved.map(|resolved| {
+                let bridge = resolved
+                    .iter()
+                    .map(|region| crate::document::DiscoveredBridgeRegion {
+                        language: region.injection_language.clone(),
+                        region_id: region.region.region_id.clone(),
+                        content: region.virtual_content.clone(),
+                    })
+                    .collect();
+                crate::document::snapshot::ResolvedRegions {
+                    generation,
+                    bridge: std::sync::Arc::new(bridge),
+                    whole_document: std::sync::Arc::new(resolved),
+                }
+            });
 
             if crate::cancel::is_cancelled(cancel) {
                 return None;
             }
-
-            // Producer half of the discovery lever: build the owned discovery
-            // from the SAME `regions` just collected — the injection query (`Q`)
-            // is not re-run — so a semanticTokens request bound to the snapshot
-            // this parse publishes can rebuild its contexts without
-            // re-discovering. `None` when not worth reusing
-            // (gate/combined/incomplete).
-            let discovery = crate::analysis::semantic::build_document_discovery_cancellable(
-                &regions,
-                &cacheable_regions,
-                injection_query.as_ref(),
-                text,
-                language,
-                uri,
-                tracker,
-                generation,
-                incarnation,
-                cancel,
-            )?;
 
             // Live-hash set for the content-addressed injection-token cache's
             // eviction sweep, taken from the DISCOVERY's own per-region cache
@@ -510,12 +543,7 @@ impl CacheCoordinator {
                     .retain_document(uri, &live_hashes);
             });
             committed?;
-            Some(PopulatedInjections {
-                discovery,
-                bridge_regions,
-                resolved_regions,
-                generation,
-            })
+            Some(PopulatedInjections { discovery, regions })
         }
     }
 
@@ -524,6 +552,31 @@ impl CacheCoordinator {
     pub(crate) fn get_injections(&self, uri: &Url) -> Option<Vec<CacheableInjectionRegion>> {
         self.injection_map.get(uri)
     }
+
+    /// Test probe: hold every populate pass between its discovery hand-off
+    /// and its resolution until the returned guard is dropped, so a test can
+    /// observe the first install (tree + discovery) as a state of its own.
+    #[cfg(test)]
+    pub(crate) fn hold_resolution(&self) -> ResolutionHold {
+        *self
+            .resolution_hold
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
+        ResolutionHold(std::sync::Arc::clone(&self.resolution_hold))
+    }
+
+    #[cfg(test)]
+    fn await_resolution_hold(&self) {
+        let (held, released) = &*self.resolution_hold;
+        let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+        while *held {
+            held = released.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    #[cfg(not(test))]
+    fn await_resolution_hold(&self) {}
 
     /// Share the per-region injection token cache for use on the blocking
     /// semantic-token pool (#529), where the hot path reuses/stores region tokens.
@@ -981,10 +1034,9 @@ mod tests {
             .expect("the pass ran");
 
         assert!(
-            populated.bridge_regions.is_none(),
+            populated.regions.is_none(),
             "no query available must not publish a definitive empty region set"
         );
-        assert!(populated.resolved_regions.is_none());
         assert!(populated.discovery.is_none());
 
         // Once the parser is visible its queries are too (they are published
@@ -1007,11 +1059,85 @@ mod tests {
             )
             .expect("the pass ran");
         assert!(
-            populated
-                .bridge_regions
-                .as_ref()
-                .is_some_and(|regions| regions.is_empty()),
+            populated.regions.as_ref().is_some_and(
+                |regions| regions.bridge.is_empty() && regions.whole_document.is_empty()
+            ),
             "a settled language without an injection query publishes a definitive empty set"
+        );
+    }
+
+    /// The token readers consume the discovery and the tree, never the
+    /// resolution (virtual content and canonical languages for the bridge),
+    /// so populate hands the discovery out — for the parse to publish —
+    /// before it starts resolving. Resolution canonicalizes each region's
+    /// language through the base map, so a mapping installed by the
+    /// hand-off is the probe: a resolution run after it sees the mapping.
+    #[test]
+    fn populate_hands_the_discovery_out_before_resolving() {
+        use tree_sitter::Parser;
+
+        let cache = CacheCoordinator::new();
+        let tracker = NodeTracker::new();
+        let coordinator = LanguageCoordinator::new();
+        let uri = create_test_uri("handoff.md");
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            "(fenced_code_block (info_string (language) @injection.language) \
+             (code_fence_content) @injection.content)",
+        )
+        .expect("valid markdown injection query");
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(query));
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), language.clone());
+        // Enough regions for the discovery to be worth storing (the token
+        // path's reuse gate), so the hand-off is seen to carry it.
+        let text = "```lua\nprint(1)\n```\n".repeat(9);
+        let text = text.as_str();
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+
+        let handed_out = std::cell::Cell::new(None);
+        let mut on_discovered = |discovered: InjectionDiscovery| {
+            assert!(
+                discovered.discovery.is_some(),
+                "the hand-off carries the discovery the token readers consume"
+            );
+            handed_out.set(Some(discovered.generation));
+            coordinator.set_base_mapping("lua", "python");
+        };
+        let populated = cache
+            .populate_injections_cancellable(
+                &uri,
+                text,
+                &tree,
+                "markdown",
+                &coordinator,
+                &tracker,
+                tracker.mint_epoch(&uri),
+                1,
+                true,
+                &mut on_discovered,
+                None,
+            )
+            .expect("the pass ran");
+        assert_eq!(
+            handed_out.get(),
+            populated.regions.as_ref().map(|regions| regions.generation),
+            "the hand-off carries the pass's generation"
+        );
+        assert_eq!(
+            populated.regions.as_ref().map(|regions| regions
+                .bridge
+                .iter()
+                .map(|region| region.language.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["python"; 9]),
+            "resolution ran after the hand-off: it saw the mapping the hand-off installed"
         );
     }
 
@@ -1051,6 +1177,7 @@ mod tests {
             tracker.mint_epoch(&uri),
             1,
             true,
+            &mut |_| {},
             Some(&cancel),
         );
 
@@ -1100,6 +1227,7 @@ mod tests {
             tracker.mint_epoch(&uri),
             1,
             true,
+            &mut |_| {},
             Some(&cancel),
         );
 

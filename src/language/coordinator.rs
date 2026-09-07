@@ -777,6 +777,16 @@ impl LanguageCoordinator {
         }
     }
 
+    /// Test probe: a base mapping installed mid-flight, so a test can tell
+    /// which side of a hand-off a language resolution ran on.
+    #[cfg(test)]
+    pub(crate) fn set_base_mapping(&self, language_id: &str, base: &str) {
+        self.base_map
+            .write()
+            .recover_poison("LanguageCoordinator::set_base_mapping")
+            .insert(language_id.to_string(), base.to_string());
+    }
+
     /// Resolve a derived languageId to its base language name.
     ///
     /// Returns the registered base mapping, otherwise `None`. A declaration is
