@@ -422,6 +422,20 @@ impl DiagnosticSnapshotPreparer {
             self.language
                 .injection_query(&language_name)
                 .map(|injection_query| {
+                    // A roster nothing routes (the parse looked; no runnable
+                    // server handles any region language, so no entry
+                    // carries content) means no region has a server to ask:
+                    // no contexts, and no inline resolution paying on every
+                    // edit what the parse path declined. Generation-stamped,
+                    // so a reload that configures a server resolves inline
+                    // below.
+                    if self
+                        .documents
+                        .current_bridge_regions(uri, self.cache.semantic_token_generation())
+                        .is_some_and(|roster| roster.iter().all(|region| region.content.is_none()))
+                    {
+                        return Vec::new();
+                    }
                     // Prefer the populate pass's regions riding the current
                     // parse snapshot (never discover twice, ADR §3); fall
                     // back to the inline resolution when absent/stale.
