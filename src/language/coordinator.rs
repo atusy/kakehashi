@@ -1282,19 +1282,33 @@ impl LanguageCoordinator {
     /// `python`/`javascript` unless the explicit identifier itself has an
     /// eligible base mapping (for example, `py.base`).
     pub(crate) fn canonical_injection_language(&self, identifier: &str, content: &str) -> String {
-        if let Some(base) = self.resolve_base(identifier) {
-            return base;
-        }
-        if identifier == "plaintext" {
-            return identifier.to_string();
-        }
-        if let Some(candidate) = super::heuristic::detect_from_token(identifier) {
-            return self.resolve_base(&candidate).unwrap_or(candidate);
+        if let Some(canonical) = self.canonical_injection_language_from_identifier(identifier) {
+            return canonical;
         }
         if let Some(candidate) = super::heuristic::detect_from_first_line(content) {
             return self.resolve_base(&candidate).unwrap_or(candidate);
         }
         identifier.to_string()
+    }
+
+    /// The content-free prefix of [`Self::canonical_injection_language`]: the
+    /// base mapping, the `plaintext` short-circuit and syntect's token lookup.
+    /// `None` when only the content's first line could tell — the caller
+    /// then either resolves the region in full or treats it as unknown; it
+    /// never guesses. Lets populate decide whether a region is routable
+    /// before it extracts the region's content.
+    pub(crate) fn canonical_injection_language_from_identifier(
+        &self,
+        identifier: &str,
+    ) -> Option<String> {
+        if let Some(base) = self.resolve_base(identifier) {
+            return Some(base);
+        }
+        if identifier == "plaintext" {
+            return Some(identifier.to_string());
+        }
+        super::heuristic::detect_from_token(identifier)
+            .map(|candidate| self.resolve_base(&candidate).unwrap_or(candidate))
     }
 
     fn detect_language_logged(
