@@ -285,6 +285,17 @@ impl Document {
         installed
     }
 
+    /// Complete a published parse without accepting replacement parse inputs.
+    /// The store retains `expected` and `regions` until after its guard drops.
+    pub(super) fn enrich_regions(
+        &self,
+        expected: &Arc<ParseSnapshot>,
+        regions: &super::snapshot::ResolvedRegions,
+    ) -> bool {
+        self.snapshot_tx
+            .send_if_modified(|slot| slot.enrich_regions(expected, regions))
+    }
+
     /// Install the terminal closed slot (see
     /// [`CLOSED_INCARNATION`](super::snapshot::CLOSED_INCARNATION)): wakes any
     /// reader parked on the first-parse `watch::changed()` and rejects every

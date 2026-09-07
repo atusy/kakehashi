@@ -144,12 +144,26 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
 > incarnation check (clause 1). The equal-version arm is what lets a reparse
 > attach its tree over a same-version tree-less publish — the reload placeholder
 > and the give-up snapshot both depend on it — without which strict `>` alone
-> would strand those documents tree-less until the next edit. The same arm also
-> admits an equal-version **regions upgrade** over a tree-bearing snapshot: both
-> sides carry a tree (readers derive theirs from the published one and must
-> never lose it), no region view goes from present to absent, and at least one
-> of the bridge / resolved views goes from absent to present. The same shape
-> again is not an upgrade, so a version never re-publishes for nothing.
+> would strand those documents tree-less until the next edit. Region completion
+> does not use this general admission rule: an equal-version replacement stays
+> rejected even if it carries a clone of the tree already published.
+
+`DocumentStore::complete_parse` instead receives the exact `Arc<ParseSnapshot>`
+accepted by the first install and optional resolved regions. Under the same
+entry guard it checks the language/lifetime and the held snapshot's pointer
+identity. If regions are available, the channel's restricted enrichment operation
+constructs a new snapshot from the held inputs, preserving text, tree, discovery,
+and the lazy layer-tree cell. A sibling parse cannot replace those inputs, nor
+can an already completed snapshot be enriched again. No extra parse-ID counter
+or tree-sitter child-identity comparison is needed.
+
+Completion rechecks currency even when resolution was skipped or cancelled.
+An edit can leave the first snapshot eligible for stale-but-consistent enrichment,
+but completion returns false for current-version downstream work. A newer publish,
+reload placeholder, or close/reopen rejects completion of the displaced snapshot.
+The coordinator keeps the initial publication outcome separate from this later
+currency verdict, recording the former once in a `OnceLock` outside the compute
+work unit so a contained panic after the hand-off cannot lose it.
 
 The bridge and whole-document region views are one `ResolvedRegions` value
 with one settings generation. They become available together; independent
@@ -233,18 +247,17 @@ A parse pass therefore has a **single version/incarnation-guarded commit sequenc
 compute the tree, region map, and tokens on the tree value (the populate pass
 commits its injection caches under its own tracker-epoch/lifetime guard, so a
 pass whose text moved on commits nothing there); install through the one
-primitive (`install_parse`: the snapshot publish under the entry guard, reported
-*current* iff the snapshot parsed the document's content version) — **twice per
-version**: the tree with its discovery the moment populate hands the discovery
-out, from inside the populate work-unit, so the token readers wake without
-waiting for the resolution only the bridge and the whole-document readers
-consume; then the same version again, upgraded with the bridge / resolved
-regions once the pass has resolved (the equal-version regions upgrade above; a
-pass refused before the hand-off installs once, with no regions); and emit the
-downstream — `semanticTokens/refresh`, injected-language forwarding, diagnostic
-republish — gated on the first install's result, after the upgrade, in the order
-the per-document-parse-scheduler loop already uses
-(`populate → install → install (upgrade) → mark finished → downstream`). A rejected publish (a racing
+store (`install_parse`: the initial snapshot publish under the entry guard,
+reported *current* iff the snapshot parsed the document's content version).
+The first publish carries tree/discovery from inside the populate work unit,
+releasing token readers before resolution. After the awaited work,
+`complete_parse` may enrich that exact snapshot with regions and separately
+reports currency at completion. A pass without a hand-off installs once.
+Downstream decisions use the appropriate outcome: current-tree follow-ups use
+completion-time currency; settle refresh uses the initial publication/placeholder
+upgrade and its existing live-version check. The scheduler order remains
+`populate → initial publish → optional enrichment → mark finished → downstream`.
+ A rejected publish (a racing
 edit or reopen advanced the slot) emits nothing and attaches nothing. (Two
 parses of the *same* version — an install reparse racing the edit reparse — may
 both commit their populate bookkeeping before one of them loses the equal-version

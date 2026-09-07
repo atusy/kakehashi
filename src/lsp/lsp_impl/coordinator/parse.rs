@@ -10,10 +10,8 @@ use url::Url;
 use crate::lsp::lsp_impl::{Kakehashi, build_notifier};
 use crate::lsp::settings_manager::SettingsManager;
 
-/// What every snapshot a parse publishes shares: the text and tree it parsed,
-/// the language it detected, and the version/lifetime stamps. The two
-/// installs a parse makes per version (tree + discovery first, the regions
-/// upgrade after) differ only in the regions they carry.
+/// Inputs of the initial snapshot. Region completion reuses that published
+/// snapshot directly and cannot submit these inputs again.
 struct SnapshotInputs {
     text: std::sync::Arc<str>,
     tree: tree_sitter::Tree,
@@ -23,14 +21,9 @@ struct SnapshotInputs {
 }
 
 impl SnapshotInputs {
-    /// `layer_trees` is the lazy cell the snapshot derives its layer trees
-    /// into: fresh for a first install, the first install's own for the
-    /// regions upgrade of the same version, so a reader deriving them
-    /// across the upgrade lands where every later reader looks.
     fn snapshot(
         &self,
         regions: PopulatedSnapshotRegions,
-        layer_trees: LayerTreeCell,
     ) -> std::sync::Arc<crate::document::snapshot::ParseSnapshot> {
         std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
             text: std::sync::Arc::clone(&self.text),
@@ -40,14 +33,10 @@ impl SnapshotInputs {
             incarnation: self.incarnation,
             injection_regions: regions.discovery,
             regions: regions.regions,
-            layer_trees,
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
 }
-
-type LayerTreeCell = std::sync::Arc<
-    std::sync::OnceLock<(u64, std::sync::Arc<Vec<crate::document::SnapshotLayerTree>>)>,
->;
 
 /// An owned [`LanguageCheck`](crate::document::LanguageCheck): the first
 /// install runs on the compute pool, so the expectation must travel.
@@ -73,6 +62,22 @@ impl InstallCheck {
 struct PopulatedSnapshotRegions {
     discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
     regions: Option<crate::document::snapshot::ResolvedRegions>,
+}
+
+/// Keep the historical publish outcome separate from the verdict after the
+/// resolution work finishes. Only the latter authorizes current downstream work.
+struct ParseCompletion {
+    initial_install: crate::document::ParseInstall,
+    current_at_completion: bool,
+}
+
+impl From<crate::document::ParseInstall> for ParseCompletion {
+    fn from(initial_install: crate::document::ParseInstall) -> Self {
+        Self {
+            current_at_completion: initial_install.current,
+            initial_install,
+        }
+    }
 }
 
 /// Timeout for compute-pool parse operations to prevent hangs on pathological inputs.
@@ -340,29 +345,19 @@ impl ParseCoordinator {
         }
     }
 
-    /// Run `CacheCoordinator::populate_injections` as a compute-pool work-unit
-    /// and make the two installs a parse makes per version (parse-snapshot
-    /// ADR §2): the tree with its discovery as soon as the pass hands the
-    /// discovery out — from inside the work-unit, so the token readers
-    /// parked on the cell wake without waiting for resolution — and the same
-    /// version again, upgraded with the bridge / resolved regions, once the
-    /// pass has resolved. Returns the FIRST install's outcome: `current` is
-    /// "this parse published the current tree", which is what the callers'
-    /// downstream keys on; the upgrade rides the same version and needs no
-    /// separate verdict (the cell refuses it when nothing new arrived).
-    ///
-    /// The pass is **awaited**, not detached, preserving the `populate →
-    /// mark finished` ordering the injection-map invalidation depends on. A
-    /// pass refused before the hand-off (its inputs moved on, no query yet)
-    /// or that could not look installs once, with no regions, exactly as a
-    /// pass that never ran.
+    /// Publish tree/discovery from inside the compute work unit, then complete
+    /// that exact snapshot with the resolution. The store owns enrichment and
+    /// rechecks currency after the awaited work; downstream never acts on the
+    /// earlier install-time verdict. A skipped/cancelled/panicking resolution
+    /// leaves the first snapshot usable and readers fall back inline.
+    /// Awaiting the work unit preserves populate → mark-finished ordering.
     async fn populate_and_install(
         &self,
         uri: &Url,
         check: InstallCheck,
         inputs: SnapshotInputs,
         version_cancel: crate::cancel::CancelToken,
-    ) -> crate::document::ParseInstall {
+    ) -> ParseCompletion {
         let cache = std::sync::Arc::clone(&self.cache);
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
@@ -402,14 +397,14 @@ impl ParseCoordinator {
         // regions — after the edit lock is released, so a queued edit never
         // waits behind a stale publish and the evicted tree's teardown.
         let Some(entry_mint_epoch) = entry_mint_epoch else {
-            return self.documents.install_parse(
-                uri,
-                check.as_check(),
-                inputs.snapshot(
-                    PopulatedSnapshotRegions::default(),
-                    std::sync::Arc::new(std::sync::OnceLock::new()),
-                ),
-            );
+            return self
+                .documents
+                .install_parse(
+                    uri,
+                    check.as_check(),
+                    inputs.snapshot(PopulatedSnapshotRegions::default()),
+                )
+                .into();
         };
         let build_bridge_regions = self
             .settings_manager
@@ -418,12 +413,11 @@ impl ParseCoordinator {
         let pool_uri = uri.clone();
         // The first install's verdict lives outside the work-unit too, so a
         // panic after the hand-off cannot lose a publish that already landed.
-        type First = Option<(
+        type First = (
             crate::document::ParseInstall,
             std::sync::Arc<crate::document::snapshot::ParseSnapshot>,
-        )>;
-        let first: std::sync::Arc<std::sync::Mutex<First>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
+        );
+        let first = std::sync::Arc::new(std::sync::OnceLock::<First>::new());
         let regions = run_awaited_populate(&self.compute_pool, version_cancel, {
             let inputs = std::sync::Arc::clone(&inputs);
             let check = std::sync::Arc::clone(&check);
@@ -446,20 +440,16 @@ impl ParseCoordinator {
                             inputs.parsed_version,
                             discovered.generation
                         );
-                        let snapshot = inputs.snapshot(
-                            PopulatedSnapshotRegions {
-                                discovery: discovered.discovery,
-                                ..PopulatedSnapshotRegions::default()
-                            },
-                            std::sync::Arc::new(std::sync::OnceLock::new()),
-                        );
+                        let snapshot = inputs.snapshot(PopulatedSnapshotRegions {
+                            discovery: discovered.discovery,
+                            ..PopulatedSnapshotRegions::default()
+                        });
                         let installed = documents.install_parse(
                             &pool_uri,
                             check.as_check(),
                             std::sync::Arc::clone(&snapshot),
                         );
-                        *first.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some((installed, snapshot));
+                        let _ = first.set((installed, snapshot));
                     },
                     Some(&cancel_for_work),
                 );
@@ -482,8 +472,7 @@ impl ParseCoordinator {
         // A work-unit the pool contained (it panicked) derived nothing: the
         // snapshot rides without regions, exactly as a refused pass.
         .unwrap_or_default();
-        let first = first.lock().unwrap_or_else(|e| e.into_inner()).take();
-        match first {
+        match first.get() {
             // The pass handed its discovery out and the tree is published:
             // land the regions it resolved on the same version. Nothing to
             // land (skipped resolution, refused commit) publishes nothing —
@@ -491,39 +480,24 @@ impl ParseCoordinator {
             // the cell refused (a sibling parse of this version landed its
             // tree first) has nothing to upgrade: the regions would ride the
             // sibling's tree with a tree the readers never derived from.
-            Some((first, first_snapshot)) => {
-                // The verdict the callers act on is taken now, after the
-                // resolution, not at the first install: an edit landing in
-                // between has moved the document on, and the downstream
-                // must not run for a version that is no longer current.
-                // The upgrade re-judges under the entry guard; without one,
-                // the cell is asked whether the version is still current.
-                let upgraded = (first.published && regions.regions.is_some()).then(|| {
-                    self.documents.install_parse(
+            Some((initial_install, first_snapshot)) => {
+                let current_at_completion = initial_install.published
+                    && self.documents.complete_parse(
                         uri,
                         check.as_check(),
-                        inputs
-                            .snapshot(regions, std::sync::Arc::clone(&first_snapshot.layer_trees)),
-                    )
-                });
-                let current = match upgraded {
-                    Some(upgrade) => upgrade.current,
-                    None => {
-                        first.current
-                            && self.documents.latest_snapshot(uri).is_some_and(|view| {
-                                view.slot.current_incarnation == inputs.incarnation
-                                    && view.content_version == inputs.parsed_version
-                            })
-                    }
-                };
-                crate::document::ParseInstall { current, ..first }
+                        first_snapshot,
+                        regions.regions,
+                    );
+                ParseCompletion {
+                    initial_install: *initial_install,
+                    current_at_completion,
+                }
             }
-            // The pass never reached the hand-off: one install, as before.
-            None => self.documents.install_parse(
-                uri,
-                check.as_check(),
-                inputs.snapshot(regions, std::sync::Arc::new(std::sync::OnceLock::new())),
-            ),
+            // No hand-off: one install, whose currency is judged right now.
+            None => self
+                .documents
+                .install_parse(uri, check.as_check(), inputs.snapshot(regions))
+                .into(),
         }
     }
 
@@ -672,7 +646,7 @@ impl ParseCoordinator {
                         version_cancel.clone(),
                     )
                     .await;
-                if installed.current {
+                if installed.current_at_completion {
                     // AFTER the install: a downstream task woken by this mark
                     // on another runtime thread must find the snapshot (and
                     // its fast-path regions) already in the cell.
@@ -685,7 +659,7 @@ impl ParseCoordinator {
                 // racing `didChange`/reopen moved the text or incarnation on and the
                 // edit reparse won, in which case the open downstream must NOT re-run
                 // over the edit's tree.
-                return installed.current;
+                return installed.current_at_completion;
             }
 
             // Parse produced no tree (timeout / parser unavailable / join error) but
@@ -913,12 +887,12 @@ impl ParseCoordinator {
             // still compiling has no lineage to re-drive it — without the
             // refresh, a slow install leaves the document unhighlighted
             // until an incidental edit.
-            if installed.published {
+            if installed.initial_install.published {
                 events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
                     language_name.clone(),
                 ));
             }
-            if installed.current {
+            if installed.current_at_completion {
                 break;
             }
             // Not current: the text moved under us (a concurrent `didChange`
@@ -1108,7 +1082,7 @@ impl ParseCoordinator {
                     version_cancel.clone(),
                 )
                 .await;
-            let published = installed.published;
+            let published = installed.initial_install.published;
             // Serve-stale's heal signal (ADR §3), narrowed to the cases the
             // workspace-scoped request is actually FOR. `refresh` is expensive
             // for the client (Neovim's handler cancels its in-flight token
@@ -1134,7 +1108,7 @@ impl ParseCoordinator {
                     &self.cache,
                     uri,
                     content_version,
-                    installed.tree_upgrade,
+                    installed.initial_install.tree_upgrade,
                 )
             {
                 events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
@@ -1273,11 +1247,11 @@ mod tests {
         drop(hold);
         let installed = install.await.expect("the install task completes");
         assert!(
-            installed.published,
+            installed.initial_install.published,
             "the first install did publish the tree of the version it parsed"
         );
         assert!(
-            !installed.current,
+            !installed.current_at_completion,
             "the verdict acted on after the resolution must reflect the edit"
         );
     }
