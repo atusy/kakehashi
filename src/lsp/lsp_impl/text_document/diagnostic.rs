@@ -1099,6 +1099,109 @@ mod tests {
         assert_ne!(id, diagnostic_result_id(&shrunk));
     }
 
+    /// The editor pulls diagnostics after every change. A document whose
+    /// roster nothing routes (every region listed, none with content) has
+    /// no virt region to ask a server about, and the pull must take that
+    /// answer from the roster instead of resolving every region inline —
+    /// minting region identity and paying, on every pull, the resolution
+    /// the parse path declined.
+    #[tokio::test]
+    async fn a_pull_takes_an_unrouted_roster_without_resolving() {
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            "(fenced_code_block (info_string (language) @injection.language) \
+             (code_fence_content) @injection.content)",
+        )
+        .expect("valid markdown injection query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(query));
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), language.clone());
+        let uri = Url::parse("file:///test/unrouted_pull.md").unwrap();
+        let text = "```lua\nprint(1)\n```\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        let generation = server.cache.semantic_token_generation();
+        assert!(
+            server
+                .documents
+                .install_parse(
+                    &uri,
+                    crate::document::LanguageCheck::Expect(Some("markdown")),
+                    std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
+                        text: std::sync::Arc::from(text),
+                        tree: Some(tree.clone()),
+                        language: Some("markdown".to_string()),
+                        parsed_version: content_version,
+                        incarnation,
+                        injection_regions: None,
+                        bridge_regions: Some((
+                            generation,
+                            std::sync::Arc::new(vec![crate::document::DiscoveredBridgeRegion {
+                                language: "lua".to_string(),
+                                region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                                content: None,
+                            }]),
+                        )),
+                        resolved_regions: None,
+                        layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                    }),
+                )
+                .current
+        );
+
+        let params = DocumentDiagnosticParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                uri: "file:///test/unrouted_pull.md".parse().expect("uri"),
+            },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let _ = server.diagnostic_impl(params).await;
+
+        let content = {
+            let mut node = tree
+                .root_node()
+                .descendant_for_byte_range(8, 9)
+                .expect("a node covers the fence content");
+            while node.kind() != "code_fence_content" {
+                node = node.parent().expect("the fence content encloses it");
+            }
+            node
+        };
+        assert!(
+            server
+                .bridge
+                .node_tracker()
+                .lookup_in_layer(
+                    &uri,
+                    content.start_byte(),
+                    content.end_byte(),
+                    content.kind(),
+                    crate::language::injection::REGION_IDENTITY_LAYER_BASE,
+                )
+                .is_none(),
+            "a roster nothing routes must not be resolved inline by a pull"
+        );
+    }
+
     #[tokio::test]
     async fn degraded_pull_does_not_mark_the_change_served() {
         // The pull-side sibling of republish's geometry deferral: when the
