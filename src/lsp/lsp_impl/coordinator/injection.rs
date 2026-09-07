@@ -263,7 +263,7 @@ impl InjectionCoordinator {
     }
 
     /// Every region on the current snapshot's roster as `(region_id,
-    /// language, routed)` — routed iff the pass resolved it with content —
+    /// language, resolved)` — resolved iff the pass gave it content —
     /// when a populate pass published one under the current settings
     /// generation; `None` when the pass could not look or the regions are
     /// stale, so the caller derives both the languages owed a grammar and
@@ -398,12 +398,26 @@ impl InjectionCoordinator {
             .iter()
             .map(|(_, language, _)| language.clone())
             .collect();
-        // A region nothing routes any more says so explicitly: its old
-        // virtual document is taken whatever its language.
+        // A region is routed iff the pass gave it content AND a server
+        // handles its language under the current settings: a document one
+        // of whose regions is routed is resolved in full, so content alone
+        // does not say. A region nothing routes any more says so
+        // explicitly: its old virtual document is taken whatever its
+        // language.
+        let settings = self.settings_manager.load_settings();
+        let routed = |language: &str| {
+            !self
+                .bridge
+                .cached_configs_for_injection_language(&settings, &host_language, language)
+                .is_empty()
+        };
         let expected: Vec<(String, Option<String>)> = roster
             .iter()
-            .map(|(region_id, language, routed)| {
-                (region_id.clone(), routed.then(|| language.clone()))
+            .map(|(region_id, language, resolved)| {
+                (
+                    region_id.clone(),
+                    (*resolved && routed(language)).then(|| language.clone()),
+                )
             })
             .collect();
         if injections.is_empty() && languages.is_empty() {
