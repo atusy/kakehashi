@@ -394,7 +394,6 @@ impl ParseCoordinator {
                 entry_mint_epoch,
                 incarnation,
                 build_bridge_regions,
-                build_bridge_regions,
                 Some(&cancel_for_work),
             ) else {
                 return PopulatedSnapshotRegions::default();

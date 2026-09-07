@@ -1243,7 +1243,6 @@ mod tests {
             server.bridge.node_tracker_arc().mint_epoch(&uri),
             incarnation,
             true,
-            true,
         );
         let populated = populated.expect("current pass populates");
         let bridge_regions = populated.bridge_regions.expect("gate was true");
@@ -1432,7 +1431,6 @@ mod tests {
                 &server.bridge.node_tracker_arc(),
                 server.bridge.node_tracker_arc().mint_epoch(&uri),
                 server.documents.get(&uri).unwrap().incarnation(),
-                true,
                 true,
             )
             .expect("current pass populates");
