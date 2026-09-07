@@ -238,8 +238,10 @@ runnable bridge server, populate resolves only a document one of whose region
 languages — canonicalized the way the bridge routes — a server handles; a
 document nothing routes publishes a roster instead (every region's language
 and identity, no content), enough for the injected-grammar load and the closing
-of a virtual document a region used to have, and its whole-document readers
-resolve inline as they do without a runnable server; and emit the
+of a virtual document a region used to have; its diagnostic readers take that
+roster at its word (no virtual region to anchor or check), and its other
+whole-document readers resolve inline as they do without a runnable server;
+and emit the
 downstream — `semanticTokens/refresh`, injected-language forwarding, diagnostic
 republish — gated on the first install's result, after the upgrade, in the order
 the per-document-parse-scheduler loop already uses
