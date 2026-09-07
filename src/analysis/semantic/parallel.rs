@@ -40,7 +40,7 @@ pub(super) const INJECTION_CACHE_MIN_REGIONS: usize = 8;
 
 /// Test-only counter of how many times the discovery-reuse branch fired (skipped
 /// the injection query by reusing owned discovery). Lets an in-process server
-/// test assert reuse actually engages end-to-end after a real parse+attach —
+/// test assert reuse actually engages end-to-end after a real parse+publish —
 /// the latency benchmark cannot distinguish "reuse fired" from "reuse never
 /// fired, fell back inline" (both read as flat request latency).
 #[cfg(test)]
@@ -1044,7 +1044,7 @@ pub(crate) fn build_document_discovery_cancellable(
         // Producer: don't gate on the highlight query — store the region and let
         // reuse re-resolve the query (a load without a generation bump self-heals).
         // Producer path: called from populate_injections right after this
-        // parse's CAS landed, so the coordinates are current; the region id +
+        // parse's install landed, so the coordinates are current; the region id +
         // content hash are REUSED from the caller's just-built identity
         // (`prebuilt`), not recomputed.
         match discover_single_region(
@@ -1353,7 +1353,7 @@ pub(crate) fn collect_injection_tokens_parallel(
     // while the partial discovery's singles still feed the token-cache
     // read/store path and the eviction sweep). The reused
     // region ids were minted while their snapshot was current (populate runs
-    // behind the landed CAS), so rebuilding from them never writes the tracker —
+    // behind the landed install), so rebuilding from them never writes the tracker —
     // the `mint_regions` stale-serve latch only governs the inline branch.
     let reusable_discovery = cache_ctx.and_then(|c| {
         c.discovery

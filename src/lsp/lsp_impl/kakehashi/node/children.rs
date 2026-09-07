@@ -67,12 +67,6 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Ensure the document is parsed before snapshotting — same race as in
-        // `kakehashi/node` and `kakehashi/node/parent`: didOpen schedules an
-        // async parse, and a `didChange` mid-flight can briefly leave
-        // `Document::tree()` populated with a stale tree while NodeTracker has
-        // already been adjusted. The helper waits on the parse-state watch
-        // channel and re-parses on demand so the snapshot below is consistent.
         // Resolve a CURRENT parse snapshot (parse-snapshot ADR §3): a node id
         // names a live-position node, so a trailing snapshot rejects
         // immediately with the protocol's universal null; only the bounded

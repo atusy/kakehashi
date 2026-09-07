@@ -681,12 +681,7 @@ mod tests {
         let tree = parser.parse(text, None).unwrap();
         let installed = documents.install_parse(
             &uri,
-            crate::document::ParseInputs {
-                text: &expected_text,
-                language_id: Some(Some("markdown")),
-                incarnation,
-                content_version,
-            },
+            crate::document::LanguageCheck::Expect(Some("markdown")),
             std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                 text: std::sync::Arc::clone(&expected_text),
                 tree: Some(tree),
@@ -699,7 +694,7 @@ mod tests {
                 layer_trees: std::sync::OnceLock::new(),
             }),
         );
-        assert!(installed.attached && installed.published);
+        assert!(installed.current && installed.published);
 
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait)
@@ -734,12 +729,7 @@ mod tests {
                 .documents
                 .install_parse(
                     &uri,
-                    crate::document::ParseInputs {
-                        text: &expected_text,
-                        language_id: Some(Some("markdown")),
-                        incarnation,
-                        content_version,
-                    },
+                    crate::document::LanguageCheck::Expect(Some("markdown")),
                     std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
                         text: std::sync::Arc::clone(&expected_text),
                         tree: Some(tree),
@@ -752,7 +742,7 @@ mod tests {
                         layer_trees: std::sync::OnceLock::new(),
                     }),
                 )
-                .attached
+                .current
         );
 
         assert!(document_matches_lineage(
@@ -771,7 +761,7 @@ mod tests {
         );
         server
             .documents
-            .apply_edit_clearing_tree(&uri, "# edited\n".to_string(), &[]);
+            .apply_edit(&uri, "# edited\n".to_string(), &[]);
         assert!(!document_matches_lineage(
             &server.documents.get(&uri).unwrap(),
             incarnation,

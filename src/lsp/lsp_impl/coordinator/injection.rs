@@ -777,7 +777,7 @@ impl InjectionCoordinator {
     /// Wait (bounded by `budget`) for `uri`'s tree to be current before its
     /// injections are resolved.
     ///
-    /// `didChange` clears the tree and reparses off-ingress, so a re-open
+    /// `didChange` stales the tree and reparses off-ingress, so a re-open
     /// landing right after an edit would resolve ZERO injections and silently
     /// open nothing — the same reason every request path waits for a fresh tree
     /// (execute-command-routing-token). This NARROWS that window rather than
@@ -1189,7 +1189,7 @@ mod tests {
             .insert(uri.clone(), text.to_string(), Some("rust".into()), None);
         server
             .documents
-            .update_document(uri.clone(), text.to_string(), Some(tree.clone()));
+            .update_document(uri.clone(), text.to_string(), None);
 
         let injection = server.injection_coordinator();
 
@@ -1249,7 +1249,7 @@ mod tests {
         let bridge_regions = populated.bridge_regions.expect("gate was true");
         server
             .documents
-            .update_document(uri.clone(), text.to_string(), Some(tree.clone()));
+            .update_document(uri.clone(), text.to_string(), None);
         let content_version = server.documents.get(&uri).unwrap().content_version();
         publish(
             Some((populated.generation, std::sync::Arc::new(bridge_regions))),
@@ -1386,7 +1386,7 @@ mod tests {
             .insert(uri.clone(), text.to_string(), Some("rust".into()), None);
         server
             .documents
-            .update_document(uri.clone(), text.to_string(), Some(tree.clone()));
+            .update_document(uri.clone(), text.to_string(), None);
         publish_test_snapshot(server, &uri, text, tree, "rust");
         let injection = server.injection_coordinator();
 
@@ -1439,11 +1439,9 @@ mod tests {
         let bridge_regions = populated.bridge_regions.expect("gate was true");
         // A new revision, so the fast-path snapshot below is admitted (a
         // second publish at the same revision is refused).
-        server.documents.update_document(
-            uri.clone(),
-            text.to_string(),
-            Some(parser.parse(text, None).expect("parse rust")),
-        );
+        server
+            .documents
+            .update_document(uri.clone(), text.to_string(), None);
         let content_version = server.documents.get(&uri).unwrap().content_version();
         let incarnation = server.documents.get(&uri).unwrap().incarnation();
         let landed = server
@@ -1566,7 +1564,7 @@ mod tests {
             .insert(uri.clone(), text.to_string(), Some("rust".into()), None);
         server
             .documents
-            .update_document(uri.clone(), text.to_string(), Some(tree.clone()));
+            .update_document(uri.clone(), text.to_string(), None);
         publish_test_snapshot(server, &uri, text, tree, "rust");
         let injection = server.injection_coordinator();
 

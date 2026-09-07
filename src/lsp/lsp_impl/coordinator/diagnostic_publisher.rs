@@ -421,7 +421,7 @@ impl DiagnosticPublisher {
                 if self
                     .documents
                     .get(&uri)
-                    .is_some_and(|doc| doc.snapshot().is_none())
+                    .is_some_and(|doc| !doc.has_current_tree())
                 {
                     summary.coverage_incomplete = true;
                 }
@@ -1681,10 +1681,12 @@ impl DiagnosticPublisher {
         // guard is dropped before any further store lookup: a second lookup
         // under a held guard could queue behind a writer on the same shard
         // that is itself waiting for this guard.
-        // Language, tree, text and lifetime from ONE current snapshot: a
-        // replacement parse of a re-detected document attaches its tree to
-        // the legacy document before it publishes, and the old query over
-        // the new tree would anchor region diagnostics wrongly. The view is
+        // Language, tree, text and lifetime from ONE current snapshot: the
+        // reload reparse publishes the re-detected language on the snapshot
+        // only (`Document::language_id` is recorded by the open parse alone),
+        // so pairing the store's language with the snapshot's tree would run
+        // the old query over the new tree and anchor region diagnostics
+        // wrongly. The view is
         // an owned clone; no store guard is held across the lookups below.
         let Some(view) = self.documents.latest_snapshot(host) else {
             return Some(offsets); // closed host: nothing to anchor against
