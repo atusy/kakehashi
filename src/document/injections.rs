@@ -114,10 +114,14 @@ pub(crate) struct DiscoveredBridgeRegion {
     /// the query-pattern/language discriminator so same-range alternatives
     /// remain distinct within the document incarnation.
     pub region_id: String,
-    /// The exact virtual-document text the bridge opens downstream: excluded
-    /// prefixes are removed, while an `injection.combined` group preserves host
-    /// line numbers with empty lines and uses spaces for later gaps on a line.
-    pub content: String,
+    /// The exact virtual-document text the bridge opens downstream (excluded
+    /// prefixes removed; an `injection.combined` group preserves host line
+    /// numbers with empty lines and uses spaces for later gaps on a line):
+    /// `Some` for a region a runnable bridge server handles, `None` for one
+    /// no server handles — the region is on the roster, its language and
+    /// identity still drive the injected-grammar install and the closing of
+    /// a virtual document it used to have, but nothing opens it.
+    pub content: Option<String>,
 }
 
 /// One pre-parsed injection layer of a document, in document-order DFS —

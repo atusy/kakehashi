@@ -165,12 +165,18 @@ impl InjectionCoordinator {
             // query would not discover. Mismatch falls back inline below.
             && *stamped_generation == self.cache.semantic_token_generation()
         {
+            // Only the regions a server handles carry content and are
+            // routed; the rest of the roster informs the injected-grammar
+            // install and the closing of virtual documents (see
+            // `injection_languages`).
             let regions = bridge_regions
                 .iter()
-                .map(|region| BridgeInjection {
-                    language: region.language.clone(),
-                    region_id: region.region_id.clone(),
-                    content: region.content.clone(),
+                .filter_map(|region| {
+                    region.content.as_ref().map(|content| BridgeInjection {
+                        language: region.language.clone(),
+                        region_id: region.region_id.clone(),
+                        content: content.clone(),
+                    })
                 })
                 .collect();
             return settled().then_some(regions);

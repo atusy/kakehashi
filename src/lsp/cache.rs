@@ -486,7 +486,7 @@ impl CacheCoordinator {
                         .map(|region| crate::document::DiscoveredBridgeRegion {
                             language: region.injection_language.clone(),
                             region_id: region.region.region_id.clone(),
-                            content: region.virtual_content.clone(),
+                            content: Some(region.virtual_content.clone()),
                         })
                         .collect()
                 });
