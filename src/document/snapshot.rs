@@ -244,6 +244,60 @@ mod tests {
         );
     }
 
+    fn with_regions(mut snapshot: ParseSnapshot, bridge: bool, resolved: bool) -> ParseSnapshot {
+        if bridge {
+            snapshot.bridge_regions = Some((1, Arc::new(Vec::new())));
+        }
+        if resolved {
+            snapshot.resolved_regions = Some((1, Arc::new(Vec::new())));
+        }
+        snapshot
+    }
+
+    /// A parse publishes its tree as soon as the injection discovery is
+    /// derived, and the bridge/resolved regions — the resolution the token
+    /// readers never consume — land on the same version afterwards. The
+    /// cell admits that as an upgrade: same lifetime, same version, a tree
+    /// on both sides, and at least one region view going from absent to
+    /// present. Nothing else re-publishes an equal version: the same shape
+    /// again, a tree-less upgrade (no reader may lose the tree), or a
+    /// region view going from present to absent.
+    #[test]
+    fn equal_version_regions_upgrade_is_admitted_over_a_tree_bearing_snapshot() {
+        let mut slot = SnapshotSlot::bootstrap(7);
+        slot.snapshot = Some(Arc::new(snap_with_tree(7, 3)));
+        assert!(
+            slot.admits(&with_regions(snap_with_tree(7, 3), true, false)),
+            "bridge regions arriving on the published version upgrade it"
+        );
+        assert!(
+            slot.admits(&with_regions(snap_with_tree(7, 3), true, true)),
+            "both region views arriving upgrade it"
+        );
+        assert!(
+            !slot.admits(&with_regions(snap_with_tree(6, 3), true, true)),
+            "the incarnation clause is never bypassed by the upgrade"
+        );
+        assert!(
+            !slot.admits(&with_regions(snap(7, 3), true, true)),
+            "an upgrade must carry the tree the readers already derive from"
+        );
+
+        slot.snapshot = Some(Arc::new(with_regions(snap_with_tree(7, 3), true, false)));
+        assert!(
+            slot.admits(&with_regions(snap_with_tree(7, 3), true, true)),
+            "the remaining region view arriving still upgrades"
+        );
+        assert!(
+            !slot.admits(&with_regions(snap_with_tree(7, 3), true, false)),
+            "the same shape again is not an upgrade"
+        );
+        assert!(
+            !slot.admits(&snap_with_tree(7, 3)),
+            "a region view going absent is a downgrade, never admitted"
+        );
+    }
+
     #[test]
     fn equal_version_tree_upgrade_is_admitted_but_swap_and_downgrade_are_not() {
         let mut slot = SnapshotSlot::bootstrap(7);
