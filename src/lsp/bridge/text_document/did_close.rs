@@ -242,11 +242,11 @@ impl LanguageServerPool {
     pub(crate) async fn close_replaced_docs(
         &self,
         host_uri: &Url,
-        expected: &[(String, String)],
+        expected: &[(String, Option<String>)],
     ) -> std::collections::HashSet<String> {
         let expected_languages = expected
             .iter()
-            .map(|(region_id, language)| (region_id.as_str(), language.as_str()))
+            .map(|(region_id, language)| (region_id.as_str(), language.as_deref()))
             .collect();
         let to_close = self
             .remove_replaced_virtual_docs(host_uri, &expected_languages)

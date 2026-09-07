@@ -742,11 +742,15 @@ impl DocumentTracker {
 
     /// Take opened documents whose URI no longer matches the expected URI for
     /// their still-live region. A content-based language change can preserve
-    /// the region ULID while changing the language-derived URI extension.
+    /// the region ULID while changing the language-derived URI extension;
+    /// `None` says the live region is no longer routed at all (a reload
+    /// changed the host's bridge filter or a server's languages), so its
+    /// document is taken whatever its language. A region absent from the map
+    /// was not seen by this pass and is left alone.
     pub(crate) async fn remove_replaced_virtual_docs(
         &self,
         host_uri: &Url,
-        expected_languages: &std::collections::HashMap<&str, &str>,
+        expected_languages: &std::collections::HashMap<&str, Option<&str>>,
     ) -> Vec<OpenedVirtualDoc> {
         let mut host_map = self.host_to_virtual.lock().await;
         let Some(docs) = host_map.get_mut(host_uri) else {
@@ -758,7 +762,7 @@ impl DocumentTracker {
             let Some(expected) = expected_languages.get(doc.virtual_uri.region_id()) else {
                 return true;
             };
-            let replaced = doc.virtual_uri.language() != *expected;
+            let replaced = expected.is_none_or(|language| doc.virtual_uri.language() != language);
             if replaced {
                 to_close.push(doc.clone());
             }

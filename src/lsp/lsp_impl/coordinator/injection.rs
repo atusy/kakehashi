@@ -263,11 +263,12 @@ impl InjectionCoordinator {
     }
 
     /// Every region on the current snapshot's roster as `(region_id,
-    /// language)` — routed or not — when a populate pass published one under
-    /// the current settings generation; `None` when the pass could not look
-    /// or the regions are stale, so the caller derives both the languages
-    /// owed a grammar and the replacement set from what it resolved inline.
-    fn roster_regions(&self, uri: &Url) -> Option<Vec<(String, String)>> {
+    /// language, routed)` — routed iff the pass resolved it with content —
+    /// when a populate pass published one under the current settings
+    /// generation; `None` when the pass could not look or the regions are
+    /// stale, so the caller derives both the languages owed a grammar and
+    /// the replacement set from what it resolved inline.
+    fn roster_regions(&self, uri: &Url) -> Option<Vec<(String, String, bool)>> {
         let view = self.documents.latest_snapshot(uri)?;
         let snapshot = view.slot.snapshot?;
         if snapshot.parsed_version != view.content_version {
@@ -277,7 +278,13 @@ impl InjectionCoordinator {
         (*stamped_generation == self.cache.semantic_token_generation()).then(|| {
             roster
                 .iter()
-                .map(|region| (region.region_id.clone(), region.language.clone()))
+                .map(|region| {
+                    (
+                        region.region_id.clone(),
+                        region.language.clone(),
+                        region.content.is_some(),
+                    )
+                })
                 .collect()
         })
     }
@@ -384,12 +391,20 @@ impl InjectionCoordinator {
         let roster = self.roster_regions(uri).unwrap_or_else(|| {
             injections
                 .iter()
-                .map(|inj| (inj.region_id.clone(), inj.language.clone()))
+                .map(|inj| (inj.region_id.clone(), inj.language.clone(), true))
                 .collect()
         });
         let languages: HashSet<String> = roster
             .iter()
-            .map(|(_, language)| language.clone())
+            .map(|(_, language, _)| language.clone())
+            .collect();
+        // A region nothing routes any more says so explicitly: its old
+        // virtual document is taken whatever its language.
+        let expected: Vec<(String, Option<String>)> = roster
+            .iter()
+            .map(|(region_id, language, routed)| {
+                (region_id.clone(), routed.then(|| language.clone()))
+            })
             .collect();
         if injections.is_empty() && languages.is_empty() {
             self.bridge.cancel_eager_open(uri);
@@ -403,7 +418,7 @@ impl InjectionCoordinator {
         // current — so a region that stopped being routed closes the
         // virtual document it used to have.
         self.bridge.cancel_eager_open(uri);
-        let replaced_regions = self.bridge.close_replaced_docs(uri, &roster).await;
+        let replaced_regions = self.bridge.close_replaced_docs(uri, &expected).await;
         for region_id in replaced_regions {
             self.diagnostics
                 .evict_source(uri, &DiagnosticSource::Region(region_id));

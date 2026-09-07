@@ -1272,7 +1272,7 @@ impl LanguageServerPool {
     pub(crate) async fn remove_replaced_virtual_docs(
         &self,
         host_uri: &Url,
-        expected_languages: &std::collections::HashMap<&str, &str>,
+        expected_languages: &std::collections::HashMap<&str, Option<&str>>,
     ) -> Vec<OpenedVirtualDoc> {
         self.document_tracker
             .remove_replaced_virtual_docs(host_uri, expected_languages)
