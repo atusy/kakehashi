@@ -132,8 +132,11 @@ pub(crate) fn detect_from_first_line(content: &str) -> Option<String> {
     let detected = SYNTAX_SET
         .find_syntax_by_first_line(first_line)
         .map(|syntax| normalize_syntax_name(&syntax.name));
-    if FIRST_LINE_MEMO.len() >= TOKEN_MEMO_CAP {
-        FIRST_LINE_MEMO.clear();
+    if memoized {
+        if FIRST_LINE_MEMO.len() >= TOKEN_MEMO_CAP {
+            FIRST_LINE_MEMO.clear();
+        }
+        FIRST_LINE_MEMO.insert(first_line.to_string(), detected.clone());
     }
     detected
 }
