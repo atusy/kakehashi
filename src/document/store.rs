@@ -748,6 +748,14 @@ impl DocumentStore {
                 }
                 let parsed_current_version = snapshot.parsed_version == doc.content_version();
                 let detected = snapshot.language.clone();
+                // Read before the publish, under the same guard: the held
+                // snapshot is what this publish upgrades, if anything.
+                let fills_placeholder = has_tree
+                    && evicted.as_ref().is_some_and(|held| {
+                        held.parsed_version == version
+                            && held.incarnation == incarnation
+                            && held.tree.is_none()
+                    });
                 let published = doc.publish_snapshot(&snapshot);
                 let current = published && parsed_current_version;
                 // The reparses do not relabel (the snapshot carries the
@@ -759,7 +767,7 @@ impl DocumentStore {
                 ParseInstall {
                     current,
                     published,
-                    tree_upgrade: false,
+                    tree_upgrade: published && fills_placeholder,
                 }
             });
         // Likewise a rejected `snapshot` (still owned here: the publish

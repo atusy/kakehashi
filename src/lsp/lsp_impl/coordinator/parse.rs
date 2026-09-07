@@ -1068,13 +1068,6 @@ impl ParseCoordinator {
             // against a pass whose text moved on mid-parse (the scheduler's
             // dirty loop is already reparsing the newer text), and the install
             // then publishes it.
-            // Read BEFORE the installs: the first one lands the tree from
-            // inside the populate work-unit.
-            let tree_less_upgrade = self.documents.latest_snapshot(uri).is_some_and(|view| {
-                view.slot.snapshot.is_some_and(|snapshot| {
-                    snapshot.parsed_version == content_version && snapshot.tree.is_none()
-                })
-            });
             let installed = self
                 .populate_and_install(
                     uri,
@@ -1115,7 +1108,7 @@ impl ParseCoordinator {
                     &self.cache,
                     uri,
                     content_version,
-                    tree_less_upgrade || installed.tree_upgrade,
+                    installed.tree_upgrade,
                 )
             {
                 events.push(crate::language::LanguageEvent::semantic_tokens_refresh(
