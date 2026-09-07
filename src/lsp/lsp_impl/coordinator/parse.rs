@@ -1159,6 +1159,103 @@ mod tests {
         assert_eq!(snapshot.incarnation, incarnation);
     }
 
+    /// The first install's verdict says the tree it published was current
+    /// at that instant, but the caller acts on it only after the resolution
+    /// — an edit landing in between has moved the document on, and the
+    /// downstream (did_open's eager open, the finished mark) must not run
+    /// for a version that is no longer current. With the resolution held,
+    /// an edit lands between the two installs; the verdict must be stale.
+    #[tokio::test]
+    async fn an_edit_during_the_resolution_stales_the_installs_verdict() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), language.clone());
+        let query = tree_sitter::Query::new(
+            &language,
+            "(fenced_code_block (info_string (language) @injection.language) \
+             (code_fence_content) @injection.content)",
+        )
+        .expect("valid markdown injection query");
+        server
+            .language
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(query));
+        let uri = Url::parse("file:///workspace/stale-verdict.md").unwrap();
+        let text = "```lua\nprint(1)\n```\n";
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (text_arc, content_version, version_cancel) = {
+            let doc = server.documents.get(&uri).unwrap();
+            (
+                doc.text_arc(),
+                doc.content_version(),
+                doc.version_cancel_token(),
+            )
+        };
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+
+        let hold = server.cache.hold_resolution();
+        let coordinator = server.parse_coordinator();
+        let task_uri = uri.clone();
+        let install = tokio::spawn(async move {
+            coordinator
+                .populate_and_install(
+                    &task_uri,
+                    InstallCheck::Expect(Some("markdown".to_string())),
+                    SnapshotInputs {
+                        text: text_arc,
+                        tree,
+                        language_name: "markdown".to_string(),
+                        parsed_version: content_version,
+                        incarnation,
+                    },
+                    version_cancel,
+                )
+                .await
+        });
+        // The first install lands while the resolution is held.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline
+            && !server
+                .documents
+                .get(&uri)
+                .is_some_and(|doc| doc.has_current_tree())
+        {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            server
+                .documents
+                .get(&uri)
+                .is_some_and(|doc| doc.has_current_tree()),
+            "the tree publishes before the resolution"
+        );
+        // An edit lands between the two installs.
+        server
+            .documents
+            .apply_edit(&uri, "```lua\nprint(2)\n```\n".to_string(), &[]);
+        drop(hold);
+        let installed = install.await.expect("the install task completes");
+        assert!(
+            installed.published,
+            "the first install did publish the tree of the version it parsed"
+        );
+        assert!(
+            !installed.current,
+            "the verdict acted on after the resolution must reflect the edit"
+        );
+    }
+
     #[tokio::test]
     async fn cancelled_populate_keeps_awaiter_joined_until_work_returns() {
         let pool = crate::compute_pool::test_pool();
