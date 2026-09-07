@@ -4059,4 +4059,38 @@ mod tests {
             "Lua should have highlight queries"
         );
     }
+    /// The canonical language of an injection region, from its identifier
+    /// alone: the base mapping, the `plaintext` short-circuit and syntect's
+    /// token lookup need no content, so populate can decide whether a region
+    /// is routable before it extracts the region's content. An identifier
+    /// those steps do not resolve is answered `None` — its language would
+    /// come from the content's first line, which only a resolution sees.
+    #[test]
+    fn canonical_language_from_identifier_answers_without_content_or_not_at_all() {
+        let coordinator = LanguageCoordinator::new();
+        assert_eq!(
+            coordinator.canonical_injection_language_from_identifier("py"),
+            Some("python".to_string())
+        );
+        assert_eq!(
+            coordinator.canonical_injection_language_from_identifier("plaintext"),
+            Some("plaintext".to_string())
+        );
+        coordinator.set_base_mapping("rmd", "markdown");
+        assert_eq!(
+            coordinator.canonical_injection_language_from_identifier("rmd"),
+            Some("markdown".to_string()),
+            "a base mapping wins before any detection"
+        );
+        assert_eq!(
+            coordinator.canonical_injection_language_from_identifier("no-such-language"),
+            None,
+            "an identifier only the content could resolve is not guessed"
+        );
+        assert_eq!(
+            coordinator.canonical_injection_language("no-such-language", "#!/usr/bin/env python\n"),
+            "python",
+            "the full resolution still consults the content for it"
+        );
+    }
 }
