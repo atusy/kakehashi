@@ -286,11 +286,11 @@ first `install_parse` — the tree and the discovery — landing from inside the
 populate work-unit at the hand-off, the second `install_parse` — the same
 version upgraded with the bridge / resolved regions — after the pass returns,
 then `mark_parse_finished` / `advance_watermark`
-(`src/lsp/lsp_impl/coordinator/parse.rs`), and the semantic handler's settle waits on the parse
-watermark + parse-completion before snapshotting the tree
-(`src/lsp/lsp_impl/text_document/semantic_tokens.rs`), so in the common debounced case the
-snapshot already carries (or its epoch already matches) the populated discovery —
-and never waits for the resolution the token path does not consume.
+(`src/lsp/lsp_impl/coordinator/parse.rs`), and the semantic handler parks on the
+document's snapshot cell until the current version is published
+(`src/lsp/lsp_impl/text_document/semantic_tokens.rs`), so it always sees the discovery the
+first install published with the tree — and never waits for the resolution the token path
+does not consume.
 On the branches where `populate_injections` does not run (the no-tree / error
 paths — `advance_watermark` still runs there), when the
 200 ms settle budget expires, or on the on-demand-parse fallback, there is simply
