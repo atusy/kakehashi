@@ -447,6 +447,7 @@ impl ParseCoordinator {
                     entry_mint_epoch,
                     inputs.incarnation,
                     build_bridge_regions,
+                    &|_| true,
                     &mut |discovered| {
                         log::trace!(
                             target: "kakehashi::parse",

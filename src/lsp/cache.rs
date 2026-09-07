@@ -259,6 +259,7 @@ impl CacheCoordinator {
         entry_mint_epoch: (u64, u64),
         incarnation: u64,
         build_bridge_regions: bool,
+        bridged: &dyn Fn(&str) -> bool,
     ) -> Option<PopulatedInjections> {
         self.populate_injections_cancellable(
             uri,
@@ -270,6 +271,7 @@ impl CacheCoordinator {
             entry_mint_epoch,
             incarnation,
             build_bridge_regions,
+            bridged,
             &mut |_| {},
             None,
         )
@@ -287,6 +289,7 @@ impl CacheCoordinator {
         entry_mint_epoch: (u64, u64),
         incarnation: u64,
         build_bridge_regions: bool,
+        bridged: &dyn Fn(&str) -> bool,
         on_discovered: &mut dyn FnMut(InjectionDiscovery),
         cancel: Option<&crate::cancel::CancelToken>,
     ) -> Option<PopulatedInjections> {
@@ -457,6 +460,19 @@ impl CacheCoordinator {
             // One resolution for every consumer that needs resolved languages /
             // virtual content: the bridge regions and the whole-document
             // resolved regions below are two views of this single pass.
+            // Judged on the canonical language the bridge routes on; a
+            // region whose identifier only its content could canonicalize
+            // counts as routable, so it is resolved rather than guessed.
+            let routable = regions.iter().any(|info| {
+                language
+                    .canonical_injection_language_from_identifier(&info.language)
+                    .is_none_or(|canonical| bridged(&canonical))
+            });
+            log::trace!(
+                target: "kakehashi::populate",
+                "{uri}: {} regions, a bridge server handles one: {routable}",
+                regions.len()
+            );
             let resolved = if build_bridge_regions {
                 let resolved = crate::language::injection::InjectionResolver::resolve_from_prebuilt_cancellable(
                     language,
@@ -1047,6 +1063,7 @@ mod tests {
                 tracker.mint_epoch(&uri),
                 1,
                 true,
+                &|_| true,
             )
             .expect("the pass ran");
 
@@ -1074,6 +1091,7 @@ mod tests {
                 tracker.mint_epoch(&uri),
                 1,
                 true,
+                &|_| true,
             )
             .expect("the pass ran");
         assert!(
@@ -1140,6 +1158,7 @@ mod tests {
                 tracker.mint_epoch(&uri),
                 1,
                 true,
+                &|_| true,
                 &mut on_discovered,
                 None,
             )
@@ -1156,6 +1175,90 @@ mod tests {
                 .collect::<Vec<_>>()),
             Some(vec!["python"; 9]),
             "resolution ran after the hand-off: it saw the mapping the hand-off installed"
+        );
+    }
+
+    /// Resolution — extracting every region's virtual document — feeds only
+    /// the bridge servers routed to the regions' languages. With a runnable
+    /// server, populate resolves a document only when one of its regions
+    /// is in a language a server handles, judged on the canonical language
+    /// the bridge itself routes on (`py` is `python`); a region whose
+    /// identifier only its content could canonicalize is resolved rather
+    /// than guessed. A document nothing routes publishes a roster instead:
+    /// every region's language and identity, no content, no whole-document
+    /// resolution.
+    #[test]
+    fn populate_resolves_only_a_document_a_server_handles_a_region_of() {
+        use tree_sitter::Parser;
+
+        let cache = CacheCoordinator::new();
+        let tracker = NodeTracker::new();
+        let coordinator = LanguageCoordinator::new();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            "(fenced_code_block (info_string (language) @injection.language) \
+             (code_fence_content) @injection.content)",
+        )
+        .expect("valid markdown injection query");
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(query));
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), language.clone());
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let handles_python = |canonical: &str| canonical == "python";
+        let mut populate = |name: &str, text: &str| {
+            let uri = create_test_uri(name);
+            let tree = parser.parse(text, None).unwrap();
+            cache
+                .populate_injections(
+                    &uri,
+                    text,
+                    &tree,
+                    "markdown",
+                    &coordinator,
+                    &tracker,
+                    tracker.mint_epoch(&uri),
+                    1,
+                    true,
+                    &handles_python,
+                )
+                .expect("the pass ran")
+        };
+
+        let unrouted = populate("unrouted.md", "```lua\nprint(1)\n```\n");
+        let roster = unrouted.bridge_regions.expect("the roster is published");
+        assert_eq!(
+            roster
+                .iter()
+                .map(|region| (region.language.as_str(), region.content.is_some()))
+                .collect::<Vec<_>>(),
+            vec![("lua", false)],
+            "no server handles lua: on the roster, not resolved"
+        );
+        assert!(unrouted.resolved_regions.is_none());
+
+        let routed = populate("routed.md", "```py\nprint(1)\n```\n");
+        assert_eq!(
+            routed.bridge_regions.as_ref().map(|regions| regions
+                .iter()
+                .map(|region| (region.language.as_str(), region.content.is_some()))
+                .collect::<Vec<_>>()),
+            Some(vec![("python", true)]),
+            "a server handles python, which is what `py` canonicalizes to: resolved"
+        );
+        assert!(routed.resolved_regions.is_some());
+
+        let unknown = populate("unknown.md", "```no-such-language\nprint(1)\n```\n");
+        assert!(
+            unknown
+                .bridge_regions
+                .as_ref()
+                .is_some_and(|regions| regions.iter().all(|region| region.content.is_some())),
+            "an identifier only the content could canonicalize is resolved, not guessed"
         );
     }
 
@@ -1195,6 +1298,7 @@ mod tests {
             tracker.mint_epoch(&uri),
             1,
             true,
+            &|_| true,
             &mut |_| {},
             Some(&cancel),
         );
@@ -1245,6 +1349,7 @@ mod tests {
             tracker.mint_epoch(&uri),
             1,
             true,
+            &|_| true,
             &mut |_| {},
             Some(&cancel),
         );
@@ -1308,6 +1413,7 @@ print("hello")
             tracker.mint_epoch(&uri),
             0,
             true,
+            &|_| true,
         );
 
         // Verify we have one injection region
@@ -1370,6 +1476,7 @@ print("hello")
             tracker.mint_epoch(&uri),
             0,
             true,
+            &|_| true,
         );
 
         // The region still exists, but changing its dynamic language creates a
@@ -1449,6 +1556,7 @@ print("hello")
             tracker.mint_epoch(&uri),
             0,
             true,
+            &|_| true,
         );
 
         let regions = cache.get_injections(&uri).expect("should have injections");
@@ -1495,6 +1603,7 @@ print("goodbye")
             tracker.mint_epoch(&uri),
             0,
             true,
+            &|_| true,
         );
 
         let regions_after = cache.get_injections(&uri).expect("should have injections");
