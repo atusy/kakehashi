@@ -777,12 +777,6 @@ impl LanguageCoordinator {
         }
     }
 
-    /// Resolve a derived languageId to its base language name.
-    ///
-    /// Returns the registered base mapping, otherwise `None`. A declaration is
-    /// intentionally not registered when the derived language owns a distinct
-    /// parser; see [`Self::build_base_map`].
-    /// Example: "rmd" → Some("markdown") when its base mapping is eligible.
     /// Test probe: a base mapping installed mid-flight, so a test can tell
     /// which side of a hand-off a language resolution ran on.
     #[cfg(test)]
@@ -793,6 +787,12 @@ impl LanguageCoordinator {
             .insert(language_id.to_string(), base.to_string());
     }
 
+    /// Resolve a derived languageId to its base language name.
+    ///
+    /// Returns the registered base mapping, otherwise `None`. A declaration is
+    /// intentionally not registered when the derived language owns a distinct
+    /// parser; see [`Self::build_base_map`].
+    /// Example: "rmd" → Some("markdown") when its base mapping is eligible.
     fn resolve_base(&self, language_id: &str) -> Option<String> {
         let base_map = self
             .base_map

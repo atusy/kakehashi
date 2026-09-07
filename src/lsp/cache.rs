@@ -30,9 +30,6 @@ pub(crate) type RequestId = u64;
 
 /// Coordinates all cache structures for semantic token operations.
 ///
-/// This struct wraps five underlying caches (full tokens, range tokens, the
-/// injection map, injection-region tokens, and request tracking) and provides a
-/// unified API for document lifecycle management, edit handling, and token operations.
 /// Drop to release the populate passes [`CacheCoordinator::hold_resolution`] holds.
 #[cfg(test)]
 pub(crate) struct ResolutionHold(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
@@ -45,6 +42,9 @@ impl Drop for ResolutionHold {
     }
 }
 
+/// This struct wraps five underlying caches (full tokens, range tokens, the
+/// injection map, injection-region tokens, and request tracking) and provides a
+/// unified API for document lifecycle management, edit handling, and token operations.
 pub(crate) struct CacheCoordinator {
     #[cfg(test)]
     resolution_hold: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
@@ -74,12 +74,6 @@ pub(crate) struct CacheCoordinator {
     served_semantic_versions: dashmap::DashMap<Url, u64>,
 }
 
-/// Everything one `populate_injections` pass derives from its single
-/// injection-query run (parse-snapshot ADR §3, never discover twice): the
-/// semantic-path discovery (below its own reuse gate) and, behind one gate
-/// (a runnable bridge server), two views of one resolution — the
-/// bridge-downstream region list and the whole-document resolved regions.
-/// All ride the `ParseSnapshot` the parse publishes.
 /// The first half of a populate pass, handed out before resolution starts
 /// (see [`CacheCoordinator::populate_injections_cancellable`]): everything
 /// the token readers consume. The parse publishes its tree with this, so a
@@ -92,6 +86,12 @@ pub(crate) struct InjectionDiscovery {
     pub(crate) generation: u64,
 }
 
+/// Everything one `populate_injections` pass derives from its single
+/// injection-query run (parse-snapshot ADR §3, never discover twice): the
+/// semantic-path discovery (below its own reuse gate) and, behind one gate
+/// (a runnable bridge server), two views of one resolution — the
+/// bridge-downstream region list and the whole-document resolved regions.
+/// All ride the `ParseSnapshot` the parse publishes.
 pub(crate) struct PopulatedInjections {
     pub(crate) discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
     /// `None` when the resolution was skipped (no runnable bridge server) —
@@ -570,8 +570,6 @@ impl CacheCoordinator {
         self.injection_map.get(uri)
     }
 
-    /// Share the per-region injection token cache for use on the blocking
-    /// semantic-token pool (#529), where the hot path reuses/stores region tokens.
     /// Test probe: hold every populate pass between its discovery hand-off
     /// and its resolution until the returned guard is dropped, so a test can
     /// observe the first install (tree + discovery) as a state of its own.
@@ -597,6 +595,8 @@ impl CacheCoordinator {
     #[cfg(not(test))]
     fn await_resolution_hold(&self) {}
 
+    /// Share the per-region injection token cache for use on the blocking
+    /// semantic-token pool (#529), where the hot path reuses/stores region tokens.
     pub(crate) fn injection_token_cache_arc(&self) -> std::sync::Arc<InjectionTokenCache> {
         std::sync::Arc::clone(&self.injection_token_cache)
     }
