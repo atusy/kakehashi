@@ -169,9 +169,10 @@ impl SnapshotSlot {
             })
     }
 
-    /// The equal-version regions upgrade: both sides carry a tree (readers
-    /// derive theirs from the published one and must never lose it), no
-    /// region view goes from present to absent, and at least one of the
+    /// The equal-version regions upgrade: both sides carry the SAME tree
+    /// (readers derive theirs from the published one and must never lose it
+    /// or see it swapped — not even for a sibling parse of the same text),
+    /// no region view goes from present to absent, and at least one of the
     /// bridge / resolved views goes from absent to present. The same shape
     /// again is not an upgrade, so a version never re-publishes for nothing.
     fn regions_upgrade(current: &ParseSnapshot, snapshot: &ParseSnapshot) -> bool {
@@ -189,12 +190,30 @@ impl SnapshotSlot {
             current.injection_regions.is_some(),
             snapshot.injection_regions.is_some(),
         );
-        current.tree.is_some()
-            && snapshot.tree.is_some()
+        Self::same_tree(current, snapshot)
             && !downgraded(bridge.0, bridge.1)
             && !downgraded(resolved.0, resolved.1)
             && !downgraded(discovery.0, discovery.1)
             && (upgraded(bridge.0, bridge.1) || upgraded(resolved.0, resolved.1))
+    }
+
+    /// Whether both snapshots carry the same tree. A `Tree` clone gives its
+    /// root node a fresh identity but shares the children, so the first
+    /// child's identity tells a clone of one parse from another parse of the
+    /// same text; a tree with no children (an empty document) is told by
+    /// its text instead, which the two installs of one parse share by
+    /// allocation.
+    fn same_tree(current: &ParseSnapshot, snapshot: &ParseSnapshot) -> bool {
+        match (&current.tree, &snapshot.tree) {
+            (Some(held), Some(incoming)) => {
+                match (held.root_node().child(0), incoming.root_node().child(0)) {
+                    (Some(held), Some(incoming)) => held.id() == incoming.id(),
+                    (None, None) => Arc::ptr_eq(&current.text, &snapshot.text),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 }
 
