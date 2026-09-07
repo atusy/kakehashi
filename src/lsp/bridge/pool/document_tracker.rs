@@ -1530,7 +1530,7 @@ mod tests {
             .register_opened_document(&host_uri, &sibling_uri, &connection)
             .await;
 
-        let expected = std::collections::HashMap::from([(TEST_ULID_LUA_0, "python")]);
+        let expected = std::collections::HashMap::from([(TEST_ULID_LUA_0, Some("python"))]);
         let removed = tracker
             .remove_replaced_virtual_docs(&host_uri, &expected)
             .await;
@@ -1545,6 +1545,51 @@ mod tests {
         assert_eq!(
             remaining[0].virtual_uri.to_uri_string(),
             sibling_uri.to_uri_string()
+        );
+    }
+
+    /// A region that is still live but no longer routed — a reload changed
+    /// the host's bridge filter or the server's languages, not the region —
+    /// keeps its identity and language, so a language compare would keep
+    /// its old virtual document open on a server that no longer handles it.
+    /// The expected map says "no longer routed" explicitly, and the document
+    /// is taken like a replaced one.
+    #[tokio::test]
+    async fn remove_replaced_virtual_docs_takes_a_region_no_longer_routed() {
+        let tracker = DocumentTracker::new();
+        let host_uri = test_host_uri("region_no_longer_routed");
+        let unrouted_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let routed_uri =
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", TEST_ULID_PYTHON_0);
+        let connection = ConnectionKey::for_server("server");
+        tracker
+            .register_opened_document(&host_uri, &unrouted_uri, &connection)
+            .await;
+        tracker
+            .register_opened_document(&host_uri, &routed_uri, &connection)
+            .await;
+
+        let expected = std::collections::HashMap::from([
+            (TEST_ULID_LUA_0, None),
+            (TEST_ULID_PYTHON_0, Some("python")),
+        ]);
+        let removed = tracker
+            .remove_replaced_virtual_docs(&host_uri, &expected)
+            .await;
+
+        assert_eq!(
+            removed
+                .iter()
+                .map(|doc| doc.virtual_uri.to_uri_string())
+                .collect::<Vec<_>>(),
+            vec![unrouted_uri.to_uri_string()],
+            "the region nothing routes any more loses its virtual document"
+        );
+        let remaining = tracker.host_virtual_docs(&host_uri).await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].virtual_uri.to_uri_string(),
+            routed_uri.to_uri_string()
         );
     }
 
