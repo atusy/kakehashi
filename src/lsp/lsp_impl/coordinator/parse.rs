@@ -419,8 +419,7 @@ impl ParseCoordinator {
                 ),
             );
         };
-        let settings = self.settings_manager.load_settings();
-        let build_bridge_regions = settings.any_bridge_server_runnable();
+        let settings_manager = std::sync::Arc::clone(&self.settings_manager);
         let bridge = std::sync::Arc::clone(&self.bridge);
         let pool_uri = uri.clone();
         // The first install's verdict lives outside the work-unit too, so a
@@ -436,6 +435,8 @@ impl ParseCoordinator {
             let check = std::sync::Arc::clone(&check);
             let first = std::sync::Arc::clone(&first);
             move |cancel_for_work| {
+                let settings_cell = std::sync::OnceLock::new();
+                let settings = || settings_cell.get_or_init(|| settings_manager.load_settings());
                 let populated = cache.populate_injections_cancellable(
                     &pool_uri,
                     &inputs.text,
@@ -445,7 +446,11 @@ impl ParseCoordinator {
                     &tracker,
                     entry_mint_epoch,
                     inputs.incarnation,
-                    build_bridge_regions,
+                    // The settings are loaded on first use, i.e. after the
+                    // pass has taken its generation stamp: settings a reload
+                    // publishes in between then pair with a stamp the
+                    // stamp-checking readers reject, never the other way.
+                    &|| settings().any_bridge_server_runnable(),
                     // The routing rule the bridge itself applies to a region
                     // (host filter, spawnable command, `languages` list with
                     // its wildcard), asked with the canonical language it
@@ -455,7 +460,7 @@ impl ParseCoordinator {
                     &|canonical: &str| {
                         !bridge
                             .cached_configs_for_injection_language(
-                                &settings,
+                                settings(),
                                 &inputs.language_name,
                                 canonical,
                             )

@@ -1371,7 +1371,7 @@ mod tests {
             &server.bridge.node_tracker_arc(),
             server.bridge.node_tracker_arc().mint_epoch(&uri),
             incarnation,
-            true,
+            &|| true,
             &|_| true,
         );
         let populated = populated.expect("current pass populates");
@@ -1561,7 +1561,7 @@ mod tests {
                 &server.bridge.node_tracker_arc(),
                 server.bridge.node_tracker_arc().mint_epoch(&uri),
                 server.documents.get(&uri).unwrap().incarnation(),
-                true,
+                &|| true,
                 &|_| true,
             )
             .expect("current pass populates");

@@ -261,7 +261,7 @@ impl CacheCoordinator {
         tracker: &NodeTracker,
         entry_mint_epoch: (u64, u64),
         incarnation: u64,
-        build_bridge_regions: bool,
+        bridge_runnable: &dyn Fn() -> bool,
         bridged: &dyn Fn(&str) -> bool,
     ) -> Option<PopulatedInjections> {
         self.populate_injections_cancellable(
@@ -273,7 +273,7 @@ impl CacheCoordinator {
             tracker,
             entry_mint_epoch,
             incarnation,
-            build_bridge_regions,
+            bridge_runnable,
             bridged,
             &mut |_| {},
             None,
@@ -291,7 +291,7 @@ impl CacheCoordinator {
         tracker: &NodeTracker,
         entry_mint_epoch: (u64, u64),
         incarnation: u64,
-        build_bridge_regions: bool,
+        bridge_runnable: &dyn Fn() -> bool,
         bridged: &dyn Fn(&str) -> bool,
         on_discovered: &mut dyn FnMut(InjectionDiscovery),
         cancel: Option<&crate::cancel::CancelToken>,
@@ -466,19 +466,23 @@ impl CacheCoordinator {
             // Judged on the canonical language the bridge routes on; a
             // region whose identifier only its content could canonicalize
             // counts as routable, so it is resolved rather than guessed.
-            let canonical: Vec<Option<String>> = regions
-                .iter()
-                .map(|info| language.canonical_injection_language_from_identifier(&info.language))
-                .collect();
-            let routable = canonical
-                .iter()
-                .any(|canonical| canonical.as_deref().is_none_or(bridged));
+            // Both asked only now — after the generation stamp at the top
+            // of this pass — so settings a reload publishes in between
+            // pair with a stamp that stamp-checking readers reject.
+            let build_bridge_regions = bridge_runnable();
+            let routable = build_bridge_regions
+                && regions.iter().any(|info| {
+                    language
+                        .canonical_injection_language_from_identifier(&info.language)
+                        .as_deref()
+                        .is_none_or(bridged)
+                });
             log::trace!(
-                target: "kakehashi::populate",
+                target: "kakehashi::cache",
                 "{uri}: {} regions, a bridge server handles one: {routable}",
                 regions.len()
             );
-            let resolved = if build_bridge_regions && routable {
+            let resolved = if routable {
                 let resolved = crate::language::injection::InjectionResolver::resolve_from_prebuilt_cancellable(
                     language,
                     &regions,
@@ -515,18 +519,24 @@ impl CacheCoordinator {
                             })
                             .collect(),
                     ),
+                    // Every identifier canonicalizes without content here:
+                    // one that could not would have made the document
+                    // routable above. (Memo hits: the names were just asked.)
                     None if build_bridge_regions => Some(
                         regions
                             .iter()
                             .zip(&cacheable_regions)
-                            .zip(canonical)
-                            .map(|((info, cacheable), canonical)| {
-                                crate::document::DiscoveredBridgeRegion {
-                                    language: canonical.unwrap_or_else(|| info.language.clone()),
+                            .map(
+                                |(info, cacheable)| crate::document::DiscoveredBridgeRegion {
+                                    language: language
+                                        .canonical_injection_language_from_identifier(
+                                            &info.language,
+                                        )
+                                        .unwrap_or_else(|| info.language.clone()),
                                     region_id: cacheable.region_id.clone(),
                                     content: None,
-                                }
-                            })
+                                },
+                            )
                             .collect(),
                     ),
                     None => None,
@@ -1087,7 +1097,7 @@ mod tests {
                 &tracker,
                 tracker.mint_epoch(&uri),
                 1,
-                true,
+                &|| true,
                 &|_| true,
             )
             .expect("the pass ran");
@@ -1115,7 +1125,7 @@ mod tests {
                 &tracker,
                 tracker.mint_epoch(&uri),
                 1,
-                true,
+                &|| true,
                 &|_| true,
             )
             .expect("the pass ran");
@@ -1182,7 +1192,7 @@ mod tests {
                 &tracker,
                 tracker.mint_epoch(&uri),
                 1,
-                true,
+                &|| true,
                 &|_| true,
                 &mut on_discovered,
                 None,
@@ -1248,7 +1258,7 @@ mod tests {
                     &tracker,
                     tracker.mint_epoch(&uri),
                     1,
-                    true,
+                    &|| true,
                     &handles_python,
                 )
                 .expect("the pass ran")
@@ -1322,7 +1332,7 @@ mod tests {
             &tracker,
             tracker.mint_epoch(&uri),
             1,
-            true,
+            &|| true,
             &|_| true,
             &mut |_| {},
             Some(&cancel),
@@ -1373,7 +1383,7 @@ mod tests {
             &tracker,
             tracker.mint_epoch(&uri),
             1,
-            true,
+            &|| true,
             &|_| true,
             &mut |_| {},
             Some(&cancel),
@@ -1437,7 +1447,7 @@ print("hello")
             &tracker,
             tracker.mint_epoch(&uri),
             0,
-            true,
+            &|| true,
             &|_| true,
         );
 
@@ -1500,7 +1510,7 @@ print("hello")
             &tracker,
             tracker.mint_epoch(&uri),
             0,
-            true,
+            &|| true,
             &|_| true,
         );
 
@@ -1580,7 +1590,7 @@ print("hello")
             &tracker,
             tracker.mint_epoch(&uri),
             0,
-            true,
+            &|| true,
             &|_| true,
         );
 
@@ -1627,7 +1637,7 @@ print("goodbye")
             &tracker,
             tracker.mint_epoch(&uri),
             0,
-            true,
+            &|| true,
             &|_| true,
         );
 
