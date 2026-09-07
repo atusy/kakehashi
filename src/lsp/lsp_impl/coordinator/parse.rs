@@ -397,8 +397,9 @@ impl ParseCoordinator {
                 &mut |discovered| {
                     log::trace!(
                         target: "kakehashi::populate",
-                        "discovery handed out at settings generation {}",
-                        discovered.generation
+                        "discovery handed out at settings generation {} (reusable: {})",
+                        discovered.generation,
+                        discovered.discovery.is_some()
                     );
                 },
                 Some(&cancel_for_work),
