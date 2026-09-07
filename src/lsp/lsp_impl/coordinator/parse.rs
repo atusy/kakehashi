@@ -10,10 +10,6 @@ use url::Url;
 use crate::lsp::lsp_impl::{Kakehashi, build_notifier};
 use crate::lsp::settings_manager::SettingsManager;
 
-/// Everything one populate pass derives for the snapshot it rides on
-/// (parse-snapshot ADR §3): all `None` when the pool work-unit panicked or
-/// populate's own epoch/lifetime guard committed nothing — readers then fall
-/// back to inline resolution for that snapshot.
 /// What every snapshot a parse publishes shares: the text and tree it parsed,
 /// the language it detected, and the version/lifetime stamps. The two
 /// installs a parse makes per version (tree + discovery first, the regions
@@ -61,6 +57,10 @@ impl InstallCheck {
     }
 }
 
+/// Everything one populate pass derives for the snapshot it rides on
+/// (parse-snapshot ADR §3): all `None` when the pool work-unit panicked or
+/// populate's own epoch/lifetime guard committed nothing — readers then fall
+/// back to inline resolution for that snapshot.
 #[derive(Default)]
 struct PopulatedSnapshotRegions {
     discovery: Option<std::sync::Arc<crate::document::DiscoveredInjections>>,
@@ -451,11 +451,12 @@ impl ParseCoordinator {
                     Some(&cancel_for_work),
                 );
                 // A refused pass (`None`) maps to all-`None` region fields —
-                // the snapshot then rides WITHOUT regions and readers fall
-                // back to inline resolution. Mapping it to the ran-and-empty
-                // shape instead would publish "no injections" for a pass
-                // that never derived anything, blanking the document's
-                // injections until the next parse.
+                // the version then keeps what the first install published
+                // (the tree with the discovery already handed out, or
+                // nothing yet) and readers resolve inline. Mapping it to the
+                // ran-and-empty shape instead would publish "no injections"
+                // for a pass that never derived anything, blanking the
+                // document's injections until the next parse.
                 populated.map_or_else(PopulatedSnapshotRegions::default, |populated| {
                     PopulatedSnapshotRegions {
                         discovery: populated.discovery,
